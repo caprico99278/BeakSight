@@ -17,8 +17,8 @@ beaksight-output/
 .git-sandbox-backup/
 .superpowers/sdd/
 
-# Claude Code local settings (machine-specific permissions, may contain local paths)
-.claude/settings.local.json
+# Claude Code settings, skills, and hooks (local development environment only)
+.claude/
 
 # Editor/OS noise
 .DS_Store
