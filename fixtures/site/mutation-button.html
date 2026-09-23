@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Mutation Button</title></head>
+  <body>
+    <button type="button">Attempt mutation</button>
+    <script>
+      document.querySelector('button').addEventListener('click', () => {
+        void fetch('/__mutation', { method: 'POST' });
+      });
+    </script>
+  </body>
+</html>
+

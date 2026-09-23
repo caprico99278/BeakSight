@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Replaced Candidate</title></head>
+  <body>
+    <button type="button" aria-expanded="false">Replace candidate</button>
+    <script>
+      document.querySelector('button').addEventListener('click', (event) => {
+        const replacement = event.currentTarget.cloneNode(true);
+        replacement.setAttribute('aria-expanded', 'true');
+        event.currentTarget.replaceWith(replacement);
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Multi-root candidate fixture</title>
+  </head>
+  <body>
+    <span id="multi-root-label-a"></span>
+    <span id="multi-root-label-b"></span>
+    <button
+      type="button"
+      title="Fallback label"
+      aria-labelledby="multi-root-label-a multi-root-label-b"
+    ></button>
+    <script>
+      for (const id of ['multi-root-label-a', 'multi-root-label-b']) {
+        const label = document.getElementById(id);
+        const fragment = document.createDocumentFragment();
+        for (let index = 0; index < 300; index += 1) {
+          fragment.append(document.createElement('span'));
+        }
+        label.append(fragment);
+      }
+    </script>
+  </body>
+</html>

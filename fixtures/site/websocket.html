@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture WebSocket Button</title></head>
+  <body>
+    <button type="button">Open WebSocket</button>
+    <script>
+      document.querySelector('button').addEventListener('click', () => {
+        const socket = new WebSocket(location.origin.replace(/^http/, 'ws') + '/socket');
+        socket.addEventListener('error', () => undefined);
+      });
+    </script>
+  </body>
+</html>
+

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Bad contrast fixture</title>
+    <style>
+      body { margin: 0; background-color: rgb(136, 136, 136); font-family: sans-serif; }
+      #poor-contrast { color: rgb(119, 119, 119); font-size: 16px; }
+      #opaque-sample { color: rgb(20, 40, 60); background-color: rgb(240, 240, 240); }
+      #image-ambiguous {
+        color: rgb(10, 20, 30);
+        background-color: transparent;
+        background-image: linear-gradient(white, black);
+      }
+      #transparent-parent { opacity: 0; }
+      #partial-opacity { opacity: 0.5; color: rgb(20, 40, 60); background: rgb(240, 240, 240); }
+      #ancestor-partial { opacity: 0.5; }
+      #ancestor-partial-sample { color: rgb(20, 40, 60); background: rgb(240, 240, 240); }
+      #clip-container { width: 100px; height: 20px; overflow: hidden; }
+      #overflow-clipped-color { width: 200px; height: 40px; margin: 0; color: rgb(30, 60, 90); }
+      #clip-host { position: relative; width: 100px; height: 20px; overflow: hidden; }
+      #fully-clipped-color {
+        position: absolute;
+        left: 150px;
+        top: 0;
+        width: 50px;
+        height: 20px;
+        margin: 0;
+        color: rgb(40, 80, 120);
+      }
+      #viewport-clipped-color {
+        position: fixed;
+        left: 0;
+        top: 590px;
+        width: 100px;
+        height: 40px;
+        margin: 0;
+        color: rgb(50, 100, 150);
+        background: white;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p id="poor-contrast" data-long-attribute="abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz">Difficult to read contrast fixture text.</p>
+      <p id="opaque-sample">Opaque color sample.</p>
+      <p id="image-ambiguous">Image-backed ambiguous sample.</p>
+      <div id="transparent-parent"><p id="not-visible-sample">Ancestor-hidden sample.</p></div>
+      <p id="partial-opacity">Partially transparent text.</p>
+      <div id="ancestor-partial"><p id="ancestor-partial-sample">Ancestor partially transparent text.</p></div>
+      <div id="clip-container"><p id="overflow-clipped-color">Overflow-clipped color sample.</p></div>
+      <div id="clip-host"><p id="fully-clipped-color">Fully clipped color sample.</p></div>
+      <p id="viewport-clipped-color">Viewport-clipped color sample.</p>
+      <p id="modern-color">Modern serialized color sample.</p>
+      <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+    </main>
+  </body>
+</html>

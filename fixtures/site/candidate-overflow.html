@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Candidate Overflow</title></head>
+  <body>
+    <script>
+      for (let index = 0; index < 105; index += 1) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = `${'x'.repeat(400)}-${index}`;
+        document.body.append(button);
+      }
+    </script>
+  </body>
+</html>

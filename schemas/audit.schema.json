@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:audit:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "run", "pages", "findings"],
+  "properties": {
+    "schemaVersion": { "const": "audit-schema/1.0" },
+    "run": { "$ref": "urn:beaksight:schema:run:1.0" },
+    "pages": { "type": "array", "items": { "$ref": "urn:beaksight:schema:page:1.0" } },
+    "findings": { "type": "array", "items": { "$ref": "urn:beaksight:schema:finding:1.0" } }
+  }
+}

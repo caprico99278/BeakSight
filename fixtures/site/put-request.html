@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Put Request</title>
+  </head>
+  <body>
+    <h1>Fixture Put Request</h1>
+    <button type="button" id="send-put">Send PUT</button>
+    <script>
+      document.querySelector('#send-put').addEventListener('click', () => {
+        void fetch('/__mutation', { method: 'PUT' });
+      });
+    </script>
+  </body>
+</html>

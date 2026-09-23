@@ -1,0 +1,9 @@
+{
+  "target": {
+    "id": "example"
+  },
+  "site": {
+    "startUrl": "https://example.com/",
+    "allowedOrigins": ["https://example.com"]
+  }
+}

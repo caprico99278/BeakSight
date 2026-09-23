@@ -1,0 +1,84 @@
+export interface HttpRequestFacts {
+  readonly kind: 'HTTP';
+  readonly method: string;
+  readonly url: string;
+  readonly isNavigationRequest: boolean;
+  readonly isMainFrame: boolean;
+}
+
+export interface WebSocketRequestFacts {
+  readonly kind: 'WEBSOCKET';
+  readonly url: string;
+}
+
+export type PassiveRequestFacts = HttpRequestFacts | WebSocketRequestFacts;
+
+export type PassiveRequestDecision =
+  | { readonly action: 'ALLOW'; readonly delivery: 'DIRECT' | 'INSPECT_REDIRECTS' }
+  | { readonly action: 'BLOCK'; readonly category: 'REQUEST'; readonly reason: 'NON_READ_METHOD' }
+  | {
+    readonly action: 'BLOCK';
+    readonly category: 'NAVIGATION';
+    readonly reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION';
+  }
+  | { readonly action: 'BLOCK'; readonly category: 'WEBSOCKET'; readonly reason: 'PASSIVE_WEBSOCKET' };
+
+export function isReadMethod(method: string): boolean {
+  const normalizedMethod = method.toUpperCase();
+  return normalizedMethod === 'GET' || normalizedMethod === 'HEAD';
+}
+
+export function canonicalPassiveAllowedOrigins(allowedOrigins: ReadonlySet<string>): ReadonlySet<string> {
+  const canonicalOrigins = new Set<string>();
+  for (const entry of allowedOrigins) {
+    try {
+      const candidate = new URL(entry);
+      if (
+        (candidate.protocol === 'http:' || candidate.protocol === 'https:')
+        && candidate.username.length === 0
+        && candidate.password.length === 0
+      ) {
+        canonicalOrigins.add(candidate.origin);
+      }
+    } catch {
+      // 不正な形式のエントリにネットワーク権限を与えてはならない。
+    }
+  }
+  return canonicalOrigins;
+}
+
+function hasAllowedOrigin(url: string, allowedOrigins: ReadonlySet<string>): boolean {
+  try {
+    const candidate = new URL(url);
+    return canonicalPassiveAllowedOrigins(allowedOrigins).has(candidate.origin);
+  } catch {
+    return false;
+  }
+}
+
+export function classifyPassiveRequest(
+  facts: PassiveRequestFacts,
+  allowedOrigins: ReadonlySet<string>,
+): PassiveRequestDecision {
+  if (facts.kind === 'WEBSOCKET') {
+    return { action: 'BLOCK', category: 'WEBSOCKET', reason: 'PASSIVE_WEBSOCKET' };
+  }
+  if (!isReadMethod(facts.method)) {
+    return { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' };
+  }
+  if (
+    facts.isNavigationRequest
+    && facts.isMainFrame
+    && !hasAllowedOrigin(facts.url, allowedOrigins)
+  ) {
+    return {
+      action: 'BLOCK',
+      category: 'NAVIGATION',
+      reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
+    };
+  }
+  return {
+    action: 'ALLOW',
+    delivery: facts.isNavigationRequest && facts.isMainFrame ? 'INSPECT_REDIRECTS' : 'DIRECT',
+  };
+}

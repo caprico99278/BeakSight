@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Ambiguous Candidate</title></head>
+  <body>
+    <button type="button">Duplicate candidate</button>
+    <script>
+      document.querySelector('button').addEventListener('click', (event) => {
+        const original = event.currentTarget;
+        const first = original.cloneNode(true);
+        const second = original.cloneNode(true);
+        original.replaceWith(first, second);
+      });
+    </script>
+  </body>
+</html>

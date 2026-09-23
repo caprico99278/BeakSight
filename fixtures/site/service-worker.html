@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Service Worker Button</title></head>
+  <body>
+    <button type="button">Register worker</button>
+    <script>
+      document.querySelector('button').addEventListener('click', () => {
+        void navigator.serviceWorker.register('/fixture-service-worker.js').catch(() => undefined);
+      });
+    </script>
+  </body>
+</html>
+

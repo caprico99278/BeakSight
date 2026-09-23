@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hostile candidate fixture</title>
+  </head>
+  <body>
+    <button id="hostile-label" type="button" aria-label="Fallback label"></button>
+    <script>
+      const label = document.getElementById('hostile-label');
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < 100000; index += 1) {
+        fragment.append(document.createElement('span'));
+      }
+      fragment.append(document.createTextNode('must-not-require-unbounded-traversal'));
+      label.append(fragment);
+    </script>
+  </body>
+</html>

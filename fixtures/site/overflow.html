@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Layout overflow fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; width: 1200px; font-family: sans-serif; }
+      #fixed-banner {
+        position: fixed;
+        inset: 0 0 auto 0;
+        z-index: 20;
+        height: 72px;
+        background: rgba(0, 0, 0, 0.9);
+        color: white;
+      }
+      #covered-heading { margin: 16px 0 0 8px; height: 48px; }
+      #outside { position: absolute; left: 1100px; top: 160px; width: 80px; height: 40px; }
+      #zero-action {
+        position: absolute;
+        left: 24px;
+        top: 240px;
+        width: 0;
+        height: 0;
+        min-width: 0;
+        min-height: 0;
+        padding: 0;
+        border: 0;
+        overflow: hidden;
+      }
+      #layout-opacity-parent { opacity: 0; }
+      #ancestor-hidden-outside,
+      #aria-visual-outside,
+      #priority-horizontal {
+        position: absolute;
+        left: 1100px;
+        width: 80px;
+        height: 20px;
+      }
+      #ancestor-hidden-outside { top: 260px; }
+      #aria-visual-outside { top: 290px; }
+      #priority-horizontal { top: 320px; }
+      #vertical-fillers { width: 300px; }
+      .vertical-filler { width: 300px; height: 20px; }
+      #priority-fixed-offscreen,
+      #offscreen-fixed,
+      #offscreen-heading {
+        position: fixed;
+        left: 1000px;
+        width: 80px;
+        height: 30px;
+      }
+      #priority-fixed-offscreen { top: 20px; }
+      #self-fixed-heading { position: fixed; left: 20px; top: 100px; width: 180px; height: 30px; margin: 0; }
+      #fixed-containing { position: fixed; left: 20px; top: 150px; width: 220px; height: 40px; }
+      #contained-heading { margin: 0; height: 40px; }
+      #heading-containing { position: fixed; left: 20px; top: 210px; width: 220px; height: 40px; margin: 0; }
+      #contained-fixed { position: fixed; left: 20px; top: 210px; width: 220px; height: 40px; }
+      #offscreen-fixed, #offscreen-heading { top: 100px; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="fixed-banner">Fixed navigation</div>
+    <h1 id="covered-heading">Visible covered heading</h1>
+    <div id="outside">Outside viewport</div>
+    <button id="zero-action" type="button">Hidden by zero geometry</button>
+    <div id="layout-opacity-parent"><div id="ancestor-hidden-outside">Visually hidden by ancestor</div></div>
+    <div id="aria-visual-outside" aria-hidden="true">ARIA-hidden but visually present</div>
+    <div id="vertical-fillers"></div>
+    <script>
+      for (let index = 0; index < 140; index += 1) {
+        const filler = document.createElement('div');
+        filler.className = 'vertical-filler';
+        filler.textContent = `Vertical filler ${index}`;
+        document.querySelector('#vertical-fillers').append(filler);
+      }
+    </script>
+    <div id="priority-horizontal">Late horizontal candidate</div>
+    <div id="priority-fixed-offscreen">Late fixed candidate</div>
+    <h2 id="self-fixed-heading">Self fixed heading</h2>
+    <section id="fixed-containing"><h2 id="contained-heading">Contained heading</h2></section>
+    <h2 id="heading-containing">Containing heading<span id="contained-fixed">Contained fixed</span></h2>
+    <div id="offscreen-fixed">Offscreen fixed</div>
+    <h2 id="offscreen-heading">Offscreen heading</h2>
+  </body>
+</html>

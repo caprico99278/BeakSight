@@ -1,0 +1,32 @@
+{
+  "$id": "urn:beaksight:schema:run:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "runStatus",
+    "startedAt",
+    "finishedAt",
+    "discoveredPageCount",
+    "auditedPageCount",
+    "failedPageCount",
+    "skippedPageCount",
+    "incompleteReasons"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "run-schema/1.0" },
+    "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
+    "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
+    "startedAt": { "type": "string", "minLength": 1 },
+    "finishedAt": { "type": ["string", "null"] },
+    "discoveredPageCount": { "type": "integer", "minimum": 0 },
+    "auditedPageCount": { "type": "integer", "minimum": 0 },
+    "failedPageCount": { "type": "integer", "minimum": 0 },
+    "skippedPageCount": { "type": "integer", "minimum": 0 },
+    "incompleteReasons": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

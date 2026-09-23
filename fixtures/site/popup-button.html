@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Popup Button</title></head>
+  <body>
+    <button type="button">Open popup</button>
+    <script>
+      document.querySelector('button').addEventListener('click', () => {
+        const popup = window.open('about:blank');
+        if (popup !== null) {
+          popup.location.href = '/popup-target.html';
+        }
+      });
+    </script>
+  </body>
+</html>

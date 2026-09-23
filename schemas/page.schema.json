@@ -1,0 +1,146 @@
+{
+  "$id": "urn:beaksight:schema:page:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "pageId",
+    "pageUrl",
+    "status",
+    "evidence",
+    "findings",
+    "incompleteReasons"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "page-schema/1.0" },
+    "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+    "pageUrl": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["AUDITED", "PARTIAL", "SKIPPED", "FAILED"] },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "findings": { "type": "array", "items": { "$ref": "urn:beaksight:schema:finding:1.0" } },
+    "incompleteReasons": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidenceId", "type", "pageId", "viewport", "observedAt", "payload"],
+      "properties": {
+        "evidenceId": { "type": "string", "pattern": "^EV-[A-Z0-9_]+-[0-9]{6,}$" },
+        "type": { "enum": ["network", "console", "dom", "layout", "performance", "accessibility", "interaction", "screenshot", "metadata"] },
+        "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+        "viewport": { "type": "string", "minLength": 1 },
+        "observedAt": { "type": "string", "minLength": 1 },
+        "payload": true
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "type": { "const": "network" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["requestUrl", "status"],
+                  "properties": { "requestUrl": { "type": "string" }, "status": { "type": ["integer", "null"] } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "console" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["level", "message"],
+                  "properties": { "level": { "enum": ["ERROR", "WARN", "INFO"] }, "message": { "type": "string" } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "dom" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["title", "visibleText"],
+                  "properties": { "title": { "type": ["string", "null"] }, "visibleText": { "type": "string" } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "layout" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["condition", "affectedSelectors"],
+                  "properties": { "condition": { "type": "string" }, "affectedSelectors": { "type": "array", "items": { "type": "string" } } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "performance" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["metric", "value", "status"],
+                  "properties": { "metric": { "type": "string" }, "value": { "type": ["number", "null"] }, "status": { "enum": ["OBSERVED", "NOT_OBSERVED"] } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "accessibility" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["ruleId", "impact", "targetSelectors"],
+                  "properties": { "ruleId": { "type": "string" }, "impact": { "type": ["string", "null"] }, "targetSelectors": { "type": "array", "items": { "type": "string" } } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "interaction" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["candidateId", "status"],
+                  "properties": { "candidateId": { "type": "string" }, "status": { "enum": ["VERIFIED", "REJECTED_UNSAFE", "BLOCKED_BY_SAFETY", "NOT_VERIFIABLE", "EXECUTION_FAILED"] } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "screenshot" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["relativePath", "captureType"],
+                  "properties": { "relativePath": { "type": "string" }, "captureType": { "enum": ["VIEWPORT", "FULL_PAGE"] } }
+                }
+              }
+            },
+            {
+              "properties": {
+                "type": { "const": "metadata" },
+                "payload": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["source", "value"],
+                  "properties": { "source": { "type": "string" }, "value": { "type": "string" } }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

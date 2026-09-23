@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Download Button</title></head>
+  <body>
+    <a role="button" href="/__download" download>Direct download</a>
+    <button type="button">Attempt generated download</button>
+    <button type="button">Attempt HTTP download</button>
+    <script>
+      const buttons = document.querySelectorAll('button');
+      buttons[0].addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.href = 'data:text/plain,fixture-download';
+        link.download = 'fixture.txt';
+        link.click();
+      });
+      buttons[1].addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.href = '/__download';
+        link.download = 'fixture-http.txt';
+        link.click();
+      });
+    </script>
+  </body>
+</html>

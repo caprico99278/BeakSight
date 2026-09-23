@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Technical evidence fixture</title>
+  </head>
+  <body>
+    <h1>Technical evidence fixture</h1>
+    <img src="/__broken-image.png" alt="Deliberately broken fixture image">
+    <script>
+      console.warn('fixture console warning');
+      console.error('fixture duplicate error');
+      console.error('fixture duplicate error');
+      setTimeout(() => {
+        throw new Error('fixture uncaught exception');
+      }, 0);
+    </script>
+  </body>
+</html>

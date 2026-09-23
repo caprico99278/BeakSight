@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime audit output (may contain screenshots/data from real crawl targets)
+artifacts/
+beaksight-output/
+
+# Local-only environment: real target configs, machine-specific overrides.
+# Never commit customer-identifying configuration here.
+/local/*
+!/local/README.md
+
+# Leftover sandboxed git history / internal agent work history — not part of this repo.
+.git-sandbox-backup/
+.superpowers/sdd/
+
+# Claude Code local settings (machine-specific permissions, may contain local paths)
+.claude/settings.local.json
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.tmp
+*.temp
+*.swp
+*~

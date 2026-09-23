@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Accordion</title>
+  </head>
+  <body>
+    <button type="button" aria-expanded="false" aria-controls="accordion-panel">Toggle details</button>
+    <div id="accordion-panel" hidden>Expanded fixture content</div>
+    <div role="tab" aria-selected="false">Secondary tab</div>
+    <details><summary>Native summary</summary><p>Native details</p></details>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#accordion-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>
+

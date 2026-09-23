@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<body>
+  <button id="early" type="button" aria-controls="deep-controlled">Early candidate</button>
+  <div id="deep-chain-host" style="display:none">
+    <div id="deep-controlled"></div>
+  </div>
+  <section id="no-early-candidate"></section>
+  <section id="many-candidate-subtrees"></section>
+  <script>
+    const controlled = document.querySelector('#deep-controlled');
+    let parent = controlled;
+    for (let index = 0; index < 20000; index += 1) {
+      const wrapper = document.createElement('div');
+      parent.replaceWith(wrapper);
+      wrapper.append(parent);
+      parent = wrapper;
+    }
+    const empty = document.querySelector('#no-early-candidate');
+    for (let index = 0; index < 20000; index += 1) empty.append(document.createElement('div'));
+    const late = document.createElement('button');
+    late.type = 'button';
+    late.textContent = 'Candidate beyond budget';
+    empty.append(late);
+    const repeated = document.querySelector('#many-candidate-subtrees');
+    for (let candidateIndex = 0; candidateIndex < 100; candidateIndex += 1) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('aria-label', `Repeated candidate ${candidateIndex}`);
+      for (let nodeIndex = 0; nodeIndex < 512; nodeIndex += 1) button.append(document.createElement('span'));
+      repeated.append(button);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lazy content fixture</title>
+  <style>
+    body { margin: 0; }
+    main > section { box-sizing: border-box; min-height: 720px; padding: 24px; }
+    main > section:nth-child(odd) { background: #eef4ff; }
+    [data-lazy-batch] { box-sizing: border-box; min-height: 680px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <main id="content">
+    <section><h1>Lazy content fixture</h1></section>
+    <section><p>Initial content</p></section>
+  </main>
+  <script>
+    (() => {
+      const content = document.querySelector('#content');
+      let batches = 0;
+      let pending = false;
+      const appendNearBottom = () => {
+        if (pending || batches >= 3) return;
+        const remaining = document.documentElement.scrollHeight - (window.scrollY + window.innerHeight);
+        if (remaining > 180) return;
+        pending = true;
+        setTimeout(() => {
+          batches += 1;
+          const batch = document.createElement('section');
+          batch.dataset.lazyBatch = String(batches);
+          batch.textContent = `Lazy batch ${batches}`;
+          content.append(batch);
+          pending = false;
+          appendNearBottom();
+        }, 10);
+      };
+      addEventListener('scroll', appendNearBottom, { passive: true });
+    })();
+  </script>
+</body>
+</html>
