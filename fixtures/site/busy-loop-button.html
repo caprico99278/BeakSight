@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Busy Loop Button</title></head>
+  <body>
+    <button type="button">Start busy loop</button>
+    <script>
+      // クリックの後で、ページのメインスレッドを止める（品質レビュー Q1 の実測条件）。
+      document.querySelector('button').addEventListener('click', () => {
+        setTimeout(() => {
+          while (true) { /* busy loop */ }
+        }, 0);
+      });
+    </script>
+  </body>
+</html>

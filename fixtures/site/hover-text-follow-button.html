@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Hover Text Follow Button</title>
+  </head>
+  <body>
+    <button type="button" aria-pressed="true">Following</button>
+    <script>
+      // マウスが乗っている間は「Unfollow」、離れると「Following」を表示する。押すと aria-pressed が切り替わる。
+      const button = document.querySelector('button');
+      button.addEventListener('mouseenter', () => { button.textContent = 'Unfollow'; });
+      button.addEventListener('mouseleave', () => { button.textContent = 'Following'; });
+      button.addEventListener('click', () => {
+        button.setAttribute('aria-pressed', String(button.getAttribute('aria-pressed') !== 'true'));
+      });
+    </script>
+  </body>
+</html>

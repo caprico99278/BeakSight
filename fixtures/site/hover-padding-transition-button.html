@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Hover Padding Transition Button</title>
+    <style>
+      body { margin: 8px; }
+      /* マウスが乗ると、余白が時間をかけて広がる。ボタン自身は何もしない。 */
+      button { padding: 4px 8px; transition: padding 300ms linear; }
+      button:hover { padding: 16px 32px; }
+    </style>
+  </head>
+  <body>
+    <button type="button">Hover padding inert</button>
+  </body>
+</html>

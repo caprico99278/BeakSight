@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Links</title>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ1。壊した箇所: 404 になるページ（missing.html。このサーバにないパス）へのリンク → BROKEN_INTERNAL_LINK。
+      リンク先の missing.html（深さ2）は、HTTP_4XX になる。contrast.html と accessibility.html（深さ2）へもリンクする。
+    -->
+    <main>
+      <h1>Full crawl fixture links</h1>
+      <p>Depth 1.</p>
+      <ul>
+        <li><a href="/full-crawl/missing.html">Missing page (404)</a></li>
+        <li><a href="/full-crawl/contrast.html">Low contrast text</a></li>
+        <li><a href="/full-crawl/accessibility.html">Accessibility problem</a></li>
+        <li><a href="/full-crawl/index.html">Back to the start</a></li>
+      </ul>
+    </main>
+  </body>
+</html>

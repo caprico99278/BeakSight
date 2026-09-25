@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Self Growing Button</title>
+    <style>body { margin: 8px; }</style>
+  </head>
+  <body>
+    <button type="button">Grow me</button>
+    <script>
+      // 押すと、自分の幅と高さが広がる。位置（左上）は変わらない。
+      const button = document.querySelector('button');
+      button.addEventListener('click', () => {
+        button.style.width = '320px';
+        button.style.height = '80px';
+      });
+    </script>
+  </body>
+</html>

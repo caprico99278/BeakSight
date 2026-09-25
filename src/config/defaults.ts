@@ -1,6 +1,6 @@
-import type { AuditConfig } from './types.js';
+import type { AuditConfigDefaults } from './types.js';
 
-export const DEFAULT_CONFIG: AuditConfig = {
+export const DEFAULT_CONFIG: AuditConfigDefaults = {
   site: {
     startUrl: '',
     allowedOrigins: [],

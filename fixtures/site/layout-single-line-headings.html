@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>Single line headings fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.5; }
+      main { width: 400px; padding: 0 20px; }
+      section { margin: 0 0 24px; }
+      /*
+       * 高さが auto の overflow:hidden の1行の見出し（RT12r2 の I1）。行の高さが小さいので、行の矩形（フォントの内容領域）が、
+       * 箱の上と下に同じ量だけ出る。上下の合計は行の矩形の高さの4分の1を超えるが、片側ずつは超えない。これは見切れではない。
+       */
+      .single-line-heading {
+        width: 360px;
+        margin: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        font-family: Meiryo, "Noto Sans JP", "Segoe UI", sans-serif;
+        font-size: 32px;
+        font-weight: bold;
+      }
+      #heading-line-height-10 { line-height: 1.0; }
+      #heading-line-height-11 { line-height: 1.1; }
+      /* 見出しの横に線を引く形（overflow:hidden と ::after）。線は、箱の右に大きくはみ出して、切り取られる。 */
+      #heading-with-rule { line-height: 1.1; }
+      #heading-with-rule::after {
+        content: '';
+        display: inline-block;
+        width: 100%;
+        height: 1px;
+        margin-left: 12px;
+        margin-right: -100%;
+        vertical-align: middle;
+        background: #333;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h2 class="single-line-heading" id="heading-line-height-10">見出しの行の高さ</h2>
+      </section>
+      <section>
+        <h2 class="single-line-heading" id="heading-line-height-11">見出しの行の高さ</h2>
+      </section>
+      <section>
+        <h2 class="single-line-heading" id="heading-with-rule">線のある見出し</h2>
+      </section>
+    </main>
+  </body>
+</html>

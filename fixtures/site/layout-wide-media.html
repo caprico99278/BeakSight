@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Wide media fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; }
+      section { margin: 0 0 16px; }
+      /* スクロールする外枠のない、ビューポートより広い埋め込み。 */
+      iframe, video, canvas { display: block; width: 600px; height: 60px; border: 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <iframe id="wide-frame" title="Wide frame" srcdoc="<p>Framed content</p>"></iframe>
+      </section>
+      <section>
+        <video id="wide-video"></video>
+      </section>
+      <section>
+        <canvas id="wide-canvas" width="600" height="60"></canvas>
+      </section>
+    </main>
+  </body>
+</html>

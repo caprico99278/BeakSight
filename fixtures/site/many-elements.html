@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Many elements layout fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      .row { margin: 0; height: 20px; }
+    </style>
+  </head>
+  <body>
+    <script>
+      // `?count=N` の数だけ、body の直下に兄弟要素を並べる（兄弟の走査が最も長くなる形）。
+      // 先頭の数行だけがビューポートに入り、残りはビューポートの下の外に出る。
+      const requested = Number.parseInt(new URLSearchParams(location.search).get('count') ?? '', 10);
+      const count = Number.isSafeInteger(requested) && requested > 0 ? requested : 16000;
+      const fragment = document.createDocumentFragment();
+      for (let index = 0; index < count; index += 1) {
+        const row = document.createElement('p');
+        row.className = 'row';
+        row.textContent = `Row ${index}`;
+        fragment.append(row);
+      }
+      document.body.append(fragment);
+      document.currentScript?.remove();
+    </script>
+  </body>
+</html>

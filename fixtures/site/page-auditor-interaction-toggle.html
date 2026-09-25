@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Page Auditor interaction toggle fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Page Auditor interaction toggle fixture</h1>
+      <!-- Interaction の候補は、aria-expanded を切り替えるこのボタン1つだけ（P14d）。 -->
+      <button type="button" aria-expanded="false" aria-controls="toggle-panel">Toggle details</button>
+      <div id="toggle-panel" hidden>Expanded fixture content</div>
+    </main>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#toggle-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>

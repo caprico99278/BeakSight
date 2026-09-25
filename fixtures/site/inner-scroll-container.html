@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Inner scroll container fixture</title>
+  <style>
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; margin: 0; overflow: hidden; font-family: sans-serif; }
+    #app-shell { box-sizing: border-box; height: 100%; overflow-y: auto; }
+    #app-shell > section { box-sizing: border-box; min-height: 900px; padding: 24px; }
+    [data-lazy-batch] { box-sizing: border-box; min-height: 700px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <div id="app-shell">
+    <section><h1>Inner scroll container fixture</h1></section>
+    <section><p>Content inside an application shell that scrolls by itself.</p></section>
+  </div>
+  <script>
+    (() => {
+      const shell = document.querySelector('#app-shell');
+      let batches = 0;
+      let pending = false;
+      const appendNearBottom = () => {
+        if (pending || batches >= 2) return;
+        const remaining = shell.scrollHeight - (shell.scrollTop + shell.clientHeight);
+        if (remaining > 180) return;
+        pending = true;
+        setTimeout(() => {
+          batches += 1;
+          const batch = document.createElement('section');
+          batch.dataset.lazyBatch = String(batches);
+          batch.textContent = `Inner lazy batch ${batches}`;
+          shell.append(batch);
+          pending = false;
+          appendNearBottom();
+        }, 10);
+      };
+      shell.addEventListener('scroll', appendNearBottom, { passive: true });
+    })();
+  </script>
+</body>
+</html>

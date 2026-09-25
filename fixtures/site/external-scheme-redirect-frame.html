@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture External Scheme Redirect Frame</title></head>
+  <body>
+    <h1>Fixture External Scheme Redirect Frame</h1>
+    <script>
+      // iframe が、許可 Origin の `/__external-scheme-redirect?to=<名前>` を読む。サーバは `302 Location: <外部スキーム>` を返す
+      // （C18g。RC18a の指摘1、GATE-S03）。iframe は読み込みの間（HTML の解析の間）に加えるので、ページの読み込みに含まれる。
+      // - 宛先の名前はクエリの to で選ぶ（例: ?to=tel）。一覧にない値の場合は、iframe を加えない。
+      // - 宛先の URL は、サーバの中の固定の一覧（実在しないもの）だけで決まる。
+      const names = ['tel', 'mailto', 'custom'];
+      const to = new URLSearchParams(location.search).get('to');
+      if (names.includes(to)) {
+        const frame = document.createElement('iframe');
+        frame.title = 'External scheme redirect frame';
+        frame.src = `/__external-scheme-redirect?to=${to}`;
+        document.body.append(frame);
+      }
+    </script>
+  </body>
+</html>

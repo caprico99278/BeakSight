@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Element overlap fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; }
+      main { position: relative; width: 800px; height: 1400px; }
+      .abs { position: absolute; margin: 0; }
+      #colliding-heading { left: 20px; top: 20px; width: 300px; height: 40px; }
+      #colliding-paragraph { left: 40px; top: 40px; width: 300px; height: 40px; z-index: 2; overflow: hidden; }
+      #overlapping-image { left: 420px; top: 20px; width: 100px; height: 60px; }
+      #overlapped-button { left: 480px; top: 50px; width: 120px; height: 40px; }
+      #container-paragraph { left: 20px; top: 120px; width: 400px; height: 40px; }
+      #hidden-overlay { left: 20px; top: 120px; width: 400px; height: 40px; visibility: hidden; }
+      #zero-link { left: 20px; top: 120px; width: 0; height: 0; overflow: hidden; display: block; }
+      #separate-input { left: 20px; top: 200px; width: 200px; height: 30px; }
+      #far-heading { left: 20px; top: 1200px; width: 300px; height: 40px; }
+      #far-paragraph { left: 60px; top: 1220px; width: 300px; height: 40px; }
+      #consent-banner {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 800px;
+        height: 300px;
+        z-index: 50;
+        background: #333;
+        color: #fff;
+      }
+      #under-banner-link { left: 20px; top: 350px; width: 200px; height: 30px; display: block; }
+      #offscreen-sticky-free { left: 20px; top: 900px; width: 200px; height: 30px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h2 id="colliding-heading" class="abs">Colliding heading</h2>
+      <p id="colliding-paragraph" class="abs">Colliding paragraph text</p>
+      <img id="overlapping-image" class="abs" alt="Overlap sample" src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">
+      <button id="overlapped-button" class="abs" type="button">Overlapped</button>
+      <p id="container-paragraph" class="abs">Paragraph with <a id="nested-link" href="#nested">a nested link</a></p>
+      <p id="hidden-overlay" class="abs">Hidden overlay</p>
+      <a id="zero-link" class="abs" href="#zero">Zero</a>
+      <input id="separate-input" class="abs" type="text" aria-label="Separate">
+      <h3 id="far-heading" class="abs">Far heading</h3>
+      <p id="far-paragraph" class="abs">Far paragraph</p>
+      <a id="under-banner-link" class="abs" href="#under">Link under the banner</a>
+      <p id="offscreen-sticky-free" class="abs">Below the fold</p>
+    </main>
+    <div id="consent-banner">Consent banner</div>
+  </body>
+</html>

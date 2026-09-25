@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Late Flex Neighbor Button</title>
+    <style>
+      html, body { overflow-anchor: none; }
+      body { margin: 8px; }
+      #spacer { height: 2000px; }
+      /* flex の行。既定の align-items: stretch により、ボタンの高さは行の高さに合わせて伸びる。 */
+      .row { display: flex; }
+      #neighbor { width: 0; height: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="spacer"></div>
+    <div class="row">
+      <div id="neighbor"></div>
+      <button type="button">Flex neighbor inert</button>
+    </div>
+    <script>
+      // 遅延読み込みの画像の代わり: ボタンが画面に入ってから遅れて、同じ行の隣の要素が大きくなり、
+      // ボタンは右へずれ、高さが伸びる。通信を使わないので、凍結の後にも起きる。ボタン自身は何もしない。
+      const button = document.querySelector('button');
+      const neighbor = document.querySelector('#neighbor');
+      const observer = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        setTimeout(() => {
+          neighbor.style.width = '120px';
+          neighbor.style.height = '80px';
+        }, 400);
+      });
+      observer.observe(button);
+    </script>
+  </body>
+</html>

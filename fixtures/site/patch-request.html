@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Patch Request</title>
+  </head>
+  <body>
+    <h1>Fixture Patch Request</h1>
+    <button type="button" id="send-patch">Send PATCH</button>
+    <script>
+      // ボタンを押すと PATCH を送る（Task 18 の S02）。Interaction 中は、サーバに届いてはいけない。
+      document.querySelector('#send-patch').addEventListener('click', () => {
+        void fetch('/__mutation', { method: 'PATCH' }).catch(() => undefined);
+      });
+    </script>
+  </body>
+</html>

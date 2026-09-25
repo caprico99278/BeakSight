@@ -1,72 +1,57 @@
-export type InteractionHrefKind =
-  | 'NONE'
-  | 'SAME_ORIGIN_HTTP'
-  | 'EXTERNAL_ORIGIN_HTTP'
-  | 'SPECIAL_SCHEME'
-  | 'MALFORMED';
+import {
+  INTERACTION_HREF_KINDS,
+  type InteractionBoundingBoxEvidence,
+  type InteractionCandidateEvidence,
+  type InteractionHrefKindEvidence,
+  type InteractionRejectionReasonEvidence,
+} from '../core/evidence-types.js';
+import { isNonNegativeSafeInteger } from '../core/guards.js';
+import { isSha256Fingerprint } from '../core/ids.js';
+import { MAX_URL_LENGTH } from '../core/limits.js';
 
-export interface InteractionBoundingBox {
-  readonly x: number;
-  readonly y: number;
-  readonly width: number;
-  readonly height: number;
-  readonly top: number;
-  readonly right: number;
-  readonly bottom: number;
-  readonly left: number;
-}
+/** Interaction の候補の `href` の種類。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
+export type InteractionHrefKind = InteractionHrefKindEvidence;
 
-export interface InteractionCandidate {
-  readonly candidateId: string;
-  readonly ordinal: number;
-  readonly tagName: string;
-  readonly role: string | null;
-  readonly accessibleName: string;
-  readonly textFingerprint: string;
-  readonly ariaExpanded: string | null;
-  readonly ariaControls: string | null;
-  readonly ariaSelected: string | null;
-  readonly controlledVisible: boolean | null;
-  readonly controlledHidden: boolean | null;
-  readonly formAssociated: boolean;
-  readonly formMethod: string | null;
-  readonly formAction: string | null;
-  readonly href: string | null;
-  readonly hrefKind: InteractionHrefKind;
-  readonly download: boolean;
-  readonly type: string | null;
-  readonly disabled: boolean;
-  readonly visible: boolean;
-  readonly boundingBox: InteractionBoundingBox;
-}
+/** Interaction の候補の境界の矩形（ページ座標）。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
+export type InteractionBoundingBox = InteractionBoundingBoxEvidence;
+
+/** Interaction の候補の事実。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
+export type InteractionCandidate = InteractionCandidateEvidence;
 
 export const INTERACTION_CANDIDATE_LIMITS = Object.freeze({
   maxCandidates: 100,
   maxTextLength: 256,
   maxTextNodes: 512,
   maxAttributeLength: 512,
-  maxUrlLength: 2_048,
+  /**
+   * 対象自身の属性の記録で、class の値だけに使う上限（設計書 2026-09-23 4.4.1「長い class」、F20b）。
+   * Tailwind などで組んだボタンは、class が `maxAttributeLength` を超えることがあるためである。
+   * この上限でも切り詰められた可能性がある class の変化は、VERIFIED の根拠にしない（fail-closed）。
+   */
+  maxClassAttributeLength: 4_096,
+  maxUrlLength: MAX_URL_LENGTH,
   maxOrdinal: 99,
   maxDomWork: 16_384,
 });
 
-export type InteractionRejectionReason =
-  | 'SUBMISSION_CONTROL'
-  | 'RESET_CONTROL'
-  | 'FORM_ASSOCIATED'
-  | 'NAVIGATION_HREF'
-  | 'EXTERNAL_ACTION'
-  | 'DOWNLOAD'
-  | 'DISABLED'
-  | 'NOT_VISIBLE'
-  | 'MALFORMED_CANDIDATE';
+/**
+ * Interaction の候補を実行しない理由。閉じた一覧は `src/core/evidence-types.ts` の `INTERACTION_REJECTION_REASONS` に
+ * 1か所だけ置く（Safety の Evidence の `excludedInteractionCandidates` の理由と同じ型）。
+ */
+export type InteractionRejectionReason = InteractionRejectionReasonEvidence;
 
 export type InteractionAdmission =
   | { readonly action: 'ALLOW'; readonly reason: 'MECHANICALLY_SAFE' }
   | { readonly action: 'REJECT'; readonly reason: InteractionRejectionReason };
 
-const candidateIdPattern = /^interaction-candidate:sha256:[a-f0-9]{64}$/u;
-const fingerprintPattern = /^sha256:[a-f0-9]{64}$/u;
+/** Interaction候補IDの接頭辞。IDは `interaction-candidate:` の後に `sha256:` の書式（`src/core/ids.ts`）が続く。 */
+export const INTERACTION_CANDIDATE_ID_PREFIX = 'interaction-candidate:';
+
+function isInteractionCandidateId(value: unknown): boolean {
+  return typeof value === 'string'
+    && value.startsWith(INTERACTION_CANDIDATE_ID_PREFIX)
+    && isSha256Fingerprint(value.slice(INTERACTION_CANDIDATE_ID_PREFIX.length));
+}
 
 function boundedNullable(value: string | null, maxLength: number): boolean {
   return value === null || (typeof value === 'string' && value.length <= maxLength);
@@ -107,10 +92,9 @@ function validControlledState(
 function candidateIsWellFormed(candidate: InteractionCandidate): boolean {
   return candidate !== null
     && typeof candidate === 'object'
-    && candidateIdPattern.test(candidate.candidateId)
-    && fingerprintPattern.test(candidate.textFingerprint)
-    && Number.isSafeInteger(candidate.ordinal)
-    && candidate.ordinal >= 0
+    && isInteractionCandidateId(candidate.candidateId)
+    && isSha256Fingerprint(candidate.textFingerprint)
+    && isNonNegativeSafeInteger(candidate.ordinal)
     && candidate.ordinal <= INTERACTION_CANDIDATE_LIMITS.maxOrdinal
     && candidate.tagName.length > 0
     && candidate.tagName.length <= INTERACTION_CANDIDATE_LIMITS.maxAttributeLength
@@ -125,8 +109,7 @@ function candidateIsWellFormed(candidate: InteractionCandidate): boolean {
     && boundedNullable(candidate.formAction, INTERACTION_CANDIDATE_LIMITS.maxUrlLength)
     && boundedNullable(candidate.href, INTERACTION_CANDIDATE_LIMITS.maxUrlLength)
     && boundedNullable(candidate.type, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength)
-    && ['NONE', 'SAME_ORIGIN_HTTP', 'EXTERNAL_ORIGIN_HTTP', 'SPECIAL_SCHEME', 'MALFORMED']
-      .includes(candidate.hrefKind)
+    && (INTERACTION_HREF_KINDS as readonly string[]).includes(candidate.hrefKind)
     && typeof candidate.formAssociated === 'boolean'
     && typeof candidate.download === 'boolean'
     && typeof candidate.disabled === 'boolean'
@@ -136,14 +119,57 @@ function candidateIsWellFormed(candidate: InteractionCandidate): boolean {
     && validControlledState(candidate.ariaControls, candidate.controlledVisible, candidate.controlledHidden);
 }
 
+/** 例外を投げずに、候補が上限付きの契約を満たすかを判定する（null の boundingBox などの TypeError を契約違反として扱う）。 */
+function candidateSatisfiesContract(candidate: InteractionCandidate): boolean {
+  try {
+    return candidateIsWellFormed(candidate);
+  } catch {
+    return false;
+  }
+}
+
 export function freezeInteractionCandidate(candidate: InteractionCandidate): InteractionCandidate {
-  if (!candidateIsWellFormed(candidate)) {
+  if (!candidateSatisfiesContract(candidate)) {
     throw new Error('Interaction candidate is malformed or exceeds bounded contract');
   }
   return Object.freeze({
     ...candidate,
     boundingBox: Object.freeze({ ...candidate.boundingBox }),
   });
+}
+
+/**
+ * 除外した候補を Safety Ledger のどの記録に残すか（設計書 2026-09-23 4.6）。
+ * - `BLOCKED_EXTERNAL_ACTION`: 外部への作用（外部Origin、`tel:`・`mailto:` などの特殊scheme、ダウンロード）。
+ *   `blockedExternalActions` に残す。
+ * - `EXCLUDED_CANDIDATE`: 外部への作用ではないが、安全のため機械的に除外した候補（送信・リセット・フォーム関連・同一Originの遷移）。
+ *   `excludedInteractionCandidates` に残す。
+ * - `NONE`: 安全のための除外ではない（無効・不可視・不正な候補）。Ledger には残さない。
+ */
+export type InteractionRejectionLedgerRecord = 'BLOCKED_EXTERNAL_ACTION' | 'EXCLUDED_CANDIDATE' | 'NONE';
+
+const INTERACTION_REJECTION_LEDGER_RECORDS: Readonly<Record<InteractionRejectionReason, InteractionRejectionLedgerRecord>> =
+  Object.freeze({
+    SUBMISSION_CONTROL: 'EXCLUDED_CANDIDATE',
+    RESET_CONTROL: 'EXCLUDED_CANDIDATE',
+    FORM_ASSOCIATED: 'EXCLUDED_CANDIDATE',
+    NAVIGATION_HREF: 'EXCLUDED_CANDIDATE',
+    EXTERNAL_ACTION: 'BLOCKED_EXTERNAL_ACTION',
+    DOWNLOAD: 'BLOCKED_EXTERNAL_ACTION',
+    DISABLED: 'NONE',
+    NOT_VISIBLE: 'NONE',
+    MALFORMED_CANDIDATE: 'NONE',
+  });
+
+/**
+ * 除外理由の、Safety Ledger の記録先を返す。表にない理由（`constructor` などの、Object の既定のプロパティ名を含む）は、
+ * 記録先を決めずに `TypeError` を投げる（fail-closed。DEF-003）。
+ */
+export function interactionRejectionLedgerRecord(reason: InteractionRejectionReason): InteractionRejectionLedgerRecord {
+  if (typeof reason !== 'string' || !Object.hasOwn(INTERACTION_REJECTION_LEDGER_RECORDS, reason)) {
+    throw new TypeError('Interaction rejection reason has no Safety Ledger record');
+  }
+  return INTERACTION_REJECTION_LEDGER_RECORDS[reason];
 }
 
 function reject(reason: InteractionRejectionReason): InteractionAdmission {

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Text clipping lines fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.5; }
+      main { width: 400px; }
+      section { margin: 0 0 24px; }
+      /* 高さが auto の overflow:hidden の箱。行の高さが小さく、行の矩形（フォントの内容領域）だけが、箱の上下に少し出る。 */
+      #tight-line-box { width: 360px; margin: 0; overflow: hidden; font-family: Arial, sans-serif; font-size: 32px; line-height: 1; }
+      /* 行の高さ 24px の4行のテキストを、高さ 48px の箱に入れる。箱の下の境界は、2行目と3行目の間にある。 */
+      #two-of-four-lines { width: 200px; height: 48px; margin: 0; overflow: hidden; font-size: 16px; line-height: 24px; }
+      /* 縦にも横にも切り取るカルーセル。2枚目のスライドは横に隠れ、その行は箱の下まで続く。 */
+      #vertical-carousel { width: 300px; height: 60px; overflow: hidden; }
+      #vertical-carousel-track { display: flex; width: 900px; }
+      .vertical-slide { flex: 0 0 300px; margin: 0; font-size: 16px; line-height: 24px; }
+      /* 閉じたアコーディオンのパネル（高さ 0）。 */
+      #closed-panel { height: 0; overflow: hidden; }
+      #closed-panel p { margin: 0; font-size: 16px; line-height: 24px; }
+      /* 幅 300px の箱に、折り返さない1行（幅は約 380px）を入れる。行の一部（約 80px）だけが、箱の右に隠れる（RT12e）。 */
+      #partly-cut-line { width: 300px; margin: 0; overflow: hidden; white-space: nowrap; font-family: Arial, sans-serif; font-size: 16px; line-height: 24px; }
+      /* 幅 300px の箱の右端に寄せた1行を、負の margin で、箱の右に 2px だけ張り出させる（RT12e）。 */
+      #small-overhang { width: 300px; margin: 0; overflow: hidden; white-space: nowrap; text-align: right; font-size: 16px; line-height: 24px; }
+      #small-overhang span { margin-right: -2px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <p id="tight-line-box">Tight line text that wraps onto a second line</p>
+      </section>
+      <section>
+        <p id="two-of-four-lines">First visible line<br>Second visible line<br>Third hidden line<br>Fourth hidden line</p>
+      </section>
+      <section>
+        <div id="vertical-carousel">
+          <div id="vertical-carousel-track">
+            <p class="vertical-slide" id="vertical-slide-1">First slide</p>
+            <p class="vertical-slide" id="vertical-slide-2">Second slide line one<br>line two<br>line three<br>line four<br>line five</p>
+          </div>
+        </div>
+      </section>
+      <section>
+        <div id="closed-panel">
+          <p>Closed panel answer text</p>
+          <p>Another closed panel line</p>
+        </div>
+      </section>
+      <section>
+        <p id="partly-cut-line">This one line is partly hidden by the right edge of box</p>
+      </section>
+      <section>
+        <p id="small-overhang"><span>Overhang of two pixels</span></p>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Start</title>
+  </head>
+  <body>
+    <!--
+      T19a（Task 19 の設計書 4.1）: 本物の CLI で全体を監査する、専用の fixture のサイトの入口（深さ0）。
+      このサイトのページは、/full-crawl/ の下のページだけにリンクする。既存の fixture のページ（危険な操作を試すページ）には
+      リンクしない。外部の Origin への読み込み、外部スキーム、フォーム、ダウンロード、変更系のリクエストを持たない。
+      このページ自身には、壊した箇所を置かない。
+    -->
+    <main>
+      <h1>Full crawl fixture start</h1>
+      <p>Depth 0. The start page of the full crawl fixture.</p>
+      <ul>
+        <li><a href="/full-crawl/links.html">Links</a></li>
+        <li><a href="/full-crawl/technical.html">Technical problems</a></li>
+        <li><a href="/full-crawl/layout.html">Layout problem</a></li>
+        <li><a href="/full-crawl/control.html">Control page</a></li>
+      </ul>
+    </main>
+  </body>
+</html>

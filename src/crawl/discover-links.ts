@@ -1,47 +1,42 @@
 import type { Page } from 'playwright';
 import type { PageId } from '../core/contracts.js';
+import type { LinkAdmissionEvidence, LinkDiscoveryEvidence, LinkEvidence } from '../core/evidence-types.js';
+import { MAX_URL_LENGTH } from '../core/limits.js';
+import { normalizeWhitespace, truncateText } from '../core/text.js';
 import { classifyUrl, type AdmissionPolicy, type UrlAdmission } from './admission-policy.js';
-import { normalizeUrl, type NormalizedUrlResult } from './normalize-url.js';
+import { normalizeUrl, redactUrlCredentials, type NormalizedUrlResult } from './normalize-url.js';
 
-export interface LinkEvidence {
-  readonly sourcePageId: PageId;
-  readonly anchorText: string;
-  readonly ariaLabel: string | null;
-  readonly title: string | null;
-  readonly rawHref: string;
-  readonly normalized: NormalizedUrlResult;
-  readonly admission: UrlAdmission;
-}
+/** Link の Evidence の上限。超えた分は、件数（`omittedLinkCount`）か印（`truncated`）を Evidence に残す。 */
+export const LINK_LIMITS = Object.freeze({
+  /** 1ページで記録するリンク（`a[href]`）の最大件数。文書の順で、先頭から記録する。 */
+  maxLinks: 2_000,
+  /** `anchorText`・`ariaLabel`・`title` の最大長（UTF-16 のコード単位）。 */
+  maxTextLength: 1_024,
+  /** `rawHref`、`normalized` と `admission` の `rawUrl`、`scheme` の最大長。 */
+  maxUrlLength: MAX_URL_LENGTH,
+});
 
-/** リンク証跡用に注入するURLポリシー。省略した場合、探索範囲は現在のページOriginに限定される。 */
+/** リンク証跡用に注入するURLポリシー（必須。暗黙の受け入れ判定は持たない）。 */
 export interface LinkDiscoveryPolicy extends AdmissionPolicy {
   readonly allowedQueryParameters: ReadonlySet<string>;
 }
 
 interface ExtractedAnchor {
-  readonly anchorText: string;
+  readonly anchorText: string | null;
   readonly ariaLabel: string | null;
   readonly title: string | null;
   readonly rawHref: string;
   readonly baseUrl: string;
 }
 
-const normalizeAnchorText = (text: string | null): string => text?.replace(/\s+/gu, ' ').trim() ?? '';
+interface ExtractedAnchors {
+  /** 文書の中の `a[href]` の総数。 */
+  readonly totalCount: number;
+  /** 先頭から `LINK_LIMITS.maxLinks` 件までのアンカー。 */
+  readonly anchors: readonly ExtractedAnchor[];
+}
 
-const resolveDefaultPolicy = (pageUrl: string): LinkDiscoveryPolicy => {
-  try {
-    const currentPageUrl = new URL(pageUrl);
-    if (currentPageUrl.protocol !== 'http:' && currentPageUrl.protocol !== 'https:') {
-      return { allowedOrigins: new Set(), allowedQueryParameters: new Set() };
-    }
-    return {
-      allowedOrigins: new Set([currentPageUrl.origin]),
-      allowedQueryParameters: new Set(),
-    };
-  } catch {
-    return { allowedOrigins: new Set(), allowedQueryParameters: new Set() };
-  }
-};
+const normalizeAnchorText = (text: string | null): string => (text === null ? '' : normalizeWhitespace(text));
 
 const classifyRejectedNormalization = (
   normalized: Extract<NormalizedUrlResult, { readonly ok: false }>,
@@ -62,40 +57,92 @@ const classifyRejectedNormalization = (
 };
 
 /**
- * 本番で使用する唯一のアンカー抽出処理。証跡を返すのみであり、INTERNAL_NAVIGABLEの
- * 許可を巡回候補にするかどうかは呼び出し側が判断する。
+ * 1つのアンカーの Evidence を作る。認証情報は、切り詰める前の値で伏せ字にする（切り詰めで伏せ字が効かなくならないように）。
+ * 文字列は `LINK_LIMITS` までに切り詰め、切り詰めた場合は `truncated` を真にする。
+ * 正規化済みのURL（`normalized.url`、`admission.url`）は、正規化が `MAX_URL_LENGTH` を超えるものを受け入れないので、切り詰めない。
+ */
+const toLinkEvidence = (anchor: ExtractedAnchor, sourcePageId: PageId, policy: LinkDiscoveryPolicy): LinkEvidence => {
+  const normalized = normalizeUrl(anchor.rawHref, anchor.baseUrl, policy.allowedQueryParameters);
+  const admission = normalized.ok
+    ? classifyUrl(new URL(normalized.url), policy)
+    : classifyRejectedNormalization(normalized, anchor.baseUrl, policy);
+
+  let truncated = false;
+  const bound = (value: string, maxLength: number): string => {
+    const result = truncateText(value, maxLength);
+    truncated ||= result.truncated;
+    return result.text;
+  };
+  const boundNullable = (value: string | null, maxLength: number): string | null =>
+    (value === null ? null : bound(value, maxLength));
+  const boundAdmission = (value: LinkAdmissionEvidence): LinkAdmissionEvidence => {
+    switch (value.kind) {
+      case 'INTERNAL_NAVIGABLE':
+      case 'EXTERNAL_RECORD_ONLY':
+        return value;
+      case 'SPECIAL_SCHEME_RECORD_ONLY':
+        return {
+          ...value,
+          rawUrl: bound(value.rawUrl, LINK_LIMITS.maxUrlLength),
+          scheme: bound(value.scheme, LINK_LIMITS.maxUrlLength),
+        };
+      case 'REJECTED_INVALID':
+        return { ...value, rawUrl: bound(value.rawUrl, LINK_LIMITS.maxUrlLength) };
+    }
+  };
+
+  const anchorText = bound(normalizeAnchorText(anchor.anchorText), LINK_LIMITS.maxTextLength);
+  const ariaLabel = boundNullable(anchor.ariaLabel, LINK_LIMITS.maxTextLength);
+  const title = boundNullable(anchor.title, LINK_LIMITS.maxTextLength);
+  const rawHref = bound(redactUrlCredentials(anchor.rawHref, anchor.baseUrl), LINK_LIMITS.maxUrlLength);
+  const boundedNormalized: NormalizedUrlResult = normalized.ok
+    ? normalized
+    : { ...normalized, rawUrl: bound(normalized.rawUrl, LINK_LIMITS.maxUrlLength) };
+  const boundedAdmission = boundAdmission(admission);
+
+  return {
+    sourcePageId,
+    anchorText,
+    ariaLabel,
+    title,
+    rawHref,
+    normalized: boundedNormalized,
+    admission: boundedAdmission,
+    truncated,
+  };
+};
+
+/**
+ * 本番で使用する唯一のアンカー抽出処理（link の Evidence の payload を返す）。証跡を返すのみであり、
+ * INTERNAL_NAVIGABLEの許可を巡回候補にするかどうかは呼び出し側が判断する。
+ * 文書の順で先頭から `LINK_LIMITS.maxLinks` 件までを記録し、超えた件数を `omittedLinkCount` に残す。
+ * DOM の Evidence には、ここで得た結果（`links` と `omittedLinkCount`）をそのまま渡す（Link は1回だけ抽出する。ARCH03）。
+ * Link を抽出する入口は、この関数だけにする（実装タスク指示 4.2「No Parallel Entry Points」）。
  */
 export const discoverLinks = async (
   page: Page,
   sourcePageId: PageId,
-  policy?: LinkDiscoveryPolicy,
-): Promise<readonly LinkEvidence[]> => {
-  const resolvedPolicy = policy ?? resolveDefaultPolicy(page.url());
-  const anchors = await page.locator('a[href]').evaluateAll((elements) => elements.map((element) => {
-    const anchor = element as HTMLAnchorElement;
-    return {
-      anchorText: anchor.textContent,
-      ariaLabel: anchor.getAttribute('aria-label'),
-      title: anchor.getAttribute('title'),
-      rawHref: anchor.getAttribute('href') ?? '',
-      baseUrl: document.baseURI,
-    };
-  }));
+  policy: LinkDiscoveryPolicy,
+): Promise<LinkDiscoveryEvidence> => {
+  if (typeof policy !== 'object' || policy === null) {
+    throw new TypeError('discoverLinks requires an explicit link discovery policy');
+  }
+  const extracted = await page.locator('a[href]').evaluateAll((elements, maxLinks): ExtractedAnchors => ({
+    totalCount: elements.length,
+    anchors: elements.slice(0, maxLinks).map((element) => {
+      const anchor = element as HTMLAnchorElement;
+      return {
+        anchorText: anchor.textContent,
+        ariaLabel: anchor.getAttribute('aria-label'),
+        title: anchor.getAttribute('title'),
+        rawHref: anchor.getAttribute('href') ?? '',
+        baseUrl: document.baseURI,
+      };
+    }),
+  }), LINK_LIMITS.maxLinks);
 
-  return anchors.map((anchor): LinkEvidence => {
-    const normalized = normalizeUrl(anchor.rawHref, anchor.baseUrl, resolvedPolicy.allowedQueryParameters);
-    const admission = normalized.ok
-      ? classifyUrl(new URL(normalized.url), resolvedPolicy)
-      : classifyRejectedNormalization(normalized, anchor.baseUrl, resolvedPolicy);
-
-    return {
-      sourcePageId,
-      anchorText: normalizeAnchorText(anchor.anchorText),
-      ariaLabel: anchor.ariaLabel,
-      title: anchor.title,
-      rawHref: anchor.rawHref,
-      normalized,
-      admission,
-    };
-  });
+  return {
+    links: extracted.anchors.map((anchor) => toLinkEvidence(anchor, sourcePageId, policy)),
+    omittedLinkCount: Math.max(0, extracted.totalCount - extracted.anchors.length),
+  };
 };

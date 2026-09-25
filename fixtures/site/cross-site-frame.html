@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Cross-Site Frame</title></head>
+  <body>
+    <h1>Fixture Cross-Site Frame</h1>
+    <script>
+      // C18i（RC18b の N1）: 同じ fixture のサーバを、別のホスト名で読む iframe を加える。ホスト名は、`127.0.0.1` と `localhost` を
+      // 入れ替える（ポートは同じ）。別のサイトなので、`--site-per-process` の Chromium では、別のプロセスの iframe（OOPIF）になる。
+      // - iframe の中で読むパスは、クエリの src（`/` で始まる、このサーバの中のパス）で選ぶ。ホストとスキームは、ここで決める。
+      // - インターネット上のサイトは使わない。
+      const src = new URLSearchParams(location.search).get('src');
+      const otherHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      if (src !== null && src.startsWith('/')) {
+        const frame = document.createElement('iframe');
+        frame.title = 'Cross-site frame';
+        frame.src = `${location.protocol}//${otherHost}:${location.port}${src}`;
+        document.body.append(frame);
+      }
+    </script>
+  </body>
+</html>

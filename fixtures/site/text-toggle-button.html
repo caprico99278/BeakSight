@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Text Toggle Button</title>
+  </head>
+  <body>
+    <button type="button">Show more</button>
+    <script>
+      // 押すと、ボタンの文字が切り替わる。ボタン自身の属性は変わらない。
+      const button = document.querySelector('button');
+      button.addEventListener('click', () => {
+        button.textContent = button.textContent === 'Show more' ? 'Show less' : 'Show more';
+      });
+    </script>
+  </body>
+</html>

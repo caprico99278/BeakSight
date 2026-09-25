@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Non-Evidence Attribute Buttons</title>
+    <style>
+      .tooltip { position: fixed; right: 8px; bottom: 8px; padding: 4px; background: #222; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <button type="button" id="radix-tooltip" data-state="closed">Radix tooltip inert</button>
+    <button type="button" id="tippy-tooltip">Tippy tooltip inert</button>
+    <button type="button" id="aria-focus">React Aria focus inert</button>
+    <button type="button" id="radix-accordion" data-state="closed" aria-expanded="false" aria-controls="accordion-content">
+      Radix accordion toggle
+    </button>
+    <div id="accordion-content" role="region" hidden>Accordion content</div>
+    <button type="button" id="headless-ui">Headless UI inert</button>
+    <button type="button" id="mui-button" class="MuiButtonBase-root MuiButton-root">MUI focus visible inert</button>
+    <button type="button" id="long-class-focus">Long class focus visible inert</button>
+    <button type="button" id="long-class-toggle">Long class toggle</button>
+    <button type="button" id="huge-class-toggle">Huge class toggle</button>
+    <button type="button" id="huge-class-aria-toggle" aria-expanded="false">Huge class ARIA toggle</button>
+    <script>
+      // R7 の Important-1 の再現の形。どのボタンも、click では何もしない（accordion だけは開閉する）。
+      // 押したことで変わるのは、tooltip や入力の種類（hover、focus、pointer）を表す属性だけである。
+
+      /** tooltip の中身を、対象の外（body の末尾）に出し入れする。 */
+      function showTooltip(id, text) {
+        if (document.getElementById(id) !== null) return;
+        const tooltip = document.createElement('div');
+        tooltip.id = id;
+        tooltip.className = 'tooltip';
+        tooltip.setAttribute('role', 'tooltip');
+        tooltip.textContent = text;
+        document.body.append(tooltip);
+      }
+      function hideTooltip(id) {
+        document.getElementById(id)?.remove();
+      }
+
+      // Radix Tooltip の形: hover と focus で data-state="delayed-open" と aria-describedby が付き、pointerdown で閉じる。
+      // pointerdown の後は、focus で開き直さない。
+      const radix = document.querySelector('#radix-tooltip');
+      let radixPointerDown = false;
+      const openRadix = () => {
+        radix.setAttribute('data-state', 'delayed-open');
+        radix.setAttribute('aria-describedby', 'radix-tooltip-content');
+        showTooltip('radix-tooltip-content', 'Radix tooltip');
+      };
+      const closeRadix = () => {
+        radix.setAttribute('data-state', 'closed');
+        radix.removeAttribute('aria-describedby');
+        hideTooltip('radix-tooltip-content');
+      };
+      radix.addEventListener('pointerenter', openRadix);
+      radix.addEventListener('focus', () => { if (!radixPointerDown) openRadix(); });
+      radix.addEventListener('pointerdown', () => { radixPointerDown = true; closeRadix(); });
+      radix.addEventListener('pointerleave', closeRadix);
+
+      // tippy.js の形: mouseenter と focus で aria-describedby が付き、mousedown で外れる。
+      const tippy = document.querySelector('#tippy-tooltip');
+      const showTippy = () => {
+        tippy.setAttribute('aria-describedby', 'tippy-1');
+        showTooltip('tippy-1', 'Tippy tooltip');
+      };
+      const hideTippy = () => {
+        tippy.removeAttribute('aria-describedby');
+        hideTooltip('tippy-1');
+      };
+      tippy.addEventListener('mouseenter', showTippy);
+      tippy.addEventListener('focus', showTippy);
+      tippy.addEventListener('mousedown', hideTippy);
+      tippy.addEventListener('mouseleave', hideTippy);
+
+      // React Aria の形: pointer で操作する前にプログラムから focus すると data-focus-visible が付き、
+      // pointerdown で入力の種類が pointer に変わって外れる。押している間は data-pressed が付く。
+      const aria = document.querySelector('#aria-focus');
+      let modality = 'keyboard';
+      aria.addEventListener('pointerenter', () => aria.setAttribute('data-hovered', 'true'));
+      aria.addEventListener('pointerleave', () => aria.removeAttribute('data-hovered'));
+      aria.addEventListener('focus', () => {
+        aria.setAttribute('data-focused', 'true');
+        if (modality !== 'pointer') aria.setAttribute('data-focus-visible', 'true');
+      });
+      aria.addEventListener('blur', () => {
+        aria.removeAttribute('data-focused');
+        aria.removeAttribute('data-focus-visible');
+      });
+      aria.addEventListener('pointerdown', () => {
+        modality = 'pointer';
+        aria.removeAttribute('data-focus-visible');
+        aria.setAttribute('data-pressed', 'true');
+      });
+      aria.addEventListener('pointerup', () => aria.removeAttribute('data-pressed'));
+
+      // Headless UI v2 の形（R8 の Important-1）: hover・focus・押し下げの状態を、1つの属性 data-headlessui-state にまとめて出す。
+      // プログラムからの focus の後は "hover focus" になり、pointerdown で入力の種類が pointer に変わって focus が外れ、
+      // pointerup の後は "hover" のまま残る。
+      const headless = document.querySelector('#headless-ui');
+      const headlessState = { hover: false, focus: false, active: false };
+      const renderHeadless = () => {
+        const names = ['hover', 'focus', 'active'].filter((name) => headlessState[name]);
+        headless.setAttribute('data-headlessui-state', names.join(' '));
+      };
+      headless.addEventListener('pointerenter', () => { headlessState.hover = true; renderHeadless(); });
+      headless.addEventListener('pointerleave', () => { headlessState.hover = false; renderHeadless(); });
+      headless.addEventListener('focus', () => { headlessState.focus = true; renderHeadless(); });
+      headless.addEventListener('blur', () => { headlessState.focus = false; renderHeadless(); });
+      headless.addEventListener('pointerdown', () => {
+        headlessState.focus = false;
+        headlessState.active = true;
+        renderHeadless();
+      });
+      headless.addEventListener('pointerup', () => { headlessState.active = false; renderHeadless(); });
+      renderHeadless();
+
+      // MUI の形（R8 の Important-1）: キーボードやプログラムからの focus で Mui-focusVisible の class が付き、pointerdown で外れる。
+      const mui = document.querySelector('#mui-button');
+      let muiPointer = false;
+      mui.addEventListener('focus', () => { if (!muiPointer) mui.classList.add('Mui-focusVisible'); });
+      mui.addEventListener('blur', () => mui.classList.remove('Mui-focusVisible'));
+      mui.addEventListener('pointerdown', () => {
+        muiPointer = true;
+        mui.classList.remove('Mui-focusVisible');
+      });
+
+      // 長い class の形（F20 の発見事項。設計書 2026-09-23 4.4.1「長い class」）。Tailwind などで組んだボタンは、class が512文字を超える。
+      /** `minLength` 文字以上になるまで、ユーティリティの class の名前を並べる。 */
+      function utilityClasses(minLength) {
+        const names = [];
+        let length = 0;
+        for (let index = 0; length < minLength; index += 1) {
+          const name = `tw-utility-${index}`;
+          names.push(name);
+          length += name.length + 1;
+        }
+        return names.join(' ');
+      }
+      const LONG_UTILITIES = utilityClasses(600);
+      const HUGE_UTILITIES = utilityClasses(4200);
+
+      // class が約600文字の、何もしないボタン。MUI の clsx のように、focus の class を利用者の class の前に差し込む。
+      // プログラムからの focus で focus-visible が付き、pointerdown で入力の種類が pointer に変わって外れる。
+      const longFocus = document.querySelector('#long-class-focus');
+      let longFocusPointer = false;
+      const renderLongFocus = (focusVisible) => {
+        longFocus.className = `btn-base${focusVisible ? ' focus-visible' : ''} ${LONG_UTILITIES}`;
+      };
+      longFocus.addEventListener('focus', () => { if (!longFocusPointer) renderLongFocus(true); });
+      longFocus.addEventListener('blur', () => renderLongFocus(false));
+      longFocus.addEventListener('pointerdown', () => {
+        longFocusPointer = true;
+        renderLongFocus(false);
+      });
+      renderLongFocus(false);
+
+      // class が約600文字で、click で is-open の class を切り替えるトグル（classList.toggle なので、末尾に付く）。
+      const longToggle = document.querySelector('#long-class-toggle');
+      longToggle.className = `btn-base ${LONG_UTILITIES}`;
+      longToggle.addEventListener('click', () => longToggle.classList.toggle('is-open'));
+
+      // class が4096文字を超え、click で is-open の class を切り替えるトグル。ARIA の状態は持たない。
+      // is-open は先頭の近くに差し込むので、class 専用の上限で切り詰めた値でも、変化は見える。
+      const hugeToggle = document.querySelector('#huge-class-toggle');
+      let hugeOpen = false;
+      const renderHugeToggle = () => {
+        hugeToggle.className = `btn-base${hugeOpen ? ' is-open' : ''} ${HUGE_UTILITIES}`;
+      };
+      hugeToggle.addEventListener('click', () => {
+        hugeOpen = !hugeOpen;
+        renderHugeToggle();
+      });
+      renderHugeToggle();
+
+      // class が4096文字を超え、click で is-open の class と aria-expanded を一緒に切り替えるトグル。
+      const hugeAriaToggle = document.querySelector('#huge-class-aria-toggle');
+      let hugeAriaOpen = false;
+      const renderHugeAriaToggle = () => {
+        hugeAriaToggle.className = `btn-base${hugeAriaOpen ? ' is-open' : ''} ${HUGE_UTILITIES}`;
+        hugeAriaToggle.setAttribute('aria-expanded', String(hugeAriaOpen));
+      };
+      hugeAriaToggle.addEventListener('click', () => {
+        hugeAriaOpen = !hugeAriaOpen;
+        renderHugeAriaToggle();
+      });
+      renderHugeAriaToggle();
+
+      // Radix のアコーディオンの形: click で data-state と aria-expanded が一緒に変わり、aria-controls の先が開閉する。
+      const accordion = document.querySelector('#radix-accordion');
+      const content = document.querySelector('#accordion-content');
+      accordion.addEventListener('click', () => {
+        const open = accordion.getAttribute('aria-expanded') !== 'true';
+        accordion.setAttribute('aria-expanded', String(open));
+        accordion.setAttribute('data-state', open ? 'open' : 'closed');
+        content.hidden = !open;
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Short content fixture</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    main { box-sizing: border-box; padding: 24px; }
+    .box { box-sizing: border-box; height: 80px; margin-top: 8px; }
+    .box > div { height: 300px; }
+    #hidden-scroller { display: none; overflow-y: auto; }
+    #invisible-scroller { visibility: hidden; overflow-y: scroll; }
+    #clipped-box { overflow-y: hidden; }
+    #fitting-scroller { overflow-y: auto; }
+    #fitting-scroller > div { height: 40px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Short content fixture</h1>
+    <p>The whole document fits in the viewport.</p>
+    <div id="hidden-scroller" class="box"><div>Hidden scrollable content</div></div>
+    <div id="invisible-scroller" class="box"><div>Invisible scrollable content</div></div>
+    <div id="clipped-box" class="box"><div>Clipped content that cannot be scrolled by the user</div></div>
+    <div id="fitting-scroller" class="box"><div>Scrollable box whose content fits</div></div>
+  </main>
+</body>
+</html>
