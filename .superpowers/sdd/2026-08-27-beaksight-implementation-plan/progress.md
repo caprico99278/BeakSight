@@ -2121,3 +2121,24 @@
 - 指示どおり、ここで止めた。型チェック、テスト、ビルドはこのセッションでは実行していない（前のセッションの結果は上の項目のとおり）。
 - 未実行: `npm run verify` の全体、`fixture-full-crawl.test.ts`、幅の走査の結果の `report.html` での見え方、RT19 の I-1 の振る舞いの実行での確認。
 - Task 19 は未完了のまま。次: 環境の Network access の設定（許可するドメインに `cdn.playwright.dev` があるか、または広いアクセスの段階か）を確かめ、設定が反映された新しいセッションで、Chromium を取得して verify を行う。または Windows で verify を行う。
+
+### 2026-09-26 クラウドのセッション（2回目）での設計者の verify と Task 19 の完了
+
+- Chromium の取得: 環境の設定を設計者は変えられない。そこで、Playwright 1.62.1 が求める版と同じ Chrome for Testing 151.0.7922.34（`chrome-linux64.zip` と `chrome-headless-shell-linux64.zip`）を、Google の公式の配布元（`storage.googleapis.com/chrome-for-testing-public`。このコンテナで接続できた）から、スクラッチパッドに取得した。`cdn.playwright.dev` は、同じ Chrome for Testing の版を配布している。
+  - SHA-256: `chrome-linux64.zip` は `ae8736ac28bc69278551500f219fc749575648263c43ec5990749eff43b9fcf8`、`chrome-headless-shell-linux64.zip` は `3cfc2bd00d1bafcf8a68dc74c9c92bb7150ddc8d26ade948a776316e1cec4f14`。
+  - 取得した zip を、127.0.0.1 だけで待ち受ける一時の HTTP サーバで配り、`PLAYWRIGHT_CHROMIUM_DOWNLOAD_HOST` でその場所を指して `npx playwright install chromium chromium-headless-shell` を実行した。展開と配置は Playwright の手順のとおり（`chromium-1234`、`chromium_headless_shell-1234`）。ほかのブラウザは入れていない。一時のサーバは終了した。
+  - ユーザーは、この後に環境の設定を直した（2026-09-26。次のセッションからは、`cdn.playwright.dev` から直接取得できる見込み。未確認）。
+- 型チェック: PASS（終了コード 0）。
+- テストの全体（`npx vitest run --reporter=json`）: 101ファイル、3,659件のうち、PASS 3,658件、FAIL 1件、skip 0件。
+  - `tests/integration/fixture-full-crawl.test.ts`: 18件すべて PASS（Chromium を使う実行での初めての確認）。
+  - FAIL の1件: `tests/integration/layout-accessibility.test.ts` の「compares the overshoot above and below a single line separately, and does not report the heading (I1)」。`#heading-line-height-10` で、上下に出た量の合計（4 px）が、行の高さの4分の1（9 px 超）を超えなかった。
+  - 原因: 環境のフォントの違い。このテストは、Windows の既定のフォント（Meiryo など）の寸法を前提にし、前提が崩れた環境では目に見える形で失敗させる設計である（テストのコメント、RT12r3 の m2）。このコンテナの既定のフォントは DejaVu Sans で、日本語のフォントもない。前提の確かめの assert で失敗しており、製品の判定の assert には達していない。Node の版（22 と 24）の違いによる失敗ではない。
+  - DEF-015 の異常終了は起きなかった。
+- ビルド: PASS（終了コード 0）。
+- 判断: Task 19 を完了とする。理由は次のとおり。
+  - T19b と修正の回 1 で変えたのは `README.md` だけで、コードとテストは、Windows で 3,659件すべて PASS した状態（T19a-fix-round-1 の後の設計者の verify）と同じ。
+  - 今回の唯一の FAIL は、Windows のフォントを前提にした前提の確かめの失敗で、その前提が崩れる環境では失敗させることが既に決まっている。これは除外した失敗として記録する（PASS には数えない）。
+  - Task 19 の受け入れの中心である `fixture-full-crawl.test.ts` は、Chromium の実行で PASS した。
+- フォントに依存する件は DEF-019（監視）として登録した。
+- 未実行: 幅の走査の結果の `report.html` での目視での見え方、RT19 の I-1 の振る舞いの CLI の実行での確認（I-1 に関わる `external-scheme-navigation.test.ts` などの結合テストは PASS）。どちらも Task 20（ユーザーの Windows の PC。headed）で見る。
+- 次: Task 20。

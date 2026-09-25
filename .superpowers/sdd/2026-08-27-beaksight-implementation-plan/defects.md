@@ -304,3 +304,12 @@
 - 影響: Chromium のない環境で `tests/unit` を実行すると、このファイルだけ失敗する。製品の振る舞いへの影響はない。
 - 扱い: C8 を `tests/integration/` へ移すかどうかを、設計者が決めてから、サブタスクにする。テストを弱めたり削ったりはしない。
 - 実施の時期: 未定（ユーザーと相談）。
+
+## DEF-019 レイアウトの結合テストの1件が、Windows のフォントを前提にしていて、Linux のクラウドの環境で失敗する（監視の項目）
+
+- 発見: 2026-09-26。クラウドの環境（Linux、既定のフォントは DejaVu Sans、日本語のフォントなし）での設計者の verify で。
+- 現象: `tests/integration/layout-accessibility.test.ts` の「compares the overshoot above and below a single line separately, and does not report the heading (I1)」が、前提の確かめの assert（648 行付近）で失敗する。`#heading-line-height-10` の上下に出た量の合計が 4 px で、行の高さの4分の1を超えない。
+- 再現: Windows の既定のフォントがない環境で、`npx vitest run tests/integration/layout-accessibility.test.ts`。
+- 影響: 製品の振る舞いへの影響はない。Windows では PASS する。Windows 以外の環境で全体の verify を行うと、毎回この1件が失敗する。
+- 扱い: 今は直さない。テストは、前提が崩れた環境で skip にせず失敗させる設計である（RT12r3 の m2）。クラウドで verify を続けるなら、fixture で使うフォントを固定する（fixture に同梱した字形を使うなど）案を、設計者が検討してからサブタスクにする。テストを弱めたり skip にしたりはしない。
+- 実施の時期: 未定（ユーザーと相談）。
