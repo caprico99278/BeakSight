@@ -305,6 +305,28 @@ describe('CLI: --help', () => {
     expect(lines[helpLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS.help.description);
   });
 
+  // DEF-017（設計書 3.1、7章）: `--headed` と `--headless` の説明は、どちらも設定の browser.headed を上書きすることを書く。
+  it('describes both --headed and --headless as overriding browser.headed of the configuration', () => {
+    for (const option of ['headed', 'headless'] as const) {
+      const { description } = CLI_OPTION_DESCRIPTIONS[option];
+
+      expect(description, option).toContain('browser.headed');
+      expect(description, option).toContain('上書き');
+    }
+  });
+
+  it('lists --headless with its description among the options of the usage', () => {
+    const lines = invokeCli('--help').stdout.split('\n');
+    const optionsHeading = lines.indexOf(`${CLI_TEXT.usage.optionsHeading}:`);
+    const exitCodesHeading = lines.indexOf(`${CLI_TEXT.usage.exitCodesHeading}:`);
+    const headlessLine = lines.indexOf('  --headless');
+
+    expect(headlessLine).toBeGreaterThan(optionsHeading);
+    expect(headlessLine).toBeLessThan(exitCodesHeading);
+    expect(lines[headlessLine + 1]).toMatch(JAPANESE_CHARACTER);
+    expect(lines[headlessLine + 1]?.trim()).toBe(CLI_OPTION_DESCRIPTIONS.headless.description);
+  });
+
   it('still reports arguments that cannot be parsed as CONFIG_ERROR, even with --help', () => {
     const result = invokeCli('run', '--help', '--unknown-option');
 

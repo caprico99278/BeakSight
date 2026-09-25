@@ -319,3 +319,8 @@
 - 設計書 `2026-09-26-beaksight-post-task-19-defects-design.md` の 3.3 のとおり、直さない。
 - 理由: `npm run test:unit` の対象の `tests/component` の4ファイルも、もともと Chromium を起動する。`test:unit` は、ブラウザのない環境で動くことを約束していない。対象の describe を移すと、同じファイルの見本のデータ（約 800 行）の複製か、大きな切り出しが要る。Chromium を入れた環境では PASS する（2026-09-26 のクラウドの verify）。
 - 状態: 対応しない（理由付きで閉じる）。
+
+### DEF-017・DEF-019 の完了（2026-09-26）
+
+- DEF-017: 完了。`--headless` の説明に、設定の `browser.headed` を上書きすることを加えた。テストを2件加えた。
+- DEF-019: 完了。fixture の `@font-face` で行の縦の寸法を固定し、Linux の環境でも前提が成り立つようにした。クラウドの verify で全件 PASS。Windows での確認は未実行。

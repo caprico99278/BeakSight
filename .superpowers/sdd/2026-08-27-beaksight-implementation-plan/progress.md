@@ -2152,3 +2152,14 @@
   - DEF-018: 直さない（設計書 3.3）。台帳に理由を書いた。
   - DEF-016: Task 20 の結果を見てから決める（変更なし）。
 - DEF-017 と DEF-019 の実装者を並行で起動した（変えるファイルは重ならない）。指示書は `DEF-017-brief.md`、`DEF-019-brief.md`。
+
+### 2026-09-26 DEF-017・DEF-019 の完了と設計者の verify
+
+- DEF-017 が完了した。`CLI_OPTION_DESCRIPTIONS.headless.description` に「設定の browser.headed を上書きします。」を加えた。`tests/unit/cli.test.ts` にテストを2件加えた（説明の確かめは、変更の前に失敗し、変更の後に PASS）。
+- DEF-019 が完了した。`fixtures/site/layout-single-line-headings.html` に、`local()` の並びと寸法の指定の `@font-face` を加えた。テストの変更は前提のコメントだけ（assert は同じ）。RED（4 px が 9 px を超えない）から GREEN になった。
+- 実装者の報告は、会話の中で受け取った（ファイルには保存していない）。要旨はこの項目のとおり。
+- 設計者の確認: 変更したファイルは指示の4つだけ（`git status`、`git diff`）。テストの削除・弱体化・skip はない。
+- 設計者の verify（クラウド、Linux、Node 22、Chromium 1234）: 型チェック PASS。テストの全体は 101ファイル、3,661件すべて PASS（前回より 2件増えた。DEF-017 の追加分）。ビルド PASS。DEF-015 の異常終了は起きなかった。
+- DEF-017 と DEF-019 を完了にした。DEF-018 は対応しない（理由付き）。DEF-016 は Task 20 の後に決める。
+- 未実行: Windows での verify（DEF-019 の fixture は、Windows では Meiryo の字形に同じ寸法の指定がかかるので、これまでと同じ結果になる見込み。未確認）。Task 20 の前に、ユーザーの PC で `npm run verify` を行う。
+- 次: Task 20（ユーザーの Windows の PC。headed）。
