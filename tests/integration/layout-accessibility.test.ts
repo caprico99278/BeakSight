@@ -638,9 +638,10 @@ describe('layout evidence corrected after the RT12r2 review (I1, M1, M2)', () =>
         };
       }), ['#heading-line-height-10', '#heading-line-height-11', '#heading-with-rule']);
 
-      // 前提の注記（RT12r3 の m2）: このテストは、Windows の既定のフォント（Meiryo など）で、
-      // 上下に出た量の合計が、行の高さの4分の1を超えることを前提にしている。BeakSight は、Windows で使う前提である。
-      // 前提が崩れた環境では、skip にせず、次の前提の assert で目に見える形で失敗させる（skip にすると、誤りが隠れるため）。
+      // 前提の注記（RT12r3 の m2、DEF-019）: このテストは、上下に出た量の合計が、行の高さの4分の1を超えることを前提にしている。
+      // fixture の @font-face（ascent-override・descent-override・line-gap-override）で、行の縦の寸法を固定しているので、
+      // 環境のフォントによらず前提が成り立つ。local() のどのフォントもない環境では前提が崩れ、次の前提の assert で目に見える形で失敗する
+      // （skip にすると、誤りが隠れるため、skip にしない）。
       const ratio = LAYOUT_THRESHOLDS.clippedTextLineMinOutsideRatio;
       for (const heading of measured) {
         // 前提: 1行で、上下の出た量の合計は、行の矩形の高さの4分の1を超える（合計して比べると、誤って報告する形）。
