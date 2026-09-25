@@ -2098,3 +2098,18 @@
 
 - 型チェック PASS、全テスト 101ファイル、3,659件 PASS、ビルド PASS。DEF-015 の異常終了は起きなかった。
 - T19a を完了とする。次は T19b（README）。クラウドへ移す場合は、移した先で T19b を起動する。
+
+### 2026-09-26 クラウドのセッションでの T19b と RT19
+
+- クラウドの環境の確認:
+  - Node は v22.22.2（`engines` は 24）。`npm ci` を、ユーザーの承認を得て行った（lockfile のとおり。版の変更なし）。
+  - Playwright 1.62.1 の Chromium（revision 1234）がない（環境にあるのは 1194）。取得の承認を得たが、ネットワークの設定で `cdn.playwright.dev` が拒否された。ユーザーが許可のリストに加えた後も、このコンテナでは 403 のままだった（新しいセッションで有効になる見込み。未確認）。
+  - 設計者の verify（クラウド、Chromium なし）: 型チェック PASS、ビルド PASS。テストは 101ファイル、3,659件のうち、PASS 2,394件、失敗 72件、skip 1,193件。失敗の34ファイルは、どれも Chromium の実行ファイルがないことによる起動の失敗だった。期待値の不一致は、ブラウザの起動の失敗の結果として起きたものだけ。全体の `npm run verify` の PASS は未確認（Windows で行う）。DEF-015 の異常終了は起きなかった。
+- T19b（README の書き直し）が完了した。報告は `T19b-report.md`。指示書に「クラウドの環境での追補」を加えた（ブラウザを起動しない、PowerShell の表示は設計書 第7章を出どころにする）。
+- RT19（独立の確認）: Critical 0、Important 1、Minor 7。結果は `RT19-review.md`。
+  - I-1: headless でも、新しいウィンドウで外部スキームを開こうとすると `FRAME_CLASSIFICATION_FAILED` の違反になる。README が「headless では違反にしない」と断定していた。
+- T19b 修正の回 1: I-1、M-1〜M-7 を直した。報告は `T19b-fix-round-1-report.md`。設計者が確かめたこと: 変更は `README.md` だけ。README の URL は `https://example.com` だけ。I-1 の記述がコードと設計書 4.2.1 に合う。
+- 発見事項の登録: DEF-017（`--headless` の説明の不足）、DEF-018（単体テストの置き場所のテストが Chromium を起動する）。共通化の候補の新規はなし。共通部品台帳への新規の部品はなし（更新履歴だけ加えた）。
+- ユーザーの指示（2026-09-26）: クラウドの環境では、設計者がコミットとプッシュをしてよい。`.claude/hooks/block-git-commit-push.mjs` を、`CLAUDE_CODE_REMOTE=true` のときは止めないように変え、`settings.json` の Bash の deny を外した。`SKILL.md` 第2章に例外を書いた。実装者とレビュー担当には、これまでどおり禁止する。
+- 未実行: `npm run verify` の全体、`fixture-full-crawl.test.ts`、幅の走査の結果の `report.html` での見え方、I-1 の振る舞いの実行での確認。Chromium のある環境（Windows、または Chromium を取得できる新しいクラウドのセッション）で行う。
+- 次: Chromium のある環境で verify を行い、Task 19 を完了とする。その後、Task 20（ユーザーの Windows の PC。headed）。

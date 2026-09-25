@@ -1,8 +1,14 @@
 // PreToolUse フック: git commit / git push を含むコマンドの実行を拒否する。
 // メインエージェント・サブエージェントの両方に適用される。
 // 対象: Bash、PowerShell、Desktop Commander の start_process / interact_with_process。
+// 例外: クラウドの環境（環境変数 CLAUDE_CODE_REMOTE が "true"）では止めない（2026-09-25 ユーザー指示）。
+//   クラウドのコンテナはセッションの終了で消え、ユーザーがそこでコミットできないため。
 
 import { readFileSync } from 'node:fs';
+
+if (process.env.CLAUDE_CODE_REMOTE === 'true') {
+  process.exit(0);
+}
 
 const input = JSON.parse(readFileSync(0, 'utf8'));
 const toolInput = input.tool_input ?? {};
