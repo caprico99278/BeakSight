@@ -2142,3 +2142,13 @@
 - フォントに依存する件は DEF-019（監視）として登録した。
 - 未実行: 幅の走査の結果の `report.html` での目視での見え方、RT19 の I-1 の振る舞いの CLI の実行での確認（I-1 に関わる `external-scheme-navigation.test.ts` などの結合テストは PASS）。どちらも Task 20（ユーザーの Windows の PC。headed）で見る。
 - 次: Task 20。
+
+### 2026-09-26 Task 19 の後の不具合の修正の設計と起動
+
+- ユーザーの指示（2026-09-26）: このクラウドのセッションで進められる範囲で進める。Task 20・21 は実サイトに接続するので、ここでは行わない。
+- 設計書 `doc/design/2026-09-26-beaksight-post-task-19-defects-design.md` と実装計画を書いた。
+  - DEF-017: `--headless` の説明に、設定の `browser.headed` を上書きすることを書く。
+  - DEF-019: 1行の見出しの fixture に、`local()` の並びと `ascent-override: 106%`・`descent-override: 44%`・`line-gap-override: 0%` の `@font-face` を使い、行の縦の寸法を環境のフォントによらず固定する。設計者の実験（DejaVu Sans）で、テストの前提が成り立つことを確かめた（設計書 3.2 の表）。
+  - DEF-018: 直さない（設計書 3.3）。台帳に理由を書いた。
+  - DEF-016: Task 20 の結果を見てから決める（変更なし）。
+- DEF-017 と DEF-019 の実装者を並行で起動した（変えるファイルは重ならない）。指示書は `DEF-017-brief.md`、`DEF-019-brief.md`。
