@@ -394,7 +394,7 @@ export const CLI_OPTION_DESCRIPTIONS = deepFreeze({
   },
   headless: {
     valueName: null,
-    description: 'ブラウザの画面を表示せずに実行します。--headed と同時には指定できません。',
+    description: 'ブラウザの画面を表示せずに実行します。設定の browser.headed を上書きします。--headed と同時には指定できません。',
   },
   help: {
     valueName: null,

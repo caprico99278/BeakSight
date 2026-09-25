@@ -9,6 +9,18 @@
       main { width: 400px; padding: 0 20px; }
       section { margin: 0 0 24px; }
       /*
+       * 見出しの行の縦の寸法を固定する（DEF-019）。字形は、環境にある一般的なフォントを local() で使うが、
+       * ascent・descent・line-gap を指定して、行の矩形（フォントの内容領域）の高さを、環境のフォントによらず、
+       * フォントの大きさの 1.5 倍にする。106% と 44% は、これまで前提にしてきた Meiryo の寸法（約 1.06 と約 0.44）に合わせた値である。
+       */
+      @font-face {
+        font-family: "BeakSight Fixture Heading";
+        src: local("Meiryo"), local("Yu Gothic"), local("Noto Sans JP"), local("Segoe UI"), local("DejaVu Sans"), local("Liberation Sans"), local("Arial");
+        ascent-override: 106%;
+        descent-override: 44%;
+        line-gap-override: 0%;
+      }
+      /*
        * 高さが auto の overflow:hidden の1行の見出し（RT12r2 の I1）。行の高さが小さいので、行の矩形（フォントの内容領域）が、
        * 箱の上と下に同じ量だけ出る。上下の合計は行の矩形の高さの4分の1を超えるが、片側ずつは超えない。これは見切れではない。
        */
@@ -17,7 +29,7 @@
         margin: 0;
         overflow: hidden;
         white-space: nowrap;
-        font-family: Meiryo, "Noto Sans JP", "Segoe UI", sans-serif;
+        font-family: "BeakSight Fixture Heading", sans-serif;
         font-size: 32px;
         font-weight: bold;
       }
