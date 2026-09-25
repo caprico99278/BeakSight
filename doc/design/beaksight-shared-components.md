@@ -176,3 +176,4 @@ Guard（`src/safety/passive-request-guard.ts`）は、Guard の終了処理を�
 | 2026-09-23 | C1〜C8、F04、F05、DEF-001、DEF-001b で新設・移動した共通部品を登録。2.1 に、Guard の付いた Context で使うライブラリの注意を加えた |
 | 2026-09-23 | F06〜F12 で新設した共通部品を登録。2.2 に、値の一覧（enum）の置き場所と一致の検査を加えた |
 | 2026-09-23 | F13: Evidence の ID の接頭辞をスキーマの分岐ごとに限り、`ids.ts` との一致をテストで確かめるようにした。DOM の Evidence の文書の項目の切り詰めを、項目ごとの印（`DomDocumentFieldTruncationEvidence`）にした |
+| 2026-09-26 | Task 19（fixture の全体の監査と README）: 新しい共通部品はなし。README は、この台帳の部品（終了コード表、表示カタログ、既定値）を出どころにして書いた |
