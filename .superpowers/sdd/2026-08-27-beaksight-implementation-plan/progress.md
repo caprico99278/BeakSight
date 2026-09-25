@@ -2113,3 +2113,11 @@
 - ユーザーの指示（2026-09-26）: クラウドの環境では、設計者がコミットとプッシュをしてよい。`.claude/hooks/block-git-commit-push.mjs` を、`CLAUDE_CODE_REMOTE=true` のときは止めないように変え、`settings.json` の Bash の deny を外した。`SKILL.md` 第2章に例外を書いた。実装者とレビュー担当には、これまでどおり禁止する。
 - 未実行: `npm run verify` の全体、`fixture-full-crawl.test.ts`、幅の走査の結果の `report.html` での見え方、I-1 の振る舞いの実行での確認。Chromium のある環境（Windows、または Chromium を取得できる新しいクラウドのセッション）で行う。
 - 次: Chromium のある環境で verify を行い、Task 19 を完了とする。その後、Task 20（ユーザーの Windows の PC。headed）。
+
+### 2026-09-26 クラウドのセッション（2回目）での Chromium の取得の失敗（Task 19 は未完了）
+
+- `npm ci` を行った（lockfile のとおり。版の変更なし。Node は v22.22.2）。
+- `npx playwright install chromium chromium-headless-shell` は失敗した。`cdn.playwright.dev` への接続が、環境のネットワークの方針で 403 で拒否された（`request blocked: no rule or allowlist entry allows host "cdn.playwright.dev"`）。予備の `playwright.download.prss.microsoft.com` も 403 だった。プロキシの状態でも、両方のホストが `connect_rejected` と記録された。ユーザーが許可のリストに加えた設定は、このセッションのコンテナには反映されていない。
+- 指示どおり、ここで止めた。型チェック、テスト、ビルドはこのセッションでは実行していない（前のセッションの結果は上の項目のとおり）。
+- 未実行: `npm run verify` の全体、`fixture-full-crawl.test.ts`、幅の走査の結果の `report.html` での見え方、RT19 の I-1 の振る舞いの実行での確認。
+- Task 19 は未完了のまま。次: 環境の Network access の設定（許可するドメインに `cdn.playwright.dev` があるか、または広いアクセスの段階か）を確かめ、設定が反映された新しいセッションで、Chromium を取得して verify を行う。または Windows で verify を行う。
