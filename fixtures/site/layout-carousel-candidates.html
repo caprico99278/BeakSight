@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Carousels before a wide image fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 400px; }
+      section { margin: 0 0 16px; }
+      img { display: block; }
+      /* 横にスライドするカルーセル。2枚目以降は、overflow:hidden の外枠で切り取られる。 */
+      .carousel { width: 400px; height: 120px; overflow: hidden; }
+      .carousel-track { display: flex; width: 4800px; }
+      .slide { flex: 0 0 400px; height: 120px; }
+      .slide img { width: 400px; height: 40px; }
+      .slide h3, .slide p { margin: 0; font-size: 16px; }
+      /* カルーセルの後にある、本当に横へはみ出す、固定の幅の画像。 */
+      #late-wide-image { width: 600px; height: 40px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section><div class="carousel" id="carousel-a"><div class="carousel-track"></div></div></section>
+      <section><div class="carousel" id="carousel-b"><div class="carousel-track"></div></div></section>
+      <script>
+        // 12枚のスライドを、2つのカルーセルに置く。スライドごとに、リンク・画像・見出し・段落・リンクを持つ。
+        // 2枚目以降のスライドの要素は、どれも横にはみ出す候補になる（1つのカルーセルで 11 × 6 個と外枠の中の track）。
+        const pixel = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+        for (const track of document.querySelectorAll('.carousel-track')) {
+          for (let index = 1; index <= 12; index += 1) {
+            const slide = document.createElement('div');
+            slide.className = 'slide';
+            slide.innerHTML = `<a href="#slide-${index}"><img alt="Slide ${index}" src="${pixel}"></a>`
+              + `<h3>Slide ${index}</h3><p>Slide caption ${index}</p><a href="#more-${index}">More</a>`;
+            track.append(slide);
+          }
+        }
+        document.currentScript?.remove();
+      </script>
+      <section>
+        <img id="late-wide-image" alt="Late wide image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+      </section>
+    </main>
+  </body>
+</html>

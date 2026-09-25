@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Scroll locked fixture</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #tall-content { box-sizing: border-box; height: 3000px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <main id="tall-content"><h1>Page script returns every scroll to the top</h1></main>
+  <script>
+    addEventListener('scroll', () => {
+      if (window.scrollY !== 0) {
+        window.scrollTo(0, 0);
+      }
+    }, { passive: true });
+  </script>
+</body>
+</html>

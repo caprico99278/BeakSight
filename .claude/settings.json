@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "PowerShell(git commit *)",
+      "PowerShell(git push *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|mcp__plugin_desktop-commander_desktop-commander__start_process|mcp__plugin_desktop-commander_desktop-commander__interact_with_process",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-git-commit-push.mjs\"",
+            "timeout": 10,
+            "statusMessage": "git commit / push の禁止を確認中"
+          }
+        ]
+      }
+    ]
+  }
+}

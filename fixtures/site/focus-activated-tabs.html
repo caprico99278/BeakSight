@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Focus Activated Tabs</title>
+  </head>
+  <body>
+    <div role="tablist" aria-label="Automatic tabs" data-activation="automatic">
+      <button type="button" role="tab" id="auto-tab-1" aria-selected="true" aria-controls="auto-panel-1" tabindex="0">Auto first tab</button>
+      <button type="button" role="tab" id="auto-tab-2" aria-selected="false" aria-controls="auto-panel-2" tabindex="-1">Auto second tab</button>
+    </div>
+    <div role="tabpanel" id="auto-panel-1" aria-labelledby="auto-tab-1">Auto first panel</div>
+    <div role="tabpanel" id="auto-panel-2" aria-labelledby="auto-tab-2" hidden>Auto second panel</div>
+
+    <div role="tablist" aria-label="Manual tabs" data-activation="manual">
+      <button type="button" role="tab" id="manual-tab-1" aria-selected="true" aria-controls="manual-panel-1" tabindex="0">Manual first tab</button>
+      <button type="button" role="tab" id="manual-tab-2" aria-selected="false" aria-controls="manual-panel-2" tabindex="-1">Manual second tab</button>
+    </div>
+    <div role="tabpanel" id="manual-panel-1" aria-labelledby="manual-tab-1">Manual first panel</div>
+    <div role="tabpanel" id="manual-panel-2" aria-labelledby="manual-tab-2" hidden>Manual second panel</div>
+
+    <button type="button" id="focus-disclosure" aria-expanded="false" aria-controls="focus-disclosure-panel">Focus disclosure</button>
+    <div id="focus-disclosure-panel" hidden>Focus disclosure panel</div>
+    <script>
+      // R8 の Important-2 の再現の形。
+      /** タブの並びの中で `tab` を選び、ほかのタブを選ばない状態にし、aria-controls の先の表示を切り替える。 */
+      function select(tablist, tab) {
+        for (const other of tablist.querySelectorAll('[role="tab"]')) {
+          const selected = other === tab;
+          other.setAttribute('aria-selected', String(selected));
+          other.setAttribute('tabindex', selected ? '0' : '-1');
+          document.getElementById(other.getAttribute('aria-controls')).hidden = !selected;
+        }
+      }
+
+      // 自動で切り替わる形（WAI-ARIA APG の「選択が focus に従う」。Radix や shadcn の既定）: focus だけで選ばれる。
+      // focus の間は、focus を表す class が付く（R8 の Important-1 の決まりで、根拠から外れる）。
+      for (const tablist of document.querySelectorAll('[role="tablist"]')) {
+        const automatic = tablist.dataset.activation === 'automatic';
+        for (const tab of tablist.querySelectorAll('[role="tab"]')) {
+          tab.addEventListener('focus', () => {
+            tab.classList.add('is-focused');
+            if (automatic) select(tablist, tab);
+          });
+          tab.addEventListener('blur', () => tab.classList.remove('is-focused'));
+          // 手動で切り替わる形: click（Enter・Space を含む）でだけ選ばれる。自動の形も、click で選ばれる。
+          tab.addEventListener('click', () => select(tablist, tab));
+        }
+      }
+
+      // role を持たないのに、focus で開くボタン。click でも開閉する。
+      const disclosure = document.querySelector('#focus-disclosure');
+      const disclosurePanel = document.querySelector('#focus-disclosure-panel');
+      const setDisclosure = (open) => {
+        disclosure.setAttribute('aria-expanded', String(open));
+        disclosurePanel.hidden = !open;
+      };
+      disclosure.addEventListener('focus', () => setDisclosure(true));
+      disclosure.addEventListener('click', () => setDisclosure(disclosure.getAttribute('aria-expanded') !== 'true'));
+    </script>
+
+    <!--
+      R9 の Important-1 の再現の形（F21）。下準備で focus をしない tab では、focus や mousedown で変わる属性が、click の後の差に出る。
+      上の script は、読み込みの時点までにある tablist だけに処理を付けるので、ここから下の tablist には付かない。
+    -->
+    <div role="tablist" aria-label="Radix automatic tabs" data-roving-activation="automatic">
+      <button type="button" role="tab" id="radix-auto-tab-1" aria-selected="true" aria-controls="radix-auto-panel-1" data-state="active" tabindex="-1">Radix auto first tab</button>
+      <button type="button" role="tab" id="radix-auto-tab-2" aria-selected="false" aria-controls="radix-auto-panel-2" data-state="inactive" tabindex="-1">Radix auto second tab</button>
+    </div>
+    <div role="tabpanel" id="radix-auto-panel-1" data-state="active">Radix auto first panel</div>
+    <div role="tabpanel" id="radix-auto-panel-2" data-state="inactive" hidden>Radix auto second panel</div>
+
+    <div role="tablist" aria-label="Radix manual tabs" data-roving-activation="manual">
+      <button type="button" role="tab" id="radix-manual-tab-1" aria-selected="true" aria-controls="radix-manual-panel-1" data-state="active" tabindex="-1">Radix manual first tab</button>
+      <button type="button" role="tab" id="radix-manual-tab-2" aria-selected="false" aria-controls="radix-manual-panel-2" data-state="inactive" tabindex="-1">Radix manual second tab</button>
+    </div>
+    <div role="tabpanel" id="radix-manual-panel-1" data-state="active">Radix manual first panel</div>
+    <div role="tabpanel" id="radix-manual-panel-2" data-state="inactive" hidden>Radix manual second panel</div>
+
+    <div role="tablist" aria-label="Focused attribute tabs" data-focus-marker="attribute">
+      <button type="button" role="tab" id="focused-tab-1" aria-selected="true" aria-controls="focused-panel-1" tabindex="0">Focused attribute first tab</button>
+      <button type="button" role="tab" id="focused-tab-2" aria-selected="false" aria-controls="focused-panel-2" tabindex="0">Focused attribute second tab</button>
+    </div>
+    <div role="tabpanel" id="focused-panel-1">Focused attribute first panel</div>
+    <div role="tabpanel" id="focused-panel-2" hidden>Focused attribute second panel</div>
+
+    <div role="tablist" aria-label="Box shadow tabs" data-focus-marker="box-shadow">
+      <button type="button" role="tab" id="shadow-tab-1" aria-selected="true" aria-controls="shadow-panel-1" tabindex="0">Box shadow first tab</button>
+      <button type="button" role="tab" id="shadow-tab-2" aria-selected="false" aria-controls="shadow-panel-2" tabindex="0">Box shadow second tab</button>
+    </div>
+    <div role="tabpanel" id="shadow-panel-1">Box shadow first panel</div>
+    <div role="tabpanel" id="shadow-panel-2" hidden>Box shadow second panel</div>
+
+    <!-- role を持たない要素の属性の変化は、引き続き根拠にする（F21）。 -->
+    <button type="button" id="plain-active-toggle">Plain active toggle</button>
+    <button type="button" id="plain-open-toggle">Plain open toggle</button>
+    <script>
+      /** タブの並びの中で `tab` を選び、aria-selected・data-state と aria-controls の先の表示を切り替える。tabindex は変えない。 */
+      function selectTab(tablist, tab) {
+        for (const other of tablist.querySelectorAll('[role="tab"]')) {
+          const selected = other === tab;
+          other.setAttribute('aria-selected', String(selected));
+          if (other.hasAttribute('data-state')) other.setAttribute('data-state', selected ? 'active' : 'inactive');
+          const panel = document.getElementById(other.getAttribute('aria-controls'));
+          panel.hidden = !selected;
+          if (panel.hasAttribute('data-state')) panel.setAttribute('data-state', selected ? 'active' : 'inactive');
+        }
+      }
+
+      // Radix の形の roving tabindex: 初めはどのトリガーも tabindex="-1"（tab stop がまだない）。focus と mousedown で、
+      // そのトリガーを tab stop（tabindex="0"）にする。選ばれているタブを押しても、tabindex だけが変わる。
+      // Radix の Tabs は、自動と手動のどちらでも mousedown で選ぶ。自動の形は、focus でも選ぶ。
+      for (const tablist of document.querySelectorAll('[role="tablist"][data-roving-activation]')) {
+        const automatic = tablist.dataset.rovingActivation === 'automatic';
+        for (const tab of tablist.querySelectorAll('[role="tab"]')) {
+          const makeTabStop = () => {
+            for (const other of tablist.querySelectorAll('[role="tab"]')) {
+              other.setAttribute('tabindex', other === tab ? '0' : '-1');
+            }
+          };
+          tab.addEventListener('focus', () => {
+            makeTabStop();
+            if (automatic) selectTab(tablist, tab);
+          });
+          tab.addEventListener('mousedown', (event) => {
+            if (event.button !== 0) return;
+            makeTabStop();
+            selectTab(tablist, tab);
+          });
+        }
+      }
+
+      // focus で変わる、data- の付かない属性（Vaadin の `focused`）と、inline の style（box-shadow）。click で選ぶ。
+      for (const tablist of document.querySelectorAll('[role="tablist"][data-focus-marker]')) {
+        const marker = tablist.dataset.focusMarker;
+        for (const tab of tablist.querySelectorAll('[role="tab"]')) {
+          tab.addEventListener('focus', () => {
+            if (marker === 'attribute') tab.setAttribute('focused', '');
+            else tab.style.boxShadow = '0 0 0 2px rgb(0, 0, 255)';
+          });
+          tab.addEventListener('blur', () => {
+            if (marker === 'attribute') tab.removeAttribute('focused');
+            else tab.style.boxShadow = '';
+          });
+          tab.addEventListener('click', () => selectTab(tablist, tab));
+        }
+      }
+
+      // role を持たない、class だけを切り替えるボタン（`.active` のトグルと、aria-pressed のない class のトグル）。
+      const activeToggle = document.querySelector('#plain-active-toggle');
+      activeToggle.addEventListener('click', () => activeToggle.classList.toggle('active'));
+      const openToggle = document.querySelector('#plain-open-toggle');
+      openToggle.addEventListener('click', () => openToggle.classList.toggle('is-open'));
+    </script>
+  </body>
+</html>

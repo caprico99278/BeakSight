@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Hover Intent Class Button</title>
+  </head>
+  <body>
+    <button type="button">Hover intent inert</button>
+    <script>
+      // マウスが乗ってから150ms後に（hover intent）、自分に class を付ける。click では何もしない。
+      const button = document.querySelector('button');
+      button.addEventListener('mouseenter', () => {
+        setTimeout(() => button.classList.add('intent'), 150);
+      });
+    </script>
+  </body>
+</html>

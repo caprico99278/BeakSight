@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Body overflow-x hidden fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; overflow-x: hidden; font-family: sans-serif; }
+      main { width: 100%; }
+      img { display: block; }
+      /* 画面の端まで広げる装飾。body の overflow-x:hidden で切り取られる。 */
+      #bleed-image { width: 600px; height: 60px; margin-left: -40px; }
+      #bleed-heading { width: 560px; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img id="bleed-image" alt="Decorative bleed" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+      <h2 id="bleed-heading">Heading wider than the viewport</h2>
+      <p>Ordinary paragraph inside the page.</p>
+    </main>
+  </body>
+</html>

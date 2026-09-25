@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Self-Navigating Frame</title></head>
+  <body>
+    <h1>Fixture Self-Navigating Frame</h1>
+    <button id="navigate-top" type="button">Navigate top</button>
+    <script>
+      // C18i（RC18b の N1）: iframe の中のページが、読み込みの後に、自分で移動する。`cross-site-frame.html` の iframe で読むと、
+      // 別のプロセスの iframe（OOPIF）の中で始まる移動になる。
+      // - 宛先は、クエリの to（固定の一覧の名前）で選ぶ。一覧にない値の場合は、移動しない。
+      //   - tel、mailto、custom: `/__external-scheme-redirect?to=<名前>`（サーバが `302 Location: <外部スキーム>` を返す。宛先は、
+      //     サーバの中の固定の一覧の、実在しないものだけ）
+      //   - slow: `/__slow-redirect`（サーバが1.5秒待ってから、同じ Origin の `/navigation-target.html` へ 302 を返す）
+      //   - post-form: `/__mutation` への POST の form の送信（ページの移動）
+      // - ボタン「Navigate top」は、一番上の frame を、この iframe の Origin の `/navigation-target.html` に移動させる（利用者の操作が要る）。
+      const destinations = {
+        tel: '/__external-scheme-redirect?to=tel',
+        mailto: '/__external-scheme-redirect?to=mailto',
+        custom: '/__external-scheme-redirect?to=custom',
+        slow: '/__slow-redirect',
+      };
+      const to = new URLSearchParams(location.search).get('to');
+      window.addEventListener('load', () => {
+        if (to !== null && Object.hasOwn(destinations, to)) {
+          location.href = destinations[to];
+        } else if (to === 'post-form') {
+          const form = document.createElement('form');
+          form.method = 'post';
+          form.action = '/__mutation';
+          document.body.append(form);
+          form.submit();
+        }
+      });
+      document.getElementById('navigate-top').addEventListener('click', () => {
+        window.top.location.href = `${location.origin}/navigation-target.html`;
+      });
+    </script>
+  </body>
+</html>

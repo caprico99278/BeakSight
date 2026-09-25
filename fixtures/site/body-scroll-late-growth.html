@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Body scroll with late growth fixture</title>
+  <style>
+    /*
+     * R'2 の I-1 の再現条件。body の余白は既定（8px）のまま。
+     * 最初は文書だけが余白の分（16px）スクロールでき、body はスクロールできない。
+     * 150ms 後に body の中身が伸びて、body のほうが大きくスクロールできるようになる。
+     */
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; overflow: auto; font-family: sans-serif; }
+    #late-content { height: 10px; }
+  </style>
+</head>
+<body>
+  <div id="late-content"></div>
+  <script>
+    setTimeout(() => {
+      const content = document.getElementById('late-content');
+      content.style.height = '5000px';
+      content.dataset.grown = 'true';
+    }, 150);
+  </script>
+</body>
+</html>

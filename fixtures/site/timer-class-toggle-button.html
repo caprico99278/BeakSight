@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Timer Class Toggle Button</title>
+  </head>
+  <body>
+    <button type="button">Timer class toggle</button>
+    <script>
+      // 300ms ごとに、タイマーで自分の class の "pulse" を切り替える（R6 の M-2）。
+      // 押すと、別の class の名前 "active" を切り替える。
+      const button = document.querySelector('button');
+      setInterval(() => {
+        button.classList.toggle('pulse');
+      }, 300);
+      button.addEventListener('click', () => {
+        button.classList.toggle('active');
+      });
+    </script>
+  </body>
+</html>

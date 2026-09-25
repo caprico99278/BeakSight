@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture External Scheme Button</title></head>
+  <body>
+    <h1>Fixture External Scheme Button</h1>
+    <button type="button">Open external application</button>
+    <script>
+      // ボタンの click で、外部スキームへ移動する（C18b。DEF-012、GATE-S03 の Interaction の段階）。
+      // - Interaction の候補の方針で拒否されないように、href を持たない button の click の処理で移動する。
+      // - スキームはクエリの to で選ぶ（例: ?to=mailto）。宛先は、下の一覧の、実在しないものだけである。
+      // - 押されるまでは、何もしない。一覧にない値の場合は、押しても何もしない。
+      const destinations = {
+        tel: 'tel:+10000000000',
+        mailto: 'mailto:nobody@example.invalid',
+        custom: 'beaksight-test-app:probe',
+      };
+      const to = new URLSearchParams(location.search).get('to');
+      document.querySelector('button').addEventListener('click', () => {
+        if (Object.hasOwn(destinations, to)) {
+          location.href = destinations[to];
+        }
+      });
+    </script>
+  </body>
+</html>

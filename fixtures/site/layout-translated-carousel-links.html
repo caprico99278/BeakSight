@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Translated carousel links fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      main { position: relative; width: 800px; }
+      /* 幅 600px の箱に、左へ 1200px 動かしたトラックを置き、スライドを4枚並べる（RT12r3 の m1）。 */
+      #carousel { width: 600px; height: 200px; overflow: hidden; }
+      #carousel-track { display: flex; width: 2400px; height: 200px; transform: translate3d(-1200px, 0, 0); }
+      .slide { position: relative; flex: 0 0 600px; height: 200px; }
+      /* リンクは block で、子はすべて absolute なので、リンクの高さは 0 になる。 */
+      .slide a { display: block; }
+      .slide img { position: absolute; left: 0; top: 0; width: 600px; height: 200px; }
+      .slide span { position: absolute; left: 16px; bottom: 16px; width: 200px; height: 24px; }
+      /* 文書の左の外に丸ごと置いて、画面から隠すテキスト（対照。ビューポートの中にあるリンク）。 */
+      #offscreen-label-holder { margin: 24px 0 0 40px; }
+      .offscreen-left { position: absolute; left: -9999px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="carousel">
+        <div id="carousel-track">
+          <div class="slide">
+            <a id="slide-link-1" href="#slide-1"><img alt="Slide 1" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><span>Slide 1</span></a>
+          </div>
+          <div class="slide">
+            <a id="slide-link-2" href="#slide-2"><img alt="Slide 2" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><span>Slide 2</span></a>
+          </div>
+          <div class="slide">
+            <a id="slide-link-3" href="#slide-3"><img alt="Slide 3" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><span>Slide 3</span></a>
+          </div>
+          <div class="slide">
+            <a id="slide-link-4" href="#slide-4"><img alt="Slide 4" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><span>Slide 4</span></a>
+          </div>
+        </div>
+      </div>
+      <section id="offscreen-label-holder">
+        <a id="offscreen-label-link" href="#skip" style="display: block;"><span class="offscreen-left">Skip to the content</span></a>
+      </section>
+    </main>
+  </body>
+</html>

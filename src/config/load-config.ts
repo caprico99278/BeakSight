@@ -1,5 +1,11 @@
 import { readdir, readFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import type { Dirent } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { safeErrorMessage } from '../core/errors.js';
+import { isRecord } from '../core/guards.js';
+import { deepFreeze } from '../core/immutable.js';
+import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import { ConfigError } from './config-error.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import type { AuditConfig, AuditConfigOverrides } from './types.js';
 import { validateConfig } from './validate-config.js';
@@ -12,8 +18,6 @@ interface TargetConfig {
   };
   readonly [section: string]: unknown;
 }
-
-const isRecord = (value: unknown): value is UnknownRecord => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const deepMerge = (base: unknown, addition: unknown): unknown => {
   if (addition === undefined) {
@@ -36,33 +40,63 @@ const deepMerge = (base: unknown, addition: unknown): unknown => {
   return merged;
 };
 
-const deepFreeze = <T>(value: T): T => {
-  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) {
-      deepFreeze(child);
-    }
-    Object.freeze(value);
+/** 例外の文（技術的な詳細）。 */
+const errorDetail = (error: unknown): string => safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH);
+
+const isFileNotFound = (error: unknown): boolean => isRecord(error) && error.code === 'ENOENT';
+
+/**
+ * 設定のファイルかディレクトリの入出力の失敗を、`ConfigError` にする。ない場合は `CONFIG_FILE_NOT_FOUND`、ほかの失敗
+ * （ディレクトリである、権限がない、など）は `CONFIG_FILE_UNREADABLE`。
+ */
+const configInputError = (subject: string, path: string, error: unknown): ConfigError => {
+  if (isFileNotFound(error)) {
+    const message = `${subject} not found: ${path}`;
+    return new ConfigError('CONFIG_FILE_NOT_FOUND', message, [message], { cause: error });
   }
-  return value;
+  const message = `cannot read the ${subject}: ${path}`;
+  return new ConfigError('CONFIG_FILE_UNREADABLE', message, [message, errorDetail(error)], { cause: error });
 };
 
+/** UTF-8 の BOM（U+FEFF）。 */
+const BYTE_ORDER_MARK = '\uFEFF';
+
+/**
+ * 先頭の UTF-8 の BOM を、1つだけ取り除く（Task 14〜17 の設計書 第7章、R17 の指摘4）。Windows PowerShell 5.1 は、既定で BOM を付けて書くため。
+ * 2つ目以降の BOM と、先頭以外の BOM は、そのまま残す（JSON として読めなければ、`CONFIG_JSON_INVALID` になる）。
+ */
+const withoutByteOrderMark = (contents: string): string =>
+  contents.startsWith(BYTE_ORDER_MARK) ? contents.slice(BYTE_ORDER_MARK.length) : contents;
+
 const readTargetConfig = async (path: string): Promise<TargetConfig> => {
-  const contents = await readFile(path, 'utf8');
+  let contents: string;
+  try {
+    contents = await readFile(path, 'utf8');
+  } catch (error) {
+    throw configInputError('target configuration', path, error);
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(contents);
-  } catch {
-    throw new Error(`target configuration is not valid JSON: ${path}`);
+    parsed = JSON.parse(withoutByteOrderMark(contents));
+  } catch (error) {
+    const message = `target configuration is not valid JSON: ${path}`;
+    throw new ConfigError('CONFIG_JSON_INVALID', message, [message, errorDetail(error)], { cause: error });
   }
 
   if (!isRecord(parsed) || !isRecord(parsed.target) || typeof parsed.target.id !== 'string' || parsed.target.id.length === 0) {
-    throw new Error(`target configuration requires a non-empty target.id: ${path}`);
+    const message = `target configuration requires a non-empty target.id: ${path}`;
+    throw new ConfigError('TARGET_ID_MISSING', message, [message]);
   }
   return parsed as TargetConfig;
 };
 
 const listTargetConfigPaths = async (directory: string): Promise<readonly string[]> => {
-  const entries = await readdir(directory, { withFileTypes: true });
+  let entries: readonly Dirent[];
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    throw configInputError('target configuration directory', directory, error);
+  }
   const files = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
     .map((entry) => resolve(directory, entry.name));
@@ -77,18 +111,14 @@ const isWithinDirectory = (path: string, directory: string): boolean => {
   return pathFromDirectory !== '..' && !pathFromDirectory.startsWith(`..${sep}`) && !isAbsolute(pathFromDirectory);
 };
 
-const selectTargetConfigPath = async (path: string | undefined, directory: string): Promise<string> => {
-  if (path !== undefined) {
-    return resolve(path);
-  }
-
+const selectCanonicalTargetConfigPath = async (directory: string): Promise<string> => {
   const targetPaths = await listTargetConfigPaths(directory);
-  if (targetPaths.length !== 1) {
-    throw new Error('expected exactly one target configuration; pass --config to select one');
-  }
   const targetPath = targetPaths[0];
-  if (targetPath === undefined) {
-    throw new Error('no target configuration found');
+  if (targetPaths.length !== 1 || targetPath === undefined) {
+    throw new ConfigError('TARGET_NOT_SELECTED', 'expected exactly one target configuration; pass --config to select one', [
+      `found ${targetPaths.length} target configurations in ${directory}`,
+      ...targetPaths,
+    ]);
   }
   return targetPath;
 };
@@ -99,26 +129,35 @@ const verifyUniqueTargetIds = async (directory: string): Promise<void> => {
   for (const targetPath of targetPaths) {
     const targetConfig = await readTargetConfig(targetPath);
     if (seenIds.has(targetConfig.target.id)) {
-      throw new Error(`duplicate target.id: ${targetConfig.target.id}`);
+      const message = `duplicate target.id: ${targetConfig.target.id}`;
+      throw new ConfigError('TARGET_ID_DUPLICATED', message, [message, targetPath]);
     }
     seenIds.add(targetConfig.target.id);
   }
 };
 
+/**
+ * 対象の設定ファイルを読み、既定値と上書きを合わせて検証した、不変な設定を返す。
+ *
+ * - `path` を省略した場合と、`path` が `config/targets/` 配下の場合は、`config/targets/` 配下の
+ *   `target.id` の一意性を確かめる。
+ * - `path` が `config/targets/` の外の場合は、そのファイルだけを読む（ほかの JSON は読まない）。
+ * - 設定の誤り（ファイルがない・読めない、JSON として読めない、`target.id` がない・重なる、対象が1つに決まらない、検証のエラー）は、
+ *   `ConfigError`（種類のコードと、英語の技術的な詳細の一覧）を投げる（Task 14〜17 の設計書 6.1.5）。
+ */
 export const loadConfig = async (path?: string, overrides?: AuditConfigOverrides): Promise<AuditConfig> => {
   const canonicalTargetDirectory = resolve(process.cwd(), 'config', 'targets');
   const resolvedPath = path === undefined ? undefined : resolve(path);
-  const directory = resolvedPath !== undefined && !isWithinDirectory(resolvedPath, canonicalTargetDirectory)
-    ? dirname(resolvedPath)
-    : canonicalTargetDirectory;
-  await verifyUniqueTargetIds(directory);
-  const targetPath = await selectTargetConfigPath(resolvedPath, directory);
+  if (resolvedPath === undefined || isWithinDirectory(resolvedPath, canonicalTargetDirectory)) {
+    await verifyUniqueTargetIds(canonicalTargetDirectory);
+  }
+  const targetPath = resolvedPath ?? await selectCanonicalTargetConfigPath(canonicalTargetDirectory);
   const targetConfig = await readTargetConfig(targetPath);
-  const { target: _target, ...policy } = targetConfig;
-  const merged = deepMerge(deepMerge(DEFAULT_CONFIG, policy), overrides);
+  const merged = deepMerge(deepMerge(DEFAULT_CONFIG, targetConfig), overrides);
   const validation = validateConfig(merged);
   if (!validation.ok) {
-    throw new Error(`invalid configuration: ${validation.errors.join('; ')}`);
+    throw new ConfigError('CONFIG_INVALID', `invalid configuration: ${validation.errors.join('; ')}`, validation.errors);
   }
-  return deepFreeze(validation.value);
+  // 既定値や呼び出し側の上書きと参照を共有しないよう、複製してから凍結する。
+  return deepFreeze(structuredClone(validation.value));
 };

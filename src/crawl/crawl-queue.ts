@@ -1,3 +1,4 @@
+import { isNonNegativeSafeInteger } from '../core/guards.js';
 import type { NormalizedHttpUrl } from './normalize-url.js';
 
 export interface CrawlCandidate {
@@ -11,7 +12,7 @@ export class CrawlQueue {
   readonly #seenUrls = new Set<string>();
 
   enqueue(candidate: CrawlCandidate): boolean {
-    if (!Number.isSafeInteger(candidate.depth) || candidate.depth < 0) {
+    if (!isNonNegativeSafeInteger(candidate.depth)) {
       return false;
     }
 

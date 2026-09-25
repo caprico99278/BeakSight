@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Layout rule cases fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 1.25; }
+      main { width: 400px; }
+      section { margin: 0 0 24px; }
+      img { display: block; }
+      /* 横にスライドするカルーセル。2枚目以降は、overflow:hidden の外枠で切り取られる。 */
+      #carousel { width: 400px; height: 120px; overflow: hidden; }
+      #carousel-track { display: flex; width: 1200px; }
+      .slide { flex: 0 0 400px; height: 120px; }
+      .slide img { width: 400px; height: 80px; }
+      .slide p { margin: 0; }
+      /* 横にスクロールできる表。 */
+      #table-scroller { width: 400px; overflow-x: auto; }
+      #scroll-table { width: 900px; border-collapse: collapse; table-layout: fixed; }
+      #scroll-table td { width: 300px; padding: 0; }
+      #scroll-table a { display: inline-block; width: 280px; }
+      /* 画像を拡大するカード（hover の状態を、そのまま固定した）。 */
+      #zoom-card { width: 300px; height: 200px; overflow: hidden; }
+      #zoom-card img { width: 300px; height: 150px; transform: scale(1.2); }
+      #zoom-card p { margin: 0; }
+      /* 本当に横へはみ出す、固定の幅の画像。 */
+      #fixed-width-image { width: 600px; height: 40px; }
+      /* 本当にテキストが切れている箱。 */
+      #clipped-caption { width: 120px; height: 24px; margin: 0; white-space: nowrap; overflow: hidden; }
+      /* float の画像だけを包むリンクと、absolute の子だけを包むリンク。 */
+      #float-image-link img { float: left; width: 100px; height: 60px; }
+      #absolute-child-holder { position: relative; height: 40px; }
+      #absolute-child-link span { position: absolute; left: 0; top: 0; width: 120px; height: 32px; }
+      /* 本当に中身がない、大きさ0のボタン。 */
+      #empty-button { width: 0; height: 0; padding: 0; border: 0; }
+      .clearfix::after { content: ''; display: block; clear: both; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <div id="carousel">
+          <div id="carousel-track">
+            <div class="slide" id="slide-1">
+              <img alt="Slide one" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+              <p>First slide caption</p>
+            </div>
+            <div class="slide" id="slide-2">
+              <img alt="Slide two" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+              <p>Second slide caption</p>
+            </div>
+            <div class="slide" id="slide-3">
+              <img alt="Slide three" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+              <p>Third slide caption</p>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section>
+        <div id="table-scroller">
+          <table id="scroll-table">
+            <tbody>
+              <tr>
+                <td><a id="scroll-cell-link-1" href="#cell-1">First cell link</a></td>
+                <td><a id="scroll-cell-link-2" href="#cell-2">Second cell link</a></td>
+                <td><a id="scroll-cell-link-3" href="#cell-3">Third cell link</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <div id="zoom-card">
+          <img alt="Zoomed card image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+          <p>Card caption under a zoomed image</p>
+        </div>
+      </section>
+      <section>
+        <img id="fixed-width-image" alt="Fixed width image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+      </section>
+      <section>
+        <p id="clipped-caption">This caption is really cut by its narrow box.</p>
+      </section>
+      <section class="clearfix">
+        <a id="float-image-link" href="#float"><img alt="Floated image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></a>
+      </section>
+      <section id="absolute-child-holder">
+        <a id="absolute-child-link" href="#absolute"><span>Absolute label</span></a>
+      </section>
+      <section>
+        <button id="empty-button" type="button"></button>
+      </section>
+    </main>
+  </body>
+</html>

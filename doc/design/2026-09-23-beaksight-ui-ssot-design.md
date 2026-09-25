@@ -100,7 +100,7 @@ src/cli（exit-codes、messages を使って出力）
 src/config（設定エラーの文言に messages を使う）
 ```
 
-- `src/presentation/**` が import してよいのは `src/core/**` と `src/config/types.ts` だけです。ブラウザ、安全判定、クロール、Rule評価のモジュールには依存しません。表示の定義が、監査の処理の内部構造に引きずられないようにするためです。
+- `src/presentation/**` が import してよいのは `src/core/**` と `src/config/types.ts` だけです。`src/presentation/` の中どうしの import（例: `format.ts` が `messages.ts` の日本語の単位を使う）は、同じ表示の層の中なので許されます（2026-09-24 U16a の判断を設計者が承認。責務の分け方は変えていない）。ブラウザ、安全判定、クロール、Rule評価のモジュールには依存しません。表示の定義が、監査の処理の内部構造に引きずられないようにするためです。
 - `src/report/html-report.ts` は、`html-components.ts` の部品を組み合わせるだけにします。HTMLのタグを含む文字列を直接書きません。
 - `src/report/chatgpt-bundle.ts` と CLI の結果表示は、`view-model.ts` が組み立てた表示用モデルを使います。件数の集計をやり直しません。
 

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Control</title>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ1。対照のページ。壊した箇所を持たない。
+      安全に確かめられる Interaction の候補として、aria-expanded を切り替えて、隠した内容を開閉するボタンを1つ置く。
+      ボタンは、ページの中の表示を変えるだけで、リクエストもナビゲーションもしない。
+    -->
+    <main>
+      <h1>Full crawl fixture control page</h1>
+      <p>Depth 1. This page has no deliberate problem.</p>
+      <button type="button" aria-expanded="false" aria-controls="control-panel">Toggle details</button>
+      <div id="control-panel" hidden>Expanded control content</div>
+      <p><a href="/full-crawl/index.html">Back to the start</a></p>
+    </main>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#control-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>

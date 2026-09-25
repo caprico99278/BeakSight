@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Passive Patch Request</title>
+  </head>
+  <body>
+    <h1>Fixture Passive Patch Request</h1>
+    <p>This page sends a PATCH request without any user action.</p>
+    <script>
+      // 利用者の操作なしに PATCH を送る（Task 18 の S02）。Passive では、サーバに届いてはいけない。
+      void fetch('/__mutation', { method: 'PATCH', body: 'fixture' }).catch(() => undefined);
+    </script>
+  </body>
+</html>
