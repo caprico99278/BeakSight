@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Technical</title>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ1。壊した箇所:
+      - 読み込めない画像（このサーバにないパスで、404 になる） → IMAGE_LOAD_FAILED
+      - 捕まえられない JavaScript の例外 → PAGE_ERROR
+    -->
+    <main>
+      <h1>Full crawl fixture technical problems</h1>
+      <p>Depth 1.</p>
+      <img src="/full-crawl/missing-image.png" alt="Deliberately missing fixture image" width="40" height="40">
+      <p><a href="/full-crawl/index.html">Back to the start</a></p>
+    </main>
+    <script>
+      setTimeout(() => {
+        throw new Error('full crawl fixture uncaught exception');
+      }, 0);
+    </script>
+  </body>
+</html>

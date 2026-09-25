@@ -1,50 +1,30 @@
-import { chromium, type Browser, type BrowserContext, type Download } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { BrowserContextFactory, type ContextConstructionError } from '../../src/browser/context-factory.js';
-import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
+import type { Browser, BrowserContext, Download } from 'playwright';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
+import { wait } from '../../src/core/deadline.js';
 import { startFixtureServer } from '../../fixtures/server.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
+import { useHeadlessChromium } from '../helpers/chromium.js';
+import { createDeferred } from '../helpers/deferred.js';
+import { closePassiveResources } from '../helpers/passive-cleanup.js';
+import { createTestConfig } from '../helpers/test-config.js';
 
 const viewport: Viewport = { width: 800, height: 600 };
 let browser: Browser;
 const contexts: BrowserContext[] = [];
 
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
-
 function configFor(origin = 'https://example.test'): AuditConfig {
-  return {
-    ...DEFAULT_CONFIG,
-    site: { startUrl: `${origin}/`, allowedOrigins: [origin] },
-    browser: { headed: false, locale: 'en-GB', timezone: 'Europe/London' },
-    viewports: {
-      primaryDesktop: { ...DEFAULT_CONFIG.viewports.primaryDesktop },
-      primaryMobile: { ...DEFAULT_CONFIG.viewports.primaryMobile },
-      stressWidths: [...DEFAULT_CONFIG.viewports.stressWidths],
-    },
-  };
+  return createTestConfig(origin, '/', { browser: { locale: 'en-GB', timezone: 'Europe/London' } });
 }
 
 function factoryFor(config = configFor()): BrowserContextFactory {
   return new BrowserContextFactory(browser, config, () => new SafetyLedger());
 }
 
-beforeAll(async () => {
-  browser = await chromium.launch({ headless: true });
+useHeadlessChromium((launched) => {
+  browser = launched;
 });
 
 afterEach(async () => {
@@ -55,10 +35,6 @@ afterEach(async () => {
     await context.close().catch(() => undefined);
   }));
   vi.restoreAllMocks();
-});
-
-afterAll(async () => {
-  await browser.close();
 });
 
 describe('BrowserContextFactory', () => {
@@ -101,9 +77,78 @@ describe('BrowserContextFactory', () => {
     } as unknown as Browser;
     const factory = new BrowserContextFactory(failedBrowser, configFor(), () => new SafetyLedger());
 
-    await expect(factory.createPassiveContext(viewport)).rejects.toThrow('fixture route installation failure');
+    // P14f（R14r の Important-1）: Guard が Context を閉じた場合も、Ledger を持つ `ContextConstructionError` を投げ、
+    // factory は Context と Ledger の対応を消さない。閉じた Context は、もう閉じられない（所有は解放済み）。
+    const failure: unknown = await factory.createPassiveContext(viewport).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ContextConstructionError);
+    const constructionFailure = failure as ContextConstructionError;
+    expect(constructionFailure.context).toBe(failedContext);
+    expect((constructionFailure.cause as Error).message).toBe('fixture route installation failure');
     expect(close).toHaveBeenCalledOnce();
-    expect(() => factory.getSafetyLedger(failedContext)).toThrow(/owned/i);
+    expect(factory.getSafetyLedger(failedContext)).toBe(constructionFailure.ledger);
+    // この偽の Context には `off` がないので、listener の後片付けの失敗も記録される。ここでは、取り付けの失敗の記録を確かめる。
+    expect(constructionFailure.ledger.snapshot().invariantViolations).toContainEqual(
+      { code: 'GUARD_INSTALLATION_FAILED', message: 'fixture route installation failure' },
+    );
+    await expect(factory.closePassiveContext(failedContext)).rejects.toThrow(/no longer active|not owned/i);
+  });
+
+  // P14f（R14r の Important-1、設計書 4.3）: `newContext` の直後に page を1つ開く Browser では、Guard の取り付けが
+  // GUARD_INSTALLATION_FAILED で失敗し、Guard が Context を閉じる。その場合も、Ledger を持つ `ContextConstructionError` を投げる。
+  it.each(['createPassiveContext', 'createInteractionSession'] as const)(
+    '%s throws ContextConstructionError with the Ledger when the Guard closed the Context after its installation failed',
+    async (method) => {
+      const ledgers: SafetyLedger[] = [];
+      const factory = new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, {
+        onContextCreated: (context) => contexts.push(context),
+      }), configFor(), () => {
+        const ledger = new SafetyLedger();
+        ledgers.push(ledger);
+        return ledger;
+      });
+
+      const failure: unknown = await factory[method](viewport).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ContextConstructionError);
+      const constructionFailure = failure as ContextConstructionError;
+      expect(ledgers).toHaveLength(1);
+      expect(constructionFailure.ledger).toBe(ledgers[0]);
+      expect(constructionFailure.ledger.snapshot().invariantViolations.map((violation) => violation.code))
+        .toContain('GUARD_INSTALLATION_FAILED');
+      // Guard が Context を閉じている。factory は、Ledger との対応を残し、所有は解放する。
+      expect(browser.contexts()).not.toContain(constructionFailure.context);
+      expect(factory.getSafetyLedger(constructionFailure.context)).toBe(constructionFailure.ledger);
+      await expect(factory.closePassiveContext(constructionFailure.context)).rejects.toThrow(/no longer active|not owned/i);
+    },
+  );
+
+  // P14f（R14r の Important-1）: Interaction の session の page の作成に失敗し、factory が Context を閉じた場合も、Ledger を持つ
+  // `ContextConstructionError` を投げる。
+  it('createInteractionSession throws ContextConstructionError with the Ledger when page creation fails and the Context is closed', async () => {
+    const pageCreationFailure = new Error('fixture interaction page creation failure');
+    const rawNewContext = browser.newContext.bind(browser);
+    vi.spyOn(browser, 'newContext').mockImplementationOnce(async (options) => {
+      const context = await rawNewContext(options);
+      contexts.push(context);
+      vi.spyOn(context, 'newPage').mockRejectedValueOnce(pageCreationFailure);
+      return context;
+    });
+    const ledgers: SafetyLedger[] = [];
+    const factory = new BrowserContextFactory(browser, configFor(), () => {
+      const ledger = new SafetyLedger();
+      ledgers.push(ledger);
+      return ledger;
+    });
+
+    const failure: unknown = await factory.createInteractionSession(viewport).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ContextConstructionError);
+    const constructionFailure = failure as ContextConstructionError;
+    expect(constructionFailure.cause).toBe(pageCreationFailure);
+    expect(constructionFailure.ledger).toBe(ledgers[0]);
+    expect(browser.contexts()).not.toContain(constructionFailure.context);
+    expect(factory.getSafetyLedger(constructionFailure.context)).toBe(constructionFailure.ledger);
+    await expect(factory.closePassiveContext(constructionFailure.context)).rejects.toThrow(/no longer active|not owned/i);
   });
 
   it('rejects a reused Safety Ledger before constructing another Context across factories', async () => {
@@ -293,7 +338,7 @@ describe('BrowserContextFactory', () => {
         () => { sessionCloseSettled = true; },
         (error: unknown) => { sessionCloseError = error; sessionCloseSettled = true; },
       );
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      await wait(20);
       expect(sessionCloseSettled).toBe(false);
 
       cancelGate.reject(new Error('factory invalidation cutoff cancel failed'));
@@ -341,7 +386,7 @@ describe('BrowserContextFactory', () => {
         () => { sessionCloseSettled = true; },
         () => { sessionCloseSettled = true; },
       );
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      await wait(20);
       expect(sessionCloseSettled).toBe(false);
 
       cancelGate.reject(new Error('factory active-operation cutoff cancel failed'));
@@ -381,7 +426,9 @@ describe('BrowserContextFactory', () => {
         code: 'GUARDED_CONTEXT_CLOSE_FAILED', message: 'first retained close failed',
       });
       await expect(factory.createPassivePage(context)).rejects.toThrow(/invalidated/i);
-      await expect(session.close()).resolves.toBeUndefined();
+      // I1/Q3（設計書 4.1）: invalidation を経て CLOSED に達した close は、前回の失敗にかかわらず
+      // factory.closePassiveContext() と同じく invalidated で reject する。所有は CLOSED で解放する。
+      await expect(session.close()).rejects.toThrow('Passive request guard context was invalidated');
       expect(session.isClosed()).toBe(true);
       expect(session.page.isClosed()).toBe(true);
       expect(attempts).toBe(2);
@@ -496,5 +543,146 @@ describe('BrowserContextFactory', () => {
     expect(page.viewportSize()).toEqual({ width: 700, height: 500 });
     await expect(page.goto('https://attacker.invalid/')).rejects.toThrow();
     expect(factory.getSafetyLedger(context).snapshot().blockedNavigations).toHaveLength(1);
+  });
+
+  it.each([
+    ['a fractional width', { width: 800.5, height: 600 }],
+    ['a fractional height', { width: 800, height: 600.25 }],
+    ['an unsafe integer width', { width: Number.MAX_SAFE_INTEGER + 1, height: 600 }],
+  ] as const)('rejects %s as the viewport before creating a Context (F07 finding 6)', async (_name, fractional) => {
+    const newContext = vi.spyOn(browser, 'newContext');
+    const factory = factoryFor();
+
+    await expect(factory.createPassiveContext(fractional)).rejects.toThrow(/positive safe integers/u);
+    expect(newContext).not.toHaveBeenCalled();
+  });
+
+  describe('V13: browser settings take effect in a real browser', () => {
+    it('blocks Service Worker registration in the passive Context', async () => {
+      const server = await startFixtureServer();
+      const factory = factoryFor(configFor(server.origin));
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      // 対照: 遮断しない Context では、同じページで登録でき、Worker のスクリプトが取得される（テストが空振りしないことの確認）。
+      const unblockedContext = await browser.newContext({ viewport });
+      contexts.push(unblockedContext);
+      try {
+        const unblockedPage = await unblockedContext.newPage();
+        await unblockedPage.goto(`${server.origin}/service-worker.html`);
+        await unblockedPage.evaluate(() => navigator.serviceWorker.register('/fixture-service-worker.js'));
+        await expect.poll(() => unblockedPage.evaluate(async () => (
+          (await navigator.serviceWorker.getRegistrations()).length
+        ))).toBe(1);
+        expect(server.getRequestObservations().some((observation) => (
+          observation.pathname === '/fixture-service-worker.js'
+        ))).toBe(true);
+        await unblockedContext.close();
+        server.resetRequestObservations();
+
+        await page.goto(`${server.origin}/service-worker.html`);
+        // fixture のボタンの処理（`navigator.serviceWorker.register('/fixture-service-worker.js')`）を実行する。
+        await page.evaluate(() => {
+          document.querySelector('button')?.click();
+        });
+        await page.evaluate(async () => {
+          await navigator.serviceWorker.register('/fixture-service-worker.js').catch(() => undefined);
+        });
+        await wait(200);
+
+        const state = await page.evaluate(async () => ({
+          registrations: (await navigator.serviceWorker.getRegistrations()).length,
+          controlled: navigator.serviceWorker.controller !== null,
+        }));
+        expect(state).toEqual({ registrations: 0, controlled: false });
+        expect(server.getRequestObservations().map((observation) => observation.pathname))
+          .not.toContain('/fixture-service-worker.js');
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+
+    it('applies the configured locale and timezone inside the browser', async () => {
+      const server = await startFixtureServer();
+      // 実行環境の既定値と重なりにくい値を使う。
+      const config = createTestConfig(server.origin, '/', { browser: { locale: 'de-CH', timezone: 'Pacific/Auckland' } });
+      const factory = factoryFor(config);
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      try {
+        await page.goto(`${server.origin}/index.html`);
+
+        const observed = await page.evaluate(() => ({
+          language: navigator.language,
+          locale: Intl.DateTimeFormat().resolvedOptions().locale,
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }));
+
+        expect(observed).toEqual({ language: 'de-CH', locale: 'de-CH', timeZone: 'Pacific/Auckland' });
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+  });
+
+  describe('V1/M3: page-initiated downloads are never accepted', () => {
+    it('creates Passive and Interaction Contexts with acceptDownloads disabled', async () => {
+      const newContext = vi.spyOn(browser, 'newContext');
+      const factory = factoryFor();
+
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const session = await factory.createInteractionSession(viewport);
+      contexts.push(session.page.context());
+      try {
+        expect(newContext).toHaveBeenCalledTimes(2);
+        for (const [options] of newContext.mock.calls) {
+          expect(options).toMatchObject({ acceptDownloads: false });
+        }
+      } finally {
+        await closePassiveResources({ factory, context });
+        await session.close().catch(() => undefined);
+      }
+    });
+
+    it.each([
+      ['an HTTP download', 1, '/__download'],
+      ['a generated data-URL download', 0, 'data:text/plain,fixture-download'],
+    ] as const)('does not save %s clicked by page script in the passive phase and records it', async (
+      _name,
+      buttonIndex,
+      downloadUrl,
+    ) => {
+      const server = await startFixtureServer();
+      const factory = factoryFor(configFor(server.origin));
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      try {
+        const downloads: Download[] = [];
+        page.on('download', (download) => downloads.push(download));
+        await page.goto(`${server.origin}/download-button.html`);
+
+        await page.evaluate((index) => {
+          document.querySelectorAll('button')[index]?.click();
+        }, buttonIndex);
+
+        const expectedUrl = downloadUrl.startsWith('/') ? `${server.origin}${downloadUrl}` : downloadUrl;
+        await expect.poll(() => factory.getSafetyLedger(context).snapshot().blockedDownloads).toEqual([
+          expect.objectContaining({ url: expectedUrl, reason: 'PASSIVE_DOWNLOAD' }),
+        ]);
+        expect(downloads).toHaveLength(1);
+        expect(await downloads[0]!.failure()).not.toBeNull();
+        await expect(downloads[0]!.path()).rejects.toThrow();
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
   });
 });

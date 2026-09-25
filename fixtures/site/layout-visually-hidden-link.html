@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Visually hidden link label fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      main { position: relative; width: 400px; }
+      /* スクリーンリーダー向けに、画面から隠すテキスト（1 × 1 px と overflow:hidden）。 */
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: -1px;
+        padding: 0;
+        border: 0;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p><a id="visually-hidden-label-link" href="#menu"><span class="visually-hidden">Open the menu</span></a></p>
+    </main>
+  </body>
+</html>

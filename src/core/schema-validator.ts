@@ -65,6 +65,11 @@ export const validateArtifact = async (
   schemaName: ArtifactSchemaName,
   value: unknown,
 ): Promise<ArtifactValidationResult> => {
+  // 検証関数の表は普通のオブジェクトなので、`constructor` などの継承したプロパティ名で引くと、`Object` などの無関係な関数が
+  // 検証関数として呼ばれ、検証を素通りする。スキーマ名は、自身のプロパティかどうかで確かめる（DEF-002）。
+  if (!Object.hasOwn(schemaIdByName, schemaName)) {
+    throw new RangeError(`unsupported artifact schema name: ${schemaName}`);
+  }
   const validate = (await loadValidators())[schemaName];
   if (validate(value)) {
     return { ok: true };

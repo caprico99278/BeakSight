@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Ripple Button</title>
+  </head>
+  <body>
+    <button type="button">Ripple inert</button>
+    <script>
+      // 押し下げたときに ripple の class を付け、400ms後に外す。click そのものでは何もしない。
+      const button = document.querySelector('button');
+      button.addEventListener('pointerdown', () => {
+        button.classList.add('ripple-active');
+        setTimeout(() => button.classList.remove('ripple-active'), 400);
+      });
+    </script>
+  </body>
+</html>

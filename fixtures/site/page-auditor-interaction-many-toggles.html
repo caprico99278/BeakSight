@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Page Auditor interaction many toggles fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Page Auditor interaction many toggles fixture</h1>
+      <!-- aria-expanded を切り替えるボタンが4つある。予算と後片付けの失敗の確認に使う（P14d）。 -->
+      <button type="button" aria-expanded="false" aria-controls="panel-1">Toggle one</button>
+      <div id="panel-1" hidden>Panel one</div>
+      <button type="button" aria-expanded="false" aria-controls="panel-2">Toggle two</button>
+      <div id="panel-2" hidden>Panel two</div>
+      <button type="button" aria-expanded="false" aria-controls="panel-3">Toggle three</button>
+      <div id="panel-3" hidden>Panel three</div>
+      <button type="button" aria-expanded="false" aria-controls="panel-4">Toggle four</button>
+      <div id="panel-4" hidden>Panel four</div>
+    </main>
+    <script>
+      for (const toggle of document.querySelectorAll('button')) {
+        const panel = document.getElementById(toggle.getAttribute('aria-controls'));
+        toggle.addEventListener('click', () => {
+          const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+          toggle.setAttribute('aria-expanded', String(expanded));
+          panel.hidden = !expanded;
+        });
+      }
+    </script>
+  </body>
+</html>

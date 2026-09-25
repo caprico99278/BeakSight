@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hidden slide text fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; font-size: 16px; line-height: 24px; }
+      main { width: 400px; }
+      section { margin: 0 0 24px; }
+      /*
+       * スライドを重ねて切り替える箱（RT12r2 の M1）。表示中のスライドは箱に収まり、見えない（opacity:0 か visibility:hidden の）
+       * 背の高いスライドの行だけが、箱の下に出る。見えないテキストは見切れではない。
+       */
+      .fade-slider { position: relative; width: 300px; height: 48px; overflow: hidden; }
+      .fade-slide { position: absolute; top: 0; left: 0; width: 100%; margin: 0; }
+      .fade-slide.is-inactive-opacity { opacity: 0; }
+      .fade-slide.is-inactive-visibility { visibility: hidden; }
+      /* `#visible-cut-slider` は対照。見えるスライドのテキストが、本当に箱の下で切れている。 */
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <div class="fade-slider" id="opacity-slider">
+          <p class="fade-slide is-active">Active slide</p>
+          <p class="fade-slide is-inactive-opacity">Hidden slide line one<br>line two<br>line three<br>line four<br>line five</p>
+        </div>
+      </section>
+      <section>
+        <div class="fade-slider" id="visibility-slider">
+          <p class="fade-slide is-active">Active slide</p>
+          <p class="fade-slide is-inactive-visibility">Hidden slide line one<br>line two<br>line three<br>line four<br>line five</p>
+        </div>
+      </section>
+      <section>
+        <div class="fade-slider" id="visible-cut-slider">
+          <p class="fade-slide is-active">Visible slide line one<br>line two<br>line three<br>line four</p>
+          <p class="fade-slide is-inactive-opacity">Hidden slide</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

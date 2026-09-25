@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Page Auditor interaction exclusions fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Page Auditor interaction exclusions fixture</h1>
+      <!-- どの候補も、受け入れの判定（classifyInteractionCandidate）で機械的に除外される（P14d）。 -->
+      <a role="button" href="mailto:fixture@example.test">Send mail</a>
+      <a role="button" href="/__download" download>Download file</a>
+      <form action="/__mutation" method="post">
+        <button type="submit">Submit form</button>
+      </form>
+    </main>
+  </body>
+</html>

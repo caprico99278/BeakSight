@@ -5,28 +5,307 @@
   "required": [
     "schemaVersion",
     "runId",
+    "toolVersion",
+    "target",
+    "startUrl",
+    "allowedOrigins",
     "runStatus",
     "startedAt",
     "finishedAt",
     "discoveredPageCount",
     "auditedPageCount",
+    "partialPageCount",
     "failedPageCount",
     "skippedPageCount",
+    "viewportPageCounts",
+    "environment",
+    "effectiveConfig",
+    "safety",
+    "unverifiedInteractionCount",
+    "unverifiedInternalLinkCount",
+    "retries",
+    "crawlLimits",
     "incompleteReasons"
   ],
   "properties": {
     "schemaVersion": { "const": "run-schema/1.0" },
     "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
+    "toolVersion": { "type": "string", "minLength": 1 },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": { "id": { "type": "string", "minLength": 1 } }
+    },
+    "startUrl": { "type": "string", "minLength": 1 },
+    "allowedOrigins": { "type": "array", "items": { "type": "string", "minLength": 1 } },
     "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
     "startedAt": { "type": "string", "minLength": 1 },
     "finishedAt": { "type": ["string", "null"] },
     "discoveredPageCount": { "type": "integer", "minimum": 0 },
     "auditedPageCount": { "type": "integer", "minimum": 0 },
+    "partialPageCount": { "type": "integer", "minimum": 0 },
     "failedPageCount": { "type": "integer", "minimum": 0 },
     "skippedPageCount": { "type": "integer", "minimum": 0 },
-    "incompleteReasons": {
+    "viewportPageCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desktop", "mobile"],
+      "properties": {
+        "desktop": { "$ref": "#/$defs/viewportPageCounts" },
+        "mobile": { "$ref": "#/$defs/viewportPageCounts" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeVersion",
+        "platform",
+        "osRelease",
+        "arch",
+        "playwrightVersion",
+        "chromiumVersion",
+        "userAgents"
+      ],
+      "properties": {
+        "nodeVersion": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "osRelease": { "type": "string" },
+        "arch": { "type": "string", "minLength": 1 },
+        "playwrightVersion": { "type": "string", "minLength": 1 },
+        "chromiumVersion": { "type": ["string", "null"] },
+        "userAgents": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["desktop", "mobile"],
+          "properties": { "desktop": { "type": ["string", "null"] }, "mobile": { "type": ["string", "null"] } }
+        }
+      }
+    },
+    "effectiveConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "site", "crawl", "browser", "viewports", "audit", "output"],
+      "properties": {
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": { "id": { "type": "string", "minLength": 1 } }
+        },
+        "site": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["startUrl", "allowedOrigins"],
+          "properties": {
+            "startUrl": { "type": "string" },
+            "allowedOrigins": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "crawl": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "maxPages",
+            "maxDepth",
+            "maxRuntimeMs",
+            "navigationTimeoutMs",
+            "overallPageTimeoutMs",
+            "resourceSettlingTimeoutMs",
+            "interactionTimeoutMs",
+            "allowedQueryParameters"
+          ],
+          "properties": {
+            "maxPages": { "type": "integer", "minimum": 1 },
+            "maxDepth": { "type": "integer", "minimum": 1 },
+            "maxRuntimeMs": { "type": "integer", "minimum": 1 },
+            "navigationTimeoutMs": { "type": "integer", "minimum": 1 },
+            "overallPageTimeoutMs": { "type": "integer", "minimum": 1 },
+            "resourceSettlingTimeoutMs": { "type": "integer", "minimum": 1 },
+            "interactionTimeoutMs": { "type": "integer", "minimum": 1001 },
+            "allowedQueryParameters": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["headed", "locale", "timezone"],
+          "properties": {
+            "headed": { "type": "boolean" },
+            "locale": { "type": "string" },
+            "timezone": { "type": "string" }
+          }
+        },
+        "viewports": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["primaryDesktop", "primaryMobile", "stressWidths"],
+          "properties": {
+            "primaryDesktop": { "$ref": "#/$defs/viewportSize" },
+            "primaryMobile": { "$ref": "#/$defs/viewportSize" },
+            "stressWidths": { "type": "array", "items": { "type": "integer", "minimum": 1 } }
+          }
+        },
+        "audit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["performance", "accessibility", "interactions", "screenshots"],
+          "properties": {
+            "performance": { "type": "boolean" },
+            "accessibility": { "type": "boolean" },
+            "interactions": { "type": "boolean" },
+            "screenshots": { "type": "boolean" }
+          }
+        },
+        "output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["directory"],
+          "properties": { "directory": { "type": "string" } }
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "guardEnabled",
+        "blockedRequestsByMethod",
+        "blockedActions",
+        "excludedInteractionCandidateCount",
+        "invariantViolationCount",
+        "invariantViolations",
+        "recordTruncated"
+      ],
+      "properties": {
+        "guardEnabled": { "type": "boolean" },
+        "blockedRequestsByMethod": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "blockedActions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requests", "navigations", "externalActions", "popups", "downloads", "webSockets"],
+          "properties": {
+            "requests": { "type": "integer", "minimum": 0 },
+            "navigations": { "type": "integer", "minimum": 0 },
+            "externalActions": { "type": "integer", "minimum": 0 },
+            "popups": { "type": "integer", "minimum": 0 },
+            "downloads": { "type": "integer", "minimum": 0 },
+            "webSockets": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "excludedInteractionCandidateCount": { "type": "integer", "minimum": 0 },
+        "invariantViolationCount": { "type": "integer", "minimum": 0 },
+        "invariantViolations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+          }
+        },
+        "recordTruncated": { "type": "boolean" }
+      }
+    },
+    "unverifiedInteractionCount": { "type": "integer", "minimum": 0 },
+    "unverifiedInternalLinkCount": { "type": "integer", "minimum": 0 },
+    "retries": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "attempt", "navigationOutcome", "detail", "evidenceIds"],
+        "properties": {
+          "url": { "type": "string", "minLength": 1 },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "navigationOutcome": { "enum": ["OK", "TIMEOUT", "FAILED", "BLOCKED_EXTERNAL_REDIRECT"] },
+          "detail": { "type": ["string", "null"] },
+          "evidenceIds": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^EV-[A-Z0-9_]+-[0-9]{6,}$" }
+          }
+        }
+      }
+    },
+    "crawlLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxPagesReached", "maxDepthReached", "maxRuntimeReached"],
+      "properties": {
+        "maxPagesReached": { "type": "boolean" },
+        "maxDepthReached": { "type": "boolean" },
+        "maxRuntimeReached": { "type": "boolean" }
+      }
+    },
+    "incompleteReasons": { "type": "array", "items": { "$ref": "#/$defs/incompleteReason" } }
+  },
+  "$defs": {
+    "incompleteReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "detail"],
+      "properties": {
+        "code": {
+          "enum": [
+            "DEADLINE_EXCEEDED",
+            "EVALUATION_FAILED",
+            "PAGE_CLOSED",
+            "NAVIGATION_FAILED",
+            "DOM_READINESS_FAILED",
+            "SCROLL_TARGET_UNRESOLVED",
+            "SCROLL_NOT_ADVANCED",
+            "INNER_SCROLL_CONTAINER_NOT_TRAVERSED",
+            "INNER_SCROLL_SCAN_LIMIT_REACHED",
+            "SCROLL_TARGET_UNSTABLE",
+            "POSITION_NOT_AT_ORIGIN",
+            "LAYOUT_COMPARISON_LIMIT_REACHED",
+            "RESOURCE_LIMIT_REACHED",
+            "INVALID_BROWSER_DATA",
+            "PREFLIGHT_FAILED",
+            "RUN_DIRECTORY_UNAVAILABLE",
+            "SAFETY_INVARIANT_VIOLATION",
+            "SAFETY_LEDGER_TRUNCATED",
+            "UNHANDLED_FAILURE",
+            "MAX_PAGES_REACHED",
+            "MAX_DEPTH_REACHED",
+            "MAX_RUNTIME_REACHED",
+            "REQUIRED_ARTIFACT_INVALID",
+            "EXECUTION_INCOMPLETE",
+            "REQUIRED_WORK_SKIPPED",
+            "REQUIRED_WORK_BLOCKED",
+            "REQUIRED_WORK_TIMED_OUT",
+            "REQUIRED_WORK_NOT_OBSERVED",
+            "REQUIRED_WORK_NOT_VERIFIED",
+            "REQUIRED_WORK_FAILED",
+            "COLLECTOR_INCOMPLETE",
+            "RULE_EVALUATION_FAILED",
+            "PAGE_CRASHED",
+            "SAFETY_VIOLATION_ABORT"
+          ]
+        },
+        "detail": { "type": ["string", "null"] }
+      }
+    },
+    "viewportPageCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audited", "partial", "failed", "skipped"],
+      "properties": {
+        "audited": { "type": "integer", "minimum": 0 },
+        "partial": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "viewportSize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
     }
   }
 }

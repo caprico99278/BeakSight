@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Timer Class Button</title>
+  </head>
+  <body>
+    <button type="button">Timer class inert</button>
+    <script>
+      // 300ms ごとに、タイマーで自分の class を切り替える。click では何もしない。
+      const button = document.querySelector('button');
+      setInterval(() => {
+        button.classList.toggle('pulse');
+      }, 300);
+    </script>
+  </body>
+</html>

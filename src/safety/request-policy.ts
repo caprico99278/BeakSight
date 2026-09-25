@@ -1,3 +1,5 @@
+import { canonicalizeAllowedOrigins } from '../crawl/normalize-url.js';
+
 export interface HttpRequestFacts {
   readonly kind: 'HTTP';
   readonly method: string;
@@ -28,23 +30,9 @@ export function isReadMethod(method: string): boolean {
   return normalizedMethod === 'GET' || normalizedMethod === 'HEAD';
 }
 
+/** Passive HTTP の許可Origin。正規化は URL の意味の owner（`canonicalizeAllowedOrigins`）に委譲する。 */
 export function canonicalPassiveAllowedOrigins(allowedOrigins: ReadonlySet<string>): ReadonlySet<string> {
-  const canonicalOrigins = new Set<string>();
-  for (const entry of allowedOrigins) {
-    try {
-      const candidate = new URL(entry);
-      if (
-        (candidate.protocol === 'http:' || candidate.protocol === 'https:')
-        && candidate.username.length === 0
-        && candidate.password.length === 0
-      ) {
-        canonicalOrigins.add(candidate.origin);
-      }
-    } catch {
-      // 不正な形式のエントリにネットワーク権限を与えてはならない。
-    }
-  }
-  return canonicalOrigins;
+  return canonicalizeAllowedOrigins(allowedOrigins);
 }
 
 function hasAllowedOrigin(url: string, allowedOrigins: ReadonlySet<string>): boolean {

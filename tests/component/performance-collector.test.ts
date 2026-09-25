@@ -1,16 +1,15 @@
 import type { BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MAX_ERROR_MESSAGE_LENGTH, MAX_RESOURCE_TIMING_ENTRIES } from '../../src/core/limits.js';
 import type {
   HeaderEvidence,
   NetworkEvidence,
   NetworkRequestEvidence,
-} from '../../src/evidence/network-collector.js';
-import {
-  PerformanceCollector,
-  type PerformanceEvidence,
-  type ResourceSummariesEvidence,
-  type WebVitalsEvidence,
-} from '../../src/evidence/performance-collector.js';
+  PerformanceEvidence,
+  ResourceSummariesEvidence,
+  WebVitalsEvidence,
+} from '../../src/core/evidence-types.js';
+import { PerformanceCollector } from '../../src/evidence/performance-collector.js';
 
 const readControl = vi.hoisted(() => ({ failuresRemaining: 0 }));
 
@@ -28,11 +27,36 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
+const NETWORK_COVERAGE = Object.freeze({
+  omittedRequestCount: 0,
+  omittedResponseCount: 0,
+  omittedFailureCount: 0,
+});
+
+const REQUEST_FLAGS = Object.freeze({
+  isNavigationRequest: false,
+  isMainFrame: true,
+  truncated: false,
+});
+
+const RESPONSE_FLAGS = Object.freeze({
+  ...REQUEST_FLAGS,
+  transferSize: Object.freeze({ status: 'NOT_OBSERVED' as const }),
+});
+
 const EMPTY_NETWORK: NetworkEvidence = Object.freeze({
   requests: Object.freeze([]),
   responses: Object.freeze([]),
   failures: Object.freeze([]),
+  ...NETWORK_COVERAGE,
 });
+
+function networkOf(
+  requests: NetworkEvidence['requests'],
+  responses: NetworkEvidence['responses'] = [],
+): NetworkEvidence {
+  return { requests, responses, failures: [], ...NETWORK_COVERAGE };
+}
 
 function timing(responseEnd = 20) {
   return Object.freeze({
@@ -69,6 +93,7 @@ function networkEvidence(): NetworkEvidence {
         redirectFromRequestId: null,
         redirectToRequestId: null,
         redirectChainRequestIds: Object.freeze([]),
+        ...REQUEST_FLAGS,
       }),
       Object.freeze({
         requestId: 'REQ-000002',
@@ -80,6 +105,7 @@ function networkEvidence(): NetworkEvidence {
         redirectFromRequestId: null,
         redirectToRequestId: null,
         redirectChainRequestIds: Object.freeze([]),
+        ...REQUEST_FLAGS,
       }),
       Object.freeze({
         requestId: 'REQ-000003',
@@ -91,6 +117,7 @@ function networkEvidence(): NetworkEvidence {
         redirectFromRequestId: null,
         redirectToRequestId: null,
         redirectChainRequestIds: Object.freeze([]),
+        ...REQUEST_FLAGS,
       }),
     ]),
     responses: Object.freeze([
@@ -108,6 +135,7 @@ function networkEvidence(): NetworkEvidence {
         }),
         contentLengthHeader: '12',
         timing: timing(),
+        ...RESPONSE_FLAGS,
       }),
       Object.freeze({
         requestId: 'REQ-000002',
@@ -117,9 +145,11 @@ function networkEvidence(): NetworkEvidence {
         headers: Object.freeze({ status: 'FAILED' as const, errorText: 'response headers unavailable' }),
         contentLengthHeader: null,
         timing: timing(),
+        ...RESPONSE_FLAGS,
       }),
     ]),
     failures: Object.freeze([]),
+    ...NETWORK_COVERAGE,
   });
 }
 
@@ -142,11 +172,12 @@ function requestEvidence(
     redirectFromRequestId: null,
     redirectToRequestId: null,
     redirectChainRequestIds: [],
+    ...REQUEST_FLAGS,
   };
 }
 
 function networkWithRequests(requests: NetworkRequestEvidence[]): NetworkEvidence {
-  return { requests, responses: [], failures: [] };
+  return networkOf(requests);
 }
 
 function rawResource(
@@ -165,6 +196,7 @@ function rawResource(
     encodedBodySize: sizes.encodedBodySize ?? 8,
     decodedBodySize: sizes.decodedBodySize ?? 12,
     serverTiming: [],
+    omittedServerTimingCount: 0,
   };
 }
 
@@ -178,6 +210,9 @@ interface RawBrowserEvidenceFixture {
   };
   navigationEntries: Record<string, unknown>[];
   resourceEntries: Record<string, unknown>[];
+  omittedResourceEntryCount: unknown;
+  resourceBuffer: unknown;
+  webVitalsTextTruncated: unknown;
 }
 
 function rawBrowserEvidence(): RawBrowserEvidenceFixture {
@@ -256,6 +291,7 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         { name: 'cache', description: 'hit', duration: 1.5 },
         { name: 'db', description: 'primary', duration: 3 },
       ],
+      omittedServerTimingCount: 0,
     }],
     resourceEntries: [
       {
@@ -269,6 +305,7 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         encodedBodySize: 80,
         decodedBodySize: 120,
         serverTiming: [{ name: 'edge', description: 'warm', duration: 0.5 }],
+        omittedServerTimingCount: 0,
       },
       {
         name: 'https://fixture.test/photo.png',
@@ -281,6 +318,7 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         encodedBodySize: 180,
         decodedBodySize: 240,
         serverTiming: [],
+        omittedServerTimingCount: 0,
       },
       {
         name: 'https://fixture.test/site.css',
@@ -293,6 +331,7 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         encodedBodySize: 70,
         decodedBodySize: 110,
         serverTiming: [],
+        omittedServerTimingCount: 0,
       },
       {
         name: 'https://fixture.test/analytics/collect',
@@ -305,6 +344,7 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         encodedBodySize: 20,
         decodedBodySize: 20,
         serverTiming: [],
+        omittedServerTimingCount: 0,
       },
       {
         name: 'https://fixture.test/unknown.bin',
@@ -317,8 +357,12 @@ function rawBrowserEvidence(): RawBrowserEvidenceFixture {
         encodedBodySize: 40,
         decodedBodySize: 60,
         serverTiming: [],
+        omittedServerTimingCount: 0,
       },
     ],
+    omittedResourceEntryCount: 0,
+    resourceBuffer: { size: 500, full: false },
+    webVitalsTextTruncated: false,
   };
 }
 
@@ -400,7 +444,6 @@ describe('PerformanceCollector', () => {
       status: 'NOT_OBSERVED',
       value: null,
       id: null,
-      rating: null,
       navigationType: null,
       attribution: null,
     });
@@ -504,6 +547,7 @@ describe('PerformanceCollector', () => {
     const resourceSummaries = requireResourceSummaries(result);
     expect(resourceSummaries.script).toEqual({
       count: 1,
+      sizeUnknownCount: 0,
       transferSize: 100,
       encodedBodySize: 80,
       decodedBodySize: 120,
@@ -511,6 +555,7 @@ describe('PerformanceCollector', () => {
     expect(resourceSummaries.image.count).toBe(1);
     expect(resourceSummaries.stylesheet).toEqual({
       count: 1,
+      sizeUnknownCount: 0,
       transferSize: 90,
       encodedBodySize: 70,
       decodedBodySize: 110,
@@ -762,7 +807,7 @@ describe('PerformanceCollector', () => {
 
     const result = await new PerformanceCollector().collect(
       fakePage(rawBrowserEvidence()),
-      { requests, responses, failures: [] },
+      networkOf(requests, responses),
       { deadlineAtMs: Date.now() + 1_000 },
     );
 
@@ -814,7 +859,7 @@ describe('PerformanceCollector', () => {
 
       const result = await new PerformanceCollector().collect(
         page,
-        { requests, responses, failures: [] },
+        networkOf(requests, responses),
         { deadlineAtMs },
       );
 
@@ -941,6 +986,7 @@ describe('PerformanceCollector', () => {
       headers: { status: 'OBSERVED' as const, values: {} },
       contentLengthHeader: null,
       timing: timing(),
+      ...RESPONSE_FLAGS,
     };
     const requests = new Proxy(Array.from({ length: 501 }, () => request), {
       get(target, property, receiver) {
@@ -957,7 +1003,7 @@ describe('PerformanceCollector', () => {
 
     const result = await new PerformanceCollector().collect(
       fakePage(rawBrowserEvidence()),
-      { requests, responses, failures: [] },
+      networkOf(requests, responses),
       { deadlineAtMs: Date.now() + 1_000 },
     );
 
@@ -984,7 +1030,7 @@ describe('PerformanceCollector', () => {
 
     const result = await new PerformanceCollector().collect(
       page,
-      { requests, responses: [], failures: [] },
+      networkOf(requests),
       { deadlineAtMs },
     );
 
@@ -1298,5 +1344,330 @@ describe('PerformanceCollector', () => {
     });
     expect(JSON.stringify(result)).not.toContain('"transferSize":null');
     expect(JSON.stringify(result)).not.toContain('Infinity');
+  });
+  it('does not retain the web-vitals rating even when the browser reports one', async () => {
+    const result = await new PerformanceCollector().collect(
+      fakePage(rawBrowserEvidence()),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.status).toBe('COMPLETE');
+    const webVitals = requireWebVitals(result);
+    for (const vital of Object.values(webVitals)) {
+      expect(vital).not.toHaveProperty('rating');
+    }
+    expect(JSON.stringify(result)).not.toContain('rating');
+  });
+
+  it('accepts unobserved vitals that carry no rating field', async () => {
+    const raw = rawBrowserEvidence();
+    raw.webVitals.INP = {
+      status: 'NOT_OBSERVED',
+      value: null,
+      id: null,
+      navigationType: null,
+      attribution: null,
+    };
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.status).toBe('COMPLETE');
+    expect(requireWebVitals(result).INP).toEqual({
+      status: 'NOT_OBSERVED',
+      value: null,
+      id: null,
+      navigationType: null,
+      attribution: null,
+    });
+  });
+
+  it.each([
+    ['evaluation failure', () => ({ evaluate: vi.fn(async () => { throw new Error('fixture failure'); }) }), 1_000],
+    ['expired deadline', () => ({ evaluate: vi.fn() }), -1],
+    ['non-object browser data', () => ({ evaluate: vi.fn(async () => null) }), 1_000],
+  ] as const)('does not report zero resource summaries after %s', async (_name, createPage, offsetMs) => {
+    const result = await new PerformanceCollector().collect(
+      createPage() as unknown as Page,
+      networkEvidence(),
+      { deadlineAtMs: Date.now() + offsetMs },
+    );
+
+    expect(result.status).toBe('PARTIAL');
+    expect(result.resourceSummaries).toBeNull();
+    expect(result.resourceCoverage).toBeNull();
+    expect(result.truncation?.omittedServerTimingCount ?? null).toBeNull();
+    expect(JSON.stringify(result)).not.toContain('"count":0');
+  });
+
+  it('reports a full Resource Timing buffer as PARTIAL with the coverage facts', async () => {
+    const raw = rawBrowserEvidence();
+    raw.resourceBuffer = { size: MAX_RESOURCE_TIMING_ENTRIES, full: true };
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
+    expect(result.resourceCoverage).toEqual({
+      bufferSize: MAX_RESOURCE_TIMING_ENTRIES,
+      bufferFull: true,
+      retainedEntryCount: 5,
+      omittedEntryCount: 0,
+    });
+    expect(result.resources).toHaveLength(5);
+    expect(requireResourceSummaries(result).image.count).toBe(1);
+    expect(Object.isFrozen(result.resourceCoverage)).toBe(true);
+  });
+
+  it('counts resource entries beyond the retained limit and does not claim completeness', async () => {
+    const raw = rawBrowserEvidence();
+    raw.omittedResourceEntryCount = 7;
+
+    const reported = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(reported).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
+    expect(reported.resourceCoverage).toMatchObject({ bufferFull: false, retainedEntryCount: 5, omittedEntryCount: 7 });
+
+    const oversized = rawBrowserEvidence();
+    oversized.resourceEntries.splice(0, oversized.resourceEntries.length, ...Array.from(
+      { length: MAX_RESOURCE_TIMING_ENTRIES + 3 },
+      (_value, index) => rawResource(`https://fixture.test/item-${index}.js`, 'script'),
+    ));
+    const bounded = await new PerformanceCollector().collect(
+      fakePage(oversized),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(bounded).toMatchObject({ status: 'PARTIAL', reason: 'RESOURCE_LIMIT_REACHED' });
+    expect(bounded.resources).toHaveLength(MAX_RESOURCE_TIMING_ENTRIES);
+    expect(bounded.resourceCoverage).toMatchObject({
+      retainedEntryCount: MAX_RESOURCE_TIMING_ENTRIES,
+      omittedEntryCount: 3,
+    });
+  });
+
+  it.each([
+    ['missing buffer facts', (raw: RawBrowserEvidenceFixture) => { raw.resourceBuffer = undefined; }],
+    ['non-boolean buffer full flag', (raw: RawBrowserEvidenceFixture) => { raw.resourceBuffer = { size: 500, full: 'no' }; }],
+    ['negative omitted entry count', (raw: RawBrowserEvidenceFixture) => { raw.omittedResourceEntryCount = -1; }],
+    ['missing omitted server timing count', (raw: RawBrowserEvidenceFixture) => {
+      delete raw.resourceEntries[0]!.omittedServerTimingCount;
+    }],
+  ])('rejects %s instead of assuming complete resource coverage', async (_name, mutate) => {
+    const raw = rawBrowserEvidence();
+    mutate(raw);
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'INVALID_BROWSER_DATA' });
+  });
+
+  it('prefers INVALID_BROWSER_DATA over RESOURCE_LIMIT_REACHED when both apply', async () => {
+    const raw = rawBrowserEvidence();
+    raw.resourceBuffer = { size: MAX_RESOURCE_TIMING_ENTRIES, full: true };
+    raw.resourceEntries[0]!.duration = -1;
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result).toMatchObject({ status: 'PARTIAL', reason: 'INVALID_BROWSER_DATA' });
+    expect(result.resourceCoverage?.bufferFull).toBe(true);
+  });
+
+  it('keeps cross-origin zero-size resources out of transfer totals and counts them as size unknown', async () => {
+    const raw = rawBrowserEvidence();
+    const zero = { transferSize: 0, encodedBodySize: 0, decodedBodySize: 0 };
+    raw.resourceEntries.splice(0, raw.resourceEntries.length,
+      rawResource('https://cdn.other.test/restricted.js', 'script', zero),
+      rawResource('https://fixture.test/cached.js', 'script', zero),
+      rawResource('https://cdn.other.test/allowed.js', 'script', {
+        transferSize: 300,
+        encodedBodySize: 200,
+        decodedBodySize: 400,
+      }),
+      rawResource('https://fixture.test/app.js', 'script', {
+        transferSize: 10,
+        encodedBodySize: 8,
+        decodedBodySize: 12,
+      }),
+    );
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.status).toBe('COMPLETE');
+    expect(result.resources.map(({ url, sizeStatus, transferSize }) => ({ url, sizeStatus, transferSize }))).toEqual([
+      { url: 'https://cdn.other.test/restricted.js', sizeStatus: 'CROSS_ORIGIN_RESTRICTED', transferSize: null },
+      { url: 'https://fixture.test/cached.js', sizeStatus: 'OBSERVED', transferSize: 0 },
+      { url: 'https://cdn.other.test/allowed.js', sizeStatus: 'OBSERVED', transferSize: 300 },
+      { url: 'https://fixture.test/app.js', sizeStatus: 'OBSERVED', transferSize: 10 },
+    ]);
+    expect(result.resources[0]).toMatchObject({ encodedBodySize: null, decodedBodySize: null });
+    expect(requireResourceSummaries(result).script).toEqual({
+      count: 4,
+      sizeUnknownCount: 1,
+      transferSize: 310,
+      encodedBodySize: 208,
+      decodedBodySize: 412,
+    });
+  });
+
+  it('treats zero-size resources as size unknown when the document origin is not observed', async () => {
+    const raw = rawBrowserEvidence();
+    raw.navigationEntries = [];
+    raw.resourceEntries.splice(0, raw.resourceEntries.length,
+      rawResource('https://fixture.test/zero.js', 'script', { transferSize: 0, encodedBodySize: 0, decodedBodySize: 0 }),
+    );
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.resources[0]).toMatchObject({ sizeStatus: 'CROSS_ORIGIN_RESTRICTED', transferSize: null });
+    expect(requireResourceSummaries(result).script).toMatchObject({ count: 1, sizeUnknownCount: 1, transferSize: 0 });
+  });
+
+  it('records Server-Timing entries omitted by the per-entry and total limits', async () => {
+    const raw = rawBrowserEvidence();
+    const serverTiming = Array.from({ length: 20 }, (_value, index) => ({
+      name: `metric-${index}`,
+      description: '',
+      duration: 1,
+    }));
+    raw.navigationEntries[0]!.serverTiming = [];
+    raw.resourceEntries.splice(0, raw.resourceEntries.length, ...Array.from({ length: 26 }, (_value, index) => ({
+      ...rawResource(`https://fixture.test/timed-${index}.js`, 'script'),
+      serverTiming,
+      omittedServerTimingCount: 1,
+    })));
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.serverTiming).toHaveLength(500);
+    expect(result.truncation?.omittedServerTimingCount).toBe(26 + 20);
+  });
+
+  it('records telemetry headers, telemetry candidates, and projected network records omitted by limits', async () => {
+    const requests = Array.from({ length: 505 }, (_value, index) => requestEvidence(
+      `REQ-${index}`,
+      `https://fixture.test/analytics/${index}`,
+      'fetch',
+      { status: 'OBSERVED', values: { traceparent: `00-${index}` } },
+    ));
+    const responses = Array.from({ length: 205 }, (_value, index) => ({
+      requestId: `REQ-${index}`,
+      url: `https://fixture.test/analytics/${index}`,
+      status: 204,
+      statusText: 'No Content',
+      headers: { status: 'OBSERVED' as const, values: {} },
+      contentLengthHeader: null,
+      timing: timing(),
+      ...RESPONSE_FLAGS,
+    }));
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(rawBrowserEvidence()),
+      networkOf(requests, responses),
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.telemetryHeaders).toHaveLength(200);
+    expect(result.telemetryCandidates).toHaveLength(100);
+    expect(result.truncation).toMatchObject({
+      omittedNetworkRequestCount: 5,
+      omittedNetworkResponseCount: 5,
+      omittedTelemetryHeaderCount: 300,
+      omittedTelemetryCandidateCount: 400,
+    });
+  });
+
+  it('reports no truncation for small evidence', async () => {
+    const result = await new PerformanceCollector().collect(
+      fakePage(rawBrowserEvidence()),
+      networkEvidence(),
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.truncation).toEqual({
+      omittedServerTimingCount: 0,
+      omittedTelemetryHeaderCount: 0,
+      omittedTelemetryCandidateCount: 0,
+      omittedNetworkRequestCount: 0,
+      omittedNetworkResponseCount: 0,
+      textTruncated: false,
+    });
+    expect(Object.isFrozen(result.truncation)).toBe(true);
+  });
+
+  it('marks truncated text from projected network scalars and from browser web-vitals state', async () => {
+    const request = { ...requestEvidence('REQ-LONG-METHOD', 'https://fixture.test/app.js', 'script'), method: 'M'.repeat(700) };
+    const fromNetwork = await new PerformanceCollector().collect(
+      fakePage(rawBrowserEvidence()),
+      networkWithRequests([request]),
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+    expect(fromNetwork.truncation?.textTruncated).toBe(true);
+
+    const raw = rawBrowserEvidence();
+    raw.webVitalsTextTruncated = true;
+    const fromBrowser = await new PerformanceCollector().collect(
+      fakePage(raw),
+      EMPTY_NETWORK,
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+    expect(fromBrowser.status).toBe('COMPLETE');
+    expect(fromBrowser.truncation?.textTruncated).toBe(true);
+  });
+
+  it('bounds FAILED telemetry header error text by the shared error message limit', async () => {
+    const request = requestEvidence(
+      'REQ-HEADER-FAILURE',
+      'https://fixture.test/app.js',
+      'script',
+      { status: 'FAILED', errorText: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10) },
+    );
+
+    const result = await new PerformanceCollector().collect(
+      fakePage(rawBrowserEvidence()),
+      networkWithRequests([request]),
+      { deadlineAtMs: Date.now() + 1_000 },
+    );
+
+    expect(result.telemetryHeaders[0]).toEqual({
+      direction: 'REQUEST',
+      requestId: 'REQ-HEADER-FAILURE',
+      url: 'https://fixture.test/app.js',
+      status: 'FAILED',
+      errorText: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH),
+    });
+    expect(result.truncation?.textTruncated).toBe(true);
   });
 });

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Inner scroll container with default margin fixture</title>
+  <style>
+    /* body の余白は既定（8px）のまま。文書は余白の分だけスクロールできるが、本文は内側の領域がスクロールする。 */
+    body { font-family: sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="app-shell" style="height:100vh;overflow:auto">
+    <div id="tall-content" style="height:5000px">
+      <h1>Inner scroll container with default margin fixture</h1>
+    </div>
+  </div>
+</body>
+</html>

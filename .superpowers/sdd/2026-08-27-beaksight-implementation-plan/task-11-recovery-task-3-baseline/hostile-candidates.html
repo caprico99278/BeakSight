@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hostile candidate fixture</title>
+  </head>
+  <body>
+    <span id="hostile-label"></span>
+    <button type="button" aria-labelledby="hostile-label">Fallback label</button>
+    <script>
+      const label = document.getElementById('hostile-label');
+      for (let index = 0; index < 700; index += 1) {
+        label.append(document.createTextNode('x'));
+      }
+    </script>
+  </body>
+</html>

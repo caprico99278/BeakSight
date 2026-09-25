@@ -1,11 +1,52 @@
 import { readFile } from 'node:fs/promises';
 import type { BrowserContext, Page } from 'playwright';
-import type { HeaderEvidence, NetworkEvidence } from './network-collector.js';
+import { awaitBeforeDeadline } from '../core/deadline.js';
+import type {
+  CLSAttributionEvidence,
+  HeaderEvidence,
+  INPAttributionEvidence,
+  LCPAttributionEvidence,
+  NavigationTimingEvidence,
+  NetworkEvidence,
+  PerformanceEvidence,
+  PerformanceEvidenceFacts,
+  PerformanceTruncationEvidence,
+  ResourceCategory,
+  ResourceCategoryBasis,
+  ResourceCoverageEvidence,
+  ResourceSizeEvidence,
+  ResourceSizeStatus,
+  ResourceSummariesEvidence,
+  ResourceSummaryEvidence,
+  ResourceTimingEvidence,
+  ServerTimingEvidence,
+  ServerTimingSource,
+  TelemetryCandidateEvidence,
+  TelemetryHeaderDirection,
+  TelemetryHeaderEvidence,
+  TelemetryMatchingBasis,
+  UnobservedWebVitalStatus,
+  WebVitalEvidence,
+  WebVitalsEvidence,
+} from '../core/evidence-types.js';
+import {
+  INP_INTERACTION_TYPES,
+  UNOBSERVED_WEB_VITAL_STATUSES,
+  WEB_VITAL_NAVIGATION_TYPES,
+} from '../core/evidence-types.js';
+import {
+  isNonNegativeFiniteNumber,
+  isNonNegativeSafeInteger,
+  isPositiveSafeInteger,
+  isRecord,
+} from '../core/guards.js';
+import { deepFreeze } from '../core/immutable.js';
+import { MAX_ERROR_MESSAGE_LENGTH, MAX_RESOURCE_TIMING_ENTRIES, MAX_URL_LENGTH } from '../core/limits.js';
+import { truncateText } from '../core/text.js';
 
-const MAX_URL_LENGTH = 2_048;
 const MAX_ID_LENGTH = 256;
 const MAX_TEXT_LENGTH = 512;
-const MAX_RESOURCES = 500;
+const MAX_RESOURCES = MAX_RESOURCE_TIMING_ENTRIES;
 const MAX_SERVER_TIMING_PER_ENTRY = 20;
 const MAX_SERVER_TIMING_TOTAL = 500;
 const MAX_TELEMETRY_HEADERS = 200;
@@ -39,193 +80,78 @@ const GENERIC_TELEMETRY_HINTS = Object.freeze([
   'track',
 ] as const);
 
-export type WebVitalStatus = 'OBSERVED' | 'NOT_OBSERVED' | 'UNSUPPORTED';
-export type WebVitalRating = 'good' | 'needs-improvement' | 'poor';
-export type WebVitalNavigationType =
-  | 'navigate'
-  | 'reload'
-  | 'back-forward'
-  | 'back-forward-cache'
-  | 'prerender'
-  | 'restore'
-  | 'soft-navigation';
-
-export interface CLSAttributionEvidence {
-  readonly largestShiftTarget?: string;
-  readonly largestShiftTime?: number;
-  readonly largestShiftValue?: number;
-  readonly loadState?: string;
-}
-
-export interface LCPAttributionEvidence {
-  readonly target?: string;
-  readonly url?: string;
-  readonly timeToFirstByte?: number;
-  readonly resourceLoadDelay?: number;
-  readonly resourceLoadDuration?: number;
-  readonly elementRenderDelay?: number;
-}
-
-export interface INPAttributionEvidence {
-  readonly interactionTarget?: string;
-  readonly interactionTime?: number;
-  readonly interactionType?: 'pointer' | 'keyboard';
-  readonly nextPaintTime?: number;
-  readonly inputDelay?: number;
-  readonly processingDuration?: number;
-  readonly presentationDelay?: number;
-  readonly loadState?: string;
-}
-
-export type WebVitalEvidence<TAttribution> = Readonly<{
-  readonly status: 'OBSERVED';
-  readonly value: number;
-  readonly id: string | null;
-  readonly rating: WebVitalRating | null;
-  readonly navigationType: WebVitalNavigationType | null;
-  readonly attribution: Readonly<TAttribution> | null;
-}> | Readonly<{
-  readonly status: 'NOT_OBSERVED' | 'UNSUPPORTED';
-  readonly value: null;
-  readonly id: null;
-  readonly rating: null;
-  readonly navigationType: null;
-  readonly attribution: null;
-}>;
-
-export interface WebVitalsEvidence {
-  readonly CLS: WebVitalEvidence<CLSAttributionEvidence>;
-  readonly FCP: WebVitalEvidence<never>;
-  readonly INP: WebVitalEvidence<INPAttributionEvidence>;
-  readonly LCP: WebVitalEvidence<LCPAttributionEvidence>;
-  readonly TTFB: WebVitalEvidence<never>;
-}
-
-export interface ServerTimingEvidence {
-  readonly source: 'NAVIGATION' | 'RESOURCE';
-  readonly url: string;
-  readonly name: string;
-  readonly description: string;
-  readonly duration: number;
-}
-
-export interface NavigationTimingEvidence {
-  readonly url: string;
-  readonly navigationType: string;
-  readonly startTime: number;
-  readonly duration: number;
-  readonly responseStart: number;
-  readonly responseEnd: number;
-  readonly domContentLoadedEventStart: number;
-  readonly domContentLoadedEventEnd: number;
-  readonly loadEventStart: number;
-  readonly loadEventEnd: number;
-  readonly transferSize: number;
-  readonly encodedBodySize: number;
-  readonly decodedBodySize: number;
-  readonly serverTiming: readonly Readonly<ServerTimingEvidence>[];
-}
-
-export type ResourceCategory = 'script' | 'stylesheet' | 'image' | 'fetch-xhr';
-export type ResourceCategoryBasis = 'NETWORK_EVIDENCE' | 'INITIATOR_TYPE' | 'UNKNOWN';
-
-export interface ResourceTimingEvidence {
-  readonly url: string;
-  readonly initiatorType: string;
-  readonly startTime: number;
-  readonly duration: number;
-  readonly responseStart: number;
-  readonly responseEnd: number;
-  readonly transferSize: number;
-  readonly encodedBodySize: number;
-  readonly decodedBodySize: number;
-  readonly requestId: string | null;
-  readonly networkResourceType: string | null;
-  readonly category: ResourceCategory | null;
-  readonly categoryBasis: ResourceCategoryBasis;
-  readonly serverTiming: readonly Readonly<ServerTimingEvidence>[];
-}
-
-export interface ResourceSummaryEvidence {
-  readonly count: number;
-  readonly transferSize: number;
-  readonly encodedBodySize: number;
-  readonly decodedBodySize: number;
-}
-
-export interface ResourceSummariesEvidence {
-  readonly script: Readonly<ResourceSummaryEvidence>;
-  readonly stylesheet: Readonly<ResourceSummaryEvidence>;
-  readonly image: Readonly<ResourceSummaryEvidence>;
-  readonly 'fetch-xhr': Readonly<ResourceSummaryEvidence>;
-}
-
-export type TelemetryHeaderEvidence = Readonly<{
-  readonly direction: 'REQUEST' | 'RESPONSE';
-  readonly requestId: string;
-  readonly url: string;
-  readonly status: 'OBSERVED';
-  readonly values: Readonly<Record<string, string>>;
-}> | Readonly<{
-  readonly direction: 'REQUEST' | 'RESPONSE';
-  readonly requestId: string;
-  readonly url: string;
-  readonly status: 'FAILED';
-  readonly errorText: string;
-}>;
-
-export interface TelemetryCandidateEvidence {
-  readonly requestId: string;
-  readonly url: string;
-  readonly method: string;
-  readonly resourceType: string;
-  readonly matchingBasis: readonly ('TRACE_OR_CORRELATION_HEADER' | 'GENERIC_URL_HINT')[];
-  readonly matchedHeaderNames: readonly string[];
-  readonly matchedHints: readonly string[];
-}
-
-interface PerformanceEvidenceFacts {
-  readonly webVitals: Readonly<WebVitalsEvidence> | null;
-  readonly navigationTiming: Readonly<NavigationTimingEvidence> | null;
-  readonly resources: readonly Readonly<ResourceTimingEvidence>[];
-  readonly resourceSummaries: Readonly<ResourceSummariesEvidence> | null;
-  readonly serverTiming: readonly Readonly<ServerTimingEvidence>[];
-  readonly telemetryHeaders: readonly TelemetryHeaderEvidence[];
-  readonly telemetryCandidates: readonly Readonly<TelemetryCandidateEvidence>[];
-}
-
-export type PerformanceEvidence = Readonly<PerformanceEvidenceFacts & {
-  readonly status: 'COMPLETE';
-  readonly reason: 'COLLECTED';
-}> | Readonly<PerformanceEvidenceFacts & {
-  readonly status: 'PARTIAL';
-  readonly reason: 'DEADLINE_EXCEEDED' | 'EVALUATION_FAILED' | 'INVALID_BROWSER_DATA';
-}>;
 
 export interface PerformanceCollectionOptions {
   readonly deadlineAtMs: number;
 }
 
-type OperationOutcome<T> =
-  | { readonly status: 'FULFILLED'; readonly value: T }
-  | { readonly status: 'REJECTED'; readonly reason: unknown };
-
+// Network Evidence の同期的な射影の途中で期限を過ぎたことを表す。
 const DEADLINE = Symbol('deadline');
 
-function initializePerformanceState(library: unknown): void {
-  const maxIdLength = 256;
-  const maxTextLength = 512;
-  const maxUrlLength = 2_048;
+/** ブラウザ内の処理に渡す上限値。ブラウザ内では import できないため、Node側の定数を引数で渡す。 */
+interface BrowserPerformanceLimits {
+  readonly maxIdLength: number;
+  readonly maxTextLength: number;
+  readonly maxUrlLength: number;
+  readonly maxResourceTimingEntries: number;
+  readonly maxServerTimingPerEntry: number;
+}
+
+const BROWSER_PERFORMANCE_LIMITS: BrowserPerformanceLimits = Object.freeze({
+  maxIdLength: MAX_ID_LENGTH,
+  maxTextLength: MAX_TEXT_LENGTH,
+  maxUrlLength: MAX_URL_LENGTH,
+  maxResourceTimingEntries: MAX_RESOURCES,
+  maxServerTimingPerEntry: MAX_SERVER_TIMING_PER_ENTRY,
+});
+
+/** ブラウザ内の処理に渡す値の一覧。ブラウザ内では import できないため、core の配列を引数で渡す。 */
+interface BrowserPerformanceValueLists {
+  readonly webVitalNavigationTypes: readonly string[];
+  readonly inpInteractionTypes: readonly string[];
+}
+
+const BROWSER_PERFORMANCE_VALUE_LISTS: BrowserPerformanceValueLists = Object.freeze({
+  webVitalNavigationTypes: WEB_VITAL_NAVIGATION_TYPES,
+  inpInteractionTypes: INP_INTERACTION_TYPES,
+});
+
+function initializePerformanceState(
+  library: unknown,
+  limits: BrowserPerformanceLimits,
+  valueLists: BrowserPerformanceValueLists,
+): void {
+  const { maxIdLength, maxTextLength, maxUrlLength, maxResourceTimingEntries } = limits;
+  // Resource Timing のバッファを広げ、満杯になったことを記録する。ページのリスナーより先に動くよう capture で登録する。
+  let resourceBufferSize: number | null = null;
+  try {
+    if (typeof performance.setResourceTimingBufferSize === 'function') {
+      performance.setResourceTimingBufferSize(maxResourceTimingEntries);
+      resourceBufferSize = maxResourceTimingEntries;
+    }
+  } catch {
+    resourceBufferSize = null;
+  }
+  let resourceBufferFull = false;
+  let resourceBufferObservable = false;
+  try {
+    performance.addEventListener('resourcetimingbufferfull', () => {
+      resourceBufferFull = true;
+    }, { capture: true });
+    resourceBufferObservable = true;
+  } catch {
+    resourceBufferObservable = false;
+  }
+  let textTruncated = false;
   const supportedEntries = new Set(
     typeof PerformanceObserver === 'function' && Array.isArray(PerformanceObserver.supportedEntryTypes)
       ? PerformanceObserver.supportedEntryTypes
       : [],
   );
-  const blank = (status: 'NOT_OBSERVED' | 'UNSUPPORTED') => ({
+  const blank = (status: UnobservedWebVitalStatus) => ({
     status,
     value: null,
     id: null,
-    rating: null,
     navigationType: null,
     attribution: null,
   });
@@ -248,9 +174,11 @@ function initializePerformanceState(library: unknown): void {
     LCP: blank(support.LCP && typeof libraryRecord.onLCP === 'function' ? 'NOT_OBSERVED' : 'UNSUPPORTED'),
     TTFB: blank(support.TTFB && typeof libraryRecord.onTTFB === 'function' ? 'NOT_OBSERVED' : 'UNSUPPORTED'),
   };
-  const boundedString = (value: unknown, maxLength: number): string | undefined => (
-    typeof value === 'string' ? value.slice(0, maxLength) : undefined
-  );
+  const boundedString = (value: unknown, maxLength: number): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    if (value.length > maxLength) textTruncated = true;
+    return value.slice(0, maxLength);
+  };
   const nonnegative = (value: unknown): number | undefined => (
     typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
   );
@@ -283,7 +211,10 @@ function initializePerformanceState(library: unknown): void {
     } else if (name === 'INP') {
       copyString('interactionTarget');
       copyNumber('interactionTime');
-      if (source.interactionType === 'pointer' || source.interactionType === 'keyboard') {
+      if (
+        typeof source.interactionType === 'string'
+        && valueLists.inpInteractionTypes.includes(source.interactionType)
+      ) {
         output.interactionType = source.interactionType;
       }
       copyNumber('nextPaintTime');
@@ -294,24 +225,17 @@ function initializePerformanceState(library: unknown): void {
     }
     return Object.keys(output).length === 0 ? null : output;
   };
+  // web-vitals の `rating` は読まない（しきい値に照らした評価は Rule Catalog が行う）。
   const report = (name: string, metric: unknown): void => {
     if (typeof metric !== 'object' || metric === null) return;
     const candidate = metric as Record<string, unknown>;
     const value = nonnegative(candidate.value);
     if (value === undefined) return;
-    const rating = candidate.rating === 'good'
-      || candidate.rating === 'needs-improvement'
-      || candidate.rating === 'poor'
-      ? candidate.rating
-      : null;
-    const navigationTypes = new Set([
-      'navigate', 'reload', 'back-forward', 'back-forward-cache', 'prerender', 'restore', 'soft-navigation',
-    ]);
+    const navigationTypes = new Set(valueLists.webVitalNavigationTypes);
     state[name] = {
       status: 'OBSERVED',
       value,
       id: boundedString(candidate.id, maxIdLength) ?? null,
-      rating,
       navigationType: typeof candidate.navigationType === 'string' && navigationTypes.has(candidate.navigationType)
         ? candidate.navigationType
         : null,
@@ -336,7 +260,11 @@ function initializePerformanceState(library: unknown): void {
   register('LCP', 'onLCP');
   register('TTFB', 'onTTFB');
 
-  const snapshot = (): { readonly webVitals: Record<string, Record<string, unknown>> } => ({
+  const snapshot = (): {
+    readonly webVitals: Record<string, Record<string, unknown>>;
+    readonly textTruncated: boolean;
+    readonly resourceBuffer: { readonly size: number | null; readonly full: boolean | null };
+  } => ({
     webVitals: Object.fromEntries(Object.entries(state).map(([name, metric]) => [
       name,
       {
@@ -346,6 +274,9 @@ function initializePerformanceState(library: unknown): void {
           : null,
       },
     ])),
+    textTruncated,
+    // リスナーを登録できなかった場合は、満杯かどうかが分からないので `null` にする。
+    resourceBuffer: { size: resourceBufferSize, full: resourceBufferObservable ? resourceBufferFull : null },
   });
   Object.defineProperty(globalThis, '__BEAKSIGHT_PERFORMANCE__', {
     configurable: false,
@@ -361,7 +292,9 @@ function webVitalsBundleUrl(): URL {
 
 async function createInitScript(): Promise<string> {
   const bundle = await readFile(webVitalsBundleUrl(), { encoding: 'utf8' });
-  return `${bundle}\n;(${initializePerformanceState.toString()})(typeof webVitals === 'object' ? webVitals : undefined);`;
+  return `${bundle}\n;(${initializePerformanceState.toString()})(`
+    + `typeof webVitals === 'object' ? webVitals : undefined, ${JSON.stringify(BROWSER_PERFORMANCE_LIMITS)}, `
+    + `${JSON.stringify(BROWSER_PERFORMANCE_VALUE_LISTS)});`;
 }
 
 function validateOptions(options: PerformanceCollectionOptions): void {
@@ -370,78 +303,65 @@ function validateOptions(options: PerformanceCollectionOptions): void {
   }
 }
 
-async function beforeDeadline<T>(operation: Promise<T>, deadlineAtMs: number): Promise<T | typeof DEADLINE> {
-  const outcome = operation.then<OperationOutcome<T>, OperationOutcome<T>>(
-    (value) => ({ status: 'FULFILLED', value }),
-    (reason: unknown) => ({ status: 'REJECTED', reason }),
-  );
-  const remainingMs = deadlineAtMs - Date.now();
-  if (remainingMs <= 0) {
-    return DEADLINE;
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const result = await Promise.race([
-      outcome,
-      new Promise<typeof DEADLINE>((resolve) => {
-        timer = setTimeout(() => resolve(DEADLINE), remainingMs);
-      }),
-    ]);
-    if (result === DEADLINE || Date.now() >= deadlineAtMs) {
-      return DEADLINE;
-    }
-    if (result.status === 'REJECTED') {
-      throw result.reason;
-    }
-    return result.value;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-function boundedString(value: unknown, maximum: number): string | null {
-  return typeof value === 'string' ? value.slice(0, maximum) : null;
+/** 文字列を上限で切り詰める。切り詰めた場合は `state.textTruncated` を立てる。文字列でなければ `null`。 */
+function boundedString(value: unknown, maximum: number, state: TextState): string | null {
+  if (typeof value !== 'string') return null;
+  const bounded = truncateText(value, maximum);
+  if (bounded.truncated) state.textTruncated = true;
+  return bounded.text;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
+  return isRecord(value) ? value : null;
 }
 
 function nonnegative(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+  return isNonNegativeFiniteNumber(value) ? value : null;
 }
 
-function deepFreeze<T>(value: T): T {
-  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
-  for (const nested of Object.values(value)) deepFreeze(nested);
-  return Object.freeze(value);
-}
-
-function emptyVital(status: 'NOT_OBSERVED' | 'UNSUPPORTED' = 'NOT_OBSERVED'): WebVitalEvidence<never> {
+function emptyVital(status: UnobservedWebVitalStatus = 'NOT_OBSERVED'): WebVitalEvidence<never> {
   return Object.freeze({
     status,
     value: null,
     id: null,
-    rating: null,
     navigationType: null,
     attribution: null,
   });
 }
 
-interface ValidationState {
+interface TextState {
+  textTruncated: boolean;
+}
+
+interface ValidationState extends TextState {
   invalid: boolean;
+  /** 上限のため記録しなかった Server-Timing の件数（ブラウザ内とNode側の切り捨ての合計）。 */
+  omittedServerTimingCount: number;
+}
+
+function createValidationState(): ValidationState {
+  return { invalid: false, textTruncated: false, omittedServerTimingCount: 0 };
+}
+
+/** 上限のため記録しなかった件数を加える。件数が0以上の安全な整数でない場合や、合計が安全な整数を超える場合は不正なデータとする。 */
+function addOmittedServerTiming(validation: ValidationState, count: unknown): void {
+  const total = isNonNegativeSafeInteger(count) ? validation.omittedServerTimingCount + count : Number.NaN;
+  if (!isNonNegativeSafeInteger(total)) {
+    validation.invalid = true;
+    return;
+  }
+  validation.omittedServerTimingCount = total;
 }
 
 function copyOptionalString(
   source: Record<string, unknown>,
   target: Record<string, string | number>,
   key: string,
+  validation: ValidationState,
   maximum = MAX_TEXT_LENGTH,
 ): void {
   if (!(key in source)) return;
-  const value = boundedString(source[key], maximum);
+  const value = boundedString(source[key], maximum, validation);
   if (value !== null) target[key] = value;
 }
 
@@ -470,30 +390,31 @@ function normalizeAttribution(
   if (source === null) return null;
   const target: Record<string, string | number> = {};
   if (name === 'CLS') {
-    copyOptionalString(source, target, 'largestShiftTarget');
+    copyOptionalString(source, target, 'largestShiftTarget', validation);
     copyOptionalNumber(source, target, 'largestShiftTime', validation);
     copyOptionalNumber(source, target, 'largestShiftValue', validation);
-    copyOptionalString(source, target, 'loadState');
+    copyOptionalString(source, target, 'loadState', validation);
   } else if (name === 'LCP') {
-    copyOptionalString(source, target, 'target');
-    copyOptionalString(source, target, 'url', MAX_URL_LENGTH);
+    copyOptionalString(source, target, 'target', validation);
+    copyOptionalString(source, target, 'url', validation, MAX_URL_LENGTH);
     copyOptionalNumber(source, target, 'timeToFirstByte', validation);
     copyOptionalNumber(source, target, 'resourceLoadDelay', validation);
     copyOptionalNumber(source, target, 'resourceLoadDuration', validation);
     copyOptionalNumber(source, target, 'elementRenderDelay', validation);
   } else {
-    copyOptionalString(source, target, 'interactionTarget');
+    copyOptionalString(source, target, 'interactionTarget', validation);
     copyOptionalNumber(source, target, 'interactionTime', validation);
     if ('interactionType' in source) {
-      if (source.interactionType === 'pointer' || source.interactionType === 'keyboard') {
-        target.interactionType = source.interactionType;
+      const interactionType = INP_INTERACTION_TYPES.find((type) => type === source.interactionType);
+      if (interactionType !== undefined) {
+        target.interactionType = interactionType;
       }
     }
     copyOptionalNumber(source, target, 'nextPaintTime', validation);
     copyOptionalNumber(source, target, 'inputDelay', validation);
     copyOptionalNumber(source, target, 'processingDuration', validation);
     copyOptionalNumber(source, target, 'presentationDelay', validation);
-    copyOptionalString(source, target, 'loadState');
+    copyOptionalString(source, target, 'loadState', validation);
   }
   return Object.keys(target).length === 0 ? null : Object.freeze(target);
 }
@@ -504,17 +425,18 @@ function normalizeVital<TAttribution>(
   validation: ValidationState,
 ): WebVitalEvidence<TAttribution> {
   const source = record(value);
-  if (source?.status === 'UNSUPPORTED' || source?.status === 'NOT_OBSERVED') {
+  // `rating` はブラウザが返しても読まない（V12）。
+  const unobservedStatus = UNOBSERVED_WEB_VITAL_STATUSES.find((status) => status === source?.status);
+  if (source !== null && unobservedStatus !== undefined) {
     if (
       source.value !== null
       || source.id !== null
-      || source.rating !== null
       || source.navigationType !== null
       || source.attribution !== null
     ) {
       validation.invalid = true;
     }
-    return emptyVital(source.status === 'UNSUPPORTED' ? 'UNSUPPORTED' : 'NOT_OBSERVED');
+    return emptyVital(unobservedStatus);
   }
   if (source?.status !== 'OBSERVED') {
     validation.invalid = true;
@@ -525,31 +447,16 @@ function normalizeVital<TAttribution>(
     validation.invalid = true;
     return emptyVital();
   }
-  const rating = source.rating === 'good'
-    || source.rating === 'needs-improvement'
-    || source.rating === 'poor'
-    ? source.rating
-    : source.rating === null
+  const navigationType = WEB_VITAL_NAVIGATION_TYPES.find((type) => type === source.navigationType)
+    ?? (source.navigationType === null
       ? null
-      : (validation.invalid = true, null);
-  const navigationType = source.navigationType === 'navigate'
-    || source.navigationType === 'reload'
-    || source.navigationType === 'back-forward'
-    || source.navigationType === 'back-forward-cache'
-    || source.navigationType === 'prerender'
-    || source.navigationType === 'restore'
-    || source.navigationType === 'soft-navigation'
-    ? source.navigationType
-    : source.navigationType === null
-      ? null
-      : (validation.invalid = true, null);
-  const id = boundedString(source.id, MAX_ID_LENGTH);
+      : (validation.invalid = true, null));
+  const id = boundedString(source.id, MAX_ID_LENGTH, validation);
   if (source.id !== null && id === null) validation.invalid = true;
   return Object.freeze({
     status: 'OBSERVED',
     value: metricValue,
     id,
-    rating,
     navigationType,
     attribution: normalizeAttribution(name, source.attribution, validation) as Readonly<TAttribution> | null,
   });
@@ -561,7 +468,7 @@ function normalizeWebVitals(value: unknown, validation: ValidationState): WebVit
     validation.invalid = true;
     return null;
   }
-  const vitalValidation: ValidationState = { invalid: false };
+  const vitalValidation = createValidationState();
   const normalized = Object.freeze({
     CLS: normalizeVital<CLSAttributionEvidence>('CLS', source.CLS, vitalValidation),
     FCP: normalizeVital<never>('FCP', source.FCP, vitalValidation),
@@ -573,23 +480,31 @@ function normalizeWebVitals(value: unknown, validation: ValidationState): WebVit
     validation.invalid = true;
     return null;
   }
+  if (vitalValidation.textTruncated) validation.textTruncated = true;
   return normalized;
 }
 
+/**
+ * 1件の Navigation・Resource Timing の Server-Timing を正規化する。
+ * ブラウザ内で切り捨てた件数（`omittedServerTimingCount`）と、Node側の1件あたりの上限で切り捨てた件数を数える。
+ */
 function normalizeServerTiming(
-  value: unknown,
-  source: 'NAVIGATION' | 'RESOURCE',
+  entry: Record<string, unknown>,
+  source: ServerTimingSource,
   url: string,
   validation: ValidationState,
 ): readonly Readonly<ServerTimingEvidence>[] {
+  const value = entry.serverTiming;
   if (!Array.isArray(value)) {
     validation.invalid = true;
     return Object.freeze([]);
   }
+  addOmittedServerTiming(validation, entry.omittedServerTimingCount);
+  addOmittedServerTiming(validation, Math.max(0, value.length - MAX_SERVER_TIMING_PER_ENTRY));
   const output: ServerTimingEvidence[] = [];
   for (const candidate of value.slice(0, MAX_SERVER_TIMING_PER_ENTRY)) {
     const item = record(candidate);
-    const name = boundedString(item?.name, MAX_TEXT_LENGTH);
+    const name = boundedString(item?.name, MAX_TEXT_LENGTH, validation);
     const duration = nonnegative(item?.duration);
     if (item === null || name === null || duration === null) {
       validation.invalid = true;
@@ -599,7 +514,7 @@ function normalizeServerTiming(
       source,
       url,
       name,
-      description: boundedString(item.description, MAX_TEXT_LENGTH) ?? '',
+      description: boundedString(item.description, MAX_TEXT_LENGTH, validation) ?? '',
       duration,
     }));
   }
@@ -627,7 +542,7 @@ function normalizeNavigation(value: unknown, validation: ValidationState): Navig
   }
   if (value.length === 0) return null;
   const item = record(value[0]);
-  const url = boundedString(item?.name, MAX_URL_LENGTH);
+  const url = boundedString(item?.name, MAX_URL_LENGTH, validation);
   if (item === null || url === null) {
     validation.invalid = true;
     return null;
@@ -639,7 +554,7 @@ function normalizeNavigation(value: unknown, validation: ValidationState): Navig
   }
   return Object.freeze({
     url,
-    navigationType: boundedString(item.type, MAX_TEXT_LENGTH) ?? '',
+    navigationType: boundedString(item.type, MAX_TEXT_LENGTH, validation) ?? '',
     startTime: numbers.startTime as number,
     duration: numbers.duration as number,
     responseStart: numbers.responseStart as number,
@@ -651,7 +566,7 @@ function normalizeNavigation(value: unknown, validation: ValidationState): Navig
     transferSize: numbers.transferSize as number,
     encodedBodySize: numbers.encodedBodySize as number,
     decodedBodySize: numbers.decodedBodySize as number,
-    serverTiming: normalizeServerTiming(item.serverTiming, 'NAVIGATION', url, validation),
+    serverTiming: normalizeServerTiming(item, 'NAVIGATION', url, validation),
   });
 }
 
@@ -722,16 +637,32 @@ interface ProjectedNetworkResponse {
 interface ProjectedNetworkEvidence {
   readonly requests: readonly Readonly<ProjectedNetworkRequest>[];
   readonly responses: readonly Readonly<ProjectedNetworkResponse>[];
+  /** 上限のため読まなかったリクエストと response の件数。 */
+  readonly omittedRequestCount: number;
+  readonly omittedResponseCount: number;
+  /** 読んだ文字列のどれかを上限で切り詰めたか。 */
+  readonly textTruncated: boolean;
 }
 
-function projectHeaderEvidence(headers: HeaderEvidence, deadlineAtMs: number): HeaderEvidence | typeof DEADLINE {
+/** `value.slice(0, maximum)` と同じ結果を返し、切り詰めた場合は `state.textTruncated` を立てる。 */
+function clip(value: string, maximum: number, state: TextState): string {
+  const text = value.slice(0, maximum);
+  if (text.length < value.length) state.textTruncated = true;
+  return text;
+}
+
+function projectHeaderEvidence(
+  headers: HeaderEvidence,
+  deadlineAtMs: number,
+  state: TextState,
+): HeaderEvidence | typeof DEADLINE {
   if (Date.now() >= deadlineAtMs) return DEADLINE;
   const status = headers.status;
   if (Date.now() >= deadlineAtMs) return DEADLINE;
   if (status === 'FAILED') {
     const rawErrorText = headers.errorText;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const errorText = rawErrorText.slice(0, MAX_TEXT_LENGTH);
+    const errorText = clip(rawErrorText, MAX_ERROR_MESSAGE_LENGTH, state);
     return Object.freeze({
       status: 'FAILED',
       errorText,
@@ -756,7 +687,7 @@ function projectHeaderEvidence(headers: HeaderEvidence, deadlineAtMs: number): H
     const value = sourceValues[key];
     if (Date.now() >= deadlineAtMs) return DEADLINE;
     if (typeof value === 'string') {
-      values[key] = value.slice(0, MAX_TEXT_LENGTH);
+      values[key] = clip(value, MAX_TEXT_LENGTH, state);
     }
   }
   return Date.now() >= deadlineAtMs
@@ -781,6 +712,7 @@ function projectNetworkEvidence(
   const responseLimit = Math.min(responseLength, MAX_PROJECTED_RESPONSES);
   const requests: ProjectedNetworkRequest[] = [];
   const responses: ProjectedNetworkResponse[] = [];
+  const state: TextState = { textTruncated: false };
   for (let index = 0; index < requestLimit; index += 1) {
     if (Date.now() >= deadlineAtMs) return DEADLINE;
     const source = sourceRequests[index];
@@ -788,17 +720,17 @@ function projectNetworkEvidence(
     if (source === undefined) continue;
     const rawRequestId = source.requestId;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const requestId = rawRequestId.slice(0, MAX_ID_LENGTH);
+    const requestId = clip(rawRequestId, MAX_ID_LENGTH, state);
     const rawUrl = source.url;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const url = rawUrl.slice(0, MAX_URL_LENGTH);
+    const url = clip(rawUrl, MAX_URL_LENGTH, state);
     const correlationUrl = rawUrl.length <= MAX_URL_LENGTH ? rawUrl : null;
     const rawMethod = source.method;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const method = rawMethod.slice(0, MAX_TEXT_LENGTH);
+    const method = clip(rawMethod, MAX_TEXT_LENGTH, state);
     const rawResourceType = source.resourceType;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const resourceType = rawResourceType.slice(0, MAX_TEXT_LENGTH);
+    const resourceType = clip(rawResourceType, MAX_TEXT_LENGTH, state);
     let correlationResourceType: string | null = null;
     if (rawResourceType.length <= MAX_TEXT_LENGTH) {
       const normalizedResourceType = rawResourceType.toLowerCase();
@@ -806,7 +738,7 @@ function projectNetworkEvidence(
     }
     const rawHeaders = source.headers;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs);
+    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs, state);
     if (headers === DEADLINE) return DEADLINE;
     requests.push(Object.freeze({
       requestId,
@@ -826,13 +758,13 @@ function projectNetworkEvidence(
     if (source === undefined) continue;
     const rawRequestId = source.requestId;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const requestId = rawRequestId.slice(0, MAX_ID_LENGTH);
+    const requestId = clip(rawRequestId, MAX_ID_LENGTH, state);
     const rawUrl = source.url;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const url = rawUrl.slice(0, MAX_URL_LENGTH);
+    const url = clip(rawUrl, MAX_URL_LENGTH, state);
     const rawHeaders = source.headers;
     if (Date.now() >= deadlineAtMs) return DEADLINE;
-    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs);
+    const headers = projectHeaderEvidence(rawHeaders, deadlineAtMs, state);
     if (headers === DEADLINE) return DEADLINE;
     responses.push(Object.freeze({
       requestId,
@@ -844,6 +776,9 @@ function projectNetworkEvidence(
   return Object.freeze({
     requests: Object.freeze(requests),
     responses: Object.freeze(responses),
+    omittedRequestCount: requestLength - requestLimit,
+    omittedResponseCount: responseLength - responseLimit,
+    textTruncated: state.textTruncated,
   });
 }
 
@@ -879,9 +814,39 @@ function takeCompatibleRequest(
   return resourceTypes.size === 1 ? queue.shift() : undefined;
 }
 
+/** 文書のOrigin。文書を観測できない場合と、Originが不透明（`null`）な場合は `null`。 */
+function documentOrigin(navigation: NavigationTimingEvidence | null): string | null {
+  if (navigation === null) return null;
+  try {
+    const origin = new URL(navigation.url).origin;
+    return origin === 'null' ? null : origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 転送量と本文の大きさがすべて0で、文書と別Origin（または文書のOriginが分からない）の資源は、
+ * Timing-Allow-Origin がないため大きさを隠されたものとして扱い、大きさを不明とする。
+ */
+function resourceSizeStatus(
+  rawUrl: string,
+  sizes: { readonly transferSize: number; readonly encodedBodySize: number; readonly decodedBodySize: number },
+  origin: string | null,
+): ResourceSizeStatus {
+  if (sizes.transferSize !== 0 || sizes.encodedBodySize !== 0 || sizes.decodedBodySize !== 0) return 'OBSERVED';
+  if (origin === null) return 'CROSS_ORIGIN_RESTRICTED';
+  try {
+    return new URL(rawUrl).origin === origin ? 'OBSERVED' : 'CROSS_ORIGIN_RESTRICTED';
+  } catch {
+    return 'CROSS_ORIGIN_RESTRICTED';
+  }
+}
+
 function normalizeResources(
   value: unknown,
   projectedRequests: readonly ProjectedNetworkRequest[],
+  origin: string | null,
   validation: ValidationState,
 ): readonly Readonly<ResourceTimingEvidence>[] {
   if (!Array.isArray(value)) {
@@ -893,8 +858,8 @@ function normalizeResources(
   for (const candidate of value.slice(0, MAX_RESOURCES)) {
     const item = record(candidate);
     const rawUrl = typeof item?.name === 'string' ? item.name : null;
-    const url = boundedString(rawUrl, MAX_URL_LENGTH);
-    const initiatorType = boundedString(item?.initiatorType, MAX_TEXT_LENGTH);
+    const url = boundedString(rawUrl, MAX_URL_LENGTH, validation);
+    const initiatorType = boundedString(item?.initiatorType, MAX_TEXT_LENGTH, validation);
     if (item === null || rawUrl === null || url === null || initiatorType === null) {
       validation.invalid = true;
       continue;
@@ -916,6 +881,14 @@ function normalizeResources(
       : fromInitiator !== null
         ? 'INITIATOR_TYPE'
         : 'UNKNOWN';
+    const sizes = {
+      transferSize: numbers.transferSize as number,
+      encodedBodySize: numbers.encodedBodySize as number,
+      decodedBodySize: numbers.decodedBodySize as number,
+    };
+    const sizeEvidence: ResourceSizeEvidence = resourceSizeStatus(rawUrl, sizes, origin) === 'OBSERVED'
+      ? { sizeStatus: 'OBSERVED', ...sizes }
+      : { sizeStatus: 'CROSS_ORIGIN_RESTRICTED', transferSize: null, encodedBodySize: null, decodedBodySize: null };
     output.push(Object.freeze({
       url,
       initiatorType,
@@ -923,26 +896,27 @@ function normalizeResources(
       duration: numbers.duration as number,
       responseStart: numbers.responseStart as number,
       responseEnd: numbers.responseEnd as number,
-      transferSize: numbers.transferSize as number,
-      encodedBodySize: numbers.encodedBodySize as number,
-      decodedBodySize: numbers.decodedBodySize as number,
-      requestId: request === undefined ? null : boundedString(request.requestId, MAX_ID_LENGTH),
-      networkResourceType: request === undefined ? null : boundedString(request.resourceType, MAX_TEXT_LENGTH),
+      ...sizeEvidence,
+      requestId: request === undefined ? null : boundedString(request.requestId, MAX_ID_LENGTH, validation),
+      networkResourceType: request === undefined
+        ? null
+        : boundedString(request.resourceType, MAX_TEXT_LENGTH, validation),
       category,
       categoryBasis,
-      serverTiming: normalizeServerTiming(item.serverTiming, 'RESOURCE', url, validation),
+      serverTiming: normalizeServerTiming(item, 'RESOURCE', url, validation),
     }));
   }
   return Object.freeze(output);
 }
 
 function emptySummary(): ResourceSummaryEvidence {
-  return { count: 0, transferSize: 0, encodedBodySize: 0, decodedBodySize: 0 };
+  return { count: 0, sizeUnknownCount: 0, transferSize: 0, encodedBodySize: 0, decodedBodySize: 0 };
 }
 
+/** 観測できた資源をカテゴリごとに集計する。大きさが不明な資源は件数だけを数え、大きさの合計に0として入れない。 */
 function summarizeResources(
   resources: readonly ResourceTimingEvidence[],
-  validation?: ValidationState,
+  validation: ValidationState,
 ): ResourceSummariesEvidence | null {
   const mutable: Record<ResourceCategory, ResourceSummaryEvidence> = {
     script: emptySummary(),
@@ -953,14 +927,17 @@ function summarizeResources(
   for (const resource of resources) {
     if (resource.category === null) continue;
     const previous = mutable[resource.category];
-    const next = {
-      count: previous.count + 1,
-      transferSize: previous.transferSize + resource.transferSize,
-      encodedBodySize: previous.encodedBodySize + resource.encodedBodySize,
-      decodedBodySize: previous.decodedBodySize + resource.decodedBodySize,
-    };
-    if (Object.values(next).some((value) => !Number.isSafeInteger(value) || value < 0)) {
-      if (validation !== undefined) validation.invalid = true;
+    const next = resource.sizeStatus === 'OBSERVED'
+      ? {
+        count: previous.count + 1,
+        sizeUnknownCount: previous.sizeUnknownCount,
+        transferSize: previous.transferSize + resource.transferSize,
+        encodedBodySize: previous.encodedBodySize + resource.encodedBodySize,
+        decodedBodySize: previous.decodedBodySize + resource.decodedBodySize,
+      }
+      : { ...previous, count: previous.count + 1, sizeUnknownCount: previous.sizeUnknownCount + 1 };
+    if (Object.values(next).some((value) => !isNonNegativeSafeInteger(value))) {
+      validation.invalid = true;
       return null;
     }
     mutable[resource.category] = next;
@@ -973,8 +950,36 @@ function summarizeResources(
   });
 }
 
-function emptyResourceSummaries(): ResourceSummariesEvidence {
-  return summarizeResources([]) as ResourceSummariesEvidence;
+/**
+ * Resource Timing の観測範囲を正規化する。バッファの状態か、上限で記録しなかった件数が不正な場合は、
+ * 不正なデータとして `null` を返す（完全に観測できたとはみなさない）。
+ */
+function normalizeResourceCoverage(
+  rawRecord: Record<string, unknown>,
+  rawResources: unknown,
+  retainedEntryCount: number,
+  validation: ValidationState,
+): ResourceCoverageEvidence | null {
+  const buffer = record(rawRecord.resourceBuffer);
+  const bufferSize = buffer?.size;
+  const bufferFull = buffer?.full;
+  const browserOmitted = rawRecord.omittedResourceEntryCount;
+  if (
+    buffer === null
+    || typeof bufferFull !== 'boolean'
+    || !(bufferSize === null || isPositiveSafeInteger(bufferSize))
+    || !isNonNegativeSafeInteger(browserOmitted)
+    || !Array.isArray(rawResources)
+  ) {
+    validation.invalid = true;
+    return null;
+  }
+  const omittedEntryCount = browserOmitted + Math.max(0, rawResources.length - MAX_RESOURCES);
+  if (!isNonNegativeSafeInteger(omittedEntryCount)) {
+    validation.invalid = true;
+    return null;
+  }
+  return Object.freeze({ bufferSize, bufferFull, retainedEntryCount, omittedEntryCount });
 }
 
 function selectedTelemetryHeaders(headers: Readonly<Record<string, string>>): Readonly<Record<string, string>> {
@@ -984,7 +989,7 @@ function selectedTelemetryHeaders(headers: Readonly<Record<string, string>>): Re
 }
 
 function telemetryHeaderObservation(
-  direction: 'REQUEST' | 'RESPONSE',
+  direction: TelemetryHeaderDirection,
   requestId: string,
   url: string,
   headers: HeaderEvidence,
@@ -995,7 +1000,7 @@ function telemetryHeaderObservation(
       requestId: requestId.slice(0, MAX_ID_LENGTH),
       url: url.slice(0, MAX_URL_LENGTH),
       status: 'FAILED',
-      errorText: headers.errorText.slice(0, MAX_TEXT_LENGTH),
+      errorText: headers.errorText.slice(0, MAX_ERROR_MESSAGE_LENGTH),
     });
   }
   const values = selectedTelemetryHeaders(headers.values);
@@ -1011,32 +1016,29 @@ function telemetryHeaderObservation(
 interface TelemetryFacts {
   readonly headers: readonly TelemetryHeaderEvidence[];
   readonly candidates: readonly Readonly<TelemetryCandidateEvidence>[];
-}
-
-function emptyTelemetryFacts(): TelemetryFacts {
-  return Object.freeze({
-    headers: Object.freeze([]),
-    candidates: Object.freeze([]),
-  });
+  readonly omittedHeaderCount: number;
+  readonly omittedCandidateCount: number;
 }
 
 function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFacts {
-  const observations: TelemetryHeaderEvidence[] = [];
+  const allObservations: TelemetryHeaderEvidence[] = [];
   for (const request of networkEvidence.requests) {
     const observation = telemetryHeaderObservation(
       'REQUEST', request.requestId, request.url, request.headers,
     );
-    if (observation !== null && observations.length < MAX_TELEMETRY_HEADERS) observations.push(observation);
+    if (observation !== null) allObservations.push(observation);
   }
   for (const response of networkEvidence.responses) {
     const observation = telemetryHeaderObservation(
       'RESPONSE', response.requestId, response.url, response.headers,
     );
-    if (observation !== null && observations.length < MAX_TELEMETRY_HEADERS) observations.push(observation);
+    if (observation !== null) allObservations.push(observation);
   }
+  const observations = allObservations.slice(0, MAX_TELEMETRY_HEADERS);
 
+  // 候補の判定には、上限で記録しなかったヘッダの観測も使う。
   const headerNamesByRequest = new Map<string, string[]>();
-  for (const observation of observations) {
+  for (const observation of allObservations) {
     if (observation.status !== 'OBSERVED') continue;
     const names = headerNamesByRequest.get(observation.requestId) ?? [];
     const existing = new Set(names.map((name) => name.toLowerCase()));
@@ -1050,15 +1052,19 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
   }
 
   const candidates: TelemetryCandidateEvidence[] = [];
+  let omittedCandidateCount = 0;
   for (const request of networkEvidence.requests) {
-    if (candidates.length >= MAX_TELEMETRY_CANDIDATES) break;
     const matchedHeaderNames = headerNamesByRequest.get(request.requestId) ?? [];
     const lowerUrl = request.url.toLowerCase();
     const matchedHints = GENERIC_TELEMETRY_HINTS.filter((hint) => lowerUrl.includes(hint));
-    const matchingBasis: ('TRACE_OR_CORRELATION_HEADER' | 'GENERIC_URL_HINT')[] = [];
+    const matchingBasis: TelemetryMatchingBasis[] = [];
     if (matchedHeaderNames.length > 0) matchingBasis.push('TRACE_OR_CORRELATION_HEADER');
     if (matchedHints.length > 0) matchingBasis.push('GENERIC_URL_HINT');
     if (matchingBasis.length === 0) continue;
+    if (candidates.length >= MAX_TELEMETRY_CANDIDATES) {
+      omittedCandidateCount += 1;
+      continue;
+    }
     candidates.push(Object.freeze({
       requestId: request.requestId.slice(0, MAX_ID_LENGTH),
       url: request.url.slice(0, MAX_URL_LENGTH),
@@ -1072,10 +1078,12 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
   return Object.freeze({
     headers: Object.freeze(observations),
     candidates: Object.freeze(candidates),
+    omittedHeaderCount: allObservations.length - observations.length,
+    omittedCandidateCount,
   });
 }
 
-function browserSnapshot(): unknown {
+function browserSnapshot(limits: BrowserPerformanceLimits): unknown {
   const globalObject = globalThis as typeof globalThis & {
     __BEAKSIGHT_PERFORMANCE__?: unknown;
   };
@@ -1083,6 +1091,17 @@ function browserSnapshot(): unknown {
   const pageStateRecord = typeof pageState === 'object' && pageState !== null && !Array.isArray(pageState)
     ? pageState as Record<string, unknown>
     : undefined;
+  const serverTimingOf = (entry: PerformanceResourceTiming) => {
+    const serverTiming = Array.from(entry.serverTiming ?? []);
+    return {
+      serverTiming: serverTiming.slice(0, limits.maxServerTimingPerEntry).map((server) => ({
+        name: server.name,
+        description: server.description,
+        duration: server.duration,
+      })),
+      omittedServerTimingCount: Math.max(0, serverTiming.length - limits.maxServerTimingPerEntry),
+    };
+  };
   const navigationEntries = performance.getEntriesByType('navigation').slice(0, 1).map((entry) => {
     const navigation = entry as PerformanceNavigationTiming;
     return {
@@ -1099,14 +1118,11 @@ function browserSnapshot(): unknown {
       transferSize: navigation.transferSize,
       encodedBodySize: navigation.encodedBodySize,
       decodedBodySize: navigation.decodedBodySize,
-      serverTiming: Array.from(navigation.serverTiming ?? []).slice(0, 20).map((server) => ({
-        name: server.name,
-        description: server.description,
-        duration: server.duration,
-      })),
+      ...serverTimingOf(navigation),
     };
   });
-  const resourceEntries = performance.getEntriesByType('resource').slice(0, 500).map((entry) => {
+  const allResourceEntries = performance.getEntriesByType('resource');
+  const resourceEntries = allResourceEntries.slice(0, limits.maxResourceTimingEntries).map((entry) => {
     const resource = entry as PerformanceResourceTiming;
     return {
       name: resource.name,
@@ -1118,31 +1134,53 @@ function browserSnapshot(): unknown {
       transferSize: resource.transferSize,
       encodedBodySize: resource.encodedBodySize,
       decodedBodySize: resource.decodedBodySize,
-      serverTiming: Array.from(resource.serverTiming ?? []).slice(0, 20).map((server) => ({
-        name: server.name,
-        description: server.description,
-        duration: server.duration,
-      })),
+      ...serverTimingOf(resource),
     };
   });
   return {
     webVitals: pageStateRecord?.webVitals,
+    webVitalsTextTruncated: pageStateRecord?.textTruncated,
+    resourceBuffer: pageStateRecord?.resourceBuffer,
     navigationEntries,
     resourceEntries,
+    omittedResourceEntryCount: allResourceEntries.length - resourceEntries.length,
   };
 }
 
-function emptyFacts(telemetry: TelemetryFacts): PerformanceEvidenceFacts {
-  const resources = Object.freeze([]) as readonly ResourceTimingEvidence[];
+/** ブラウザの値を観測する前の事実。資源の集計と観測範囲は、0件ではなく `null`（未観測）にする。 */
+function unobservedFacts(
+  projected: ProjectedNetworkEvidence | null,
+  telemetry: TelemetryFacts | null,
+): PerformanceEvidenceFacts {
   return {
     webVitals: null,
     navigationTiming: null,
-    resources,
-    resourceSummaries: emptyResourceSummaries(),
+    resources: Object.freeze([]),
+    resourceSummaries: null,
+    resourceCoverage: null,
     serverTiming: Object.freeze([]),
-    telemetryHeaders: telemetry.headers,
-    telemetryCandidates: telemetry.candidates,
+    telemetryHeaders: telemetry?.headers ?? Object.freeze([]),
+    telemetryCandidates: telemetry?.candidates ?? Object.freeze([]),
+    truncation: projected === null || telemetry === null
+      ? null
+      : truncationFacts(projected, telemetry, null, false),
   };
+}
+
+function truncationFacts(
+  projected: ProjectedNetworkEvidence,
+  telemetry: TelemetryFacts,
+  omittedServerTimingCount: number | null,
+  browserTextTruncated: boolean,
+): PerformanceTruncationEvidence {
+  return Object.freeze({
+    omittedServerTimingCount,
+    omittedTelemetryHeaderCount: telemetry.omittedHeaderCount,
+    omittedTelemetryCandidateCount: telemetry.omittedCandidateCount,
+    omittedNetworkRequestCount: projected.omittedRequestCount,
+    omittedNetworkResponseCount: projected.omittedResponseCount,
+    textTruncated: projected.textTruncated || browserTextTruncated,
+  });
 }
 
 function partial(
@@ -1189,50 +1227,75 @@ export class PerformanceCollector {
   ): Promise<PerformanceEvidence> {
     validateOptions(options);
     const deadlineAtMs = options.deadlineAtMs;
-    const unavailable = emptyFacts(emptyTelemetryFacts());
+    const unavailable = unobservedFacts(null, null);
     if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', unavailable);
     const projectedNetwork = projectNetworkEvidence(networkEvidence, deadlineAtMs);
     if (projectedNetwork === DEADLINE || Date.now() >= deadlineAtMs) {
       return partial('DEADLINE_EXCEEDED', unavailable);
     }
     const telemetry = telemetryFacts(projectedNetwork);
-    const empty = emptyFacts(telemetry);
+    const empty = unobservedFacts(projectedNetwork, telemetry);
     if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', unavailable);
 
-    let raw: unknown | typeof DEADLINE;
-    try {
-      raw = await beforeDeadline(page.evaluate(browserSnapshot), deadlineAtMs);
-    } catch {
+    const evaluated = await awaitBeforeDeadline(
+      page.evaluate(browserSnapshot, BROWSER_PERFORMANCE_LIMITS),
+      deadlineAtMs,
+    );
+    if (evaluated.status === 'REJECTED') {
       return Date.now() >= deadlineAtMs
         ? partial('DEADLINE_EXCEEDED', empty)
         : partial('EVALUATION_FAILED', empty);
     }
-    if (raw === DEADLINE) return partial('DEADLINE_EXCEEDED', empty);
+    if (evaluated.status === 'DEADLINE_EXCEEDED') return partial('DEADLINE_EXCEEDED', empty);
 
-    const validation: ValidationState = { invalid: false };
-    const rawRecord = record(raw);
+    const validation = createValidationState();
+    const rawRecord = record(evaluated.value);
     if (rawRecord === null) {
       return partial('INVALID_BROWSER_DATA', empty);
     }
     const webVitals = normalizeWebVitals(rawRecord.webVitals, validation);
+    const webVitalsTextTruncated = rawRecord.webVitalsTextTruncated;
+    if (typeof webVitalsTextTruncated !== 'boolean') validation.invalid = true;
     const navigationTiming = normalizeNavigation(rawRecord.navigationEntries, validation);
-    const resources = normalizeResources(rawRecord.resourceEntries, projectedNetwork.requests, validation);
-    const serverTiming = Object.freeze([
+    const resources = normalizeResources(
+      rawRecord.resourceEntries,
+      projectedNetwork.requests,
+      documentOrigin(navigationTiming),
+      validation,
+    );
+    const resourceCoverage = normalizeResourceCoverage(
+      rawRecord,
+      rawRecord.resourceEntries,
+      resources.length,
+      validation,
+    );
+    const allServerTiming = [
       ...(navigationTiming?.serverTiming ?? []),
       ...resources.flatMap((resource) => resource.serverTiming),
-    ].slice(0, MAX_SERVER_TIMING_TOTAL));
+    ];
+    const serverTiming = Object.freeze(allServerTiming.slice(0, MAX_SERVER_TIMING_TOTAL));
+    addOmittedServerTiming(validation, allServerTiming.length - serverTiming.length);
     const facts: PerformanceEvidenceFacts = {
       webVitals,
       navigationTiming,
       resources,
       resourceSummaries: summarizeResources(resources, validation),
+      resourceCoverage,
       serverTiming,
       telemetryHeaders: telemetry.headers,
       telemetryCandidates: telemetry.candidates,
+      truncation: truncationFacts(
+        projectedNetwork,
+        telemetry,
+        validation.omittedServerTimingCount,
+        validation.textTruncated || (webVitals !== null && webVitalsTextTruncated === true),
+      ),
     };
     if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', facts);
-    return validation.invalid
-      ? partial('INVALID_BROWSER_DATA', facts)
-      : completeBeforeDeadline(deadlineAtMs, facts);
+    if (validation.invalid) return partial('INVALID_BROWSER_DATA', facts);
+    if (resourceCoverage !== null && (resourceCoverage.bufferFull || resourceCoverage.omittedEntryCount > 0)) {
+      return partial('RESOURCE_LIMIT_REACHED', facts);
+    }
+    return completeBeforeDeadline(deadlineAtMs, facts);
   }
 }

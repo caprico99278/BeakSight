@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mobile-only overflow fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      /* Desktop（1440px）の幅には収まり、Mobile（390px）の幅では文書が横にはみ出す。 */
+      #fixed-width-panel { width: 600px; height: 120px; background: #dde; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Mobile-only overflow fixture</h1>
+      <div id="fixed-width-panel">A panel with a fixed width of 600px</div>
+    </main>
+  </body>
+</html>

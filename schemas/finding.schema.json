@@ -22,14 +22,29 @@
     "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "ruleId": { "type": "string", "minLength": 1 },
     "ruleVersion": { "type": "integer", "minimum": 1 },
-    "category": { "type": "string", "minLength": 1 },
+    "category": {
+      "enum": [
+        "HTTP",
+        "LINK",
+        "RESOURCE",
+        "JAVASCRIPT",
+        "DOM",
+        "FORM",
+        "ACCESSIBILITY",
+        "LAYOUT",
+        "PERFORMANCE",
+        "CROSS_PAGE",
+        "SAFETY"
+      ]
+    },
     "severity": { "enum": ["ERROR", "WARN", "INFO", "SAFETY"] },
     "pageId": { "type": ["string", "null"] },
     "pageUrl": { "type": ["string", "null"] },
-    "viewport": { "type": ["string", "null"] },
+    "viewport": { "enum": ["desktop", "mobile", null] },
     "message": { "type": "string", "minLength": 1 },
     "evidenceRefs": {
       "type": "array",
+      "minItems": 1,
       "items": { "type": "string", "pattern": "^EV-[A-Z0-9_]+-[0-9]{6,}$" }
     }
   }

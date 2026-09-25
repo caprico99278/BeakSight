@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Wide table fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; }
+      /* スクロールする外枠のない、ビューポートより広い表。 */
+      #wide-table { width: 900px; border-collapse: collapse; table-layout: fixed; }
+      #wide-table td { width: 300px; padding: 0; }
+      #wide-table a { display: inline-block; width: 280px; }
+    </style>
+  </head>
+  <body>
+    <table id="wide-table">
+      <tbody>
+        <tr>
+          <td><a id="wide-cell-link-1" href="#cell-1">First cell link</a></td>
+          <td><a id="wide-cell-link-2" href="#cell-2">Second cell link</a></td>
+          <td><a id="wide-cell-link-3" href="#cell-3">Third cell link</a></td>
+        </tr>
+      </tbody>
+    </table>
+  </body>
+</html>

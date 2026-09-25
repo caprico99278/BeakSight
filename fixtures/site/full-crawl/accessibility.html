@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Accessibility</title>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ2。壊した箇所: 名前（文字も aria-label もない）のないボタン → axe の button-name → A11Y_BUTTON_NAME。
+      ボタンは、押しても何もしない（リクエストもナビゲーションもしない）。
+    -->
+    <main>
+      <h1>Full crawl fixture accessibility problem</h1>
+      <button type="button" id="unnamed-button"></button>
+      <p><a href="/full-crawl/index.html">Back to the start</a></p>
+    </main>
+  </body>
+</html>

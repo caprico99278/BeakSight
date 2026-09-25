@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Page wrapper overflow-x hidden fixture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: sans-serif; }
+      img { display: block; }
+      /* ページ全体を包む外枠。はみ出す装飾を、overflow-x:hidden で切り取る。 */
+      #page-wrapper { overflow-x: hidden; }
+      #decoration { width: 640px; height: 24px; margin-left: -60px; background: #ddd; }
+      #wide-banner-image { width: 700px; height: 60px; }
+      #page-wrapper p { margin: 0 0 8px; }
+    </style>
+  </head>
+  <body>
+    <div id="page-wrapper">
+      <div id="decoration"></div>
+      <img id="wide-banner-image" alt="Wide banner" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+      <p>Every line of this text fits inside the page wrapper.</p>
+      <p>Another short paragraph.</p>
+    </div>
+  </body>
+</html>

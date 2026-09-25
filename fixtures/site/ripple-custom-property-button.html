@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Ripple Custom Property Button</title>
+  </head>
+  <body>
+    <button type="button" id="inert">Ripple variable inert</button>
+    <button type="button" id="grow">Ripple variable grow</button>
+    <script>
+      // 押し下げたときに、ripple の開始位置を CSS の変数として style に残し、ripple の class を225ms後に外す（R6 の I-1）。
+      // 変数は、押した後も style に残る。
+      for (const button of document.querySelectorAll('button')) {
+        button.addEventListener('pointerdown', (event) => {
+          button.classList.add('rp-active');
+          button.style.setProperty('--rp-start', `${Math.round(event.offsetX)}px ${Math.round(event.offsetY)}px`);
+          setTimeout(() => button.classList.remove('rp-active'), 225);
+        });
+      }
+      // "Ripple variable inert" は、click では何もしない。"Ripple variable grow" は、click で自分の幅を変える。
+      const grow = document.querySelector('#grow');
+      grow.addEventListener('click', () => {
+        grow.style.width = '320px';
+      });
+    </script>
+  </body>
+</html>

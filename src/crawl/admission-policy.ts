@@ -1,47 +1,43 @@
+import type { LinkAdmissionEvidence } from '../core/evidence-types.js';
+import {
+  canonicalizeAllowedOrigins,
+  CREDENTIALS_NOT_ALLOWED,
+  hasUrlCredentials,
+  isHttpProtocol,
+  redactUrlCredentials,
+} from './normalize-url.js';
+
 export interface AdmissionPolicy {
   readonly allowedOrigins: ReadonlySet<string>;
 }
 
-export type UrlAdmission =
-  | { readonly kind: 'INTERNAL_NAVIGABLE'; readonly url: string }
-  | { readonly kind: 'EXTERNAL_RECORD_ONLY'; readonly url: string }
-  | { readonly kind: 'SPECIAL_SCHEME_RECORD_ONLY'; readonly rawUrl: string; readonly scheme: string }
-  | { readonly kind: 'REJECTED_INVALID'; readonly rawUrl: string; readonly reason: string };
+/** URL の受け入れ判定の結果。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
+export type UrlAdmission = LinkAdmissionEvidence;
 
-const canonicalizeAllowedOrigins = (policy: AdmissionPolicy): ReadonlySet<string> => {
-  const canonicalOrigins = new Set<string>();
-  for (const entry of policy.allowedOrigins) {
-    try {
-      const url = new URL(entry);
-      if ((url.protocol === 'http:' || url.protocol === 'https:') && url.username.length === 0 && url.password.length === 0) {
-        canonicalOrigins.add(url.origin);
-      }
-    } catch {
-      // 不正なポリシーエントリに巡回権限を与えてはならない。
-    }
-  }
-  return canonicalOrigins;
-};
-
+/**
+ * URL を受け入れ判定する。記録する `rawUrl` は、認証情報を伏せ字にした値（`redactUrlCredentials`）。
+ * 受け入れない理由は、閉じた一覧 `URL_REJECTION_REASONS` のコード。
+ */
 export const classifyUrl = (url: URL, policy: AdmissionPolicy): UrlAdmission => {
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+  const rawUrl = redactUrlCredentials(url.toString());
+  if (!isHttpProtocol(url.protocol)) {
     return {
       kind: 'SPECIAL_SCHEME_RECORD_ONLY',
-      rawUrl: url.toString(),
+      rawUrl,
       scheme: url.protocol.slice(0, -1),
     };
   }
 
-  if (url.username.length > 0 || url.password.length > 0) {
-    return { kind: 'REJECTED_INVALID', rawUrl: url.toString(), reason: 'credential-bearing HTTP(S) URL' };
+  if (hasUrlCredentials(url)) {
+    return { kind: 'REJECTED_INVALID', rawUrl, reason: CREDENTIALS_NOT_ALLOWED };
   }
 
   if (url.origin === 'null' || url.hostname.length === 0) {
-    return { kind: 'REJECTED_INVALID', rawUrl: url.toString(), reason: 'invalid HTTP(S) URL' };
+    return { kind: 'REJECTED_INVALID', rawUrl, reason: 'INVALID_URL' };
   }
 
   const canonicalUrl = url.toString();
-  if (canonicalizeAllowedOrigins(policy).has(url.origin)) {
+  if (canonicalizeAllowedOrigins(policy.allowedOrigins).has(url.origin)) {
     return { kind: 'INTERNAL_NAVIGABLE', url: canonicalUrl };
   }
 

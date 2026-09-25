@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Controlled Panel Button</title>
+  </head>
+  <body>
+    <button type="button" aria-controls="controlled-panel">Show panel</button>
+    <div id="controlled-panel" hidden>Controlled panel content</div>
+    <script>
+      // 押すと、aria-controls の先の表示が切り替わる。ボタン自身の属性と文字は変わらない。
+      const button = document.querySelector('button');
+      const panel = document.querySelector('#controlled-panel');
+      button.addEventListener('click', () => {
+        panel.hidden = !panel.hidden;
+      });
+    </script>
+  </body>
+</html>
