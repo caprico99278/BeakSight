@@ -2163,3 +2163,12 @@
 - DEF-017 と DEF-019 を完了にした。DEF-018 は対応しない（理由付き）。DEF-016 は Task 20 の後に決める。
 - 未実行: Windows での verify（DEF-019 の fixture は、Windows では Meiryo の字形に同じ寸法の指定がかかるので、これまでと同じ結果になる見込み。未確認）。Task 20 の前に、ユーザーの PC で `npm run verify` を行う。
 - 次: Task 20（ユーザーの Windows の PC。headed）。
+
+### 2026-10-01 Task 20 の手順書（クラウドのセッション）
+
+- ユーザーが、クラウドのセッションの作業をマージした。残りの作業（Windows での `npm run verify`、Task 20、DEF-016 の判断）は、ユーザーの Windows の PC で行う。
+- ユーザーの許可（2026-10-01）を得て、このセッションの作業ツリーを、リモートの作業ブランチに早送り（`git merge --ff-only`）で合わせた。SKILL.md 第2章のクラウドの例外に、このことを加えた。
+- Task 20 の実行の手順書 `T20-procedure.md` を書いた。内容: headed の制約、事前の Gate、リポジトリの外に置く smoke 専用の設定（デモのサイト、`maxPages` 5、headed）、確かめる項目（Safety Ledger、出力、`report.html` の目視、DEF-016 の材料）、判定、設計者に渡す記録の形式。
+  - 並行の数の設定の項目はなく、Run Coordinator はページを1つずつ処理する（`src/orchestration/run-coordinator.ts` の 513 行からのループ）。
+  - 手順書の設定は、クラウドで `validate-config` を通した（終了コード 0。接続はしていない）。
+- 次: ユーザーの Windows の PC で、手順書の 1〜6 を行う。
