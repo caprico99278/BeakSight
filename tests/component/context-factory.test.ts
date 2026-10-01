@@ -1,8 +1,12 @@
-import type { Browser, BrowserContext, Download } from 'playwright';
+import { createServer, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { Browser, BrowserContext, Download, Page } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
+import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
+import type { LoadMeter } from '../../src/crawl/load-meter.js';
 import { startFixtureServer } from '../../fixtures/server.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
@@ -680,6 +684,422 @@ describe('BrowserContextFactory', () => {
         await expect(downloads[0]!.path()).rejects.toThrow();
         expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
       } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+  });
+
+  // L4（サイトへの負荷の制御の設計書 4.5）: factory は、作るすべての Context の要求の終わりの事象を、渡された LoadMeter に
+  // そのまま渡す（数えない）。渡されなければ、事象を受け取らない。
+  describe('L4: request end events are passed to the load meter', () => {
+    /** 受け取った呼び出しを、そのまま記録する偽の LoadMeter（数え方は `LoadMeter` の単体テストで確かめる）。 */
+    function recordingLoadMeter(): {
+      readonly meter: LoadMeter;
+      readonly finished: { readonly request: object; readonly url: string }[];
+      readonly failed: { readonly request: object; readonly url: string; readonly errorText: string | null }[];
+    } {
+      const finished: { readonly request: object; readonly url: string }[] = [];
+      const failed: { readonly request: object; readonly url: string; readonly errorText: string | null }[] = [];
+      const meter: LoadMeter = {
+        recordRequestFinished: (request, url) => {
+          finished.push({ request, url });
+        },
+        recordRequestFailed: (request, url, errorText) => {
+          failed.push({ request, url, errorText });
+        },
+        recordServedFromRunCache: () => undefined,
+        recordWithheld: () => undefined,
+        snapshot: () => {
+          throw new Error('the factory must not read the load meter');
+        },
+        // L7（設計書 4.8）: 直近の1分の件数も、factory は読まない。
+        recentPerMinute: () => {
+          throw new Error('the factory must not read the load meter');
+        },
+      };
+      return { meter, finished, failed };
+    }
+
+    it('passes requestfinished of the Passive and Interaction Contexts with the request and its URL', async () => {
+      const server = await startFixtureServer();
+      const recording = recordingLoadMeter();
+      const factory = new BrowserContextFactory(
+        browser,
+        configFor(server.origin),
+        () => new SafetyLedger(),
+        { loadMeter: recording.meter },
+      );
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      const session = await factory.createInteractionSession(viewport);
+      contexts.push(session.page.context());
+      try {
+        await page.goto(`${server.origin}/unsized-svg-image.html`, { waitUntil: 'load' });
+        await expect.poll(() => recording.finished.map(({ url }) => url)).toEqual([
+          `${server.origin}/unsized-svg-image.html`,
+          `${server.origin}/unsized-image.svg`,
+        ]);
+        await session.page.goto(`${server.origin}/index.html`, { waitUntil: 'load' });
+        await expect.poll(() => recording.finished.map(({ url }) => url)).toEqual([
+          `${server.origin}/unsized-svg-image.html`,
+          `${server.origin}/unsized-image.svg`,
+          `${server.origin}/index.html`,
+        ]);
+        // 渡す鍵は、事象の Playwright の Request そのもの（キャッシュから返した印の照合に使う）。
+        for (const { request, url } of recording.finished) {
+          expect((request as { url(): string }).url()).toBe(url);
+        }
+        expect(recording.failed).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await session.close().catch(() => undefined);
+        await server.close();
+      }
+    });
+
+    it('passes requestfailed with its failure reason, including the requests the Guard blocked', async () => {
+      const server = await startFixtureServer();
+      const recording = recordingLoadMeter();
+      const factory = new BrowserContextFactory(
+        browser,
+        configFor(server.origin),
+        () => new SafetyLedger(),
+        { loadMeter: recording.meter },
+      );
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      // Playwright が報告した失敗の理由（factory が渡したものと比べる）。
+      const reported: string[] = [];
+      context.on('requestfailed', (request) => {
+        reported.push(`${request.url()} ${request.failure()?.errorText ?? null}`);
+      });
+      const page = await factory.createPassivePage(context);
+      try {
+        await page.goto(`${server.origin}/passive-patch-request.html`, { waitUntil: 'load' });
+        await expect.poll(() => reported.length).toBe(1);
+        // Guard が止めた PATCH。Chromium は、page の中の要求を止めた理由を `net::ERR_BLOCKED_BY_CLIENT.Inspector` と報告する。
+        expect(reported[0]?.startsWith(`${server.origin}/__mutation net::ERR_BLOCKED_BY_CLIENT`), reported[0]).toBe(true);
+        // 許可 Origin の外の、つながらない宛先への GET（Guard は通す）。
+        const refusedUrl = 'http://127.0.0.1:9/unreachable.js';
+        await page.evaluate(async (url) => {
+          await fetch(url, { mode: 'no-cors' }).catch(() => undefined);
+        }, refusedUrl);
+        await expect.poll(() => reported.length).toBe(2);
+        expect(reported[1]?.startsWith(`${refusedUrl} net::ERR_`), reported[1]).toBe(true);
+        expect(reported[1]).not.toMatch(/BLOCKED_BY_CLIENT/u);
+        // factory は、Playwright が報告した URL と失敗の理由を、そのまま渡す（数えるかどうかは meter が決める）。
+        expect(recording.failed.map(({ url, errorText }) => `${url} ${errorText}`)).toEqual(reported);
+        for (const { request, url } of recording.failed) {
+          expect((request as { url(): string }).url()).toBe(url);
+        }
+        expect(server.getCounters().patch).toBe(0);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+
+    it('does not listen to request end events when no load meter is given', async () => {
+      const server = await startFixtureServer();
+      const factory = factoryFor(configFor(server.origin));
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const withMeter = new BrowserContextFactory(
+        browser,
+        configFor(server.origin),
+        () => new SafetyLedger(),
+        { loadMeter: recordingLoadMeter().meter },
+      );
+      const meteredContext = await withMeter.createPassiveContext(viewport);
+      contexts.push(meteredContext);
+      // Playwright の BrowserContext は、実行時には EventEmitter（`listenerCount` を持つ）である。
+      const listeners = (target: BrowserContext, event: string): number =>
+        (target as unknown as { listenerCount(eventName: string): number }).listenerCount(event);
+      try {
+        expect(listeners(context, 'requestfinished')).toBe(0);
+        expect(listeners(meteredContext, 'requestfinished')).toBe(1);
+        expect(listeners(meteredContext, 'requestfailed')).toBe(listeners(context, 'requestfailed') + 1);
+      } finally {
+        await closePassiveResources({ factory, context });
+        await closePassiveResources({ factory: withMeter, context: meteredContext });
+        await server.close();
+      }
+    });
+  });
+
+  // L5b（サイトへの負荷の制御の設計書 4.6、4.7）: Context の役割（既定は PRIMARY）と、Run 全体のキャッシュの配線。
+  // キャッシュを渡した factory は、作るすべての Context の応答をキャッシュに入れ、REVISIT の Context の Guard にだけ、届け方の部品を渡す。
+  // キャッシュを渡さない factory は、今の振る舞いのまま（応答を受け取らず、どの役割でも、すべてネットワークに送る）。
+  describe('L5b: Context roles and the Run cache', () => {
+    /** 画像を1つ読むページと、その画像（Run 全体のキャッシュに入る種類）。 */
+    const IMAGE_PAGE = '/unsized-svg-image.html';
+    const IMAGE_PATH = '/unsized-image.svg';
+    /** Playwright の BrowserContext は、実行時には EventEmitter（`listenerCount` を持つ）である。 */
+    const listeners = (target: BrowserContext, event: string): number =>
+      (target as unknown as { listenerCount(eventName: string): number }).listenerCount(event);
+
+    function cachedFactoryFor(origin: string): { readonly factory: BrowserContextFactory; readonly cache: ResourceCache } {
+      const cache = new ResourceCache();
+      return { factory: new BrowserContextFactory(browser, configFor(origin), () => new SafetyLedger(), { resourceCache: cache }), cache };
+    }
+
+    /** `factory` で `role` の Context と page を作り、`url` を読み込んでから閉じる。 */
+    async function loadOnce(
+      factory: BrowserContextFactory,
+      url: string,
+      role?: 'PRIMARY' | 'REVISIT',
+    ): Promise<void> {
+      const context = await factory.createPassiveContext(viewport, role);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      try {
+        await page.goto(url, { waitUntil: 'load' });
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+      }
+    }
+
+    const imageRequests = (server: Awaited<ReturnType<typeof startFixtureServer>>): number =>
+      server.getRequestObservations().filter((observation) => observation.pathname === IMAGE_PATH).length;
+
+    it('creates PRIMARY Contexts by default; they take every resource from the network even when the Run cache has it', async () => {
+      const server = await startFixtureServer();
+      const { factory, cache } = cachedFactoryFor(server.origin);
+      try {
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
+        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
+
+        // 役割を省略した Context も、PRIMARY と同じく、キャッシュにある画像をネットワークから取り直す（主の読み込みは今のまま）。
+        expect(imageRequests(server)).toBe(3);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('passes the delivery part to the Guard of a REVISIT Context, which serves the cached image from the Run cache', async () => {
+      const server = await startFixtureServer();
+      const { factory, cache } = cachedFactoryFor(server.origin);
+      try {
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
+        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'REVISIT');
+        // Interaction の session の Context も、REVISIT である（呼び出し側は役割を渡さない）。
+        const session = await factory.createInteractionSession(viewport);
+        contexts.push(session.page.context());
+        try {
+          await session.page.goto(`${server.origin}${IMAGE_PAGE}`, { waitUntil: 'load' });
+          expect(session.ledger.snapshot().invariantViolations).toEqual([]);
+        } finally {
+          await session.close().catch(() => undefined);
+        }
+
+        // 文書は3回とも届くが、画像は主の読み込みの1回だけ届く。
+        expect(server.getRequestObservations().filter((observation) => observation.pathname === IMAGE_PAGE)).toHaveLength(3);
+        expect(imageRequests(server)).toBe(1);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('keeps the current behavior without a Run cache: no response listener, and REVISIT Contexts take everything from the network', async () => {
+      const server = await startFixtureServer();
+      const factory = factoryFor(configFor(server.origin));
+      const { factory: withCache } = cachedFactoryFor(server.origin);
+      const context = await factory.createPassiveContext(viewport, 'REVISIT');
+      contexts.push(context);
+      const cachedContext = await withCache.createPassiveContext(viewport, 'REVISIT');
+      contexts.push(cachedContext);
+      try {
+        // キャッシュがなければ、応答の事象を受け取らない（キャッシュがあれば、factory が1つだけ受け取る）。
+        expect(listeners(context, 'response')).toBe(0);
+        expect(listeners(cachedContext, 'response')).toBe(1);
+
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'REVISIT');
+        expect(imageRequests(server)).toBe(2);
+      } finally {
+        await closePassiveResources({ factory, context });
+        await closePassiveResources({ factory: withCache, context: cachedContext });
+        await server.close();
+      }
+    });
+
+    it('rejects an unknown role before creating a Context, and a Run cache that is not a ResourceCache', async () => {
+      const newContext = vi.spyOn(browser, 'newContext');
+      const ledgers: SafetyLedger[] = [];
+      const factory = new BrowserContextFactory(browser, configFor(), () => {
+        const ledger = new SafetyLedger();
+        ledgers.push(ledger);
+        return ledger;
+      });
+
+      await expect(factory.createPassiveContext(viewport, 'OTHER' as unknown as 'PRIMARY')).rejects.toThrow(TypeError);
+      expect(newContext).not.toHaveBeenCalled();
+      expect(ledgers).toEqual([]);
+      expect(() => new BrowserContextFactory(browser, configFor(), () => new SafetyLedger(), {
+        resourceCache: { lookup: () => undefined, store: () => true } as unknown as ResourceCache,
+      })).toThrow(TypeError);
+    });
+
+    /** `handle` で応答する、この試験だけのサーバ（ループバック）を起動し、Origin と閉じる関数を返す。 */
+    async function startBodyServer(
+      handle: (pathname: string, response: ServerResponse) => void,
+    ): Promise<{ readonly origin: string; close(): Promise<void> }> {
+      const server = createServer((request, response) => {
+        handle((request.url ?? '/').split('?', 1)[0] ?? '/', response);
+      });
+      await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
+      const { port } = server.address() as AddressInfo;
+      return {
+        origin: `http://127.0.0.1:${port}`,
+        close: async () => {
+          server.closeAllConnections();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    const SMALL_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"></svg>';
+
+    /**
+     * Playwright の Response の `body` を見張る（どの応答の本文を取ろうとしたか）。prototype は、`page` で `url` を読み込んだ応答から取る。
+     * `reject` に当たる URL の応答では、本文を取れなかったことにする（拒否する）。それ以外は、本物の `body` を呼ぶ。
+     */
+    async function watchResponseBodies(
+      page: Page,
+      url: string,
+      reject: (responseUrl: string) => boolean = () => false,
+    ): Promise<() => string[]> {
+      const first = await page.goto(url, { waitUntil: 'load' });
+      const prototype = Object.getPrototypeOf(first) as { body(): Promise<Buffer> };
+      const original = prototype.body;
+      const body = vi.spyOn(prototype, 'body').mockImplementation(function (this: { url(): string }) {
+        return reject(this.url()) ? Promise.reject(new Error('fixture body unavailable')) : original.call(this);
+      });
+      return () => body.mock.contexts.map((response) => (response as { url(): string }).url());
+    }
+
+    // L5b-fix-round-1: factory は、キャッシュが入れる見込みがある（`ResourceCache.mayStore`）応答の本文だけを読む。文書、XHR、fetch、
+    // リダイレクトの応答と、`content-length` がそのキャッシュの1件の上限を超えると分かる応答は、本文を読まない。画像は今までどおり入る。
+    it('reads the body only of the responses the Run cache may store (L5b-fix-round-1)', async () => {
+      // 1件の上限を小さくしたキャッシュ（`content-length` の判断が、そのキャッシュ自身の上限で行われることを確かめる）。
+      const limits = Object.freeze({ maxEntryBytes: 1_024, maxTotalBytes: 4_096 });
+      const oversizedBytes = limits.maxEntryBytes + 1;
+      const server = await startBodyServer((pathname, response) => {
+        switch (pathname) {
+          case '/page.html':
+            response.setHeader('Content-Type', 'text/html; charset=utf-8');
+            response.end([
+              '<!doctype html><title>bodies</title>',
+              '<img src="/small.svg" alt="small"><img src="/oversized.svg" alt="oversized"><img src="/redirect.svg" alt="redirect">',
+              '<script>',
+              'const xhr = new XMLHttpRequest();',
+              'const xhrDone = new Promise((resolve) => { xhr.addEventListener("loadend", resolve); });',
+              'xhr.open("GET", "/data.json"); xhr.send();',
+              'Promise.all([xhrDone, fetch("/fetch.json").then((r) => r.text())]).then(() => { window.requestsDone = true; });',
+              '</script>',
+            ].join(''));
+            return;
+          case '/small.svg':
+          case '/target.svg':
+            response.setHeader('Content-Type', 'image/svg+xml');
+            response.end(SMALL_SVG);
+            return;
+          case '/oversized.svg':
+            response.setHeader('Content-Type', 'image/svg+xml');
+            response.setHeader('Content-Length', String(oversizedBytes));
+            response.end(Buffer.alloc(oversizedBytes, ' '));
+            return;
+          case '/redirect.svg':
+            response.statusCode = 302;
+            response.setHeader('Location', '/target.svg');
+            response.end();
+            return;
+          case '/data.json':
+          case '/fetch.json':
+            response.setHeader('Content-Type', 'application/json');
+            response.end('{"fixture":true}');
+            return;
+          default:
+            response.statusCode = 404;
+            response.end();
+        }
+      });
+      const cache = new ResourceCache({ limits });
+      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { resourceCache: cache });
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      try {
+        const bodyUrlsOf = await watchResponseBodies(page, `${server.origin}/fetch.json`);
+
+        await page.goto(`${server.origin}/page.html`, { waitUntil: 'load' });
+        await expect.poll(() => page.evaluate(() => (globalThis as { requestsDone?: boolean }).requestsDone === true)).toBe(true);
+        await expect.poll(() => cache.stats().entryCount).toBe(2);
+        // 本文を読まないことを確かめるため、事象が届くだけの時間を置く。
+        await wait(200);
+
+        // 本文を読んだのは、キャッシュに入る画像（リダイレクトの先を含む）だけ。
+        expect([...bodyUrlsOf()].sort()).toEqual([`${server.origin}/small.svg`, `${server.origin}/target.svg`]);
+        expect(cache.lookup(`${server.origin}/small.svg`)).toBeDefined();
+        expect(cache.lookup(`${server.origin}/target.svg`)).toBeDefined();
+        for (const pathname of ['/page.html', '/data.json', '/fetch.json', '/oversized.svg', '/redirect.svg']) {
+          expect(cache.lookup(`${server.origin}${pathname}`), pathname).toBeUndefined();
+        }
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+
+    it('does not store a response whose body cannot be read, without an unhandled rejection', async () => {
+      const server = await startBodyServer((pathname, response) => {
+        if (pathname === '/page.html') {
+          response.setHeader('Content-Type', 'text/html; charset=utf-8');
+          response.end('<!doctype html><title>bodies</title><img src="/unreadable.svg" alt="unreadable"><img src="/small.svg" alt="small">');
+          return;
+        }
+        if (pathname === '/unreadable.svg' || pathname === '/small.svg') {
+          response.setHeader('Content-Type', 'image/svg+xml');
+          response.end(SMALL_SVG);
+          return;
+        }
+        response.statusCode = 404;
+        response.end();
+      });
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown): void => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+      const { factory, cache } = cachedFactoryFor(server.origin);
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+      try {
+        const unreadableUrl = `${server.origin}/unreadable.svg`;
+        const bodyUrlsOf = await watchResponseBodies(page, `${server.origin}/small.svg`, (url) => url === unreadableUrl);
+
+        await page.goto(`${server.origin}/page.html`, { waitUntil: 'load' });
+        await expect.poll(() => cache.lookup(`${server.origin}/small.svg`)).toBeDefined();
+        await expect.poll(bodyUrlsOf).toContain(unreadableUrl);
+        await wait(200);
+
+        // 本文を取れなかった応答は入れない。例外は外に出さず、未処理の拒否にもしない。ほかの応答は今までどおり入る。
+        expect(cache.lookup(unreadableUrl)).toBeUndefined();
+        expect(cache.stats().entryCount).toBe(1);
+        expect(unhandled).toEqual([]);
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
         await closePassiveResources({ factory, context, page });
         await server.close();
       }

@@ -17,10 +17,16 @@ export const NOT_OBSERVED_TEXT = '未観測';
 
 /** 書式（`src/presentation/format.ts`）が付ける、日本語の単位。 */
 export const FORMAT_UNIT_TEXT = deepFreeze({
-  /** 秒（例: `1.5秒`）。 */
+  /** 秒（例: `1.5秒`、経過時間の `24分10秒`）。 */
   seconds: '秒',
   /** 件数（例: `3件`）。 */
   count: '件',
+  /** 回数（例: `284回`。ページの読み込みの回数。サイトへの負荷の制御の設計書 4.5、4.8）。 */
+  times: '回',
+  /** 経過時間の時間（例: `1時間5分`。設計書 4.8）。 */
+  hours: '時間',
+  /** 経過時間の分（例: `24分10秒`。設計書 4.8）。 */
+  minutes: '分',
 } as const);
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -78,6 +84,8 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   RULE_EVALUATION_FAILED: 'Rule の評価が、失敗しました。',
   PAGE_CRASHED: 'ページを描画するプロセスが、停止しました。',
   SAFETY_VIOLATION_ABORT: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
+  CHECKPOINT_WRITE_FAILED: '再開のための途中の保存を書けなかったため、それより後の監査を始めませんでした。',
+  RUN_INTERRUPTED: '止める指示（Ctrl+C など）を受けたため、それより後の監査を始めませんでした。',
 } as const satisfies Record<IncompleteReasonCode, string>);
 
 /** 未完了の理由のコードの、日本語の説明。 */
@@ -222,11 +230,46 @@ export const RUN_SUMMARY_TEXT = deepFreeze({
     skipped: 'スキップしたページ',
   },
   reasonsHeading: '未完了の理由',
+  /** サイトへの負荷の記録（`RunSummary.load`。サイトへの負荷の制御の設計書 3.1 の7、4.5）の、HTML の小節の見出しと CLI の行の名前。 */
+  loadHeading: 'サイトへの負荷',
+  /** 許可 Origin への要求（`load.requests.allowedOrigins`）。HTML の小節の項目と、CLI の負荷の行の項目。 */
+  allowedOriginRequests: '許可 Origin への要求',
 } as const);
+
+/** 1分あたりの最大（`RunLoadOriginRequests.peakPerMinute`）の短い名前。 */
+const PEAK_PER_MINUTE_LABEL = '1分あたり最大';
+
+/** 直近の1分の件数（`RunLoadRecentPerMinute`。サイトへの負荷の制御の設計書 4.8）の短い名前。 */
+const RECENT_MINUTE_LABEL = '直近1分';
+
+/**
+ * 件数に、補足の項目を括弧で添える（例: `12件（発見したページ 85件、上限 50件）`）。項目は、一覧の区切り（`listText`）で並べる。
+ */
+export const countWithDetailsText = (countText: string, details: readonly string[]): string => `${countText}（${listText(details)}）`;
+
+/**
+ * 要求の件数に、1分あたりの最大を添える（例: `3,400件（1分あたり最大 210件）`。サイトへの負荷の制御の設計書 4.5）。
+ * 件数と最大の書式は、`formatCount` のもの。組み立ては、`src/presentation/format.ts` の `formatRequestsWithPeak` だけが行う（L7）。
+ */
+export const countWithPeakPerMinuteText = (countText: string, peakText: string): string =>
+  countWithDetailsText(countText, [`${PEAK_PER_MINUTE_LABEL} ${peakText}`]);
+
+/**
+ * 要求の件数に、直近の1分の件数と、1分あたりの最大を添える（例: `1,930件（直近1分 38件、1分あたり最大 61件）`。設計書 4.8）。
+ * 実行中の進み具合の行で使う。組み立ては、`formatRequestsWithPeak` だけが行う。
+ */
+export const countWithRecentAndPeakPerMinuteText = (countText: string, recentText: string, peakText: string): string =>
+  countWithDetailsText(countText, [`${RECENT_MINUTE_LABEL} ${recentText}`, `${PEAK_PER_MINUTE_LABEL} ${peakText}`]);
 
 // ---------------------------------------------------------------------------------------------------------------
 // HTML レポート（`src/report/html-report.ts`。U16c）
 // ---------------------------------------------------------------------------------------------------------------
+
+/** 開始の日時の項目の名前（Run の開始の日時と、実行の記録の表の列の見出し。R6）。 */
+const STARTED_AT_LABEL = '開始の日時';
+
+/** 終了の日時の項目の名前（Run の終了の日時と、実行の記録の表の列の見出し。R6）。 */
+const FINISHED_AT_LABEL = '終了の日時';
 
 /**
  * HTML レポートが示す、日本語の文言。節の名前と説明は、表示カタログ（`REPORT_SECTION_CATALOG`、`REPORT_CATEGORY_SECTION_CATALOG`）が
@@ -246,8 +289,8 @@ export const HTML_REPORT_TEXT = deepFreeze({
     runHeading: 'Run',
     runId: 'Run の ID',
     allowedOrigins: '許可 Origin',
-    startedAt: '開始の日時',
-    finishedAt: '終了の日時',
+    startedAt: STARTED_AT_LABEL,
+    finishedAt: FINISHED_AT_LABEL,
     toolVersion: 'BeakSight の版',
     countsHeading: '指摘の件数',
     countsNote: 'サイト品質（エラー、警告、情報）と安全は、分けて数えます。',
@@ -265,6 +308,36 @@ export const HTML_REPORT_TEXT = deepFreeze({
     notReached: '達していない',
     unverifiedInteractions: '確かめられなかった Interaction',
     unverifiedInternalLinks: '確かめられなかった内部リンク',
+    /** 「サイトへの負荷」の小節（見出しは `RUN_SUMMARY_TEXT.loadHeading`）の説明。 */
+    loadNote: 'BeakSight が監査対象のサイトに送った要求の実績です。ページの読み込みは、最小の間隔以上空けて行いました。',
+    /**
+     * 「サイトへの負荷」の小節の項目（`RunSummary.load` の順。許可 Origin への要求は、CLI と共通の `RUN_SUMMARY_TEXT.allowedOriginRequests`）。
+     * ページの読み込みの回数は、間隔の判定に使った読み込みの開始の回数で、始められなかった読み込みを含む（多めに数える側。設計書 4.5）。
+     */
+    load: {
+      minNavigationInterval: 'ページの読み込みの最小の間隔',
+      maxInteractionsPerPage: '1ページで監査する Interaction の候補の上限',
+      navigationCount: 'ページの読み込みの回数（始められなかったものを含む）',
+      pacingWait: '間隔のために待った時間の合計',
+      otherOriginRequests: '許可 Origin の外への要求',
+      servedFromCache: 'Run 全体のキャッシュから返した要求',
+      withheldOtherOrigins: '送らなかった、許可 Origin の外への要求',
+    },
+    /** 「実行の記録」の小節（`RunSummary.executions`。中断した Run の再開の設計書 4.8 の「表示」。R6）の見出し。 */
+    executionsHeading: '実行の記録',
+    /** 「実行の記録」の小節の説明。 */
+    executionsNote:
+      'BeakSight を起動した回ごとの、開始と終了の日時と、終わり方です。中断した Run を、同じコマンドで続きから監査した起動を、再開として数えます。',
+    /** 「実行の記録」の小節の項目（実行の回数と、再開の回数）。 */
+    executions: {
+      count: '実行の回数',
+      resumeCount: '再開の回数',
+    },
+    /**
+     * 実行の一覧の表の列の見出し（何回目、開始の日時、終了の日時、終わり方）。終わり方の欄は、表示カタログのラベル、コード、説明を示す。
+     * 開始と終了の日時の列は、Run の開始と終了の日時と同じ名前にする。
+     */
+    executionColumns: ['何回目の実行', STARTED_AT_LABEL, FINISHED_AT_LABEL, '終わり方'],
     environmentHeading: '実行の環境',
     environment: {
       nodeVersion: 'Node.js',
@@ -338,8 +411,11 @@ export const severityGroupTotalText = (groupLabel: string): string => `${groupLa
 /** User-Agent の項目（例: `User-Agent（デスクトップ）`）。ラベルは、表示カタログのもの。 */
 export const userAgentLabelText = (viewportLabel: string): string => `User-Agent（${viewportLabel}）`;
 
+/** 何回目か（例: `1回目`）。再試行の前の試行の番号と、実行（起動）の番号（実行の記録の表。R6）の、共通の書き方。 */
+export const ordinalText = (ordinal: number): string => `${ordinal}回目`;
+
 /** 再試行の前の試行の番号（例: `1回目`）。 */
-export const retryAttemptText = (attempt: number): string => `${attempt}回目`;
+export const retryAttemptText = (attempt: number): string => ordinalText(attempt);
 
 /** 再試行の前の試行の記録であることの印（例: `再試行の前の記録（1回目）`。Safety の事象の表。C16d）。 */
 export const earlierAttemptRecordText = (attempt: number): string =>
@@ -396,6 +472,10 @@ export const CLI_OPTION_DESCRIPTIONS = deepFreeze({
     valueName: null,
     description: 'ブラウザの画面を表示せずに実行します。設定の browser.headed を上書きします。--headed と同時には指定できません。',
   },
+  new: {
+    valueName: null,
+    description: '途中の Run があっても、続きから再開せずに、新しい Run を始めます（run のときだけ）。',
+  },
   help: {
     valueName: null,
     description: 'この使い方を表示します。設定は読まず、監査も実行しません。',
@@ -415,6 +495,15 @@ export const CLI_TEXT = deepFreeze({
   },
   /** 設定のエラーの見出し。終了コードの表の、設定のエラーの行のラベルにも使う（Run Status のラベルは、表示カタログのもの）。 */
   configErrorHeading: '設定のエラー',
+  /**
+   * 終了コードの表の、Run を始められない場合（実行中の Run がある、版が違う、ロックを同時に作り直された、保存を始められない）の行の
+   * ラベル（中断した Run の再開の設計書 4.7.1）。
+   */
+  runUnavailableHeading: 'Run を始められない',
+  /**
+   * 終了コードの表の、中断（2回目のシグナルで、最後の処理をせずにすぐに終えた）の行のラベル（中断した Run の再開の設計書 4.7、4.7.1）。
+   */
+  interruptedHeading: '中断',
   /** 技術的な詳細（英語のエラーの文、パスなど）の見出し。 */
   detailsHeading: '詳細（技術的な情報）',
   validateConfig: {
@@ -426,6 +515,37 @@ export const CLI_TEXT = deepFreeze({
     outputDirectory: '出力先',
     report: 'HTML レポート',
     bundle: 'ChatGPT 用のバンドル',
+    /**
+     * 結果の、サイトへの負荷の行（見出しは `RUN_SUMMARY_TEXT.loadHeading`）の、ページの読み込みの回数の短い名前
+     * （HTML レポートの名前は `HTML_REPORT_TEXT.summary.load.navigationCount`）。
+     */
+    navigationCount: 'ページの読み込み',
+    /**
+     * 結果の、実行の記録の行（例: `実行: 3回、再開 2回`。中断した Run の再開の設計書 4.8 の「表示」。R6）の名前。HTML レポートの
+     * 名前は `HTML_REPORT_TEXT.summary.executions.count`。
+     */
+    executions: '実行',
+    /** 実行の記録の行の、再開の回数の短い名前（HTML レポートの名前は `HTML_REPORT_TEXT.summary.executions.resumeCount`）。 */
+    resumes: '再開',
+  },
+  /**
+   * 実行中の進み具合の行（サイトへの負荷の制御の設計書 4.8）の、CLI だけで使う文言。発見したページは `RUN_SUMMARY_TEXT.coverage.discovered`、
+   * ページの読み込みは `CLI_TEXT.run.navigationCount`、許可 Origin への要求は `RUN_SUMMARY_TEXT.allowedOriginRequests` を使う。
+   */
+  progress: {
+    /** 行の見出し。 */
+    heading: '進み具合',
+    /**
+     * 監査を終えたページ（`RunProgressReport.pagesFinished`。Run の全体で、監査を終えたページの数で、再開した Run では、再開の前に終わった
+     * ページを含む）。状態が監査済みのページだけの「監査したページ」とは別の数。
+     */
+    pagesFinished: '監査を終えたページ',
+    /** 設定のページ数の上限（`RunProgressReport.maxPages`）。監査を終えたページの括弧の中に示す。 */
+    maxPages: '上限',
+    /** 許可 Origin の外への要求（`RunProgressReport.requests.otherOrigins.count`）の短い名前。 */
+    otherOriginRequests: '許可 Origin の外',
+    /** この実行の開始からの経過時間（`RunProgressReport.elapsedMs`）。 */
+    elapsed: '経過',
   },
   failure: {
     /** artifact の書き出しの入出力の失敗（`ArtifactWriteError`）。 */
@@ -442,13 +562,84 @@ export const CLI_TEXT = deepFreeze({
     /** 作れなかった Run のディレクトリのパスの項目の名前。 */
     runDirectory: 'Run のディレクトリ',
   },
+  /** 中断した Run の再開の流れ（中断した Run の再開の設計書 4.7.1）の、値を含まない文言。値を含む文言は、下の `…Text` の関数。 */
+  resume: {
+    /**
+     * 最後の出力を書いた後に、保存の終わり（最後の状態の書き出しと、ロックを外す処理）を、最後まで行えなかった（警告。終了コードは
+     * Run Status のとおり）。最後の状態は書けて、ロックを外す処理だけが失敗した場合は、次の起動で最後の処理をやり直さないので、
+     * 「ことがあります」とする。
+     */
+    finishFailed: '再開のための保存の終わりを、最後まで書けませんでした。次に同じコマンドを実行すると、最後の処理をもう一度行うことがあります。',
+  },
+  /** シグナル（SIGINT・SIGTERM・SIGHUP。Ctrl+C など）を受けたときに、標準エラーに示す文言（中断した Run の再開の設計書 4.7 の「シグナル」）。 */
+  interrupt: {
+    /** 1回目: 止める印を付け、今のページの監査を終えてから止める。 */
+    stopRequested: '中断を受け付けました。今のページの監査を終えてから止めます。すぐに止めるには、もう一度押してください。',
+    /** 2回目: 最後の処理をせずに、すぐに終える（終了コード 5）。保存は、最後に監査を終えたページまで残る。 */
+    exitingNow: 'すぐに止めます。再開のための保存は、最後に監査を終えたページまで残っています。同じコマンドを実行すると、続きから再開します。',
+  },
 } as const);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 中断した Run の再開の流れの文言（中断した Run の再開の設計書 4.7、4.7.1。R5a）。値（Run の ID、違う項目、版、パス、ページの数の書式）は、
+// 呼び出し側（`src/cli/output.ts`）が渡す。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 同じ出力先で、別の Run が実行中（動いている Run のロックがある）なので、再開も新しい Run もせずに終える。 */
+export const activeRunInOutputDirectoryText = (runId: string): string =>
+  `同じ出力先で、別の Run（${runId}）が実行中です。その Run が終わってから実行してください。`;
+
+/** 途中の Run の再開のための保存（`state.json` と `state.prev.json`）を読めないので、再開の対象にしない。 */
+export const unreadableCheckpointText = (runId: string): string =>
+  `途中の Run（${runId}）の再開のための保存を読めないため、再開の対象にしません。`;
+
+/** 途中の Run の実効の設定が今回と違うので、再開せずに、新しい Run を始める。`differencesText` は、違う項目のパスの一覧の文言。 */
+export const differentConfigRunText = (runId: string, differencesText: string): string =>
+  `設定が違うため、途中の Run（${runId}）は再開しません（違う項目: ${differencesText}）。新しい Run を始めます。`;
+
+/** 違う版の1項目（例: `BeakSight の版: 保存 0.1.0 → 今 0.2.0`）。ラベルは、表示の文言のもの。 */
+export const versionDifferenceText = (label: string, saved: string, current: string): string =>
+  `${label}: 保存 ${saved} → 今 ${current}`;
+
+/** 途中の Run の版が今と違うので、再開できずに終える。`differencesText` は、違う版の項目（`versionDifferenceText`）の一覧の文言。 */
+export const differentVersionRunText = (runId: string, differencesText: string): string =>
+  `途中の Run（${runId}）は、版が違うため再開できません（${differencesText}）。最初から始めるには --new を付けてください。`;
+
+/**
+ * 途中の Run を、続きから再開する。`pagesFinishedText` は、監査を終えたページの数の項目（実行中の進み具合の行と同じ書き方。例:
+ * `監査を終えたページ 3件`）。
+ */
+export const resumingRunText = (runId: string, pagesFinishedText: string): string =>
+  `途中の Run（${runId}。${pagesFinishedText}）を、続きから再開します。最初から始めるには --new を付けてください。`;
+
+/** 途中の Run は、違反を検出した後なので、新しいページを監査せずに、最後の処理だけを行う。 */
+export const finalizingRunText = (runId: string): string =>
+  `途中の Run（${runId}）は、安全の不変条件の違反を検出した後のため、新しいページを監査せずに、最後の処理だけを行います。`;
+
+/** 再開を始められなかった: ロックが、動いている別のプロセスの Run のもの（`LOCK_HELD_BY_ACTIVE_RUN`）。 */
+export const runLockHeldText = (runId: string): string => `別のプロセスが、この Run（${runId}）を実行しています。`;
+
+/** 再開を始められなかった: 古いロックを、別のプロセスが同時に作り直した（`LOCK_TAKEN_OVER_CONCURRENTLY`）。 */
+export const runLockTakenOverText = (runId: string): string => `別のプロセスが、同時にこの Run（${runId}）の再開を始めました。`;
+
+/** 再開を始められなかった: 再開のための保存やロックを、読み書きできなかった（`CHECKPOINT_STORE_FAILED`）。 */
+export const checkpointStoreFailedText = (runId: string): string => `再開のための保存を読み書きできませんでした（${runId}）。`;
+
+/** 終わった Run の、使わない再開のための保存（ページの保存、`state.prev.json`）を消せなかった（警告。終了コードは変えない）。 */
+export const finishedCheckpointCleanupFailedText = (path: string): string =>
+  `終わった Run の再開のための保存の一部を消せませんでした（${path}）。手で消しても問題ありません。`;
 
 /** CLI の1つの項目の行（例: `出力先: C:\artifacts\RUN-…`）。 */
 export const cliFieldText = (label: string, value: string): string => `${label}: ${value}`;
 
 /** CLI の件数の項目（例: `エラー 3件`）。件数の書式は、`formatCount` のもの。 */
 export const cliCountText = (label: string, countText: string): string => `${label} ${countText}`;
+
+/**
+ * 実行中の進み具合の行の項目を、`・` で1つの文字列に並べる（例: `監査を終えたページ 12件（…）・ページの読み込み 284回`。設計書 4.8）。
+ * 項目の中の括弧で一覧の区切り（`、`）を使うので、項目どうしは別の区切りにする。
+ */
+export const progressItemsText = (items: readonly string[]): string => items.join('・');
 
 /** ラベルに、コピーや検索のための値そのもの（コード）を添える（例: `完了（COMPLETE）`。UI追補設計書 3.1）。 */
 export const labelWithCodeText = (label: string, code: string): string => `${label}（${code}）`;

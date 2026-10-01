@@ -35,7 +35,7 @@ export function canonicalPassiveAllowedOrigins(allowedOrigins: ReadonlySet<strin
   return canonicalizeAllowedOrigins(allowedOrigins);
 }
 
-function hasAllowedOrigin(url: string, allowedOrigins: ReadonlySet<string>): boolean {
+export function hasAllowedOrigin(url: string, allowedOrigins: ReadonlySet<string>): boolean {
   try {
     const candidate = new URL(url);
     return canonicalPassiveAllowedOrigins(allowedOrigins).has(candidate.origin);

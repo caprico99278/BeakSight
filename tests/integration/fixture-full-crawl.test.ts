@@ -1,8 +1,9 @@
 // T19a（Task 19 の設計書 第4章。上位の実装計画 Task 19 の Step 3）: 専用の fixture のサイト（`fixtures/site/full-crawl/`）を、
 // 一時ディレクトリにビルドした本物の CLI（`dist/cli/index.js`）で、別のプロセスとして最後まで監査する。
 //
-// - 設定は、製品の既定値（`DEFAULT_CONFIG`）のまま、`site`（入口と許可 Origin）と出力先だけを変える。幅の走査、スクリーンショット、
-//   Interaction の段階も、既定のまま行う。起動には、必ず `--headless` を付ける。
+// - 設定は、製品の既定値（`DEFAULT_CONFIG`）のまま、`site`（入口と許可 Origin）と出力先と、ページの読み込みの最小の間隔
+//   （`crawl.minNavigationIntervalMs` を 0。対象はループバックの fixture のサーバ。サイトへの負荷の制御の設計書 4.2）だけを変える。
+//   幅の走査、スクリーンショット、Interaction の段階も、既定のまま行う。起動には、必ず `--headless` を付ける。
 // - 確かめること（設計書 4.2）: 終了コード 0 と `COMPLETE`、監査したページの一覧、壊したページごとの ruleId、対照のページ、
 //   Guard の有効と不変条件の違反0件、サーバに届いたリクエストが GET と HEAD だけ、artifact とスキーマ、期限とスタックトレース。
 //
@@ -130,12 +131,13 @@ beforeAll(async () => {
   workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-fixture-full-crawl-'));
   outputDirectory = join(workDirectory, 'output');
   configPath = join(workDirectory, 'full-crawl.json');
-  // 製品の既定値のまま、`site` だけを指定する（出力先は `--output` で変える）。
+  // 製品の既定値のまま、`site` と、ページの読み込みの最小の間隔（0）だけを指定する（出力先は `--output` で変える）。
   await writeFile(
     configPath,
     JSON.stringify({
       target: { id: TARGET_ID },
       site: { startUrl: `${server.origin}${PATHS.start}`, allowedOrigins: [server.origin] },
+      crawl: { minNavigationIntervalMs: 0 },
     }),
     'utf8',
   );
@@ -184,11 +186,11 @@ describe('fixture full crawl through the built CLI with the default settings (Ta
     expect(result.status, result.stderr).toBe(EXIT_CODES.COMPLETE);
   });
 
-  it('uses the product defaults except the site and the output directory', () => {
+  it('uses the product defaults except the site, the output directory, and the navigation interval', () => {
     expect(run.target.id).toBe(TARGET_ID);
     expect(run.effectiveConfig.site).toEqual({ startUrl: urlOf(PATHS.start), allowedOrigins: [server.origin] });
     expect(run.effectiveConfig.output.directory).toBe(outputDirectory);
-    expect(run.effectiveConfig.crawl).toEqual(DEFAULT_CONFIG.crawl);
+    expect(run.effectiveConfig.crawl).toEqual({ ...DEFAULT_CONFIG.crawl, minNavigationIntervalMs: 0 });
     expect(run.effectiveConfig.browser).toEqual(DEFAULT_CONFIG.browser);
     expect(run.effectiveConfig.browser.headed).toBe(false);
     expect(run.effectiveConfig.viewports).toEqual(DEFAULT_CONFIG.viewports);

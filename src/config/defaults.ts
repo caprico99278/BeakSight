@@ -13,6 +13,8 @@ export const DEFAULT_CONFIG: AuditConfigDefaults = {
     overallPageTimeoutMs: 60_000,
     resourceSettlingTimeoutMs: 5_000,
     interactionTimeoutMs: 3_000,
+    minNavigationIntervalMs: 5_000,
+    maxInteractionsPerPage: 20,
     allowedQueryParameters: [],
   },
   browser: {

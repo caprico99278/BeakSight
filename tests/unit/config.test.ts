@@ -13,12 +13,16 @@ import {
   MAX_URL_LENGTH,
   MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
 } from '../../src/core/limits.js';
+import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const temporaryDirectories: string[] = [];
 const initialWorkingDirectory = process.cwd();
 
-const validConfig = () => createTestConfig('https://example.test');
+// ループバックでない Origin なので、ページの読み込みの間隔は、`createTestConfig` の 0 ではなく既定値にする（L1。設計書 4.2 の下限）。
+const validConfig = () => createTestConfig('https://example.test', '/', {
+  crawl: { minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs },
+});
 
 const writeTargetConfig = async (path: string, id: string, extra: Record<string, unknown> = {}): Promise<void> => {
   await writeFile(path, JSON.stringify({
@@ -259,6 +263,132 @@ describe('configuration', () => {
 
   it('keeps the default crawl.interactionTimeoutMs at 3,000 ms (F17)', () => {
     expect(DEFAULT_CONFIG.crawl.interactionTimeoutMs).toBe(3_000);
+  });
+
+  // L1（サイトへの負荷の制御の設計書 3.2、4.2）: ページの読み込みの最小の間隔と、1ページの Interaction の候補の上限。
+  // 間隔は、許可 Origin にループバックでないものが1つでもあれば 1000 ms 以上、ループバックのアドレスだけなら 0 以上。
+  describe('crawl.minNavigationIntervalMs and crawl.maxInteractionsPerPage (L1)', () => {
+    const LOOPBACK_ORIGINS = ['http://127.0.0.1:8123', 'http://localhost:8123', 'http://[::1]:8123'] as const;
+    const NON_LOOPBACK_ORIGIN = 'https://example.com';
+    const INTERVAL_LOWER_BOUND_ERROR = 'crawl.minNavigationIntervalMs must be at least 1000 ms when site.allowedOrigins '
+      + 'includes an origin that is not a loopback address (127.0.0.1, [::1], localhost)';
+    const INTERVAL_INTEGER_ERROR = 'crawl.minNavigationIntervalMs must be a non-negative integer';
+    const INTERACTION_LIMIT_INTEGER_ERROR = 'crawl.maxInteractionsPerPage must be a positive integer';
+    const INTERACTION_LIMIT_MAXIMUM_ERROR = `crawl.maxInteractionsPerPage must be at most ${INTERACTION_CANDIDATE_LIMITS.maxCandidates} `
+      + '(the number of Interaction candidates discovered on a page)';
+
+    /** `allowedOrigins` だけを許可し、その1つ目から始める設定に、`crawl` の項目を重ねる。 */
+    const configWith = (allowedOrigins: readonly string[], crawl: Record<string, unknown>): Record<string, unknown> => {
+      const config = validConfig();
+      return {
+        ...config,
+        site: { startUrl: `${allowedOrigins[0] ?? ''}/`, allowedOrigins },
+        crawl: { ...config.crawl, ...crawl },
+      };
+    };
+
+    it('uses 5,000 ms and 20 candidates as the defaults', () => {
+      expect(DEFAULT_CONFIG.crawl.minNavigationIntervalMs).toBe(5_000);
+      expect(DEFAULT_CONFIG.crawl.maxInteractionsPerPage).toBe(20);
+    });
+
+    it('accepts the defaults for a non-loopback origin', () => {
+      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], {
+        minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs,
+        maxInteractionsPerPage: DEFAULT_CONFIG.crawl.maxInteractionsPerPage,
+      }))).toMatchObject({ ok: true });
+    });
+
+    it('loads a target file without the settings with the defaults, for a non-loopback origin', async () => {
+      const directory = await createTemporaryDirectory('beaksight-config-load-control-');
+      const path = join(directory, 'target.json');
+      await writeTargetConfig(path, 'load-control-defaults');
+
+      const config = await loadConfig(path);
+
+      expect(Object.keys(config.crawl)).toEqual(expect.arrayContaining(['minNavigationIntervalMs', 'maxInteractionsPerPage']));
+      expect(config.crawl.minNavigationIntervalMs).toBe(DEFAULT_CONFIG.crawl.minNavigationIntervalMs);
+      expect(config.crawl.maxInteractionsPerPage).toBe(DEFAULT_CONFIG.crawl.maxInteractionsPerPage);
+    });
+
+    it.each(LOOPBACK_ORIGINS)('accepts crawl.minNavigationIntervalMs = 0 when the only allowed origin is the loopback origin %s', (origin) => {
+      expect(validateConfig(configWith([origin], { minNavigationIntervalMs: 0 }))).toMatchObject({ ok: true });
+    });
+
+    it('accepts crawl.minNavigationIntervalMs = 0 when every allowed origin is a loopback origin', () => {
+      expect(validateConfig(configWith(LOOPBACK_ORIGINS, { minNavigationIntervalMs: 0 }))).toMatchObject({ ok: true });
+    });
+
+    it.each([
+      [[NON_LOOPBACK_ORIGIN], 0],
+      [[NON_LOOPBACK_ORIGIN], 999],
+      [['http://127.0.0.1:8123', NON_LOOPBACK_ORIGIN], 999],
+      [[NON_LOOPBACK_ORIGIN, 'http://localhost:8123'], 0],
+    ])('rejects crawl.minNavigationIntervalMs below 1000 ms when the allowed origins %j include a non-loopback origin (%s ms)', (allowedOrigins, minNavigationIntervalMs) => {
+      expect(validateConfig(configWith(allowedOrigins, { minNavigationIntervalMs }))).toMatchObject({
+        ok: false,
+        errors: [INTERVAL_LOWER_BOUND_ERROR],
+      });
+    });
+
+    it.each([
+      [[NON_LOOPBACK_ORIGIN]],
+      [['http://127.0.0.1:8123', NON_LOOPBACK_ORIGIN]],
+    ])('accepts crawl.minNavigationIntervalMs = 1000 when the allowed origins %j include a non-loopback origin', (allowedOrigins) => {
+      expect(validateConfig(configWith(allowedOrigins, { minNavigationIntervalMs: 1_000 }))).toMatchObject({ ok: true });
+    });
+
+    it.each([
+      [LOOPBACK_ORIGINS[0], -1],
+      [LOOPBACK_ORIGINS[0], 1_000.5],
+      [LOOPBACK_ORIGINS[0], '5000'],
+      [LOOPBACK_ORIGINS[0], Number.MAX_SAFE_INTEGER + 1],
+      [NON_LOOPBACK_ORIGIN, -1],
+      [NON_LOOPBACK_ORIGIN, 0.5],
+      [NON_LOOPBACK_ORIGIN, '5000'],
+    ])('rejects crawl.minNavigationIntervalMs for the origin %s = %j because it must be a non-negative integer', (origin, minNavigationIntervalMs) => {
+      expect(validateConfig(configWith([origin], { minNavigationIntervalMs }))).toMatchObject({
+        ok: false,
+        errors: [INTERVAL_INTEGER_ERROR],
+      });
+    });
+
+    it.each([0, 1.5, -1, '20'])('rejects crawl.maxInteractionsPerPage = %j because it must be a positive integer', (maxInteractionsPerPage) => {
+      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage }))).toMatchObject({
+        ok: false,
+        errors: [INTERACTION_LIMIT_INTEGER_ERROR],
+      });
+    });
+
+    it('rejects crawl.maxInteractionsPerPage above INTERACTION_CANDIDATE_LIMITS.maxCandidates', () => {
+      const maxInteractionsPerPage = INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1;
+
+      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage }))).toMatchObject({
+        ok: false,
+        errors: [INTERACTION_LIMIT_MAXIMUM_ERROR],
+      });
+    });
+
+    it.each([1, INTERACTION_CANDIDATE_LIMITS.maxCandidates])('accepts crawl.maxInteractionsPerPage = %s', (maxInteractionsPerPage) => {
+      expect(validateConfig(configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage })))
+        .toMatchObject({ ok: true });
+    });
+
+    it('accepts both settings in the crawl section, which rejects unknown and missing settings', () => {
+      const config = configWith([NON_LOOPBACK_ORIGIN], { minNavigationIntervalMs: 1_000, maxInteractionsPerPage: 20 });
+      const crawl = config.crawl as Record<string, unknown>;
+      const { minNavigationIntervalMs: _interval, ...withoutInterval } = crawl;
+      const { maxInteractionsPerPage: _limit, ...withoutLimit } = crawl;
+      const unsupportedSettingsError = 'crawl must be an object with only supported settings';
+
+      expect(validateConfig(config)).toEqual({ ok: true, value: config });
+      expect(validateConfig({ ...config, crawl: { ...crawl, unsupportedSetting: 1 } })).toMatchObject({
+        ok: false,
+        errors: [unsupportedSettingsError],
+      });
+      expect(validateConfig({ ...config, crawl: withoutInterval })).toMatchObject({ ok: false, errors: [unsupportedSettingsError] });
+      expect(validateConfig({ ...config, crawl: withoutLimit })).toMatchObject({ ok: false, errors: [unsupportedSettingsError] });
+    });
   });
 
   it('rejects malformed, non-HTTP, and origin-mismatched site URLs', () => {

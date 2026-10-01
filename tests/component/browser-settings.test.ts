@@ -7,6 +7,14 @@ import { createTestConfig } from '../helpers/test-config.js';
 
 let browser: Browser;
 
+/**
+ * 設定の検証に通す、ループバックでない Origin の設定。ページの読み込みの間隔は、`createTestConfig` の 0 ではなく既定値にする
+ * （サイトへの負荷の制御の設計書 4.2 の下限）。
+ */
+const validatedConfig = () => createTestConfig('https://example.test', '/', {
+  crawl: { minNavigationIntervalMs: DEFAULT_CONFIG.crawl.minNavigationIntervalMs },
+});
+
 useHeadlessChromium((launched) => {
   browser = launched;
 });
@@ -19,7 +27,7 @@ describe('browser locale and timezone accepted by the configuration validation (
       ['de-CH', 'UTC'],
     ] as const;
     for (const [locale, timezone] of accepted) {
-      const config = createTestConfig('https://example.test');
+      const config = validatedConfig();
       expect(validateConfig({ ...config, browser: { ...config.browser, locale, timezone } })).toMatchObject({ ok: true });
 
       const context = await browser.newContext({ locale, timezoneId: timezone });
@@ -41,7 +49,7 @@ describe('browser locale and timezone accepted by the configuration validation (
   // F13b: ICU が別の表記に解決する IANA の名前（Asia/Kolkata → Asia/Calcutta など）も、Chromium の Context と page で使える。
   it('creates a Chromium context and page with accepted timezones that ICU resolves to another spelling (F13b)', async () => {
     for (const timezone of ['Asia/Kolkata', 'Etc/UTC']) {
-      const config = createTestConfig('https://example.test');
+      const config = validatedConfig();
       expect(validateConfig({ ...config, browser: { ...config.browser, timezone } })).toMatchObject({ ok: true });
 
       const context = await browser.newContext({ locale: config.browser.locale, timezoneId: timezone });

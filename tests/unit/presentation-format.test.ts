@@ -6,13 +6,21 @@ import {
   formatDateTime,
   formatDecimal,
   formatDuration,
+  formatElapsedTime,
   formatInteger,
   formatMilliseconds,
   formatNotObserved,
   formatPercent,
   formatPixels,
+  formatRequestsWithPeak,
+  formatTimes,
 } from '../../src/presentation/format.js';
-import { NOT_OBSERVED_TEXT } from '../../src/presentation/messages.js';
+import {
+  FORMAT_UNIT_TEXT,
+  NOT_OBSERVED_TEXT,
+  countWithPeakPerMinuteText,
+  countWithRecentAndPeakPerMinuteText,
+} from '../../src/presentation/messages.js';
 
 /** 置き換える前の Rule のファイルの丸め方（文言が変わらないことを確かめるための比較用）。 */
 const formerRoundToThousandths = (value: number): string => String(Math.round(value * 1000) / 1000);
@@ -181,5 +189,89 @@ describe('formatCount', () => {
 
   it.each(UNOBSERVED_NUMBERS)('shows the not-observed text for %s', (value) => {
     expect(formatCount(value)).toBe(NOT_OBSERVED_TEXT);
+  });
+});
+
+// L7（サイトへの負荷の制御の設計書 4.5、4.8）: 回数の書式。区切りは `formatCount` と同じで、単位だけが違う。
+describe('formatTimes', () => {
+  it('groups the digits like formatCount and appends the unit of times', () => {
+    expect(FORMAT_UNIT_TEXT.times).toBe('回');
+    expect(formatTimes(0)).toBe('0回');
+    expect(formatTimes(284)).toBe('284回');
+    expect(formatTimes(1234)).toBe('1,234回');
+    expect(formatTimes(1234567)).toBe('1,234,567回');
+  });
+
+  it.each(UNOBSERVED_NUMBERS)('shows the not-observed text for %s', (value) => {
+    expect(formatTimes(value)).toBe(NOT_OBSERVED_TEXT);
+  });
+});
+
+// L7（設計書 4.8）: 経過時間の書式。時間・分・秒で書き、1時間以上では秒を省く。端数は切り捨てる（経過した分だけを示す）。
+describe('formatElapsedTime', () => {
+  const SECOND_MS = 1000;
+  const MINUTE_MS = 60 * SECOND_MS;
+  const HOUR_MS = 60 * MINUTE_MS;
+
+  it('uses the units of hours, minutes and seconds from the message catalog', () => {
+    expect(FORMAT_UNIT_TEXT).toMatchObject({ hours: '時間', minutes: '分', seconds: '秒' });
+  });
+
+  it('shows less than one minute in whole seconds, cutting off the fraction', () => {
+    expect(formatElapsedTime(0)).toBe('0秒');
+    expect(formatElapsedTime(999)).toBe('0秒');
+    expect(formatElapsedTime(40 * SECOND_MS)).toBe('40秒');
+    expect(formatElapsedTime(59 * SECOND_MS)).toBe('59秒');
+    expect(formatElapsedTime(MINUTE_MS - 1)).toBe('59秒');
+  });
+
+  it('shows one minute or more in minutes and seconds, without zero seconds', () => {
+    expect(formatElapsedTime(60 * SECOND_MS)).toBe('1分');
+    expect(formatElapsedTime(MINUTE_MS + SECOND_MS)).toBe('1分1秒');
+    expect(formatElapsedTime(24 * MINUTE_MS + 10 * SECOND_MS)).toBe('24分10秒');
+    expect(formatElapsedTime(HOUR_MS - 1)).toBe('59分59秒');
+  });
+
+  it('shows one hour or more in hours and minutes, without seconds and without zero minutes', () => {
+    expect(formatElapsedTime(HOUR_MS)).toBe('1時間');
+    expect(formatElapsedTime(HOUR_MS + 59 * SECOND_MS)).toBe('1時間');
+    expect(formatElapsedTime(HOUR_MS + 5 * MINUTE_MS)).toBe('1時間5分');
+    expect(formatElapsedTime(HOUR_MS + 5 * MINUTE_MS + 30 * SECOND_MS)).toBe('1時間5分');
+    expect(formatElapsedTime(25 * HOUR_MS + 59 * MINUTE_MS)).toBe('25時間59分');
+  });
+
+  it('keeps formatDuration as it was', () => {
+    expect(formatDuration(65_432)).toBe('65.4秒');
+  });
+
+  it.each(UNOBSERVED_NUMBERS)('shows the not-observed text for %s', (value) => {
+    expect(formatElapsedTime(value)).toBe(NOT_OBSERVED_TEXT);
+  });
+});
+
+// L7（設計書 4.5、4.8。L6 の報告の発見事項3）: 要求の件数と1分あたりの最大の組み立ての、唯一の場所。直近の1分の件数を渡すと、
+// それも添える（実行中の進み具合の行）。
+describe('formatRequestsWithPeak', () => {
+  it('shows a request count with the peak per minute, in the count format', () => {
+    expect(formatRequestsWithPeak({ count: 3400, peakPerMinute: 210 })).toBe('3,400件（1分あたり最大 210件）');
+    expect(formatRequestsWithPeak({ count: 0, peakPerMinute: 0 })).toBe('0件（1分あたり最大 0件）');
+    expect(formatRequestsWithPeak({ count: 3400, peakPerMinute: 210 }))
+      .toBe(countWithPeakPerMinuteText(formatCount(3400), formatCount(210)));
+  });
+
+  it('adds the count of the latest minute before the peak when it is given', () => {
+    expect(formatRequestsWithPeak({ count: 1930, peakPerMinute: 61 }, 38)).toBe('1,930件（直近1分 38件、1分あたり最大 61件）');
+    expect(formatRequestsWithPeak({ count: 0, peakPerMinute: 0 }, 0)).toBe('0件（直近1分 0件、1分あたり最大 0件）');
+    expect(formatRequestsWithPeak({ count: 1930, peakPerMinute: 61 }, 38))
+      .toBe(countWithRecentAndPeakPerMinuteText(formatCount(1930), formatCount(38), formatCount(61)));
+  });
+
+  it('shows the values as they are given (does not compute them)', () => {
+    // 直近の1分の件数が最大より大きい、矛盾した値でも、そのまま示す。
+    expect(formatRequestsWithPeak({ count: 5, peakPerMinute: 3 }, 9)).toBe('5件（直近1分 9件、1分あたり最大 3件）');
+  });
+
+  it('shows the not-observed text for a value that was not observed', () => {
+    expect(formatRequestsWithPeak({ count: -1, peakPerMinute: 2 })).toBe(`${NOT_OBSERVED_TEXT}（1分あたり最大 2件）`);
   });
 });

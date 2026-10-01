@@ -413,6 +413,10 @@ describe('C8: incomplete reason codes', () => {
     'PAGE_CRASHED',
     // C18f（Task 19 の前の整理の設計書 4.5）: 安全の不変条件の違反を検出したため、その監査（ページ、ビューポート）を始めなかった。
     'SAFETY_VIOLATION_ABORT',
+    // R4a（中断した Run の再開の設計書 4.3）: 再開のための保存（チェックポイント）を書けなかったため、その後の監査を始めなかった。
+    'CHECKPOINT_WRITE_FAILED',
+    // R4b1（中断した Run の再開の設計書 4.6.1）: 止める印（Ctrl+C など）を受けたため、その後の監査を始めなかった。
+    'RUN_INTERRUPTED',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -808,6 +812,21 @@ describe('F07 M5: page identity, viewport, and URL rejection reason types', () =
   it('keeps the blocked action counts of the run summary as counts', () => {
     expectTypeOf<RunSafetySummary['blockedActions']>().toEqualTypeOf<SafetyBlockedActionCounts>();
     expectTypeOf<RunSummary['safety']>().toEqualTypeOf<RunSafetySummary>();
+  });
+
+  // RL-fix（RL の 7-3）: run.json の `load` は、サイトへの負荷の記録の型（`RunLoad`。サイトへの負荷の制御の設計書 4.5）である。
+  it('keeps the site load of the run summary as the load record', () => {
+    expectTypeOf<RunSummary['load']>().toEqualTypeOf<CoreContracts.RunLoad>();
+  });
+
+  // R4b2（中断した Run の再開の設計書 4.8）: run.json の実行の記録は、1件以上の、終えた実行の記録（開始と終わりの時刻と、終わり方）である。
+  it('keeps the executions of the run summary as one or more finished executions', () => {
+    expectTypeOf<RunSummary['executions']>().toEqualTypeOf<readonly [CoreContracts.RunExecution, ...CoreContracts.RunExecution[]]>();
+    expectTypeOf<CoreContracts.RunExecution>().toEqualTypeOf<{
+      readonly startedAt: string;
+      readonly finishedAt: string;
+      readonly endReason: CoreContracts.RunExecutionEndReason;
+    }>();
   });
 });
 

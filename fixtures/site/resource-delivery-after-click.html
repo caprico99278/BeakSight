@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Resource delivery after click fixture</title>
+  </head>
+  <body>
+    <main>
+      <h1>Resource delivery after click fixture</h1>
+      <!--
+        Interaction の候補は、aria-expanded を切り替えるこのボタン1つだけ（L5b）。クリックすると、resource-delivery.html が読む
+        画像（/resource-delivery.svg）を読もうとする。このページは、読み込みのときには、その画像を読まない。先に resource-delivery.html を
+        監査していれば、その画像は Run 全体のキャッシュにあるが、クリックの後（凍結の後）の要求なので、Guard が止める。
+      -->
+      <button type="button" aria-expanded="false" aria-controls="toggle-panel">Toggle details</button>
+      <div id="toggle-panel" hidden>Expanded fixture content</div>
+    </main>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#toggle-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+        const image = new Image();
+        image.alt = 'An image requested after the click';
+        image.src = '/resource-delivery.svg';
+        panel.append(image);
+      });
+    </script>
+  </body>
+</html>

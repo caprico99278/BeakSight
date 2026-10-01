@@ -3,7 +3,13 @@
  * 見本の Run は、`tests/helpers/audit-run-fixture.ts`（C16b）で作る。
  */
 import { describe, expect, it } from 'vitest';
-import { SEVERITIES, VIEWPORT_PROFILES, type AuditRunResult } from '../../src/core/contracts.js';
+import {
+  SEVERITIES,
+  VIEWPORT_PROFILES,
+  type AuditRunResult,
+  type RunExecution,
+  type RunExecutionEndReason,
+} from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import {
   INTERACTION_NOT_VERIFIABLE_KIND_CATALOG,
@@ -12,6 +18,7 @@ import {
   REPORT_CATEGORY_SECTIONS,
   REPORT_SECTION_CATALOG,
   REPORT_SECTIONS,
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SAFETY_EVENT_KIND_CATALOG,
   SEVERITY_CATALOG,
@@ -19,17 +26,35 @@ import {
   VIEWPORT_PROFILE_CATALOG,
   sortByDisplayOrder,
 } from '../../src/presentation/catalog.js';
-import { formatCount, formatInteger, formatNotObserved } from '../../src/presentation/format.js';
+import {
+  formatCount,
+  formatDateTime,
+  formatDuration,
+  formatElapsedTime,
+  formatInteger,
+  formatNotObserved,
+  formatRequestsWithPeak,
+  formatTimes,
+} from '../../src/presentation/format.js';
 import {
   HTML_REPORT_TEXT,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
   describeInteractionReason,
   earlierAttemptRecordText,
+  ordinalText,
   ruleVersionText,
 } from '../../src/presentation/messages.js';
-import { escapeHtml, renderCode, renderEvidenceRef, renderSeverityBadge } from '../../src/report/html-components.js';
+import {
+  escapeHtml,
+  renderBadge,
+  renderCode,
+  renderEvidenceRef,
+  renderSeverityBadge,
+  toAnchorId,
+} from '../../src/report/html-components.js';
 import { renderHtmlReport } from '../../src/report/html-report.js';
+import { REPORT_CLASS_NAMES } from '../../src/report/html-tokens.js';
 import { buildReportViewModel, type ReportViewModel } from '../../src/report/view-model.js';
 import {
   HOSTILE_STRINGS,
@@ -39,9 +64,11 @@ import {
   SPECIAL_SCHEME_URLS,
   auditRun,
   edgeCaseAuditRun,
+  executionsDisplaySample,
   fixtureUrl,
   httpSafetyEventSamples,
   interaction,
+  loadDisplaySample,
   page,
   retry,
   runSummary,
@@ -388,6 +415,225 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     const skippedPage = sliceBetween(html, `page-${PAGE_2}`, null);
     expect(skippedPage).toContain('data-value="SKIPPED"');
     expect(skippedPage.match(/MAX_PAGES_REACHED/gu)?.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// L6（サイトへの負荷の制御の設計書 3.1 の7、4.5）: 要約の小節「サイトへの負荷」。「上限」の小節の後、「未完了の理由」と「実行の環境」の
+// 前に置き、表示用モデルの `summary.load` の値を、書式（`format.ts`）にかけて示す。HTML の側では数え直さない。
+describe('renderHtmlReport: the site load in the summary (L6)', () => {
+  /** 負荷の記録だけを、項目ごとに異なる値の見本にした Run（Run の理由がある見本。未完了の理由の小節に表がある）。 */
+  const loadRun = (): AuditRunResult => {
+    const result = edgeCaseAuditRun();
+    return { ...result, run: { ...result.run, load: loadDisplaySample() } };
+  };
+  const summaryAnchor = (key: string): string => toAnchorId('summary', key);
+  // 小節の終わりは、次の小節（R6 で加えた「実行の記録」）の見出しの前。
+  const loadPart = (html: string): string => sliceBetween(html, summaryAnchor('load'), summaryAnchor('executions'));
+  const items = HTML_REPORT_TEXT.summary.load;
+
+  it('puts the site load subsection right after the limits, before the incomplete reasons and the environment', () => {
+    const html = render(loadRun());
+    const positions = ['limits', 'load', 'reasons', 'environment'].map((key) => positionOfId(html, summaryAnchor(key)));
+    for (const position of positions) {
+      expect(position).toBeGreaterThanOrEqual(0);
+    }
+    expect([...positions].sort((left, right) => left - right)).toEqual(positions);
+    const summary = sliceBetween(html, 'summary', 'critical-findings');
+    expect(summary).toContain(`<h3 id="${summaryAnchor('load')}">${escapeHtml(RUN_SUMMARY_TEXT.loadHeading)}</h3>`);
+    // 要約の小見出しは、R6 で「実行の記録」を加えて8つ（Run、ページの網羅、指摘の件数、上限、サイトへの負荷、実行の記録、未完了の理由、
+    // 実行の環境）。
+    expect(summary.match(/<h3 /gu)?.length).toBe(8);
+  });
+
+  it('explains in one paragraph that the values are the requests sent to the site, with the navigation interval', () => {
+    const part = loadPart(render(loadRun()));
+    expect(part).toContain(`<p>${escapeHtml(HTML_REPORT_TEXT.summary.loadNote)}</p>`);
+    expect(part.match(/<p>/gu)?.length).toBe(1);
+  });
+
+  it('shows every item of the site load from the view model, in the shared formats, as a key-value list', () => {
+    const viewModel = buildReportViewModel(loadRun());
+    const part = loadPart(renderHtmlReport(viewModel));
+    const { load } = viewModel.summary;
+    const { requests } = load;
+    const withPeak = (origin: { readonly count: number; readonly peakPerMinute: number }): string =>
+      escapeHtml(formatRequestsWithPeak(origin));
+    const expected = [
+      keyValue(items.minNavigationInterval, escapeHtml(formatDuration(load.minNavigationIntervalMs))),
+      keyValue(items.maxInteractionsPerPage, escapeHtml(formatCount(load.maxInteractionsPerPage))),
+      keyValue(items.navigationCount, escapeHtml(formatTimes(load.navigationCount))),
+      keyValue(items.pacingWait, escapeHtml(formatElapsedTime(load.pacingWaitMs))),
+      keyValue(RUN_SUMMARY_TEXT.allowedOriginRequests, withPeak(requests.allowedOrigins)),
+      keyValue(items.otherOriginRequests, withPeak(requests.otherOrigins)),
+      keyValue(items.servedFromCache, escapeHtml(formatCount(requests.servedFromCache))),
+      keyValue(items.withheldOtherOrigins, escapeHtml(formatCount(requests.withheldOtherOrigins))),
+    ];
+    // 項目の順のまま、1つの一覧（`renderKeyValueList`）にある。
+    expect(part).toContain(`<dl class="${REPORT_CLASS_NAMES.keyValueList}">${expected.join('')}</dl>`);
+    // 見本の値の書式の確かめ（1分あたりの最大を添えた件数、時間、読み込みの回数。回数の単位は L7 で「回」にした）。
+    expect(part).toContain(keyValue(RUN_SUMMARY_TEXT.allowedOriginRequests, escapeHtml('3,400件（1分あたり最大 210件）')));
+    expect(part).toContain(keyValue(items.otherOriginRequests, escapeHtml('56件（1分あたり最大 7件）')));
+    expect(part).toContain(keyValue(items.navigationCount, escapeHtml('1,234回')));
+    expect(part).toContain(keyValue(items.minNavigationInterval, escapeHtml('2.5秒')));
+    // 待った時間の合計は、経過時間の書式（時間・分・秒。L7）で示す（見本は 98,765ms）。
+    expect(part).toContain(keyValue(items.pacingWait, escapeHtml('1分38秒')));
+    expect(part).not.toContain('<table');
+  });
+
+  it('uses the site load of the view model as it is (does not count or compute again)', () => {
+    const viewModel = buildReportViewModel(loadRun());
+    const { load } = viewModel.summary;
+    const altered: ReportViewModel = {
+      ...viewModel,
+      summary: {
+        ...viewModel.summary,
+        load: {
+          ...load,
+          navigationCount: 4321,
+          pacingWaitMs: (65 * 60 + 30) * 1000,
+          requests: { ...load.requests, servedFromCache: 8765, otherOrigins: { count: 11, peakPerMinute: 13 } },
+        },
+      },
+    };
+    const part = loadPart(renderHtmlReport(altered));
+    expect(part).toContain(keyValue(items.navigationCount, escapeHtml(formatTimes(4321))));
+    expect(part).toContain(keyValue(items.servedFromCache, escapeHtml(formatCount(8765))));
+    expect(part).toContain(keyValue(items.otherOriginRequests, escapeHtml(formatRequestsWithPeak({ count: 11, peakPerMinute: 13 }))));
+    expect(part).toContain(keyValue(items.navigationCount, escapeHtml('4,321回')));
+    expect(part).toContain(keyValue(items.pacingWait, escapeHtml(formatElapsedTime((65 * 60 + 30) * 1000))));
+    expect(part).toContain(keyValue(items.pacingWait, escapeHtml('1時間5分')));
+    expect(part).toContain(keyValue(items.otherOriginRequests, escapeHtml('11件（1分あたり最大 13件）')));
+  });
+});
+
+// R6（中断した Run の再開の設計書 4.8 の「表示」）: 要約の小節「実行の記録」。「サイトへの負荷」の小節の後、「未完了の理由」の前に置き
+// （CLI の結果の行の順と同じ）、表示用モデルの `summary.executions` の回数と一覧を、書式（`format.ts`）と表示カタログ
+// （`RUN_EXECUTION_END_REASON_CATALOG`）で示す。HTML の側では数え直さない。
+describe('renderHtmlReport: the executions in the summary (R6)', () => {
+  /** 実行の記録だけを、3回の実行の見本にした Run（Run の理由がある見本。未完了の理由の小節に表がある）。 */
+  const executionsRun = (executions: AuditRunResult['run']['executions'] = executionsDisplaySample()): AuditRunResult => {
+    const result = edgeCaseAuditRun();
+    return { ...result, run: { ...result.run, executions } };
+  };
+  const summaryAnchor = (key: string): string => toAnchorId('summary', key);
+  const executionsPart = (html: string): string => sliceBetween(html, summaryAnchor('executions'), summaryAnchor('reasons'));
+  const text = HTML_REPORT_TEXT.summary;
+
+  /** 小節の中の表の行（`<tbody>` の中の `<tr>` の中身）の一覧。 */
+  const rowsOf = (part: string): string[] =>
+    (part.split('<tbody>')[1]?.split('</tbody>')[0] ?? '').split('</tr>').filter((row) => row.startsWith('<tr'));
+
+  /** 行の欄（`<td>` の中身）の一覧。 */
+  const cellsOf = (row: string): string[] =>
+    row
+      .split('<td>')
+      .slice(1)
+      .map((cell) => cell.split('</td>')[0] ?? '');
+
+  /** 終わり方の欄の期待値: カタログのラベルのバッジ、コード、カタログの説明を、空白でつないだもの。 */
+  const endReasonCell = (reason: RunExecutionEndReason): string => {
+    const spec = RUN_EXECUTION_END_REASON_CATALOG[reason];
+    return [renderBadge(spec, reason).html, renderCode(reason).html, escapeHtml(spec.description)].join(' ');
+  };
+
+  /** 1つの実行の行の欄の期待値（何回目、開始の日時、終了の日時、終わり方）。 */
+  const expectedCells = (execution: RunExecution, index: number): string[] => [
+    escapeHtml(ordinalText(index + 1)),
+    escapeHtml(formatDateTime(execution.startedAt)),
+    escapeHtml(formatDateTime(execution.finishedAt)),
+    endReasonCell(execution.endReason),
+  ];
+
+  it('puts the executions subsection right after the site load, before the incomplete reasons and the environment', () => {
+    const html = render(executionsRun());
+    const positions = ['limits', 'load', 'executions', 'reasons', 'environment'].map((key) => positionOfId(html, summaryAnchor(key)));
+    for (const position of positions) {
+      expect(position).toBeGreaterThanOrEqual(0);
+    }
+    expect([...positions].sort((left, right) => left - right)).toEqual(positions);
+    const summary = sliceBetween(html, 'summary', 'critical-findings');
+    expect(summary).toContain(`<h3 id="${summaryAnchor('executions')}">${escapeHtml(text.executionsHeading)}</h3>`);
+  });
+
+  it('explains the executions in one paragraph and shows the number of executions and of resumes from the view model', () => {
+    const viewModel = buildReportViewModel(executionsRun());
+    const part = executionsPart(renderHtmlReport(viewModel));
+    const { executions } = viewModel.summary;
+    expect(part).toContain(`<p>${escapeHtml(text.executionsNote)}</p>`);
+    expect(part.match(/<p>/gu)?.length).toBe(1);
+    expect(part).toContain(
+      `<dl class="${REPORT_CLASS_NAMES.keyValueList}">${[
+        keyValue(text.executions.count, escapeHtml(formatTimes(executions.count))),
+        keyValue(text.executions.resumeCount, escapeHtml(formatTimes(executions.resumeCount))),
+      ].join('')}</dl>`,
+    );
+    // 見本の値の書式の確かめ（3回の実行、再開は2回）。
+    expect(part).toContain(keyValue(text.executions.count, escapeHtml('3回')));
+    expect(part).toContain(keyValue(text.executions.resumeCount, escapeHtml('2回')));
+  });
+
+  it('lists every execution in its order: the ordinal, the start and end date-times, and the end reason with its label, code and description', () => {
+    const viewModel = buildReportViewModel(executionsRun());
+    const part = executionsPart(renderHtmlReport(viewModel));
+    for (const column of text.executionColumns) {
+      expect(part).toContain(`<th scope="col">${escapeHtml(column)}</th>`);
+    }
+    const rows = rowsOf(part);
+    const { items } = viewModel.summary.executions;
+    expect(rows).toHaveLength(items.length);
+    expect(rows).toHaveLength(3);
+    items.forEach((execution, index) => {
+      expect(cellsOf(rows[index] ?? ''), `${index}`).toEqual(expectedCells(execution, index));
+    });
+    // 見本の値の書式の確かめ（日時は `Asia/Tokyo`。終わり方は、ラベル、コード、説明）。
+    const [first, second, third] = rows.map(cellsOf);
+    expect(first).toEqual([
+      escapeHtml('1回目'),
+      escapeHtml('2026-10-01 09:00:00 JST'),
+      escapeHtml('2026-10-01 10:00:00 JST'),
+      endReasonCell('STOPPED_BY_RUNTIME_LIMIT'),
+    ]);
+    expect(second?.[2]).toBe(escapeHtml('2026-10-02 09:30:15 JST'));
+    expect(second?.[3]).toContain(`data-value="INTERRUPTED_ABNORMALLY">${escapeHtml(RUN_EXECUTION_END_REASON_CATALOG.INTERRUPTED_ABNORMALLY.label)}<`);
+    expect(third?.[0]).toBe(escapeHtml('3回目'));
+    expect(third?.[3]).toContain(escapeHtml(RUN_EXECUTION_END_REASON_CATALOG.COMPLETED.description));
+  });
+
+  it('shows one execution and no resume for a Run that was not interrupted', () => {
+    const viewModel = buildReportViewModel(auditRun());
+    const part = executionsPart(renderHtmlReport(viewModel));
+    expect(part).toContain(keyValue(text.executions.count, escapeHtml('1回')));
+    expect(part).toContain(keyValue(text.executions.resumeCount, escapeHtml('0回')));
+    const rows = rowsOf(part);
+    expect(rows).toHaveLength(1);
+    const [execution] = viewModel.summary.executions.items;
+    expect(cellsOf(rows[0] ?? '')).toEqual(expectedCells(execution, 0));
+    expect(execution.endReason).toBe('COMPLETED');
+  });
+
+  it('escapes the recorded values of the executions', () => {
+    const [first, ...rest] = executionsDisplaySample();
+    const html = render(executionsRun([{ ...first, startedAt: HOSTILE_TEXT, finishedAt: HOSTILE_STRINGS.scriptTag }, ...rest]));
+    const part = executionsPart(html);
+    // 解析できない日時は、記録されたままの文字列を示す（`formatDateTime`）。HTML には、エスケープして入れる。
+    expect(part).toContain(`<td>${escapeHtml(HOSTILE_TEXT)}</td>`);
+    expect(part).toContain(`<td>${escapeHtml(HOSTILE_STRINGS.scriptTag)}</td>`);
+    expect(part).not.toContain(HOSTILE_STRINGS.scriptTag);
+    expect(part).not.toContain(HOSTILE_STRINGS.attributeBreak);
+    expect(html).not.toContain('<script');
+  });
+
+  it('uses the executions of the view model as they are (does not count again)', () => {
+    const viewModel = buildReportViewModel(executionsRun());
+    const { executions } = viewModel.summary;
+    const altered: ReportViewModel = {
+      ...viewModel,
+      summary: { ...viewModel.summary, executions: { count: 9, resumeCount: 4, items: [executions.items[0]] } },
+    };
+    const part = executionsPart(renderHtmlReport(altered));
+    expect(part).toContain(keyValue(text.executions.count, escapeHtml(formatTimes(9))));
+    expect(part).toContain(keyValue(text.executions.resumeCount, escapeHtml(formatTimes(4))));
+    expect(rowsOf(part)).toHaveLength(1);
   });
 });
 

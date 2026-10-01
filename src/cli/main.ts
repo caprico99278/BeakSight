@@ -9,6 +9,8 @@
  * - Run のディレクトリを作れなかった Run（DEF-009）は、`run-command.ts` が、artifact を書かずに標準エラーに示し、その Run の
  *   Run Status（FAILED）の終了コード 1 を返す。
  * - `runCli` の外で起きた、扱われない例外と reject も、同じ形で示す（`reportUnhandledFailure`。`index.ts` が登録する。R17 の指摘1）。
+ * - 止める印（`CliDependencies.stopSignal`。シグナルの1回目で付く）は、`run` のときだけ、Run Coordinator に届ける（中断した Run の再開の
+ *   設計書 4.7 の「シグナル」）。2回目のシグナルで、すぐに終える処理は、`interrupt.ts` が行う。
  * - すべての書き込みが終わるのを待ってから、終了コードを返す。
  */
 import { isConfigError } from '../config/config-error.js';
@@ -27,9 +29,28 @@ export interface CliStreams {
   readonly stderr: CliOutput;
 }
 
-/** CLI に注入するもの（テスト用。省略すると本番のもの）。 */
+/** CLI に注入するもの（`run` はテスト用。省略すると本番のもの）。 */
 export interface CliDependencies {
   readonly run?: RunCommandDependencies;
+  /**
+   * 止める印（中断した Run の再開の設計書 4.6.1、4.7 の「シグナル」）。`index.ts` が、シグナルの受け手（`interrupt.ts`）と一緒に作って渡す。
+   * `run` のときだけ、`run` の依存（`dependencies.run`、省略すると本番の依存）に加えて、Run Coordinator に届ける
+   * （`resolveRunCommandDependencies`）。`validate-config` と `--help` では使わない。省略すると、止めない。
+   */
+  readonly stopSignal?: AbortSignal;
+}
+
+/**
+ * `run` に渡す依存を組み立てる。`dependencies.run`（省略すると `production`）に、止める印（`dependencies.stopSignal`）を加えた写しを返す。
+ * 止める印がなければ、`dependencies.run`（省略すると `production`）をそのまま返す。渡された依存は変えない。
+ * `production` は、呼び出し側が渡す（本番の依存は Playwright を読み込む `run-command.ts` にあり、`run` のときだけ読み込むため）。
+ */
+export function resolveRunCommandDependencies(
+  dependencies: CliDependencies,
+  production: RunCommandDependencies,
+): RunCommandDependencies {
+  const base = dependencies.run ?? production;
+  return dependencies.stopSignal === undefined ? base : { ...base, stopSignal: dependencies.stopSignal };
 }
 
 /**
@@ -48,9 +69,15 @@ export async function runCli(argv: readonly string[], streams: CliStreams, depen
       await streams.stdout.write(joinLines(validConfigLines(config)));
       return SUCCESS_EXIT_CODE;
     }
-    // Playwright を読み込むのは、`run` のときだけにする。
-    const { runAuditCommand } = await import('./run-command.js');
-    return await runAuditCommand(config, streams, dependencies.run);
+    // Playwright を読み込むのは、`run` のときだけにする。`--new` は、そのまま渡す。止める印は、`run` の依存に加えて渡す
+    // （中断した Run の再開の設計書 4.7）。
+    const { PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } = await import('./run-command.js');
+    return await runAuditCommand(
+      config,
+      streams,
+      resolveRunCommandDependencies(dependencies, PRODUCTION_RUN_DEPENDENCIES),
+      { startNew: invocation.startNew },
+    );
   } catch (error) {
     if (isConfigError(error)) {
       await streams.stderr.write(joinLines(configErrorLines(error)));

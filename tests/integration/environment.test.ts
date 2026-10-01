@@ -11,7 +11,7 @@ import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
-import { collectRunEnvironment, readToolVersion } from '../../src/orchestration/environment.js';
+import { collectRunEnvironment, readPlaywrightVersion, readToolVersion } from '../../src/orchestration/environment.js';
 import {
   PassiveContextCloseDeadlineError,
   type PassiveSessionCloseFailure,
@@ -129,6 +129,7 @@ describe('collectRunEnvironment (R15c)', () => {
       runStatus: 'FAILED',
       startedAt: '2026-09-24T01:02:03.000Z',
       finishedAt: '2026-09-24T01:02:04.000Z',
+      executions: [{ startedAt: '2026-09-24T01:02:03.000Z', finishedAt: '2026-09-24T01:02:04.000Z', endReason: 'COMPLETED' }],
       discoveredPageCount: 0,
       auditedPageCount: 0,
       partialPageCount: 0,
@@ -154,6 +155,18 @@ describe('collectRunEnvironment (R15c)', () => {
       retries: [],
       crawlLimits: { maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false },
       incompleteReasons: [{ code: 'PREFLIGHT_FAILED', detail: 'BROWSER_LAUNCH' }],
+      load: {
+        minNavigationIntervalMs: config.crawl.minNavigationIntervalMs,
+        maxInteractionsPerPage: config.crawl.maxInteractionsPerPage,
+        navigationCount: 0,
+        pacingWaitMs: 0,
+        requests: {
+          allowedOrigins: { count: 0, peakPerMinute: 0 },
+          otherOrigins: { count: 0, peakPerMinute: 0 },
+          servedFromCache: 0,
+          withheldOtherOrigins: 0,
+        },
+      },
     } satisfies RunSummary;
 
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
@@ -429,5 +442,22 @@ describe('collectRunEnvironment (R15c)', () => {
 describe('readToolVersion (R15c)', () => {
   it('reads the version of the BeakSight package.json', async () => {
     await expect(readToolVersion()).resolves.toBe(await packageVersion(new URL('../../package.json', import.meta.url)));
+  });
+});
+
+// R5a（中断した Run の再開の設計書 4.7.1 の「版の確かめ」）: CLI は、再開の前に、今の Playwright の版を、run.json の環境と同じ関数で読む。
+describe('readPlaywrightVersion (R5a)', () => {
+  it('reads the version of the Playwright package.json, the same as the environment of run.json', async () => {
+    const version = readPlaywrightVersion();
+
+    expect(version).toBe(await packageVersion(playwrightPackageUrl()));
+    const environment = await collectRunEnvironment({
+      config: createTestConfig(server.origin),
+      browser: null,
+      factory: null,
+      onSafetyLedger: () => undefined,
+      onCloseFailure: () => undefined,
+    });
+    expect(environment.playwrightVersion).toBe(version);
   });
 });

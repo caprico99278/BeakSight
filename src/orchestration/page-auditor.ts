@@ -28,7 +28,7 @@ import {
 import { awaitBeforeDeadline } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { NormalizedHttpUrlEvidence, ScreenshotCaptureType, ScrollEvidence } from '../core/evidence-types.js';
-import { isPositiveSafeInteger } from '../core/guards.js';
+import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import {
   COLLECTOR_DEADLINE_MARGIN_MS,
@@ -46,6 +46,7 @@ import {
   unhandledFailureReason,
 } from '../core/status.js';
 import { discoverLinks } from '../crawl/discover-links.js';
+import type { NavigationPacer } from '../crawl/navigation-pacer.js';
 import { collectAccessibilityEvidence } from '../evidence/accessibility-collector.js';
 import type { CollectorHandle } from '../evidence/collector-handle.js';
 import { collectColorEvidence } from '../evidence/color-collector.js';
@@ -157,6 +158,14 @@ export interface PageAuditorDependencies {
    * 違反では止めない Page Auditor が必要な場合（テストなど）は、それを明示する関数（`() => false`）を渡す。
    */
   readonly safetyViolationRecorded: () => boolean;
+  /**
+   * ページの読み込みの間隔を守る部品（サイトへの負荷の制御の設計書 4.1）。Run Coordinator が Run の初めに1つだけ作り、robots.txt と
+   * sitemap.xml の取得にも同じものを渡す。Page Auditor は、Passive の各ビューポート（再試行を含む）、幅の走査の各幅、Interaction の
+   * 各候補の読み込みの前に `beforeNavigation()` を呼ぶ。待った時間は、期限を消費しない（設計書 4.4。待った分だけ期限を延ばす）。
+   * 必須の依存である（渡し忘れると間隔を空けずに読み込む、という形を残さない）。`beforeNavigation` と `snapshot` の関数を持たない
+   * 値と、渡さなかった場合は `TypeError`。
+   */
+  readonly navigationPacer: NavigationPacer;
 }
 
 /**
@@ -214,8 +223,21 @@ const INTERACTION_STOP_REASONS = Object.freeze({
   cleanup: 'cleanup',
   /** 安全の不変条件の違反を検出した（Task 19 の前の整理の設計書 4.5。C18f）。 */
   safety: SAFETY_VIOLATION_ABORT_CODE,
+  /** 監査を始めた候補の数が、設定の上限（`crawl.maxInteractionsPerPage`）に達した（サイトへの負荷の制御の設計書 4.3）。 */
+  limit: 'limit',
 } as const);
 type InteractionStopReason = (typeof INTERACTION_STOP_REASONS)[keyof typeof INTERACTION_STOP_REASONS];
+
+/**
+ * 1つのビューポートの監査の期限（Task 14〜17 の設計書 4.5.7。`Date.now()` と同じ基準の絶対時刻）。ページの読み込みの間隔のために
+ * 待った時間（幅の走査の中の待ち）の分だけ、両方を同じだけ後ろに延ばす（サイトへの負荷の制御の設計書 4.4。待ち時間は期限を消費しない）。
+ * - `pageAtMs`: ページの期限。段階を見放す時刻の既定（`StageRunner.attempt`）でもある。
+ * - `collectorAtMs`: 期限を受け取る collector に渡す期限の上限（ページの期限 − `COLLECTOR_DEADLINE_MARGIN_MS`）。
+ */
+interface ViewportDeadlines {
+  pageAtMs: number;
+  collectorAtMs: number;
+}
 
 /** `auditViewport()` の中間の結果。ページの結果は、両方のビューポートのこれから組み立てる。 */
 interface ViewportAuditOutcome {
@@ -263,6 +285,7 @@ export class PageAuditor {
   readonly #collectors: PageAuditCollectors;
   readonly #deadlines: ResolvedPassiveSessionDeadlines;
   readonly #safetyViolationRecorded: () => boolean;
+  readonly #pacer: NavigationPacer;
 
   /** 注入した期限（`dependencies.deadlines`）が不正なら、`RangeError` か `TypeError` を投げる。 */
   constructor(dependencies: PageAuditorDependencies) {
@@ -278,6 +301,15 @@ export class PageAuditor {
       throw new TypeError('PageAuditor requires a safetyViolationRecorded function');
     }
     this.#safetyViolationRecorded = safetyViolationRecorded;
+    const { navigationPacer } = dependencies;
+    if (
+      !isRecord(navigationPacer)
+      || typeof navigationPacer.beforeNavigation !== 'function'
+      || typeof navigationPacer.snapshot !== 'function'
+    ) {
+      throw new TypeError('PageAuditor requires a navigation pacer');
+    }
+    this.#pacer = navigationPacer;
     this.#deadlines = resolvePassiveSessionDeadlines(dependencies.deadlines);
     this.#factory = contextFactory;
     this.#config = config;
@@ -361,10 +393,17 @@ export class PageAuditor {
     const factory = this.#factory;
     const config = this.#config;
     const viewportSize = viewportSizeFor(config, profile);
+    // ページの読み込みの間隔を守る（サイトへの負荷の制御の設計書 4.1）。ページの期限は、待った後の時刻から数える（4.4）。再試行も、
+    // このビューポートの監査を通るので、同じく待つ。
+    await this.#pacer.beforeNavigation();
     const pageDeadlineAtMs = this.#now() + config.crawl.overallPageTimeoutMs;
-    // 期限を受け取る collector（DOM の準備、scroll、layout、幅の走査、accessibility、performance）に渡す期限の上限。
+    // 期限を受け取る collector（DOM の準備、scroll、layout、幅の走査、accessibility、performance）に渡す期限の上限（`collectorAtMs`）は、
     // ページの期限より余裕の分だけ前にして、collector が期限で止まったときの PARTIAL の Evidence を捨てずに記録する（設計書 4.5.7）。
-    const collectorDeadlineAtMs = pageDeadlineAtMs - COLLECTOR_DEADLINE_MARGIN_MS;
+    // どちらの期限も、幅の走査の中で待った時間の分だけ延ばす（`ViewportDeadlines`）。
+    const deadlines: ViewportDeadlines = {
+      pageAtMs: pageDeadlineAtMs,
+      collectorAtMs: pageDeadlineAtMs - COLLECTOR_DEADLINE_MARGIN_MS,
+    };
     const allowedQueryParameters: ReadonlySet<string> = new Set(config.crawl.allowedQueryParameters);
 
     const evidence: EvidenceRecord[] = [];
@@ -393,7 +432,7 @@ export class PageAuditor {
       const opened = await openPassiveSessionBeforeDeadline(
         factory,
         viewportSize,
-        passiveSessionOpenDeadlineAtMs({ timeoutMs: this.#deadlines.sessionOpenTimeoutMs, notAfterMs: pageDeadlineAtMs }),
+        passiveSessionOpenDeadlineAtMs({ timeoutMs: this.#deadlines.sessionOpenTimeoutMs, notAfterMs: deadlines.pageAtMs }),
         this.#deadlines,
       );
       // 構築に失敗した Context の Ledger も、Safety の Evidence と違反の集計に含める（設計書 4.3、R14 の I2、R14r の Important-1）。
@@ -425,11 +464,12 @@ export class PageAuditor {
         const runner = new StageRunner(activePage, reasons, this.#now);
         stages = runner;
         activePage.on('crash', runner.onCrash);
-        // Passive の段階は、既定で、ページの期限まで待つ（設計書 4.5.7）。
+        // Passive の段階は、既定で、ページの期限まで待つ（設計書 4.5.7）。既定の値は呼び出しのたびに読むので、幅の走査の後の段階は、
+        // 延ばしたページの期限を使う（サイトへの負荷の制御の設計書 4.4）。
         const attempt = <T>(
           stage: PageAuditStage,
           work: () => Promise<T>,
-          abandonAtMs: number | null = pageDeadlineAtMs,
+          abandonAtMs: number | null = deadlines.pageAtMs,
           failureReason?: StageFailureReason,
         ): Promise<StageAttempt<T>> => runner.attempt(stage, work, abandonAtMs, failureReason);
 
@@ -441,7 +481,7 @@ export class PageAuditor {
 
         // 3. ナビゲーションする。
         const navigationStartedAtMs = this.#now();
-        const navigationDeadlineAtMs = stageDeadline(pageDeadlineAtMs, navigationStartedAtMs, config.crawl.navigationTimeoutMs);
+        const navigationDeadlineAtMs = stageDeadline(deadlines.pageAtMs, navigationStartedAtMs, config.crawl.navigationTimeoutMs);
         // ナビゲーションは、期限（`timeoutMs`）を受け取り、例外を投げずに結果を返す。crash の段階を記すためだけに、処理中の段階にする。
         const passiveContext = context;
         navigation = await runner.during('navigation', () => navigatePage(activePage, url, {
@@ -456,7 +496,7 @@ export class PageAuditor {
         } else {
           // 4. DOM の準備を待ち、controlled scroll を行う。
           const settling = await attempt('settling', () => waitForPageSettled(activePage, {
-            deadlineAtMs: this.#stageDeadline(collectorDeadlineAtMs, config.crawl.resourceSettlingTimeoutMs),
+            deadlineAtMs: this.#stageDeadline(deadlines.collectorAtMs, config.crawl.resourceSettlingTimeoutMs),
             ...PAGE_SETTLING_PACING,
           }));
           if (settling.ok && settling.value.status === 'PARTIAL') {
@@ -464,7 +504,7 @@ export class PageAuditor {
           }
           const scroll = await attempt('scroll', () => controlledScroll(activePage, {
             deadlineAtMs: this.#stageDeadline(
-              collectorDeadlineAtMs,
+              deadlines.collectorAtMs,
               config.crawl.resourceSettlingTimeoutMs * SCROLL_STAGE_BUDGET_SETTLING_MULTIPLIER,
             ),
             ...CONTROLLED_SCROLL_PACING,
@@ -481,7 +521,7 @@ export class PageAuditor {
             profile,
             page: activePage,
             viewportSize,
-            collectorDeadlineAtMs,
+            deadlines,
             allowedQueryParameters,
             performanceInstalled,
             network,
@@ -553,10 +593,10 @@ export class PageAuditor {
 
   /** 設計書 4.5.2 の 5。設定で無効な段階は実行しない（4.5.5）。 */
   async #collect(state: CollectionState): Promise<void> {
-    const { url, pageId, profile, page, viewportSize, collectorDeadlineAtMs, reasons, safety, record, attempt } = state;
+    const { url, pageId, profile, page, viewportSize, deadlines, reasons, safety, record, attempt } = state;
     const config = this.#config;
     const collectors = this.#collectors;
-    const deadlineAtMs = (): number => this.#stageDeadline(collectorDeadlineAtMs, null);
+    const deadlineAtMs = (): number => this.#stageDeadline(deadlines.collectorAtMs, null);
 
     const dom = await attempt('dom', () => collectors.collectDomEvidence(page, pageId));
     if (dom.ok) {
@@ -571,30 +611,53 @@ export class PageAuditor {
       // 幅の走査は Desktop で1回だけ行い、Mobile の `stressSweep` は null にする（設計書 4.5.6）。
       let stressSweep: EvidencePayloadByType['layout']['stressSweep'] = null;
       if (profile === 'desktop') {
-        // 幅の走査のセッションの作成と終了も、期限付きで待つ（DEF-008）。作成の期限の上限は、幅の走査に渡す期限（ページの期限から
-        // 余裕の分だけ前の `collectorDeadlineAtMs`）である。期限の注入（R15r-4）も、そのまま渡す。
-        const sessions = createStressSessionFactory(this.#factory, { deadlines: this.#deadlines, notAfterMs: collectorDeadlineAtMs });
+        // 幅の走査の中で、ページの読み込みの間隔のために待った時間（走査の前後の、pacer の待った時間の合計の差。サイトへの負荷の制御の
+        // 設計書 4.4）。幅のセッションの作成の期限の上限と、走査の後のページの期限を、この分だけ延ばす。
+        const sweepWaitStartMs = this.#pacer.snapshot().totalWaitMs;
+        const sweepWaitedMs = (): number => this.#pacer.snapshot().totalWaitMs - sweepWaitStartMs;
         // 違反を検出した後は、幅の走査の次の幅を始めない（Task 19 の前の整理の設計書 4.5）。各幅のセッションを作る前に確かめ、違反が
         // あれば作らずに段階を止める（理由は `stress-layout:SAFETY_VIOLATION_ABORT`）。始めた幅のセッションの Ledger は、今までどおり残る。
+        // 幅の走査のセッションの作成と終了も、期限付きで待つ（DEF-008）。作成の期限の上限は、幅の走査に渡す期限（ページの期限から
+        // 余裕の分だけ前の `collectorAtMs`）を、それまでに走査の中で待った時間の分だけ延ばしたものである（幅の走査が自分の期限を
+        // 延ばすのと同じ量。負荷の制御の設計書 4.4）。上限は幅ごとに変わるので、幅ごとにセッションの factory を作る。期限の注入
+        // （R15r-4）も、そのまま渡す。作ったセッションの Ledger は、作成の途中で失敗した場合も含めて、作った順に残す。
         const createSession: StressSessionFactory['createSession'] = async (viewport) => {
           if (this.#safetyViolationRecorded()) {
             throw new SafetyViolationAbortError();
           }
-          return sessions.createSession(viewport);
+          // 幅の走査の Context は、ページの読み込み直しなので、役割は `REVISIT` である（負荷の制御の設計書 4.7）。
+          const sessions = createStressSessionFactory(this.#factory, {
+            deadlines: this.#deadlines,
+            notAfterMs: deadlines.collectorAtMs + sweepWaitedMs(),
+            role: 'REVISIT',
+          });
+          try {
+            return await sessions.createSession(viewport);
+          } finally {
+            safety.stressLedgers.push(...sessions.ledgers());
+          }
         };
         // 幅の走査は、この page ではなく幅ごとの Context で行うので、この page の crash とも、ページの期限とも競わせない
         // （走査は、ページの期限を受け取って自分で守る）。途中で見放すと、走査のセッションが監査の後まで残るためである。
+        // 各幅の読み込みの前には、ページの読み込みの間隔を守る（負荷の制御の設計書 4.1）。走査は、待った時間の分だけ自分の期限を延ばす。
         // セッションを閉じる処理の期限切れは、`stress-layout:CLOSE_DEADLINE_EXCEEDED` として記録する（RP18r の Minor-2）。
         // 幅のセッションの中で違反が起き、Guard がその Context を閉じた場合、段階は、そのセッションの後始末の失敗（Guard が無効にした
         // Context の page は閉じられない）で止まる。その場合も、違反で止まったことが分かる `stress-layout:SAFETY_VIOLATION_ABORT` にする
         // （C18i、RC18b の N2。違反の検出は、注入された確かめ（Run Coordinator が持つ）だけで行う）。
         const swept = await attempt(
           'stress-layout',
-          () => collectors.collectStressLayout(createSession, url, stressSweepWidths(config), { deadlineAtMs: deadlineAtMs() }),
+          () => collectors.collectStressLayout(createSession, url, stressSweepWidths(config), {
+            deadlineAtMs: deadlineAtMs(),
+            beforeNavigation: () => this.#pacer.beforeNavigation(),
+          }),
           null,
           (error) => (this.#safetyViolationRecorded() ? SAFETY_VIOLATION_ABORT_CODE : stressSweepFailureReason(error)),
         );
-        safety.stressLedgers.push(...sessions.ledgers());
+        // 走査の中で待った時間の分だけ、ページの期限を延ばす。走査の後の段階（配色、accessibility、performance、スクリーンショット、
+        // Link、Interaction の候補の発見）と、段階を見放す時刻の既定は、延ばした期限を使う（負荷の制御の設計書 4.4）。
+        const sweepWaitMs = sweepWaitedMs();
+        deadlines.pageAtMs += sweepWaitMs;
+        deadlines.collectorAtMs += sweepWaitMs;
         if (swept.ok) {
           stressSweep = swept.value;
           const sweepReasons = new Set(
@@ -687,7 +750,8 @@ export class PageAuditor {
 
   /**
    * Interaction の段階（設計書 4.3.1、4.5.7、4.5.8）。Passive の page で候補を見つけ、除外されるものも含めて、
-   * 見つけた順にすべて `auditInteraction` に渡す（呼び出しの前に取り除かない）。
+   * 見つけた順に `auditInteraction` に渡す（呼び出しの前に取り除かない）。渡すのは、1ページの上限（`crawl.maxInteractionsPerPage`）
+   * までで、残りは理由 `interaction:limit:remaining=<件数>` で記録する（サイトへの負荷の制御の設計書 4.3）。
    * 各候補の結果は、Evidence の部分を `interaction` の Evidence に記録し、Safety の snapshot は、INTERACTION の safety の
    * Evidence と違反の集計に使う。候補の結果の状態（NOT_VERIFIABLE など）では、ビューポートの状態を変えない。
    */
@@ -701,9 +765,10 @@ export class PageAuditor {
     }
     // Interaction の段階の予算は、Passive の段階とは別に、候補の発見が終わった時刻から数える（4.5.7）。
     // 1件目の候補も、この時刻から数える。そうすると、設定の検証を通った設定（ページの期限 ≧ 候補1つの見積もり）なら、
-    // 1件目の候補が予算に収まる。
+    // 1件目の候補が予算に収まる。ページの読み込みの間隔のために待った時間は、予算を消費しない（サイトへの負荷の制御の設計書 4.4）。
+    // 候補の前に待った時間の分だけ、段階の期限を延ばし、1件目の候補の開始の時刻も、その分だけ後ろにずらす。
     const discoveryFinishedAtMs = this.#now();
-    const interactionStageDeadlineAtMs = discoveryFinishedAtMs + this.#config.crawl.overallPageTimeoutMs;
+    let interactionStageDeadlineAtMs = discoveryFinishedAtMs + this.#config.crawl.overallPageTimeoutMs;
     const { candidates, completeness } = discovery.value;
     if (completeness !== 'COMPLETE') {
       reasons.push(collectorIncompleteReason('interaction-discovery', completeness));
@@ -719,9 +784,19 @@ export class PageAuditor {
         reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.safety, candidates.length - index));
         return;
       }
+      // 監査を始めた候補の数（失敗した候補も数える）が、1ページの上限に達したら、残りの候補を始めない（サイトへの負荷の制御の設計書
+      // 4.3）。確かめる順は、違反、上限、予算である。残りの候補は読み込まないので、ページの読み込みの間隔の待ちも呼ばない。
+      if (index >= this.#config.crawl.maxInteractionsPerPage) {
+        reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.limit, candidates.length - index));
+        return;
+      }
+      // ページの読み込みの間隔を守る（負荷の制御の設計書 4.1）。候補の監査は、隔離した Context で対象のページを読み込むためである。
+      // 2件目以降の候補の開始の時刻は、待った後の現在の時刻である。
+      const waitedMs = await this.#pacer.beforeNavigation();
+      interactionStageDeadlineAtMs += waitedMs;
       const deadlineAtMs = this.#interactionCandidateDeadline(
         interactionStageDeadlineAtMs,
-        index === 0 ? discoveryFinishedAtMs : this.#now(),
+        index === 0 ? discoveryFinishedAtMs + waitedMs : this.#now(),
       );
       if (deadlineAtMs === null) {
         reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.budget, candidates.length - index));
@@ -804,7 +879,8 @@ export class PageAuditor {
   /**
    * 次の Interaction の候補の期限（設計書 4.5.7。計算はここだけで行う）。段階の期限と「候補の開始の時刻 + 候補1つの予算」の早い方とする。
    * 候補1つの予算は、`navigationTimeoutMs` と、`interactionTimeoutMs` の2倍の和である。
-   * 候補の開始の時刻は、1件目は候補の発見が終わった時刻、2件目以降は現在の時刻である（呼び出し側が渡す）。
+   * 候補の開始の時刻は、1件目は候補の発見が終わった時刻（ページの読み込みの間隔のために待った時間の分だけ後ろにずらしたもの）、
+   * 2件目以降は現在の時刻（待った後）である（呼び出し側が渡す。サイトへの負荷の制御の設計書 4.4）。
    * 予算の全体が段階の期限に収まらない場合は、`null`（そこで止める）を返す。
    */
   #interactionCandidateDeadline(interactionStageDeadlineAtMs: number, candidateStartedAtMs: number): number | null {
@@ -848,8 +924,11 @@ interface CollectionState {
   readonly profile: ViewportProfile;
   readonly page: Page;
   readonly viewportSize: Viewport;
-  /** 期限を受け取る collector に渡す期限の上限（ページの期限 − `COLLECTOR_DEADLINE_MARGIN_MS`。設計書 4.5.7）。 */
-  readonly collectorDeadlineAtMs: number;
+  /**
+   * ビューポートの期限（ページの期限と、collector に渡す期限の上限。設計書 4.5.7）。幅の走査の中で待った時間の分だけ延ばすので、
+   * 段階ごとに、その時点の値を読む（サイトへの負荷の制御の設計書 4.4）。
+   */
+  readonly deadlines: ViewportDeadlines;
   readonly allowedQueryParameters: ReadonlySet<string>;
   readonly performanceInstalled: boolean;
   readonly network: CollectorHandle<EvidencePayloadByType['network']>;
