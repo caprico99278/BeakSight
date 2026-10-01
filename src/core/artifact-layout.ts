@@ -11,14 +11,23 @@
  *   - 再試行の前の試行のスクリーンショット: `pages/<pageId>/retry-<n>/<ビューポート>/`（DEF-007）
  * - Run のディレクトリからの相対パスが安全かどうかの検証（`isPortableRelativeArtifactPath`、`isPortableArtifactPathSegment`）も、
  *   ここだけで行う（CC-027）。スクリーンショットの収集、`ArtifactWriter`、ChatGPT 用バンドルは、どれもここを使う。
- * - Run のディレクトリを排他的に作る処理（`createRunArtifactDirectory`。DEF-009）も、ここに置く。このファイルで入出力を行うのは、
- *   これだけである。
+ * - 中断した Run の再開のための保存（チェックポイント）とロックの配置（中断した Run の再開の設計書 4.1、4.4）:
+ *   - `checkpoint/`: `state.json`、`state.prev.json`、`run.lock`
+ *   - `checkpoint/pages/<pageId>.json`: ページの保存
+ *   保存のファイルを読み書きし、消すのは `ArtifactWriter` である。ここは、名前とパスだけを持つ。
+ * - PREFLIGHT が Run のディレクトリの直下に作る一時ファイルの名前（接頭辞と接尾辞）も、ここに置く（PREFLIGHT が作り、再開のときの
+ *   後始末で `ArtifactWriter` が消す。report の層は orchestration を import しないため）。
+ * - Run のディレクトリを排他的に作る処理（`createRunArtifactDirectory`。DEF-009）と、Run のディレクトリの一覧の読み取り
+ *   （`listRunDirectories` と、それから保存のあるものを選ぶ `listCheckpointRunDirectories`。読むだけ）も、ここに置く。このファイルで
+ *   入出力を行うのは、これらだけである。
  */
-import { mkdir } from 'node:fs/promises';
+import { mkdir, readdir, stat } from 'node:fs/promises';
 import { join, posix, win32 } from 'node:path';
 import type { PageId, RunId, ViewportProfile } from './contracts.js';
 import type { ScreenshotCaptureType } from './evidence-types.js';
 import { isPositiveSafeInteger, isRecord } from './guards.js';
+import { isPageId, isRunId } from './ids.js';
+import { compareCodeUnits } from './text.js';
 
 /** Run のディレクトリの直下のファイルの名前。 */
 export const RUN_ARTIFACT_FILE_NAMES = Object.freeze({
@@ -47,6 +56,28 @@ export const SCREENSHOT_FILE_NAMES = Object.freeze({
   FULL_PAGE: 'full-page.png',
 } as const satisfies Record<ScreenshotCaptureType, string>);
 
+/** 再開のための保存（チェックポイント）とロックを置く、Run のディレクトリの直下のディレクトリの名前（中断した Run の再開の設計書 4.1）。 */
+export const CHECKPOINT_ARTIFACT_DIRECTORY = 'checkpoint';
+
+/** `checkpoint/` の中のファイルの名前（状態の保存、1つ前の状態の保存、ロック。設計書 4.1、4.3、4.4）。 */
+export const CHECKPOINT_ARTIFACT_FILE_NAMES = Object.freeze({
+  state: 'state.json',
+  previousState: 'state.prev.json',
+  lock: 'run.lock',
+} as const);
+export type CheckpointArtifactFile = keyof typeof CHECKPOINT_ARTIFACT_FILE_NAMES;
+
+/** ページの保存（`<pageId>.json`）を置くディレクトリの、Run のディレクトリからの相対パス（区切りは `/`。`checkpoint/pages`）。 */
+export const CHECKPOINT_PAGES_ARTIFACT_DIRECTORY = `${CHECKPOINT_ARTIFACT_DIRECTORY}/${PAGES_ARTIFACT_DIRECTORY}`;
+
+/** ページの保存のファイルの名前の接尾辞（`<pageId>.json`）。 */
+const CHECKPOINT_PAGE_FILE_SUFFIX = '.json';
+
+/** PREFLIGHT が出力先を確かめるために、Run のディレクトリの直下に作って消す一時ファイルの名前の接頭辞（`<接頭辞><UUID><接尾辞>`）。 */
+export const PREFLIGHT_TEMPORARY_FILE_PREFIX = '.beaksight-preflight-';
+/** PREFLIGHT の一時ファイルの名前の接尾辞。 */
+export const PREFLIGHT_TEMPORARY_FILE_SUFFIX = '.tmp';
+
 /** Run の artifact を置くディレクトリ（`<出力先の根>/<runId>`。区切りは実行している環境のもの）。 */
 export function runArtifactDirectory(outputDirectory: string, runId: RunId): string {
   return join(outputDirectory, runId);
@@ -55,6 +86,32 @@ export function runArtifactDirectory(outputDirectory: string, runId: RunId): str
 /** ページのファイルの、Run のディレクトリからの相対パス（区切りは `/`。例: `pages/PAGE-000001/page.json`）。 */
 export const pageArtifactRelativePath = (pageId: PageId, file: PageArtifactFile): string =>
   `${PAGES_ARTIFACT_DIRECTORY}/${pageId}/${PAGE_ARTIFACT_FILE_NAMES[file]}`;
+
+/** `checkpoint/` の中のファイルの、Run のディレクトリからの相対パス（区切りは `/`。例: `checkpoint/state.json`）。 */
+export const checkpointArtifactRelativePath = (file: CheckpointArtifactFile): string =>
+  `${CHECKPOINT_ARTIFACT_DIRECTORY}/${CHECKPOINT_ARTIFACT_FILE_NAMES[file]}`;
+
+/** ページの保存の、Run のディレクトリからの相対パス（区切りは `/`。例: `checkpoint/pages/PAGE-000001.json`）。 */
+export const checkpointPageArtifactRelativePath = (pageId: PageId): string =>
+  `${CHECKPOINT_PAGES_ARTIFACT_DIRECTORY}/${pageId}${CHECKPOINT_PAGE_FILE_SUFFIX}`;
+
+/**
+ * `checkpoint/pages/` の中のファイルの名前が、ページの保存の名前（`<pageId>.json`。ページの ID は `isPageId` の形）なら、その
+ * ページの ID を返す。そうでなければ `null`（再開のときの後始末で、ページの保存だけを見分けるために使う）。
+ */
+export function checkpointPageIdOfFileName(fileName: string): PageId | null {
+  if (!fileName.endsWith(CHECKPOINT_PAGE_FILE_SUFFIX)) {
+    return null;
+  }
+  const pageId = fileName.slice(0, -CHECKPOINT_PAGE_FILE_SUFFIX.length);
+  return isPageId(pageId) ? pageId : null;
+}
+
+/** PREFLIGHT の一時ファイルの名前（接頭辞と接尾辞の間に1文字以上ある）か。 */
+export const isPreflightTemporaryFileName = (fileName: string): boolean =>
+  fileName.length > PREFLIGHT_TEMPORARY_FILE_PREFIX.length + PREFLIGHT_TEMPORARY_FILE_SUFFIX.length
+  && fileName.startsWith(PREFLIGHT_TEMPORARY_FILE_PREFIX)
+  && fileName.endsWith(PREFLIGHT_TEMPORARY_FILE_SUFFIX);
 
 /**
  * スクリーンショットの、Run のディレクトリからの相対パス（区切りは `/`）。
@@ -109,6 +166,75 @@ export async function createRunArtifactDirectory(outputDirectory: string, runId:
     return Object.freeze({ ok: false, runDirectory, alreadyExists: isRecord(error) && error.code === 'EEXIST', error });
   }
   return Object.freeze({ ok: true, runDirectory });
+}
+
+/** `listRunDirectories` の1件（Run の ID と、Run のディレクトリ）。 */
+export interface RunArtifactDirectoryEntry {
+  readonly runId: RunId;
+  readonly runDirectory: string;
+}
+
+/** `listCheckpointRunDirectories` の1件（Run の ID と、Run のディレクトリ）。 */
+export type CheckpointRunDirectory = RunArtifactDirectoryEntry;
+
+/** 出力先がない（出力先そのものか、途中の区切りがない、またはディレクトリでない）ことを表す、読み取りの失敗の `code`。 */
+const MISSING_OUTPUT_DIRECTORY_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR']);
+
+/**
+ * 出力先（`outputDirectory`）の直下の、名前が Run の ID の形（`isRunId`、`isPortableArtifactPathSegment`）のディレクトリの一覧を、名前の順
+ * （コード単位の順）に返す（中断した Run の再開の設計書 4.7.1 の「実行中の Run の確かめ」。読むだけ）。保存の有無は問わない。
+ * - 出力先がない場合（途中の区切りがファイルの場合を含む）は、空の一覧を返す（作らない）。出力先を読めないほかの失敗は、その例外で reject する。
+ * - リンク（symlink、junction）は、たどらない（ディレクトリとして数えない）。
+ */
+export async function listRunDirectories(outputDirectory: string): Promise<readonly RunArtifactDirectoryEntry[]> {
+  let entries;
+  try {
+    entries = await readdir(outputDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (isRecord(error) && typeof error.code === 'string' && MISSING_OUTPUT_DIRECTORY_CODES.has(error.code)) {
+      return Object.freeze([]);
+    }
+    throw error;
+  }
+  const runIds: RunId[] = [];
+  for (const entry of entries) {
+    const { name } = entry;
+    if (entry.isDirectory() && isRunId(name) && isPortableArtifactPathSegment(name)) {
+      runIds.push(name);
+    }
+  }
+  return Object.freeze(runIds.sort(compareCodeUnits).map((runId) => Object.freeze({
+    runId,
+    runDirectory: runArtifactDirectory(outputDirectory, runId),
+  })));
+}
+
+/** `path` が、ファイルとしてあるか（ないか、ファイルでないか、調べられない場合は偽）。 */
+const isExistingFile = async (path: string): Promise<boolean> => {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * 出力先（`outputDirectory`）の直下の Run のディレクトリ（`listRunDirectories` の一覧）のうち、`checkpoint/state.json` か
+ * `checkpoint/state.prev.json` があるものの一覧を、名前の順（コード単位の順）に返す（中断した Run の再開の設計書 4.7。読むだけ）。
+ * - 出力先がない場合は、空の一覧を返す（作らない）。出力先を読めないほかの失敗は、その例外で reject する。
+ * - リンク（symlink、junction）は、たどらない（ディレクトリとして数えない）。名前とリンクの判定は、`listRunDirectories` の1か所で行う。
+ * - 保存が使えるかどうか（JSON、スキーマ、整合）は確かめない。読んで確かめるのは `ArtifactWriter.readCheckpoint` である。
+ */
+export async function listCheckpointRunDirectories(outputDirectory: string): Promise<readonly CheckpointRunDirectory[]> {
+  const listed: CheckpointRunDirectory[] = [];
+  for (const run of await listRunDirectories(outputDirectory)) {
+    const hasCheckpoint = await isExistingFile(artifactFilePath(run.runDirectory, checkpointArtifactRelativePath('state')))
+      || await isExistingFile(artifactFilePath(run.runDirectory, checkpointArtifactRelativePath('previousState')));
+    if (hasCheckpoint) {
+      listed.push(run);
+    }
+  }
+  return Object.freeze(listed);
 }
 
 /** Run のディレクトリからの相対パス（区切りは `/`）を、Run のディレクトリの下のファイルのパス（環境の区切り）にする。 */

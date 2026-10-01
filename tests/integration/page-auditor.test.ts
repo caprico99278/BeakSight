@@ -30,6 +30,7 @@ import {
   SESSION_OPEN_TIMEOUT_MS,
 } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
+import type { NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { collectLayoutEvidence } from '../../src/evidence/layout-collector.js';
@@ -47,6 +48,7 @@ import { startFixtureServer, type FixtureServer, type FixtureServerOptions } fro
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
 const AUDIT_TEST_TIMEOUT_MS = 180_000;
@@ -154,6 +156,7 @@ async function auditFixture(server: FixtureServer, pathname: string, options: Au
     clock: () => new Date(),
     now: () => Date.now(),
     screenshotRootDirectory,
+    navigationPacer: createTestNavigationPacer(config),
     ...(options.createRuleEngine === undefined ? {} : { createRuleEngine: options.createRuleEngine }),
     ...(options.collectors === undefined ? {} : { collectors: options.collectors }),
     ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
@@ -645,6 +648,7 @@ describe('PageAuditor attempt argument (DEF-007)', () => {
       clock: () => new Date(),
       now: () => Date.now(),
       screenshotRootDirectory: tmpdir(),
+      navigationPacer: createTestNavigationPacer(config),
       safetyViolationRecorded: NEVER_STOP_FOR_SAFETY,
     });
 
@@ -1531,10 +1535,32 @@ describe('PageAuditor requires the safety violation check (C18f)', () => {
       clock: () => new Date(),
       now: () => Date.now(),
       screenshotRootDirectory: tmpdir(),
+      navigationPacer: createTestNavigationPacer(config),
     };
     // @ts-expect-error: 違反の確かめ（`safetyViolationRecorded`）を渡さないと、型のエラーになる。
     expect(() => new PageAuditor(withoutCheck)).toThrow(TypeError);
     expect(() => new PageAuditor({ ...withoutCheck, safetyViolationRecorded: 'no' as unknown as () => boolean })).toThrow(TypeError);
     expect(() => new PageAuditor({ ...withoutCheck, safetyViolationRecorded: NEVER_STOP_FOR_SAFETY })).not.toThrow();
+  });
+});
+
+// L2（サイトへの負荷の制御の設計書 4.1）: ページの読み込みの間隔を守る部品は、Page Auditor の必須の依存である。渡し忘れると、
+// 間隔を空けずに読み込む、という形を残さない。
+describe('PageAuditor requires the navigation pacer (load control design 4.1)', () => {
+  it('is a type error and a TypeError to construct a PageAuditor without a navigation pacer', () => {
+    const config = createTestConfig('http://127.0.0.1:1', '/');
+    const withoutPacer = {
+      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger()),
+      config,
+      allocator: new IdAllocator(),
+      clock: () => new Date(),
+      now: () => Date.now(),
+      screenshotRootDirectory: tmpdir(),
+      safetyViolationRecorded: NEVER_STOP_FOR_SAFETY,
+    };
+    // @ts-expect-error: ページの読み込みの間隔を守る部品（`navigationPacer`）を渡さないと、型のエラーになる。
+    expect(() => new PageAuditor(withoutPacer)).toThrow(TypeError);
+    expect(() => new PageAuditor({ ...withoutPacer, navigationPacer: {} as unknown as NavigationPacer })).toThrow(TypeError);
+    expect(() => new PageAuditor({ ...withoutPacer, navigationPacer: createTestNavigationPacer(config) })).not.toThrow();
   });
 });

@@ -11,7 +11,7 @@ import * as contracts from '../../src/core/contracts.js';
 import * as evidenceTypes from '../../src/core/evidence-types.js';
 import { createEvidenceId } from '../../src/core/ids.js';
 
-type SchemaName = 'audit' | 'finding' | 'page' | 'run';
+type SchemaName = 'audit' | 'checkpoint' | 'checkpoint-page' | 'finding' | 'page' | 'run';
 
 interface EnumMapping {
   readonly schema: SchemaName;
@@ -39,6 +39,13 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('run', '/$defs/incompleteReason/properties/code/enum', 'INCOMPLETE_REASON_CODES'),
   // R15a（Task 14〜17 の設計書 5.6.4、5.6.5）: 再試行の記録の、最初の試行のナビゲーションの結果の種類。
   mapping('run', '/properties/retries/items/properties/navigationOutcome/enum', 'NAVIGATION_OUTCOME_KINDS'),
+  // R4b2（中断した Run の再開の設計書 4.8）: run.json の実行の記録の終わり方（実行を終えた記録だけなので、null なし）。
+  mapping('run', '/properties/executions/items/properties/endReason/enum', 'RUN_EXECUTION_END_REASONS'),
+  // checkpoint.schema.json（R2。中断した Run の再開の設計書 4.1、4.2）: 保存の状態、実行の終わり方（実行の途中は null）、
+  // 巡回の記録の状態。checkpoint-page.schema.json は、page.schema.json の定義を参照するだけで、enum を持たない。
+  mapping('checkpoint', '/properties/state/enum', 'RUN_CHECKPOINT_STATES'),
+  mapping('checkpoint', '/$defs/execution/properties/endReason/enum', 'RUN_EXECUTION_END_REASONS', NULLABLE),
+  mapping('checkpoint', '/$defs/frontierEntry/properties/state/enum', 'CRAWL_URL_STATES'),
   // page.schema.json: ページとビューポート
   mapping('page', '/properties/status/enum', 'PAGE_AUDIT_STATUSES'),
   mapping('page', '/$defs/viewportAuditResult/properties/status/enum', 'PAGE_AUDIT_STATUSES'),
@@ -250,7 +257,7 @@ beforeAll(() => {
 
 describe('F12: schema enums and the core value arrays', () => {
   it('reads every schema that the mapping table refers to', () => {
-    expect([...schemas.keys()].sort()).toEqual(['audit', 'finding', 'page', 'run']);
+    expect([...schemas.keys()].sort()).toEqual(['audit', 'checkpoint', 'checkpoint-page', 'finding', 'page', 'run']);
   });
 
   it('has no duplicate row in the mapping table', () => {

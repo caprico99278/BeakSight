@@ -2,8 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { BrowserContextFactory, type SafetyLedgerFactory } from '../browser/context-factory.js';
+import {
+  BrowserContextFactory,
+  type BrowserContextFactoryOptions,
+  type SafetyLedgerFactory,
+} from '../browser/context-factory.js';
 import type { AuditConfig } from '../config/types.js';
+// 一時ファイルの名前は、再開のときの後始末（`ArtifactWriter`）が見分けるので、配置の owner に置く（中断した Run の再開の設計書 4.5）。
+import { PREFLIGHT_TEMPORARY_FILE_PREFIX, PREFLIGHT_TEMPORARY_FILE_SUFFIX } from '../core/artifact-layout.js';
 import type { IncompleteReason } from '../core/contracts.js';
 import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
@@ -87,6 +93,12 @@ export interface PreflightOptions {
    * 省略した項目は、`limits.ts` の定数を使う。
    */
   readonly deadlines?: PreflightDeadlines | undefined;
+  /**
+   * 返す `BrowserContextFactory` のコンストラクタに、そのまま渡す省略可能な依存（サイトへの負荷の制御の設計書 4.5。例: 要求の実績を
+   * 数える `loadMeter`）。PREFLIGHT は中身を見ない。Guard を確かめる PREFLIGHT の Context も、この factory で作る。
+   * 省略すると、依存なしの factory を作る。オブジェクトでない値は `TypeError`。
+   */
+  readonly contextFactoryOptions?: BrowserContextFactoryOptions | undefined;
 }
 
 /** PREFLIGHT の期限の注入口。作成と終了の期限（`PassiveSessionDeadlineOptions`）に、Browser を閉じる処理の期限を加えたもの。 */
@@ -135,9 +147,6 @@ type CheckResult = { readonly passed: true } | { readonly passed: false; readonl
 const PASSED: CheckResult = Object.freeze({ passed: true });
 const failed = (failure: unknown): CheckResult => ({ passed: false, failure });
 
-const PREFLIGHT_TEMPORARY_FILE_PREFIX = '.beaksight-preflight-';
-const PREFLIGHT_TEMPORARY_FILE_SUFFIX = '.tmp';
-
 /**
  * Run の前の確認（PREFLIGHT。Task 14〜17 の設計書 5.6.7）。`PREFLIGHT_CHECKS` の順に確かめる。
  *
@@ -175,7 +184,7 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   const safetyLedgers: SafetyLedger[] = [];
   let guardFailure: unknown;
   try {
-    const factory = new BrowserContextFactory(browser, config, createSafetyLedger);
+    const factory = new BrowserContextFactory(browser, config, createSafetyLedger, options.contextFactoryOptions);
     const guard = await checkPassiveGuard(factory, config, safetyLedgers, sessionDeadlines);
     if (guard.passed) {
       // Browser、factory、Ledger は、呼び出し側が使い続けるので、凍結しない（結果の外側と一覧だけを凍結する）。
@@ -214,6 +223,9 @@ function assertPreflightOptions(options: PreflightOptions): void {
   }
   if (options.deadlines !== undefined && !isRecord(options.deadlines)) {
     throw new TypeError('preflight deadlines must be an object');
+  }
+  if (options.contextFactoryOptions !== undefined && !isRecord(options.contextFactoryOptions)) {
+    throw new TypeError('preflight context factory options must be an object');
   }
 }
 

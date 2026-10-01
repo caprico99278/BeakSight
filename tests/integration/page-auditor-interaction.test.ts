@@ -22,6 +22,7 @@ import type {
 } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
+import type { NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
@@ -30,6 +31,7 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
 const AUDIT_TEST_TIMEOUT_MS = 180_000;
@@ -104,6 +106,11 @@ interface AuditOptions {
    * 必須の依存なので、省略した場合は、違反では止めないことを明示する `() => false` を渡す。
    */
   readonly safetyViolationRecorded?: PageAuditorDependencies['safetyViolationRecorded'];
+  /**
+   * ページの読み込みの間隔を守る部品の差し替え（L3。呼ばれた回数と順序を確かめるため）。省略すると、本番と同じ部品で、設定の間隔の
+   * pacer（`createTestNavigationPacer`）を渡す。
+   */
+  readonly createNavigationPacer?: (config: AuditConfig) => NavigationPacer;
 }
 
 async function auditFixture(pathname: string, options: AuditOptions = {}): Promise<AuditRun> {
@@ -125,6 +132,9 @@ async function auditFixture(pathname: string, options: AuditOptions = {}): Promi
     clock: () => new Date(),
     now: () => Date.now(),
     screenshotRootDirectory,
+    // 省略した場合は、本番と同じ部品で、設定の間隔（`createTestConfig` では 0）の pacer を渡す（L2。本番では Run Coordinator が
+    // Run で1つ作る）。
+    navigationPacer: options.createNavigationPacer?.(config) ?? createTestNavigationPacer(config),
     ...(options.collectors === undefined ? {} : { collectors: options.collectors }),
     // 省略した場合は、違反では止めないことを明示する（Page Auditor だけを確かめるテスト）。
     safetyViolationRecorded: options.safetyViolationRecorded ?? ((): boolean => false),
@@ -610,6 +620,119 @@ describe('PageAuditor Interaction: no next candidate after a safety invariant vi
       incompleteReasons: [{ code: 'SAFETY_VIOLATION_ABORT', detail: null }],
     });
     expect(outcome.safety.invariantViolationCount).toBe(1);
+    expect(remainingContextCount).toBe(0);
+    await expectPageSchema(outcome);
+  }, AUDIT_TEST_TIMEOUT_MS);
+});
+
+// L3（サイトへの負荷の制御の設計書 3.1 の4、4.3）: Interaction で監査する候補の数は、設定の `crawl.maxInteractionsPerPage` までにする。
+// 上限を超えた候補は監査せず、今の途中で止めた扱いと同じ形（`interaction:limit:remaining=<件数>`）で、ビューポートを PARTIAL にする。
+// 止める理由を確かめる順は、違反（safety）、上限（limit）、予算（budget）である。上限で止めるときは、読み込みをしないので、
+// ページの読み込みの間隔の待ち（`beforeNavigation()`）を呼ばない。
+describe('PageAuditor Interaction candidate limit per page (load control design 4.3)', () => {
+  /** 候補の多いページ（`MANY_TOGGLES_CANDIDATE_COUNT` 件）の候補の数より小さい上限。 */
+  const SMALL_INTERACTION_LIMIT = 2;
+  /** 呼び出しの順序の記録の、ページの読み込みの間隔の待ち（`beforeNavigation()`）の呼び出し。 */
+  const PACER_CALL = 'beforeNavigation';
+  /** 呼び出しの順序の記録の、Interaction の session の作成。 */
+  const INTERACTION_SESSION = 'interaction-session';
+
+  it('audits only maxInteractionsPerPage candidates and records interaction:limit with the remaining count', async () => {
+    const { outcome, factory, remainingContextCount } = await auditFixture(MANY_TOGGLES_PAGE, {
+      overrides: { ...INTERACTION_ONLY, crawl: { maxInteractionsPerPage: SMALL_INTERACTION_LIMIT } },
+    });
+    const { result } = outcome;
+
+    // 上限の数だけ候補の session を作り、その数だけの Evidence と INTERACTION の safety の Evidence を記録する。
+    expect(factory.interactionViewports).toHaveLength(SMALL_INTERACTION_LIMIT);
+    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(SMALL_INTERACTION_LIMIT);
+    expect(safetyOf(outcome, 'desktop', 'INTERACTION')).toHaveLength(SMALL_INTERACTION_LIMIT);
+    expect(result.viewports.desktop.status).toBe('PARTIAL');
+    expect(result.viewports.desktop.incompleteReasons).toEqual([
+      { code: 'COLLECTOR_INCOMPLETE', detail: `interaction:limit:remaining=${MANY_TOGGLES_CANDIDATE_COUNT - SMALL_INTERACTION_LIMIT}` },
+    ]);
+    expect(result.viewports.mobile).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
+    expect(result.status).toBe('PARTIAL');
+    expect(remainingContextCount).toBe(0);
+    await expectPageSchema(outcome);
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it('gives no interaction:limit reason when maxInteractionsPerPage equals the candidate count', async () => {
+    // 境界の値（上限 = 候補の数）。すべての候補を監査し、上限の理由は付かない。
+    const { outcome, factory, remainingContextCount } = await auditFixture(MANY_TOGGLES_PAGE, {
+      overrides: { ...INTERACTION_ONLY, crawl: { maxInteractionsPerPage: MANY_TOGGLES_CANDIDATE_COUNT } },
+    });
+
+    expect(factory.interactionViewports).toHaveLength(MANY_TOGGLES_CANDIDATE_COUNT);
+    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(MANY_TOGGLES_CANDIDATE_COUNT);
+    expect(outcome.result.viewports.desktop).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
+    expect(outcome.result.status).toBe('AUDITED');
+    expect(remainingContextCount).toBe(0);
+    await expectPageSchema(outcome);
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it('does not call beforeNavigation() for the candidates it does not start because of the limit', async () => {
+    // pacer の呼び出しと、Interaction の session の作成を、起きた順に記録する。
+    const calls: string[] = [];
+    const { outcome } = await auditFixture(MANY_TOGGLES_PAGE, {
+      overrides: { ...INTERACTION_ONLY, crawl: { maxInteractionsPerPage: SMALL_INTERACTION_LIMIT } },
+      createNavigationPacer: (config) => {
+        const pacer = createTestNavigationPacer(config);
+        return {
+          beforeNavigation: async () => {
+            calls.push(PACER_CALL);
+            return pacer.beforeNavigation();
+          },
+          snapshot: () => pacer.snapshot(),
+        };
+      },
+      wrapSession: (session) => {
+        calls.push(INTERACTION_SESSION);
+        return session;
+      },
+    });
+
+    expect(outcome.result.viewports.desktop.incompleteReasons).toEqual([
+      { code: 'COLLECTOR_INCOMPLETE', detail: `interaction:limit:remaining=${MANY_TOGGLES_CANDIDATE_COUNT - SMALL_INTERACTION_LIMIT}` },
+    ]);
+    // Desktop の Passive の待ち、監査した候補ごとの待ちと session の作成、Mobile の Passive の待ちだけである（幅の走査はしない設定）。
+    // 上限で始めなかった候補の待ちはない。
+    expect(calls).toEqual([
+      PACER_CALL,
+      ...Array.from({ length: SMALL_INTERACTION_LIMIT }, () => [PACER_CALL, INTERACTION_SESSION]).flat(),
+      PACER_CALL,
+    ]);
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it('stops with SAFETY_VIOLATION_ABORT, not with the limit, when a violation was recorded before the limit is checked', async () => {
+    // 上限を1にし、1件目の候補の session で違反を記録する。2件目の前には、上限にも達しているが、違反の確認が先である。
+    const interactionLimit = 1;
+    const sessionLedgers: SafetyLedger[] = [];
+    const { outcome, factory, remainingContextCount } = await auditFixture(MANY_TOGGLES_PAGE, {
+      overrides: { ...INTERACTION_ONLY, crawl: { maxInteractionsPerPage: interactionLimit } },
+      wrapSession: (session) => {
+        sessionLedgers.push(session.ledger);
+        if (sessionLedgers.length === 1) {
+          session.ledger.recordInvariantViolation({ code: 'TEST_INJECTED_VIOLATION', message: 'injected interaction violation' });
+        }
+        return session;
+      },
+      safetyViolationRecorded: () => sessionLedgers.some((ledger) => ledger.snapshot().invariantViolationCount > 0),
+    });
+
+    expect(factory.interactionViewports).toHaveLength(interactionLimit);
+    expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(interactionLimit);
+    expect(outcome.result.viewports.desktop.status).toBe('PARTIAL');
+    expect(outcome.result.viewports.desktop.incompleteReasons).toEqual([
+      {
+        code: 'COLLECTOR_INCOMPLETE',
+        detail: `interaction:SAFETY_VIOLATION_ABORT:remaining=${MANY_TOGGLES_CANDIDATE_COUNT - interactionLimit}`,
+      },
+    ]);
+    expect(outcome.result.viewports.mobile).toMatchObject({
+      status: 'SKIPPED',
+      incompleteReasons: [{ code: 'SAFETY_VIOLATION_ABORT', detail: null }],
+    });
     expect(remainingContextCount).toBe(0);
     await expectPageSchema(outcome);
   }, AUDIT_TEST_TIMEOUT_MS);

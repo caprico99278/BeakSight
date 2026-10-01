@@ -1018,6 +1018,16 @@ output:
 
 User-Agentは通常のPlaywright Chromiumを基本とし、独自の強い偽装を行わない。実User-Agentをrun.jsonへ記録する。
 
+### 24.1 監査対象のサイトへの負荷（2026-10-01 追補）
+
+ユーザーの指示（2026-10-01）: 「短時間の内に大量リクエストを送信して、監査対象サイトに過負荷を与える設計はNG」。詳細は追補設計書 `2026-10-01-beaksight-site-load-control-design.md` を正とする。要点は次のとおり。
+
+- BeakSight が始めるページの読み込み（Passive、幅の走査、Interaction、robots.txt と sitemap.xml、再試行）は、Run 全体で、前の読み込みの開始から最小の間隔（`crawl.minNavigationIntervalMs`。既定 5秒。許可 Origin にループバックでないものがあれば 1秒未満にできない）以上空ける。
+- Interaction で監査する候補は、1ページあたり `crawl.maxInteractionsPerPage`（既定 20件）まで。超えた分は、理由付きで PARTIAL にする。
+- 読み込み直しの Context（幅の走査と Interaction）では、主の読み込みで取った画像などを Run 全体のキャッシュから返し、許可 Origin の外への要求（文書を除く）は送らない。許可の判定は変えない。
+- 待ち時間は、ページの監査の期限を消費しない。
+- 送った要求の実績を `run.json` の `load` に記録し、HTML レポート、CLI の結果、実行中の進み具合の行に示す。
+
 ## 25. robots.txt / sitemap.xml
 
 - robots.txtはEvidenceとして取得可能にする。

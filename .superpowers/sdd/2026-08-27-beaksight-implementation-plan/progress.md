@@ -2172,3 +2172,438 @@
   - 並行の数の設定の項目はなく、Run Coordinator はページを1つずつ処理する（`src/orchestration/run-coordinator.ts` の 513 行からのループ）。
   - 手順書の設定は、クラウドで `validate-config` を通した（終了コード 0。接続はしていない）。
 - 次: ユーザーの Windows の PC で、手順書の 1〜6 を行う。
+
+### 2026-10-01 Task 20 の smoke（ユーザーの Windows の PC。headed）: PASS
+
+- 実行した場所: ユーザーの Windows の PC（Windows 11 10.0.26200、Node v24.15.0、Playwright 1.62.1、Chromium 151.0.7922.34）。HEAD は 26dfdae（作業ツリーの変更なし）。手順書 `T20-procedure.md` の 1〜6 を、設計者が行った。
+- 事前の Gate（手順書 第1章）:
+  - `npm run verify`: 終了コード 0。型チェック PASS、101ファイル、3,661件 PASS、ビルド PASS（340秒）。DEF-015 の異常終了は起きなかった。DEF-019 の fixture の見出しのテストも、Windows で PASS した。
+  - `npx vitest run tests/integration/safety-gates.test.ts tests/integration/auditor-gates.test.ts tests/architecture`: 終了コード 0。5ファイル、151件 PASS（65秒）。
+- 設定（手順書 第2章）: `%TEMP%\beaksight-task20\todomvc-smoke.json`（リポジトリの外。`maxPages` 5、headed、出力も `%TEMP%` の下）。`validate-config` は終了コード 0。
+- headed の扱い（設計書 Task 19 の前の整理 4.3）を、実行の前にユーザーに改めて示し、headed での実行の承認を得た（2026-10-01）。
+- smoke の実行（手順書 第3章）: `node dist/cli/index.js run --config <上の設定> --headed`。終了コード 0、8秒。Run は `RUN-20261001071336`。
+- 記録（手順書 第6章の形式）:
+  - Gate: verify 101ファイル、3,661件 PASS、Gate のテスト 5ファイル、151件 PASS、DEF-015 起きない
+  - smoke: 終了コード 0、Run Status `COMPLETE`、監査したページ 1（発見 1、デスクトップとモバイルの両方で監査済み）、SKIPPED 0（`maxPagesReached` は false）
+  - Safety: guardEnabled true、invariantViolationCount 0、recordTruncated false、blockedRequestsByMethod `{}`（遮断した操作はすべて 0件）
+  - 外部のアプリの起動: なし（Safety の記録に外部スキームの事象はない。ページのリンクは、許可 Origin の外の https/http の3件だけで、記録のみの扱い。画面は設計者からは見えないので、記録による判断）
+  - report.html の目視: 日本語の表示は崩れていない（置換文字 0個。幅 1280px と 390px で確かめ、390px で横のはみ出しはない）。幅の走査の Finding は、出ていない（デスクトップで 320・768・1024px を走査し、すべて `COMPLETE`、はみ出し 0px。390・1440px は主要なビューポートと同じ幅なので走査しない。設計書 4.5.6 のとおり）
+  - DEF-016 の材料: 4xx のページはなかった。`robots.txt`、`sitemap.xml` は 404 で、metadata の Evidence（`NOT_FOUND`）として記録された
+  - 判定: PASS
+- 設計者が追加で確かめたこと:
+  - 送った要求は、デスクトップとモバイルのそれぞれで、`https://demo.playwright.dev` への GET が5件だけ（ほかに `robots.txt`、`sitemap.xml` を、Guard の付いた Passive Context の GET のナビゲーションで取得している。`src/crawl/site-metadata.ts` の 164 行と 433 行で確かめた）。GET・HEAD 以外の要求はない。
+  - `run.json`、`audit.json`、`page.json` を、リポジトリのスキーマで別の経路（ajv を直接使うスクラッチパッドのスクリプト）でも検証し、すべて VALID だった。ChatGPT 用のバンドル（11ファイル）も作られていた。
+  - Finding 14件（エラー 8、警告 6）は、すべて axe の結果（`color-contrast`、`landmark-one-main`、`region`）で、スクリーンショットの見た目（薄い色の見出しとフッター）と合う。サイトの事実の指摘であり、ツールの不備による偽の指摘は見当たらない（実装タスク指示 第13章の「分離」）。
+  - Interaction の候補は 0件だった。最初の画面には、候補の selector（`button` など）に当たる要素がない（入力欄とリンクだけ）。候補ごとに Evidence を作る設計なので、Interaction の Evidence が無いのは設計どおり。
+  - モバイルの User-Agent は、デスクトップと同じ値だった。設計書 第24章（独自の偽装をしない）のとおりで、不具合ではない。
+- この smoke で確かめられなかったこと（デモのサイトが小さいため）: 複数のページの巡回、Isolated Interaction Context での候補の監査、GET 以外の要求の遮断、iframe・OOPIF の多いページ（DEF-014）、4xx のページ（DEF-016）、幅の走査のはみ出しの Finding の表示。
+- DEF-014、DEF-016: 材料がなかったので、監視を続ける。判断の時期を Task 21 の結果の後に移した（`defects.md`）。
+- 出力（`%TEMP%\beaksight-task20\output\RUN-20261001071336\`）は Git に入れない。上位の計画の任意の `docs/verification/` の記録は作らない（手順書のとおり、この項目を記録とする）。
+- 次: Task 21（本来の監査対象のサイトの full audit）。完成とユーザーの明示の承認の後に行う。設計者からは、承認なしに着手しない。
+
+### 2026-10-01 Task 21 の着手と、負荷の大きさによる中止
+
+- ユーザーの承認（2026-10-01「Task 21へ進めて」）を得て、Task 21 に着手した。
+- 設定は、Git の対象外の `local/targets/` にある本来の監査対象のサイトの設定（8月27日に作成済み）を使った。`validate-config` は終了コード 0（接続なし）。出力は Git の対象外の `artifacts/`。
+- 事前の Gate は、同じ日に同じ HEAD（26dfdae）で PASS していて、その後に変えたのは作業記録だけ。Task 20 の smoke も PASS している。
+- 実行: 上位の計画の Step 1 のとおり、既定の設定のまま headless で実行した（16:23:59 開始）。
+- 実行中に、ユーザーから「サイトに過負荷を与えていないか注意して」と指示があった。設計者が通信量を測ったところ、PC 全体の受信が、20秒の計測で平均毎秒約14MB、最大で毎秒約56MBだった。1ページの監査には約40秒かかっていた。
+- 判断: 16:29 ごろに Run を止めた（BeakSight の node のプロセスを止めた。node と Playwright の Chromium のプロセスが残っていないことを確かめた）。止めた後、受信は毎秒約5KBに下がった。止めた理由は次のとおり。
+  - 負荷が大きく、1時間続けると、推定で約50GBを受け取る。
+  - この速さでは、1時間で約90ページしか監査できず、既定の 500ページに届かないので、結果は `PARTIAL` になることが決まっていた。
+- 止めた Run（`artifacts/RUN-20261001072359/`）は、5ページ分のスクリーンショットだけで、`run.json` などはない。Task 21 の結果としては使わない。
+- 負荷の原因をコードで確かめ、DEF-020 として登録した（`defects.md`）。1ページにつき、Passive で2回、幅の走査で3回、Interaction で候補ごとに1回（最大100回）、キャッシュのない新しい Context でページを読み込み直す。読み込みの間に待ち時間を置く設定はない。
+- 次: どう進めるかを、ユーザーに尋ねる（設定で負荷を下げて運用する案、負荷を抑える仕組みを加える案）。
+
+### 2026-10-01 負荷を抑える仕組みの設計（第1段の草案）
+
+- ユーザーの判断（2026-10-01）: 「負荷を抑える仕組みを先に作る」を選んだ。続けて、ユーザーから「短時間の内に大量リクエストを送信して、監査対象サイトに過負荷を与える設計はNG」と指示があった。設計の必須の要件にし、メモリにも記録した。
+- 設計書の草案 `doc/design/2026-10-01-beaksight-site-load-control-design.md` を書いた（状態: 草案、ユーザーの承認待ち）。要点:
+  - Run 全体で、ページの読み込みの開始の間隔を、設定の最小間隔以上にする（`NavigationPacer`、新しい owner `src/crawl/navigation-pacer.ts`）。既定 5秒、下限 1秒（ループバックだけの場合は 0）。
+  - 幅の走査を1つのセッションにまとめ、2回目からキャッシュを使えるようにする。
+  - Interaction で監査する候補を、1ページあたり既定 10件までにする（`crawl.maxInteractionsPerPage`）。超えた分は理由 `interaction:limit:remaining=<件数>` で PARTIAL。
+  - 待ち時間は、ページの期限を消費しない（待った分だけ期限を延ばす）。実行時間の上限には含める。
+  - `run.json` に `load`（読み込みの回数、待った時間、許可 Origin とそれ以外への要求の数と1分あたりの最大）を記録し、HTML・CLI・`summary.json` に示す（新しい owner `src/crawl/load-meter.ts`）。
+  - 第2段の候補（対象外）: Run 全体のリソースのキャッシュ、ページをまたいだ候補の重複の排除、外部のサービスへの要求の扱い、1回の読み込みの中の要求の速さの制御。
+- 次: ユーザーに要点と既定値の承認を求める。承認の後に、実装計画を書き、実装者を起動する。
+
+### 2026-10-01 ユーザーの判断（負荷の制御の方針と既定値）、再開の機能の指示、L1 の起動
+
+- ユーザーの判断（2026-10-01）:
+  - 第1段の方針に加え、「第2段も先に含める」（Run 全体のキャッシュと、外部のサービスへの要求の扱いも、Task 21 の前に作る）。
+  - ページの読み込みの最小間隔の既定値は 5秒。Interaction の候補の、1ページあたりの上限の既定値は 20件。
+- ユーザーの指示（2026-10-01）: 「監査途中で中断した場合、再起動時は監査の最初からではなく、途中から再開できるようにすること」。別の設計書（`2026-10-01-beaksight-resumable-run-design.md`）で扱う。設計のため、Run の間の状態の洗い出しを、読み取り専用の調査担当に任せた（実行中）。
+- 設計書 `2026-10-01-beaksight-site-load-control-design.md` を改訂した。
+  - 第2段: Run 全体のキャッシュ（`ResourceCache`）と、許可された要求の届け方（`ResourceDelivery`、`src/browser/resource-delivery.ts`）。読み込み直しの Context（幅の走査、Interaction）では、キャッシュにある画像などをキャッシュから返し、許可 Origin の外への要求（文書を除く）は送らない。Guard は、ALLOW の後の届け方を、注入された部品に尋ねる（許可の判定と凍結は変えない）。
+  - 幅の走査を1つの Context にまとめる案は、キャッシュで同じ効果が得られるので取りやめた。
+  - 候補の上限の既定値を 20 にした。再開の設計書との関係（pacer と meter の状態の引き継ぎ）を書いた。
+- 実装計画 `2026-10-01-beaksight-site-load-control-implementation-plan.md` を書いた（L1〜L6、RL）。
+- L1（設定の2項目）を起動した。指示書は `L1-brief.md`。方針と既定値はユーザーの判断で決まっているので、全体の承認の前に着手した。第2段（L5a 以降）は、再開の設計とあわせてユーザーに示してから起動する。
+- L1 の前の SHA-256（先頭16桁）: `src/core/evidence-types.ts` 58679B668A43B143、`src/config/defaults.ts` 7362A1692B26FF85、`src/config/validate-config.ts` FC47ABE4D5A39411、`schemas/run.schema.json` 47A97045AD72F9EE、`tests/helpers/test-config.ts` A61E897AB7D42430、`README.md` 4A78FD0CA441CCCC。
+
+### 2026-10-01 L1 完了、L2 ∥ L5a ∥ R1 の起動
+
+- L1 が完了した。`crawl.minNavigationIntervalMs`（既定 5000）と `crawl.maxInteractionsPerPage`（既定 20）を、型、既定値、検証、スキーマ、テストの補助、README の設定の表に加えた。値を使う処理はまだない。
+  - 検証: 間隔は 0 以上の整数。許可 Origin にループバックでないものがあれば 1000 以上（`MIN_NAVIGATION_INTERVAL_MS`）。候補の上限は 1 以上 `INTERACTION_CANDIDATE_LIMITS.maxCandidates` 以下。
+  - テストの補助 `createTestConfig`、CLI の設定を作る補助 `cliTargetConfig`、CLI のテストの設定は、間隔を 0 にした。ループバックでない Origin を検証に通すテスト（`tests/unit/config.test.ts`、`tests/component/browser-settings.test.ts`）は、間隔を既定値にした（確かめは弱めていない）。
+  - 実装者の検証: 単体 52ファイル 1,961件 PASS、関係の結合テスト PASS、Architecture PASS。全体の `npx vitest run` では 3,701件中1件（`preflight.test.ts:427` の時間の上限）が1回だけ失敗し、単独の実行で PASS した。DEF-021（監視）として登録した。
+  - 設計者の確認: 変更の範囲（15ファイル。`tests/helpers/run-harness.ts` は設定を作る補助なので範囲内と判断した）。型チェック PASS。`npx vitest run tests/unit/config.test.ts tests/unit/schema-validator.test.ts tests/unit/cli.test.ts tests/component/browser-settings.test.ts tests/architecture tests/integration/cli.test.ts tests/integration/fixture-full-crawl.test.ts` → 9ファイル 686件 PASS。
+  - 発見事項の扱い: ループバックの判定の書き方（`LOOPBACK_HOSTNAMES.has(url.hostname)`）が ARCH04 を避けていないかは、RL のレビューで確かめる。`evidence-types.ts` と `schema-validator.test.ts` の CRLF は、HEAD からある状態（変えない）。
+- 再開の設計書と実装計画を書いた。ユーザーの判断（2026-10-01）: 自動の再開（端末の再起動にも対応することが条件）、`--new`、1回の起動ごとの時間の上限、Ctrl+C の案。端末の再起動と電源断に備え、ロックに OS の起動の時刻とハートビートを加え、保存は `fsync` と1つ前の保存（`state.prev.json`）で守る。
+- 負荷の制御の第2段の設計も、ユーザーが承認した。
+- L2（`NavigationPacer` と待ち・期限の延長）、L5a（キャッシュと届け方の判断の部品）、R1（frontier・待ち行列・採番器の状態の取り出しと作り直し）を、並行で起動する。変更するファイルは重ならない。各実装者には、対象を絞ってテストを実行するよう指示した。全体の verify は、3つの完了の後に設計者が行う。
+
+### 2026-10-01 L5a 完了
+
+- `src/browser/resource-delivery.ts` に、Run 全体のキャッシュ `ResourceCache`（入れる条件、header の除外、LRU、1件 5MB・合計 256MB）と、届け方の判断 `decideResourceDelivery`（`NETWORK`、`FROM_RUN_CACHE`、`WITHHOLD`）を作った。Playwright に依存しない。配線はまだ。`src/safety/request-policy.ts` は `hasAllowedOrigin` の `export` の1行だけ。
+- 実装者の検証: `tests/unit/resource-delivery.test.ts`（79件）と `tests/unit/request-policy.test.ts`（21件）が PASS、Architecture が PASS。型チェックは、作業中の R1 のテストの型の誤り1件で失敗（L5a の変更には誤りがない）。
+- 設計者の確認: `git diff src/safety/request-policy.ts` が1行だけ。コードを読み、設計書 4.6・4.7 と一致することを確かめた。`npx vitest run tests/unit/resource-delivery.test.ts tests/unit/request-policy.test.ts` → 2ファイル 100件 PASS。型チェックは R1 の完了の後に行う。
+- 実装者の判断4件を承認した: 入れる条件を満たさない応答は同じ URL の既存の項目を消さない。同じ名前になる header は `, ` でつなぐ。本文は写さない（合計は本文のバイト数で数える）。`PRIMARY` ではキャッシュを引かない（LRU の順を変えない）。
+- L5b への申し送り: `CachedResource.body` は `Uint8Array`。`route.fulfill` の `body` に渡すときは `Buffer` に包む必要があるかを確かめる。
+
+### 2026-10-01 R1 完了
+
+- `IdAllocator`、`CrawlQueue`、`CrawlFrontier` に、状態の取り出し（`snapshot()`）と、新しいインスタンスへの作り直し（静的な `restore()`）を加えた。既存の振る舞いは変えていない。
+  - `CrawlFrontier.restore(snapshot, { maxDepth, allocator, allowedQueryParameters, requeueSkipReasonCodes })`。`AUDITING` と、指定した理由の `SKIPPED` を `QUEUED` に戻す。待ち行列は `QUEUED` の記録を発見の順に並べて作る。URL は `normalizeUrl` で正規形かを、ページの ID は `isPageId` で確かめる。
+  - `allowedQueryParameters` は、`normalizeUrl` に必要なので、実装者が加えた（承認）。
+- 実装者の検証: 3ファイル 124件 PASS（新しく 101件）。`run-coordinator.test.ts`、`crawl-run.test.ts`、Architecture が PASS。型チェック PASS。
+- 設計者の確認: コードを読み、設計書 4.2 と一致することを確かめた。`npx vitest run tests/unit/crawl-queue.test.ts tests/unit/id-allocator.test.ts tests/unit/crawl-frontier.test.ts` → 3ファイル 124件 PASS。
+- 発見事項の扱い:
+  - `markSkipped` が、まだ取り出していない `QUEUED` の URL も受け付ける（`crawl-frontier.ts:268` 付近）。今の Run Coordinator では起きない。R4a の指示書で、保存の時期（`markFinished` と Link の発見の後）を守ることと合わせて扱う。
+  - 採番器の次のページの連番と、記録のページの ID の食い違いの確かめ: R2 で、`src/core/ids.ts` にページの ID から連番を読む関数を置くかを決める。
+  - 理由の値の確かめの重複: CC-034 として登録した。
+  - `tests/unit/id-allocator.test.ts` が、`IdAllocator` の公開のメソッドの一覧を固定している。後で加える場合は、このテストも直す。
+
+### 2026-10-01 L2 完了と L2-fix-round-1 の準備
+
+- L2 が完了した。`NavigationPacer`（`src/crawl/navigation-pacer.ts`）を作り、Run Coordinator が Run の初めに1つ作って、robots/sitemap の取得と PageAuditor に渡す。Passive（Desktop、Mobile、再試行）、幅の走査の各幅、Interaction の各候補、robots/sitemap の読み込みの前で待つ。待った時間は、ページの期限、幅の走査の期限、Interaction の段階の期限を消費しない。`sleep` は Run Coordinator に注入でき、既定は `src/core/deadline.ts` の `wait`。PageAuditor の `navigationPacer` は必須。
+- 実装者の検証: 単体と結合のテスト（navigation-pacer 27件、navigation-pacing 4件ほか）、Gate のテスト（151件、65秒。前と同じ時間）、型チェックが PASS。期限を延ばすテストは、実装を一時的に戻して失敗することも確かめた。
+- 設計者の確認: `page-auditor.ts` の期限の扱いを読み、設計書 4.4 と一致することを確かめた。
+- 実装者の判断の承認: 幅の走査のセッションの作成の期限の上限（`notAfterMs`）も、走査の中で待った時間の分だけ延ばし、幅ごとにセッションの factory を作る。pacer は、タイマーが早く発火した場合に待ち直す。PageAuditor の pacer を必須にする。
+- 設計者が見つけた問題: pacer の待ち直しの繰り返しに上限がない。時計が後ろに戻ると戻った分だけ余計に待ち、時計が進まないと止まらない。L2-fix-round-1 で、1回の待ちを呼ばれた時刻から `minIntervalMs` までにし、`sleep` の回数に上限を置く。あわせて、テストで pacer を作る同じ式（3か所）を `tests/helpers/` の補助にまとめる。
+- 発見事項1（始められなかった読み込みも `navigationCount` に入る）: 多めに数える側なので、この意味で記録し、表示でも説明する（設計書 4.5 に書いた）。
+- 全体の `npm run verify` を実行中（L1、L2、L5a、R1 の後）。終わったら、L2-fix-round-1 と L4 を並行で起動し、L3 は L2-fix-round-1 の後に起動する（`page-auditor-interaction.test.ts` が重なるため）。
+
+### 2026-10-01 全体の verify、L2-fix-round-1 完了、L2-fix-round-2 ∥ L3 ∥ L4
+
+- 設計者の `npm run verify`（L1、L2、L5a、R1 の後）: 終了コード 0。105ファイル、3,925件 PASS、ビルド PASS（350秒。L1 の前の 340秒とほぼ同じ）。DEF-015 と DEF-021 は起きなかった。
+- L2-fix-round-1 が完了した。pacer の待ちの目標を `min(最後の開始 + 間隔, 呼ばれた時刻 + 間隔)` にし、`sleep` の回数を `MAX_SLEEPS_PER_NAVIGATION`（3）までにした。テストで pacer を作る式を `tests/helpers/navigation-pacer.ts` の `createTestNavigationPacer` にまとめた（3つの結合テストは前と後で 47・15・4件）。設計者の確認: `npx vitest run tests/unit/navigation-pacer.test.ts tests/integration/navigation-pacing.test.ts` → 2ファイル 35件 PASS。
+- 実装者の発見事項（待っている途中で時計が戻ると、待ち直しの1回が長くなる）は、各回の `sleep` を最小間隔以下に切り詰める L2-fix-round-2 として、同じ実装者に依頼した。
+- L3（Interaction の候補の上限）を起動した。L4（負荷の記録）は作業中。3つの変更するファイルは重ならない。
+- 共通部品台帳に、`NavigationPacer`、`hasAllowedOrigin` の export、`ResourceCache` と届け方の判断、状態の取り出しと作り直し、`createTestNavigationPacer` を登録した。
+- L5b の指示書（`L5b-brief.md`）を準備した。L4 の後に起動する。
+
+### 2026-10-01 L2-fix-round-2 完了
+
+- 各回の `sleep` に渡す時間を `minIntervalMs` 以下に切り詰めた（`sleep(Math.min(target - started, minIntervalMs))`）。待っている途中で時計が戻っても、1回の待ちは間隔を超えない。1回の呼び出しの待ちの合計は `MAX_SLEEPS_PER_NAVIGATION × minIntervalMs` 以下。
+- 実装者の検証: `tests/unit/navigation-pacer.test.ts` 32件、`navigation-pacing.test.ts` 4件 PASS。型チェックは L4 の作業中のファイルの誤りで失敗（L2 の変更には誤りがない）。
+- 設計者の確認: 差分（`await sleep(Math.min(...))`）と、`npx vitest run tests/unit/navigation-pacer.test.ts` → 32件 PASS。型チェックは L4 の完了の後に行う。L2 を完了とする。
+
+### 2026-10-01 L4 の Blocker と対応
+
+- L4 が Blocker で止まった（`LoadMeter`、factory からの事象の受け渡し、結合テストまでは作った）。
+  - Blocker 1: `BrowserContextFactory` を作るのは Run Coordinator ではなく PREFLIGHT（`src/orchestration/preflight.ts:178`）。原因は設計者の指示書の見落とし。
+  - Blocker 2: Guard が `route.abort('blockedbyclient')` で止めた要求の失敗の理由は、文書では `net::ERR_BLOCKED_BY_CLIENT`、文書以外では `net::ERR_BLOCKED_BY_CLIENT.Inspector`（実装者が Playwright 1.62.1 で確かめた）。完全一致の1つだけでは、止めた要求を数えてしまう。
+- 設計者の判断（設計書 4.5 と変更履歴に反映）:
+  - 1: `PreflightOptions` に `contextFactoryOptions` を加え、PREFLIGHT がそのまま factory に渡す。Run Coordinator が meter を作って渡す。L5b のキャッシュも同じ経路で渡す（L5b の指示書を直した）。
+  - 2: 除く理由を、完全一致の閉じた一覧（2つ）にし、`src/browser/playwright-errors.ts` に置く。知らない理由は数える（多めに数える側）。Guard の同じ文字列は CC-035 として登録した。
+- 実装者が確かめたこと: BeakSight の Context（Guard が route を付ける）では、ブラウザの HTTP のキャッシュは使われず、meter の数とサーバの受け取った数が一致した。
+- 実装者の判断（承認）: 印の付いた要求は finished でも failed でも数えない。同じ要求の印は1回だけ数える。時計が戻った場合は、戻る前の最後の時刻として扱う。URL として解釈できないものは `otherOrigins`。
+- 同じ実装者に、続き（指示書 `L4-blocker-resolution-brief.md`）を依頼した。L3 は並行で作業中。
+
+### 2026-10-01 L3 完了
+
+- Interaction で監査する候補を `crawl.maxInteractionsPerPage` までにした。超えた分は `interaction:limit:remaining=<件数>` で Desktop を PARTIAL にする。確かめる順は、違反、上限、予算。上限で止めるときは pacer の待ちを呼ばない。
+- 実装者の検証: `page-auditor-interaction.test.ts` 19件（新しく4件。上限 2、上限 = 候補の数、pacer の呼び出しの順、違反が上限より先）、関係の結合テスト 506件、architecture・presentation 112件が PASS。型チェックは L4 の作業中のテストのファイルで失敗（L3 の変更には誤りがない）。
+- 設計者の確認: 差分（`index >= maxInteractionsPerPage` で止める）と、`npx vitest run tests/integration/page-auditor-interaction.test.ts` → 19件 PASS。
+- 表示: 止めた理由の `detail` は、表示面が訳さずに示す方針で、既存の理由にも説明がない。`limit` の説明は加えないとした実装者の判断を承認し、設計書 4.3 を直した。
+
+### 2026-10-01 L4 完了、全体の verify、L5b ∥ L6 ∥ R2 の起動
+
+- L4 が完了した。`LoadMeter`（`src/crawl/load-meter.ts`）、止めた要求の失敗の理由の閉じた一覧 `BLOCKED_BY_CLIENT_FAILURE_TEXTS` と `isBlockedByClientFailure`（`src/browser/playwright-errors.ts`）、PREFLIGHT の `contextFactoryOptions`、Run Coordinator の配線、`RunSummary.load`（`RunLoad`）と `run.schema.json` の `load`。
+  - 実装者の検証: 関係の単体・コンポーネント・結合のテスト（736件、38件、282件）、Gate（151件）、型チェックが PASS。PREFLIGHT の失敗と Run のディレクトリを作れなかった場合も `load` が入る。
+  - 実装者が確かめたこと: BeakSight の Context では、ブラウザの HTTP のキャッシュは使われず、meter の数とサーバの受け取った数が一致した。
+  - 発見事項: `tests/unit/core-contracts.test.ts` に `RunSummary.load` の型の確かめがない（範囲外。RL のレビューで扱う）。
+- 設計者の `npm run verify`（L1〜L4、L5a、R1 の後）: 終了コード 0。107ファイル、4,007件 PASS、ビルド PASS（342秒）。DEF-015 と DEF-021 は起きなかった。
+- L5b（Guard への届け方の注入と配線）、L6（負荷の記録の表示と README）、R2（保存の形式と `run-checkpoint.ts`）を並行で起動する。変更するファイルは重ならない。
+
+### 2026-10-01 ユーザーの判断: Task 21 は headed ＋ 実行中の表示
+
+- ユーザーの問い（2026-10-01）: Task 21 は headless の予定だったが、負荷の状態が見えないので headed で進められるか。
+- 設計者の説明: headed は `--headed` か設定の `browser.headed` で実行できる。ただし、見えるのはページの描画で、負荷の数字は見えない。headed では、ページのスクリプトによる `tel:`・`mailto:` への移動を止められず、外部のアプリが起動しうる（違反として `ABORTED_BY_SAFETY` になる）。Context を作るたびにウィンドウが開くので、実行中は画面がほぼ使えない。負荷を見るには、実行中の表示（CLI の1行）が合う。
+- ユーザーの判断: 「headed ＋ 実行中の表示」。外部のアプリが起動しうることと、実行中は画面がほぼ使えないことを受け入れた扱いとする。
+- 設計書 4.8（実行中の進み具合と負荷の表示）と、実装計画の L7 を加えた。L7 は Run Coordinator と CLI の表示に触れるので、L5b と L6 の後に起動する。
+- Task 21 の再開のとき: 実効の設定に `browser.headed` が入るので、再開の Run も headed で起動する必要がある（再開の設計書 4.7）。Task 21 の手順書に書く。
+
+### 2026-10-01 R2 の Blocker と対応
+
+- R2 が、ファイルを変える前に Blocker で止まった。
+  - B1: ARCH08 の Gate は、`validateArtifact` を呼べるファイルを PREFLIGHT、Run Coordinator、ArtifactWriter に限っている。指示書は `run-checkpoint.ts` で呼ぶよう求めていた（設計者の指示書の見落とし）。
+  - B2: 共通部品台帳 2.2 は、スキーマの enum の値の一覧を `src/core/` に置くと定めている。保存の状態、実行の終わり方、frontier の状態（`CRAWL_URL_STATES` は `src/orchestration/crawl-frontier.ts`）が当たる。
+- 設計者の判断（再開の設計書 4.2 と変更履歴に反映）:
+  - B1: スキーマの検証は R3 の ArtifactWriter が行う。`run-checkpoint.ts` は整合の確かめと判定だけにする。Gate は変えない。
+  - B2: 一覧を `src/core/contracts.ts` に置き、`CRAWL_URL_STATES` を core に移して、frontier から export し直す。
+  - 実装者が確かめた事実を反映した: `run.schema.json` は JSON Pointer の `$ref` で参照でき、`$defs` に移さない。ページの保存は `progress.results` の値を `page.schema.json` で `$ref`。`SafetyLedgerSnapshot` は保存のスキーマに定義する。robots/sitemap は Evidence だけを保存する。
+- 同じ実装者に、続き（`R2-blocker-resolution-brief.md`）を依頼した。
+
+### 2026-10-01 L6 完了
+
+- `run.json` の `load` を表示用モデルの要約（`RunSummaryView.load`、写しだけ）に持たせ、HTML の要約の小節「サイトへの負荷」（上限の小節のすぐ後）、CLI の結果の1行（指摘の件数の行の後）、`summary.json`（要約の展開で自動）に示した。README に節「サイトへの負荷」を加えた（方針、既定値、読み込み直しの回数とキャッシュ、制約、full audit での上限の選び方の目安、実績の確かめ方）。
+- 実装者の検証: 表示の単体 214件、UI Gate（22件、48ms）、結合 13件が PASS。型チェックは実装の直後に PASS し、後の再実行では L5b の作業中のテストのファイルだけで失敗。
+- 設計者の確認: `npx vitest run tests/unit/view-model.test.ts tests/unit/html-report.test.ts tests/unit/cli.test.ts tests/unit/chatgpt-bundle.test.ts tests/unit/presentation-messages.test.ts tests/architecture/ui-ssot.test.ts` → 6ファイル 197件 PASS。README の URL は `example.com` だけ。Git に載るファイルに本来の監査対象のサイトの名前がないことを `git grep` で確かめた。
+- 発見事項の扱い: 回数の単位（「件」ではなく「回」）と、要求の数と最大の組み立ての重複（HTML と CLI の2か所）は、L7 で `format.ts` の書式の関数にまとめる（`L7-brief.md`）。README の第2段の振る舞いの記述は、L5b の完了の後に設計者が確かめる。
+- L7（実行中の進み具合と負荷の表示）の指示書を書いた。L5b の後に起動する。
+
+### 2026-10-01 R2 完了、R3 の起動
+
+- R2 が完了した。`schemas/checkpoint.schema.json`、`schemas/checkpoint-page.schema.json`（既存の定義を JSON Pointer の `$ref` で参照。`run.schema.json` は変えていない）、スキーマの名前 `checkpoint`・`checkpoint-page`、`src/core/contracts.ts` の `RUN_CHECKPOINT_STATES`・`RUN_EXECUTION_END_REASONS`・（移した）`CRAWL_URL_STATES`、`src/orchestration/run-checkpoint.ts`（保存の作成、整合の確かめ、再開の判定、設定と版の比べ、ロックの判定と補助）。`run-checkpoint.ts` は `validateArtifact` を呼ばず、ファイルを読み書きしない。
+- 実装者の検証: 3ファイル 724件 PASS、frontier と queue 80件、architecture 50件、型チェック PASS。
+- 設計者の確認: `npx vitest run tests/unit/run-checkpoint.test.ts tests/unit/schema-validator.test.ts tests/unit/schema-enum-consistency.test.ts tests/unit/crawl-frontier.test.ts tests/architecture/semantic-ownership.test.ts` → 5ファイル 804件 PASS。`validateArtifact` はコメントの中だけ。
+- 実装者の判断の承認: 逆向きの整合の確かめ（`AUDITED`・`FAILED` の記録がすべて `completedPageIds` にある）を残す。`STOPPED` で違反の後のものは `NOT_RESUMABLE`。補助の関数3つ（`renewRunLock`、`isProcessRunning`、`currentProcessRunLockHost`）。
+- 後のサブタスクへの申し送り:
+  - R4a: 最後のページの違反は、フラグにまだ立っていないことがあるので、再開の前に、保存した Ledger の snapshot で違反を確かめ直す。`markFinished` と `completedPageIds` を同じ `state.json` の保存に入れる。
+  - R4b: `RUN_INTERRUPTED` を理由のコードと `RESUME_REQUEUE_SKIP_REASON_CODES` に加え、判定のテストの行も加える。`executions` の形は `run.schema.json` に定義し、保存のスキーマから参照する向きにする。
+  - R3: 途中で切れた `state.json` の `SyntaxError` を捕まえて、壊れた保存として扱う。
+- 共通化の候補: CC-036（ミリ秒と秒の換算の定数の重複）を登録した。
+- R3 の指示書を書いた。UI Gate が report から orchestration への import を禁じているので、保存とロックの型を `src/core/contracts.ts` に移し、整合の確かめは呼び出し側が ArtifactWriter に渡す形にした（再開の設計書 4.2 に反映）。L5b とファイルが重ならないので、すぐに起動する。
+
+### 2026-10-01 L5b 完了と L5b-fix-round-1 の依頼
+
+- L5b が完了した。読み込み直しの Context（幅の走査と Interaction）で、Run 全体のキャッシュにある画像とスクリプトをキャッシュから返し、キャッシュにない許可 Origin の外への要求（文書を除く）を送らない。
+  - Guard（`src/safety/passive-request-guard.ts`）の変更: `GuardResourceDelivery` の interface、`PassiveRequestGuardOptions.resourceDelivery`、route の処理の最後の分岐、`src/browser/resource-delivery.ts` からの型だけの import。許可の判定、凍結、閉じている段階、BLOCK は変えていない。部品の例外と `fulfill`・`abort` の失敗は外に投げず、Ledger にも記録しない。
+  - factory: `createPassiveContext(viewport, role = 'PRIMARY')`、`createInteractionSession` は `REVISIT`、キャッシュがあればすべての Context の応答を格納、`REVISIT` だけに届け方の部品を渡す。幅の走査は `role: 'REVISIT'`。Run Coordinator は `contextFactoryOptions: { loadMeter, resourceCache }`。
+  - 実装者の検証: 新しい結合テスト5件、関係の10ファイル 920件、Gate 151件、full-crawl と crawl-run 33件、ほか 130件、型チェックが PASS。安全の性質（凍結の後はキャッシュにあっても止めて記録する、GET・HEAD 以外は部品に渡らない、PRIMARY はキャッシュから返さない、部品の例外で違反にならない）をテストで確かめた。負荷の記録は `servedFromCache` 8、`withheldOtherOrigins` 2 で、サーバの受け取った数と一致した。
+- 設計者の確認: Guard の差分を読み、route の処理の最後の分岐（ナビゲーションと部品なしは今のまま、`FROM_RUN_CACHE` と `WITHHOLD` はネットワークに送らない、その前に `expectedRouteFailures` に登録）だけであることを確かめた。
+- 発見事項の扱い:
+  - 1・2: キャッシュがあると、入らない種類の応答（文書、XHR、media）の本文まで読む。上限の事前の確かめが既定の上限と比べている。→ L5b-fix-round-1 で、`ResourceCache.mayStore`（本文を読む前の見込みの判断。判断は1か所）を加え、factory はそれが真の場合だけ本文を読む。同じ実装者に依頼した。
+  - 3: `fulfill` が失敗した要求も `servedFromCache` に入る（多めに数える側）。受け入れる。
+  - 4: `PassiveSessionDeadlineOptions` が `role` を受け取れるが無視する。RL のレビューで扱う。
+  - 5: OOPIF の中の画像などが Guard の route を通るかは未確認。RL のレビューで扱う。
+- L7 は、R3 が `src/core/contracts.ts` を変えているので、R3 の後に起動する。
+
+### 2026-10-01 R3 の Blocker と対応、L7 の起動
+
+- R3 が、ファイルを変える前に Blocker で止まった。保存の型（`RunCheckpoint`）の一部は、orchestration・crawl・safety の型（frontier、採番器、Ledger の snapshot、robots/sitemap の結果、pacer の snapshot）でできていて、core に移すと依存の向きが逆になる（設計者の判断の見落とし）。
+- 設計者の判断（再開の設計書 4.2 と変更履歴に反映）: 実装者の案3。保存の型は `run-checkpoint.ts` に残す。ArtifactWriter の保存の読み書きは総称にし、core の型だけで書ける最小の形（`completedPageIds`、`pageId`）だけを知る。中身はスキーマで検証し、整合の確かめは引数で受け取る。同じ実装者に続き（`R3-blocker-resolution-brief.md`）を依頼した。
+- L7（実行中の進み具合と負荷の表示）を起動した。R3 が core を変えなくなったので、変更するファイルは R3・L5b-fix-round-1 と重ならない。
+
+### 2026-10-01 L5b-fix-round-1 完了
+
+- `ResourceCache.mayStore`（本文を除いた事実で、入れる見込みがあるか。`content-length` はそのキャッシュの1件の上限で判断）を加え、`#isStorable` もそれを使う（判断は1か所）。factory は `mayStore` が真の応答だけ `response.body()` を読む。文書、XHR、fetch、リダイレクト、上限を超える応答の本文は読まない。`exceedsRunCacheEntryLimit` と既定の上限との比べは消した。
+- 振る舞いの変化: `store` も `content-length` を見るので、上限を超える `content-length` の応答は、本文が小さくても入れない（多めに拒む側）。承認する。
+- 実装者の検証: 単体とコンポーネント 137件、結合を含む 166件、ほか 25件、型チェックが PASS。
+- 設計者の確認: `npx vitest run tests/unit/resource-delivery.test.ts tests/component/context-factory.test.ts` → 2ファイル 137件 PASS。factory の `mayStore` の呼び出しと、`RESOURCE_CACHE_LIMITS`・`exceedsRunCacheEntryLimit` が factory から消えたことを確かめた。L5b を完了とする。
+
+### 2026-10-01 R3 完了
+
+- `ArtifactWriter` に、保存の書き出し（`writeCheckpointPage`、`writeCheckpointState`。スキーマで検証し、一時ファイル → `fsync` → `state.json` を `state.prev.json` に → rename → Windows 以外ではディレクトリの `fsync`）、読み込み（`readCheckpoint`。壊れ方ごとに `state.prev.json` に切り替え、失敗の理由を返す）、ロック（`acquireRunLock`、`rewriteRunLock`、`releaseRunLock`）、後始末（`cleanUpForResume`）、`writeRun` で古い `visible-text.txt` を消す処理を加えた。保存の関数は総称で、core の型だけで書ける最小の形だけを知る。`artifact-layout.ts` に保存の配置の定数、PREFLIGHT の一時ファイルの名前の定数（`preflight.ts` から移した）、保存のある Run のディレクトリの一覧（`listCheckpointRunDirectories`）を加えた。
+- 実装者の検証: 300件 PASS（4ファイル）、architecture 50件、結合 14件 PASS。型チェックは L7 の作業中のファイルの1件で失敗（R3 の変更には誤りがない）。後始末が Run のディレクトリの外に及ばないことを、隣の Run のディレクトリと、外を指す junction で確かめた。
+- 設計者の確認: `npx vitest run tests/unit/artifact-writer.test.ts tests/unit/artifact-layout.test.ts tests/unit/run-checkpoint.test.ts tests/architecture` → 6ファイル 332件 PASS（UI Gate を含む）。
+- 実装者の判断の承認: ディレクトリの `fsync` はできる限り行い、失敗しても保存の失敗にしない。ページの保存とロックにも行う。ページの保存の名前と中身の `pageId` の一致を確かめる。
+- 申し送り（再開の設計書 4.4 に反映）: ロックを作り直した後に読み直し、自分のものでなければ再開しない。後始末は、ロックを取った後、ハートビートと保存の前に行う。`listCheckpointRunDirectories` は、出力先がない場合だけ空の一覧で、ほかの失敗は reject する（R5 で扱う）。
+- 共通化の候補: CC-037（テストの見本の保存の組み立ての重複）を登録した。
+
+### 2026-10-01 L7 の報告（型チェックの1件で止まった）と仕上げの依頼
+
+- L7 は、実装とテストを終えた（`RunProgressReport`、`LoadMeter.recentPerMinute()`、Run Coordinator の `onProgress`（例外は握りつぶす）、CLI の進み具合の1行、`formatTimes`・`formatElapsedTime`・`formatRequestsWithPeak`、HTML と CLI の負荷の表示の置き換え）。関係のテスト 370件と 68件、UI Gate（51ms）が PASS。
+- 止まった理由: `tests/component/context-factory.test.ts:704` の偽の `LoadMeter` に `recentPerMinute` がなく、型チェックが失敗する（L5b-fix-round-1 のファイルで、範囲の外だった）。
+- 設計者の判断: 案1（偽のものに、呼ばれたら例外を投げる `recentPerMinute` を加える）。あわせて、HTML の「待った時間の合計」も `formatElapsedTime` で示す。同じ実装者に依頼した。設計書 4.8 の例を、実装の文言に合わせた。
+- 実装者の判断の承認: 「監査を終えたページ」（PARTIAL と FAILED を含む）の呼び方、`recentPerMinute()` は古い時刻を捨てずに窓の外を除いて数える（時計が戻った場合に最大を少なく数えないため）。
+- R4a の指示書（`R4a-brief.md`）を書いた。保存のセッションを新設し、最後の状態は CLI が最後の出力の後に書く（再開の設計書 4.3.1）。L7 の仕上げの後に起動する。
+
+### 2026-10-01 L7 完了
+
+- L7 の仕上げが完了した。`tests/component/context-factory.test.ts` の偽の `LoadMeter` に、呼ばれたら例外を投げる `recentPerMinute` を加えた。HTML の「間隔のために待った時間の合計」を `formatElapsedTime` で示す（例: `1分38秒`）。CLI は待ちの時間を出していない。
+- 実装者の検証: 型チェック PASS。14ファイル 459件、CLI 50件、full-crawl 18件、architecture 50件（UI Gate 42ms）が PASS。結合テストの RED は、受け手を渡す1行を一時的に外して確かめた（その後に戻し、SHA-256 が前と同じことを確かめた）。
+- L1〜L7 がそろったので、設計者が全体の `npm run verify` を実行する（実行中）。PASS なら、RL（負荷の制御の独立レビュー）と R4a を起動する。
+
+### 2026-10-01 全体の verify（L1〜L7 の後）、RL ∥ R4a の起動
+
+- 設計者の `npm run verify`（L1〜L7、L5a、R1〜R3 の後）: 終了コード 0。109ファイル、4,316件 PASS、ビルド PASS（349秒）。DEF-015 と DEF-021 は起きなかった。
+- RL（負荷の制御の独立レビュー。読み取り専用。指示書 `RL-review-brief.md`）と R4a（保存のセッションと保存の時期）を並行で起動した。R4a が Run Coordinator を変える間に、レビュー担当が途中のコードを読まないよう、この時点のコードの写しを scratchpad の `rl-snapshot-20261001` に作り、レビュー担当にはそれを読むよう指示した。
+
+### 2026-10-01 R4a の Blocker と対応
+
+- R4a が、ファイルを変える前に Blocker で止まった。理由のコード `CHECKPOINT_WRITE_FAILED` を加えると、固定の一覧で確かめている `tests/unit/core-contracts.test.ts:377-425` が必ず失敗する（指示書の範囲の見落とし）。
+- 設計者の判断（再開の設計書 4.1、実装計画の R4a・R4a2 の節に反映）:
+  - `core-contracts.test.ts` の `expectedCodes` に1行加えることを認める。
+  - 実装者の案（`RunCheckpointStore`、`RunCheckpointSession` の操作、ハートビートの扱い、Run Coordinator の依存、理由、調べる順）を承認した。同じ形のロックの取得の結果の型が orchestration と report の2か所になるのは、依存の向きを守るためなので受け入れる。
+  - セッションを始められなかった新しい Run は FAILED にする（既存の `deriveRunStatus` の入力を使う）。
+  - 保存の量（実装者の発見事項4）: `state.json` に全部の Ledger の snapshot を持たせると、保存のたびに書く量がページの数に比例して増える（1ページで最大25の Context。500ページで1回の保存が数MB）。ページの中の Ledger の snapshot は、そのページの保存に入れ、`state.json` にはページの外の Ledger だけを持たせる。
+- 同じ実装者に続き（`R4a-blocker-resolution-brief.md`）を依頼した。RL は並行で作業中。
+
+### 2026-10-01 RL の結果と対応
+
+- RL（負荷の制御の独立レビュー）: コードは Critical 0・Important 0。文書の更新漏れの Important 1件と、Minor 7件。結果は `RL-review-result.md`。
+- OOPIF の中の要求も Guard の届け方の部品を通ることを、レビュー担当が実験で確かめた（L5b の未確認の点。安全な側に外れていた）。
+- 設計者が直したもの:
+  - Important-1: 実装タスク指示 第5章の Owner Matrix に5つの owner（負荷の制御の3つ、再開の2つ）を加え、追補の注記を書いた。上位の設計書に 24.1（監査対象のサイトへの負荷）を加えた。共通部品台帳に、L4 以降と R2・R3 の部品を登録した。
+  - Minor-3 と「確認できなかった点」のページ自身の読み込み: 設計書 4.5 に制約として書いた。
+- 残りの Minor（1・2 README、4 テスト、5 `beforeNavigation` を必須にする、6 スキーマの下限、7-2 `role` の型、7-3 `RunSummary.load` の型の確かめ）は、R4a の後に、小さなサブタスク RL-fix として行う（R4a と同じファイルに触れるものがあるため）。Minor-7（`pagesFinished`）は R4b で決める。
+- RL のコードの判定は Critical 0・Important 0 で、Important-1（文書）は設計者が解消した。負荷の制御（L1〜L7）を完了とする（RL-fix は品質の改善）。
+
+### 2026-10-01 R4a 完了、R4a2a ∥ RL-fix の起動
+
+- R4a が完了した。保存のセッション `RunCheckpointSession`（`src/orchestration/run-checkpoint-session.ts`。`start`（`NEW_RUN`）、`savePage`、`saveState`、`finish`、`abandon`、1分ごとのハートビート（`unref`、前の回の書き出し中なら飛ばす、`finish` は書き出し中のハートビートを待ってからロックを外す））、保存の書き手の interface `RunCheckpointStore`、Run Coordinator の依存 `checkpointSession` と保存の時期（Run のディレクトリの後に始める、robots/sitemap の後に状態、各ページの後にページと状態）、保存に失敗した場合の `CHECKPOINT_WRITE_FAILED`、ページの保存の `safetyLedgerSnapshots`。セッションを始められなかった新しい Run は、`preflightFailed: true` の入力で FAILED になる。
+- 実装者の検証: 関係の単体 1,207件、結合 42件と 107件、architecture 50件、型チェック PASS。保存がすべて成功した Run の結果が、セッションなしの Run と同じことも確かめた。
+- 設計者の確認: 型チェック PASS。`npx vitest run tests/unit/run-checkpoint-session.test.ts tests/unit/run-coordinator.test.ts tests/unit/run-checkpoint.test.ts tests/unit/core-contracts.test.ts tests/integration/run-checkpoint.test.ts tests/architecture` → 8ファイル 461件 PASS。orchestration から report を import していないことを確かめた。
+- 発見事項の扱い:
+  - 1（page のスキーマに合わない結果のページは、ページの保存が拒まれ、巡回が `CHECKPOINT_WRITE_FAILED` で止まる）: スキーマに合わない結果は BeakSight 自身の不具合を示すので、再開できない状態で監査を続けない安全な側として受け入れる。
+  - 2（見本の組み立てが3か所。CC-037）: 新しい補助 `tests/helpers/run-checkpoint-samples.ts` ができた。既存の2か所の置き換えは、共通化の候補のまま（ユーザーの指示まで着手しない）。
+  - 3（`run-checkpoint.test.ts` の古い見本）: R4a2a で直す。
+- R4a2 を R4a2a（セッションの再開の始め方）と R4a2b（Run Coordinator の作り直しと続き）に分けた。R4a2a と RL-fix は変更するファイルが重ならないので、並行で起動する。
+
+### 2026-10-01 R4a2a 完了、R4a2b の起動
+
+- R4a2a が完了した。`RunCheckpointSession.start` に `mode: 'RESUME'`（`completedPageIds`）を加えた。ロックを作る → あれば `judgeRunLock` → `ACTIVE` なら失敗（`LOCK_HELD_BY_ACTIVE_RUN`）→ `STALE` なら書き換えて読み直し、自分のものでなければ失敗（`LOCK_TAKEN_OVER_CONCURRENTLY`）→ 後始末 → ハートビート。`ArtifactWriter.readRunLock`、`RunCheckpointStore` に `readRunLock` と `cleanUpForResume`。`run-checkpoint.test.ts` の古い見本を、ページの外の Ledger だけの形に直した。
+- 実装者の検証: 関係の 387件、architecture 50件、型チェック PASS。
+- 設計者の確認: `npx vitest run tests/unit/run-checkpoint-session.test.ts tests/unit/artifact-writer.test.ts tests/unit/run-checkpoint.test.ts tests/integration/run-checkpoint.test.ts` → 4ファイル 290件 PASS。
+- 発見事項の扱い:
+  - 既存のテスト1件（始め方の一覧）の直しは、`RESUME` を加える決定に伴うもので、確かめは弱めていない。承認。
+  - 2つのプロセスがほぼ同時に古いロックを作り直すと、まれに両方が進みうる。同じ Run を同時に2回起動しない場合だけに起きるので、制約として設計書 4.4 に書き、README に書く（R5）。
+- R4a2b（Run Coordinator の保存からの作り直しと続き、「中断しなかった場合と同じ」の結合テスト）を起動した。RL-fix は並行で作業中（変更するファイルは重ならない）。
+
+### 2026-10-01 RL-fix 完了
+
+- RL の Minor を直した: README（「回」の単位、実行中の進み具合の行の説明、読み込み直しで送る要求の正確な記述）、`collectSiteMetadata`・`collectStressLayout` の `beforeNavigation` を必須にした（型と実行時）、`run.schema.json` の `load.maxInteractionsPerPage` を設定の定義への `$ref` にした（1〜100）、`PassiveSessionDeadlineOptions` を `Omit<PassiveSessionOpenOptions, 'role'>` から作る、`RunSummary['load']` の型の確かめ、テストの強化（期限の延ばし過ぎの検出、サーバ側の時刻での間隔、閉じている段階で `decide` を呼ばないこと）。
+- 実装者の検証: 関係のテスト 697件、272件、151件、62件が PASS。延ばし過ぎを、実装を一時的に誤った形にして検出できることを確かめた（すぐに戻し、SHA-256 で確かめた）。型チェックは、R4a2b の作業中の `run-coordinator.test.ts` だけで失敗。
+- 設計者の確認: `npx vitest run tests/component/layout-collector.test.ts tests/unit/passive-session-open.test.ts tests/unit/core-contracts.test.ts tests/unit/schema-validator.test.ts tests/integration/site-metadata.test.ts tests/integration/navigation-pacing.test.ts tests/integration/passive-request-guard.test.ts` → 7ファイル 908件 PASS。README の URL は `example.com` だけ。`git grep` で、本来の監査対象のサイトの名前がないことを確かめた。
+- 発見事項の扱い:
+  - `NO_PACING_WAIT` の重複: CC-038 として登録した。
+  - サーバ側の間隔の許容（50ms）: 今の監査の時間では余裕がある。Passive の監査が間隔より短くなると失敗しうるので、DEF-021 と同じく、verify のたびに見る（起きたら調べる）。
+  - 幅の走査のセッションの作成の期限の上限の延ばし過ぎは、今の確かめでは検出できない（Minor。記録だけ）。
+  - README の進み具合の説明は、再開の前の分を含むか（R4a2b で含めると決めた）に触れていない。R5 で README の再開の節を書くときに直す。
+- RL の指摘への対応は、これで完了とする。
+
+### 2026-10-01 R4a2b 完了（保存からの再開の流れ）
+
+- 実装者の報告: Run Coordinator に `resumeFrom` を加えた。保存から、採番器、巡回の記録、理由、再試行、違反のフラグ、未処理の失敗、`pagesStarted`、終わったページの結果、robots/sitemap の Evidence（取得し直さない）、保存した Ledger の snapshot、pacer と meter を作り直す。専用の例外は `RunNotResumableError`（`NOT_RESUMABLE` の入力）と `RunResumeUnavailableError`（理由 `LOCK_HELD_BY_ACTIVE_RUN`、`LOCK_TAKEN_OVER_CONCURRENTLY`、`CHECKPOINT_STORE_FAILED`）。`#safetyViolationRecorded` は、Run の初めから調べるとき（`fromIndex` が 0）に、保存した snapshot も調べる。
+- 「中断しなかった場合と同じ」: fixture の `/crawl/` の5ページで、4ページ目の保存の前に中断し、端末の再起動を模した古いロックで再開した。ページ、Evidence の ID と種類、Finding の ID・ruleId・fingerprint、Run Status、SKIPPED の理由、Safety の集計、Run の理由、上限、再試行の記録が、すべて一致した。比べなかったもの: Run の ID、時刻、時刻を含む Evidence の値、`load`、`executions`、`environment`。
+- 実装者が決めたこと: 前の回が違反で robots/sitemap の取得を始めなかったこと（`SAFETY_VIOLATION_ABORT`／`site-metadata`）が保存の理由にあれば、取得も理由の追加もしない（理由が2件になり、中断しなかった場合と違うため）。妥当と判断した。
+- 設計者の確認: `npx vitest run tests/unit/run-coordinator.test.ts tests/integration/resume-run.test.ts tests/integration/run-checkpoint.test.ts tests/unit/run-checkpoint.test.ts tests/unit/run-checkpoint-session.test.ts tests/integration/crawl-run.test.ts tests/integration/fixture-full-crawl.test.ts tests/integration/safety-gates.test.ts tests/integration/auditor-gates.test.ts tests/architecture` → 12ファイル 513件 PASS。`npm run typecheck` → PASS。`run()` と `#safetyViolationRecorded` を読み、違反の検出が1か所であることを確かめた。
+- 発見事項の扱い:
+  1. `contracts.ts` の `RunProgressReport.pagesFinished` の説明が「再開の前の分は含まない」のまま → R4b1 で直す。
+  2. 再開した実行で PREFLIGHT に失敗した場合の保存の状態 → R4b の設計で、保存の状態を変えない（`ABANDON`）と決めた（設計書 3.2、4.3.2）。
+  3. 再開した実行で新しく起きた失敗は、前の回の理由に加わる → 正しい振る舞い。記録だけ。
+  4. 違反の結合テストの前提（fixture のページの Ledger が2つ）は、テストの中で確かめている → 記録だけ。
+  5. 21:16 の `page-auditor.ts` の更新 → RL-fix が、期限の延ばし過ぎを検出できるかを、実装を一時的に誤った形にして確かめ、戻した時刻と合う（RL-fix は SHA-256 で戻したことを報告済み）。
+
+### 2026-10-01 R4b の設計
+
+- 設計書に 4.3.2（保存の終わり方 `FINISH`・`ABANDON`・`NONE`、保存の状態の決め方、最後の状態の中身を巡回の終わりの値にすること）、4.6.1（止める印を `AbortSignal` で渡し、ページの間でだけ確かめる）、`savedAt`（4.1）、実行の終わり方の決め方と、`run.json` の実行の記録に環境を含めないこと（4.8）、保存の状態を変えない2つの場合（3.2）、違反の Run は必ず `FINISHED`（5章）を加えた。
+- R4b を、R4b1（理由のコード `RUN_INTERRUPTED`、保存の時刻と実行の記録の整合、実行の終わり方の判定の関数）と R4b2（Run Coordinator の止める印、保存の終わり方、`run.json` の `executions`）に分けた。
+
+### 2026-10-01 R4b1 完了（理由のコード、保存の時刻、終わり方の判定）
+
+- 実装者の報告: `RUN_INTERRUPTED`（contracts、run.schema、messages、待ち行列に戻す理由）、`savedAt`（checkpoint.schema、`RunCheckpoint`）、実行の記録の整合の確かめ、`closeInterruptedRunExecutions`、`decideRunExecutionEndReason`、`decideRunCheckpointConclusion`、`RUN_CHECKPOINT_CONCLUSION_ACTIONS`、`RUN_CHECKPOINT_FINAL_CONTENTS` を加えた。Run Coordinator は、保存の時刻と、再開のときに前の回の記録を閉じることだけ。`RunProgressReport.pagesFinished` の説明を直した。
+- 設計者の確認: R4b1 の関連の検証に、表示と CLI の単体を加えた 20ファイル 1,638件 PASS。`npm run typecheck` → PASS。`decideRunCheckpointConclusion` を読み、設計書 4.3.2 の表と順が一致することを確かめた。
+- 発見事項の扱い:
+  1. GATE-ARCH05 が `satisfies RunStatus` の定数を Run Status を決める式として検出した → 比べる関数に置き換え、Gate の例外は増やしていない。妥当。
+  2. `tests/integration/run-checkpoint.test.ts` の `FINISHED` の最後の状態で、最後の実行の記録を閉じた（新しい整合の規則のため）→ 設計書 4.3.2 のとおりで妥当と判断した。
+  3. 見本は、`STOPPED`・`FINISHED` を指定すると最後の記録を閉じる → 妥当。
+  4. 閉じた一覧が2つ（`content` の一覧も定数）→ 指示書の求めのとおり。台帳に登録した。
+  5. 作業中の設計書の更新は、設計者の R5 の設計の追記。
+
+### 2026-10-01 R4b2 完了（止める印、保存の終わり方、`executions`）
+
+- 実装者の報告: `stopSignal`（`AbortSignal`）、`RUN_INTERRUPTED` の SKIPPED と Run の理由、`run.json` の `executions`（`RunExecution`、スキーマ）、巡回の終わりの値の写し（`runCheckpointContent` に一本化）、最後に書けた保存の記録、`checkpointConclusion()`（`RunCoordinatorCheckpointConclusion`）。止める印の形の「中断しなかった場合と同じ」（k=2）で、比べた項目と、`checkpoint/` を除く出力のファイルの一覧が一致した。
+- 設計者の確認: R4b2 の関連の検証に、表示の単体、CLI の結合、Gate を加えた 22ファイル 1,684件 PASS。`npm run typecheck` → PASS。`checkpointConclusionOf` を読み、判定を `decideRunCheckpointConclusion` だけで行い、代わりの規則（巡回の終わりの中身が整合を通らなければ最後に書けた保存、なければ `ABANDON`）が指示書のとおりであることを確かめた。
+- 発見事項の扱い:
+  1. 作業中の設計書の更新は、設計者の R5a の追記。
+  2. RED の扱い（1件は直した後の形を実装の前に実行していない）→ 振る舞いは GREEN の後のテストで確かめられており、受け入れる。
+  3. 再開した実行で PREFLIGHT に失敗し、違反もある場合に、出力に前の回のページが入らない → DEF-022（Minor）として登録した。
+  4. 改行の形（CRLF）を保った → 記録だけ。
+
+### 2026-10-01 R5a の Blocker と解消
+
+- 最初の実装者は、`createRunCoordinator` の戻り値の型を変えると、変更してよいファイルにない `tests/unit/run-command.test.ts` の偽の Run Coordinator が型と実行で失敗することに気づき、ファイルを変えずに止まった（設計者が `git status` の件数と更新の時刻で、変更がないことを確かめた）。
+- 設計者の判断（`R5a-blocker-resolution-brief.md`）: そのテストを変更してよいファイルに加える。一覧を短くする書式は既存の `truncatedListText`。終了コードのテストは、`RUN_UNAVAILABLE` が `CONFIG_ERROR` と同じ 4 であることだけを例外にする。使い方の表示の終了コードの表に「Run を始められない」の行を加える。再開の知らせのページの数は `監査を終えたページ <件数>` の書き方にする。`--new` は `runAuditCommand` の4つ目の引数で受け取る。設計書の変更履歴に記録した。R5b の指示書も、終了コード 5 の行と、テストの例外に `INTERRUPTED` を加えないことに合わせて直した。
+- 新しい実装者を起動した。
+
+### 2026-10-01 R5a 完了（CLI の再開の流れ）
+
+- 実装者の報告: 出力先の実行中の Run の確かめ（`listRunDirectories`、`readRunLock`、`judgeRunLock`）、途中の Run を `state.json` だけで読んで選ぶ（`readCheckpointState`、`selectRunToResume`）、版の確かめ（`RUN_VERSION_FIELDS` を BeakSight と Playwright に。`runVersionDifferences` は保存の値と今の値を添えて返す）、`--new`、終了コード 4 の `RUN_UNAVAILABLE`、保存のセッションの受け渡し、Run の後の `finish`・`abandon`、終わった Run の片付け（`removeFinishedCheckpointFiles`）、`handleSIGINT`・`handleSIGTERM`・`handleSIGHUP` を `false`。新しい結合テスト `tests/integration/cli-resume.test.ts`（26件）。
+- 設計者の確認: R5a の関連の検証に、Run Coordinator と保存のセッションの単体を加えた 19ファイル 892件 PASS。`npm run typecheck` → PASS。`run-command.ts` の分かれ目を読み、判定を `run-checkpoint.ts` などの関数に任せていることを確かめた。
+- 発見事項の扱い:
+  1. 保存の Run の ID と Run のディレクトリの名前が違う場合、出力と保存が分かれる → R5a-fix-round-1 で、保存を読むときに名前が違えば使えない保存として扱う。
+  2. HTML レポートの文言を CLI でも使う → CC-039 として登録した。
+  3. `listCheckpointRunDirectories` が `ENOTDIR` も出力先なしとして扱う → 妥当。受け入れる。
+  4. `runVersionDifferences` の戻り値の形の変更 → 妥当。受け入れる。
+  5. `finish` の失敗の警告の文が正確でない場合がある → R5a-fix-round-1 で、どの場合にも当てはまる文に直す。
+  6. `src/cli/` の、決まった値との比べ2か所（片付けを行う条件、技術的な詳細を添えるかの表示の選び方）→ RR で確かめてもらう。
+  7. CLI の `FINALIZE_ONLY` の結合テストがない → R5a-fix-round-1 で加える。
+  8. 終了コード 4 の文言は標準エラー、知らせは標準出力 → 妥当。
+
+### 2026-10-02 R5a-fix-round-1 完了
+
+- 実装者の報告: 保存を読むときに、`runId` が Run のディレクトリの名前と違えば使えない保存として扱う（`readCheckpointStateSource` の1か所。`readCheckpoint` と `readCheckpointState` の両方が通る）。`finish` の失敗の警告の文を直した。CLI の `FINALIZE_ONLY` の結合テストを加えた（保存のフラグが真の形）。
+- 設計者の確認: 関連の検証 13ファイル 568件 PASS。`npm run typecheck` → PASS。
+- 発見事項の扱い:
+  1. 設計書 4.2 に Run の ID の確かめがない → 設計者が 4.2 に加えた。
+  2. 違反がページの保存の snapshot にだけあり、保存のフラグが偽の場合に、CLI が「続きから再開します」と知らせるが、実際には最後の処理だけで `ABORTED_BY_SAFETY` になる → 違反のあったページの保存の直後にプロセスが終わると起きる。保存のフラグを、各ページの保存の前にそのページの Ledger を調べてから書くことにした（設計書 4.2）。R4a2b-fix-round-1 として依頼した。
+- R4a2b-fix-round-1（Run Coordinator）と R5b（CLI のシグナルと README）は、変更するファイルが重ならないことを確かめて、並行で起動した。
+
+### 2026-10-02 R4a2b-fix-round-1 完了（保存の違反のフラグ）
+
+- 実装者の報告: `#safetyViolationRecorded` を、違反を調べてフラグを立てる `#detectSafetyViolation` と、止めたことを記録する部分に分けた。各ページの保存の前に `#detectSafetyViolation(progress, progress.pageLedgerStart)` を呼ぶ。守りの形（保存のフラグを偽に書き換えた保存）のテストは残した。CLI の結合テストで、最後の Ledger（Mobile）に違反がある形でも「最後の処理だけを行います」が出ることを確かめた。
+- 設計者の確認: 関連の検証 10ファイル 597件 PASS。`invariantViolationCount` を調べるのは `#detectSafetyViolation` の中の1か所だけ（ほかはコメントと、集計の結果を Run Status の入力に渡す行）。
+- 発見事項の扱い:
+  1. robots.txt と sitemap.xml の取得の後の保存でも、同じずれが残る → 設計書 4.2 を「各保存の前」に直し、R4a2b-fix-round-2 として依頼した（R5b と並行。ファイルは重ならない）。
+  2. `run-checkpoint.ts` の古いコメント → R4a2b-fix-round-2 で直す。
+
+### 2026-10-02 R5b 完了（シグナルと README）
+
+- 実装者の報告: `src/cli/interrupt.ts`（`INTERRUPT_SIGNALS`、`createInterruptHandler`、`registerInterruptHandlers`）、`index.ts` での登録と止める印の受け渡し、`main.ts` の `resolveRunCommandDependencies`、終了コード 5（`INTERRUPTED`）、使い方の表の 5 の行、README（`--new`、「中断と再開」の節、終了コード、出力の構成の `checkpoint/` と `executions`、CLI の表示、`maxRuntimeMs` の意味）。Windows では子のプロセスに本物の SIGINT を送れないので、配線は子のプロセスの中の `process.emit` で確かめた。
+- 設計者の確認: CLI の単体と Gate の 8ファイル 163件 PASS。README の URL は `https://example.com` だけ。README の「中断と再開」の節を読み、文言と数値がコードの定義と合い、実在のサイトの名前がないことを確かめた。
+- 発見事項の扱い:
+  1. `CLI_TEXT.progress.pagesFinished` の JSDoc が古い → R5-fix-round-1 で直す。
+  2. `output.directory` を書いた文字のまま比べるので、`--output artifacts` と同じ場所の絶対パスで「設定が違う」になる → 出力先は探す場所そのものなので、比べる設定から外す（R5-fix-round-1。設計書 4.7.1 を直す）。README の該当の行も直す。
+  3. 並行の作業による一時的な失敗 → R4a2b-fix-round-1 の作業中のもの。最終の実行で PASS。
+  4. `validate-config` の最中の1回目の Ctrl+C でも「今のページの監査を終えてから止めます」が出る → まれで害がないので、受け入れる。
+  5. Windows の子のプロセスへの SIGINT の制約 → 設計者が手で確かめる（設計書 第10章）。
+  6. README を確かめるテストはない → 記録だけ。
+
+### 2026-10-02 R4a2b-fix-round-2 完了
+
+- 実装者の報告: robots.txt と sitemap.xml の取得の後の保存の前に、取得の Ledger を調べてフラグを立てる。`run-checkpoint.ts` の古いコメントを直した。
+- 設計者の確認: R5b と合わせた関連の検証 11ファイル 656件 PASS。`npm run typecheck` → PASS。
+- 発見事項の扱い: 再開した実行で robots/sitemap を保存から作り直した場合は、この実行の PREFLIGHT と環境の記録の Ledger が、取得の後の保存の前に調べられない → その時点の Ledger はすべて閉じているので、Run の初めから調べる形に直す（設計書 4.2 を直した）。R5-fix-round-1 に含めた。
+
+### 2026-10-02 R5-fix-round-1 を起動
+
+- 内容: 出力先を再開の設定の比べ方から外す（`RESUME_CONFIG_IGNORED_PATHS`）、取得の後の保存の前は Run の初めから調べる、`CLI_TEXT.progress.pagesFinished` の JSDoc、README の該当の行。設計書 4.2、4.7 と変更履歴を直した。
+
+### 2026-10-02 R5-fix-round-1 完了
+
+- 実装者の報告: `RESUME_CONFIG_IGNORED_PATHS`（`output.directory`）を置き、`selectRunToResume` が比べる前に除く。取得の後の保存の前は `#detectSafetyViolation(progress, 0)`。`CLI_TEXT.progress.pagesFinished` の JSDoc、README の該当の行を直した。CLI の結合テストで、相対のパスで止めた Run を、同じ場所の絶対のパスで再開できることを確かめた。
+- 設計者の確認: 関連の検証 12ファイル 694件 PASS。`npm run typecheck` → PASS。
+- 発見事項の扱い: 1（今の振る舞いを守るテストは実装の前から PASS）→ 受け入れる。2（既存のテストの違う項目を `crawl.maxPages` に替えた）→ 意図を保つ直しで妥当。3（文言のテストの例に `output.directory`。台帳に R5 の部品がない）→ 前者は害がないので記録だけ。台帳には登録した。
+
+### 2026-10-02 R6 完了（実行の記録の表示）
+
+- 実装者の報告: 表示カタログ `RUN_EXECUTION_END_REASON_CATALOG`、表示用モデルの `summary.executions`（`count`、`resumeCount`、`items`。数えるのは `executionsView` の1か所）、HTML の小節「実行の記録」（回数と表）、CLI の行（`実行: 3回、再開 2回`）、`summary.json`（`model.summary` の写しで自動で入る）、README の「CLI の表示」と「HTML レポート」。
+- 設計者の確認: 表示の単体、UI Gate、レポートの結合の 11ファイル 396件 PASS。`npm run typecheck` → PASS。
+- 発見事項の扱い:
+  1. GATE-UI05 のカタログの一覧に新しいカタログがない → R6-fix-round-1 で加える。
+  2. 既存のテストの位置と数の直し（3か所）→ 条件を弱めていないので受け入れる。
+  3. 設計書 4.8 の CLI の例が実装と違う → 設計書を `実行: 3回、再開 2回` に揃えた。
+  4. 何回目の数は描画の側で位置から作る → 数え直しではないので受け入れる。
+
+### 2026-10-02 R6-fix-round-1 完了と、全体の検証
+
+- R6-fix-round-1: GATE-UI05 の一覧に `RUN_EXECUTION_END_REASON_CATALOG` を加えた（一時的な誤りで失敗し、戻すと PASS することを実装者が確かめた）。
+- 全体の検証: `npm run verify` → PASS（型チェック、114ファイル 4,697件、ビルド。終了コード 0。テストの所要時間 344秒）。記録はスクラッチパッドの `verify-20261002.log`。
+- 実装計画の R1〜R6 の状態を「完了」にした。RR の指示書に、レビューの対象の時点の件数を書き足した。
+
+### 2026-10-02 今日の作業の区切り（ユーザーの指示「その作業が完了したら今日はここまでにしよう」）
+
+次回の手順:
+1. レビューの対象のコードの写しを、スクラッチパッドの `rr-snapshot-20261002/` に作る（`src/`、`tests/`、`schemas/`、`fixtures/`、`README.md`、`doc/design/`）。今の作業ツリーは、全体の検証が PASS した時点のまま。
+2. 読み取り専用のレビュー担当に、`RR-review-brief.md` を渡して RR を行う。Critical 0件、Important 0件で完了とする。
+3. 設計者が、Ctrl+C の手での確かめを行う（設計書 第10章）。道具はスクラッチパッドの `ctrlc-check/`（`static-server.mjs` で fixture を 127.0.0.1:48731 で配る、`config.json`、`send-ctrl-c.ps1` で `GenerateConsoleCtrlEvent` を送る）。ビルドした CLI（`dist/`）を別のコンソールで headless で起動し、次を確かめる。
+   - 1回目の Ctrl+C で、今のページを終えて止まる（終了コード 2、`STOPPED`）。
+   - 同じコマンドで再開して、最後まで終える。
+   - 2回目の Ctrl+C で、終了コード 5 になる。
+   - 端末の再起動を模したロックでも、再開できる。
+4. DEF-022 の扱いを、RR の判断を見て決める。
+5. Task 21 の手順書を書く（headed と実行中の進み具合の行で、負荷を見ながら行う。`crawl.maxPages` と `crawl.maxRuntimeMs` はユーザーと決める。本来の監査対象のサイトの名前と設定のファイル名は、Git に載るファイルに書かない）。

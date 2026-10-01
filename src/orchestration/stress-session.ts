@@ -1,5 +1,6 @@
 import type { BrowserContext, Page } from 'playwright';
 import type { BrowserContextFactory } from '../browser/context-factory.js';
+import type { ResourceDeliveryRole } from '../browser/resource-delivery.js';
 import type { Viewport } from '../config/types.js';
 import type { PassiveStressSession, PassiveStressSessionFactory } from '../evidence/layout-collector.js';
 import type { SafetyLedger } from '../safety/safety-ledger.js';
@@ -9,6 +10,7 @@ import {
   passiveSessionOpenDeadlineAtMs,
   resolvePassiveSessionDeadlines,
   type PassiveSessionDeadlineOptions,
+  type PassiveSessionOpenOptions,
   type ResolvedPassiveSessionDeadlines,
 } from './passive-session-open.js';
 
@@ -35,6 +37,11 @@ export interface StressSessionOptions {
    * 作成の期限は、今から `sessionOpenTimeoutMs` 後と、この時刻の早い方である（設計書 4.2）。省略すると、上限を付けない。
    */
   readonly notAfterMs?: number | undefined;
+  /**
+   * セッションの Context の役割（サイトへの負荷の制御の設計書 4.7）。factory の `createPassiveContext` まで、そのまま渡す。
+   * 省略すると渡さず、factory の既定（`PRIMARY`。今の振る舞い）になる。Page Auditor の幅の走査は `REVISIT` を渡す。
+   */
+  readonly role?: ResourceDeliveryRole | undefined;
 }
 
 /**
@@ -67,10 +74,12 @@ export function createStressSessionFactory(
     throw new TypeError('A BrowserContextFactory is required for the stress sweep sessions');
   }
   const deadlines = resolvePassiveSessionDeadlines(options.deadlines);
-  const { notAfterMs } = options;
+  const { notAfterMs, role } = options;
   if (notAfterMs !== undefined && !Number.isFinite(notAfterMs)) {
     throw new RangeError('The stress sweep session deadline must be a finite time in milliseconds');
   }
+  // 作成の部品には、期限に加えて、Context の役割を渡す（省略した場合は渡さない）。
+  const openOptions: PassiveSessionOpenOptions = Object.freeze({ ...deadlines, role });
   const ledgers: SafetyLedger[] = [];
 
   const createSession = async (viewport: Viewport): Promise<PassiveStressSession> => {
@@ -78,7 +87,7 @@ export function createStressSessionFactory(
       factory,
       viewport,
       passiveSessionOpenDeadlineAtMs({ timeoutMs: deadlines.sessionOpenTimeoutMs, notAfterMs }),
-      deadlines,
+      openOptions,
     );
     // Guard が Context を閉じた場合も、エラーが持つ Ledger を含める（設計書 4.3、R14r の Important-1）。
     if (opened.ledger !== null) {

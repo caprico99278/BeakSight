@@ -438,3 +438,50 @@
   - `selectorFor`: 共通化しない（2026-09-25 設計者の決定）。別々の `page.evaluate` の関数の中にあり、関数の外の値を参照できない。共通化には、関数の文字列を注入するなどの仕組みが要り、得られるものより複雑さが大きい。layout の側の、番号を覚えておく形は、多くの要素を調べるための速さの工夫である。
   - 矩形の型: `InteractionBoundingBoxEvidence` を `RectangleEvidence` の型の別名にする（C18p）。スキーマの定義は変えない。
 - 状態: `selectorFor` は見送り。矩形の型は C18p で行う。
+
+## CC-034 未完了の理由（`IncompleteReason`）の値の確かめの重複（2026-10-01 R1 の報告で登録）
+
+- 場所と内容:
+  - `src/orchestration/skipped-page.ts:36-41`: 理由のコードが `INCOMPLETE_REASON_CODES` にあり、`detail` が文字列か null かを、その場で確かめている。
+  - `src/orchestration/crawl-frontier.ts` の `restoreEntry`（R1 で追加）: 保存から読んだ SKIPPED の理由を、同じ一覧で同じように確かめている。
+  - 再開の機能の R2（保存の読み込み）でも、同じ確かめが要る見込み。
+- 振る舞いの違い: なし（R1 の実装者の報告。設計者は未確認）。
+- 方針: `src/core/contracts.ts` の近く（理由の閉じた一覧の owner）に、`isIncompleteReason` のような確かめの関数を1つ置き、3か所で使う。R2 では、新しく同じ確かめを書かず、この候補を先に片付けるか、R2 の指示書で扱い方を決める。
+- 状態: 未着手（2026-09-23 のユーザー指示により、共通化はユーザーの明示の指示まで着手しない。ただし、新しいコードで同じ重複を増やさない。R2 の設計で扱いを決める）。
+
+## CC-035 `route.abort('blockedbyclient')` の失敗の理由の文字列の重複（2026-10-01 L4 の報告で登録）
+
+- 場所と内容:
+  - `src/safety/passive-request-guard.ts:441`: Guard が自分で起こした main frame の失敗の照合に、`'net::ERR_BLOCKED_BY_CLIENT'` を文字列のまま書いている。
+  - `src/browser/playwright-errors.ts`（L4 の Blocker の解消で追加）: `route.abort('blockedbyclient')` の失敗の理由の閉じた一覧（`net::ERR_BLOCKED_BY_CLIENT`、`net::ERR_BLOCKED_BY_CLIENT.Inspector`）。
+- 振る舞いの違い: Guard の照合は main frame の文書の要求だけが対象で、Chromium は文書の要求では `.Inspector` の付かない理由を報告するので、今の照合は合っている（L4 の実装者の確認。iframe の文書は未確認）。
+- 方針: Guard の照合も、`playwright-errors.ts` の一覧のうち文書の要求の値を参照する形にする。Guard の変更になるので、独立レビューの対象にする。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-036 ミリ秒と秒の換算の定数の重複（2026-10-01 R2 の報告で登録）
+
+- 場所: `src/presentation/format.ts:56` の `MILLISECONDS_PER_SECOND`（表示の層、export されていない）と、`src/orchestration/run-checkpoint.ts` の同じ名前の非公開の定数（`os.uptime()` の換算）。
+- 振る舞いの違い: なし（どちらも 1000）。
+- 方針: `src/core/` に時間の換算の定数を1つ置き、両方で使う。小さいので、ほかの共通化と合わせて行う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-037 テストの見本の保存の組み立ての重複（2026-10-01 R3 の報告で登録）
+
+- 場所: `tests/unit/run-checkpoint.test.ts:118` の `sampleRunState` と、`tests/unit/artifact-writer.test.ts` の `sampleCheckpoint`。frontier と採番器を動かして `createRunCheckpoint` に渡す処理が重なっている。
+- 振る舞いの違い: 未確認。
+- 方針: `tests/helpers/` に、保存の見本を作る補助を1つ置く。R4a の結合テストでも使う見込みがあるので、R4a で補助を作り、2か所を置き換えるかを R4a の指示書で決める。
+- 状態: 未着手。
+
+## CC-038 テストの「待たない関数」の重複（2026-10-01 RL-fix の報告で登録）
+
+- 場所: `NO_PACING_WAIT`（`async () => 0`）を、`tests/component/layout-collector.test.ts`、`tests/integration/site-metadata.test.ts`、`tests/integration/stress-session.test.ts` の3か所にそれぞれ定義している。
+- 振る舞いの違い: なし。
+- 方針: `tests/helpers/navigation-pacer.ts` に1つ置き、3か所で使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-039 版の表示名が HTML レポートの文言の中にある（2026-10-01 R5a の報告で登録）
+
+- 場所: `src/presentation/messages.ts` の `HTML_REPORT_TEXT.summary.toolVersion` と `HTML_REPORT_TEXT.summary.environment.playwrightVersion`。R5a で、CLI の「版が違うので再開できない」の文言の項目名にも使うようになった。
+- 問題: コメントでは「HTML レポートだけで使う」とされていて、置き場所が表示面に偏っている。
+- 方針: 複数の表示面で使う表示名を、`RUN_SUMMARY_TEXT` など、表示面に依らない置き場所に移す。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。

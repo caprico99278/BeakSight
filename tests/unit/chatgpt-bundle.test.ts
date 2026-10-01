@@ -15,6 +15,7 @@ import {
 import type { AuditRunResult, EvidenceId, EvidenceRecord, PageAuditResult } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
 import { CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES } from '../../src/core/limits.js';
+import { RUN_EXECUTION_END_REASON_CATALOG, type DisplaySpec } from '../../src/presentation/catalog.js';
 import {
   CHATGPT_BUNDLE_FILE_NAMES,
   CHATGPT_BUNDLE_OMISSION_REASONS,
@@ -29,8 +30,10 @@ import {
   auditRun,
   dom,
   edgeCaseAuditRun,
+  executionsDisplaySample,
   finding,
   idOf,
+  loadDisplaySample,
   metadata,
   page,
   screenshot,
@@ -444,6 +447,45 @@ describe('createChatGptBundle', () => {
         })),
       })))),
     );
+  });
+
+  // L6（サイトへの負荷の制御の設計書 4.5）: `summary.json` の `load` は、表示用モデルの要約の `load`（`run.json` の `load` の写し）と
+  // 同じ値である。バンドルの側で組み立て直したり、数え直したりしない。
+  it('puts the same site load as the view model summary (the copy of run.json load) in summary.json', async () => {
+    const base = edgeCaseAuditRun();
+    const result: AuditRunResult = { ...base, run: { ...base.run, load: loadDisplaySample() } };
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly load?: unknown };
+
+    expect(summary.load).toEqual(loadDisplaySample());
+    expect(summary.load).toEqual(JSON.parse(JSON.stringify(model.summary.load)));
+  });
+
+  // R6（中断した Run の再開の設計書 4.8 の「表示」）: `summary.json` の `executions` は、表示用モデルの要約の `executions`（実行の回数、
+  // 再開の回数、`run.json` の `executions` の写し）と同じ値である。バンドルの側で数え直さない。終わり方は、コードのまま入れる
+  // （日本語のラベルと説明は入れない）。
+  it('puts the same executions as the view model summary (the counts and the copy of run.json executions) in summary.json', async () => {
+    const base = edgeCaseAuditRun();
+    const result: AuditRunResult = { ...base, run: { ...base.run, executions: executionsDisplaySample() } };
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly executions?: unknown };
+
+    expect(summary.executions).toEqual({ count: 3, resumeCount: 2, items: executionsDisplaySample() });
+    expect(summary.executions).toEqual(JSON.parse(JSON.stringify(model.summary.executions)));
+    const text = decodeUtf8(entries['summary.json'] ?? new Uint8Array());
+    for (const spec of Object.values<DisplaySpec>(RUN_EXECUTION_END_REASON_CATALOG)) {
+      expect(text).not.toContain(spec.label);
+    }
+  });
+
+  it('puts one execution and no resume in summary.json for a Run that was not interrupted', async () => {
+    const result = auditRun();
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly executions?: unknown };
+
+    expect(summary.executions).toEqual({ count: 1, resumeCount: 0, items: JSON.parse(JSON.stringify(result.run.executions)) });
   });
 
   it('writes JSON with two-space indentation and a trailing LF, keeping codes and leaving out Japanese labels', async () => {

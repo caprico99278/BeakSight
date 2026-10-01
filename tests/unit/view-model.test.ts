@@ -29,10 +29,12 @@ import {
   PAGE_3,
   auditRun as buildAuditRun,
   dom,
+  executionsDisplaySample,
   finding,
   fixtureUrl as url,
   idOf,
   interaction,
+  loadDisplaySample,
   metadata,
   page,
   runStatusInput,
@@ -202,6 +204,39 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
     expect(model.summary.unverifiedInteractionCount).toBe(2);
     expect(model.summary.unverifiedInternalLinkCount).toBe(1);
     expect(model.summary.safetyInvariantViolationCount).toBe(0);
+  });
+
+  // L6（サイトへの負荷の制御の設計書 3.1 の7、4.5）: 負荷の記録は、`run.json` の `load` の値を写したまま持つ。
+  // 数え直したり計算したりしない。HTML、CLI、`summary.json` は、この1つの値を使う。
+  it('copies the site load record (run.json load) as it is, without counting or computing it', () => {
+    const result = auditRun({ load: loadDisplaySample() });
+    const model = buildReportViewModel(result);
+    expect(model.summary.load).toEqual(loadDisplaySample());
+    // 写しであって、入力の値そのものではない（入力を凍結しない）。
+    expect(model.summary.load).not.toBe(result.run.load);
+    expect(model.summary.load.requests).not.toBe(result.run.load.requests);
+    expect(Object.isFrozen(result.run.load)).toBe(false);
+    expect(Object.isFrozen(result.run.load.requests.allowedOrigins)).toBe(false);
+  });
+
+  // R6（中断した Run の再開の設計書 4.8 の「表示」）: 実行の記録は、`run.json` の `executions` の値の写し（実行の順のまま）と、
+  // 実行の回数と、再開の回数（最初の実行の後の実行の数）。回数は、ここで1回だけ数える。HTML、CLI、`summary.json` は、この値を使う。
+  it('copies the executions of run.json in their order, with the number of executions and of resumes (3 executions)', () => {
+    const result = auditRun({ executions: executionsDisplaySample() });
+    const model = buildReportViewModel(result);
+    expect(model.summary.executions).toEqual({ count: 3, resumeCount: 2, items: executionsDisplaySample() });
+    // 写しであって、入力の値そのものではない（入力を凍結しない）。
+    expect(model.summary.executions.items).not.toBe(result.run.executions);
+    expect(model.summary.executions.items[0]).not.toBe(result.run.executions[0]);
+    expect(Object.isFrozen(result.run.executions)).toBe(false);
+    expect(Object.isFrozen(result.run.executions[0])).toBe(false);
+  });
+
+  it('shows one execution and no resume for a Run that was not interrupted', () => {
+    const result = auditRun();
+    expect(result.run.executions).toHaveLength(1);
+    const model = buildReportViewModel(result);
+    expect(model.summary.executions).toEqual({ count: 1, resumeCount: 0, items: [...result.run.executions] });
   });
 });
 

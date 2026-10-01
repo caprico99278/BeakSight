@@ -12,6 +12,7 @@
     "runStatus",
     "startedAt",
     "finishedAt",
+    "executions",
     "discoveredPageCount",
     "auditedPageCount",
     "partialPageCount",
@@ -25,7 +26,8 @@
     "unverifiedInternalLinkCount",
     "retries",
     "crawlLimits",
-    "incompleteReasons"
+    "incompleteReasons",
+    "load"
   ],
   "properties": {
     "schemaVersion": { "const": "run-schema/1.0" },
@@ -42,6 +44,28 @@
     "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
     "startedAt": { "type": "string", "minLength": 1 },
     "finishedAt": { "type": ["string", "null"] },
+    "executions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["startedAt", "finishedAt", "endReason"],
+        "properties": {
+          "startedAt": { "$ref": "#/properties/startedAt" },
+          "finishedAt": { "type": "string", "minLength": 1 },
+          "endReason": {
+            "enum": [
+              "COMPLETED",
+              "STOPPED_BY_RUNTIME_LIMIT",
+              "STOPPED_BY_SIGNAL",
+              "STOPPED_BY_SAFETY_VIOLATION",
+              "INTERRUPTED_ABNORMALLY"
+            ]
+          }
+        }
+      }
+    },
     "discoveredPageCount": { "type": "integer", "minimum": 0 },
     "auditedPageCount": { "type": "integer", "minimum": 0 },
     "partialPageCount": { "type": "integer", "minimum": 0 },
@@ -114,6 +138,8 @@
             "overallPageTimeoutMs",
             "resourceSettlingTimeoutMs",
             "interactionTimeoutMs",
+            "minNavigationIntervalMs",
+            "maxInteractionsPerPage",
             "allowedQueryParameters"
           ],
           "properties": {
@@ -124,6 +150,8 @@
             "overallPageTimeoutMs": { "type": "integer", "minimum": 1 },
             "resourceSettlingTimeoutMs": { "type": "integer", "minimum": 1 },
             "interactionTimeoutMs": { "type": "integer", "minimum": 1001 },
+            "minNavigationIntervalMs": { "type": "integer", "minimum": 0 },
+            "maxInteractionsPerPage": { "type": "integer", "minimum": 1, "maximum": 100 },
             "allowedQueryParameters": { "type": "array", "items": { "type": "string" } }
           }
         },
@@ -238,7 +266,29 @@
         "maxRuntimeReached": { "type": "boolean" }
       }
     },
-    "incompleteReasons": { "type": "array", "items": { "$ref": "#/$defs/incompleteReason" } }
+    "incompleteReasons": { "type": "array", "items": { "$ref": "#/$defs/incompleteReason" } },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minNavigationIntervalMs", "maxInteractionsPerPage", "navigationCount", "pacingWaitMs", "requests"],
+      "properties": {
+        "minNavigationIntervalMs": { "type": "integer", "minimum": 0 },
+        "maxInteractionsPerPage": { "$ref": "#/properties/effectiveConfig/properties/crawl/properties/maxInteractionsPerPage" },
+        "navigationCount": { "type": "integer", "minimum": 0 },
+        "pacingWaitMs": { "type": "integer", "minimum": 0 },
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowedOrigins", "otherOrigins", "servedFromCache", "withheldOtherOrigins"],
+          "properties": {
+            "allowedOrigins": { "$ref": "#/$defs/loadOriginRequests" },
+            "otherOrigins": { "$ref": "#/$defs/loadOriginRequests" },
+            "servedFromCache": { "type": "integer", "minimum": 0 },
+            "withheldOtherOrigins": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
   },
   "$defs": {
     "incompleteReason": {
@@ -281,7 +331,9 @@
             "COLLECTOR_INCOMPLETE",
             "RULE_EVALUATION_FAILED",
             "PAGE_CRASHED",
-            "SAFETY_VIOLATION_ABORT"
+            "SAFETY_VIOLATION_ABORT",
+            "CHECKPOINT_WRITE_FAILED",
+            "RUN_INTERRUPTED"
           ]
         },
         "detail": { "type": ["string", "null"] }
@@ -296,6 +348,15 @@
         "partial": { "type": "integer", "minimum": 0 },
         "failed": { "type": "integer", "minimum": 0 },
         "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "loadOriginRequests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "peakPerMinute"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "peakPerMinute": { "type": "integer", "minimum": 0 }
       }
     },
     "viewportSize": {

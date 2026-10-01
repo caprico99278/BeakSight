@@ -139,7 +139,10 @@ export function captureCliOutput(): { readonly output: CliOutput; readonly text:
 
 /**
  * CLI の設定のファイル（`--config`）の内容。`origin` だけを許可し、`${origin}${startPath}` から始め、幅の走査はしない。
- * `extra` は、最上位のセクションを置き換える（例: `{ audit: { screenshots: false } }`）。
+ * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）は 0 にする（対象はループバックの fixture のサーバ。
+ * サイトへの負荷の制御の設計書 4.2）。
+ * `extra` は、最上位のセクションを置き換える（例: `{ audit: { screenshots: false } }`）。`crawl` を置き換える場合は、
+ * `minNavigationIntervalMs: 0` も書く。
  */
 export function cliTargetConfig(
   targetId: string,
@@ -150,6 +153,7 @@ export function cliTargetConfig(
   return {
     target: { id: targetId },
     site: { startUrl: `${origin}${startPath}`, allowedOrigins: [origin] },
+    crawl: { minNavigationIntervalMs: 0 },
     viewports: { stressWidths: [] },
     ...extra,
   };

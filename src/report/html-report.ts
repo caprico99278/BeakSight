@@ -17,7 +17,15 @@
  *   コード、日本語の説明、詳細を示す。詳細は、技術的な詳細としてそのまま（エスケープして）示す。
  * - 同じ入力からは、同じ文字列を返す（時刻や乱数を使わない）。ファイルは書かない（書くのは `ArtifactWriter.writePresentation`）。
  */
-import { INTERACTION_STATUSES, SEVERITIES, VIEWPORT_PROFILES, type EvidenceId, type PageId } from '../core/contracts.js';
+import {
+  INTERACTION_STATUSES,
+  SEVERITIES,
+  VIEWPORT_PROFILES,
+  type EvidenceId,
+  type PageId,
+  type RunExecution,
+  type RunLoad,
+} from '../core/contracts.js';
 import { INTERACTION_NOT_VERIFIABLE_KINDS } from '../core/evidence-types.js';
 import {
   EVIDENCE_TYPE_CATALOG,
@@ -26,6 +34,7 @@ import {
   REPORT_CATEGORY_SECTION_CATALOG,
   REPORT_SECTION_CATALOG,
   REPORT_SECTIONS,
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SAFETY_EVENT_KIND_CATALOG,
   SEVERITY_CATALOG,
@@ -33,14 +42,25 @@ import {
   SEVERITY_GROUPS,
   VIEWPORT_PROFILE_CATALOG,
   sortByDisplayOrder,
+  type DisplaySpec,
   type ReportSection,
 } from '../presentation/catalog.js';
-import { formatCount, formatDateTime, formatDuration, formatInteger, formatNotObserved } from '../presentation/format.js';
+import {
+  formatCount,
+  formatDateTime,
+  formatDuration,
+  formatElapsedTime,
+  formatInteger,
+  formatNotObserved,
+  formatRequestsWithPeak,
+  formatTimes,
+} from '../presentation/format.js';
 import {
   HTML_REPORT_TEXT,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
   earlierAttemptRecordText,
+  ordinalText,
   retryAttemptText,
   severityGroupTotalText,
   userAgentLabelText,
@@ -48,6 +68,7 @@ import {
 import {
   htmlText,
   joinHtml,
+  renderBadge,
   renderCode,
   renderDocument,
   renderEvidenceRef,
@@ -107,6 +128,8 @@ const SUMMARY_ANCHORS = Object.freeze({
   coverage: toAnchorId('summary', 'coverage'),
   counts: toAnchorId('summary', 'counts'),
   limits: toAnchorId('summary', 'limits'),
+  load: toAnchorId('summary', 'load'),
+  executions: toAnchorId('summary', 'executions'),
   reasons: toAnchorId('summary', 'reasons'),
   environment: toAnchorId('summary', 'environment'),
 });
@@ -228,6 +251,45 @@ const findingTableOrNone = (context: RenderContext, findings: readonly FindingVi
 
 const reachedText = (reached: boolean): string => (reached ? HTML_REPORT_TEXT.summary.reached : HTML_REPORT_TEXT.summary.notReached);
 
+/**
+ * 「サイトへの負荷」の小節の中身（サイトへの負荷の制御の設計書 3.1 の7、4.5）。値は、表示用モデルの `summary.load` をそのまま
+ * 書式にかける（数え直さない）。最小の間隔は、上限の「実行時間」と同じ `formatDuration`、待った時間の合計は、長くなるので時間・分・秒の
+ * `formatElapsedTime`（L7）、件数は `formatCount`、ページの読み込みの回数は `formatTimes`、要求の件数と1分あたりの最大は
+ * `formatRequestsWithPeak`（CLI と共通の組み立て。L7）で示す。
+ */
+const loadEntries = (load: RunLoad): readonly { readonly label: string; readonly value: string }[] => {
+  const labels = HTML_REPORT_TEXT.summary.load;
+  return [
+    { label: labels.minNavigationInterval, value: formatDuration(load.minNavigationIntervalMs) },
+    { label: labels.maxInteractionsPerPage, value: formatCount(load.maxInteractionsPerPage) },
+    { label: labels.navigationCount, value: formatTimes(load.navigationCount) },
+    { label: labels.pacingWait, value: formatElapsedTime(load.pacingWaitMs) },
+    { label: RUN_SUMMARY_TEXT.allowedOriginRequests, value: formatRequestsWithPeak(load.requests.allowedOrigins) },
+    { label: labels.otherOriginRequests, value: formatRequestsWithPeak(load.requests.otherOrigins) },
+    { label: labels.servedFromCache, value: formatCount(load.requests.servedFromCache) },
+    { label: labels.withheldOtherOrigins, value: formatCount(load.requests.withheldOtherOrigins) },
+  ];
+};
+
+/**
+ * 「実行の記録」の小節の、1つの実行の行（中断した Run の再開の設計書 4.8 の「表示」。R6）。欄は、何回目（一覧の中の位置）、開始の日時、
+ * 終了の日時（`formatDateTime`）、終わり方。終わり方は、表示カタログ（`RUN_EXECUTION_END_REASON_CATALOG`）のラベルのバッジ、コード、
+ * カタログの説明を、空白でつないで示す（Run の状態の、バッジと説明の示し方に合わせる）。終わり方の値そのものは書かない（カタログで引く）。
+ */
+const executionRow = (execution: RunExecution, index: number): SafeHtml<'row'> => {
+  const spec: DisplaySpec = RUN_EXECUTION_END_REASON_CATALOG[execution.endReason];
+  return renderTableRow([
+    ordinalText(index + 1),
+    formatDateTime(execution.startedAt),
+    formatDateTime(execution.finishedAt),
+    joinWithSpace([
+      renderBadge(spec, execution.endReason),
+      renderCode(execution.endReason),
+      spec.description === null ? null : htmlText(spec.description),
+    ]),
+  ]);
+};
+
 function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): readonly Fragment[] {
   const text = HTML_REPORT_TEXT.summary;
   const counts = summary.findingCounts;
@@ -302,6 +364,19 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         { label: text.unverifiedInteractions, value: formatCount(summary.unverifiedInteractionCount) },
         { label: text.unverifiedInternalLinks, value: formatCount(summary.unverifiedInternalLinkCount) },
       ]),
+    ]),
+    subsection(level, RUN_SUMMARY_TEXT.loadHeading, SUMMARY_ANCHORS.load, [
+      renderParagraph(text.loadNote),
+      renderKeyValueList(loadEntries(summary.load)),
+    ]),
+    // 実行の記録（R6）。回数は、表示用モデルの値をそのまま書式にかける（数え直さない）。CLI の結果の行の順と同じく、負荷の後に置く。
+    subsection(level, text.executionsHeading, SUMMARY_ANCHORS.executions, [
+      renderParagraph(text.executionsNote),
+      renderKeyValueList([
+        { label: text.executions.count, value: formatTimes(summary.executions.count) },
+        { label: text.executions.resumeCount, value: formatTimes(summary.executions.resumeCount) },
+      ]),
+      renderTable({ caption: null, columns: text.executionColumns, rows: summary.executions.items.map(executionRow) }),
     ]),
     subsection(level, RUN_SUMMARY_TEXT.reasonsHeading, SUMMARY_ANCHORS.reasons, [reasonTable(summary.incompleteReasons)]),
     subsection(level, text.environmentHeading, SUMMARY_ANCHORS.environment, [

@@ -9,10 +9,12 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { evaluateCrossPageRules } from '../../src/audit/cross-page-rules.js';
 import type { BrowserContextFactory, SafetyLedgerFactory } from '../../src/browser/context-factory.js';
+import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import {
   VIEWPORT_PROFILES,
+  type AuditRunResult,
   type EvidenceRecord,
   type Finding,
   type IncompleteReason,
@@ -20,6 +22,7 @@ import {
   type PageAuditResult,
   type PageId,
   type RunEnvironment,
+  type RunProgressReport,
   type ViewportAuditResult,
   type ViewportProfile,
 } from '../../src/core/contracts.js';
@@ -38,10 +41,12 @@ import { BROWSER_CLOSE_TIMEOUT_MS, CONTEXT_CLOSE_TIMEOUT_MS } from '../../src/co
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { derivePageAuditStatus, deriveRunStatus } from '../../src/core/status.js';
 import { classifyUrl } from '../../src/crawl/admission-policy.js';
+import { LOAD_PEAK_WINDOW_MS, type LoadMeter } from '../../src/crawl/load-meter.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import type { collectSiteMetadata, SiteMetadataResult } from '../../src/crawl/site-metadata.js';
 import type { collectRunEnvironment } from '../../src/orchestration/environment.js';
 import { createEvidenceRecord } from '../../src/orchestration/evidence-builder.js';
+import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import type { PageAuditAttempt, PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import {
   PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE,
@@ -59,9 +64,29 @@ import {
   RETRYABLE_NAVIGATION_FAILURE_DETAILS,
   RunCoordinator,
   RunDirectoryUnavailableError,
+  RunNotResumableError,
+  RunResumeUnavailableError,
+  type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
+  type RunCoordinatorResumeInput,
   type RunPageAuditor,
 } from '../../src/orchestration/run-coordinator.js';
+import {
+  checkRunCheckpointConsistency,
+  checkRunCheckpointPageConsistency,
+  createRunCheckpoint,
+  decideRunResumption,
+  RUN_CHECKPOINT_PAGE_SCHEMA_VERSION,
+  RUN_CHECKPOINT_SCHEMA_VERSION,
+  type RunCheckpoint,
+  type RunCheckpointInput,
+  type RunCheckpointPage,
+} from '../../src/orchestration/run-checkpoint.js';
+import { createRunIdFromTime } from '../../src/orchestration/run-id.js';
+import type {
+  RunCheckpointSessionStart,
+  RunCheckpointSessionStartOptions,
+} from '../../src/orchestration/run-checkpoint-session.js';
 import { safetyEventsEvidenceFromSnapshot, SafetyLedger, summarizePageSafety } from '../../src/safety/safety-ledger.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -117,6 +142,12 @@ interface FakePageSpec {
   readonly interactions?: readonly InteractionSpec[];
   /** Page の Ledger に記録する、不変条件の違反の数。 */
   readonly violations?: number;
+  /**
+   * Page の最後の Ledger（Mobile）に記録する、不変条件の違反の数（R4a2b-fix-round-1）。偽の Page Auditor は、ページの中の違反の確かめを
+   * Desktop の後にだけ行うので、この違反は、ページの中の確かめでは見つからない（本物の Page Auditor で、ページの最後の Context の Ledger に
+   * 記録された違反と同じ）。
+   */
+  readonly violationsAfterLastCheck?: number;
   /** Page の Ledger に記録する、遮断した POST の数。 */
   readonly blockedPosts?: number;
   /** Desktop のビューポートを PARTIAL にする。 */
@@ -131,6 +162,13 @@ interface FakePageSpec {
   readonly schemaInvalid?: boolean;
   /** 監査1回で進む時間。 */
   readonly durationMs?: number;
+  /** 監査の呼び出しのたびに（試行ごとに）、監査の途中で呼ぶ（R4b2。監査の途中で止める印を付けるため）。 */
+  readonly duringAudit?: () => void;
+  /**
+   * Desktop の `link` の Evidence の Link の一覧を、配列でない値にする（R4b2。`markFinished` の後、Link の取り出しで、巡回が予期しない
+   * 例外で止まる形を作るため。page のスキーマにも合わない）。
+   */
+  readonly malformedLinks?: boolean;
 }
 
 type FakeSite = Readonly<Record<string, FakePageSpec>>;
@@ -260,8 +298,15 @@ const recordBlockedPosts = (ledger: SafetyLedger, count: number, url: string): v
   }
 };
 
-/** 偽の Page Auditor。Evidence と Finding の ID は、注入された採番器で採番する（本物の Page Auditor と同じ）。 */
-function fakePageAuditorFactory(site: FakeSite, world: FakeWorld): (deps: PageAuditorDependencies) => RunPageAuditor {
+/**
+ * 偽の Page Auditor。Evidence と Finding の ID は、注入された採番器で採番する（本物の Page Auditor と同じ）。
+ * `paceNavigations` が真なら、本物と同じく、ビューポートごとに、注入された `navigationPacer` の待ちを呼ぶ（L2）。
+ */
+function fakePageAuditorFactory(
+  site: FakeSite,
+  world: FakeWorld,
+  paceNavigations = false,
+): (deps: PageAuditorDependencies) => RunPageAuditor {
   return (deps) => {
     world.createdAuditors.push(deps);
     const attemptsByUrl = new Map<string, number>();
@@ -269,6 +314,7 @@ function fakePageAuditorFactory(site: FakeSite, world: FakeWorld): (deps: PageAu
       audit: async (url, pageId, auditAttempt) => {
         world.auditCalls.push({ url, pageId, attempt: auditAttempt });
         const spec = site[pathOf(url)] ?? {};
+        spec.duringAudit?.();
         world.nowMs += spec.durationMs ?? DEFAULT_AUDIT_DURATION_MS;
         const attempt = attemptsByUrl.get(url) ?? 0;
         attemptsByUrl.set(url, attempt + 1);
@@ -289,13 +335,21 @@ function fakePageAuditorFactory(site: FakeSite, world: FakeWorld): (deps: PageAu
         const ledgers: SafetyLedger[] = [];
         const viewports = {} as Record<ViewportProfile, ViewportAuditResult>;
         for (const profile of VIEWPORT_PROFILES) {
+          if (paceNavigations) {
+            await deps.navigationPacer.beforeNavigation();
+          }
           const reasons: IncompleteReason[] = [];
           if (navigation.outcome === 'OK' && profile === 'desktop') {
             record(createEvidenceRecord({
               type: 'link',
               pageId,
               viewport: profile,
-              payload: { links: (spec.links ?? []).map((href) => linkEvidence(pageId, url, href)), omittedLinkCount: 0 },
+              payload: {
+                links: spec.malformedLinks === true
+                  ? null as unknown as LinkEvidence[]
+                  : (spec.links ?? []).map((href) => linkEvidence(pageId, url, href)),
+                omittedLinkCount: 0,
+              },
             }, context));
             for (const interaction of spec.interactions ?? []) {
               record(createEvidenceRecord({ type: 'interaction', pageId, viewport: profile, payload: interactionPayload(interaction) }, context));
@@ -312,6 +366,9 @@ function fakePageAuditorFactory(site: FakeSite, world: FakeWorld): (deps: PageAu
             recordViolations(ledger, spec.violations ?? 0, 'TEST_VIOLATION');
             recordBlockedPosts(ledger, spec.blockedPosts ?? 0, url);
             world.safetyChecks.push(deps.safetyViolationRecorded());
+          }
+          if (profile === 'mobile') {
+            recordViolations(ledger, spec.violationsAfterLastCheck ?? 0, 'TEST_VIOLATION');
           }
           ledgers.push(ledger);
           record(createEvidenceRecord({
@@ -416,6 +473,25 @@ interface HarnessOptions {
   /** Run Coordinator に注入する、Context と page の作成・終了の期限（RP18 の指摘2）。省略すると既定値。 */
   readonly deadlines?: PassiveSessionDeadlineOptions;
   /**
+   * 真なら、偽の metadata の取得と偽の Page Auditor が、本物と同じく、読み込みの前に間隔の待ちを呼ぶ（L2。サイトへの負荷の制御の
+   * 設計書 4.1）。metadata は robots.txt と sitemap.xml の前に1回ずつ、Page Auditor はビューポートごとに1回呼ぶ。
+   */
+  readonly paceNavigations?: boolean;
+  /** Run Coordinator に注入する、ページの読み込みの間隔の待ち（L2）。省略すると、本番の待ち。 */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Run Coordinator に注入する、進み具合の受け手（L7）。省略すると、渡さない。 */
+  readonly onProgress?: RunCoordinatorDependencies['onProgress'];
+  /** Run Coordinator に注入する、再開のための保存のセッション（R4a）。省略すると、渡さない。 */
+  readonly checkpointSession?: RunCoordinatorDependencies['checkpointSession'];
+  /** Run Coordinator に注入する、保存からの再開の入力（R4a2b）。省略すると、渡さない（新しい Run）。 */
+  readonly resumeFrom?: RunCoordinatorDependencies['resumeFrom'];
+  /** Run Coordinator に注入する時計（R4b1。保存の時刻を確かめるため）。省略すると、いつも `STARTED_AT` を返す。 */
+  readonly clock?: () => Date;
+  /** Run Coordinator に注入する止める印（R4b2。設計書 4.6.1）。省略すると、渡さない。 */
+  readonly stopSignal?: RunCoordinatorDependencies['stopSignal'];
+  /** 真なら、偽の環境の事実の収集が、予期しない例外を投げる（R4b2。`run()` が予期しない例外で reject する形を作るため）。 */
+  readonly environmentThrows?: boolean;
+  /**
    * 指定すると、偽の PREFLIGHT がこの Context の factory を返し、環境の事実は本物の `collectRunEnvironment` で集める
    * （RP18 の指摘1・2。作成か終了が終わらない偽の factory で、Run 全体が期限の中で確定することを確かめる）。
    */
@@ -478,6 +554,9 @@ function createHarness(options: HarnessOptions): Harness {
     return { ok: true, browser, factory: options.realEnvironmentFactory ?? ({} as BrowserContextFactory), safetyLedgers: [ledger] };
   });
   const environment = vi.fn(async (environmentOptions: Parameters<typeof collectRunEnvironment>[0]): Promise<RunEnvironment> => {
+    if (options.environmentThrows === true) {
+      throw new Error('fake environment failure');
+    }
     // 本番と同じく、Browser がある場合だけ、ビューポートごとに Context を作って User-Agent を読む。
     if (environmentOptions.browser !== null) {
       for (const profile of VIEWPORT_PROFILES) {
@@ -493,6 +572,15 @@ function createHarness(options: HarnessOptions): Harness {
     return ENVIRONMENT;
   });
   const metadata = vi.fn(async (metadataOptions: Parameters<typeof collectSiteMetadata>[0]): Promise<SiteMetadataResult> => {
+    if (options.paceNavigations === true) {
+      // robots.txt と sitemap.xml の、それぞれの読み込みの前。
+      for (let file = 0; file < 2; file += 1) {
+        if (metadataOptions.beforeNavigation === undefined) {
+          throw new Error('the site metadata must receive the navigation pacing');
+        }
+        await metadataOptions.beforeNavigation();
+      }
+    }
     const ledger = ledgerFrom(world);
     recordViolations(ledger, options.metadataViolations ?? 0, 'METADATA_VIOLATION');
     const context = { allocator: metadataOptions.allocator, clock: metadataOptions.clock };
@@ -540,10 +628,10 @@ function createHarness(options: HarnessOptions): Harness {
     config,
     launchBrowser,
     createSafetyLedger: () => new SafetyLedger(),
-    clock: () => STARTED_AT,
+    clock: options.clock ?? (() => STARTED_AT),
     now: () => world.nowMs,
     outputDirectory,
-    createPageAuditor: fakePageAuditorFactory(options.site, world),
+    createPageAuditor: fakePageAuditorFactory(options.site, world, options.paceNavigations === true),
     collectSiteMetadata: metadata as unknown as typeof collectSiteMetadata,
     runPreflight: preflight as unknown as typeof runPreflight,
     ...(options.realEnvironmentFactory === undefined
@@ -552,6 +640,11 @@ function createHarness(options: HarnessOptions): Harness {
     readToolVersion: async () => '0.1.0-test',
     ...(options.browserCloseTimeoutMs === undefined ? {} : { browserCloseTimeoutMs: options.browserCloseTimeoutMs }),
     ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
+    ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    ...(options.checkpointSession === undefined ? {} : { checkpointSession: options.checkpointSession }),
+    ...(options.resumeFrom === undefined ? {} : { resumeFrom: options.resumeFrom }),
+    ...(options.stopSignal === undefined ? {} : { stopSignal: options.stopSignal }),
   };
   return {
     coordinator: new RunCoordinator(dependencies),
@@ -1569,5 +1662,2020 @@ describe('RunCoordinator: the Run Status input kept on the confirmed Run (design
     const result = await createHarness({ site: starSite(1) }).coordinator.run();
     expect(Object.keys(result.run)).not.toContain('statusInput');
     expect(Object.keys(result).sort()).toEqual(['findings', 'pages', 'run', 'statusInput']);
+  });
+});
+
+// L2（サイトへの負荷の制御の設計書 4.1）: Run Coordinator は、Run の初めにページの読み込みの間隔を守る部品（`NavigationPacer`）を
+// 1つだけ作り、robots.txt と sitemap.xml の取得と、Page Auditor に、同じものを渡す。間隔は設定の `crawl.minNavigationIntervalMs`、
+// 時刻は注入した `now`、待ちは注入した `sleep`（省略すると本番の待ち）である。
+describe('RunCoordinator: one navigation pacer for the whole Run (load control design 4.1)', () => {
+  const INTERVAL_MS = 5_000;
+
+  it('paces the metadata and every page navigation with one pacer made from the setting, the clock and the injected sleep', async () => {
+    const sleeps: number[] = [];
+    let harness: Harness | undefined;
+    harness = createHarness({
+      site: { [START_PATH]: {} },
+      config: { crawl: { minNavigationIntervalMs: INTERVAL_MS } },
+      paceNavigations: true,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (harness !== undefined) {
+          harness.world.nowMs += ms;
+        }
+      },
+    });
+    const startedAtMs = harness.world.nowMs;
+    const result = await harness.coordinator.run();
+
+    // robots.txt（待たない）、sitemap.xml（間隔の全体）、Desktop（監査の 10ms を除いた残り）、Mobile（間隔の全体）。
+    // Desktop の待ちが sitemap.xml の開始から数えた残りなので、metadata と Page Auditor は、同じ pacer を使っている。
+    expect(sleeps).toEqual([INTERVAL_MS, INTERVAL_MS - DEFAULT_AUDIT_DURATION_MS, INTERVAL_MS]);
+    expect(harness.world.createdAuditors).toHaveLength(1);
+    expect(harness.world.createdAuditors[0]?.navigationPacer.snapshot()).toEqual({
+      navigationCount: 4,
+      totalWaitMs: 3 * INTERVAL_MS - DEFAULT_AUDIT_DURATION_MS,
+      lastNavigationStartedAtMs: startedAtMs + 3 * INTERVAL_MS,
+    });
+    expect(result.run.runStatus).toBe('COMPLETE');
+    await expectValidRun(result);
+  });
+
+  it('does not sleep when the interval setting is 0', async () => {
+    const sleeps: number[] = [];
+    const harness = createHarness({
+      site: { [START_PATH]: {} },
+      paceNavigations: true,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    await harness.coordinator.run();
+
+    expect(sleeps).toEqual([]);
+    expect(harness.world.createdAuditors[0]?.navigationPacer.snapshot()).toMatchObject({ navigationCount: 4, totalWaitMs: 0 });
+  });
+
+  it('rejects an injected sleep that is not a function with TypeError', () => {
+    expect(() => createHarness({ site: { [START_PATH]: {} }, sleep: 'sleep' as unknown as (ms: number) => Promise<void> }))
+      .toThrow(TypeError);
+  });
+
+  it('rejects the Run with RangeError before PREFLIGHT when the interval setting is not a non-negative safe integer', async () => {
+    const harness = createHarness({ site: { [START_PATH]: {} }, config: { crawl: { minNavigationIntervalMs: -1 } } });
+
+    await expect(harness.coordinator.run()).rejects.toThrow(RangeError);
+    expect(harness.preflight).not.toHaveBeenCalled();
+    expect(harness.launchBrowser).not.toHaveBeenCalled();
+    expect(existsSync(harness.outputDirectory)).toBe(false);
+  });
+});
+
+// L4（サイトへの負荷の制御の設計書 4.5）: Run Coordinator は、Run の初めに要求の実績を数える部品（`LoadMeter`）を1つだけ作り、
+// PREFLIGHT に `contextFactoryOptions: { loadMeter }` で渡す（PREFLIGHT が、それを factory に渡す）。Run の結果の `load` は、
+// Browser を閉じた後に、設定、pacer、meter の値から組み立てる。Run が早く終わった場合も、`load` は必ず入れる。
+describe('RunCoordinator: the load record of the Run (load control design 4.5)', () => {
+  const INTERVAL_MS = 5_000;
+  /** 許可 Origin の外の URL（偽の要求の終わりの事象に使う）。 */
+  const OTHER_URL = 'http://127.0.0.2:4173/tag.js';
+
+  /** PREFLIGHT が受け取った `contextFactoryOptions` の meter。 */
+  const meterOf = (options: Parameters<typeof runPreflight>[0]): LoadMeter => {
+    const loadMeter = options.contextFactoryOptions?.loadMeter;
+    if (loadMeter === undefined) {
+      throw new Error('PREFLIGHT did not receive the load meter');
+    }
+    return loadMeter;
+  };
+
+  /**
+   * 偽の PREFLIGHT を包み、受け取った meter を `received` に記録し、PREFLIGHT の Context の要求の終わりの事象を `onPreflight` で
+   * 起こしてから、元の偽の PREFLIGHT を呼ぶ。
+   */
+  const wrapPreflight = (
+    harness: Harness,
+    onPreflight: (loadMeter: LoadMeter) => void,
+  ): { readonly received: Parameters<typeof runPreflight>[0][] } => {
+    const original = harness.preflight.getMockImplementation() as (options: Parameters<typeof runPreflight>[0]) => Promise<PreflightResult>;
+    const received: Parameters<typeof runPreflight>[0][] = [];
+    harness.preflight.mockImplementation(async (options: Parameters<typeof runPreflight>[0]) => {
+      received.push(options);
+      onPreflight(meterOf(options));
+      return await original(options);
+    });
+    return { received };
+  };
+
+  it('passes one load meter to PREFLIGHT and records load from the setting, the pacer and the meter after the Browser is closed', async () => {
+    let harness: Harness | undefined;
+    harness = createHarness({
+      site: { [START_PATH]: {} },
+      config: { crawl: { minNavigationIntervalMs: INTERVAL_MS } },
+      paceNavigations: true,
+      sleep: async (ms) => {
+        if (harness !== undefined) {
+          harness.world.nowMs += ms;
+        }
+      },
+    });
+    const current = harness;
+    const { received } = wrapPreflight(current, (loadMeter) => {
+      loadMeter.recordRequestFinished({}, `${ORIGIN}/preflight-a.css`);
+      loadMeter.recordRequestFinished({}, `${ORIGIN}/preflight-b.js`);
+      loadMeter.recordRequestFailed({}, OTHER_URL, 'net::ERR_CONNECTION_REFUSED');
+    });
+    // Browser を閉じる間に届いた事象も、記録に入る（Browser を閉じた後の値で組み立てる）。1分より後に届けて、meter の時刻が
+    // 注入した `now` であることも確かめる（直近の1分から、先の2件が外れる）。
+    current.browserClose.mockImplementation(async () => {
+      current.world.nowMs += LOAD_PEAK_WINDOW_MS;
+      meterOf(received[0]!).recordRequestFinished({}, `${ORIGIN}/late.png`);
+    });
+
+    const result = await current.coordinator.run();
+
+    expect(received).toHaveLength(1);
+    // L5b: Run 全体のキャッシュも、同じ経路で渡す（`run cache` の describe で確かめる）。
+    expect(Object.keys(received[0]?.contextFactoryOptions ?? {})).toEqual(['loadMeter', 'resourceCache']);
+    const pacer = current.world.createdAuditors[0]?.navigationPacer.snapshot();
+    expect(result.run.load).toEqual({
+      minNavigationIntervalMs: INTERVAL_MS,
+      maxInteractionsPerPage: current.config.crawl.maxInteractionsPerPage,
+      navigationCount: pacer?.navigationCount,
+      pacingWaitMs: pacer?.totalWaitMs,
+      requests: {
+        allowedOrigins: { count: 3, peakPerMinute: 2 },
+        otherOrigins: { count: 1, peakPerMinute: 1 },
+        servedFromCache: 0,
+        withheldOtherOrigins: 0,
+      },
+    });
+    expect(result.run.load.navigationCount).toBe(4);
+    expect(result.run.load.pacingWaitMs).toBeGreaterThan(0);
+    expect(Object.isFrozen(result.run.load.requests.allowedOrigins)).toBe(true);
+    await expectValidRun(result);
+  });
+
+  it('records load with the requests counted so far when PREFLIGHT fails', async () => {
+    const harness = createHarness({ site: { [START_PATH]: {} }, preflightOk: false });
+    wrapPreflight(harness, (loadMeter) => {
+      loadMeter.recordRequestFinished({}, `${ORIGIN}/preflight.css`);
+    });
+
+    const result = await harness.coordinator.run();
+
+    expect(result.run.runStatus).toBe('FAILED');
+    expect(result.run.load).toEqual({
+      minNavigationIntervalMs: harness.config.crawl.minNavigationIntervalMs,
+      maxInteractionsPerPage: harness.config.crawl.maxInteractionsPerPage,
+      navigationCount: 0,
+      pacingWaitMs: 0,
+      requests: {
+        allowedOrigins: { count: 1, peakPerMinute: 1 },
+        otherOrigins: { count: 0, peakPerMinute: 0 },
+        servedFromCache: 0,
+        withheldOtherOrigins: 0,
+      },
+    });
+    await expectValidRun(result);
+  });
+
+  // L5b（サイトへの負荷の制御の設計書 4.6）: Run 全体のキャッシュも、Run の初めに1つだけ作り、PREFLIGHT に `contextFactoryOptions`
+  // で渡す（PREFLIGHT が factory に渡す）。Run ごとに新しく、空から始める（ファイルには書かない）。
+  it('creates one empty Run cache per Run and passes it to PREFLIGHT with the load meter (L5b)', async () => {
+    const caches: unknown[] = [];
+    for (let run = 0; run < 2; run += 1) {
+      const harness = createHarness({ site: { [START_PATH]: {} } });
+      const { received } = wrapPreflight(harness, () => undefined);
+
+      await harness.coordinator.run();
+
+      expect(received).toHaveLength(1);
+      const resourceCache = received[0]?.contextFactoryOptions?.resourceCache;
+      expect(resourceCache).toBeInstanceOf(ResourceCache);
+      expect(resourceCache?.stats()).toEqual({ entryCount: 0, totalBytes: 0 });
+      caches.push(resourceCache);
+    }
+    expect(caches[0]).not.toBe(caches[1]);
+  });
+
+  it('records an empty load when the run directory cannot be created (PREFLIGHT does not run)', async () => {
+    const outputDirectory = join(workDirectory, 'load-output-is-a-file');
+    await writeFile(outputDirectory, 'not a directory', 'utf8');
+    const harness = createHarness({ site: { [START_PATH]: {} }, outputDirectory });
+
+    const error = await harness.coordinator.run().then(
+      () => new Error('the Run was expected to reject with RunDirectoryUnavailableError'),
+      (rejection: unknown) => rejection,
+    );
+
+    expect(error).toBeInstanceOf(RunDirectoryUnavailableError);
+    const { run } = (error as RunDirectoryUnavailableError).result;
+    expect(harness.preflight).not.toHaveBeenCalled();
+    expect(run.load).toEqual({
+      minNavigationIntervalMs: harness.config.crawl.minNavigationIntervalMs,
+      maxInteractionsPerPage: harness.config.crawl.maxInteractionsPerPage,
+      navigationCount: 0,
+      pacingWaitMs: 0,
+      requests: {
+        allowedOrigins: { count: 0, peakPerMinute: 0 },
+        otherOrigins: { count: 0, peakPerMinute: 0 },
+        servedFromCache: 0,
+        withheldOtherOrigins: 0,
+      },
+    });
+    await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
+  });
+});
+
+// L7（サイトへの負荷の制御の設計書 4.8）: Run Coordinator は、ページの監査が1つ終わるたびに（`frontier.markFinished` と Link からの
+// 発見の後に）、進み具合の事実を、注入された受け手（`onProgress`）に渡す。受け手がなければ何もしない。受け手の例外は、Run を止めず、
+// Run の理由にもしない（表示の失敗で監査を止めないため）。
+describe('RunCoordinator: the progress report after every audited page (load control design 4.8)', () => {
+  const INTERVAL_MS = 5_000;
+  /** 許可 Origin の外の URL（偽の要求の終わりの事象に使う）。 */
+  const OTHER_URL = 'http://127.0.0.2:4173/tag.js';
+  /** 3つのページ（開始のページが、2つのページにリンクする）。2つ目に監査するページは、監査に1分かかる。 */
+  const progressSite: FakeSite = {
+    [START_PATH]: { links: ['/a.html', '/b.html'] },
+    '/a.html': { durationMs: LOAD_PEAK_WINDOW_MS },
+    '/b.html': {},
+  };
+
+  /** PREFLIGHT の Context の要求の終わりの事象を、PREFLIGHT が受け取った meter に起こす（許可 Origin への2件と、外への1件）。 */
+  const recordPreflightRequests = (harness: Harness): void => {
+    const original = harness.preflight.getMockImplementation() as (options: Parameters<typeof runPreflight>[0]) => Promise<PreflightResult>;
+    harness.preflight.mockImplementation(async (options: Parameters<typeof runPreflight>[0]) => {
+      const loadMeter = options.contextFactoryOptions?.loadMeter;
+      if (loadMeter === undefined) {
+        throw new Error('PREFLIGHT did not receive the load meter');
+      }
+      loadMeter.recordRequestFinished({}, `${ORIGIN}/preflight-a.css`);
+      loadMeter.recordRequestFinished({}, `${ORIGIN}/preflight-b.js`);
+      loadMeter.recordRequestFinished({}, OTHER_URL);
+      return await original(options);
+    });
+  };
+
+  const expectDeeplyFrozen = (value: unknown, path: string): void => {
+    if (typeof value !== 'object' || value === null) {
+      return;
+    }
+    expect(Object.isFrozen(value), `${path} is frozen`).toBe(true);
+    for (const [key, child] of Object.entries(value)) {
+      expectDeeplyFrozen(child, `${path}.${key}`);
+    }
+  };
+
+  it('calls the receiver once after every audited page, after its links are discovered, with the facts of that moment', async () => {
+    const reports: RunProgressReport[] = [];
+    const auditCallsAtReport: number[] = [];
+    let harness: Harness | undefined;
+    harness = createHarness({
+      site: progressSite,
+      onProgress: (report) => {
+        reports.push(report);
+        auditCallsAtReport.push(harness?.world.auditCalls.length ?? -1);
+      },
+    });
+    recordPreflightRequests(harness);
+
+    await harness.coordinator.run();
+
+    // 次のページの監査を始める前に、毎回呼ぶ。
+    expect(auditCallsAtReport).toEqual([1, 2, 3]);
+    const requests = {
+      allowedOrigins: { count: 2, peakPerMinute: 2 },
+      otherOrigins: { count: 1, peakPerMinute: 1 },
+      servedFromCache: 0,
+      withheldOtherOrigins: 0,
+    };
+    // 1つ目のページの Link からの発見の後なので、発見したページは、最初の報告から3つ。偽の監査は、ページの読み込みの待ちを呼ばない。
+    const common = { pagesDiscovered: 3, maxPages: harness.config.crawl.maxPages, navigationCount: 0, pacingWaitMs: 0, requests };
+    expect(reports).toEqual([
+      // PREFLIGHT の要求は、1つ目のページの後（10ms 後）には、直近の1分に入る。
+      { ...common, pagesFinished: 1, elapsedMs: DEFAULT_AUDIT_DURATION_MS, recentPerMinute: { allowedOrigins: 2, otherOrigins: 1 } },
+      // 2つ目のページの監査に1分かかったので、直近の1分から外れる（1分あたりの最大は変わらない）。
+      {
+        ...common,
+        pagesFinished: 2,
+        elapsedMs: DEFAULT_AUDIT_DURATION_MS + LOAD_PEAK_WINDOW_MS,
+        recentPerMinute: { allowedOrigins: 0, otherOrigins: 0 },
+      },
+      {
+        ...common,
+        pagesFinished: 3,
+        elapsedMs: 2 * DEFAULT_AUDIT_DURATION_MS + LOAD_PEAK_WINDOW_MS,
+        recentPerMinute: { allowedOrigins: 0, otherOrigins: 0 },
+      },
+    ]);
+    for (const [index, report] of reports.entries()) {
+      expectDeeplyFrozen(report, `report ${String(index)}`);
+      expect(JSON.parse(JSON.stringify(report))).toEqual(report);
+    }
+  });
+
+  it('takes the navigation count and the pacing wait from the pacer of the Run, and the elapsed time from the injected clock', async () => {
+    const reports: RunProgressReport[] = [];
+    const pacerAtReport: { readonly navigationCount: number; readonly pacingWaitMs: number }[] = [];
+    const nowAtReport: number[] = [];
+    let harness: Harness | undefined;
+    harness = createHarness({
+      site: progressSite,
+      config: { crawl: { minNavigationIntervalMs: INTERVAL_MS } },
+      paceNavigations: true,
+      sleep: async (ms) => {
+        if (harness !== undefined) {
+          harness.world.nowMs += ms;
+        }
+      },
+      onProgress: (report) => {
+        reports.push(report);
+        const pacer = harness?.world.createdAuditors[0]?.navigationPacer.snapshot();
+        pacerAtReport.push({ navigationCount: pacer?.navigationCount ?? -1, pacingWaitMs: pacer?.totalWaitMs ?? -1 });
+        nowAtReport.push(harness?.world.nowMs ?? -1);
+      },
+    });
+    const startedAtMs = harness.world.nowMs;
+
+    await harness.coordinator.run();
+
+    // robots.txt と sitemap.xml の2回と、ページごとに Desktop と Mobile の2回。
+    expect(reports.map(({ navigationCount }) => navigationCount)).toEqual([4, 6, 8]);
+    expect(reports.map(({ navigationCount, pacingWaitMs }) => ({ navigationCount, pacingWaitMs }))).toEqual(pacerAtReport);
+    expect(reports.every(({ pacingWaitMs }) => pacingWaitMs > 0)).toBe(true);
+    expect(reports.map(({ elapsedMs }) => elapsedMs)).toEqual(nowAtReport.map((nowMs) => nowMs - startedAtMs));
+  });
+
+  it('does not call the receiver for pages that were not audited (limits) or when PREFLIGHT fails', async () => {
+    const limited: RunProgressReport[] = [];
+    await createHarness({ site: progressSite, config: { crawl: { maxPages: 2 } }, onProgress: (report) => limited.push(report) })
+      .coordinator.run();
+    expect(limited.map(({ pagesFinished, pagesDiscovered, maxPages }) => ({ pagesFinished, pagesDiscovered, maxPages }))).toEqual([
+      { pagesFinished: 1, pagesDiscovered: 3, maxPages: 2 },
+      { pagesFinished: 2, pagesDiscovered: 3, maxPages: 2 },
+    ]);
+
+    const failed: RunProgressReport[] = [];
+    const result = await createHarness({ site: progressSite, preflightOk: false, onProgress: (report) => failed.push(report) })
+      .coordinator.run();
+    expect(result.run.runStatus).toBe('FAILED');
+    expect(failed).toEqual([]);
+  });
+
+  it('keeps the Run going without a new reason when the receiver throws: the Run is the same as without a receiver', async () => {
+    const withoutReceiver = await createHarness({ site: progressSite }).coordinator.run();
+    let calls = 0;
+    const harness = createHarness({
+      site: progressSite,
+      onProgress: () => {
+        calls += 1;
+        throw new Error('progress display failed');
+      },
+    });
+
+    const result = await harness.coordinator.run();
+
+    expect(calls).toBe(3);
+    expect(harness.world.auditCalls).toHaveLength(3);
+    expect(result).toEqual(withoutReceiver);
+    expect(result.statusInput.unhandledFailures).toBe(0);
+    await expectValidRun(result);
+  });
+
+  it('keeps the Run going when the receiver returns a rejected promise', async () => {
+    const withoutReceiver = await createHarness({ site: progressSite }).coordinator.run();
+    let calls = 0;
+    const harness = createHarness({
+      site: progressSite,
+      onProgress: async () => {
+        calls += 1;
+        throw new Error('asynchronous progress display failed');
+      },
+    });
+
+    const result = await harness.coordinator.run();
+
+    expect(calls).toBe(3);
+    expect(result).toEqual(withoutReceiver);
+  });
+
+  it('rejects a receiver that is not a function with TypeError', () => {
+    expect(() => createHarness({ site: progressSite, onProgress: 'print' as unknown as RunCoordinatorDependencies['onProgress'] }))
+      .toThrow(TypeError);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// R4a（中断した Run の再開の設計書 4.1、4.3、4.3.1）: 新しい Run の間の、再開のための保存（チェックポイント）の時期と中身と、
+// 保存に失敗した場合の扱い。偽の保存のセッションで、Run Coordinator が頼んだ保存を記録する。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 偽の保存のセッションが受けた依頼の1件（`auditCalls` は、その時点で偽の Page Auditor が呼ばれた回数）。 */
+type CheckpointCall =
+  | {
+    readonly kind: 'start';
+    readonly runDirectory: string;
+    readonly mode: string;
+    readonly auditCalls: number;
+    /** 依頼を受けた時点で、Run のディレクトリがあったか。 */
+    readonly directoryExisted: boolean;
+  }
+  | { readonly kind: 'page'; readonly page: RunCheckpointPage; readonly auditCalls: number }
+  | { readonly kind: 'state'; readonly state: RunCheckpoint; readonly auditCalls: number };
+
+interface CheckpointRecorderOptions {
+  /** 始める依頼の結果。省略すると `{ ok: true }`。 */
+  readonly start?: () => Promise<RunCheckpointSessionStart>;
+  /** この回数目（1から）のページの保存を、失敗させる。 */
+  readonly failPageAt?: number;
+  /** この回数目（1から）の状態の保存を、失敗させる。 */
+  readonly failStateAt?: number;
+}
+
+const PAGE_CHECKPOINT_FAILURE_MESSAGE = 'page checkpoint write failed';
+const STATE_CHECKPOINT_FAILURE_MESSAGE = 'state checkpoint write failed';
+
+/** 偽の保存のセッション。受けた依頼を、受けた順に `calls` に記録する。`watch` で、記録に使うハーネスを結びつける。 */
+function checkpointRecorder(options: CheckpointRecorderOptions = {}) {
+  const calls: CheckpointCall[] = [];
+  let world: FakeWorld | null = null;
+  const auditCalls = (): number => world?.auditCalls.length ?? -1;
+  let pageSaves = 0;
+  let stateSaves = 0;
+  const session = {
+    start: vi.fn(async (runDirectory: string, startOptions: RunCheckpointSessionStartOptions): Promise<RunCheckpointSessionStart> => {
+      calls.push({ kind: 'start', runDirectory, mode: startOptions.mode, auditCalls: auditCalls(), directoryExisted: existsSync(runDirectory) });
+      return options.start === undefined ? { ok: true } : await options.start();
+    }),
+    savePage: vi.fn(async (page: RunCheckpointPage): Promise<void> => {
+      pageSaves += 1;
+      calls.push({ kind: 'page', page, auditCalls: auditCalls() });
+      if (pageSaves === options.failPageAt) {
+        throw new Error(PAGE_CHECKPOINT_FAILURE_MESSAGE);
+      }
+    }),
+    saveState: vi.fn(async (state: RunCheckpoint): Promise<void> => {
+      stateSaves += 1;
+      calls.push({ kind: 'state', state, auditCalls: auditCalls() });
+      if (stateSaves === options.failStateAt) {
+        throw new Error(STATE_CHECKPOINT_FAILURE_MESSAGE);
+      }
+    }),
+    // 最後の状態の書き出しと、やめることは、CLI が呼ぶ（Run Coordinator は呼ばない。設計書 4.3.1）。
+    finish: vi.fn(async (): Promise<void> => undefined),
+    abandon: vi.fn(async (): Promise<void> => undefined),
+  };
+  return {
+    session,
+    calls,
+    watch: (harness: Harness): void => {
+      world = harness.world;
+    },
+    states: (): RunCheckpoint[] => calls.flatMap((call) => (call.kind === 'state' ? [call.state] : [])),
+    pages: (): RunCheckpointPage[] => calls.flatMap((call) => (call.kind === 'page' ? [call.page] : [])),
+  };
+}
+
+/** 偽の保存のセッションを渡したハーネス。 */
+function checkpointHarness(
+  options: Omit<HarnessOptions, 'checkpointSession'>,
+  recorderOptions: CheckpointRecorderOptions = {},
+): { readonly harness: Harness; readonly recorder: ReturnType<typeof checkpointRecorder> } {
+  const recorder = checkpointRecorder(recorderOptions);
+  const harness = createHarness({ ...options, checkpointSession: recorder.session });
+  recorder.watch(harness);
+  return { harness, recorder };
+}
+
+/** 3つのページ（開始のページが、2つのページにリンクする）。 */
+const CHECKPOINT_SITE: FakeSite = {
+  [START_PATH]: { links: ['/a.html', '/b.html'] },
+  '/a.html': {},
+  '/b.html': {},
+};
+
+const CHECKPOINT_WRITE_FAILED_SKIP: IncompleteReason = { code: 'CHECKPOINT_WRITE_FAILED', detail: null };
+
+const pageStates = (result: Awaited<ReturnType<RunCoordinator['run']>>) =>
+  result.pages.map((page) => [pathOf(page.pageUrl), page.status, page.incompleteReasons] as const);
+
+describe('RunCoordinator: checkpoints of a new Run (resumable run design 4.3, R4a)', () => {
+  it('starts the session with NEW_RUN right after the run directory is created, before PREFLIGHT', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE });
+
+    const result = await harness.coordinator.run();
+
+    expect(recorder.session.start).toHaveBeenCalledOnce();
+    expect(recorder.calls[0]).toEqual({
+      kind: 'start',
+      runDirectory: runArtifactDirectory(harness.outputDirectory, result.run.runId),
+      mode: 'NEW_RUN',
+      auditCalls: 0,
+      directoryExisted: true,
+    });
+    expect(recorder.session.start.mock.invocationCallOrder[0]).toBeLessThan(harness.preflight.mock.invocationCallOrder[0] ?? 0);
+  });
+
+  it('saves the state once after robots.txt and sitemap.xml, and then the page and the state after every audited page', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE });
+
+    const result = await harness.coordinator.run();
+
+    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls])).toEqual([
+      ['start', 0],
+      ['state', 0],
+      ['page', 1],
+      ['state', 1],
+      ['page', 2],
+      ['state', 2],
+      ['page', 3],
+      ['state', 3],
+    ]);
+    expect(harness.metadata.mock.invocationCallOrder[0]).toBeLessThan(recorder.session.saveState.mock.invocationCallOrder[0] ?? 0);
+    const pageIds = result.pages.map(({ pageId }) => pageId);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(pageIds);
+    const states = recorder.states();
+    expect(states.map(({ completedPageIds }) => completedPageIds)).toEqual([[], pageIds.slice(0, 1), pageIds.slice(0, 2), pageIds]);
+    expect(states.map(({ progress }) => progress.pagesStarted)).toEqual([0, 1, 2, 3]);
+    // 同じ状態の保存の中で、`markFinished` と `completedPageIds` が合い、Link から発見した URL が待ち行列にある。
+    expect(states.map(({ frontier }) => frontier.entries.map(({ state }) => state))).toEqual([
+      ['QUEUED'],
+      ['AUDITED', 'QUEUED', 'QUEUED'],
+      ['AUDITED', 'AUDITED', 'QUEUED'],
+      ['AUDITED', 'AUDITED', 'AUDITED'],
+    ]);
+    // Run Coordinator は、最後の状態を書かず、セッションを終えもやめもしない（設計書 4.3.1）。
+    expect(states.every(({ state }) => state === 'IN_PROGRESS')).toBe(true);
+    expect(recorder.session.finish).not.toHaveBeenCalled();
+    expect(recorder.session.abandon).not.toHaveBeenCalled();
+  });
+
+  it('saves values that match the checkpoint schemas and the R2 consistency checks', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE });
+    await harness.coordinator.run();
+
+    expect(recorder.calls.length).toBeGreaterThan(1);
+    let following: RunCheckpoint | undefined;
+    for (const call of [...recorder.calls].reverse()) {
+      if (call.kind === 'state') {
+        await expect(validateArtifact('checkpoint', JSON.parse(JSON.stringify(call.state)))).resolves.toEqual({ ok: true });
+        expect(checkRunCheckpointConsistency(call.state)).toEqual({ ok: true });
+        following = call.state;
+      } else if (call.kind === 'page') {
+        await expect(validateArtifact('checkpoint-page', JSON.parse(JSON.stringify(call.page)))).resolves.toEqual({ ok: true });
+        // ページの保存は、その後の状態の保存に載る。
+        expect(following === undefined ? null : checkRunCheckpointPageConsistency(call.page, following)).toEqual({ ok: true });
+      }
+    }
+  });
+
+  it('keeps the identity, the execution, the setting, the progress, robots.txt and sitemap.xml, and the load of the Run', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE });
+
+    const result = await harness.coordinator.run();
+
+    const states = recorder.states();
+    expect(states).toHaveLength(4);
+    const last = states.at(-1) as RunCheckpoint;
+    const startedAt = STARTED_AT.toISOString();
+    const metadataRecords = result.pages[0]?.evidence.filter(({ type }) => type === 'metadata');
+    expect(metadataRecords).toHaveLength(2);
+    for (const state of states) {
+      expect(state).toMatchObject({
+        schemaVersion: RUN_CHECKPOINT_SCHEMA_VERSION,
+        state: 'IN_PROGRESS',
+        runId: result.run.runId,
+        toolVersion: '0.1.0-test',
+        startedAt,
+        executions: [{ startedAt, finishedAt: null, endReason: null, environment: ENVIRONMENT }],
+        siteMetadata: { records: metadataRecords },
+      });
+      expect(state.effectiveConfig).toEqual(harness.config);
+    }
+    expect(last.progress).toEqual({
+      reasons: [],
+      retries: [],
+      safetyViolationDetected: false,
+      stoppedBySafetyViolation: false,
+      unhandledFailures: 0,
+      guardEnabled: true,
+      preflightFailed: false,
+      pagesStarted: 3,
+    });
+    // 採番器は、保存の時点の次の連番（Evidence は、出力のすべての Evidence の次）。
+    const evidenceCount = result.pages.reduce((count, page) => count + page.evidence.length, 0);
+    expect(last.allocator).toEqual({ nextPageSequence: 4, nextEvidenceSequence: evidenceCount + 1, nextFindingSequence: 1 });
+    expect(last.load).toEqual({
+      pacer: { navigationCount: result.run.load.navigationCount, totalWaitMs: result.run.load.pacingWaitMs, lastNavigationStartedAtMs: null },
+      meter: result.run.load.requests,
+    });
+  });
+
+  it('puts the Ledgers outside the pages in the state, and the Ledgers made in each page (with its retry) in its page checkpoint', async () => {
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html'] },
+      '/a.html': { attempts: [{ outcome: 'TIMEOUT' }] },
+      '/b.html': { blockedPosts: 2 },
+    };
+    const { harness, recorder } = checkpointHarness({ site });
+
+    await harness.coordinator.run();
+
+    // ページの外: PREFLIGHT の1つ、環境の事実の2つ（Desktop と Mobile）、robots.txt と sitemap.xml の取得の1つ。
+    expect(recorder.states().map(({ safetyLedgerSnapshots }) => safetyLedgerSnapshots.length)).toEqual([4, 4, 4, 4]);
+    // ページの中: 1回の試行で、Desktop と Mobile の2つ。/a.html は再試行したので、2回の試行の4つ。
+    const pages = recorder.pages();
+    expect(pages.map(({ safetyLedgerSnapshots }) => safetyLedgerSnapshots.length)).toEqual([2, 4, 2]);
+    expect(pages[2]?.safetyLedgerSnapshots.map(({ blockedRequests }) => blockedRequests.length)).toEqual([2, 0]);
+    // 再試行したページは、最終の試行の結果と、再試行の前の試行の Evidence を持つ。
+    const [, firstAttempt, finalAttempt] = harness.world.auditOutcomes;
+    expect(pages[1]).toEqual({
+      schemaVersion: RUN_CHECKPOINT_PAGE_SCHEMA_VERSION,
+      pageId: finalAttempt?.result.pageId,
+      url: finalAttempt?.result.pageUrl,
+      result: finalAttempt?.result,
+      retryEvidence: firstAttempt?.result.evidence,
+      safetyLedgerSnapshots: expect.any(Array),
+    });
+    expect(recorder.states()[2]?.progress.retries).toHaveLength(1);
+  });
+
+  it('puts the time of the injected clock when each state value is made into savedAt (R4b1, resumable run design 4.1)', async () => {
+    const MINUTE_MS = 60_000;
+    let world: FakeWorld | undefined;
+    // 時計は、それまでに監査を始めたページの数だけ、1分ずつ進む（実行の開始の時刻のままでは、保存の時刻にならない）。
+    const clock = (): Date => new Date(STARTED_AT.getTime() + (world?.auditCalls.length ?? 0) * MINUTE_MS);
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, clock });
+    world = harness.world;
+
+    await harness.coordinator.run();
+
+    const states = recorder.states();
+    expect(states.map(({ savedAt }) => savedAt)).toEqual(
+      [0, 1, 2, 3].map((pages) => new Date(STARTED_AT.getTime() + pages * MINUTE_MS).toISOString()),
+    );
+    expect(states.every(({ executions }) => executions[0].startedAt === STARTED_AT.toISOString())).toBe(true);
+  });
+
+  it('returns the same Run as without a session when every save succeeds', async () => {
+    const withoutSession = await createHarness({ site: CHECKPOINT_SITE }).coordinator.run();
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE });
+
+    const result = await harness.coordinator.run();
+
+    expect(recorder.calls).toHaveLength(8);
+    expect(result).toEqual(withoutSession);
+  });
+
+  it('saves the state with no metadata and the violation flags when a violation stopped the metadata collection', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, environmentViolations: 1 });
+
+    const result = await harness.coordinator.run();
+
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    const [state] = recorder.states();
+    expect(state?.siteMetadata).toBeNull();
+    expect(state?.progress).toMatchObject({ safetyViolationDetected: true, stoppedBySafetyViolation: true });
+    expect(state === undefined ? null : decideRunResumption(state)).toBe('FINALIZE_ONLY');
+  });
+});
+
+describe('RunCoordinator: a checkpoint that cannot be written (resumable run design 4.3, R4a)', () => {
+  it('starts no new page after a page checkpoint fails, skips the rest with CHECKPOINT_WRITE_FAILED, and is PARTIAL', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE }, { failPageAt: 1 });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toHaveLength(1);
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state', 'page']);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+      ['/b.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([{ code: 'CHECKPOINT_WRITE_FAILED', detail: PAGE_CHECKPOINT_FAILURE_MESSAGE }]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(deriveRunStatus(result.statusInput)).toBe('PARTIAL');
+    expect(result.run.crawlLimits).toEqual({ maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false });
+    expect(recorder.session.finish).not.toHaveBeenCalled();
+    expect(recorder.session.abandon).not.toHaveBeenCalled();
+    await expectValidRun(result);
+  });
+
+  it('starts no page when the state after robots.txt and sitemap.xml cannot be saved', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE }, { failStateAt: 1 });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]]]);
+    expect(result.run.incompleteReasons).toEqual([{ code: 'CHECKPOINT_WRITE_FAILED', detail: STATE_CHECKPOINT_FAILURE_MESSAGE }]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    await expectValidRun(result);
+  });
+
+  it('starts no new page when the state after a page cannot be saved', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE }, { failStateAt: 2 });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toHaveLength(1);
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state', 'page', 'state']);
+    expect(pageStates(result).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'SKIPPED'],
+      ['/b.html', 'SKIPPED'],
+    ]);
+    expect(codesOf(result.run.incompleteReasons)).toEqual(['CHECKPOINT_WRITE_FAILED']);
+    expect(result.run.runStatus).toBe('PARTIAL');
+  });
+
+  it('adds the Run reason and is PARTIAL even when no URL is left after the failed save', async () => {
+    const { harness } = checkpointHarness({ site: { [START_PATH]: {} } }, { failPageAt: 1 });
+
+    const result = await harness.coordinator.run();
+
+    expect(pageStates(result)).toEqual([[START_PATH, 'AUDITED', []]]);
+    expect(codesOf(result.run.incompleteReasons)).toEqual(['CHECKPOINT_WRITE_FAILED']);
+    expect(result.run.runStatus).toBe('PARTIAL');
+  });
+
+  it('checks a violation before the failed save, and the failed save before the page limit', async () => {
+    const violation = await checkpointHarness(
+      { site: { ...CHECKPOINT_SITE, [START_PATH]: { links: ['/a.html', '/b.html'], violations: 1 } } },
+      { failPageAt: 1 },
+    ).harness.coordinator.run();
+    expect(pageStates(violation).slice(1).map(([, , reasons]) => codesOf(reasons))).toEqual([
+      ['SAFETY_VIOLATION_ABORT'],
+      ['SAFETY_VIOLATION_ABORT'],
+    ]);
+    expect(codesOf(violation.run.incompleteReasons)).toEqual(['SAFETY_VIOLATION_ABORT', 'CHECKPOINT_WRITE_FAILED']);
+    expect(violation.run.runStatus).toBe('ABORTED_BY_SAFETY');
+
+    const limited = await checkpointHarness({ site: CHECKPOINT_SITE, config: { crawl: { maxPages: 1 } } }, { failPageAt: 1 })
+      .harness.coordinator.run();
+    expect(pageStates(limited).slice(1).map(([, , reasons]) => reasons)).toEqual([
+      [CHECKPOINT_WRITE_FAILED_SKIP],
+      [CHECKPOINT_WRITE_FAILED_SKIP],
+    ]);
+    expect(limited.run.crawlLimits.maxPagesReached).toBe(false);
+    expect(codesOf(limited.run.incompleteReasons)).toEqual(['CHECKPOINT_WRITE_FAILED']);
+  });
+
+  it.each([
+    ['the lock already exists', async (): Promise<RunCheckpointSessionStart> => ({ ok: false, existingLock: null }), 'checkpoint lock already exists'],
+    ['the lock cannot be written', async (): Promise<RunCheckpointSessionStart> => Promise.reject(new Error('lock write failed')), 'lock write failed'],
+  ] as const)('finishes FAILED without PREFLIGHT, the browser, or the site when the session cannot start because %s', async (_name, start, detail) => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE }, { start });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.preflight).not.toHaveBeenCalled();
+    expect(harness.launchBrowser).not.toHaveBeenCalled();
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(harness.world.createdAuditors).toEqual([]);
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start']);
+    // Run のディレクトリを作れなかった場合と同じく、Run Status の入力 `preflightFailed` で `FAILED` になる（ARCH05）。
+    expect(result.run.runStatus).toBe('FAILED');
+    expect(result.statusInput.preflightFailed).toBe(true);
+    expect(deriveRunStatus(result.statusInput)).toBe('FAILED');
+    expect(result.run.incompleteReasons).toEqual([{ code: 'CHECKPOINT_WRITE_FAILED', detail }]);
+    expect(result.run.safety.guardEnabled).toBe(false);
+    expect(result.pages).toEqual([]);
+    expect(harness.environment).toHaveBeenCalledWith(expect.objectContaining({ browser: null, factory: null }));
+    await expectValidRun(result);
+  });
+
+  it('rejects a session that does not have the start, savePage and saveState functions with TypeError', () => {
+    for (const session of ['session', { start: async () => ({ ok: true }) }, { ...checkpointRecorder().session, saveState: undefined }]) {
+      expect(() => createHarness({
+        site: CHECKPOINT_SITE,
+        checkpointSession: session as unknown as RunCoordinatorDependencies['checkpointSession'],
+      })).toThrow(TypeError);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// R4a2b（中断した Run の再開の設計書 3.1、3.2、4.1、4.4、4.9）: 保存からの再開。偽の保存のセッションで記録した新しい Run の保存
+// （状態の保存と、ページの保存）を再開の入力（`resumeFrom`）にして、新しい Run Coordinator（新しいプロセスを模す）で続きを監査する。
+// 記録した Run は、すべての保存に成功した、中断しなかった Run でもある（保存のない Run と同じ結果になる。R4a）。偽の Page Auditor、
+// 偽の PREFLIGHT、偽の環境の事実は、同じ入力に同じ結果を返し、時計も同じなので、再開した Run の結果は、中断しなかった Run と全く同じになる。
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Run の結果から、実行の記録（`run.executions`）を除いたもの（R4b2。中断した Run の再開の設計書 4.8）。再開した Run は、前の回の実行の
+ * 記録も持つので、中断しなかった Run と比べるときは、実行の記録を除いて比べる（実行の記録は、R4b2 のテストで別に確かめる）。
+ */
+function withoutExecutions(result: AuditRunResult): unknown {
+  const { executions: _executions, ...run } = result.run;
+  return { ...result, run };
+}
+
+/** 偽の保存のセッションが、再開の始め方（`RESUME`）に返す結果（始められた。後始末で消したものはない）。 */
+const RESUME_STARTED = async (): Promise<RunCheckpointSessionStart> => ({ ok: true, removedPaths: [] });
+
+const SAFETY_VIOLATION_ABORT_SKIP: IncompleteReason = { code: 'SAFETY_VIOLATION_ABORT', detail: null };
+
+/** 偽の保存のセッションを渡した新しい Run を行い、その結果と、記録した保存を返す（再開の入力の元で、中断しなかった Run でもある）。 */
+async function recordedRun(options: Omit<HarnessOptions, 'checkpointSession' | 'resumeFrom'>) {
+  const { harness, recorder } = checkpointHarness(options);
+  const result = await harness.coordinator.run();
+  return { harness, recorder, result };
+}
+
+type RecordedRun = Awaited<ReturnType<typeof recordedRun>>;
+
+/** 記録した Run の、終わったページがちょうど `completed` の最初の状態の保存。 */
+function savedStateAfter(recorded: RecordedRun, completed: number): RunCheckpoint {
+  const state = recorded.recorder.states().find(({ completedPageIds }) => completedPageIds.length === completed);
+  if (state === undefined) {
+    throw new Error(`no checkpoint state after ${String(completed)} page(s)`);
+  }
+  return state;
+}
+
+/**
+ * 記録した Run の、`completed` ページを終えた時点の保存から、再開の入力を作る（その時点でプロセスが終わったことを模す）。ページの保存は、
+ * その状態の保存に載ったもの（終わった順）。`changes` を渡すと、状態の保存のその項目を置き換える（`createRunCheckpoint` で作り直す）。
+ */
+function resumeInputAfter(
+  recorded: RecordedRun,
+  completed: number,
+  changes: Partial<RunCheckpointInput> = {},
+): RunCoordinatorResumeInput {
+  const { schemaVersion: _schemaVersion, ...input } = savedStateAfter(recorded, completed);
+  return resumeInputFrom(recorded, createRunCheckpoint({ ...input, ...changes }));
+}
+
+/**
+ * 記録した Run の Run のディレクトリと、状態の保存 `checkpoint` から、再開の入力を作る。ページの保存は、`checkpoint` に載ったもの（終わった順）を、
+ * 記録した Run のページの保存から取る（R4b2 では、最後の状態の保存 `checkpointConclusion()` の値を渡す）。
+ */
+function resumeInputFrom(recorded: RecordedRun, checkpoint: RunCheckpoint): RunCoordinatorResumeInput {
+  const pages = recorded.recorder.pages();
+  return {
+    runDirectory: runArtifactDirectory(recorded.harness.outputDirectory, recorded.result.run.runId),
+    checkpoint,
+    pages: checkpoint.completedPageIds.map((pageId) => {
+      const page = pages.find((saved) => saved.pageId === pageId);
+      if (page === undefined) {
+        throw new Error(`no page checkpoint of ${pageId}`);
+      }
+      return page;
+    }),
+  };
+}
+
+/** 再開の入力と、偽の保存のセッション（始め方の結果は `start`。既定は、始められる）を渡したハーネス。 */
+function resumedHarness(
+  options: Omit<HarnessOptions, 'checkpointSession' | 'resumeFrom'>,
+  resumeFrom: RunCoordinatorResumeInput,
+  start: () => Promise<RunCheckpointSessionStart> = RESUME_STARTED,
+): ReturnType<typeof checkpointHarness> {
+  return checkpointHarness({ ...options, resumeFrom }, { start });
+}
+
+describe('RunCoordinator: resuming a Run from its checkpoint (resumable run design 3.1, 3.2, 4.1, R4a2b)', () => {
+  it('audits only the rest with the same IDs, does not collect robots.txt and sitemap.xml again, and returns the same Run as without the interruption', async () => {
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html'], finding: true },
+      '/a.html': { links: ['/c.html'], finding: true },
+      '/b.html': { blockedPosts: 1, finding: true },
+      '/c.html': {},
+    };
+    const options = { site, sitemapUrls: [START_PATH, '/a.html', '/orphan.html'] };
+    const uninterrupted = await recordedRun(options);
+    const resumeFrom = resumeInputAfter(uninterrupted, 2);
+    const { harness, recorder } = resumedHarness(options, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    // 終わったページ（開始のページと /a.html）は監査し直さず、残りのページを、中断しなかった Run と同じページの ID で監査する。
+    const audited = (calls: readonly AuditCall[]): (string | PageId)[][] => calls.map(({ url, pageId }) => [pathOf(url), pageId]);
+    expect(audited(harness.world.auditCalls)).toEqual(audited(uninterrupted.harness.world.auditCalls.slice(2)));
+    // robots.txt と sitemap.xml は取得し直さない。sitemap は、保存の Evidence から作り直す（sitemap の Finding も同じになる）。
+    expect(harness.metadata).not.toHaveBeenCalled();
+    const [, sitemapRecord] = uninterrupted.result.pages[0]?.evidence.filter(({ type }) => type === 'metadata') ?? [];
+    expect(sitemapRecord).toBeDefined();
+    expect(uninterrupted.result.findings.filter(({ evidenceRefs }) =>
+      sitemapRecord !== undefined && evidenceRefs.includes(sitemapRecord.evidenceId)).length).toBeGreaterThan(0);
+    // ページ、Evidence、Finding の ID、Run Status、Safety の集計（再開の前のページの遮断を含む）、Run Status の入力が、中断しなかった
+    // Run と同じ（時計も同じなので、時刻も同じになる）。
+    expect(result.run.safety.blockedActions.requests).toBe(1);
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+    await expectValidRun(result);
+    // 保存のセッションは、前の回の Run のディレクトリで、再開の始め方（終わったページの ID）で始める。PREFLIGHT の前である。
+    expect(recorder.calls[0]).toEqual({ kind: 'start', runDirectory: resumeFrom.runDirectory, mode: 'RESUME', auditCalls: 0, directoryExisted: true });
+    expect(recorder.session.start).toHaveBeenCalledWith(resumeFrom.runDirectory, {
+      mode: 'RESUME',
+      completedPageIds: resumeFrom.checkpoint.completedPageIds,
+    });
+    expect(recorder.session.start.mock.invocationCallOrder[0]).toBeLessThan(harness.preflight.mock.invocationCallOrder[0] ?? 0);
+    // Run のディレクトリは作らない（前の回のものを使う）。PREFLIGHT は、そのディレクトリで行う。
+    expect(existsSync(harness.outputDirectory)).toBe(false);
+    expect(harness.preflight).toHaveBeenCalledWith(expect.objectContaining({ outputDirectory: resumeFrom.runDirectory }));
+  });
+
+  it('keeps saving from the saved progress: the earlier pages, the Ledgers outside the pages, the executions and the start of the Run stay', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const resumeFrom = resumeInputAfter(uninterrupted, 1);
+    const saved = resumeFrom.checkpoint;
+    const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom);
+
+    await harness.coordinator.run();
+
+    const pageIds = uninterrupted.result.pages.map(({ pageId }) => pageId);
+    // 再開の後も、robots.txt と sitemap.xml の段階の後に状態の保存を1回行い、各ページの後にページと状態を保存する。
+    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls])).toEqual([
+      ['start', 0],
+      ['state', 0],
+      ['page', 1],
+      ['state', 1],
+      ['page', 2],
+      ['state', 2],
+    ]);
+    // ページの保存は、この実行で終えたページだけ。終わったページの ID は、前の回の分に続ける（消えない）。
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(pageIds.slice(1));
+    const states = recorder.states();
+    expect(states.map(({ completedPageIds }) => completedPageIds)).toEqual([pageIds.slice(0, 1), pageIds.slice(0, 2), pageIds]);
+    expect(states.map(({ progress }) => progress.pagesStarted)).toEqual([1, 2, 3]);
+    for (const state of states) {
+      // Run の ID、版、最初の実行の開始の時刻は、保存のまま。実行の記録は、保存のもの（前の回の途中で終わった実行は、R4b1 で
+      // `INTERRUPTED_ABNORMALLY` に閉じる。設計書 4.8）に、この実行の分を1件加える。
+      expect(state).toMatchObject({ state: 'IN_PROGRESS', runId: saved.runId, toolVersion: saved.toolVersion, startedAt: saved.startedAt });
+      expect(state.executions).toEqual([
+        ...saved.executions.map((execution) => ({ ...execution, finishedAt: saved.savedAt, endReason: 'INTERRUPTED_ABNORMALLY' })),
+        { startedAt: STARTED_AT.toISOString(), finishedAt: null, endReason: null, environment: ENVIRONMENT },
+      ]);
+      // ページの外の Ledger: 前の回の4つ（PREFLIGHT、環境の事実の2つ、robots.txt と sitemap.xml）に続けて、この実行の3つ（PREFLIGHT、
+      // 環境の事実の2つ）。
+      expect(state.safetyLedgerSnapshots.slice(0, saved.safetyLedgerSnapshots.length)).toEqual(saved.safetyLedgerSnapshots);
+      expect(state.safetyLedgerSnapshots).toHaveLength(saved.safetyLedgerSnapshots.length + 3);
+      expect(state.siteMetadata).toEqual(saved.siteMetadata);
+      await expect(validateArtifact('checkpoint', JSON.parse(JSON.stringify(state)))).resolves.toEqual({ ok: true });
+      expect(checkRunCheckpointConsistency(state)).toEqual({ ok: true });
+    }
+    // 最後の状態の保存の巡回の記録、採番器、進み具合は、中断しなかった Run の最後のものと同じ。
+    const last = states.at(-1);
+    const uninterruptedLast = uninterrupted.recorder.states().at(-1);
+    expect(last?.frontier).toEqual(uninterruptedLast?.frontier);
+    expect(last?.allocator).toEqual(uninterruptedLast?.allocator);
+    expect(last?.progress).toEqual(uninterruptedLast?.progress);
+  });
+
+  it('uses the Run ID, the start and the environment of the first execution, and counts the runtime limit from the start of this execution', async () => {
+    const options = {
+      site: { ...CHECKPOINT_SITE, [START_PATH]: { links: ['/a.html', '/b.html'], durationMs: 1_000 }, '/a.html': { durationMs: 1_000 } },
+      config: { crawl: { maxRuntimeMs: 1_500 } },
+    };
+    const uninterrupted = await recordedRun(options);
+    // 中断しなかった Run は、/b.html の前に実行時間の上限に達する。
+    expect(pageStates(uninterrupted.result).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'AUDITED'],
+      ['/b.html', 'SKIPPED'],
+    ]);
+    const firstStartedAt = '2026-09-20T00:00:00.000Z';
+    const firstEnvironment: RunEnvironment = { ...ENVIRONMENT, nodeVersion: 'v24.0.0-first' };
+    const saved = savedStateAfter(uninterrupted, 1);
+    const resumeFrom = resumeInputAfter(uninterrupted, 1, {
+      runId: createRunIdFromTime(new Date(firstStartedAt)),
+      startedAt: firstStartedAt,
+      executions: [{ ...saved.executions[0], startedAt: firstStartedAt, environment: firstEnvironment }],
+    });
+    const { harness } = resumedHarness(options, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(result.run.runId).toBe(resumeFrom.checkpoint.runId);
+    expect(result.run.startedAt).toBe(firstStartedAt);
+    expect(result.run.finishedAt).toBe(STARTED_AT.toISOString());
+    // `run.json` の環境は、最初の実行のもの（設計書 4.8）。
+    expect(result.run.environment).toEqual(firstEnvironment);
+    // この実行の開始から数えるので、/a.html と /b.html を監査できる。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/a.html', '/b.html']);
+    expect(result.run.runStatus).toBe('COMPLETE');
+  });
+
+  it('restores the Run reasons, the page limit and the failure count from the saved progress', async () => {
+    const options = { site: CHECKPOINT_SITE, metadataPageCloseFails: true, config: { crawl: { maxPages: 2 } } };
+    const uninterrupted = await recordedRun(options);
+    expect(codesOf(uninterrupted.result.run.incompleteReasons)).toEqual(['MAX_PAGES_REACHED', 'UNHANDLED_FAILURE']);
+    const { harness } = resumedHarness({ ...options, metadataPageCloseFails: false }, resumeInputAfter(uninterrupted, 1));
+
+    const result = await harness.coordinator.run();
+
+    // 監査を始めたページの数は、保存の値から続ける（ページ数の上限で /b.html を始めない）。metadata の閉じる処理の失敗の理由は、
+    // 保存の理由から引き継ぐ（1件だけ）。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/a.html']);
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+
+    // 未処理の失敗の件数も、保存の値から続ける（中断しなかった Run は COMPLETE だが、前の回の未処理の失敗があれば PARTIAL になる）。
+    const complete = await recordedRun({ site: CHECKPOINT_SITE });
+    expect(complete.result.run.runStatus).toBe('COMPLETE');
+    const saved = savedStateAfter(complete, 1);
+    const failed = await resumedHarness(
+      { site: CHECKPOINT_SITE },
+      resumeInputAfter(complete, 1, { progress: { ...saved.progress, unhandledFailures: 1 } }),
+    ).harness.coordinator.run();
+    expect(failed.statusInput.unhandledFailures).toBe(1);
+    expect(failed.run.runStatus).toBe(deriveRunStatus(failed.statusInput));
+    expect(failed.run.runStatus).toBe('PARTIAL');
+  });
+
+  it('keeps the earlier attempt of a retried page and its retry record from the saved page', async () => {
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html'] },
+      '/a.html': { attempts: [{ outcome: 'TIMEOUT' }] },
+      '/b.html': {},
+    };
+    const uninterrupted = await recordedRun({ site });
+    const { harness } = resumedHarness({ site }, resumeInputAfter(uninterrupted, 2));
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html']);
+    expect(result.run.retries).toHaveLength(1);
+    expect(result.pages[1]?.evidence.map(({ evidenceId }) => evidenceId)).toEqual(
+      expect.arrayContaining([...(result.run.retries[0]?.evidenceIds ?? [])]),
+    );
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+  });
+
+  it.each([
+    ['its runtime limit', 'MAX_RUNTIME_REACHED', 'STOPPED_BY_RUNTIME_LIMIT'],
+    ['a stop signal (R4b1)', 'RUN_INTERRUPTED', 'STOPPED_BY_SIGNAL'],
+  ] as const)('audits again the URLs that a stopped execution skipped at %s (RESUME_REQUEUE_SKIP_REASON_CODES)', async (_name, code, endReason) => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const saved = savedStateAfter(uninterrupted, 1);
+    const frontier = {
+      entries: saved.frontier.entries.map((entry) => (entry.state === 'QUEUED'
+        ? { ...entry, state: 'SKIPPED' as const, skipReason: { code, detail: null } }
+        : entry)),
+    };
+    // STOPPED の保存の最後の実行の記録は、終わり方と終わりの時刻を持つ（R4b1 の整合。設計書 4.8）。
+    const stoppedExecution = { ...saved.executions[0], finishedAt: saved.savedAt, endReason };
+    const resumeFrom = resumeInputAfter(uninterrupted, 1, { state: 'STOPPED', frontier, executions: [stoppedExecution] });
+    expect(checkRunCheckpointConsistency(resumeFrom.checkpoint)).toEqual({ ok: true });
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe('RESUME');
+    const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/a.html', '/b.html']);
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+    // 終わり方を持つ実行の記録は、閉じ直さない（そのまま残し、この実行の分を加える）。
+    for (const state of recorder.states()) {
+      expect(state.executions).toEqual([
+        stoppedExecution,
+        { startedAt: STARTED_AT.toISOString(), finishedAt: null, endReason: null, environment: ENVIRONMENT },
+      ]);
+      expect(checkRunCheckpointConsistency(state)).toEqual({ ok: true });
+    }
+  });
+
+  it.each([
+    ['the first execution was interrupted', 1],
+    ['an earlier execution is already closed and the second one was interrupted', 2],
+  ] as const)(
+    'closes the execution that the previous process left unfinished, with INTERRUPTED_ABNORMALLY at the time of its last save, when %s (R4b1)',
+    async (_name, executionCount) => {
+      const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+      const saved = savedStateAfter(uninterrupted, 1);
+      const [first] = saved.executions;
+      // 前の回の最後の保存の時刻（この実行の開始の時刻とは違う時刻にして、どちらを使ったかを区別する）。
+      const previousSavedAt = '2026-09-30T23:30:00.000Z';
+      const closedEarlier = { ...first, startedAt: '2026-09-30T22:00:00.000Z', finishedAt: '2026-09-30T22:10:00.000Z', endReason: 'INTERRUPTED_ABNORMALLY' as const };
+      const unfinished = { ...first, startedAt: '2026-09-30T23:00:00.000Z' };
+      const executions: RunCheckpoint['executions'] = executionCount === 1 ? [unfinished] : [closedEarlier, unfinished];
+      const resumeFrom = resumeInputAfter(uninterrupted, 1, { savedAt: previousSavedAt, executions });
+      expect(resumeFrom.checkpoint.state).toBe('IN_PROGRESS');
+      expect(checkRunCheckpointConsistency(resumeFrom.checkpoint)).toEqual({ ok: true });
+      const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom);
+
+      await harness.coordinator.run();
+
+      const states = recorder.states();
+      expect(states).toHaveLength(3);
+      for (const state of states) {
+        expect(state.executions).toEqual([
+          ...(executionCount === 1 ? [] : [closedEarlier]),
+          { ...unfinished, finishedAt: previousSavedAt, endReason: 'INTERRUPTED_ABNORMALLY' },
+          { startedAt: STARTED_AT.toISOString(), finishedAt: null, endReason: null, environment: ENVIRONMENT },
+        ]);
+        // この実行の保存の時刻は、この実行の時計の値。
+        expect(state.savedAt).toBe(STARTED_AT.toISOString());
+        await expect(validateArtifact('checkpoint', JSON.parse(JSON.stringify(state)))).resolves.toEqual({ ok: true });
+        expect(checkRunCheckpointConsistency(state)).toEqual({ ok: true });
+      }
+      // 再開の入力の保存は変えない。
+      expect(resumeFrom.checkpoint.executions.at(-1)).toEqual(unfinished);
+    },
+  );
+
+  it('counts the pages finished before the interruption in the progress report', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const reports: RunProgressReport[] = [];
+    const { harness } = resumedHarness(
+      { site: CHECKPOINT_SITE, onProgress: (report) => reports.push(report) },
+      resumeInputAfter(uninterrupted, 1),
+    );
+
+    await harness.coordinator.run();
+
+    expect(reports.map(({ pagesFinished, pagesDiscovered }) => [pagesFinished, pagesDiscovered])).toEqual([[2, 3], [3, 3]]);
+  });
+
+  it('continues the navigation pacing and the load record from the saved load (load control design 4.1, resumable run design 4.9)', async () => {
+    const INTERVAL_MS = 5_000;
+    /** 前の回の最後の読み込みの開始から、再開した実行の開始までの時間。 */
+    const SINCE_LAST_NAVIGATION_MS = 1_000;
+    const config = { crawl: { minNavigationIntervalMs: INTERVAL_MS } };
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE, config });
+    expect(savedStateAfter(uninterrupted, 1).load.pacer.lastNavigationStartedAtMs).toBeNull();
+    // 前の回の最後の読み込みの開始は、前の回の時計の最後の時刻とする。
+    const lastNavigationStartedAtMs = uninterrupted.harness.world.nowMs;
+    const load = {
+      pacer: { navigationCount: 7, totalWaitMs: 1_200, lastNavigationStartedAtMs },
+      meter: {
+        allowedOrigins: { count: 40, peakPerMinute: 12 },
+        otherOrigins: { count: 3, peakPerMinute: 2 },
+        servedFromCache: 5,
+        withheldOtherOrigins: 1,
+      },
+    };
+    const sleeps: number[] = [];
+    let harness: Harness | undefined;
+    harness = resumedHarness(
+      {
+        site: CHECKPOINT_SITE,
+        config,
+        paceNavigations: true,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+          if (harness !== undefined) {
+            harness.world.nowMs += ms;
+          }
+        },
+      },
+      resumeInputAfter(uninterrupted, 1, { load }),
+    ).harness;
+    // 再開した実行は、前の回の最後の読み込みの開始の1秒後に始まる。
+    harness.world.nowMs = lastNavigationStartedAtMs + SINCE_LAST_NAVIGATION_MS;
+
+    const result = await harness.coordinator.run();
+
+    // 再開の直後の最初の読み込み（/a.html の Desktop。偽の監査の 10ms の後）も、前の回の最後の読み込みの開始から、間隔の全体を空ける。
+    expect(sleeps[0]).toBe(INTERVAL_MS - SINCE_LAST_NAVIGATION_MS - DEFAULT_AUDIT_DURATION_MS);
+    // 読み込みは、/a.html と /b.html の、Desktop と Mobile の4回。回数と待ちの合計は、保存の値から続ける。
+    expect(sleeps).toHaveLength(4);
+    expect(result.run.load.navigationCount).toBe(load.pacer.navigationCount + 4);
+    expect(result.run.load.pacingWaitMs).toBe(load.pacer.totalWaitMs + sleeps.reduce((sum, ms) => sum + ms, 0));
+    // 要求の実績も、保存の値から続ける（偽の Run は、要求の事象を起こさない）。PREFLIGHT に渡した meter も、保存の値から始まる。
+    expect(result.run.load.requests).toEqual(load.meter);
+    const preflightOptions = harness.preflight.mock.calls[0]?.[0] as Parameters<typeof runPreflight>[0] | undefined;
+    expect(preflightOptions?.contextFactoryOptions?.loadMeter?.snapshot()).toEqual(load.meter);
+  });
+});
+
+describe('RunCoordinator: resuming after a safety invariant violation (resumable run design 3.2, R4a2b)', () => {
+  const VIOLATION_SITE: FakeSite = {
+    [START_PATH]: { links: ['/a.html', '/b.html'] },
+    '/a.html': { violations: 1 },
+    '/b.html': {},
+  };
+
+  it.each([
+    ['the saved violation flags', false],
+    ['only a saved Ledger snapshot, with the saved flags rewritten to false (the guard of R4a2b)', true],
+  ] as const)('starts no new page after a violation found in %s, and is ABORTED_BY_SAFETY as without the interruption', async (_name, clearFlags) => {
+    const uninterrupted = await recordedRun({ site: VIOLATION_SITE });
+    expect(uninterrupted.result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    const saved = savedStateAfter(uninterrupted, 2);
+    expect(saved.progress).toMatchObject({ safetyViolationDetected: true, stoppedBySafetyViolation: true });
+    // フラグを消した保存は、保存のフラグが偽で、保存した snapshot に違反がある場合を模す（R4a2b の守り）。Run Coordinator は、各ページの
+    // 保存の前に、そのページの Ledger を調べてフラグを立てる（R4a2b-fix-round-1）ので、この形の保存は、保存の値を書き換えたときにだけできる。
+    const resumeFrom = resumeInputAfter(uninterrupted, 2, clearFlags
+      ? { progress: { ...saved.progress, safetyViolationDetected: false, stoppedBySafetyViolation: false } }
+      : {});
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe(clearFlags ? 'RESUME' : 'FINALIZE_ONLY');
+    const { harness, recorder } = resumedHarness({ site: VIOLATION_SITE }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+    ]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(deriveRunStatus(result.statusInput)).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.safety.invariantViolationCount).toBe(1);
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+    // 新しいページを始めないので、ページの保存はない。
+    expect(recorder.pages()).toEqual([]);
+  });
+
+  it('does not collect robots.txt and sitemap.xml again or repeat its reason when a violation stopped them before the interruption', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE, environmentViolations: 1 });
+    const resumeFrom = resumeInputAfter(uninterrupted, 0);
+    expect(resumeFrom.checkpoint.siteMetadata).toBeNull();
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe('FINALIZE_ONLY');
+    // この実行の環境の事実には、違反がない（違反は、保存の snapshot にだけある）。
+    const { harness } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP, { code: 'SAFETY_VIOLATION_ABORT', detail: 'site-metadata' }]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+  });
+});
+
+// R4a2b-fix-round-1（中断した Run の再開の設計書 4.2 の最後の項目、5章）: 保存の「違反の検出」のフラグは、各ページの保存の前に、そのページの
+// Ledger を調べてから書く。ページの中の最後の確かめの後に記録された違反（ページの最後の Ledger の違反）も、そのページの保存のフラグに入る。
+// 「止めた」ことの記録（`stoppedBySafetyViolation`）は、実際に監査を始めなかったときだけに行う（今の決まりのまま）。Run の結果は変わらない。
+describe('RunCoordinator: the violation flag of the checkpoint saved after each page (resumable run design 4.2, R4a2b-fix-round-1)', () => {
+  /** /a.html の最後の Ledger（Mobile）に、ページの中の確かめの後で、違反を記録するサイト。 */
+  const LATE_VIOLATION_SITE: FakeSite = {
+    [START_PATH]: { links: ['/a.html', '/b.html'] },
+    '/a.html': { violationsAfterLastCheck: 1 },
+    '/b.html': {},
+  };
+  const flagsOf = ({ progress }: RunCheckpoint): readonly [boolean, boolean] =>
+    [progress.safetyViolationDetected, progress.stoppedBySafetyViolation];
+
+  it('sets the detection flag of the state saved after the page with the violation, without the stop flag before the rest is stopped', async () => {
+    const { harness, recorder } = checkpointHarness({ site: LATE_VIOLATION_SITE });
+
+    const result = await harness.coordinator.run();
+
+    // ページの中の確かめ（Desktop の後）では、違反は見つからない。
+    expect(harness.world.safetyChecks).toEqual([false, false]);
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state', 'page', 'state', 'page', 'state']);
+    // 違反のページの保存は、違反を記録した Ledger の snapshot を持つ。その後の状態の保存は、検出のフラグが真で、止めたフラグは偽のまま
+    // （残りの URL を止めるのは、次のページを始める前の確かめ）。
+    expect(recorder.pages()[1]?.safetyLedgerSnapshots.map(({ invariantViolationCount }) => invariantViolationCount)).toEqual([0, 1]);
+    const states = recorder.states();
+    expect(states.map(flagsOf)).toEqual([[false, false], [false, false], [true, false]]);
+    expect(decideRunResumption(states[2] as RunCheckpoint)).toBe('FINALIZE_ONLY');
+    // Run の結果は、今と同じ（違反の後のページは始めず、SKIPPED にする。保存のセッションがない Run とも同じ）。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html']);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+    ]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(deriveRunStatus(result.statusInput)).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(result).toEqual(await createHarness({ site: LATE_VIOLATION_SITE }).coordinator.run());
+  });
+
+  it('adds no SAFETY_VIOLATION_ABORT to the Run reasons when the violation is on the last page and no URL is left', async () => {
+    const site: FakeSite = { [START_PATH]: { violationsAfterLastCheck: 1 } };
+    const { harness, recorder } = checkpointHarness({ site });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result;
+    if (result === null) {
+      throw new Error('the Run did not return a result');
+    }
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(deriveRunStatus(result.statusInput)).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.safety.invariantViolationCount).toBe(1);
+    // 監査を始めなかったものはないので、止めたことの理由は付けない（今の振る舞い）。
+    expect(pageStates(result)).toEqual([[START_PATH, 'AUDITED', []]]);
+    expect(result.run.incompleteReasons).toEqual([]);
+    // そのページの後の状態の保存と、最後の状態の保存は、検出のフラグが真で、止めたフラグは偽。
+    expect(recorder.states().map(flagsOf)).toEqual([[false, false], [true, false]]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(flagsOf(checkpoint)).toEqual([true, false]);
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('STOPPED_BY_SAFETY_VIOLATION');
+    expect(result).toEqual(await createHarness({ site }).coordinator.run());
+  });
+
+  it('only finalizes the Run resumed from the state saved after the page with the violation, as without the interruption', async () => {
+    const uninterrupted = await recordedRun({ site: LATE_VIOLATION_SITE });
+    const resumeFrom = resumeInputAfter(uninterrupted, 2);
+    expect(flagsOf(resumeFrom.checkpoint)).toEqual([true, false]);
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe('FINALIZE_ONLY');
+    const { harness, recorder } = resumedHarness({ site: LATE_VIOLATION_SITE }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(recorder.pages()).toEqual([]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+  });
+
+  // R4a2b-fix-round-2: robots.txt と sitemap.xml の取得の後の状態の保存も、各ページの保存と同じく、Ledger を調べてからフラグを書く
+  // （調べる範囲は、取得で作った Ledger を含む、Run の初めからのすべての Ledger。R5-fix-round-1）。
+  it('sets the detection flag of the state saved after robots.txt and sitemap.xml when their Ledger records a violation, without the stop flag', async () => {
+    const options = { site: CHECKPOINT_SITE, metadataViolations: 1 };
+    const { harness, recorder } = checkpointHarness(options);
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.metadata).toHaveBeenCalledOnce();
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    // 取得の後の状態の保存（最初の状態の保存）は、検出のフラグが真で、止めたフラグは偽のまま（最初のページを止めるのは、ページを
+    // 始める前の確かめ）。その保存の後にプロセスが終わった場合の再開の判定は、違反で止まる実際の動きと合う。
+    const [afterMetadata] = recorder.states();
+    if (afterMetadata === undefined) {
+      throw new Error('the state after robots.txt and sitemap.xml was not saved');
+    }
+    expect(flagsOf(afterMetadata)).toEqual([true, false]);
+    expect(decideRunResumption(afterMetadata)).toBe('FINALIZE_ONLY');
+    // Run の結果は、今と同じ（違反の後のページは始めず、SKIPPED にする。保存のセッションがない Run とも同じ）。
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]]]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(deriveRunStatus(result.statusInput)).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(result.run.safety.invariantViolations).toEqual([{ code: 'METADATA_VIOLATION', message: 'METADATA_VIOLATION 0' }]);
+    expect(result).toEqual(await createHarness(options).coordinator.run());
+  });
+
+  // R5-fix-round-1（設計書 4.2 の最後の項目）: robots.txt と sitemap.xml の取得の後の状態の保存の前は、Run の初めからのすべての Ledger
+  // （この実行の PREFLIGHT と環境の記録のものと、保存した snapshot を含む。どれも閉じている）を調べる。再開した実行で、robots.txt と
+  // sitemap.xml を保存から作り直した場合も、この実行の PREFLIGHT の Ledger の違反が、その保存のフラグに入る。
+  it('sets the detection flag of the state saved after robots.txt and sitemap.xml restored from the checkpoint, when the PREFLIGHT Ledger of the resumed execution records a violation', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const resumeFrom = resumeInputAfter(uninterrupted, 1);
+    expect(resumeFrom.checkpoint.siteMetadata).not.toBeNull();
+    expect(flagsOf(resumeFrom.checkpoint)).toEqual([false, false]);
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe('RESUME');
+    const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE, preflightViolations: 1 }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    // robots.txt と sitemap.xml は、保存から作り直す（取得し直さない）。
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    // Run の結果は、今と同じ（違反の後のページは始めず、SKIPPED にする。止めたことの理由は1件）。
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+      ['/b.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+    ]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(deriveRunStatus(result.statusInput)).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(result.run.safety.invariantViolations).toEqual([{ code: 'PREFLIGHT_VIOLATION', message: 'PREFLIGHT_VIOLATION 0' }]);
+    // 取得の後の状態の保存は、検出のフラグが真で、止めたフラグは偽のまま（最初のページを止めるのは、ページを始める前の確かめ）。
+    // その保存の後にプロセスが終わった場合の再開の判定は、違反で止まる実際の動きと合う。
+    const [afterMetadata] = recorder.states();
+    if (afterMetadata === undefined) {
+      throw new Error('the state after robots.txt and sitemap.xml was not saved');
+    }
+    expect(afterMetadata.siteMetadata).toEqual(resumeFrom.checkpoint.siteMetadata);
+    expect(flagsOf(afterMetadata)).toEqual([true, false]);
+    expect(decideRunResumption(afterMetadata)).toBe('FINALIZE_ONLY');
+  });
+});
+
+describe('RunCoordinator: a resume that cannot start (resumable run design 4.4, R4a2b)', () => {
+  const ACTIVE_LOCK = Object.freeze({ processId: 4242, bootedAtMs: 1, acquiredAtMs: 2, heartbeatAtMs: 3 });
+
+  it('rejects with RunNotResumableError and does nothing when the checkpoint is not resumable', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const resumeFrom = resumeInputAfter(uninterrupted, 3, { state: 'FINISHED' });
+    expect(decideRunResumption(resumeFrom.checkpoint)).toBe('NOT_RESUMABLE');
+    const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom);
+
+    const rejection = harness.coordinator.run();
+
+    await expect(rejection).rejects.toBeInstanceOf(RunNotResumableError);
+    await expect(rejection).rejects.toMatchObject({
+      runId: resumeFrom.checkpoint.runId,
+      runDirectory: resumeFrom.runDirectory,
+      checkpointState: 'FINISHED',
+    });
+    expect(recorder.calls).toEqual([]);
+    expect(harness.preflight).not.toHaveBeenCalled();
+    expect(harness.launchBrowser).not.toHaveBeenCalled();
+    expect(harness.environment).not.toHaveBeenCalled();
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(existsSync(harness.outputDirectory)).toBe(false);
+  });
+
+  it.each([
+    [
+      'the lock is held by a running Run',
+      async (): Promise<RunCheckpointSessionStart> => ({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: ACTIVE_LOCK }),
+      'LOCK_HELD_BY_ACTIVE_RUN',
+      ACTIVE_LOCK,
+    ],
+    [
+      'another process remade the stale lock at the same time',
+      async (): Promise<RunCheckpointSessionStart> => ({ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: ACTIVE_LOCK }),
+      'LOCK_TAKEN_OVER_CONCURRENTLY',
+      ACTIVE_LOCK,
+    ],
+    [
+      'the store cannot write',
+      async (): Promise<RunCheckpointSessionStart> => Promise.reject(new Error('lock write failed')),
+      'CHECKPOINT_STORE_FAILED',
+      null,
+    ],
+  ] as const)('rejects with RunResumeUnavailableError without PREFLIGHT, the browser, or a Run when %s', async (_name, start, reason, existingLock) => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const resumeFrom = resumeInputAfter(uninterrupted, 1);
+    const { harness, recorder } = resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom, start);
+
+    const rejection = harness.coordinator.run();
+
+    await expect(rejection).rejects.toBeInstanceOf(RunResumeUnavailableError);
+    await expect(rejection).rejects.toMatchObject({
+      runId: resumeFrom.checkpoint.runId,
+      runDirectory: resumeFrom.runDirectory,
+      reason,
+      existingLock,
+    });
+    if (reason === 'CHECKPOINT_STORE_FAILED') {
+      await expect(rejection).rejects.toMatchObject({ cause: expect.objectContaining({ message: 'lock write failed' }) });
+    }
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start']);
+    expect(harness.preflight).not.toHaveBeenCalled();
+    expect(harness.launchBrowser).not.toHaveBeenCalled();
+    expect(harness.environment).not.toHaveBeenCalled();
+    expect(harness.metadata).not.toHaveBeenCalled();
+    expect(harness.world.createdAuditors).toEqual([]);
+  });
+
+  it('rejects a resume input without a checkpoint session, or with a broken shape, with TypeError', async () => {
+    const resumeFrom = resumeInputAfter(await recordedRun({ site: CHECKPOINT_SITE }), 1);
+
+    expect(() => createHarness({ site: CHECKPOINT_SITE, resumeFrom })).toThrow(TypeError);
+    for (const broken of [
+      null,
+      'resume',
+      { ...resumeFrom, runDirectory: '' },
+      { ...resumeFrom, checkpoint: null },
+      { ...resumeFrom, pages: 'pages' },
+    ]) {
+      expect(() => checkpointHarness({
+        site: CHECKPOINT_SITE,
+        resumeFrom: broken as unknown as RunCoordinatorResumeInput,
+      })).toThrow(TypeError);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// R4b2（中断した Run の再開の設計書 3.2、4.3.2、4.6、4.6.1、4.8）: 止める印、`run.json` の実行の記録、Run の後の保存の終わり方
+// （`checkpointConclusion()`）と、最後の状態の保存の中身（巡回の終わりの値）。
+// ---------------------------------------------------------------------------------------------------------------
+
+const RUN_INTERRUPTED_SKIP: IncompleteReason = { code: 'RUN_INTERRUPTED', detail: null };
+const NO_CRAWL_LIMITS = Object.freeze({ maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false });
+
+/** 開始のページ（その監査の途中で、止める印を付ける）と、そこからリンクする2つのページ。 */
+function stoppingSite(controller: AbortController, startSpec: FakePageSpec = {}): FakeSite {
+  return {
+    ...CHECKPOINT_SITE,
+    [START_PATH]: { links: ['/a.html', '/b.html'], ...startSpec, duringAudit: () => controller.abort() },
+  };
+}
+
+/** Run の結果（reject した場合は `null` と、その値）と、その後の保存の終わり方。 */
+interface ConcludedRun {
+  readonly result: AuditRunResult | null;
+  readonly error: unknown;
+  readonly conclusion: RunCoordinatorCheckpointConclusion;
+}
+
+/** Run を行い（reject も受け取る）、その後に保存の終わり方を読む（CLI と同じ順）。 */
+async function concludedRun(harness: Harness): Promise<ConcludedRun> {
+  let result: AuditRunResult | null = null;
+  let error: unknown = null;
+  try {
+    result = await harness.coordinator.run();
+  } catch (caught) {
+    error = caught;
+  }
+  return { result, error, conclusion: harness.coordinator.checkpointConclusion() };
+}
+
+/** 保存の終わり方が `FINISH` なら、その最後の状態の保存を返す（ほかの終わり方なら、テストを失敗させる）。 */
+function finishCheckpointOf(conclusion: RunCoordinatorCheckpointConclusion): RunCheckpoint {
+  if (conclusion.action !== 'FINISH') {
+    throw new Error(`the checkpoint conclusion is ${conclusion.action}, not FINISH`);
+  }
+  return conclusion.checkpoint;
+}
+
+/**
+ * 保存の終わり方が `FINISH` で、最後の状態の保存の状態が `state` であることを確かめ、その保存を返す（設計書 4.3.2、4.8）。
+ * - 保存の時刻と、この実行の記録の終わりの時刻は、`run.json` の `finishedAt` と同じ。
+ * - 実行の記録は、`run.json` の実行の記録に、各実行の環境を加えたもの（この実行の環境は、この実行のもの）。
+ * - スキーマ（`checkpoint`）と、R2 の整合の確かめを通る。凍結している。
+ */
+async function expectFinishCheckpoint(concluded: ConcludedRun, state: 'FINISHED' | 'STOPPED'): Promise<RunCheckpoint> {
+  const { result, conclusion } = concluded;
+  expect(conclusion.action).toBe('FINISH');
+  const checkpoint = finishCheckpointOf(conclusion);
+  if (result === null) {
+    throw new Error('the Run did not return a result');
+  }
+  expect(checkpoint.state).toBe(state);
+  expect(checkpoint.runId).toBe(result.run.runId);
+  expect(checkpoint.startedAt).toBe(result.run.startedAt);
+  expect(checkpoint.savedAt).toBe(result.run.finishedAt);
+  expect(checkpoint.executions.at(-1)).toEqual({ ...result.run.executions.at(-1), environment: ENVIRONMENT });
+  expect(checkpoint.executions.map(({ environment: _environment, ...execution }) => execution)).toEqual(result.run.executions);
+  await expect(validateArtifact('checkpoint', JSON.parse(JSON.stringify(checkpoint)))).resolves.toEqual({ ok: true });
+  expect(checkRunCheckpointConsistency(checkpoint)).toEqual({ ok: true });
+  expect(Object.isFrozen(conclusion)).toBe(true);
+  expect(Object.isFrozen(checkpoint)).toBe(true);
+  return checkpoint;
+}
+
+/** 状態の保存から、状態、保存の時刻、実行の記録を除いたもの（最後の状態の保存の中身を、ほかの保存と比べるため）。 */
+const checkpointContent = ({ state: _state, savedAt: _savedAt, executions: _executions, ...content }: RunCheckpoint): unknown => content;
+
+describe('RunCoordinator: the stop signal (resumable run design 4.6.1, R4b2)', () => {
+  it('finishes the page being audited with its retry, skips the rest with RUN_INTERRUPTED, and is PARTIAL', async () => {
+    const controller = new AbortController();
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html', '/c.html'] },
+      // /a.html の最初の試行の途中で印を付ける。最初の試行は一時的な失敗なので、再試行まで行う。
+      '/a.html': { attempts: [{ outcome: 'TIMEOUT' }], duringAudit: () => controller.abort() },
+      '/b.html': {},
+      '/c.html': {},
+    };
+    const harness = createHarness({ site, stopSignal: controller.signal });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url, attempt }) => [pathOf(url), attempt?.attempt])).toEqual([
+      [START_PATH, 1],
+      ['/a.html', 1],
+      ['/a.html', 2],
+    ]);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [RUN_INTERRUPTED_SKIP]],
+      ['/c.html', 'SKIPPED', [RUN_INTERRUPTED_SKIP]],
+    ]);
+    expect(result.run.retries).toHaveLength(1);
+    // Run の理由に1件だけ残す。上限ではない（`crawlLimits` も `crawlLimitReached` も偽）。SKIPPED のページがあるので PARTIAL。
+    expect(result.run.incompleteReasons).toEqual([RUN_INTERRUPTED_SKIP]);
+    expect(Object.isFrozen(result.run.incompleteReasons[0])).toBe(true);
+    expect(result.run.crawlLimits).toEqual(NO_CRAWL_LIMITS);
+    expect(result.statusInput.crawlLimitReached).toBe(false);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(deriveRunStatus(result.statusInput)).toBe('PARTIAL');
+    await expectValidRun(result);
+  });
+
+  it('audits no page but still collects robots.txt and sitemap.xml when the signal is set before run()', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const harness = createHarness({ site: CHECKPOINT_SITE, stopSignal: controller.signal });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(harness.metadata).toHaveBeenCalledOnce();
+    expect(result.pages[0]?.evidence.map(({ type }) => type)).toEqual(['metadata', 'metadata']);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [RUN_INTERRUPTED_SKIP]]]);
+    expect(result.run.incompleteReasons).toEqual([RUN_INTERRUPTED_SKIP]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    await expectValidRun(result);
+  });
+
+  it('is the same Run as without the signal (COMPLETE) when no URL is left after the signal', async () => {
+    const controller = new AbortController();
+    const site: FakeSite = { [START_PATH]: { links: ['/a.html'] }, '/a.html': {} };
+    const withoutSignal = await createHarness({ site }).coordinator.run();
+
+    // 最後の URL（/a.html）の監査の途中で印を付ける。
+    const result = await createHarness({
+      site: { ...site, '/a.html': { duringAudit: () => controller.abort() } },
+      stopSignal: controller.signal,
+    }).coordinator.run();
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.run.runStatus).toBe('COMPLETE');
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['COMPLETED']);
+    expect(result).toEqual(withoutSignal);
+  });
+
+  it.each([
+    ['a violation', { violations: 1 }, {}, {}, 'SAFETY_VIOLATION_ABORT'],
+    ['a failed save', {}, {}, { failPageAt: 1 }, 'CHECKPOINT_WRITE_FAILED'],
+    ['the page limit', {}, { config: { crawl: { maxPages: 1 } } }, {}, 'MAX_PAGES_REACHED'],
+    ['the runtime limit', { durationMs: 2_000 }, { config: { crawl: { maxRuntimeMs: 1_500 } } }, {}, 'MAX_RUNTIME_REACHED'],
+  ] as const)('checks the signal last: %s reached at the same time gives its own reason', async (_name, startSpec, options, recorderOptions, code) => {
+    // 対照: 同じ止める印だけなら、残りの URL は RUN_INTERRUPTED の SKIPPED になる。
+    const signalOnly = new AbortController();
+    const signalOnlyResult = await checkpointHarness({ site: stoppingSite(signalOnly), stopSignal: signalOnly.signal })
+      .harness.coordinator.run();
+    expect(signalOnlyResult.pages.slice(1).map(({ incompleteReasons }) => codesOf(incompleteReasons)))
+      .toEqual([['RUN_INTERRUPTED'], ['RUN_INTERRUPTED']]);
+    const controller = new AbortController();
+    const { harness } = checkpointHarness(
+      { site: stoppingSite(controller, startSpec), ...options, stopSignal: controller.signal },
+      recorderOptions,
+    );
+
+    const result = await harness.coordinator.run();
+
+    expect(controller.signal.aborted).toBe(true);
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH]);
+    expect(result.pages.slice(1).map(({ incompleteReasons }) => codesOf(incompleteReasons))).toEqual([[code], [code]]);
+    expect(codesOf(result.run.incompleteReasons)).not.toContain('RUN_INTERRUPTED');
+  });
+
+  it('puts RUN_INTERRUPTED after the limit reasons and before the reasons kept during the Run', async () => {
+    const controller = new AbortController();
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html'] },
+      // /a.html から、深さの上限より深い URL を発見する（MAX_DEPTH_REACHED の SKIPPED）。
+      '/a.html': { links: ['/deep.html'], duringAudit: () => controller.abort() },
+      '/b.html': {},
+    };
+    const harness = createHarness({ site, config: { crawl: { maxDepth: 1 } }, metadataPageCloseFails: true, stopSignal: controller.signal });
+
+    const result = await harness.coordinator.run();
+
+    expect(pageStates(result).map(([path, status, reasons]) => [path, status, codesOf(reasons)])).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', ['RUN_INTERRUPTED']],
+      ['/deep.html', 'SKIPPED', ['MAX_DEPTH_REACHED']],
+    ]);
+    expect(codesOf(result.run.incompleteReasons)).toEqual(['MAX_DEPTH_REACHED', 'RUN_INTERRUPTED', 'UNHANDLED_FAILURE']);
+    expect(result.run.crawlLimits).toEqual({ ...NO_CRAWL_LIMITS, maxDepthReached: true });
+    await expectValidRun(result);
+  });
+
+  it('rejects a stop signal that is not an AbortSignal with TypeError', () => {
+    for (const stopSignal of ['signal', { aborted: true }, new AbortController(), null]) {
+      expect(() => createHarness({
+        site: CHECKPOINT_SITE,
+        stopSignal: stopSignal as unknown as AbortSignal,
+      }), String(stopSignal)).toThrow(TypeError);
+    }
+    expect(() => createHarness({ site: CHECKPOINT_SITE, stopSignal: new AbortController().signal })).not.toThrow();
+  });
+});
+
+describe('RunCoordinator: the executions of run.json (resumable run design 4.8, R4b2)', () => {
+  it('has one COMPLETED execution without a session, from the start of the Run to the same finishedAt as run.json', async () => {
+    const SECOND_MS = 1_000;
+    let clockReads = 0;
+    // 時計は、読むたびに1秒進む（終わりの時刻を、`run.json` の `finishedAt` と同じ1回の読み取りで決めることを確かめる）。
+    const clock = (): Date => {
+      clockReads += 1;
+      return new Date(STARTED_AT.getTime() + (clockReads - 1) * SECOND_MS);
+    };
+    const result = await createHarness({ site: CHECKPOINT_SITE, clock }).coordinator.run();
+
+    expect(result.run.startedAt).toBe(STARTED_AT.toISOString());
+    expect(result.run.finishedAt).not.toBe(result.run.startedAt);
+    expect(result.run.executions).toEqual([{ startedAt: result.run.startedAt, finishedAt: result.run.finishedAt, endReason: 'COMPLETED' }]);
+    await expectValidRun(result);
+  });
+
+  it.each([
+    ['the stop signal', 'STOPPED_BY_SIGNAL', (controller: AbortController): Omit<HarnessOptions, 'site'> => ({ stopSignal: controller.signal })],
+    ['the runtime limit', 'STOPPED_BY_RUNTIME_LIMIT', (): Omit<HarnessOptions, 'site'> => ({ config: { crawl: { maxRuntimeMs: 5 } } })],
+    ['a violation', 'STOPPED_BY_SAFETY_VIOLATION', (): Omit<HarnessOptions, 'site'> => ({ environmentViolations: 1 })],
+    ['the page limit (not a stop)', 'COMPLETED', (): Omit<HarnessOptions, 'site'> => ({ config: { crawl: { maxPages: 1 } } })],
+  ] as const)('ends the execution by %s with %s', async (_name, endReason, options) => {
+    const controller = new AbortController();
+    const result = await createHarness({ site: stoppingSite(controller), ...options(controller) }).coordinator.run();
+
+    expect(result.run.executions).toEqual([{ startedAt: result.run.startedAt, finishedAt: result.run.finishedAt, endReason }]);
+    await expectValidRun(result);
+  });
+
+  it('closes the execution that the previous process left unfinished, puts this execution last, and leaves out the environments', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const saved = savedStateAfter(uninterrupted, 1);
+    const firstStartedAt = '2026-09-30T23:00:00.000Z';
+    const previousSavedAt = '2026-09-30T23:30:00.000Z';
+    const resumeFrom = resumeInputAfter(uninterrupted, 1, {
+      startedAt: firstStartedAt,
+      savedAt: previousSavedAt,
+      executions: [{ ...saved.executions[0], startedAt: firstStartedAt }],
+    });
+
+    const result = await resumedHarness({ site: CHECKPOINT_SITE }, resumeFrom).harness.coordinator.run();
+
+    expect(result.run.startedAt).toBe(firstStartedAt);
+    expect(result.run.executions).toEqual([
+      { startedAt: firstStartedAt, finishedAt: previousSavedAt, endReason: 'INTERRUPTED_ABNORMALLY' },
+      { startedAt: STARTED_AT.toISOString(), finishedAt: result.run.finishedAt, endReason: 'COMPLETED' },
+    ]);
+    expect(result.run.executions.map((execution) => Object.keys(execution))).toEqual([
+      ['startedAt', 'finishedAt', 'endReason'],
+      ['startedAt', 'finishedAt', 'endReason'],
+    ]);
+    await expectValidRun(result);
+  });
+});
+
+describe('RunCoordinator: the checkpoint conclusion after the Run (resumable run design 4.3.2, R4b2)', () => {
+  it('throws Error when it is asked before run() has finished', async () => {
+    const { harness } = checkpointHarness({ site: CHECKPOINT_SITE });
+    expect(() => harness.coordinator.checkpointConclusion()).toThrow(Error);
+
+    const running = harness.coordinator.run();
+    expect(() => harness.coordinator.checkpointConclusion()).toThrow(Error);
+    await running;
+
+    expect(harness.coordinator.checkpointConclusion().action).toBe('FINISH');
+  });
+
+  it('is NONE without a session', async () => {
+    const concluded = await concludedRun(createHarness({ site: CHECKPOINT_SITE }));
+
+    expect(concluded.result?.run.runStatus).toBe('COMPLETE');
+    expect(concluded.conclusion).toEqual({ action: 'NONE' });
+    expect(Object.isFrozen(concluded.conclusion)).toBe(true);
+  });
+
+  it('is NONE when the run directory cannot be created (the session does not start)', async () => {
+    const outputDirectory = join(workDirectory, 'conclusion-same-run-id');
+    await createHarness({ site: CHECKPOINT_SITE, outputDirectory }).coordinator.run();
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, outputDirectory });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.error).toBeInstanceOf(RunDirectoryUnavailableError);
+    expect(recorder.session.start).not.toHaveBeenCalled();
+    expect(concluded.conclusion).toEqual({ action: 'NONE' });
+  });
+
+  it('is NONE when the lock already exists (the session does not start)', async () => {
+    const { harness } = checkpointHarness(
+      { site: CHECKPOINT_SITE },
+      { start: async (): Promise<RunCheckpointSessionStart> => ({ ok: false, existingLock: null }) },
+    );
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('FAILED');
+    expect(concluded.conclusion).toEqual({ action: 'NONE' });
+  });
+
+  it('is NONE when a resume cannot start (RunResumeUnavailableError) or the checkpoint is not resumable (RunNotResumableError)', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const held = await concludedRun(resumedHarness(
+      { site: CHECKPOINT_SITE },
+      resumeInputAfter(uninterrupted, 1),
+      async (): Promise<RunCheckpointSessionStart> => ({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: null }),
+    ).harness);
+    const finished = await concludedRun(resumedHarness({ site: CHECKPOINT_SITE }, resumeInputAfter(uninterrupted, 3, { state: 'FINISHED' })).harness);
+
+    expect(held.error).toBeInstanceOf(RunResumeUnavailableError);
+    expect(held.conclusion).toEqual({ action: 'NONE' });
+    expect(finished.error).toBeInstanceOf(RunNotResumableError);
+    expect(finished.conclusion).toEqual({ action: 'NONE' });
+  });
+
+  it('is FINISH with FINISHED from the end of the crawl after a violation', async () => {
+    const site: FakeSite = { [START_PATH]: { links: ['/a.html', '/b.html'] }, '/a.html': { violations: 1 }, '/b.html': {} };
+    const { harness, recorder } = checkpointHarness({ site });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('STOPPED_BY_SAFETY_VIOLATION');
+    // 巡回の終わりの値: 違反の後の URL は SKIPPED（最後に書いた状態の保存の後に変わった値）。
+    expect(checkpoint.frontier.entries.map(({ state, skipReason }) => [state, skipReason])).toEqual([
+      ['AUDITED', null],
+      ['AUDITED', null],
+      ['SKIPPED', SAFETY_VIOLATION_ABORT_SKIP],
+    ]);
+    expect(checkpoint.completedPageIds).toEqual(recorder.states().at(-1)?.completedPageIds);
+    expect(checkpoint.progress).toMatchObject({ safetyViolationDetected: true, stoppedBySafetyViolation: true, pagesStarted: 2 });
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it('is FINISH with FINISHED from the last written checkpoint after a violation and a failed save', async () => {
+    const site: FakeSite = { [START_PATH]: { links: ['/a.html', '/b.html'] }, '/a.html': { violations: 1 }, '/b.html': {} };
+    // /a.html のページの保存に失敗する（最後に書けた保存は、開始のページの後の状態の保存）。
+    const { harness, recorder } = checkpointHarness({ site }, { failPageAt: 2 });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(codesOf(concluded.result?.run.incompleteReasons ?? [])).toEqual(['SAFETY_VIOLATION_ABORT', 'CHECKPOINT_WRITE_FAILED']);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    const lastWritten = recorder.states().at(-1) as RunCheckpoint;
+    expect(lastWritten.completedPageIds).toHaveLength(1);
+    expect(checkpointContent(checkpoint)).toEqual(checkpointContent(lastWritten));
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it('is ABANDON after a violation and a failed save when no checkpoint was written', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, environmentViolations: 1 }, { failStateAt: 1 });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    expect(concluded.conclusion).toEqual({ action: 'ABANDON' });
+    expect(Object.isFrozen(concluded.conclusion)).toBe(true);
+  });
+
+  it.each([
+    ['a page checkpoint', { failPageAt: 1 }],
+    ['a state checkpoint', { failStateAt: 2 }],
+  ] as const)('is ABANDON when %s failed in this execution (the saved state stays as it was)', async (_name, recorderOptions) => {
+    const concluded = await concludedRun(checkpointHarness({ site: CHECKPOINT_SITE }, recorderOptions).harness);
+
+    expect(concluded.result?.run.runStatus).toBe('PARTIAL');
+    expect(concluded.conclusion).toEqual({ action: 'ABANDON' });
+  });
+
+  it('is ABANDON when PREFLIGHT fails in a resumed execution (the saved state stays as it was)', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+
+    const concluded = await concludedRun(resumedHarness({ site: CHECKPOINT_SITE, preflightOk: false }, resumeInputAfter(uninterrupted, 1)).harness);
+
+    expect(concluded.result?.run.runStatus).toBe('FAILED');
+    expect(concluded.conclusion).toEqual({ action: 'ABANDON' });
+  });
+
+  it('is FINISH with FINISHED and an empty crawl record when PREFLIGHT fails in a new Run', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, preflightOk: false });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('FAILED');
+    expect(recorder.states()).toEqual([]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.frontier).toEqual({ entries: [] });
+    expect(checkpoint.allocator).toEqual(new IdAllocator().snapshot());
+    expect(checkpoint.completedPageIds).toEqual([]);
+    expect(checkpoint.siteMetadata).toBeNull();
+    // ページの外の Ledger は、この実行のすべての Ledger（PREFLIGHT の1つ。Browser がないので、環境の事実の Ledger はない）。
+    expect(checkpoint.safetyLedgerSnapshots).toHaveLength(1);
+    expect(checkpoint.progress).toEqual({
+      reasons: [{ code: 'PREFLIGHT_FAILED', detail: 'BROWSER_LAUNCH' }],
+      retries: [],
+      safetyViolationDetected: false,
+      stoppedBySafetyViolation: false,
+      unhandledFailures: 0,
+      guardEnabled: false,
+      preflightFailed: true,
+      pagesStarted: 0,
+    });
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it.each([
+    ['the runtime limit', 'STOPPED_BY_RUNTIME_LIMIT', (): Omit<HarnessOptions, 'site'> => ({ config: { crawl: { maxRuntimeMs: 5 } } })],
+    ['the stop signal', 'STOPPED_BY_SIGNAL', (controller: AbortController): Omit<HarnessOptions, 'site'> => ({ stopSignal: controller.signal })],
+  ] as const)('is FINISH with STOPPED when the execution stopped at %s (%s), and the checkpoint is resumable', async (_name, endReason, options) => {
+    const controller = new AbortController();
+    const { harness } = checkpointHarness({ site: stoppingSite(controller), ...options(controller) });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.runStatus).toBe('PARTIAL');
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(checkpoint.executions.at(-1)?.endReason).toBe(endReason);
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+  });
+
+  it.each([
+    ['COMPLETE', {}],
+    ['PARTIAL', { config: { crawl: { maxPages: 2 } } }],
+  ] as const)('is FINISH with FINISHED otherwise (a %s Run)', async (runStatus, options) => {
+    const concluded = await concludedRun(checkpointHarness({ site: CHECKPOINT_SITE, ...options }).harness);
+
+    expect(concluded.result?.run.runStatus).toBe(runStatus);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('COMPLETED');
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it('is ABANDON when run() rejects with an unexpected exception after the session started, and NONE before it started', async () => {
+    const started = checkpointHarness({ site: CHECKPOINT_SITE, environmentThrows: true });
+    const afterStart = await concludedRun(started.harness);
+    const beforeStart = await concludedRun(checkpointHarness({ site: CHECKPOINT_SITE, clock: () => new Date(Number.NaN) }).harness);
+    const withoutSession = await concludedRun(createHarness({ site: CHECKPOINT_SITE, environmentThrows: true }));
+
+    expect(afterStart.error).toBeInstanceOf(Error);
+    expect(started.recorder.session.start).toHaveBeenCalledOnce();
+    expect(afterStart.conclusion).toEqual({ action: 'ABANDON' });
+    expect(beforeStart.error).toBeInstanceOf(Error);
+    expect(beforeStart.conclusion).toEqual({ action: 'NONE' });
+    expect(withoutSession.error).toBeInstanceOf(Error);
+    expect(withoutSession.conclusion).toEqual({ action: 'NONE' });
+  });
+
+  it('uses the last written checkpoint when the one from the end of the crawl is not consistent (an exception after a page was finished)', async () => {
+    // /a.html の監査を終えた（`markFinished` の）後、Link の取り出しで例外が起き、/a.html のページの保存を書かずに巡回が止まる。
+    const site: FakeSite = { [START_PATH]: { links: ['/a.html', '/b.html'] }, '/a.html': { malformedLinks: true }, '/b.html': {} };
+    const { harness, recorder } = checkpointHarness({ site });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.incompleteReasons).toContainEqual({ code: 'UNHANDLED_FAILURE', detail: expect.stringContaining('run-crawl') });
+    expect(concluded.result?.pages.map(({ status }) => status)).toEqual(['AUDITED', 'AUDITED', 'SKIPPED']);
+    expect(recorder.pages()).toHaveLength(1);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpointContent(checkpoint)).toEqual(checkpointContent(recorder.states().at(-1) as RunCheckpoint));
+  });
+});
+
+describe('RunCoordinator: the final checkpoint holds the values at the end of the crawl (resumable run design 4.3.2, R4b2)', () => {
+  it('does not contain the Run reason of a browser close failure', async () => {
+    const { harness, recorder } = checkpointHarness({ site: CHECKPOINT_SITE, browserCloseFails: true });
+
+    const concluded = await concludedRun(harness);
+
+    expect(concluded.result?.run.incompleteReasons).toEqual([
+      { code: 'UNHANDLED_FAILURE', detail: expect.stringContaining('browser-close') },
+    ]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.progress.reasons).toEqual([]);
+    // 最後のページの後には、巡回の値は変わらない（最後のページの後の状態の保存と、同じ中身）。
+    expect(checkpointContent(checkpoint)).toEqual(checkpointContent(recorder.states().at(-1) as RunCheckpoint));
+  });
+
+  it('keeps the Finding sequence from before the Cross-page rules, which number their Findings after it', async () => {
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html'], finding: true },
+      '/a.html': { finding: true },
+      '/b.html': {},
+    };
+    const { harness, recorder } = checkpointHarness({ site, sitemapUrls: [START_PATH, '/orphan.html'] });
+
+    const concluded = await concludedRun(harness);
+
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    const findings = concluded.result?.findings ?? [];
+    const pageFindings = findings.filter(({ ruleId }) => ruleId === 'TEST_PAGE_RULE');
+    const crossPageFindings = findings.filter(({ ruleId }) => ruleId !== 'TEST_PAGE_RULE');
+    expect(pageFindings).toHaveLength(2);
+    expect(crossPageFindings.length).toBeGreaterThan(0);
+    expect(checkpoint.allocator.nextFindingSequence).toBe(pageFindings.length + 1);
+    expect(crossPageFindings[0]?.findingId).toBe(createFindingId(checkpoint.allocator.nextFindingSequence));
+    expect(checkpointContent(checkpoint)).toEqual(checkpointContent(recorder.states().at(-1) as RunCheckpoint));
+  });
+});
+
+describe('RunCoordinator: resuming from the final checkpoint of a stopped execution (resumable run design 3.2, 4.6, R4b2)', () => {
+  it('resumes a Run stopped by the signal and gives the same Run as without the stop, with the executions of both', async () => {
+    const uninterrupted = await recordedRun({ site: CHECKPOINT_SITE });
+    const controller = new AbortController();
+    const stopped = await recordedRun({ site: stoppingSite(controller), stopSignal: controller.signal });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    expect(checkpoint.state).toBe('STOPPED');
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+    const { harness } = resumedHarness({ site: CHECKPOINT_SITE }, resumeInputFrom(stopped, checkpoint));
+
+    const concluded = await concludedRun(harness);
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/a.html', '/b.html']);
+    const result = concluded.result as AuditRunResult;
+    expect(withoutExecutions(result)).toEqual(withoutExecutions(uninterrupted.result));
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SIGNAL', 'COMPLETED']);
+    expect(result.run.executions[0]).toEqual(stopped.result.run.executions[0]);
+    await expectFinishCheckpoint(concluded, 'FINISHED');
+  });
+
+  it('reports maxRuntimeReached of the last execution only: false when the resumed execution finished every page', async () => {
+    const options = { site: starSite(3, { durationMs: 1_000 }), config: { crawl: { maxRuntimeMs: 1_500 } } };
+    const stopped = await recordedRun(options);
+    expect(stopped.result.run.crawlLimits.maxRuntimeReached).toBe(true);
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    expect(checkpoint.state).toBe('STOPPED');
+    const { harness } = resumedHarness(options, resumeInputFrom(stopped, checkpoint));
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(harness.world.auditCalls).toHaveLength(1);
+    expect(result.run.runStatus).toBe('COMPLETE');
+    expect(result.run.crawlLimits).toEqual(NO_CRAWL_LIMITS);
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_RUNTIME_LIMIT', 'COMPLETED']);
+    await expectFinishCheckpoint(concluded, 'FINISHED');
   });
 });

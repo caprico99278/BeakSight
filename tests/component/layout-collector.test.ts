@@ -1,5 +1,6 @@
 import type { Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import {
   VISUALLY_HIDDEN_MAX_DIMENSION_PX,
   type LayoutCollectionResult,
@@ -12,6 +13,7 @@ import {
   collectStressLayout,
   type PassiveStressSession,
   type PassiveStressSessionFactory,
+  type StressLayoutOptions,
 } from '../../src/evidence/layout-collector.js';
 
 function rawLayout(width: number, height: number) {
@@ -118,6 +120,17 @@ function neverSettles(): Promise<never> {
   return new Promise<never>(() => undefined);
 }
 
+/**
+ * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。幅の走査の間隔の待ちは省略できないので、間隔を確かめない
+ * テストは、待たないことを、この関数で明示して渡す。
+ */
+const NO_PACING_WAIT = async (): Promise<number> => 0;
+
+/** 間隔を確かめないテストの、幅の走査の引数。期限は、呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
+function unpacedStressOptions(widths: readonly number[]): StressLayoutOptions {
+  return { deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs * widths.length, beforeNavigation: NO_PACING_WAIT };
+}
+
 function sessionFactory(events: string[]): PassiveStressSessionFactory {
   let serial = 0;
   return async (viewport): Promise<PassiveStressSession> => {
@@ -183,7 +196,7 @@ describe('responsive layout stress lifecycle', () => {
   it('preserves input order while using a fresh owner-closed session for each width', async () => {
     const events: string[] = [];
 
-    const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320]);
+    const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], unpacedStressOptions([390, 320]));
 
     expect(result.map((entry) => entry.width)).toEqual([390, 320]);
     expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
@@ -208,7 +221,7 @@ describe('responsive layout stress lifecycle', () => {
         throw new Error('must not create');
       };
 
-      await expect(collectStressLayout(factory, 'https://fixture.test/page', [320, width])).rejects.toThrow(
+      await expect(collectStressLayout(factory, 'https://fixture.test/page', [320, width], unpacedStressOptions([320, width]))).rejects.toThrow(
         'positive finite integers',
       );
       expect(creations).toBe(0);
@@ -237,7 +250,7 @@ describe('responsive layout stress lifecycle', () => {
       };
     };
 
-    const result = await collectStressLayout(factory, 'https://fixture.test/page', [390, 320, 768]);
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [390, 320, 768], unpacedStressOptions([390, 320, 768]));
 
     expect(result.map((entry) => [entry.width, entry.status])).toEqual([
       [390, 'COMPLETE'],
@@ -277,7 +290,7 @@ describe('responsive layout stress lifecycle', () => {
       };
     };
 
-    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390]);
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390], unpacedStressOptions([320, 390]));
 
     expect(result[0]).toMatchObject({
       width: 320,
@@ -300,7 +313,7 @@ describe('responsive layout stress lifecycle', () => {
       close: async () => undefined,
     });
 
-    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320]);
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320], unpacedStressOptions([320]));
 
     expect(result[0]).toMatchObject({ status: 'FAILED', stage: 'COLLECTION', reason: 'PAGE_CLOSED' });
   });
@@ -314,6 +327,7 @@ describe('responsive layout stress lifecycle', () => {
 
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390], {
       deadlineAtMs: Date.now() - 1,
+      beforeNavigation: NO_PACING_WAIT,
     });
 
     expect(creations).toBe(0);
@@ -352,6 +366,7 @@ describe('responsive layout stress lifecycle', () => {
 
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [320], {
       deadlineAtMs: Date.now() + 50,
+      beforeNavigation: NO_PACING_WAIT,
     });
 
     expect(result[0]).toMatchObject({
@@ -373,7 +388,7 @@ describe('responsive layout stress lifecycle', () => {
       close: async () => undefined,
     });
 
-    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320]);
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320], unpacedStressOptions([320]));
 
     expect(result[0]).toMatchObject({ width: 320, status: 'PARTIAL', reason: 'DEADLINE_EXCEEDED' });
     expect(result[0]?.layout?.document.viewportWidth).toBe(320);
@@ -387,12 +402,132 @@ describe('responsive layout stress lifecycle', () => {
       close: async () => { throw closeError; },
     });
 
-    const rejection = await collectStressLayout(factory, 'https://fixture.test/page', [320]).catch(
+    const rejection = await collectStressLayout(factory, 'https://fixture.test/page', [320], unpacedStressOptions([320])).catch(
       (error: unknown) => error,
     );
 
     expect(rejection).toBeInstanceOf(AggregateError);
     expect((rejection as AggregateError).errors).toEqual([workError, closeError]);
+  });
+});
+
+// L2（サイトへの負荷の制御の設計書 4.1、4.4）: 幅の走査は、各幅の読み込み（`page.goto`）の直前に、ページの読み込みの間隔の待ち
+// （`beforeNavigation`）を呼び、待った時間の分だけ、自分の期限を延ばす。
+describe('responsive layout stress navigation pacing (load control design 4.1, 4.4)', () => {
+  it('waits right before the navigation of each width, after its session is created', async () => {
+    const events: string[] = [];
+    let paced = 0;
+
+    const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], {
+      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      beforeNavigation: async () => {
+        paced += 1;
+        events.push(`pace:${paced}`);
+        return 0;
+      },
+    });
+
+    expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
+    expect(events).toEqual([
+      `create:1:390x${STRESS_VIEWPORT_HEIGHT}`,
+      'pace:1',
+      'goto:1:https://fixture.test/page',
+      'close:1',
+      `create:2:320x${STRESS_VIEWPORT_HEIGHT}`,
+      'pace:2',
+      'goto:2:https://fixture.test/page',
+      'close:2',
+    ]);
+  });
+
+  it('extends its deadline by the time waited, so that the wait does not use up the stress deadline', async () => {
+    // 期限は 100ms 後。各幅の前に 200ms 待つ。待った時間の分だけ期限を延ばさないと、1つ目の幅の読み込みは期限切れになり、
+    // 2つ目の幅は始められない。
+    const waitedMs = 200;
+    const events: string[] = [];
+    let waits = 0;
+
+    const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], {
+      deadlineAtMs: Date.now() + 100,
+      beforeNavigation: async () => {
+        waits += 1;
+        await wait(waitedMs);
+        return waitedMs;
+      },
+    });
+
+    expect(waits).toBe(2);
+    expect(result.map((entry) => [entry.width, entry.status])).toEqual([[390, 'COMPLETE'], [320, 'COMPLETE']]);
+    expect(events.filter((event) => event.startsWith('goto:'))).toHaveLength(2);
+  });
+
+  it('extends its deadline by exactly the time each wait returned, not more, for the width and the next widths', async () => {
+    // RL-fix（RL の Minor-4 (a)）: 延長の量そのものを確かめる。待ちは実際には待たず、待った時間として決めた値を返す。各幅の収集が
+    // page に渡す走査の期限（`scanDeadlineAtMs` = 走査の期限 − `partialResultReserveMs`）は、待ちが返した時間の合計だけ後ろに延びる。
+    // 延ばし過ぎ（例: 待った時間の2倍）と延ばし忘れは、この値の違いで分かる（上のテストは、延ばし過ぎを見分けられない）。
+    const returnedWaitsMs = [700, 300] as const;
+    const deadlineAtMs = Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs;
+    const scanDeadlines: number[] = [];
+    const factory: PassiveStressSessionFactory = async (viewport) => ({
+      page: {
+        goto: async () => undefined,
+        evaluate: async (_collect: unknown, argument: { readonly scanDeadlineAtMs: number }) => {
+          scanDeadlines.push(argument.scanDeadlineAtMs);
+          return rawLayout(viewport.width, viewport.height);
+        },
+        isClosed: () => false,
+      } as unknown as Page,
+      close: async () => undefined,
+    });
+    let waits = 0;
+
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [390, 320], {
+      deadlineAtMs,
+      beforeNavigation: async () => {
+        const returnedMs = returnedWaitsMs[waits] ?? 0;
+        waits += 1;
+        return returnedMs;
+      },
+    });
+
+    expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
+    const [firstWaitMs, secondWaitMs] = returnedWaitsMs;
+    expect(scanDeadlines).toEqual([
+      deadlineAtMs + firstWaitMs - LAYOUT_THRESHOLDS.partialResultReserveMs,
+      deadlineAtMs + firstWaitMs + secondWaitMs - LAYOUT_THRESHOLDS.partialResultReserveMs,
+    ]);
+  });
+
+  // RL-fix（RL の Minor-5）: 間隔の待ちは、省略できない引数である（Page Auditor の pacer と同じ）。渡し忘れると間隔を空けずに
+  // 読み込む、という形を残さない。待たない呼び出し側は、それを明示する関数（`async () => 0`）を渡す。
+  it('is a type error and an error to sweep without beforeNavigation, before creating a session', async () => {
+    let creations = 0;
+    const factory: PassiveStressSessionFactory = async () => {
+      creations += 1;
+      throw new Error('must not create');
+    };
+
+    // @ts-expect-error: ページの読み込みの間隔の待ち（`beforeNavigation`）を渡さないと、型のエラーになる。
+    await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
+      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+    })).rejects.toThrow('beforeNavigation');
+    // @ts-expect-error: 期限と間隔の待ちの引数そのものを省略すると、型のエラーになる。
+    await expect(collectStressLayout(factory, 'https://fixture.test/page', [320])).rejects.toThrow('beforeNavigation');
+    expect(creations).toBe(0);
+  });
+
+  it('rejects a beforeNavigation that is not a function before creating a session', async () => {
+    let creations = 0;
+    const factory: PassiveStressSessionFactory = async () => {
+      creations += 1;
+      throw new Error('must not create');
+    };
+
+    await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
+      deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      beforeNavigation: 'wait' as unknown as () => Promise<number>,
+    })).rejects.toThrow('beforeNavigation');
+    expect(creations).toBe(0);
   });
 });
 

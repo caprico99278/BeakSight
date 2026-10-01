@@ -1,5 +1,6 @@
 import type { BrowserContext, Page } from 'playwright';
 import { ContextConstructionError, type BrowserContextFactory } from '../browser/context-factory.js';
+import type { ResourceDeliveryRole } from '../browser/resource-delivery.js';
 import type { Viewport } from '../config/types.js';
 import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS, PAGE_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../core/limits.js';
@@ -56,13 +57,20 @@ export interface PassiveSessionOpenOptions {
    * 呼び出し元が戻った後に呼ばれることがある。口が投げた例外は封じ込める。
    */
   readonly onLateContextRelease?: ((release: LatePassiveContextRelease) => void) | undefined;
+  /**
+   * 作る Context の役割（サイトへの負荷の制御の設計書 4.7）。factory の `createPassiveContext` に、そのまま渡す。省略すると渡さず、
+   * factory の既定（`PRIMARY`。今の振る舞い）になる。読み込み直しの Context（幅の走査）は `REVISIT` を渡す。
+   */
+  readonly role?: ResourceDeliveryRole | undefined;
 }
 
 /**
  * 呼び出し元（PREFLIGHT、環境、サイトの metadata、幅の走査など）が受け取る、作成と終了の期限の注入口（R15r-4）。
  * 省略した項目は、`limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
+ * Context の役割（`role`）は含まない（作るたびに、呼び出し側が作成の部品の引数で選ぶ）。期限の注入口に `role` を書くと、型の誤りになる
+ * （受け取って黙って捨てる形を残さない。RL の 7-2）。
  */
-export interface PassiveSessionDeadlineOptions extends PassiveSessionCloseTimeouts, PassiveSessionOpenOptions {
+export interface PassiveSessionDeadlineOptions extends PassiveSessionCloseTimeouts, Omit<PassiveSessionOpenOptions, 'role'> {
   /** Context と page の作成を待つ上限（ms）。既定は `SESSION_OPEN_TIMEOUT_MS`。 */
   readonly sessionOpenTimeoutMs?: number | undefined;
 }
@@ -241,7 +249,7 @@ export async function openPassiveContextBeforeDeadline(
   if (Date.now() >= deadlineAtMs) {
     return contextDeadlineExceeded();
   }
-  const creation = (async (): Promise<BrowserContext> => factory.createPassiveContext(viewport))();
+  const creation = (async (): Promise<BrowserContext> => factory.createPassiveContext(viewport, options.role))();
   const outcome = await awaitBeforeDeadline(creation, deadlineAtMs);
   switch (outcome.status) {
     case 'FULFILLED': {

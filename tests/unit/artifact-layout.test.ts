@@ -1,27 +1,40 @@
 // C16a（Task 14〜17 の設計書 6.1.2、6.1.8。CC-023）: artifact の配置（パスの組み立て）の唯一の owner。
 // Page Auditor、Run Coordinator、ArtifactWriter、表示用モデルが、どれもここから取る。移す前と同じパスを返すことを確かめる。
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SCREENSHOT_CAPTURE_TYPES } from '../../src/core/evidence-types.js';
 import { createPageId, createRunId } from '../../src/core/ids.js';
 import {
+  CHECKPOINT_ARTIFACT_DIRECTORY,
+  CHECKPOINT_ARTIFACT_FILE_NAMES,
+  CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
   PAGE_ARTIFACT_FILE_NAMES,
   PAGES_ARTIFACT_DIRECTORY,
+  PREFLIGHT_TEMPORARY_FILE_PREFIX,
+  PREFLIGHT_TEMPORARY_FILE_SUFFIX,
   RETRY_ARTIFACT_DIRECTORY_PREFIX,
   RUN_ARTIFACT_FILE_NAMES,
   SCREENSHOT_FILE_NAMES,
   artifactFilePath,
+  checkpointArtifactRelativePath,
+  checkpointPageArtifactRelativePath,
+  checkpointPageIdOfFileName,
   createRunArtifactDirectory,
   isPortableArtifactPathSegment,
   isPortableRelativeArtifactPath,
+  isPreflightTemporaryFileName,
+  listCheckpointRunDirectories,
+  listRunDirectories,
   pageArtifactRelativePath,
   runArtifactDirectory,
   screenshotRelativePath,
 } from '../../src/core/artifact-layout.js';
 
 const RUN_ID = createRunId(20260924000000);
+/** ディレクトリへのリンクの種類（Windows では、権限のいらない junction にする。リンク先は、どれも一時ディレクトリの中）。 */
+const LINK_TYPE = process.platform === 'win32' ? 'junction' : 'dir';
 const PAGE_1 = createPageId(1);
 const PAGE_12 = createPageId(12);
 
@@ -212,5 +225,176 @@ describe('artifact layout: creating the run directory exclusively (DEF-009)', ()
       await expect(createRunArtifactDirectory(outputDirectory, runId as typeof RUN_ID), JSON.stringify(runId)).rejects.toThrow(RangeError);
     }
     await expect(readdir(outputDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+});
+
+// R3（中断した Run の再開の設計書 4.1、4.4、4.5）: 再開のための保存（チェックポイント）とロックの配置、PREFLIGHT の一時ファイルの名前。
+// 保存のファイルを読み書きするのは `ArtifactWriter` で、名前とパスは、ここから取る。
+describe('artifact layout: the checkpoint and the PREFLIGHT temporary file (resumable run design 4.1, 4.4, 4.5)', () => {
+  it('names the checkpoint directory, its files and the page checkpoint directory', () => {
+    expect(CHECKPOINT_ARTIFACT_DIRECTORY).toBe('checkpoint');
+    expect(CHECKPOINT_ARTIFACT_FILE_NAMES).toEqual({ state: 'state.json', previousState: 'state.prev.json', lock: 'run.lock' });
+    expect(Object.isFrozen(CHECKPOINT_ARTIFACT_FILE_NAMES)).toBe(true);
+    expect(CHECKPOINT_PAGES_ARTIFACT_DIRECTORY).toBe('checkpoint/pages');
+  });
+
+  it('makes the checkpoint paths relative to the run directory, separated by /', () => {
+    expect(checkpointArtifactRelativePath('state')).toBe('checkpoint/state.json');
+    expect(checkpointArtifactRelativePath('previousState')).toBe('checkpoint/state.prev.json');
+    expect(checkpointArtifactRelativePath('lock')).toBe('checkpoint/run.lock');
+    expect(checkpointPageArtifactRelativePath(PAGE_1)).toBe('checkpoint/pages/PAGE-000001.json');
+    expect(checkpointPageArtifactRelativePath(PAGE_12)).toBe('checkpoint/pages/PAGE-000012.json');
+    for (const path of [checkpointArtifactRelativePath('state'), checkpointPageArtifactRelativePath(PAGE_12)]) {
+      expect(isPortableRelativeArtifactPath(path), path).toBe(true);
+    }
+  });
+
+  it('reads the page ID from the name of a page checkpoint, and nothing from other names', () => {
+    expect(checkpointPageIdOfFileName('PAGE-000001.json')).toBe(PAGE_1);
+    expect(checkpointPageIdOfFileName('PAGE-000012.json')).toBe(PAGE_12);
+    for (const name of ['PAGE-000001', 'PAGE-000001.json.tmp', 'PAGE-1.json', 'RUN-000001.json', 'notes.json', '.PAGE-000001.json', 'PAGE-000001.JSON']) {
+      expect(checkpointPageIdOfFileName(name), name).toBeNull();
+    }
+  });
+
+  it('names the PREFLIGHT temporary file, and tells such a name from other names', () => {
+    expect(PREFLIGHT_TEMPORARY_FILE_PREFIX).toBe('.beaksight-preflight-');
+    expect(PREFLIGHT_TEMPORARY_FILE_SUFFIX).toBe('.tmp');
+    expect(isPreflightTemporaryFileName('.beaksight-preflight-0b7c9a43-4f8e-4a55-9d1e-3a5f2c6b7d80.tmp')).toBe(true);
+    for (const name of ['.beaksight-preflight-.tmp', '.beaksight-preflight-x.txt', 'beaksight-preflight-x.tmp', 'run.json', '.run.json.x.tmp']) {
+      expect(isPreflightTemporaryFileName(name), name).toBe(false);
+    }
+  });
+});
+
+// R3（中断した Run の再開の設計書 4.7）: 出力先の直下の、保存のある Run のディレクトリの一覧（読むだけ。R5 の自動の再開で使う）。
+describe('artifact layout: listing the run directories with a checkpoint (resumable run design 4.7)', () => {
+  let workDirectory: string;
+
+  beforeAll(async () => {
+    workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-artifact-layout-list-'));
+  });
+
+  afterAll(async () => {
+    await rm(workDirectory, { recursive: true, force: true });
+  });
+
+  const putFile = async (path: string, content = '{}'): Promise<void> => {
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, content, 'utf8');
+  };
+
+  it('lists the directories named like a run ID that have checkpoint/state.json or checkpoint/state.prev.json, by name', async () => {
+    const outputDirectory = join(workDirectory, 'output');
+    const withState = createRunId(20261001000002);
+    const withPreviousOnly = createRunId(20261001000001);
+    const withoutCheckpoint = createRunId(20261001000003);
+    const withDirectoryAsState = createRunId(20261001000004);
+    const asFile = createRunId(20261001000005);
+    await putFile(artifactFilePath(runArtifactDirectory(outputDirectory, withState), checkpointArtifactRelativePath('state')));
+    await putFile(artifactFilePath(runArtifactDirectory(outputDirectory, withPreviousOnly), checkpointArtifactRelativePath('previousState')));
+    await putFile(artifactFilePath(runArtifactDirectory(outputDirectory, withoutCheckpoint), RUN_ARTIFACT_FILE_NAMES.run));
+    await mkdir(artifactFilePath(runArtifactDirectory(outputDirectory, withDirectoryAsState), checkpointArtifactRelativePath('state')), {
+      recursive: true,
+    });
+    await putFile(join(outputDirectory, asFile));
+    await putFile(artifactFilePath(join(outputDirectory, 'not-a-run'), checkpointArtifactRelativePath('state')));
+    await putFile(artifactFilePath(join(outputDirectory, 'RUN-1'), checkpointArtifactRelativePath('state')));
+
+    const listed = await listCheckpointRunDirectories(outputDirectory);
+
+    expect(listed).toEqual([
+      { runId: withPreviousOnly, runDirectory: runArtifactDirectory(outputDirectory, withPreviousOnly) },
+      { runId: withState, runDirectory: runArtifactDirectory(outputDirectory, withState) },
+    ]);
+    expect(Object.isFrozen(listed)).toBe(true);
+  });
+
+  it('returns an empty list when the output directory does not exist, without creating it', async () => {
+    const outputDirectory = join(workDirectory, 'missing');
+    await expect(listCheckpointRunDirectories(outputDirectory)).resolves.toEqual([]);
+    await expect(readdir(outputDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not count a link named like a run ID, even if it points to a run directory with a checkpoint', async () => {
+    const outputDirectory = join(workDirectory, 'checkpoint-link');
+    const target = join(workDirectory, 'checkpoint-link-target');
+    await putFile(artifactFilePath(target, checkpointArtifactRelativePath('state')));
+    await mkdir(outputDirectory, { recursive: true });
+    await symlink(target, join(outputDirectory, createRunId(20261001000010)), LINK_TYPE);
+
+    await expect(listCheckpointRunDirectories(outputDirectory)).resolves.toEqual([]);
+  });
+});
+
+// R5a（中断した Run の再開の設計書 4.7.1 の「実行中の Run の確かめ」）: 出力先の直下の、名前が Run の ID の形のディレクトリの一覧
+// （保存の有無を問わない。読むだけ）。`listCheckpointRunDirectories` は、この一覧から保存のあるものを選ぶ（判定を二重に書かない）。
+describe('artifact layout: listing the run directories (resumable run design 4.7.1)', () => {
+  let workDirectory: string;
+
+  beforeAll(async () => {
+    workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-artifact-layout-runs-'));
+  });
+
+  afterAll(async () => {
+    await rm(workDirectory, { recursive: true, force: true });
+  });
+
+  it('lists every directory named like a run ID, with or without a checkpoint, by name', async () => {
+    const outputDirectory = join(workDirectory, 'output');
+    const second = createRunId(20261001000002);
+    const first = createRunId(20261001000001);
+    const third = createRunId(20261001000003);
+    await mkdir(runArtifactDirectory(outputDirectory, second), { recursive: true });
+    await mkdir(artifactFilePath(runArtifactDirectory(outputDirectory, first), CHECKPOINT_ARTIFACT_DIRECTORY), { recursive: true });
+    await mkdir(runArtifactDirectory(outputDirectory, third), { recursive: true });
+    await writeFile(artifactFilePath(runArtifactDirectory(outputDirectory, third), RUN_ARTIFACT_FILE_NAMES.run), '{}', 'utf8');
+    // Run の ID の形でない名前と、Run の ID の名前のファイルは、数えない。
+    await mkdir(join(outputDirectory, 'not-a-run'), { recursive: true });
+    await mkdir(join(outputDirectory, 'RUN-1'), { recursive: true });
+    await writeFile(join(outputDirectory, createRunId(20261001000004)), 'a file', 'utf8');
+
+    const listed = await listRunDirectories(outputDirectory);
+
+    expect(listed).toEqual([first, second, third].map((runId) => ({ runId, runDirectory: runArtifactDirectory(outputDirectory, runId) })));
+    expect(Object.isFrozen(listed)).toBe(true);
+    expect(listed.every((entry) => Object.isFrozen(entry))).toBe(true);
+  });
+
+  it('does not count a link (symlink or junction) named like a run ID', async () => {
+    const outputDirectory = join(workDirectory, 'links');
+    const target = join(workDirectory, 'link-target');
+    const real = createRunId(20261001000001);
+    await mkdir(target, { recursive: true });
+    await mkdir(runArtifactDirectory(outputDirectory, real), { recursive: true });
+    await symlink(target, join(outputDirectory, createRunId(20261001000002)), LINK_TYPE);
+
+    await expect(listRunDirectories(outputDirectory)).resolves.toEqual([{ runId: real, runDirectory: runArtifactDirectory(outputDirectory, real) }]);
+  });
+
+  it('returns an empty list when the output directory does not exist, also under a file, without creating it', async () => {
+    const missing = join(workDirectory, 'missing');
+    await expect(listRunDirectories(missing)).resolves.toEqual([]);
+    await expect(readdir(missing)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const file = join(workDirectory, 'a-file');
+    await writeFile(file, 'not a directory', 'utf8');
+    await expect(listRunDirectories(join(file, 'output'))).resolves.toEqual([]);
+    expect(await readFile(file, 'utf8')).toBe('not a directory');
+  });
+
+  it('is the list that listCheckpointRunDirectories chooses from', async () => {
+    const outputDirectory = join(workDirectory, 'chosen');
+    const withCheckpoint = createRunId(20261001000001);
+    const withoutCheckpoint = createRunId(20261001000002);
+    await mkdir(artifactFilePath(runArtifactDirectory(outputDirectory, withCheckpoint), CHECKPOINT_ARTIFACT_DIRECTORY), { recursive: true });
+    await writeFile(artifactFilePath(runArtifactDirectory(outputDirectory, withCheckpoint), checkpointArtifactRelativePath('state')), '{}', 'utf8');
+    await mkdir(runArtifactDirectory(outputDirectory, withoutCheckpoint), { recursive: true });
+
+    const all = await listRunDirectories(outputDirectory);
+    const withState = await listCheckpointRunDirectories(outputDirectory);
+
+    expect(all.map(({ runId }) => runId)).toEqual([withCheckpoint, withoutCheckpoint]);
+    expect(withState).toEqual(all.filter(({ runId }) => runId === withCheckpoint));
   });
 });

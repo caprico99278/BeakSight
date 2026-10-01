@@ -1,8 +1,9 @@
 // P14b（Task 14〜17 の設計書 4.5.6）: 幅の走査のセッションを、BrowserContextFactory の Passive Context で作る本番の部品。
 // 作ったセッションの Ledger を、後で Safety の Evidence と違反の集計に含められるように返す。閉じるときの失敗は隠さない。
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
+import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { Viewport } from '../../src/config/types.js';
 import { collectStressLayout } from '../../src/evidence/layout-collector.js';
 import {
@@ -29,6 +30,11 @@ const INJECTED_TIMEOUT_MS = 200;
 const DEADLINE_TEST_TIMEOUT_MS = 3_000;
 /** 偽の factory で、期限を過ぎてから戻るまでの余裕。 */
 const FAKE_RETURN_MARGIN_MS = 1_000;
+/**
+ * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。幅の走査の間隔の待ちは省略できないので、間隔を確かめない
+ * テストは、待たないことを、この関数で明示して渡す。
+ */
+const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 let browser: Browser;
 let server: FixtureServer | undefined;
@@ -126,6 +132,7 @@ describe('createStressSessionFactory with a real browser', () => {
 
     const results = await collectStressLayout(stress.createSession, `${server.origin}/overflow.html`, [320, 480], {
       deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
+      beforeNavigation: NO_PACING_WAIT,
     });
 
     expect(results.map(({ width, status }) => ({ width, status }))).toEqual([
@@ -199,6 +206,42 @@ describe('createStressSessionFactory with a real browser', () => {
     await session.close();
 
     await expect(session.close()).rejects.toThrow(/already closed/u);
+  });
+
+  // L5b（サイトへの負荷の制御の設計書 4.6、4.7）: REVISIT の役割で作った幅の走査のセッションは、主の読み込みでキャッシュに入れた
+  // 画像を、キャッシュから返す（サーバに送らない）。文書は、幅ごとに送る。
+  it('serves the cached image from the Run cache in REVISIT sweep sessions (L5b)', async () => {
+    server = await startFixtureServer();
+    const cache = new ResourceCache();
+    const config = createTestConfig(server.origin);
+    const factory = new BrowserContextFactory(browser, config, () => new SafetyLedger(), { resourceCache: cache });
+    const pageUrl = `${server.origin}/unsized-svg-image.html`;
+    const imageUrl = `${server.origin}/unsized-image.svg`;
+    const primary = await createStressSessionFactory(factory).createSession(STRESS_VIEWPORT);
+    try {
+      await primary.page.goto(pageUrl, { waitUntil: 'load' });
+      await expect.poll(() => cache.lookup(imageUrl)).toBeDefined();
+    } finally {
+      await primary.close();
+    }
+    const stress = createStressSessionFactory(factory, { role: 'REVISIT' });
+
+    const results = await collectStressLayout(stress.createSession, pageUrl, [320, 480], {
+      deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
+      beforeNavigation: NO_PACING_WAIT,
+    });
+
+    expect(results.map(({ width, status }) => ({ width, status }))).toEqual([
+      { width: 320, status: 'COMPLETE' },
+      { width: 480, status: 'COMPLETE' },
+    ]);
+    const received = server.getRequestObservations().map(({ pathname }) => pathname);
+    expect(received.filter((pathname) => pathname === '/unsized-svg-image.html')).toHaveLength(3);
+    expect(received.filter((pathname) => pathname === '/unsized-image.svg')).toHaveLength(1);
+    for (const ledger of stress.ledgers()) {
+      expect(ledger.snapshot().invariantViolationCount).toBe(0);
+    }
+    expect(browser.contexts()).toHaveLength(0);
   });
 });
 
@@ -324,6 +367,7 @@ describe('createStressSessionFactory close and construction failures', () => {
     const startedAt = performance.now();
     const rejection = await collectStressLayout(stress.createSession, 'http://127.0.0.1:9/', [320, 480], {
       deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
+      beforeNavigation: NO_PACING_WAIT,
     }).then(() => undefined, (error: unknown) => error);
     const elapsedMs = performance.now() - startedAt;
 
@@ -418,6 +462,24 @@ describe('createStressSessionFactory close and construction failures', () => {
 
   it('throws TypeError when the factory is missing', () => {
     expect(() => createStressSessionFactory(undefined as unknown as BrowserContextFactory)).toThrow(TypeError);
+  });
+
+  // L5b（サイトへの負荷の制御の設計書 4.7）: 幅の走査のセッションの Context の役割を、factory の `createPassiveContext` まで渡す。
+  // 省略した場合は渡さない（factory の既定の PRIMARY。今の振る舞いのまま）。
+  it('passes the role to createPassiveContext and leaves it to the factory default when omitted (L5b)', async () => {
+    const calls: FakeFactoryCalls = { events: [] };
+    const factory = fakeFactory(calls, {});
+    const createPassiveContext = vi.spyOn(factory, 'createPassiveContext');
+
+    const revisit = await createStressSessionFactory(factory, { role: 'REVISIT' }).createSession(STRESS_VIEWPORT);
+    await revisit.close();
+    const omitted = await createStressSessionFactory(factory).createSession(STRESS_VIEWPORT);
+    await omitted.close();
+
+    expect(createPassiveContext.mock.calls.map(([viewport, role]) => [viewport, role])).toEqual([
+      [STRESS_VIEWPORT, 'REVISIT'],
+      [STRESS_VIEWPORT, undefined],
+    ]);
   });
 
   it('throws RangeError for an invalid injected deadline', () => {

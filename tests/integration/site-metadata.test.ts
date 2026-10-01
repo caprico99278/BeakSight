@@ -37,6 +37,11 @@ const RETURN_MARGIN_MS = 3_000;
 /** 期限のテストの上限。期限を守らない（既定の期限を待つか、止まり続ける）場合は、この時間で失敗する。 */
 const DEADLINE_TEST_TIMEOUT_MS = 2 * INJECTED_TIMEOUT_MS + RETURN_MARGIN_MS + 2_000;
 const OBSERVED_AT = new Date('2026-09-24T00:00:00.000Z');
+/**
+ * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。metadata の取得の間隔の待ちは省略できないので、間隔を確かめない
+ * テストは、待たないことを、この関数で明示して渡す。
+ */
+const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 let browser: Browser;
 const fixtureServers: FixtureServer[] = [];
@@ -123,7 +128,7 @@ interface CollectRun {
 
 async function collect(
   origin: string,
-  overrides: Partial<Pick<SiteMetadataOptions, 'limits' | 'deadlines'>> & {
+  overrides: Partial<Pick<SiteMetadataOptions, 'limits' | 'deadlines' | 'beforeNavigation'>> & {
     readonly navigationTimeoutMs?: number;
     readonly browser?: Browser;
     readonly createFactory?: (config: AuditConfig) => BrowserContextFactory;
@@ -145,6 +150,8 @@ async function collect(
     clock: () => OBSERVED_AT,
     ...(overrides.limits === undefined ? {} : { limits: overrides.limits }),
     ...(overrides.deadlines === undefined ? {} : { deadlines: overrides.deadlines }),
+    // 間隔の待ちは省略できない（RL-fix）。間隔を確かめないテストは、待たないことを明示して渡す。
+    beforeNavigation: overrides.beforeNavigation ?? NO_PACING_WAIT,
   };
   const result = await collectSiteMetadata(options);
   return { result, options, config };
@@ -325,6 +332,7 @@ describe('collectSiteMetadata', () => {
       pageId: allocator.allocatePageId(),
       allocator,
       clock: () => OBSERVED_AT,
+      beforeNavigation: NO_PACING_WAIT,
     });
     expect(sitemapOf(result).payload.sitemapUrls).toEqual([`${server.origin}/entity.html?a=1&b=23`]);
   }, TEST_TIMEOUT_MS);
@@ -583,6 +591,7 @@ describe('collectSiteMetadata', () => {
       pageId: allocator.allocatePageId(),
       allocator,
       clock: () => OBSERVED_AT,
+      beforeNavigation: NO_PACING_WAIT,
     };
     // 許可 Origin の外の Origin は、取得しない。
     await expect(collectSiteMetadata(base)).rejects.toThrow(RangeError);
@@ -592,6 +601,107 @@ describe('collectSiteMetadata', () => {
     await expect(
       collectSiteMetadata({ ...base, origin: server.origin, clock: 'now' as unknown as () => Date }),
     ).rejects.toThrow(TypeError);
+    await expect(
+      collectSiteMetadata({ ...base, origin: server.origin, beforeNavigation: 'wait' as unknown as () => Promise<number> }),
+    ).rejects.toThrow(TypeError);
     expect(browser.contexts()).toHaveLength(0);
+  }, TEST_TIMEOUT_MS);
+});
+
+// L2（サイトへの負荷の制御の設計書 4.1、4.4）: robots.txt と sitemap.xml の読み込みの直前に、ページの読み込みの間隔の待ち
+// （`beforeNavigation`）を呼ぶ。各ファイルの期限は、待った後の時刻から数える。
+describe('collectSiteMetadata navigation pacing (load control design 4.1, 4.4)', () => {
+  /** 待ちの呼び出しの時点で、サーバが受け取っていた robots.txt と sitemap.xml の要求の数。 */
+  const metadataRequestsAt = (server: FixtureServer): { readonly robots: number; readonly sitemap: number } => {
+    const observations = server.getRequestObservations();
+    return {
+      robots: observations.filter(({ pathname }) => pathname === '/robots.txt').length,
+      sitemap: observations.filter(({ pathname }) => pathname === '/sitemap.xml').length,
+    };
+  };
+
+  // RL-fix（RL の Minor-5）: 間隔の待ちは、省略できない引数である（Page Auditor の pacer と同じ）。渡し忘れると間隔を空けずに
+  // 読み込む、という形を残さない。待たない呼び出し側は、それを明示する関数（`async () => 0`）を渡す。
+  it('is a type error and a TypeError to collect the site metadata without beforeNavigation, before creating a Context', async () => {
+    const server = await startServer();
+    server.resetRequestObservations();
+    const config = createTestConfig(server.origin);
+    const allocator = new IdAllocator();
+    const withoutPacing = {
+      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger()),
+      origin: server.origin,
+      config,
+      pageId: allocator.allocatePageId(),
+      allocator,
+      clock: () => OBSERVED_AT,
+    };
+
+    // @ts-expect-error: ページの読み込みの間隔の待ち（`beforeNavigation`）を渡さないと、型のエラーになる。
+    await expect(collectSiteMetadata(withoutPacing)).rejects.toThrow(TypeError);
+    await expect(collectSiteMetadata({ ...withoutPacing, beforeNavigation: undefined as unknown as () => Promise<number> }))
+      .rejects.toThrow(TypeError);
+    expect(browser.contexts()).toHaveLength(0);
+    expect(metadataRequestsAt(server)).toEqual({ robots: 0, sitemap: 0 });
+  }, TEST_TIMEOUT_MS);
+
+  it('waits right before the navigation of each file', async () => {
+    const server = await startServer();
+    server.resetRequestObservations();
+    const atEachWait: { readonly robots: number; readonly sitemap: number }[] = [];
+
+    const run = await collect(server.origin, {
+      beforeNavigation: async () => {
+        atEachWait.push(metadataRequestsAt(server));
+        return 0;
+      },
+    });
+
+    // 1回目の待ちは robots.txt の要求の前、2回目の待ちは robots.txt の後で sitemap.xml の前に呼ばれる。
+    expect(atEachWait).toEqual([{ robots: 0, sitemap: 0 }, { robots: 1, sitemap: 0 }]);
+    expect(metadataRequestsAt(server)).toEqual({ robots: 1, sitemap: 1 });
+    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+  }, TEST_TIMEOUT_MS);
+
+  it('counts the deadline of each file from the end of the wait, so that a wait longer than the timeout does not fail it', async () => {
+    const server = await startServer();
+    const waitedMs = SHORT_NAVIGATION_TIMEOUT_MS + 500;
+    let waits = 0;
+
+    const run = await collect(server.origin, {
+      navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
+      beforeNavigation: async () => {
+        waits += 1;
+        await new Promise((resolve) => setTimeout(resolve, waitedMs));
+        return waitedMs;
+      },
+    });
+
+    expect(waits).toBe(2);
+    expect(run.result.failures).toEqual([]);
+    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  it('records FAILED without navigating when the wait fails', async () => {
+    const server = await startServer();
+    server.resetRequestObservations();
+
+    const run = await collect(server.origin, {
+      beforeNavigation: async () => {
+        throw new Error('injected pacing failure');
+      },
+    });
+
+    expect(metadataRequestsAt(server)).toEqual({ robots: 0, sitemap: 0 });
+    for (const record of run.result.records) {
+      expect(record.payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null });
+    }
+    expect(run.result.failures).toEqual([
+      { kind: 'ROBOTS_TXT', timedOut: false, detail: 'injected pacing failure' },
+      { kind: 'SITEMAP_XML', timedOut: false, detail: 'injected pacing failure' },
+    ]);
+    await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
 });

@@ -140,6 +140,22 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * Run Status は、違反の件数から `deriveRunStatus` が `ABORTED_BY_SAFETY` と導く（このコードでは決めない）。
    */
   'SAFETY_VIOLATION_ABORT',
+  /**
+   * 再開のための保存（チェックポイント）を書けなかったため、その後の監査を始めなかった（中断した Run の再開の設計書 4.3）。
+   * - 始めなかったページ（`SKIPPED`）の理由。`detail` は `null`。
+   * - 書けなかったことを、Run の理由にも1件残す（`detail` は、失敗のメッセージ）。
+   * - 保存のセッションを Run の初めに始められなかった場合は、Run のディレクトリを作れなかった場合と同じく、Run Status の入力は
+   *   `preflightFailed` にする（ページを1つも監査しない）。
+   */
+  'CHECKPOINT_WRITE_FAILED',
+  /**
+   * 止める印（Ctrl+C などの1回目のシグナル）を受けたため、その後の監査を始めなかった（中断した Run の再開の設計書 4.6.1）。
+   * - 始めなかったページ（`SKIPPED`）の理由。`detail` は `null`。
+   * - Run の理由にも1件残す（SKIPPED のページから、最後の処理で導く。R4b2）。
+   * - 再開のときは、この理由の SKIPPED の URL を、待ち行列に戻す（`RESUME_REQUEUE_SKIP_REASON_CODES`、`src/orchestration/run-checkpoint.ts`）。
+   * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
+   */
+  'RUN_INTERRUPTED',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -393,12 +409,111 @@ export interface RunSafetySummary {
   readonly recordTruncated: boolean;
 }
 
+/**
+ * 1つの区分（許可 Origin、またはそれ以外）の、ネットワークに送った要求の実績（サイトへの負荷の制御の設計書 4.5）。
+ * 値は 0 以上の整数。
+ */
+export interface RunLoadOriginRequests {
+  /** 数えた要求の件数。 */
+  readonly count: number;
+  /** 直近の1分（`LOAD_PEAK_WINDOW_MS`、`src/crawl/load-meter.ts`）の件数の最大。 */
+  readonly peakPerMinute: number;
+}
+
+/**
+ * run.json の `load.requests`（サイトへの負荷の制御の設計書 4.5）。数えるのは `LoadMeter`（`src/crawl/load-meter.ts`）だけで、
+ * `LoadMeter.snapshot()` がこの形の値を返す。値は 0 以上の整数。
+ */
+export interface RunLoadRequests {
+  /** 許可 Origin への要求。 */
+  readonly allowedOrigins: RunLoadOriginRequests;
+  /** 許可 Origin の外への要求。 */
+  readonly otherOrigins: RunLoadOriginRequests;
+  /** Run 全体のキャッシュから返した（ネットワークに送らなかった）要求の件数。 */
+  readonly servedFromCache: number;
+  /** 許可 Origin の外への要求のうち、送らなかったものの件数。 */
+  readonly withheldOtherOrigins: number;
+}
+
+/**
+ * run.json の `load`（サイトへの負荷の制御の設計書 3.1 の7、4.5）。Run Coordinator が、Browser を閉じた後の値で組み立てる。
+ * 値はすべて 0 以上の整数。
+ */
+export interface RunLoad {
+  /** 実効の設定の `crawl.minNavigationIntervalMs`（ページの読み込みの開始の最小の間隔。ms）。 */
+  readonly minNavigationIntervalMs: number;
+  /** 実効の設定の `crawl.maxInteractionsPerPage`（1ページで監査する Interaction の候補の上限）。 */
+  readonly maxInteractionsPerPage: number;
+  /**
+   * 間隔の判定に使った読み込みの開始の回数（`NavigationPacer.snapshot().navigationCount`）。待った後に読み込みを始められなかった
+   * 場合も含むので、実際の読み込みの回数より多いことがある（多めに数える側）。
+   */
+  readonly navigationCount: number;
+  /** 間隔のために待った時間の合計（ms。`NavigationPacer.snapshot().totalWaitMs`）。 */
+  readonly pacingWaitMs: number;
+  /** 監査対象のサイトに送った要求の実績（`LoadMeter.snapshot()`）。 */
+  readonly requests: RunLoadRequests;
+}
+
+/**
+ * 区分ごとの、直近の1分（`LOAD_PEAK_WINDOW_MS`、`src/crawl/load-meter.ts`）に終わった要求の件数（サイトへの負荷の制御の設計書 4.8）。
+ * 数えるのは `LoadMeter` だけで、`LoadMeter.recentPerMinute()` がこの形の値を返す。値は 0 以上の整数。
+ */
+export interface RunLoadRecentPerMinute {
+  /** 許可 Origin への要求。 */
+  readonly allowedOrigins: number;
+  /** 許可 Origin の外への要求。 */
+  readonly otherOrigins: number;
+}
+
+/**
+ * 実行中の進み具合の事実（サイトへの負荷の制御の設計書 4.8）。Run Coordinator が、ページの監査が1つ終わるたびに（`markFinished` と
+ * Link からの発見の後に）組み立て、注入された受け手（`RunCoordinatorDependencies.onProgress`）に渡す。JSON にできる、凍結した値。
+ * 表示の側は、この値を書式にかけるだけで、数え直したり計算したりしない。run.json には書かない（最後の記録は `RunSummary.load`）。
+ */
+export interface RunProgressReport {
+  /**
+   * 監査を終えたページの数（`markFinished` したページの数）。再開した Run では、再開の前に終わったページを含む（Run の全体で、監査を
+   * 終えたページの数）。
+   */
+  readonly pagesFinished: number;
+  /** 発見したページの数（開始の URL を含む。`CrawlFrontier.discoveredCount`）。 */
+  readonly pagesDiscovered: number;
+  /** 設定の `crawl.maxPages`。 */
+  readonly maxPages: number;
+  /** この実行の開始からの経過時間（ms。注入した `now` で測る。0 以上）。 */
+  readonly elapsedMs: number;
+  /** 間隔の判定に使った読み込みの開始の回数（`NavigationPacer.snapshot().navigationCount`。`RunLoad.navigationCount` と同じ意味）。 */
+  readonly navigationCount: number;
+  /** 間隔のために待った時間の合計（ms。`NavigationPacer.snapshot().totalWaitMs`）。 */
+  readonly pacingWaitMs: number;
+  /** 監査対象のサイトに送った要求の実績（`LoadMeter.snapshot()`）。 */
+  readonly requests: RunLoadRequests;
+  /** 区分ごとの、直近の1分に終わった要求の件数（`LoadMeter.recentPerMinute()`）。 */
+  readonly recentPerMinute: RunLoadRecentPerMinute;
+}
+
 /** クロールの上限に達したか。 */
 export interface CrawlLimitState {
   readonly maxPagesReached: boolean;
   readonly maxDepthReached: boolean;
   readonly maxRuntimeReached: boolean;
 }
+
+/**
+ * Run Coordinator が URL ごとに持つ状態の閉じた一覧（Task 14〜17 の設計書 5.1、5.6.3）。巡回の記録の owner は
+ * `src/orchestration/crawl-frontier.ts`（`CrawlFrontier`）で、同じ名前で export し直している。値の一覧は、再開のための保存の
+ * スキーマ（`schemas/checkpoint.schema.json` の巡回の記録の `state`）の enum と一致させるため、ここに置く（共通部品台帳 2.2。
+ * 中断した Run の再開の設計書 4.2、R2 の Blocker B2）。
+ * - `DISCOVERED`: 発見した（ページの ID を採番した）。
+ * - `QUEUED`: キューに入れた。
+ * - `AUDITING`: 監査している。
+ * - `AUDITED`: 監査を終えた（ページの状態が `AUDITED` か `PARTIAL`）。
+ * - `SKIPPED`: 監査しなかった（上限など）。
+ * - `FAILED`: 監査を終えたが、ページの状態が `FAILED` だった。
+ */
+export const CRAWL_URL_STATES = Object.freeze(['DISCOVERED', 'QUEUED', 'AUDITING', 'AUDITED', 'SKIPPED', 'FAILED'] as const);
+export type CrawlUrlState = (typeof CRAWL_URL_STATES)[number];
 
 export interface RunSummary {
   readonly schemaVersion: 'run-schema/1.0';
@@ -410,8 +525,16 @@ export interface RunSummary {
   readonly startUrl: string;
   readonly allowedOrigins: readonly string[];
   readonly runStatus: RunStatus;
+  /** Run の開始の時刻（ISO 8601）。再開した Run では、最初の実行の開始（中断した Run の再開の設計書 4.8）。 */
   readonly startedAt: string;
+  /** Run の終わりの時刻（ISO 8601）。再開した Run では、最後の実行の終わり（`executions` の最後の `finishedAt` と同じ値）。 */
   readonly finishedAt: string | null;
+  /**
+   * 実行（起動）の記録（中断した Run の再開の設計書 4.8。R4b2）。各実行の開始と終わりの時刻と、終わり方を、実行の順に並べる（1件以上）。
+   * 最後のものが、この Run を確定した実行である。再開していない Run は、1件だけ持つ。各実行の環境は持たない（`environment` は最初の
+   * 実行のもの。各実行の環境は、再開のための保存 `checkpoint/state.json` に残す）。組み立てるのは Run Coordinator だけである。
+   */
+  readonly executions: readonly [RunExecution, ...RunExecution[]];
   /** 発見した内部の URL の数。開始の URL を含む（Task 14〜17 の設計書 5.6.5）。 */
   readonly discoveredPageCount: number;
   /** ページの状態が `AUDITED` のページの数。 */
@@ -437,6 +560,8 @@ export interface RunSummary {
   readonly retries: readonly RunRetryRecord[];
   readonly crawlLimits: CrawlLimitState;
   readonly incompleteReasons: readonly IncompleteReason[];
+  /** サイトへの負荷の記録（サイトへの負荷の制御の設計書 4.5）。PREFLIGHT の失敗などで早く終わった Run にも入れる。 */
+  readonly load: RunLoad;
 }
 
 /**
@@ -482,4 +607,48 @@ export interface AuditRunResult {
    * 偽にして、Run Status を `deriveRunStatus` で導き直す（ARCH05）。
    */
   readonly statusInput: RunStatusInput;
+}
+
+/**
+ * 再開のための保存（`checkpoint/state.json`）の状態の閉じた一覧（中断した Run の再開の設計書 3.2、4.1）。
+ * 保存の作成と、再開できるかの判定の owner は `src/orchestration/run-checkpoint.ts`。値の一覧は、スキーマ
+ * （`schemas/checkpoint.schema.json` の `state`）の enum と一致させるため、ここに置く（共通部品台帳 2.2。R2 の Blocker B2）。
+ * - `IN_PROGRESS`: Run の途中（プロセスが途中で終わった場合も、この状態のまま残る）。
+ * - `STOPPED`: 止める印か、1回の実行の時間の上限で、今のページを終えてから止まり、最後の処理を行った（再開できることがある）。
+ * - `FINISHED`: 最後の処理まで行い、Run を終えた（再開の対象にしない）。
+ */
+export const RUN_CHECKPOINT_STATES = Object.freeze(['IN_PROGRESS', 'STOPPED', 'FINISHED'] as const);
+export type RunCheckpointState = (typeof RUN_CHECKPOINT_STATES)[number];
+
+/**
+ * 1回の実行（起動）の終わり方の閉じた一覧（中断した Run の再開の設計書 4.8）。実行の途中は、終わり方を `null` にする。
+ * 値の一覧は、スキーマ（`schemas/checkpoint.schema.json` の実行の記録の `endReason`）の enum と一致させるため、ここに置く
+ * （共通部品台帳 2.2。R2 の Blocker B2）。
+ * - `COMPLETED`: 最後の処理まで行った。
+ * - `STOPPED_BY_RUNTIME_LIMIT`: 1回の実行の時間の上限で止まった。
+ * - `STOPPED_BY_SIGNAL`: 止める印（Ctrl+C など）で止まった。
+ * - `STOPPED_BY_SAFETY_VIOLATION`: 安全の不変条件の違反で止まった。
+ * - `INTERRUPTED_ABNORMALLY`: プロセスが途中で終わった（終わりの時刻は、最後の保存の時刻とする）。
+ */
+export const RUN_EXECUTION_END_REASONS = Object.freeze([
+  'COMPLETED',
+  'STOPPED_BY_RUNTIME_LIMIT',
+  'STOPPED_BY_SIGNAL',
+  'STOPPED_BY_SAFETY_VIOLATION',
+  'INTERRUPTED_ABNORMALLY',
+] as const);
+export type RunExecutionEndReason = (typeof RUN_EXECUTION_END_REASONS)[number];
+
+/**
+ * `run.json` の、終えた1回の実行（起動）の記録（中断した Run の再開の設計書 4.8。R4b2。`RunSummary.executions` の項目）。
+ * 実行の途中を表す `null` は持たない（`run.json` は、実行を終えてから書くため）。前の回のプロセスが途中で終わった実行は、終わり方を
+ * `INTERRUPTED_ABNORMALLY`、終わりの時刻を、その実行の最後の保存の時刻にしたもの。
+ */
+export interface RunExecution {
+  /** 実行の開始の時刻（ISO 8601）。 */
+  readonly startedAt: string;
+  /** 実行の終わりの時刻（ISO 8601）。 */
+  readonly finishedAt: string;
+  /** 実行の終わり方。 */
+  readonly endReason: RunExecutionEndReason;
 }

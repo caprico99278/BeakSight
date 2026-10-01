@@ -5,6 +5,8 @@
  * - 詳細は、英語の技術的な詳細とする（`node:util` の `parseArgs` の文も、そのまま詳細に入れる）。
  * - `--help` は、引数を解析できた場合、コマンドの有無やほかの引数によらず、使い方の表示の求め（`CliHelpRequest`）にする（C17a）。
  *   引数を解析できない場合（知らないオプション、値のないオプション）は、`--help` があっても、引数の誤りとする。
+ * - `--new`（値を取らない）は、`run` のときだけのオプションである（中断した Run の再開の設計書 4.7）。`validate-config` に付けたら、
+ *   引数の誤り（`INVALID_ARGUMENTS`）にする。
  */
 import { parseArgs } from 'node:util';
 import { ConfigError } from '../config/config-error.js';
@@ -26,6 +28,7 @@ export const CLI_OPTIONS = Object.freeze({
   output: Object.freeze({ type: 'string' }),
   headed: Object.freeze({ type: 'boolean' }),
   headless: Object.freeze({ type: 'boolean' }),
+  new: Object.freeze({ type: 'boolean' }),
   help: Object.freeze({ type: 'boolean' }),
 } as const);
 export type CliOptionName = keyof typeof CLI_OPTIONS;
@@ -44,7 +47,15 @@ export interface CliInvocation {
   readonly configPath: string | undefined;
   /** CLI の上書き（`--headed`、`--headless`、`--output`）。 */
   readonly overrides: AuditConfigOverrides;
+  /**
+   * `--new` を付けたか（`run` のときだけ真になりうる）。真なら、途中の Run を探さずに、新しい Run を始める（中断した Run の再開の
+   * 設計書 4.7）。
+   */
+  readonly startNew: boolean;
 }
+
+/** `--new` を付けてよいコマンド（中断した Run の再開の設計書 4.7）。 */
+const START_NEW_COMMAND: CliCommand = 'run';
 
 const CLI_COMMAND_SET: ReadonlySet<string> = new Set(CLI_COMMANDS);
 const isCliCommand = (value: string): value is CliCommand => CLI_COMMAND_SET.has(value);
@@ -115,10 +126,16 @@ export function parseCliArguments(argv: readonly string[]): CliInvocation | CliH
       'both --headed and --headless were given',
     ]);
   }
+  const startNew = values.new === true;
+  if (startNew && command !== START_NEW_COMMAND) {
+    throw new ConfigError('INVALID_ARGUMENTS', `--new can be given only with the ${START_NEW_COMMAND} command`, [
+      `--new can be given only with the ${START_NEW_COMMAND} command`,
+    ]);
+  }
 
   const overrides: AuditConfigOverrides = {
     ...(values.headed === true ? { browser: { headed: true } } : values.headless === true ? { browser: { headed: false } } : {}),
     ...(values.output === undefined ? {} : { output: { directory: values.output } }),
   };
-  return { kind: 'command', command, configPath: values.config, overrides };
+  return { kind: 'command', command, configPath: values.config, overrides, startNew };
 }

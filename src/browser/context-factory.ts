@@ -1,6 +1,7 @@
-import type { Browser, BrowserContext, Page } from 'playwright';
+import type { Browser, BrowserContext, Page, Request, Response } from 'playwright';
 import type { AuditConfig, Viewport } from '../config/types.js';
-import { isPositiveSafeInteger } from '../core/guards.js';
+import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import type { LoadMeter } from '../crawl/load-meter.js';
 import {
   assertPassiveRequestGuardActive,
   activateInteractionFreeze,
@@ -9,11 +10,40 @@ import {
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
+  type GuardResourceDelivery,
+  type PassiveRequestGuardOptions,
 } from '../safety/passive-request-guard.js';
 import { canonicalPassiveAllowedOrigins } from '../safety/request-policy.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
+import {
+  decideResourceDelivery,
+  RESOURCE_DELIVERY_ROLES,
+  ResourceCache,
+  type ResourceCacheResponseFact,
+  type ResourceDeliveryRequestFacts,
+  type ResourceDeliveryRole,
+} from './resource-delivery.js';
 
 export type SafetyLedgerFactory = () => SafetyLedger;
+
+/** `BrowserContextFactory` の省略可能な依存（サイトへの負荷の制御の設計書 4.5、4.6）。 */
+export interface BrowserContextFactoryOptions {
+  /**
+   * 要求の実績を数える部品（Run で1つ。Run Coordinator が作る）。渡すと、factory が作るすべての Context の要求の終わりの事象
+   * （`requestfinished` と `requestfailed`）を、要求、URL、失敗の理由とともに渡す。factory は数えない。省略すると、事象を受け取らない。
+   * Run 全体のキャッシュ（`resourceCache`）もあれば、キャッシュから返した要求と、送らなかった要求も、ここに記録する（設計書 4.7）。
+   */
+  readonly loadMeter?: LoadMeter | undefined;
+  /**
+   * Run 全体のリソースのキャッシュ（Run で1つ。Run Coordinator が作る。設計書 4.6）。渡すと、factory が作るすべての Context
+   * （役割によらない）の応答の事実を、キャッシュに渡す（入れるかどうかは、キャッシュが決める）。また、読み込み直しの Context
+   * （役割 `REVISIT`）の Guard に、届け方の部品を渡す（設計書 4.7）。省略すると、応答を受け取らず、届け方も変えない（今のまま）。
+   */
+  readonly resourceCache?: ResourceCache | undefined;
+}
+
+const isResourceDeliveryRole = (value: unknown): value is ResourceDeliveryRole =>
+  (RESOURCE_DELIVERY_ROLES as readonly unknown[]).includes(value);
 
 export interface InteractionGuardedSession {
   readonly page: Page;
@@ -48,6 +78,13 @@ export class ContextConstructionError extends Error {
 
 const issuedSafetyLedgers = new WeakSet<SafetyLedger>();
 
+/** 要求の終わりの事象を受け取れる meter か（`recordRequestFinished` と `recordRequestFailed` の関数を持つ）。 */
+function recordsRequestEnds(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.recordRequestFinished === 'function'
+    && typeof value.recordRequestFailed === 'function';
+}
+
 function viewportSnapshot(viewport: Viewport): Viewport {
   if (!isPositiveSafeInteger(viewport.width) || !isPositiveSafeInteger(viewport.height)) {
     throw new Error('Passive browser viewport dimensions must be positive safe integers');
@@ -66,10 +103,34 @@ export class BrowserContextFactory {
   readonly #contextLedgers = new WeakMap<BrowserContext, SafetyLedger>();
   readonly #activeContexts = new WeakSet<BrowserContext>();
   readonly #ownedPages = new WeakMap<Page, BrowserContext>();
+  /** 要求の実績を数える部品。なければ、要求の終わりの事象を受け取らない（サイトへの負荷の制御の設計書 4.5）。 */
+  readonly #loadMeter: LoadMeter | null;
+  /** Run 全体のリソースのキャッシュ。なければ、応答を受け取らず、届け方も変えない（サイトへの負荷の制御の設計書 4.6、4.7）。 */
+  readonly #resourceCache: ResourceCache | null;
+  /**
+   * キャッシュから返した要求の印（設計書 4.6）。届け方の部品が、キャッシュから返す前に付ける。印の付いた要求の応答は、
+   * キャッシュに入れ直さない（`ResourceCache.store` の `servedFromRunCache`）。
+   */
+  readonly #servedFromRunCache = new WeakSet<Request>();
 
-  constructor(browser: Browser, config: AuditConfig, ledgerFactory: SafetyLedgerFactory) {
+  constructor(
+    browser: Browser,
+    config: AuditConfig,
+    ledgerFactory: SafetyLedgerFactory,
+    options: BrowserContextFactoryOptions = {},
+  ) {
     if (typeof ledgerFactory !== 'function') {
       throw new Error('A Safety Ledger factory dependency is required');
+    }
+    if (typeof options !== 'object' || options === null) {
+      throw new TypeError('BrowserContextFactory options must be an object');
+    }
+    const { loadMeter, resourceCache } = options;
+    if (loadMeter !== undefined && !recordsRequestEnds(loadMeter)) {
+      throw new TypeError('BrowserContextFactory load meter must record request end events');
+    }
+    if (resourceCache !== undefined && !(resourceCache instanceof ResourceCache)) {
+      throw new TypeError('BrowserContextFactory resource cache must be a ResourceCache');
     }
     this.#browser = browser;
     this.#locale = config.browser.locale;
@@ -77,9 +138,22 @@ export class BrowserContextFactory {
     this.#allowedOrigins = canonicalPassiveAllowedOrigins(new Set(config.site.allowedOrigins));
     this.#headed = config.browser.headed;
     this.#ledgerFactory = ledgerFactory;
+    this.#loadMeter = loadMeter ?? null;
+    this.#resourceCache = resourceCache ?? null;
   }
 
-  async createPassiveContext(viewport: Viewport): Promise<BrowserContext> {
+  /**
+   * Guard の付いた Passive Context を作る。`role` は Context の役割（サイトへの負荷の制御の設計書 4.7。既定は `PRIMARY`）。
+   * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml、PREFLIGHT、環境の記録。すべてネットワークから取る。
+   * - `REVISIT`: 幅の走査と Interaction。Run 全体のキャッシュがあれば、Guard に届け方の部品を渡す（キャッシュにあるものはキャッシュから
+   *   返し、許可 Origin の外へは、キャッシュになければ送らない）。キャッシュがなければ、`PRIMARY` と同じ（今のまま）。
+   * Run 全体のキャッシュがあれば、役割によらず、応答の事実をキャッシュに渡す。役割が閉じた一覧（`RESOURCE_DELIVERY_ROLES`）に
+   * なければ、何も作らずに `TypeError` を投げる。
+   */
+  async createPassiveContext(viewport: Viewport, role: ResourceDeliveryRole = 'PRIMARY'): Promise<BrowserContext> {
+    if (!isResourceDeliveryRole(role)) {
+      throw new TypeError('Passive browser Context role must be one of RESOURCE_DELIVERY_ROLES');
+    }
     const ledger = this.#ledgerFactory();
     if (!(ledger instanceof SafetyLedger)) {
       throw new Error('Safety Ledger factory must create a SafetyLedger');
@@ -96,12 +170,21 @@ export class BrowserContextFactory {
       // Passive でも Interaction でも、ページが起こしたダウンロードを保存しない（設計書 4.7）。
       acceptDownloads: false,
     });
+    // 要求の終わりの事象は、Guard の取り付けより前（最初の要求より前）に、meter に渡し始める（サイトへの負荷の制御の設計書 4.5）。
+    this.#observeRequestEnds(context);
+    // 応答の事実も、同じく最初の要求より前から、Run 全体のキャッシュに渡し始める（設計書 4.6）。
+    this.#observeResponses(context);
 
     // Context と Ledger の対応は、構築に失敗しても消さない（`getSafetyLedger` で後から取り出せるようにする。設計書 4.3）。
     this.#contextLedgers.set(context, ledger);
     this.#activeContexts.add(context);
+    // 届け方の部品は、読み込み直しの Context（`REVISIT`）で、Run 全体のキャッシュがある場合だけ渡す（設計書 4.7）。
+    const resourceDelivery = role === 'REVISIT' ? this.#createResourceDelivery() : undefined;
+    const guardOptions: PassiveRequestGuardOptions = Object.freeze(
+      resourceDelivery === undefined ? { headed: this.#headed } : { headed: this.#headed, resourceDelivery },
+    );
     try {
-      await installPassiveRequestGuard(context, ledger, this.#allowedOrigins, { headed: this.#headed });
+      await installPassiveRequestGuard(context, ledger, this.#allowedOrigins, guardOptions);
     } catch (error) {
       throw this.#constructionFailure(context, error);
     }
@@ -123,9 +206,10 @@ export class BrowserContextFactory {
    *
    * どの `ContextConstructionError` も、Context が閉じられたかどうかに関係なく、その Context と Ledger を持つ。
    * 成功した場合は、返した session の `close()` で Context を閉じる（session の持ち主が閉じる）。
+   * Interaction の Context は、ページの読み込み直しなので、役割は `REVISIT` である（サイトへの負荷の制御の設計書 4.7）。
    */
   async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
-    const context = await this.createPassiveContext(viewport);
+    const context = await this.createPassiveContext(viewport, 'REVISIT');
     let page: Page;
     try {
       page = await this.createPassivePage(context);
@@ -203,6 +287,99 @@ export class BrowserContextFactory {
     } finally {
       if (isPassiveRequestGuardClosed(context)) this.#activeContexts.delete(context);
     }
+  }
+
+  /**
+   * `context` の要求の終わりの事象（`requestfinished` と `requestfailed`）を、要求、URL、失敗の理由とともに meter に渡す
+   * （サイトへの負荷の制御の設計書 4.5）。観察だけで、Guard の判定には関わらず、数えるかどうかも meter が決める。
+   * meter がなければ、何もしない。Playwright は、閉じた Context の事象を出さないので、閉じた後に listener を外す必要はない。
+   */
+  #observeRequestEnds(context: BrowserContext): void {
+    const loadMeter = this.#loadMeter;
+    if (loadMeter === null) {
+      return;
+    }
+    context.on('requestfinished', (request: Request): void => {
+      loadMeter.recordRequestFinished(request, request.url());
+    });
+    context.on('requestfailed', (request: Request): void => {
+      loadMeter.recordRequestFailed(request, request.url(), request.failure()?.errorText ?? null);
+    });
+  }
+
+  /**
+   * `context` の応答の事象（`response`）で、要求と応答の事実を Run 全体のキャッシュに渡す（サイトへの負荷の制御の設計書 4.6）。
+   * 観察だけで、Guard の判定には関わらず、入れるかどうかもキャッシュが決める。キャッシュがなければ、何もしない。
+   * - 本文を除いた事実で、キャッシュに入れる見込みがあるか（`ResourceCache.mayStore`）を先に尋ね、見込みがある場合だけ、本文を
+   *   `response.body()`（非同期）で取る（不要な読み込みを避ける。L5b-fix-round-1）。文書、XHR、fetch、リダイレクトの応答、
+   *   キャッシュから返した要求（印の付いた要求）、`content-length` でそのキャッシュの1件の上限を超えると分かる応答は、本文を取らない。
+   * - 本文を取れなかった場合（閉じた Context など）は、入れない。例外は外に出さず、未処理の拒否にもしない。
+   * Playwright は、閉じた Context の事象を出さないので、閉じた後に listener を外す必要はない。
+   */
+  #observeResponses(context: BrowserContext): void {
+    const cache = this.#resourceCache;
+    if (cache === null) {
+      return;
+    }
+    const servedFromRunCache = this.#servedFromRunCache;
+    const store = async (response: Response): Promise<void> => {
+      try {
+        const request = response.request();
+        const fact: ResourceCacheResponseFact = {
+          method: request.method(),
+          resourceType: request.resourceType(),
+          url: request.url(),
+          requestHeaders: request.headers(),
+          status: response.status(),
+          responseHeaders: response.headers(),
+          servedFromRunCache: servedFromRunCache.has(request),
+        };
+        if (!cache.mayStore(fact)) {
+          return;
+        }
+        const body = await response.body();
+        cache.store({ ...fact, body, servedFromRunCache: servedFromRunCache.has(request) });
+      } catch {
+        // 本文を取れなかった応答は、入れない（観察の失敗は、監査の失敗ではない）。
+      }
+    };
+    context.on('response', (response: Response): void => {
+      void store(response);
+    });
+  }
+
+  /**
+   * 読み込み直しの Context（`REVISIT`）の Guard に渡す、届け方の部品を作る（サイトへの負荷の制御の設計書 4.7）。Run 全体のキャッシュが
+   * なければ作らない（`undefined`。Guard は今のまま）。判断は `decideResourceDelivery` だけが行い、許可 Origin は Guard に渡すものと
+   * 同じ値を使う。どの口も例外を投げない（meter の例外も、ここで封じ込める）。
+   */
+  #createResourceDelivery(): GuardResourceDelivery | undefined {
+    const cache = this.#resourceCache;
+    if (cache === null) {
+      return undefined;
+    }
+    const allowedOrigins = this.#allowedOrigins;
+    const servedFromRunCache = this.#servedFromRunCache;
+    const loadMeter = this.#loadMeter;
+    return Object.freeze({
+      decide: (request: ResourceDeliveryRequestFacts) =>
+        decideResourceDelivery({ role: 'REVISIT', cache, allowedOrigins, request }),
+      beforeServeFromRunCache: (request: Request): void => {
+        servedFromRunCache.add(request);
+        try {
+          loadMeter?.recordServedFromRunCache(request);
+        } catch {
+          // 数えるのに失敗しても、キャッシュから返す（負荷の記録の失敗は、安全には関わらない）。
+        }
+      },
+      afterWithhold: (): void => {
+        try {
+          loadMeter?.recordWithheld();
+        } catch {
+          // 数えるのに失敗しても、外に投げない。
+        }
+      },
+    });
   }
 
   /**
