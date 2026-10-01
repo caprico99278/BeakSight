@@ -1,6 +1,7 @@
-import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../core/limits.js';
 import { canonicalizeAllowedOrigins, hasUrlCredentials, isHttpProtocol, normalizeUrl } from '../crawl/normalize-url.js';
+import { INTERACTION_CANDIDATE_LIMITS } from '../safety/interaction-policy.js';
 import type { AuditConfig, ConfigValidationResult, Viewport } from './types.js';
 
 type UnknownRecord = Record<string, unknown>;
@@ -24,6 +25,7 @@ const validateHttpUrl = (value: string): URL | undefined => {
  * 正の整数だけを受け付ける crawl の設定値。件数・深さと、時間（ms）。
  * 時間は、Page Auditor が期限の計算に使い、`auditInteraction` などが正の整数を要求するので、正の整数に限る
  * （Task 14〜17 の設計書 4.5.7）。`schemas/run.schema.json` の `effectiveConfig.crawl` も同じ規則にする。
+ * 0 を許す `minNavigationIntervalMs` は、この一覧に入れず、`validateNavigationInterval` で確かめる。
  */
 const crawlIntegerKeys = [
   'maxPages',
@@ -33,7 +35,20 @@ const crawlIntegerKeys = [
   'overallPageTimeoutMs',
   'resourceSettlingTimeoutMs',
   'interactionTimeoutMs',
+  'maxInteractionsPerPage',
 ] as const;
+
+/**
+ * 許可 Origin にループバックでないものがある場合の、`crawl.minNavigationIntervalMs` の下限（ms）。
+ * 設定の誤りで、監査対象のサイトに短時間に大量の読み込みをしないようにする（サイトへの負荷の制御の設計書 3.2、4.2）。
+ */
+const MIN_NAVIGATION_INTERVAL_MS = 1_000;
+
+/** ループバックのアドレスの host（`URL.hostname` の値）。サイトへの負荷の制御の設計書 3.2、4.2。 */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', '[::1]', 'localhost']);
+
+/** URL の host が、ループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）か。 */
+const isLoopbackUrl = (url: URL): boolean => LOOPBACK_HOSTNAMES.has(url.hostname);
 
 /**
  * IANA の time zone の名前の書き方（例: `Asia/Tokyo`、`UTC`、`GMT`、`Etc/GMT+9`、`America/Port-au-Prince`）。
@@ -146,6 +161,29 @@ const validateInteractionCandidateBudget = (crawl: UnknownRecord, audit: unknown
   }
 };
 
+/**
+ * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）を確かめる（サイトへの負荷の制御の設計書 3.2、4.2）。
+ * 0 以上の整数でなければならない。許可 Origin にループバックでないものが1つでもあれば、`MIN_NAVIGATION_INTERVAL_MS` 以上でなければならない。
+ * 許可 Origin そのものの誤り（文字列の配列でない、HTTP(S) の URL でない）は、`validateSite` が報告するので、ここでは、読めた Origin だけで判定する。
+ */
+const validateNavigationInterval = (crawl: UnknownRecord, site: unknown, errors: string[]): void => {
+  const { minNavigationIntervalMs } = crawl;
+  if (!isNonNegativeSafeInteger(minNavigationIntervalMs)) {
+    errors.push('crawl.minNavigationIntervalMs must be a non-negative integer');
+    return;
+  }
+  if (minNavigationIntervalMs >= MIN_NAVIGATION_INTERVAL_MS || !isRecord(site) || !isStringArray(site.allowedOrigins)) {
+    return;
+  }
+  const allowedUrls = site.allowedOrigins.map(validateHttpUrl);
+  if (allowedUrls.some((url) => url !== undefined && !isLoopbackUrl(url))) {
+    errors.push(
+      `crawl.minNavigationIntervalMs must be at least ${MIN_NAVIGATION_INTERVAL_MS} ms when site.allowedOrigins `
+        + `includes an origin that is not a loopback address (${[...LOOPBACK_HOSTNAMES].join(', ')})`,
+    );
+  }
+};
+
 const validateViewport = (value: unknown, name: string, errors: string[]): value is Viewport => {
   if (!isRecord(value) || !hasExactKeys(value, ['width', 'height'])) {
     errors.push(`${name} must be an object with width and height`);
@@ -189,7 +227,7 @@ export const validateConfig = (input: unknown): ConfigValidationResult => {
     validateSite(site, allowedQueryParameters, errors);
   }
 
-  const crawlKeys = [...crawlIntegerKeys, 'allowedQueryParameters'];
+  const crawlKeys = [...crawlIntegerKeys, 'minNavigationIntervalMs', 'allowedQueryParameters'];
   if (!isRecord(crawl) || !hasExactKeys(crawl, crawlKeys)) {
     errors.push('crawl must be an object with only supported settings');
   } else {
@@ -204,6 +242,13 @@ export const validateConfig = (input: unknown): ConfigValidationResult => {
           + '(the pre-freeze stability check and the post-condition persistence check)',
       );
     }
+    if (isPositiveSafeInteger(crawl.maxInteractionsPerPage) && crawl.maxInteractionsPerPage > INTERACTION_CANDIDATE_LIMITS.maxCandidates) {
+      errors.push(
+        `crawl.maxInteractionsPerPage must be at most ${INTERACTION_CANDIDATE_LIMITS.maxCandidates} `
+          + '(the number of Interaction candidates discovered on a page)',
+      );
+    }
+    validateNavigationInterval(crawl, site, errors);
     validateInteractionCandidateBudget(crawl, audit, errors);
     if (!isStringArray(crawl.allowedQueryParameters)) {
       errors.push('crawl.allowedQueryParameters must be a string array');

@@ -24,6 +24,7 @@ import type {
   PageAuditStatus,
   PageId,
   RunId,
+  RunLoad,
   RunSummary,
   Severity,
   ViewportAuditResult,
@@ -504,6 +505,7 @@ export function runSummary(overrides: Partial<RunSummary> = {}): RunSummary {
     runStatus: 'COMPLETE',
     startedAt: '2026-09-24T00:00:00.000Z',
     finishedAt: '2026-09-24T00:01:00.000Z',
+    executions: [{ startedAt: '2026-09-24T00:00:00.000Z', finishedAt: '2026-09-24T00:01:00.000Z', endReason: 'COMPLETED' }],
     discoveredPageCount: 1,
     auditedPageCount: 1,
     partialPageCount: 0,
@@ -537,8 +539,54 @@ export function runSummary(overrides: Partial<RunSummary> = {}): RunSummary {
     retries: [],
     crawlLimits: { maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false },
     incompleteReasons: [],
+    load: {
+      minNavigationIntervalMs: createTestConfig(FIXTURE_ORIGIN).crawl.minNavigationIntervalMs,
+      maxInteractionsPerPage: createTestConfig(FIXTURE_ORIGIN).crawl.maxInteractionsPerPage,
+      navigationCount: 0,
+      pacingWaitMs: 0,
+      requests: {
+        allowedOrigins: { count: 0, peakPerMinute: 0 },
+        otherOrigins: { count: 0, peakPerMinute: 0 },
+        servedFromCache: 0,
+        withheldOtherOrigins: 0,
+      },
+    },
     ...overrides,
   };
+}
+
+/**
+ * 表示のテストのための、サイトへの負荷の記録（`RunSummary.load`）の見本（L6。サイトへの負荷の制御の設計書 4.5）。
+ * 項目ごとに異なる値にして、どの項目の値が表示のどこに出たかを見分けられるようにする。`runSummary({ load: loadDisplaySample() })`
+ * のように渡す。実効の設定（`effectiveConfig.crawl` の間隔と候補の上限）には合わせない（表示は `load` の値だけを使うため）。
+ */
+export function loadDisplaySample(): RunLoad {
+  return {
+    minNavigationIntervalMs: 2500,
+    maxInteractionsPerPage: 12,
+    navigationCount: 1234,
+    pacingWaitMs: 98_765,
+    requests: {
+      allowedOrigins: { count: 3400, peakPerMinute: 210 },
+      otherOrigins: { count: 56, peakPerMinute: 7 },
+      servedFromCache: 1500,
+      withheldOtherOrigins: 89,
+    },
+  };
+}
+
+/**
+ * 表示のテストのための、3回の実行（起動）の記録（`RunSummary.executions`）の見本（R6。中断した Run の再開の設計書 4.8）。
+ * 1回目は実行時間の上限で止まり、2回目はプロセスが途中で終わり、3回目で最後の処理まで行った（再開は2回）。終わり方と時刻を
+ * 実行ごとに変えて、どの実行の値が表示のどこに出たかを見分けられるようにする。`runSummary({ executions: executionsDisplaySample() })`
+ * のように渡す。`startedAt` と `finishedAt`（Run の最初の開始と最後の終わり）には合わせない（表示は `executions` の値だけを使うため）。
+ */
+export function executionsDisplaySample(): RunSummary['executions'] {
+  return [
+    { startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T01:00:00.000Z', endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
+    { startedAt: '2026-10-02T00:00:00.000Z', finishedAt: '2026-10-02T00:30:15.000Z', endReason: 'INTERRUPTED_ABNORMALLY' },
+    { startedAt: '2026-10-02T09:00:00.000Z', finishedAt: '2026-10-02T09:40:30.000Z', endReason: 'COMPLETED' },
+  ];
 }
 
 /** `auditRun` の上書きの指定。 */

@@ -1,0 +1,225 @@
+{
+  "$id": "urn:beaksight:schema:checkpoint:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "state",
+    "runId",
+    "toolVersion",
+    "startedAt",
+    "savedAt",
+    "effectiveConfig",
+    "executions",
+    "frontier",
+    "allocator",
+    "progress",
+    "safetyLedgerSnapshots",
+    "siteMetadata",
+    "load",
+    "completedPageIds"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "checkpoint-schema/1.0" },
+    "state": { "enum": ["IN_PROGRESS", "STOPPED", "FINISHED"] },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "toolVersion": { "$ref": "urn:beaksight:schema:run:1.0#/properties/toolVersion" },
+    "startedAt": { "$ref": "urn:beaksight:schema:run:1.0#/properties/startedAt" },
+    "savedAt": { "$ref": "urn:beaksight:schema:run:1.0#/properties/startedAt" },
+    "effectiveConfig": { "$ref": "urn:beaksight:schema:run:1.0#/properties/effectiveConfig" },
+    "executions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/execution" } },
+    "frontier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries"],
+      "properties": { "entries": { "type": "array", "items": { "$ref": "#/$defs/frontierEntry" } } }
+    },
+    "allocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nextPageSequence", "nextEvidenceSequence", "nextFindingSequence"],
+      "properties": {
+        "nextPageSequence": { "type": "integer", "minimum": 1 },
+        "nextEvidenceSequence": { "type": "integer", "minimum": 1 },
+        "nextFindingSequence": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reasons",
+        "retries",
+        "safetyViolationDetected",
+        "stoppedBySafetyViolation",
+        "unhandledFailures",
+        "guardEnabled",
+        "preflightFailed",
+        "pagesStarted"
+      ],
+      "properties": {
+        "reasons": { "$ref": "urn:beaksight:schema:run:1.0#/properties/incompleteReasons" },
+        "retries": { "$ref": "urn:beaksight:schema:run:1.0#/properties/retries" },
+        "safetyViolationDetected": { "type": "boolean" },
+        "stoppedBySafetyViolation": { "type": "boolean" },
+        "unhandledFailures": { "type": "integer", "minimum": 0 },
+        "guardEnabled": { "type": "boolean" },
+        "preflightFailed": { "type": "boolean" },
+        "pagesStarted": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "safetyLedgerSnapshots": { "type": "array", "items": { "$ref": "#/$defs/safetyLedgerSnapshot" } },
+    "siteMetadata": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["records"],
+      "properties": {
+        "records": {
+          "type": "array",
+          "minItems": 2,
+          "items": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/siteMetadataRecord" },
+                { "type": "object", "properties": { "payload": { "type": "object", "properties": { "kind": { "const": "ROBOTS_TXT" } } } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/siteMetadataRecord" },
+                { "type": "object", "properties": { "payload": { "type": "object", "properties": { "kind": { "const": "SITEMAP_XML" } } } } }
+              ]
+            }
+          ],
+          "additionalItems": false
+        }
+      }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pacer", "meter"],
+      "properties": {
+        "pacer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["navigationCount", "totalWaitMs", "lastNavigationStartedAtMs"],
+          "properties": {
+            "navigationCount": { "type": "integer", "minimum": 0 },
+            "totalWaitMs": { "type": "integer", "minimum": 0 },
+            "lastNavigationStartedAtMs": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        },
+        "meter": { "$ref": "urn:beaksight:schema:run:1.0#/properties/load/properties/requests" }
+      }
+    },
+    "completedPageIds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" }
+    }
+  },
+  "$defs": {
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedAt", "finishedAt", "endReason", "environment"],
+      "properties": {
+        "startedAt": { "$ref": "urn:beaksight:schema:run:1.0#/properties/startedAt" },
+        "finishedAt": { "$ref": "urn:beaksight:schema:run:1.0#/properties/finishedAt" },
+        "endReason": {
+          "enum": [
+            "COMPLETED",
+            "STOPPED_BY_RUNTIME_LIMIT",
+            "STOPPED_BY_SIGNAL",
+            "STOPPED_BY_SAFETY_VIOLATION",
+            "INTERRUPTED_ABNORMALLY",
+            null
+          ]
+        },
+        "environment": { "$ref": "urn:beaksight:schema:run:1.0#/properties/environment" }
+      }
+    },
+    "frontierEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "depth", "pageId", "state", "skipReason"],
+      "properties": {
+        "url": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageUrl" },
+        "depth": { "type": "integer", "minimum": 0 },
+        "pageId": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" },
+        "state": { "enum": ["DISCOVERED", "QUEUED", "AUDITING", "AUDITED", "SKIPPED", "FAILED"] },
+        "skipReason": {
+          "anyOf": [{ "type": "null" }, { "$ref": "urn:beaksight:schema:run:1.0#/$defs/incompleteReason" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["state"], "properties": { "state": { "const": "SKIPPED" } } },
+          "then": { "properties": { "skipReason": { "type": "object" } } },
+          "else": { "properties": { "skipReason": { "type": "null" } } }
+        }
+      ]
+    },
+    "safetyLedgerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blockedRequestsByMethod",
+        "blockedRequests",
+        "blockedNavigations",
+        "blockedWebSockets",
+        "blockedExternalActions",
+        "excludedInteractionCandidates",
+        "blockedInteractionRequests",
+        "blockedInteractionNavigations",
+        "blockedPopups",
+        "blockedDownloads",
+        "blockedInteractionWebSockets",
+        "externalSchemeNavigations",
+        "recordLimits",
+        "invariantViolations",
+        "invariantViolationCount"
+      ],
+      "properties": {
+        "blockedRequestsByMethod": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedRequestsByMethod"
+        },
+        "blockedRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedRequests" },
+        "blockedNavigations": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedNavigations" },
+        "blockedWebSockets": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedWebSockets" },
+        "blockedExternalActions": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedExternalActions"
+        },
+        "excludedInteractionCandidates": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/excludedInteractionCandidates"
+        },
+        "blockedInteractionRequests": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedInteractionRequests"
+        },
+        "blockedInteractionNavigations": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedInteractionNavigations"
+        },
+        "blockedPopups": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedPopups" },
+        "blockedDownloads": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedDownloads" },
+        "blockedInteractionWebSockets": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/blockedInteractionWebSockets"
+        },
+        "externalSchemeNavigations": {
+          "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/externalSchemeNavigations"
+        },
+        "recordLimits": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyLedgerRecordLimits" },
+        "invariantViolations": { "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolations" },
+        "invariantViolationCount": {
+          "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolationCount"
+        }
+      }
+    },
+    "siteMetadataRecord": {
+      "allOf": [
+        { "$ref": "urn:beaksight:schema:page:1.0#/$defs/evidence" },
+        { "type": "object", "properties": { "type": { "const": "metadata" } } }
+      ]
+    }
+  }
+}

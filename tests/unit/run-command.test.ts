@@ -3,16 +3,20 @@
 // ブラウザは起動しない（Run Coordinator は使わない）。
 // P18d（R17r の Minor-2）: 本番の `run`（`runAuditCommand`）が、Run Coordinator の後の書き出しと終了コードを `finishAuditRun` に
 // 任せることも、Run Coordinator を差し替える口（`createRunCoordinator`）で確かめる。
+// R5a（中断した Run の再開の設計書 4.7、4.7.1）: 偽の Run Coordinator は、保存の終わり方（`checkpointConclusion()`）も返す。`run` が、保存の
+// セッションと止める印を Run Coordinator に渡すことと、本番の Browser の起動が Playwright の既定のシグナルの処理を止めることも確かめる。
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { chromium, type Browser } from 'playwright';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
-import { finishAuditRun, runAuditCommand } from '../../src/cli/run-command.js';
+import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
 import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import type { PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
-import type { RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
+import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
+import type { RunCoordinatorCheckpointConclusion, RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
 import { RUN_STATUS_CATALOG } from '../../src/presentation/catalog.js';
 import { labelWithCodeText } from '../../src/presentation/messages.js';
 import { auditRun } from '../helpers/audit-run-fixture.js';
@@ -97,13 +101,19 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
       now,
       createRunCoordinator: (dependencies) => {
         coordinatorDependencies.push(dependencies);
-        return { run: async () => result };
+        // 保存のセッションを始めない偽の Run Coordinator なので、保存の終わり方は `NONE`（R5a。CLI は何もしない）。
+        return { run: async () => result, checkpointConclusion: (): RunCoordinatorCheckpointConclusion => ({ action: 'NONE' }) };
       },
     });
 
     // Run Coordinator には、注入したものと、解決した出力先を渡す。
     expect(coordinatorDependencies).toHaveLength(1);
     expect(coordinatorDependencies[0]).toMatchObject({ config, launchBrowser: failingLaunch, clock, now, outputDirectory });
+    // R5a（中断した Run の再開の設計書 4.7.1）: 保存のセッションも作って渡す。途中の Run がないので、再開の入力は渡さない。止める印も、
+    // 注入していないので渡さない。
+    expect(coordinatorDependencies[0]?.checkpointSession).toBeInstanceOf(RunCheckpointSession);
+    expect(coordinatorDependencies[0]?.resumeFrom).toBeUndefined();
+    expect(coordinatorDependencies[0]?.stopSignal).toBeUndefined();
     // 終了コードと書き出しは、`finishAuditRun` と同じく、導き直した後の Run Status（PARTIAL）による。
     expect(code).toBe(EXIT_CODES.PARTIAL);
     const runDirectory = runArtifactDirectory(outputDirectory, result.run.runId);
@@ -115,5 +125,45 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
     expect(stdout.text()).toContain(labelWithCodeText(RUN_STATUS_CATALOG.PARTIAL.label, 'PARTIAL'));
     expect(stdout.text()).toContain(runDirectory);
     expect(stderr.text()).toBe('');
+  });
+
+  // R5a（中断した Run の再開の設計書 4.7.1）: 止める印は、注入されたものを、そのまま Run Coordinator に渡す（R5b がシグナルとつなぐ口）。
+  it('hands the injected stop signal to the Run Coordinator as it is', async () => {
+    const outputDirectory = join(workDirectory, 'stop-signal');
+    const config = createTestConfig('http://127.0.0.1:9', '/', { output: { directory: outputDirectory } });
+    const controller = new AbortController();
+    const coordinatorDependencies: RunCoordinatorDependencies[] = [];
+
+    const code = await runAuditCommand(config, { stdout: captureCliOutput().output, stderr: captureCliOutput().output }, {
+      launchBrowser: failingLaunch,
+      clock: () => new Date('2026-09-25T00:00:01.000Z'),
+      now: () => 0,
+      stopSignal: controller.signal,
+      createRunCoordinator: (dependencies) => {
+        coordinatorDependencies.push(dependencies);
+        return { run: async () => auditRun(), checkpointConclusion: (): RunCoordinatorCheckpointConclusion => ({ action: 'NONE' }) };
+      },
+    });
+
+    expect(code).toBe(EXIT_CODES.COMPLETE);
+    expect(coordinatorDependencies[0]?.stopSignal).toBe(controller.signal);
+  });
+});
+
+// R5a（中断した Run の再開の設計書 4.7）: Playwright の既定のシグナルの処理を止める。Ctrl+C などで、Playwright が Browser を閉じて
+// プロセスを終えると、最後の処理（出力の書き出し）が行われないため（シグナルは、R5b で BeakSight が受ける）。
+describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([true, false])('launches Chromium with headless %s and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+    const browser = { marker: 'the fake browser' } as unknown as Browser;
+    const launch = vi.spyOn(chromium, 'launch').mockResolvedValue(browser);
+
+    await expect(PRODUCTION_RUN_DEPENDENCIES.launchBrowser({ headless })).resolves.toBe(browser);
+
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch).toHaveBeenCalledWith({ headless, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
   });
 });

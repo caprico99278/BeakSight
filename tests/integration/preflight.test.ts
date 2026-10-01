@@ -4,12 +4,13 @@
 import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Browser } from 'playwright';
+import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
+import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-close.js';
 import { PASSIVE_SESSION_OPEN_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-open.js';
 import {
@@ -151,6 +152,53 @@ describe('runPreflight (R15c)', () => {
     const context = await result.factory.createPassiveContext(createTestConfig(server.origin).viewports.primaryDesktop);
     await result.factory.closePassiveContext(context);
     expectNoTargetRequests();
+  });
+
+  // L4（サイトへの負荷の制御の設計書 4.5。Blocker 1）: PREFLIGHT は、受け取った `contextFactoryOptions` を、中身を見ずに、
+  // 返す factory のコンストラクタに渡す。Guard を確かめる PREFLIGHT の Context も、その factory で作るので、meter が事象を受け取る。
+  it('passes contextFactoryOptions to the factory, so the load meter observes the PREFLIGHT Context and the Run Contexts', async () => {
+    server.resetRequestObservations();
+    server.resetCounters();
+    const outputDirectory = await createWorkDirectory();
+    const config = createTestConfig(server.origin);
+    const loadMeter = createLoadMeter({ allowedOrigins: config.site.allowedOrigins, now: () => Date.now() });
+    const createdContexts: BrowserContext[] = [];
+    const launcher = recordingLauncher((browser) => {
+      const rawNewContext = browser.newContext.bind(browser);
+      vi.spyOn(browser, 'newContext').mockImplementation(async (options) => {
+        const context = await rawNewContext(options);
+        createdContexts.push(context);
+        return context;
+      });
+      return browser;
+    });
+
+    const result = await runPreflight({
+      config,
+      launchBrowser: launcher.launcher,
+      createSafetyLedger: ledgerFactory().create,
+      outputDirectory,
+      contextFactoryOptions: { loadMeter },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.message);
+    // Guard を確かめた PREFLIGHT の Context にも、要求の終わりの事象を受け取る listener がある（PREFLIGHT は読み込まないので、0 件）。
+    expect(createdContexts).toHaveLength(1);
+    const listeners = (context: BrowserContext, event: string): number =>
+      (context as unknown as { listenerCount(eventName: string): number }).listenerCount(event);
+    expect(listeners(createdContexts[0]!, 'requestfinished')).toBe(1);
+    expectNoTargetRequests();
+    expect(loadMeter.snapshot().allowedOrigins.count).toBe(0);
+
+    // 返した factory で作った Context の要求も、同じ meter が数える。
+    const context = await result.factory.createPassiveContext(config.viewports.primaryDesktop);
+    const page = await result.factory.createPassivePage(context);
+    await page.goto(`${server.origin}/index.html`, { waitUntil: 'load' });
+    await expect.poll(() => loadMeter.snapshot().allowedOrigins.count).toBe(1);
+    expect(server.getRequestObservations()).toHaveLength(1);
+    await result.factory.closePassivePage(page);
+    await result.factory.closePassiveContext(context);
   });
 
   it('passes headless: false to the launcher when the configuration asks for a headed browser', async () => {
@@ -504,5 +552,6 @@ describe('runPreflight (R15c)', () => {
     await expect(runPreflight({ ...valid, config: null as never })).rejects.toThrow(TypeError);
     await expect(runPreflight({ ...valid, deadlines: { sessionOpenTimeoutMs: 0 } })).rejects.toThrow(RangeError);
     await expect(runPreflight({ ...valid, deadlines: { browserCloseTimeoutMs: -1 } })).rejects.toThrow(RangeError);
+    await expect(runPreflight({ ...valid, contextFactoryOptions: null as never })).rejects.toThrow(TypeError);
   });
 });

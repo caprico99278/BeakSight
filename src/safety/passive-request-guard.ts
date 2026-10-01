@@ -7,6 +7,7 @@ import type {
   Request,
   Route,
 } from 'playwright';
+import type { ResourceDeliveryDecision, ResourceDeliveryRequestFacts } from '../browser/resource-delivery.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { NON_EXTERNAL_NAVIGATION_SCHEMES } from '../core/evidence-types.js';
 import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../core/limits.js';
@@ -49,12 +50,31 @@ const MAX_GUARD_OOPIF_SESSIONS = 64;
 const GUARD_ERROR_NORMALIZATION_FALLBACK = 'Guard error could not be safely normalized';
 
 /**
+ * Guard が、許可（ALLOW）した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。
+ * factory（`BrowserContextFactory`）が、読み込み直しの Context（役割 `REVISIT`）ごとに作り、Guard の取り付けの指定で渡す。
+ * Guard が尋ねるのは、段階が `PASSIVE_ACTIVE` で、許可の判定（`classifyPassiveRequest`）が ALLOW で、ナビゲーションの要求でない
+ * 要求だけである。凍結の段階、閉じている段階、BLOCK の要求は、尋ねる前に Guard が止める。許可の判定は、この部品には委ねない。
+ * 判断の意味の owner は `src/browser/resource-delivery.ts`（`decideResourceDelivery`）である。
+ */
+export interface GuardResourceDelivery {
+  /** 届け方を決める。例外を投げない（投げた場合は、Guard が今のままネットワークに送る）。 */
+  decide(request: ResourceDeliveryRequestFacts): ResourceDeliveryDecision;
+  /** キャッシュから返す直前に呼ぶ（factory の印と、LoadMeter の印を付ける）。例外を投げない。 */
+  beforeServeFromRunCache(request: Request): void;
+  /** 送らないと決めた直後に呼ぶ（LoadMeter で数える）。例外を投げない。 */
+  afterWithhold(request: Request): void;
+}
+
+/**
  * Guard の取り付けの指定（C18a）。
  * - `headed`: ブラウザの画面を表示して実行するか。値の出どころは設定（`config.browser.headed`）の1つだけで、factory
  *   （`BrowserContextFactory`）が渡す。headed で外部スキームへの移動を検出したら、不変条件の違反として Context を閉じる。
+ * - `resourceDelivery`: 許可した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。省略した場合は、
+ *   今のまま、許可した要求をすべてネットワークに送る。
  */
 export interface PassiveRequestGuardOptions {
   readonly headed: boolean;
+  readonly resourceDelivery?: GuardResourceDelivery | undefined;
 }
 
 /**
@@ -2057,6 +2077,65 @@ export async function installPassiveRequestGuard(
             method: request.method(),
             url: request.url(),
           });
+          return;
+        }
+        // サイトへの負荷の制御の設計書 4.7: ここに来るのは、段階が `PASSIVE_ACTIVE` で、許可の判定が ALLOW の要求だけである
+        // （凍結の段階、閉じている段階、BLOCK は、ここより前で止めている）。ナビゲーションの要求と、届け方の部品がない場合は、今のまま
+        // ネットワークに送る。部品があれば、届け方を尋ねる。部品が選べるのは、ネットワーク、キャッシュから返す、送らない、の3つだけで、
+        // 後の2つはネットワークに何も送らない（その前に `expectedRouteFailures` に登録する）。部品の例外では、今のままネットワークに
+        // 送る。部品の例外と、キャッシュから返す・送らない処理の失敗は、Guard の外に投げず、Ledger にも記録しない（安全のための遮断では
+        // なく、安全には関わらないため）。
+        const resourceDelivery = options.resourceDelivery;
+        if (isNavigationRequest || resourceDelivery === undefined) {
+          await continueNative(requestInvalidation, route, ledger);
+          return;
+        }
+        let delivery: ResourceDeliveryDecision | undefined;
+        try {
+          delivery = resourceDelivery.decide({
+            method: request.method(),
+            resourceType: request.resourceType(),
+            url: request.url(),
+            isNavigationRequest,
+          });
+        } catch {
+          delivery = undefined;
+        }
+        if (delivery?.kind === 'FROM_RUN_CACHE') {
+          expectedRouteFailures.add(request);
+          try {
+            resourceDelivery.beforeServeFromRunCache(request);
+          } catch {
+            // 印の失敗は、外に投げない（キャッシュから返す）。
+          }
+          try {
+            const { status, headers, body } = delivery.resource;
+            await route.fulfill({
+              status,
+              headers: { ...headers },
+              body: Buffer.from(body.buffer, body.byteOffset, body.byteLength),
+            });
+          } catch {
+            try {
+              await route.abort('blockedbyclient');
+            } catch {
+              // 返すのにも止めるのにも失敗した場合も、外に投げない（ネットワークには送っていない）。
+            }
+          }
+          return;
+        }
+        if (delivery?.kind === 'WITHHOLD') {
+          expectedRouteFailures.add(request);
+          try {
+            await route.abort('blockedbyclient');
+          } catch {
+            // 止めるのに失敗しても、外に投げない（ネットワークには送っていない）。
+          }
+          try {
+            resourceDelivery.afterWithhold(request);
+          } catch {
+            // 数えるのに失敗しても、外に投げない。
+          }
           return;
         }
         await continueNative(requestInvalidation, route, ledger);

@@ -159,8 +159,16 @@ export interface PassiveStressSession {
 export type PassiveStressSessionFactory = (viewport: Viewport) => Promise<PassiveStressSession>;
 
 export interface StressLayoutOptions {
-  /** すべての幅の収集の期限（`Date.now()` の絶対時刻）。省略時は呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
+  /** すべての幅の収集の期限（`Date.now()` の絶対時刻）。 */
   readonly deadlineAtMs: number;
+  /**
+   * 各幅の読み込み（`page.goto`）の直前に呼ぶ、ページの読み込みの間隔の待ち（サイトへの負荷の制御の設計書 4.1。Page Auditor は
+   * `NavigationPacer` の `beforeNavigation` を渡す）。待った時間（ms）を返す。返った時間の分だけ、`deadlineAtMs` を延ばし、
+   * 延ばした期限で、その幅と次の幅を判定する（設計書 4.4。待ち時間は期限を消費しない）。
+   * 必須の引数である（渡し忘れると間隔を空けずに読み込む、という形を残さない。Page Auditor の pacer と同じ。RL の Minor-5）。
+   * 待たない呼び出し側（テストなど）は、それを明示する関数（`async () => 0`）を渡す。
+   */
+  readonly beforeNavigation: () => Promise<number>;
 }
 
 function positiveFiniteDimension(value: number, name: string): void {
@@ -1315,13 +1323,15 @@ function failedWidth(
  * レスポンシブの各幅を、その都度新規に保護されたowner管理下のセッションでサンプリングする。
  * ある幅の遷移や収集が失敗しても、それまでの幅の結果を保持し、失敗した幅を理由付きで記録して次の幅へ進む。
  * 期限を過ぎた後の幅は、セッションを作らずに `NOT_STARTED` として記録する。
+ * 各幅の遷移の直前に `options.beforeNavigation` を呼び、待った時間の分だけ期限を延ばす（サイトへの負荷の制御の設計書 4.1、4.4）。
+ * `options`（期限と間隔の待ち）は省略できない。省略した場合と、`beforeNavigation` が関数でない場合は、セッションを作らずに例外を投げる。
  * セッションの作成と close の失敗は、owner のライフサイクルの失敗として例外で返す。
  */
 export async function collectStressLayout(
   pageFactory: PassiveStressSessionFactory,
   url: string,
   widths: readonly number[],
-  options: StressLayoutOptions = { deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs * widths.length },
+  options: StressLayoutOptions,
 ): Promise<readonly StressLayoutEvidence[]> {
   if (typeof pageFactory !== 'function') {
     throw new Error('A passive stress session factory is required');
@@ -1329,9 +1339,16 @@ export async function collectStressLayout(
   if (widths.some((width) => !Number.isFinite(width) || !Number.isInteger(width) || width <= 0)) {
     throw new Error('Responsive stress widths must be positive finite integers');
   }
-  const { deadlineAtMs } = options;
+  if (typeof options !== 'object' || options === null) {
+    throw new Error('Responsive stress requires options with a deadline and a beforeNavigation function');
+  }
+  const { beforeNavigation } = options;
+  let { deadlineAtMs } = options;
   if (!Number.isFinite(deadlineAtMs)) {
     throw new Error('Responsive stress deadline must be finite');
+  }
+  if (typeof beforeNavigation !== 'function') {
+    throw new Error('Responsive stress requires a beforeNavigation function');
   }
 
   const results: StressLayoutEvidence[] = [];
@@ -1346,6 +1363,8 @@ export async function collectStressLayout(
     let closeError: unknown;
     let result: StressLayoutEvidence | undefined;
     try {
+      // ページの読み込みの間隔のために待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。
+      deadlineAtMs += await beforeNavigation();
       const navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
       if (navigated.status === 'DEADLINE_EXCEEDED') {
         result = failedWidth(width, 'NAVIGATION', 'DEADLINE_EXCEEDED', undefined);

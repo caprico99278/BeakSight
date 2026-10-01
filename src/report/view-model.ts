@@ -37,9 +37,12 @@ import {
   type PageAuditStatus,
   type PageId,
   type RunEnvironment,
+  type RunExecution,
   type RunId,
+  type RunLoad,
   type RunSafetySummary,
   type RunStatus,
+  type RunSummary,
   type Severity,
   type ViewportProfile,
 } from '../core/contracts.js';
@@ -112,6 +115,19 @@ export interface RunLimitsView {
   readonly reached: CrawlLimitState;
 }
 
+/**
+ * 実行（起動）の記録（`RunSummary.executions`。中断した Run の再開の設計書 4.8 の「表示」。R6）。回数は、このモデルの組み立ての中で
+ * 1回だけ数える。HTML レポートの「実行の記録」、CLI の実行の行、`summary.json` は、この値を使い、数え直さない。
+ */
+export interface RunExecutionsView {
+  /** 実行の回数（`items` の件数）。 */
+  readonly count: number;
+  /** 再開の回数（最初の実行の後の、実行の数。`count - 1`）。 */
+  readonly resumeCount: number;
+  /** 実行の記録の値の写し（`RunSummary.executions` の順のまま）。終わり方のラベルと説明は、描画する側がカタログで引く。 */
+  readonly items: readonly [RunExecution, ...RunExecution[]];
+}
+
 /** 要約（設計書 6.1.4 の節1）。 */
 export interface RunSummaryView {
   readonly runId: RunId;
@@ -130,6 +146,13 @@ export interface RunSummaryView {
   /** 安全の不変条件の違反の件数（`RunSafetySummary.invariantViolationCount`）。 */
   readonly safetyInvariantViolationCount: number;
   readonly limits: RunLimitsView;
+  /**
+   * サイトへの負荷の記録（`RunSummary.load` の写し。サイトへの負荷の制御の設計書 3.1 の7、4.5）。集計や計算をせず、記録の値のまま持つ。
+   * HTML レポートの「サイトへの負荷」、CLI の負荷の行、`summary.json` は、この値を使う。
+   */
+  readonly load: RunLoad;
+  /** 実行（起動）の記録と、実行の回数と、再開の回数（R6）。 */
+  readonly executions: RunExecutionsView;
   /** Run の未完了の理由（`RunSummary.incompleteReasons` の順）。 */
   readonly incompleteReasons: readonly ReasonView[];
   readonly unverifiedInteractionCount: number;
@@ -377,6 +400,15 @@ const sortBySeverity = (findings: readonly FindingView[]): readonly FindingView[
   [...findings].sort((left, right) => SEVERITY_CATALOG[left.finding.severity].order - SEVERITY_CATALOG[right.finding.severity].order);
 
 const copyFinding = (finding: Finding): Finding => ({ ...finding, evidenceRefs: [...finding.evidenceRefs] });
+
+/**
+ * 実行の記録の表示（R6）。実行の回数と再開の回数を数えるのは、ここだけである。最初の実行の後の実行が、再開である。
+ * 記録の値は、写して持つ（入力を凍結しない）。
+ */
+const executionsView = (executions: RunSummary['executions']): RunExecutionsView => {
+  const [, ...resumedExecutions] = executions;
+  return { count: executions.length, resumeCount: resumedExecutions.length, items: structuredClone(executions) };
+};
 
 /** Safety の事象の記録から取り出す項目（記録にない項目は `null`）。 */
 type SafetyEventFields = Pick<SafetyEventView, 'method' | 'url' | 'candidateId' | 'reason'>;
@@ -732,6 +764,8 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
         maxRuntimeMs: crawl.maxRuntimeMs,
         reached: { ...run.crawlLimits },
       },
+      load: structuredClone(run.load),
+      executions: executionsView(run.executions),
       incompleteReasons: run.incompleteReasons.map(reasonView),
       unverifiedInteractionCount: run.unverifiedInteractionCount,
       unverifiedInternalLinkCount: run.unverifiedInternalLinkCount,

@@ -8,11 +8,13 @@ import { describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { controlledScroll } from '../../src/browser/controlled-scroll.js';
+import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import type { Viewport } from '../../src/config/types.js';
 import {
   FINDING_CATEGORIES,
   INCOMPLETE_REASON_CODES,
   INTERACTION_STATUSES,
+  RUN_EXECUTION_END_REASONS,
   VIEWPORT_PROFILES,
   type AuditRunResult,
   type EvidenceId,
@@ -63,9 +65,11 @@ import { PerformanceCollector } from '../../src/evidence/performance-collector.j
 import { captureScreenshots } from '../../src/evidence/screenshot-collector.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
+import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
+import { sampleRunCheckpoint } from '../helpers/run-checkpoint-samples.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory } from '../helpers/temporary-build.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -846,6 +850,7 @@ const validRun = {
   runStatus: 'PARTIAL',
   startedAt: '2026-08-27T00:00:00.000Z',
   finishedAt: '2026-08-27T00:01:00.000Z',
+  executions: [{ startedAt: '2026-08-27T00:00:00.000Z', finishedAt: '2026-08-27T00:01:00.000Z', endReason: 'COMPLETED' }],
   discoveredPageCount: 1,
   auditedPageCount: 0,
   partialPageCount: 1,
@@ -885,6 +890,18 @@ const validRun = {
   }],
   crawlLimits: { maxPagesReached: false, maxDepthReached: false, maxRuntimeReached: false },
   incompleteReasons: [{ code: 'DEADLINE_EXCEEDED', detail: 'PAGE-000001 mobile accessibility' }],
+  load: {
+    minNavigationIntervalMs: createTestConfig('https://example.test').crawl.minNavigationIntervalMs,
+    maxInteractionsPerPage: createTestConfig('https://example.test').crawl.maxInteractionsPerPage,
+    navigationCount: 3,
+    pacingWaitMs: 120,
+    requests: {
+      allowedOrigins: { count: 12, peakPerMinute: 9 },
+      otherOrigins: { count: 2, peakPerMinute: 2 },
+      servedFromCache: 4,
+      withheldOtherOrigins: 1,
+    },
+  },
 } satisfies RunSummary;
 
 const validAudit = {
@@ -941,6 +958,43 @@ describe('validateArtifact', () => {
 
   it('rejects an audit with a malformed nested Run summary', async () => {
     await expect(validateArtifact('audit', { ...validAudit, run: {} })).resolves.toMatchObject({ ok: false });
+  });
+
+  // R2（中断した Run の再開の設計書 4.2）: 再開のための保存の2つのスキーマ（`state.json` とページの保存）を、スキーマの名前の
+  // 閉じた一覧に加えた。保存の内容の詳しい検査は `tests/unit/run-checkpoint.test.ts` にある。
+  it.each([
+    ['checkpoint', 'checkpoint-schema/1.0'],
+    ['checkpoint-page', 'checkpoint-page-schema/1.0'],
+  ] as const)('validates %s artifacts with their own schema', async (schemaName, schemaVersion) => {
+    await expect(validateArtifact(schemaName, {})).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining(['/ must include schemaVersion']),
+    });
+    await expect(validateArtifact(schemaName, { schemaVersion })).resolves.toMatchObject({ ok: false });
+    await expect(validateArtifact(schemaName, validPage)).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining(['/schemaVersion must be equal to constant']),
+    });
+  });
+
+  // R4b1（中断した Run の再開の設計書 4.1、4.6.1）: 保存の時刻（`savedAt`）は、`state.json` の必須の項目である。止める印（Ctrl+C など）で
+  // 止めた理由 `RUN_INTERRUPTED` は、run.json の理由の閉じた一覧にある。
+  it('requires the saved time (savedAt) of a checkpoint state', async () => {
+    const checkpoint = JSON.parse(JSON.stringify(sampleRunCheckpoint())) as Record<string, unknown>;
+    await expect(validateArtifact('checkpoint', checkpoint)).resolves.toEqual({ ok: true });
+
+    const { savedAt: _savedAt, ...withoutSavedAt } = checkpoint;
+    await expect(validateArtifact('checkpoint', withoutSavedAt)).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining(['/ must include savedAt']),
+    });
+  });
+
+  it('accepts a run.json and an audit.json whose Run reason is RUN_INTERRUPTED (a stop signal)', async () => {
+    const run = { ...validRun, incompleteReasons: [{ code: 'RUN_INTERRUPTED', detail: null }] };
+
+    await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('audit', { ...validAudit, run })).resolves.toEqual({ ok: true });
   });
 
   // DEF-002: 検証関数の表は普通のオブジェクトなので、Object の既定のプロパティ名（継承したもの）や未知の名前を
@@ -1305,6 +1359,54 @@ describe('F17b: the lower bound of the interaction timeout in the effective conf
 
   it('accepts an interaction timeout at the lower bound', async () => {
     await expect(validateArtifact('run', withInteractionTimeout(lowestAcceptedTimeoutMs))).resolves.toEqual({ ok: true });
+  });
+});
+
+// L1（サイトへの負荷の制御の設計書 3.2、4.2）: ページの読み込みの最小の間隔と、1ページの Interaction の候補の上限。
+// スキーマは数値を直接書くので、上限が `INTERACTION_CANDIDATE_LIMITS.maxCandidates` と一致することを確かめる。
+// ループバックの例外（許可 Origin による下限）は、設定の検証（`validateConfig`）だけが確かめる。
+describe('L1: the navigation interval and the Interaction limit per page in the effective configuration', () => {
+  const config = validRun.effectiveConfig;
+  const withCrawl = (change: Record<string, unknown>) => ({
+    ...validRun,
+    effectiveConfig: { ...config, crawl: { ...config.crawl, ...change } },
+  });
+  const crawlSchemaAt = async (path: readonly string[]): Promise<unknown> =>
+    schemaAt(await readSchema('run'), ['properties', 'effectiveConfig', 'properties', 'crawl', ...path]);
+
+  it('requires crawl.minNavigationIntervalMs and crawl.maxInteractionsPerPage', async () => {
+    expect(await crawlSchemaAt(['required'])).toEqual(expect.arrayContaining(['minNavigationIntervalMs', 'maxInteractionsPerPage']));
+    for (const key of ['minNavigationIntervalMs', 'maxInteractionsPerPage']) {
+      await expect(validateArtifact('run', { ...validRun, effectiveConfig: { ...config, crawl: withoutKey(config.crawl, key) } }), key)
+        .resolves.toMatchObject({ ok: false, errors: expect.arrayContaining([expect.stringContaining(key)]) });
+    }
+  });
+
+  it('uses INTERACTION_CANDIDATE_LIMITS.maxCandidates as the maximum of crawl.maxInteractionsPerPage', async () => {
+    expect(await crawlSchemaAt(['properties', 'maxInteractionsPerPage', 'maximum'])).toBe(INTERACTION_CANDIDATE_LIMITS.maxCandidates);
+  });
+
+  it.each([
+    ['minNavigationIntervalMs', -1],
+    ['minNavigationIntervalMs', 1_000.5],
+    ['minNavigationIntervalMs', '5000'],
+    ['maxInteractionsPerPage', 0],
+    ['maxInteractionsPerPage', INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1],
+    ['maxInteractionsPerPage', 1.5],
+  ] as const)('rejects crawl.%s = %j', async (key, value) => {
+    await expect(validateArtifact('run', withCrawl({ [key]: value }))).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.stringContaining(key)]),
+    });
+  });
+
+  it.each([
+    ['minNavigationIntervalMs', 0],
+    ['minNavigationIntervalMs', DEFAULT_CONFIG.crawl.minNavigationIntervalMs],
+    ['maxInteractionsPerPage', 1],
+    ['maxInteractionsPerPage', INTERACTION_CANDIDATE_LIMITS.maxCandidates],
+  ] as const)('accepts crawl.%s = %j', async (key, value) => {
+    await expect(validateArtifact('run', withCrawl({ [key]: value }))).resolves.toEqual({ ok: true });
   });
 });
 
@@ -2135,6 +2237,7 @@ describe('C8: real collector output from local fixtures', () => {
       });
       const dom = await collectDomEvidence(page, sourcePageId);
       const primary = await collectLayoutEvidence(page, viewport, { deadlineAtMs });
+      // 幅の走査の間隔の待ちは省略できない（RL-fix）。この Evidence の見本は、間隔を確かめないので、待たないことを明示して渡す。
       const stressSweep = await collectStressLayout(async (stressViewport) => {
         const stressContext = await factory.createPassiveContext(stressViewport);
         const stressPage = await factory.createPassivePage(stressContext);
@@ -2145,7 +2248,7 @@ describe('C8: real collector output from local fixtures', () => {
             await factory.closePassiveContext(stressContext);
           },
         };
-      }, url, [320], { deadlineAtMs });
+      }, url, [320], { deadlineAtMs, beforeNavigation: async () => 0 });
       const color = await collectColorEvidence(page);
       const networkEvidence = await network.snapshot();
       const performance = await performanceCollector.collect(page, networkEvidence, { deadlineAtMs });
@@ -2368,6 +2471,158 @@ describe('R15a: run summary counts and retries', () => {
   it.each(['url', 'attempt', 'navigationOutcome', 'detail', 'evidenceIds'])('rejects a retry without %s', async (key) => {
     await expect(validateArtifact('run', { ...validRun, retries: [withoutKey(retry as object, key)] }))
       .resolves.toMatchObject({ ok: false });
+  });
+});
+
+// L4（サイトへの負荷の制御の設計書 4.5）: run.json の必須の項目 `load`。すべての項目が必須で、0 以上の整数。宣言していない項目は拒む。
+describe('L4: run summary load', () => {
+  const { load } = validRun;
+  const { requests } = load;
+
+  // 数の項目は、すべて 0 を受け付ける。Interaction の候補の上限は、設定と同じ範囲なので、その下限（1）にする（RL-fix。RL の Minor-6）。
+  it('accepts a load record whose counts are all zero, with the interaction limit at its lower bound', async () => {
+    await expect(validateArtifact('run', {
+      ...validRun,
+      load: {
+        minNavigationIntervalMs: 0,
+        maxInteractionsPerPage: 1,
+        navigationCount: 0,
+        pacingWaitMs: 0,
+        requests: {
+          allowedOrigins: { count: 0, peakPerMinute: 0 },
+          otherOrigins: { count: 0, peakPerMinute: 0 },
+          servedFromCache: 0,
+          withheldOtherOrigins: 0,
+        },
+      },
+    })).resolves.toEqual({ ok: true });
+  });
+
+  it('rejects a run summary without load', async () => {
+    await expect(validateArtifact('run', withoutKey(validRun, 'load'))).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.stringContaining('load')]),
+    });
+  });
+
+  it.each(['minNavigationIntervalMs', 'maxInteractionsPerPage', 'navigationCount', 'pacingWaitMs', 'requests'])(
+    'rejects a load record without %s',
+    async (key) => {
+      await expect(validateArtifact('run', { ...validRun, load: withoutKey(load, key) })).resolves.toMatchObject({ ok: false });
+    },
+  );
+
+  it.each(['allowedOrigins', 'otherOrigins', 'servedFromCache', 'withheldOtherOrigins'])(
+    'rejects load requests without %s',
+    async (key) => {
+      await expect(validateArtifact('run', { ...validRun, load: { ...load, requests: withoutKey(requests, key) } }))
+        .resolves.toMatchObject({ ok: false });
+    },
+  );
+
+  it.each(['allowedOrigins', 'otherOrigins'] as const)('rejects %s requests without count or peakPerMinute', async (origin) => {
+    for (const key of ['count', 'peakPerMinute']) {
+      await expect(validateArtifact('run', {
+        ...validRun,
+        load: { ...load, requests: { ...requests, [origin]: withoutKey(requests[origin], key) } },
+      })).resolves.toMatchObject({ ok: false });
+    }
+  });
+
+  it.each([
+    ['a negative navigation count', { ...load, navigationCount: -1 }],
+    ['a fractional pacing wait', { ...load, pacingWaitMs: 0.5 }],
+    ['a string minimum navigation interval', { ...load, minNavigationIntervalMs: '5000' }],
+    ['a null interaction limit', { ...load, maxInteractionsPerPage: null }],
+    ['a negative served-from-cache count', { ...load, requests: { ...requests, servedFromCache: -1 } }],
+    ['a fractional withheld count', { ...load, requests: { ...requests, withheldOtherOrigins: 1.5 } }],
+    ['a negative allowed-origin count', { ...load, requests: { ...requests, allowedOrigins: { count: -1, peakPerMinute: 0 } } }],
+    ['a fractional other-origin peak', { ...load, requests: { ...requests, otherOrigins: { count: 1, peakPerMinute: 0.5 } } }],
+    ['an undeclared load field', { ...load, extra: 1 }],
+    ['an undeclared requests field', { ...load, requests: { ...requests, extra: 1 } }],
+    ['an undeclared origin requests field', { ...load, requests: { ...requests, allowedOrigins: { count: 1, peakPerMinute: 1, extra: 1 } } }],
+    ['requests that are not an object', { ...load, requests: [] }],
+  ])('rejects a load record with %s', async (_label, changed) => {
+    await expect(validateArtifact('run', { ...validRun, load: changed })).resolves.toMatchObject({ ok: false });
+  });
+
+  // RL-fix（RL の Minor-6）: `load.maxInteractionsPerPage` は、実効の設定の `crawl.maxInteractionsPerPage` の値なので、設定と同じ
+  // 範囲（1 以上、`INTERACTION_CANDIDATE_LIMITS.maxCandidates` 以下の整数）にする。形は二重に定義せず、設定の定義を JSON Pointer で参照する。
+  describe('the range of load.maxInteractionsPerPage (the same definition as the setting)', () => {
+    const SETTING_POINTER_PATH = ['properties', 'effectiveConfig', 'properties', 'crawl', 'properties', 'maxInteractionsPerPage'] as const;
+
+    it('refers to the definition of effectiveConfig.crawl.maxInteractionsPerPage', async () => {
+      const schema = await readSchema('run');
+
+      expect(schemaAt(schema, ['properties', 'load', 'properties', 'maxInteractionsPerPage'])).toEqual({
+        $ref: `#/${SETTING_POINTER_PATH.join('/')}`,
+      });
+      // 参照の先は、設定の定義（1 以上、候補の発見の上限以下の整数）である。
+      expect(schemaAt(schema, SETTING_POINTER_PATH)).toEqual({
+        type: 'integer',
+        minimum: 1,
+        maximum: INTERACTION_CANDIDATE_LIMITS.maxCandidates,
+      });
+    });
+
+    it.each([0, INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1, 1.5])('rejects load.maxInteractionsPerPage = %j', async (value) => {
+      await expect(validateArtifact('run', { ...validRun, load: { ...load, maxInteractionsPerPage: value } })).resolves.toMatchObject({
+        ok: false,
+        errors: expect.arrayContaining([expect.stringContaining('/load/maxInteractionsPerPage')]),
+      });
+    });
+
+    it.each([1, INTERACTION_CANDIDATE_LIMITS.maxCandidates])('accepts load.maxInteractionsPerPage = %j', async (value) => {
+      await expect(validateArtifact('run', { ...validRun, load: { ...load, maxInteractionsPerPage: value } }))
+        .resolves.toEqual({ ok: true });
+    });
+  });
+});
+
+// R4b2（中断した Run の再開の設計書 4.8）: run.json の実行の記録。各実行の開始と終わりの時刻と終わり方を、実行の順に並べる（1件以上）。
+// 終わり方は、閉じた一覧 `RUN_EXECUTION_END_REASONS` の値で、実行の途中を表す null を含まない。各実行の環境は含めない（保存の state.json に残す）。
+describe('R4b2: run summary executions', () => {
+  const [execution] = validRun.executions;
+
+  it('accepts the executions of a resumed Run, with every end reason of RUN_EXECUTION_END_REASONS', async () => {
+    const executions = RUN_EXECUTION_END_REASONS.map((endReason) => ({ ...execution, endReason }));
+
+    await expect(validateArtifact('run', { ...validRun, executions })).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('audit', { ...validAudit, run: { ...validRun, executions } })).resolves.toEqual({ ok: true });
+  });
+
+  it('rejects a run summary without executions, or with no execution', async () => {
+    await expect(validateArtifact('run', withoutKey(validRun, 'executions'))).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.stringContaining('executions')]),
+    });
+    await expect(validateArtifact('run', { ...validRun, executions: [] })).resolves.toMatchObject({ ok: false });
+  });
+
+  it.each(['startedAt', 'finishedAt', 'endReason'])('rejects an execution without %s', async (key) => {
+    await expect(validateArtifact('run', { ...validRun, executions: [withoutKey(execution, key)] })).resolves.toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.stringContaining(key)]),
+    });
+  });
+
+  it.each([
+    ['a null end reason (an unfinished execution)', { endReason: null }],
+    ['an end reason outside RUN_EXECUTION_END_REASONS', { endReason: 'CANCELLED' }],
+    ['a null finishedAt', { finishedAt: null }],
+    ['an empty finishedAt', { finishedAt: '' }],
+    ['an empty startedAt', { startedAt: '' }],
+    ['the environment of the execution', { environment: validRun.environment }],
+  ])('rejects an execution with %s', async (_name, change) => {
+    // 対照: 変える前の実行の記録は受け付ける（拒むのは、変えた項目のため）。
+    await expect(validateArtifact('run', { ...validRun, executions: [execution] })).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('run', { ...validRun, executions: [{ ...execution, ...change }] })).resolves.toMatchObject({ ok: false });
+  });
+
+  it('refers to the definition of the startedAt of the run summary', async () => {
+    const schema = await readSchema('run');
+
+    expect(schemaAt(schema, ['properties', 'executions', 'items', 'properties', 'startedAt'])).toEqual({ $ref: '#/properties/startedAt' });
   });
 });
 

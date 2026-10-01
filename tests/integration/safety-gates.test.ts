@@ -502,7 +502,7 @@ describe('GATE-S03: navigations to external schemes by the page are recorded, an
     // 開始の URL のクエリ（経路とスキームの選択）を、クロールの正規化で落とさないように、許可するクエリの名前を指定する。
     const cliRun = await runGateCli('s03-external-scheme', externalSchemeFixturePath(route, key), undefined, {
       audit: { screenshots: false },
-      crawl: { allowedQueryParameters: ['to', 'via'] },
+      crawl: { allowedQueryParameters: ['to', 'via'], minNavigationIntervalMs: 0 },
     });
 
     expect(cliRun.stderr).toBe('');
@@ -596,7 +596,7 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
 
     const cliRun = await runGateCli('s03-external-scheme-main-redirect', path, undefined, {
       audit: { screenshots: false },
-      crawl: { allowedQueryParameters: ['to'] },
+      crawl: { allowedQueryParameters: ['to'], minNavigationIntervalMs: 0 },
     });
 
     expect(cliRun.stderr).toBe('');
@@ -622,7 +622,7 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
     // 開始の URL のクエリ（宛先の名前の選択）を、クロールの正規化で落とさないように、許可するクエリの名前を指定する。
     const cliRun = await runGateCli('s03-external-scheme-redirect', path, undefined, {
       audit: { screenshots: false },
-      crawl: { allowedQueryParameters: ['to'] },
+      crawl: { allowedQueryParameters: ['to'], minNavigationIntervalMs: 0 },
     });
 
     expect(cliRun.stderr).toBe('');

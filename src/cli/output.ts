@@ -3,12 +3,13 @@
  * - 日本語の文言は `src/presentation/messages.ts`、ラベルは `src/presentation/catalog.ts`、件数の書式は `src/presentation/format.ts`
  *   から取る。このファイルには、行の並べ方（字下げ、箇条書きの印）だけを置く。
  * - 実行の結果の件数は、表示用モデル（`ReportViewModel.summary`）から取る。数え直さない（UI追補設計書 4.1）。
+ * - 実行中の進み具合の件数と時間は、Run Coordinator が渡す事実（`RunProgressReport`）から取る。計算しない（サイトへの負荷の制御の設計書 4.8）。
  * - 技術的な詳細（英語のエラーの文、パス）は、1行にして、そのまま示す。スタックトレースは示さない。
  */
 import type { ConfigError, ConfigErrorKind } from '../config/config-error.js';
 import type { AuditConfig } from '../config/types.js';
 import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath } from '../core/artifact-layout.js';
-import { RUN_STATUSES, type RunStatus } from '../core/contracts.js';
+import { RUN_STATUSES, type RunProgressReport, type RunStatus } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace } from '../core/text.js';
@@ -20,22 +21,47 @@ import {
   severitiesInGroup,
   sortByDisplayOrder,
 } from '../presentation/catalog.js';
-import { formatCount } from '../presentation/format.js';
+import { formatCount, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../presentation/format.js';
+import type { RunVersionDifference, RunVersionField } from '../orchestration/run-checkpoint.js';
+import type { RunResumeUnavailableReason } from '../orchestration/run-coordinator.js';
 import {
   CLI_COMMAND_DESCRIPTIONS,
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
+  HTML_REPORT_TEXT,
   RUN_SUMMARY_TEXT,
+  activeRunInOutputDirectoryText,
+  checkpointStoreFailedText,
   cliCountText,
   cliFieldText,
+  countWithDetailsText,
   describeConfigError,
+  differentConfigRunText,
+  differentVersionRunText,
+  finalizingRunText,
   findingGroupCountsLabelText,
+  finishedCheckpointCleanupFailedText,
   labelWithCodeText,
   listText,
+  progressItemsText,
+  resumingRunText,
+  runLockHeldText,
+  runLockTakenOverText,
+  truncatedListText,
+  unreadableCheckpointText,
+  versionDifferenceText,
 } from '../presentation/messages.js';
 import type { RunSummaryView } from '../report/view-model.js';
 import { CLI_COMMANDS, CLI_OPTION_NAMES } from './arguments.js';
-import { CONFIG_ERROR_EXIT_CODE, CONFIG_ERROR_OUTCOME, exitCodeForRunStatus } from './exit-codes.js';
+import {
+  CONFIG_ERROR_EXIT_CODE,
+  CONFIG_ERROR_OUTCOME,
+  INTERRUPTED_EXIT_CODE,
+  INTERRUPTED_OUTCOME,
+  RUN_UNAVAILABLE_EXIT_CODE,
+  RUN_UNAVAILABLE_OUTCOME,
+  exitCodeForRunStatus,
+} from './exit-codes.js';
 
 /** 使い方の表示で使う、プログラムの名前（`package.json` の `bin`）。 */
 const PROGRAM_NAME = 'beaksight';
@@ -82,6 +108,10 @@ export function usageLines(): readonly string[] {
       label: labelWithCodeText(RUN_STATUS_CATALOG[status].label, status),
     })),
     { code: CONFIG_ERROR_EXIT_CODE, label: labelWithCodeText(CLI_TEXT.configErrorHeading, CONFIG_ERROR_OUTCOME) },
+    // 設定のエラーと同じ値（中断した Run の再開の設計書 4.7.1）。並べ替えは安定なので、設定のエラーの行の後に並ぶ。
+    { code: RUN_UNAVAILABLE_EXIT_CODE, label: labelWithCodeText(CLI_TEXT.runUnavailableHeading, RUN_UNAVAILABLE_OUTCOME) },
+    // 中断（2回目のシグナル。最後の処理をしていない。中断した Run の再開の設計書 4.7、4.7.1）。
+    { code: INTERRUPTED_EXIT_CODE, label: labelWithCodeText(CLI_TEXT.interruptedHeading, INTERRUPTED_OUTCOME) },
   ].sort((left, right) => left.code - right.code);
   return [
     cliFieldText(CLI_TEXT.usage.heading, [PROGRAM_NAME, CLI_TEXT.usage.commandPlaceholder, CLI_TEXT.usage.optionsPlaceholder].join(' ')),
@@ -152,16 +182,53 @@ export function runStartedLines(config: AuditConfig): readonly string[] {
 }
 
 /**
+ * `run` の実行中の進み具合の1行（サイトへの負荷の制御の設計書 4.8）。ページの監査が1つ終わるたびに、Run Coordinator が渡す事実
+ * （`RunProgressReport`）から作る。値は、事実をそのまま書式にかけるだけで、計算しない（直近の1分の件数も、事実のもの）。
+ * 項目の順: 監査を終えたページ（発見したページと、ページ数の上限を添える）、ページの読み込みの回数、許可 Origin への要求（直近の1分の
+ * 件数と、1分あたりの最大を添える）、許可 Origin の外への要求、経過時間。
+ */
+export function runProgressLines(report: RunProgressReport): readonly string[] {
+  const text = CLI_TEXT.progress;
+  return [
+    cliFieldText(
+      text.heading,
+      progressItemsText([
+        cliCountText(
+          text.pagesFinished,
+          countWithDetailsText(formatCount(report.pagesFinished), [
+            cliCountText(RUN_SUMMARY_TEXT.coverage.discovered, formatCount(report.pagesDiscovered)),
+            cliCountText(text.maxPages, formatCount(report.maxPages)),
+          ]),
+        ),
+        cliCountText(CLI_TEXT.run.navigationCount, formatTimes(report.navigationCount)),
+        cliCountText(
+          RUN_SUMMARY_TEXT.allowedOriginRequests,
+          formatRequestsWithPeak(report.requests.allowedOrigins, report.recentPerMinute.allowedOrigins),
+        ),
+        cliCountText(text.otherOriginRequests, formatCount(report.requests.otherOrigins.count)),
+        cliCountText(text.elapsed, formatElapsedTime(report.elapsedMs)),
+      ]),
+    ),
+  ];
+}
+
+/**
  * `run` の結果の行（設計書 第7章）。値は、表示用モデルの `summary` から取る。
  * - Run Status の日本語のラベル（値そのものを添える）
  * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス
  * - ページの網羅（発見、監査、一部未完了、失敗、スキップ）
  * - severity の区分（サイト品質、Safety）ごとの、severity ごとの件数
+ * - サイトへの負荷（ページの読み込みの回数と、許可 Origin への要求の件数と1分あたりの最大。サイトへの負荷の制御の設計書 4.5）。
+ *   指摘の件数の行の後に置く（HTML レポートの要約の小節の順と同じ）。回数は `formatTimes`、要求の件数と最大は
+ *   HTML レポートと共通の `formatRequestsWithPeak` で示す（L7）
+ * - 実行の記録（実行の回数と再開の回数。例: `実行: 3回、再開 2回`。中断した Run の再開の設計書 4.8 の「表示」。R6）。負荷の行の後、
+ *   未完了の理由の行の前に置く（HTML レポートの要約の小節の順と同じ）。実行が1回でも示す。回数は、表示用モデルの値を `formatTimes` で示す
  * - 未完了の理由がある場合は、その件数
  */
 export function runSummaryLines(summary: RunSummaryView, runDirectory: string): readonly string[] {
   const coverage = RUN_SUMMARY_TEXT.coverage;
   const counts = summary.findingCounts;
+  const { load, executions } = summary;
   const groupLines = sortByDisplayOrder(SEVERITY_GROUPS, SEVERITY_GROUP_CATALOG).map((group) =>
     cliFieldText(
       findingGroupCountsLabelText(SEVERITY_GROUP_CATALOG[group].label),
@@ -187,8 +254,103 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
       ]),
     ),
     ...groupLines,
+    cliFieldText(
+      RUN_SUMMARY_TEXT.loadHeading,
+      listText([
+        cliCountText(CLI_TEXT.run.navigationCount, formatTimes(load.navigationCount)),
+        cliCountText(RUN_SUMMARY_TEXT.allowedOriginRequests, formatRequestsWithPeak(load.requests.allowedOrigins)),
+      ]),
+    ),
+    cliFieldText(
+      CLI_TEXT.run.executions,
+      listText([formatTimes(executions.count), cliCountText(CLI_TEXT.run.resumes, formatTimes(executions.resumeCount))]),
+    ),
     ...(summary.incompleteReasons.length > 0
       ? [cliFieldText(RUN_SUMMARY_TEXT.reasonsHeading, formatCount(summary.incompleteReasons.length))]
       : []),
   ];
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 中断した Run の再開の流れの行（中断した Run の再開の設計書 4.7、4.7.1。R5a）。文言は `messages.ts`、数の書式は `format.ts`、一覧を短くする
+// 書式は `truncatedListText` のもの。ここには、値の並べ方だけを置く。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 設定が違う途中の Run の知らせで、違う項目のパスを並べる上限（設計書 4.7.1。残りは、件数だけを示す）。 */
+export const MAX_LISTED_CONFIG_DIFFERENCES = 5;
+
+/** 違う版の項目の、表示の名前（HTML レポートの要約の、BeakSight の版と Playwright の版のラベル）。 */
+const RUN_VERSION_FIELD_LABELS = Object.freeze({
+  toolVersion: HTML_REPORT_TEXT.summary.toolVersion,
+  playwrightVersion: HTML_REPORT_TEXT.summary.environment.playwrightVersion,
+} as const satisfies Record<RunVersionField, string>);
+
+/** 再開を始められなかった理由（`RunResumeUnavailableError.reason`）ごとの文言。書き漏れは、型のエラーになる。 */
+const RUN_RESUME_UNAVAILABLE_TEXTS = Object.freeze({
+  LOCK_HELD_BY_ACTIVE_RUN: runLockHeldText,
+  LOCK_TAKEN_OVER_CONCURRENTLY: runLockTakenOverText,
+  CHECKPOINT_STORE_FAILED: checkpointStoreFailedText,
+} as const satisfies Record<RunResumeUnavailableReason, (runId: string) => string>);
+
+/** 同じ出力先で、別の Run が実行中なので、Run を始めずに終える行。 */
+export function activeRunLines(runId: string): readonly string[] {
+  return [activeRunInOutputDirectoryText(runId)];
+}
+
+/** 途中の Run の再開のための保存を読めないので、再開の対象にしない行（壊れた保存）。 */
+export function unreadableCheckpointLines(runId: string): readonly string[] {
+  return [unreadableCheckpointText(runId)];
+}
+
+/**
+ * 設定が違うので、途中の Run を再開せずに、新しい Run を始める行。違う項目のパスは、`MAX_LISTED_CONFIG_DIFFERENCES` 件まで並べ、残りは
+ * 件数だけを示す（`truncatedListText`）。
+ */
+export function differentConfigRunLines(runId: string, differences: readonly string[]): readonly string[] {
+  return [differentConfigRunText(runId, truncatedListText(differences, MAX_LISTED_CONFIG_DIFFERENCES))];
+}
+
+/** 版が違うので、途中の Run を再開できずに終える行。違う版の項目を、表示の名前、保存の値、今の値で、項目の順に並べる。 */
+export function differentVersionRunLines(runId: string, differences: readonly RunVersionDifference[]): readonly string[] {
+  return [differentVersionRunText(
+    runId,
+    listText(differences.map(({ field, saved, current }) => versionDifferenceText(RUN_VERSION_FIELD_LABELS[field], saved, current))),
+  )];
+}
+
+/**
+ * 途中の Run を、続きから再開する行。監査を終えたページの数は、実行中の進み具合の行と同じ書き方（`監査を終えたページ <件数>`）にする。
+ */
+export function resumingRunLines(runId: string, completedPages: number): readonly string[] {
+  return [resumingRunText(runId, cliCountText(CLI_TEXT.progress.pagesFinished, formatCount(completedPages)))];
+}
+
+/** 違反を検出した後の途中の Run なので、新しいページを監査せずに、最後の処理だけを行う行。 */
+export function finalizingRunLines(runId: string): readonly string[] {
+  return [finalizingRunText(runId)];
+}
+
+/**
+ * 再開を始められなかった（`RunResumeUnavailableError`）行。理由ごとの文言と、保存を読み書きできなかった場合は、1行の技術的な詳細
+ * （`cause`）を示す。
+ */
+export function runResumeUnavailableLines(input: {
+  readonly reason: RunResumeUnavailableReason;
+  readonly runId: string;
+  readonly cause: unknown;
+}): readonly string[] {
+  return [
+    RUN_RESUME_UNAVAILABLE_TEXTS[input.reason](input.runId),
+    ...(input.reason === 'CHECKPOINT_STORE_FAILED' ? detailLines([input.cause]) : []),
+  ];
+}
+
+/** 最後の出力を書いた後に、保存の終わりを書けなかった警告の行。 */
+export function checkpointFinishFailedLines(): readonly string[] {
+  return [CLI_TEXT.resume.finishFailed];
+}
+
+/** 終わった Run の、使わない再開のための保存を消せなかった警告の行（`path` は、消せなかったもの）。 */
+export function finishedCheckpointCleanupFailedLines(path: string): readonly string[] {
+  return [finishedCheckpointCleanupFailedText(technicalDetailText(path))];
 }

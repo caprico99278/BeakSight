@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { Browser, BrowserContext, CDPSession, Download, Page, Request, Route, WebSocketRoute } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import type { CachedResource } from '../../src/browser/resource-delivery.js';
 import { wait } from '../../src/core/deadline.js';
 import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
@@ -15,6 +16,7 @@ import {
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
+  type GuardResourceDelivery,
 } from '../../src/safety/passive-request-guard.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
@@ -4992,5 +4994,315 @@ describe('C18h: the redirect correlation is counted from the 3xx response and fo
     ]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
     expect(harness.closeCount).toBe(0);
+  });
+});
+
+// L5b（サイトへの負荷の制御の設計書 4.7）: Guard は、段階が PASSIVE_ACTIVE で、許可の判定が ALLOW の、ナビゲーションでない要求の
+// 届け方だけを、注入された部品（`resourceDelivery`）に尋ねる。部品が選べるのは、ネットワーク（今のまま）、キャッシュから返す、
+// 送らない、の3つだけで、後の2つはネットワークに何も送らない。部品の例外と、`route.fulfill` と `route.abort` の失敗は、Guard の外に
+// 投げず、違反にもしない（安全には関わらない）。送らなかった要求は、Safety の記録に入れない。
+describe('resource delivery of the requests the Guard allowed (L5b)', () => {
+  const ORIGIN = 'https://example.test';
+  const OTHER_ORIGIN = 'https://other.test';
+  const CACHED_RESOURCE: CachedResource = Object.freeze({
+    url: `${ORIGIN}/asset.svg`,
+    status: 200,
+    headers: Object.freeze({ 'content-type': 'image/svg+xml' }),
+    body: new Uint8Array(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')),
+  });
+
+  /** 届け方の部品の呼び出しを記録する偽の部品。`decide` は注入する。 */
+  function recordingDelivery(decide: GuardResourceDelivery['decide']): {
+    readonly delivery: GuardResourceDelivery;
+    readonly calls: string[];
+    readonly decided: Parameters<GuardResourceDelivery['decide']>[0][];
+  } {
+    const calls: string[] = [];
+    const decided: Parameters<GuardResourceDelivery['decide']>[0][] = [];
+    return {
+      calls,
+      decided,
+      delivery: {
+        decide: (request) => {
+          calls.push('decide');
+          decided.push(request);
+          return decide(request);
+        },
+        beforeServeFromRunCache: (request) => {
+          calls.push(`beforeServeFromRunCache:${request.url()}`);
+        },
+        afterWithhold: (request) => {
+          calls.push(`afterWithhold:${request.url()}`);
+        },
+      },
+    };
+  }
+
+  /** route の操作を `calls` に記録する偽の route。fulfill と abort の失敗を注入できる。 */
+  function deliveryRoute(
+    calls: string[],
+    facts: {
+      readonly method?: string;
+      readonly url: string;
+      readonly resourceType?: string;
+      readonly navigationPage?: Page;
+      readonly fulfillError?: Error;
+      readonly abortError?: Error;
+    },
+  ): { readonly route: Route; readonly request: Request; readonly fulfilled: unknown[] } {
+    const fulfilled: unknown[] = [];
+    const request = {
+      method: () => facts.method ?? 'GET',
+      url: () => facts.url,
+      resourceType: () => facts.resourceType ?? 'image',
+      isNavigationRequest: () => facts.navigationPage !== undefined,
+      frame: () => ({ parentFrame: () => null, page: () => facts.navigationPage }),
+    } as unknown as Request;
+    const route = {
+      request: () => request,
+      fulfill: async (options: unknown): Promise<void> => {
+        calls.push('fulfill');
+        fulfilled.push(options);
+        if (facts.fulfillError !== undefined) throw facts.fulfillError;
+      },
+      abort: async (errorCode?: string): Promise<void> => {
+        calls.push(`abort:${errorCode ?? ''}`);
+        if (facts.abortError !== undefined) throw facts.abortError;
+      },
+      fallback: async (): Promise<void> => {
+        calls.push('fallback');
+      },
+    } as unknown as Route;
+    return { route, request, fulfilled };
+  }
+
+  async function guardWith(delivery: GuardResourceDelivery): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger }> {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), { ...HEADLESS_GUARD, resourceDelivery: delivery });
+    return { harness, ledger };
+  }
+
+  /** Safety の記録が、何もないこと（送らなかった要求も、キャッシュから返した要求も、記録しない）。 */
+  function expectNoSafetyRecords(ledger: SafetyLedger): void {
+    const snapshot = ledger.snapshot();
+    expect(snapshot.blockedRequests).toEqual([]);
+    expect(snapshot.blockedInteractionRequests).toEqual([]);
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.invariantViolationCount).toBe(0);
+  }
+
+  it('serves FROM_RUN_CACHE with route.fulfill, marking the request before serving, without the network or a Safety record', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.decided).toEqual([
+      { method: 'GET', resourceType: 'image', url: CACHED_RESOURCE.url, isNavigationRequest: false },
+    ]);
+    expect(recording.calls).toEqual(['decide', `beforeServeFromRunCache:${CACHED_RESOURCE.url}`, 'fulfill']);
+    const [options] = routed.fulfilled as [{ readonly status: number; readonly headers: Record<string, string>; readonly body: Buffer }];
+    expect(options.status).toBe(200);
+    expect(options.headers).toEqual({ 'content-type': 'image/svg+xml' });
+    // 本文は、写さずに包んだ Buffer（キャッシュの本文と同じメモリー）。
+    expect(Buffer.isBuffer(options.body)).toBe(true);
+    expect(options.body.buffer).toBe(CACHED_RESOURCE.body.buffer);
+    expect(options.body.equals(Buffer.from(CACHED_RESOURCE.body))).toBe(true);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('withholds WITHHOLD with route.abort and then tells the delivery part, without the network or a Safety record', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'WITHHOLD' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const url = `${OTHER_ORIGIN}/tag.js`;
+    const routed = deliveryRoute(recording.calls, { url, resourceType: 'script' });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.calls).toEqual(['decide', 'abort:blockedbyclient', `afterWithhold:${url}`]);
+    // Guard が自分で止めた要求なので、その失敗の事象は違反にしない（`expectedRouteFailures` に登録してある）。
+    harness.requestFailedHandler?.(routed.request);
+    await flushGuardProtocolCallbacks();
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('sends NETWORK through the native fallback, as without the delivery part', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'NETWORK' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: `${ORIGIN}/fresh.svg` });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['decide', 'fallback']);
+    expectNoSafetyRecords(ledger);
+  });
+
+  it('does not ask the delivery part for a navigation request', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'WITHHOLD' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const page = await readyHarnessPage(harness);
+    const routed = deliveryRoute(recording.calls, { url: `${ORIGIN}/next.html`, resourceType: 'document', navigationPage: page });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['fallback']);
+    expectNoSafetyRecords(ledger);
+  });
+
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])('does not ask the delivery part for a %s request; the Guard blocks and records it', async (method) => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { method, url: CACHED_RESOURCE.url, resourceType: 'fetch' });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    expect(ledger.snapshot().blockedRequests).toEqual([expect.objectContaining({ method, url: CACHED_RESOURCE.url })]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('does not ask the delivery part after the freeze, even for a cached URL; the Guard blocks and records it', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const page = createHarnessPage(harness, { url: `${ORIGIN}/fixture` });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([
+      { method: 'GET', url: CACHED_RESOURCE.url, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  // RL-fix（RL の Minor-4 (c)）: Guard が閉じている段階（閉じかけ、無効化の途中）では、届け方の部品に尋ねず、Guard が今のまま止める
+  // （キャッシュにある URL でも、キャッシュから返さない）。対照として、同じ Guard と同じ要求で、PASSIVE_ACTIVE の段階では部品に
+  // 尋ねることを先に確かめる（この確かめが、部品に尋ねる経路を通る要求で行われていることを示す）。
+  it.each([
+    ['closing (owner close pending)', 'closing'],
+    ['invalidating (safety invalidation pending)', 'invalidating'],
+  ] as const)('does not ask the delivery part while the Guard is %s; the Guard aborts the request', async (_label, phase) => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const closeGate = createDeferred<void>();
+    const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), {
+      ...HEADLESS_GUARD,
+      resourceDelivery: recording.delivery,
+    });
+    const page = await readyHarnessPage(harness);
+
+    // 対照: PASSIVE_ACTIVE の段階では、同じ要求の届け方を部品に尋ねる。
+    const active = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+    await harness.httpHandler?.(active.route);
+    expect(recording.calls).toEqual(['decide', `beforeServeFromRunCache:${CACHED_RESOURCE.url}`, 'fulfill']);
+    recording.calls.splice(0);
+
+    // 閉じかけ: 持ち主が Context を閉じる（閉じる処理は、門で止めておく）。無効化: 違反（main frame の要求の失敗）で、Guard が Context を
+    // 無効にする（閉じる処理は、門で止めておく）。
+    const closing = phase === 'closing'
+      ? closePassiveGuardedContext(harness.context).then(() => undefined)
+      : Promise.resolve(emitFailedMainFrameRequest(harness, page, {
+        method: 'GET',
+        url: `${ORIGIN}/catalog`,
+        errorText: 'net::ERR_FAILED',
+      }));
+    await expect.poll(() => harness.closeCount).toBe(1);
+    // 閉じている段階である（動いている段階でも、閉じた後でもない）。
+    expect(() => assertPassiveRequestGuardActive(harness.context)).toThrow();
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
+    const late = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+    await harness.httpHandler?.(late.route);
+    closeGate.resolve(undefined);
+    await closing;
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    // 部品に尋ねたのは、対照の1回だけである。
+    expect(recording.decided).toHaveLength(1);
+    expect(late.fulfilled).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual(
+      phase === 'closing' ? [] : [{ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_FAILED' }],
+    );
+  });
+
+  it('falls back to the network without a violation when the delivery part throws', async () => {
+    const recording = recordingDelivery(() => {
+      throw new Error('delivery decision failed');
+    });
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.calls).toEqual(['decide', 'fallback']);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('aborts without a violation when route.fulfill fails, and contains a failed abort as well', async () => {
+    for (const abortError of [undefined, new Error('abort failed')]) {
+      const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+      const { harness, ledger } = await guardWith(recording.delivery);
+      const routed = deliveryRoute(recording.calls, {
+        url: CACHED_RESOURCE.url,
+        fulfillError: new Error('fulfill failed'),
+        ...(abortError === undefined ? {} : { abortError }),
+      });
+
+      await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+      expect(recording.calls).toEqual([
+        'decide',
+        `beforeServeFromRunCache:${CACHED_RESOURCE.url}`,
+        'fulfill',
+        'abort:blockedbyclient',
+      ]);
+      harness.requestFailedHandler?.(routed.request);
+      await flushGuardProtocolCallbacks();
+      expectNoSafetyRecords(ledger);
+      expect(harness.closeCount).toBe(0);
+    }
+  });
+
+  it('contains a failed abort of WITHHOLD and failures of the delivery part callbacks without a violation', async () => {
+    const { harness, ledger } = await guardWith({
+      decide: () => ({ kind: 'WITHHOLD' }),
+      beforeServeFromRunCache: () => {
+        throw new Error('mark failed');
+      },
+      afterWithhold: () => {
+        throw new Error('count failed');
+      },
+    });
+    const calls: string[] = [];
+    const routed = deliveryRoute(calls, { url: `${OTHER_ORIGIN}/tag.js`, abortError: new Error('abort failed') });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(calls).toEqual(['abort:blockedbyclient']);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+
+    // キャッシュから返す前の印の失敗も、Guard の外に投げず、キャッシュから返す。
+    const served = await guardWith({
+      decide: () => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }),
+      beforeServeFromRunCache: () => {
+        throw new Error('mark failed');
+      },
+      afterWithhold: () => undefined,
+    });
+    const servedCalls: string[] = [];
+    const servedRoute = deliveryRoute(servedCalls, { url: CACHED_RESOURCE.url });
+    await expect(Promise.resolve(served.harness.httpHandler?.(servedRoute.route))).resolves.toBeUndefined();
+    expect(servedCalls).toEqual(['fulfill']);
+    expectNoSafetyRecords(served.ledger);
   });
 });

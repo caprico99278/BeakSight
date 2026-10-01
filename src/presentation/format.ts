@@ -4,10 +4,17 @@
  *   （日本語の単位と「未観測」を、文言カタログ `messages.ts` から取るため）だけ（UI追補設計書の依存の向き）。
  * - 日本語の文言は置かない（文言は文言カタログと Rule の定義が持つ。GATE-UI06）。
  * - `formatDecimal`・`formatPixels`・`formatMilliseconds`・`formatPercent` は、値が有限の数であることを前提にする（Rule の文言用）。
- * - 日時・時間・データ量・件数・整数の書式（U16a、C16d で追加）は、観測できなかった値（`null`、有限でない数、負の数）を「未観測」と書く。
- *   0 や空文字にはしない（上位の設計書 14.11、GATE-UI05）。
+ * - 日時・時間・データ量・件数・整数の書式（U16a、C16d で追加）と、回数・経過時間の書式（L7 で追加）は、観測できなかった値（`null`、
+ *   有限でない数、負の数）を「未観測」と書く。0 や空文字にはしない（上位の設計書 14.11、GATE-UI05）。
+ * - 要求の件数と1分あたりの最大の組み立て（`formatRequestsWithPeak`。L7）は、ここだけで行う。
  */
-import { FORMAT_UNIT_TEXT, NOT_OBSERVED_TEXT } from './messages.js';
+import type { RunLoadOriginRequests } from '../core/contracts.js';
+import {
+  FORMAT_UNIT_TEXT,
+  NOT_OBSERVED_TEXT,
+  countWithPeakPerMinuteText,
+  countWithRecentAndPeakPerMinuteText,
+} from './messages.js';
 
 /** 文言に書く数値の、小数の最大の桁数の既定値。丸めるだけで、判定には使わない。 */
 const DEFAULT_MAX_FRACTION_DIGITS = 3;
@@ -54,6 +61,12 @@ const DISPLAY_TIME_ZONE_ABBREVIATION = 'JST';
 
 /** 1秒のミリ秒。 */
 const MILLISECONDS_PER_SECOND = 1000;
+
+/** 1分の秒数（経過時間の書式）。 */
+const SECONDS_PER_MINUTE = 60;
+
+/** 1時間の分数（経過時間の書式）。 */
+const MINUTES_PER_HOUR = 60;
 
 /** 秒で書くときの、小数の最大の桁数。 */
 const SECONDS_MAX_FRACTION_DIGITS = 1;
@@ -154,3 +167,51 @@ export const formatCount = (count: number | null): string => {
   }
   return `${COUNT_FORMAT.format(count)}${FORMAT_UNIT_TEXT.count}`;
 };
+
+/**
+ * 回数（ページの読み込みの回数など）を、`formatCount` と同じ桁区切りで、回数の単位を付けて書く（例: `1,234回`。サイトへの負荷の制御の
+ * 設計書 4.5、4.8）。観測できなかった値は「未観測」。
+ */
+export const formatTimes = (count: number | null): string => {
+  if (!isObservedQuantity(count)) {
+    return formatNotObserved();
+  }
+  return `${COUNT_FORMAT.format(count)}${FORMAT_UNIT_TEXT.times}`;
+};
+
+/**
+ * 経過時間（ミリ秒）を、時間・分・秒で書く（例: `40秒`、`24分10秒`、`1時間5分`。サイトへの負荷の制御の設計書 4.8）。
+ * - 1分未満は秒だけ、1時間未満は分と秒、1時間以上は時間と分（秒は省く）で書く。0 の下位の単位は書かない（例: `1分`、`1時間`）。
+ * - 端数は切り捨てる（経過した分だけを示す。例: 59.9秒は `59秒`）。
+ * - 観測できなかった値は「未観測」。
+ * 時間の長さの書式（`formatDuration`）とは別のもの（あちらは、小数1桁までの秒で書く）。
+ */
+export const formatElapsedTime = (milliseconds: number | null): string => {
+  if (!isObservedQuantity(milliseconds)) {
+    return formatNotObserved();
+  }
+  const totalSeconds = Math.floor(milliseconds / MILLISECONDS_PER_SECOND);
+  const totalMinutes = Math.floor(totalSeconds / SECONDS_PER_MINUTE);
+  const hours = Math.floor(totalMinutes / MINUTES_PER_HOUR);
+  const minutes = totalMinutes % MINUTES_PER_HOUR;
+  const seconds = totalSeconds % SECONDS_PER_MINUTE;
+  const part = (value: number, unit: string): string => `${String(value)}${unit}`;
+  if (hours > 0) {
+    return `${part(hours, FORMAT_UNIT_TEXT.hours)}${minutes > 0 ? part(minutes, FORMAT_UNIT_TEXT.minutes) : ''}`;
+  }
+  if (minutes > 0) {
+    return `${part(minutes, FORMAT_UNIT_TEXT.minutes)}${seconds > 0 ? part(seconds, FORMAT_UNIT_TEXT.seconds) : ''}`;
+  }
+  return part(seconds, FORMAT_UNIT_TEXT.seconds);
+};
+
+/**
+ * 要求の件数に、1分あたりの最大を添えて書く（例: `3,400件（1分あたり最大 210件）`。サイトへの負荷の制御の設計書 4.5）。
+ * `recentPerMinute`（直近の1分の件数。`RunLoadRecentPerMinute` の値）を渡すと、それも添える（例: `1,930件（直近1分 38件、1分あたり最大 61件）`。
+ * 実行中の進み具合の行。設計書 4.8）。件数と最大の組み立ては、ここだけで行う（HTML レポートと CLI は、これを使う。L6 の報告の発見事項3）。
+ * 値は、渡されたまま書式にかけるだけで、計算しない。書式は `formatCount` のもの。
+ */
+export const formatRequestsWithPeak = (requests: RunLoadOriginRequests, recentPerMinute?: number): string =>
+  recentPerMinute === undefined
+    ? countWithPeakPerMinuteText(formatCount(requests.count), formatCount(requests.peakPerMinute))
+    : countWithRecentAndPeakPerMinuteText(formatCount(requests.count), formatCount(recentPerMinute), formatCount(requests.peakPerMinute));

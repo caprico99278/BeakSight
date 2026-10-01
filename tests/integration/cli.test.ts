@@ -9,11 +9,17 @@ import { unzipSync } from 'fflate';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
-import { RUN_ARTIFACT_FILE_NAMES } from '../../src/core/artifact-layout.js';
+import {
+  CHECKPOINT_ARTIFACT_DIRECTORY,
+  CHECKPOINT_ARTIFACT_FILE_NAMES,
+  RUN_ARTIFACT_FILE_NAMES,
+  artifactFilePath,
+  checkpointArtifactRelativePath,
+} from '../../src/core/artifact-layout.js';
 import type { Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { RUN_STATUS_CATALOG, SEVERITY_CATALOG } from '../../src/presentation/catalog.js';
-import { formatCount } from '../../src/presentation/format.js';
+import { formatCount, formatTimes } from '../../src/presentation/format.js';
 import { CLI_TEXT, HTML_REPORT_TEXT, RUN_SUMMARY_TEXT } from '../../src/presentation/messages.js';
 import {
   expectFinishedInTime,
@@ -48,6 +54,11 @@ afterAll(async () => {
 /** 一時的なビルドの CLI を、作業のディレクトリ `workDirectory` で、別のプロセスとして起動する（`runCliProcess`）。 */
 const runCli = (...arguments_: string[]): Promise<CliProcessResult> => runCliProcess(build, workDirectory, arguments_);
 
+/**
+ * 設定のファイルを書く。`extra` は、最上位のセクションを置き換える。
+ * ページの読み込みの最小の間隔は 0 にする（対象はループバックの fixture のサーバ。サイトへの負荷の制御の設計書 4.2）。
+ * `extra` で `crawl` を置き換える場合は、`minNavigationIntervalMs: 0` も書く。
+ */
 async function writeTargetConfig(name: string, startPath: string, extra: Record<string, unknown>): Promise<string> {
   const path = join(workDirectory, name);
   await writeFile(
@@ -55,6 +66,7 @@ async function writeTargetConfig(name: string, startPath: string, extra: Record<
     JSON.stringify({
       target: { id: `cli-${name.replace(/\.json$/u, '')}` },
       site: { startUrl: `${server.origin}${startPath}`, allowedOrigins: [server.origin] },
+      crawl: { minNavigationIntervalMs: 0 },
       viewports: { stressWidths: [] },
       ...extra,
     }),
@@ -64,6 +76,14 @@ async function writeTargetConfig(name: string, startPath: string, extra: Record<
 }
 
 const readJson = async (path: string): Promise<unknown> => JSON.parse(await readFile(path, 'utf8')) as unknown;
+
+/** Run のディレクトリの `checkpoint/` に、`state.json`（保存の状態は FINISHED）だけがある。 */
+async function expectOnlyFinishedState(runDirectory: string): Promise<void> {
+  const checkpointDirectory = artifactFilePath(runDirectory, CHECKPOINT_ARTIFACT_DIRECTORY);
+  expect(await readdir(checkpointDirectory)).toEqual([CHECKPOINT_ARTIFACT_FILE_NAMES.state]);
+  const state = (await readJson(artifactFilePath(runDirectory, checkpointArtifactRelativePath('state')))) as { readonly state: string };
+  expect(state.state).toBe('FINISHED');
+}
 
 describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', () => {
   let result: CliProcessResult;
@@ -115,6 +135,12 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
     expect(new TextDecoder().decode(bundle['run.json'])).toBe(await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run), 'utf8'));
   });
 
+  // R5a（中断した Run の再開の設計書 4.7.1）: 最後まで終えた Run の `checkpoint/` には、`state.json`（FINISHED）だけが残る。ページの保存、
+  // `state.prev.json`、ロックは残らない。
+  it('leaves only state.json (FINISHED) in checkpoint/, without the page checkpoints, state.prev.json and the lock', async () => {
+    await expectOnlyFinishedState(runDirectory);
+  });
+
   it('prints the Run Status, the output directory and the counts from the view model in Japanese', () => {
     expect(result.stdout).toMatch(JAPANESE_CHARACTER);
     expect(result.stdout).toContain(RUN_STATUS_CATALOG.COMPLETE.label);
@@ -124,6 +150,26 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
     const errorCount = findings.filter((finding) => finding.severity === 'ERROR').length;
     expect(result.stdout).toContain(`${SEVERITY_CATALOG.ERROR.label} ${formatCount(errorCount)}`);
     expect(result.stdout).not.toContain(RUN_SUMMARY_TEXT.reasonsHeading);
+  });
+
+  // L7（サイトへの負荷の制御の設計書 4.8）: 実行中に、ページの監査が1つ終わるたびに、進み具合の1行を標準出力に示す。
+  it('prints one progress line for every audited page during the Run, after the start lines and before the result', () => {
+    const lines = result.stdout.split('\n');
+    const progressLines = lines.filter((line) => line.startsWith(`${CLI_TEXT.progress.heading}: `));
+    const finishedPages = run.auditedPageCount + run.partialPageCount + run.failedPageCount;
+    expect(finishedPages).toBeGreaterThan(0);
+    expect(progressLines).toHaveLength(finishedPages);
+    progressLines.forEach((line, index) => {
+      expect(line).toContain(`${CLI_TEXT.progress.pagesFinished} ${formatCount(index + 1)}（`);
+    });
+    // 最後のページの後には、ページの読み込みも発見もないので、最後の行の値は、run.json の値と同じになる。
+    const first = progressLines[0] ?? '';
+    const last = progressLines.at(-1) ?? '';
+    expect(last).toContain(`${RUN_SUMMARY_TEXT.coverage.discovered} ${formatCount(run.discoveredPageCount)}`);
+    expect(last).toContain(`${CLI_TEXT.run.navigationCount} ${formatTimes(run.load.navigationCount)}`);
+    expect(lines.indexOf(CLI_TEXT.run.started)).toBeGreaterThanOrEqual(0);
+    expect(lines.indexOf(CLI_TEXT.run.started)).toBeLessThan(lines.indexOf(first));
+    expect(lines.indexOf(last)).toBeLessThan(lines.indexOf(CLI_TEXT.run.resultHeading));
   });
 });
 
@@ -135,7 +181,7 @@ describe('CLI run: a PARTIAL Run (page limit)', () => {
 
   beforeAll(async () => {
     const config = await writeTargetConfig('partial.json', '/crawl/index.html', {
-      crawl: { maxPages: 1 },
+      crawl: { maxPages: 1, minNavigationIntervalMs: 0 },
       audit: { screenshots: false },
       output: { directory: 'partial-output' },
     });
@@ -157,6 +203,11 @@ describe('CLI run: a PARTIAL Run (page limit)', () => {
     for (const file of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
       await expect(readFile(join(runDirectory, file))).resolves.toBeInstanceOf(Buffer);
     }
+  });
+
+  // R5a（中断した Run の再開の設計書 3.2、4.7.1）: ページ数の上限による PARTIAL は、再開の対象にしない（保存の状態は FINISHED）。
+  it('leaves only state.json (FINISHED) in checkpoint/, because a Run stopped by the page limit is not resumed', async () => {
+    await expectOnlyFinishedState(runDirectory);
   });
 
   it('prints the PARTIAL label and the number of incomplete reasons', () => {

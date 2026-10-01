@@ -1,0 +1,17 @@
+{
+  "$id": "urn:beaksight:schema:checkpoint-page:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "pageId", "url", "result", "retryEvidence", "safetyLedgerSnapshots"],
+  "properties": {
+    "schemaVersion": { "const": "checkpoint-page-schema/1.0" },
+    "pageId": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" },
+    "url": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageUrl" },
+    "result": { "$ref": "urn:beaksight:schema:page:1.0" },
+    "retryEvidence": { "$ref": "urn:beaksight:schema:page:1.0#/properties/evidence" },
+    "safetyLedgerSnapshots": {
+      "type": "array",
+      "items": { "$ref": "urn:beaksight:schema:checkpoint:1.0#/$defs/safetyLedgerSnapshot" }
+    }
+  }
+}

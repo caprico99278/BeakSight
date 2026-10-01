@@ -122,7 +122,11 @@ function assertCollectRunEnvironmentOptions(options: CollectRunEnvironmentOption
   }
 }
 
-function readPlaywrightVersion(): string {
+/**
+ * Playwright の版（run.json の `environment.playwrightVersion`）を、Playwright の `package.json` から読む。CLI は、途中の Run を再開する前に、
+ * これで今の版を読み、保存の版と比べる（中断した Run の再開の設計書 4.7.1）。
+ */
+export function readPlaywrightVersion(): string {
   const manifest = createRequire(import.meta.url)(PLAYWRIGHT_PACKAGE_JSON) as unknown;
   return packageVersionOf(manifest, 'Playwright');
 }

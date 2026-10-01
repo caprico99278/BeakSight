@@ -4,9 +4,11 @@ import {
   FINDING_CATEGORIES,
   INTERACTION_STATUSES,
   PAGE_AUDIT_STATUSES,
+  RUN_EXECUTION_END_REASONS,
   RUN_STATUSES,
   SEVERITIES,
   VIEWPORT_PROFILES,
+  type RunExecutionEndReason,
 } from '../../src/core/contracts.js';
 import {
   EXTERNAL_SCHEME_NAVIGATION_REASONS,
@@ -24,6 +26,7 @@ import {
   REPORT_CATEGORY_SECTIONS,
   REPORT_SECTION_CATALOG,
   REPORT_SECTIONS,
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SAFETY_EVENT_KIND_CATALOG,
   SCREENSHOT_CAPTURE_TYPE_CATALOG,
@@ -66,6 +69,8 @@ const DISPLAY_CATALOGS: readonly {
   { name: 'SCREENSHOT_CAPTURE_TYPE_CATALOG', values: SCREENSHOT_CAPTURE_TYPES, catalog: SCREENSHOT_CAPTURE_TYPE_CATALOG },
   // C16d（設計書 6.1.10）: 値の一覧は、実際の Safety の Evidence の、事象の一覧の項目の名前。
   { name: 'SAFETY_EVENT_KIND_CATALOG', values: safetyEventListNames(), catalog: SAFETY_EVENT_KIND_CATALOG },
+  // R6（中断した Run の再開の設計書 4.8）: 実行（起動）の終わり方。値の一覧は core の `RUN_EXECUTION_END_REASONS`。
+  { name: 'RUN_EXECUTION_END_REASON_CATALOG', values: RUN_EXECUTION_END_REASONS, catalog: RUN_EXECUTION_END_REASON_CATALOG },
 ];
 
 describe('display catalogs', () => {
@@ -96,7 +101,13 @@ describe('display catalogs', () => {
   });
 
   it('describes every severity and status value', () => {
-    for (const catalog of [SEVERITY_CATALOG, RUN_STATUS_CATALOG, PAGE_AUDIT_STATUS_CATALOG, INTERACTION_STATUS_CATALOG]) {
+    for (const catalog of [
+      SEVERITY_CATALOG,
+      RUN_STATUS_CATALOG,
+      PAGE_AUDIT_STATUS_CATALOG,
+      INTERACTION_STATUS_CATALOG,
+      RUN_EXECUTION_END_REASON_CATALOG,
+    ]) {
       for (const spec of Object.values<DisplaySpec>(catalog)) {
         expect(spec.description).not.toBeNull();
       }
@@ -189,6 +200,55 @@ describe('the kinds of Safety events (design 6.1.10)', () => {
     }
     expect(description).toContain('リダイレクト');
     expect(description).toContain('止め');
+  });
+});
+
+// R6（中断した Run の再開の設計書 4.8 の「表示」）: 実行（起動）の終わり方の表示カタログ。HTML レポートの「実行の記録」の表は、
+// このカタログのラベル、説明、色のトーンで示す。新しい終わり方は、core の一覧とこのカタログに加えるだけで表示される。
+describe('the end reasons of a run execution (resumable run design 4.8)', () => {
+  it('gives every end reason its Japanese label and description, in the order of the design', () => {
+    expect(RUN_EXECUTION_END_REASON_CATALOG).toEqual({
+      COMPLETED: { label: '最後まで実行', order: 1, tone: 'positive', description: '最後の処理まで行いました。' },
+      STOPPED_BY_RUNTIME_LIMIT: {
+        label: '実行時間の上限で停止',
+        order: 2,
+        tone: 'caution',
+        description: '1回の起動の実行時間の上限に達したため、残りのページを監査せずに止めました。',
+      },
+      STOPPED_BY_SIGNAL: {
+        label: '中断の指示で停止',
+        order: 3,
+        tone: 'caution',
+        description: '止める指示（Ctrl+C など）を受けたため、今のページを終えてから止めました。',
+      },
+      STOPPED_BY_SAFETY_VIOLATION: {
+        label: '安全のため停止',
+        order: 4,
+        tone: 'shield',
+        description: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
+      },
+      INTERRUPTED_ABNORMALLY: {
+        label: '途中で終了',
+        order: 5,
+        tone: 'critical',
+        description:
+          'プロセスが途中で終わりました（強制終了、停電、端末の再起動、2回目の Ctrl+C など）。終わりの時刻は、最後に保存した時刻です。',
+      },
+    });
+    expect(sortByDisplayOrder(RUN_EXECUTION_END_REASONS, RUN_EXECUTION_END_REASON_CATALOG)).toEqual([...RUN_EXECUTION_END_REASONS]);
+  });
+
+  it('does not rely on colour alone: distinct end reasons have distinct labels and descriptions', () => {
+    const specs = RUN_EXECUTION_END_REASONS.map((reason) => RUN_EXECUTION_END_REASON_CATALOG[reason]);
+    expect(new Set(specs.map((spec) => spec.label)).size).toBe(RUN_EXECUTION_END_REASONS.length);
+    expect(new Set(specs.map((spec) => spec.description)).size).toBe(RUN_EXECUTION_END_REASONS.length);
+  });
+
+  it('makes a catalog without an end reason a type error', () => {
+    const spec = { label: 'x', order: 1, tone: 'positive', description: null } as const satisfies DisplaySpec;
+    // @ts-expect-error -- 終わり方を書き漏らしたカタログは、型のエラーになる。
+    const missing = { COMPLETED: spec } as const satisfies Record<RunExecutionEndReason, DisplaySpec>;
+    expect(missing.COMPLETED.label).toBe('x');
   });
 });
 

@@ -1906,6 +1906,16 @@ export interface EffectiveAuditConfig {
     readonly resourceSettlingTimeoutMs: number;
     /** 正の整数（ミリ秒）。 */
     readonly interactionTimeoutMs: number;
+    /**
+     * ページの読み込みの最小の間隔。0 以上の整数（ミリ秒。サイトへの負荷の制御の設計書 3.2、4.2）。
+     * 許可 Origin にループバックでないものがあれば、`src/config/validate-config.ts` の下限以上でなければならない。
+     */
+    readonly minNavigationIntervalMs: number;
+    /**
+     * 1つのページで Interaction で監査する候補の数の上限。1 以上、`INTERACTION_CANDIDATE_LIMITS.maxCandidates` 以下の整数
+     * （サイトへの負荷の制御の設計書 3.2、4.2）。
+     */
+    readonly maxInteractionsPerPage: number;
     readonly allowedQueryParameters: readonly string[];
   };
   readonly browser: {

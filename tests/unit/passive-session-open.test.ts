@@ -2,7 +2,7 @@
 // 期限を過ぎた場合は期限切れを返し、遅れて届いた Context は閉じる。今の失敗（`ContextConstructionError` など）の扱いは変えない。
 // どのテストも、実際の期限（`SESSION_OPEN_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を待たず、短い期限を注入する。
 import type { BrowserContext, Page } from 'playwright';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { ContextConstructionError, type BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS, PAGE_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../../src/core/limits.js';
@@ -17,6 +17,8 @@ import {
   releaseLatePassiveContextFailure,
   resolvePassiveSessionDeadlines,
   type LatePassiveContextRelease,
+  type PassiveSessionDeadlineOptions,
+  type PassiveSessionOpenOptions,
 } from '../../src/orchestration/passive-session-open.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { createDeferred, type Deferred } from '../helpers/deferred.js';
@@ -339,6 +341,28 @@ describe('openPassiveSessionBeforeDeadline (DEF-008)', () => {
   });
 });
 
+// L5b（サイトへの負荷の制御の設計書 4.7）: 作成の部品は、省略できる Context の役割（`role`）を、factory の `createPassiveContext` に
+// そのまま渡す。省略した場合は渡さない（factory の既定の PRIMARY になる。今の振る舞いのまま）。
+describe('the Context role of the open functions (L5b)', () => {
+  it('passes the role to createPassiveContext and leaves it to the factory default when omitted', async () => {
+    const fake = fakeFactory();
+    const createPassiveContext = vi.spyOn(fake.factory, 'createPassiveContext');
+
+    const revisit = await openPassiveSessionBeforeDeadline(fake.factory, VIEWPORT, deadlineIn(SHORT_OPEN_TIMEOUT_MS), { role: 'REVISIT' });
+    const omitted = await openPassiveSessionBeforeDeadline(fake.factory, VIEWPORT, deadlineIn(SHORT_OPEN_TIMEOUT_MS));
+    const contextOnly = await openPassiveContextBeforeDeadline(fake.factory, VIEWPORT, deadlineIn(SHORT_OPEN_TIMEOUT_MS), {
+      role: 'PRIMARY',
+    });
+
+    expect([revisit.status, omitted.status, contextOnly.status]).toEqual(['OPENED', 'OPENED', 'OPENED']);
+    expect(createPassiveContext.mock.calls.map(([viewport, role]) => [viewport, role])).toEqual([
+      [VIEWPORT, 'REVISIT'],
+      [VIEWPORT, undefined],
+      [VIEWPORT, 'PRIMARY'],
+    ]);
+  });
+});
+
 describe('openPassiveContextBeforeDeadline and openPassivePageBeforeDeadline (DEF-008)', () => {
   it('opens only the Context', async () => {
     const fake = fakeFactory();
@@ -433,6 +457,18 @@ describe('resolvePassiveSessionDeadlines (DEF-008, R15r-4)', () => {
       contextCloseTimeoutMs: 3,
       onLateContextRelease,
     })).toEqual({ sessionOpenTimeoutMs: 1, pageCloseTimeoutMs: 2, contextCloseTimeoutMs: 3, onLateContextRelease });
+  });
+
+  // RL-fix（RL の 7-2）: Context の役割（`role`）は、作成の部品の引数（`PassiveSessionOpenOptions`）で、作るたびに呼び出し側が選ぶ。
+  // 期限の注入口（`PassiveSessionDeadlineOptions`）は `role` を受け取らない（受け取って黙って捨てる形を残さない）。書くと型の誤りになる。
+  it('does not take the Context role in the deadline options (a type error)', () => {
+    expectTypeOf<PassiveSessionDeadlineOptions>().not.toHaveProperty('role');
+    expectTypeOf<PassiveSessionOpenOptions>().toHaveProperty('role');
+
+    // @ts-expect-error: 期限の注入口に Context の役割（`role`）を書くと、型の誤りになる。
+    const withRole: PassiveSessionDeadlineOptions = { sessionOpenTimeoutMs: SESSION_OPEN_TIMEOUT_MS, role: 'REVISIT' };
+    // 型を外して渡しても、役割は解決した期限に入らない。
+    expect(resolvePassiveSessionDeadlines(withRole)).not.toHaveProperty('role');
   });
 
   it('rejects invalid deadlines and receivers', () => {

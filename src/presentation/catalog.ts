@@ -11,6 +11,7 @@ import type {
   FindingCategory,
   InteractionStatus,
   PageAuditStatus,
+  RunExecutionEndReason,
   RunStatus,
   Severity,
   ViewportProfile,
@@ -136,6 +137,44 @@ export const RUN_STATUS_CATALOG = deepFreeze({
     description: '安全の不変条件の違反を記録したため、監査を中止しました。',
   },
 } as const satisfies Record<RunStatus, DisplaySpec>);
+
+/**
+ * 1回の実行（起動）の終わり方（`RunExecution.endReason`。中断した Run の再開の設計書 4.8）。値の一覧と意味は core の
+ * `RUN_EXECUTION_END_REASONS` が持ち、ここは、HTML レポートの「実行の記録」の表で示すラベル、順、色のトーン、説明だけを持つ。
+ */
+export const RUN_EXECUTION_END_REASON_CATALOG = deepFreeze({
+  COMPLETED: {
+    label: '最後まで実行',
+    order: 1,
+    tone: 'positive',
+    description: '最後の処理まで行いました。',
+  },
+  STOPPED_BY_RUNTIME_LIMIT: {
+    label: '実行時間の上限で停止',
+    order: 2,
+    tone: 'caution',
+    description: '1回の起動の実行時間の上限に達したため、残りのページを監査せずに止めました。',
+  },
+  STOPPED_BY_SIGNAL: {
+    label: '中断の指示で停止',
+    order: 3,
+    tone: 'caution',
+    description: '止める指示（Ctrl+C など）を受けたため、今のページを終えてから止めました。',
+  },
+  STOPPED_BY_SAFETY_VIOLATION: {
+    label: '安全のため停止',
+    order: 4,
+    tone: 'shield',
+    description: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
+  },
+  INTERRUPTED_ABNORMALLY: {
+    label: '途中で終了',
+    order: 5,
+    tone: 'critical',
+    description:
+      'プロセスが途中で終わりました（強制終了、停電、端末の再起動、2回目の Ctrl+C など）。終わりの時刻は、最後に保存した時刻です。',
+  },
+} as const satisfies Record<RunExecutionEndReason, DisplaySpec>);
 
 export const PAGE_AUDIT_STATUS_CATALOG = deepFreeze({
   AUDITED: {

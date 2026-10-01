@@ -82,6 +82,14 @@ export interface SiteMetadataOptions {
    * Passive Context と page の作成・終了の期限の注入口（DEF-008、R15r-4）。省略した項目は、`limits.ts` の定数を使う。
    */
   readonly deadlines?: PassiveSessionDeadlineOptions | undefined;
+  /**
+   * 各ファイルの読み込み（`page.goto`）の直前に呼ぶ、ページの読み込みの間隔の待ち（サイトへの負荷の制御の設計書 4.1。Run Coordinator は、
+   * Run で1つの `NavigationPacer` の `beforeNavigation` を渡す）。各ファイルの期限は、待った後の時刻から数える（設計書 4.4）。
+   * 待ちが失敗した場合は、そのファイルを読み込まずに `FAILED` にする。
+   * 必須の引数である（渡し忘れると間隔を空けずに読み込む、という形を残さない。Page Auditor の pacer と同じ。RL の Minor-5）。
+   * 待たない呼び出し側（テストなど）は、それを明示する関数（`async () => 0`）を渡す。関数でない値と、渡さなかった場合は `TypeError`。
+   */
+  readonly beforeNavigation: () => Promise<number>;
 }
 
 /**
@@ -181,16 +189,18 @@ type OpenedPage =
  *   `failures` の `timedOut` は真、`detail` は期限切れのメッセージである。部品が Context を閉じる処理の失敗は `closeFailures` に記録する。
  * - 閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）も注入できる。Context を閉じる処理の期限切れは、
  *   `closeFailures` に記録する。
+ * - 各ファイルの読み込みの直前に、ページの読み込みの間隔の待ち（`beforeNavigation`）を呼ぶ。各ファイルの期限は、待った後の時刻から
+ *   数える（サイトへの負荷の制御の設計書 4.1、4.4）。
  *
  * 例外を投げる（reject する）のは、引数が不正な場合だけで、そのときは Context を作らない。
  * - Origin が Origin の直列化でない、または取得する URL が許可 Origin の中（`classifyUrl` の `INTERNAL_NAVIGABLE`）でない: `RangeError`
  * - 上限が0以上の安全な整数でない、期限（`crawl.navigationTimeoutMs` と、注入した作成・終了の期限）が正の安全な整数でない: `RangeError`
- * - factory、採番器、時計、pageId、設定の形が不正: `TypeError`
+ * - factory、採番器、時計、pageId、設定の形、`beforeNavigation`（関数でない、または渡さなかった）が不正: `TypeError`
  * 取得の失敗（Context を作れない場合を含む）は、`FAILED` の Evidence として返す。
  */
 export async function collectSiteMetadata(options: SiteMetadataOptions): Promise<SiteMetadataResult> {
   const validated = validateOptions(options);
-  const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines } = validated;
+  const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation } = validated;
   const evidenceContext: EvidenceRecordContext = { allocator: options.allocator, clock: options.clock };
 
   const session = await openContext(contextFactory, options.config.viewports.primaryDesktop, deadlines);
@@ -239,7 +249,7 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
               abandonedFailure = opened.failure;
             }
           } else {
-            fetched = await fetchMetadata(opened.page, url, timeoutMs);
+            fetched = await fetchMetadata(opened.page, url, timeoutMs, beforeNavigation);
           }
         }
       }
@@ -300,6 +310,7 @@ interface ValidatedOptions {
   readonly allowedQueryParameters: ReadonlySet<string>;
   readonly targets: readonly { readonly kind: SiteMetadataKind; readonly url: string }[];
   readonly deadlines: ResolvedPassiveSessionDeadlines;
+  readonly beforeNavigation: () => Promise<number>;
 }
 
 function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
@@ -318,6 +329,10 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
   }
   if (typeof pageId !== 'string' || pageId.length === 0) {
     throw new TypeError('site metadata requires the page ID of the start URL');
+  }
+  const { beforeNavigation } = options;
+  if (typeof beforeNavigation !== 'function') {
+    throw new TypeError('site metadata requires a beforeNavigation function');
   }
   if (!isRecord(config) || !isRecord(config.site) || !isRecord(config.crawl) || !isRecord(config.viewports)) {
     throw new TypeError('site metadata requires the audit config');
@@ -341,6 +356,7 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
     allowedQueryParameters: new Set(allowedQueryParameters),
     targets: metadataTargets(origin, allowedOrigins),
     deadlines: resolvePassiveSessionDeadlines(options.deadlines),
+    beforeNavigation,
   };
 }
 
@@ -431,12 +447,20 @@ function openDeadlineFailureOf(error: PassiveSessionOpenDeadlineError): Omit<Sit
 
 /**
  * 1つのファイルを、`page.goto`（GET のナビゲーション）で取得する。ナビゲーションと本文の読み取りを合わせて `timeoutMs` までに終える。
- * 例外は投げない。
+ * 読み込みの直前に、ページの読み込みの間隔の待ち（`beforeNavigation`）を呼ぶ。期限は、待った後の時刻から数える（サイトへの負荷の
+ * 制御の設計書 4.1、4.4）。待ちが失敗した場合は、読み込まずに `FAILED` を返す。例外は投げない。
  */
-async function fetchMetadata(page: Page, url: string, timeoutMs: number): Promise<FetchOutcome> {
-  const deadlineAtMs = Date.now() + timeoutMs;
+async function fetchMetadata(
+  page: Page,
+  url: string,
+  timeoutMs: number,
+  beforeNavigation: () => Promise<number>,
+): Promise<FetchOutcome> {
+  let deadlineAtMs: number;
   let response: Response | null;
   try {
+    await beforeNavigation();
+    deadlineAtMs = Date.now() + timeoutMs;
     response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
   } catch (error) {
     return { outcome: 'FAILED', httpStatus: null, body: null, failure: failureOf(error) };

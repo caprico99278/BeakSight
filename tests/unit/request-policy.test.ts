@@ -1,7 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { classifyPassiveRequest, isReadMethod } from '../../src/safety/request-policy.js';
+import { classifyPassiveRequest, hasAllowedOrigin, isReadMethod } from '../../src/safety/request-policy.js';
 
 const allowedOrigins = new Set(['HTTPS://EXAMPLE.TEST:443/path']);
+
+describe('hasAllowedOrigin', () => {
+  it('is exported, and compares the URL origin with the canonicalized allowed origins', () => {
+    expect(hasAllowedOrigin('https://example.test/catalog', allowedOrigins)).toBe(true);
+    expect(hasAllowedOrigin('http://example.test/catalog', allowedOrigins)).toBe(false);
+    expect(hasAllowedOrigin('https://external.test/catalog', allowedOrigins)).toBe(false);
+  });
+
+  it('returns false for an unparsable URL or invalid allowed-origin entries instead of throwing', () => {
+    expect(hasAllowedOrigin('not a URL', allowedOrigins)).toBe(false);
+    expect(hasAllowedOrigin('https://example.test/catalog', new Set(['not a URL', 'mailto:help@example.test']))).toBe(false);
+  });
+});
 
 describe('isReadMethod', () => {
   it.each(['GET', 'get', 'GeT', 'HEAD', 'head', 'HeAd'])(
