@@ -26,12 +26,25 @@ describe('classifyUrl', () => {
     });
   });
 
-  it('rejects an HTTP(S) URL carrying credentials even when its origin is allowed', () => {
+  it('rejects an HTTP(S) URL carrying credentials even when its origin is allowed, and redacts them', () => {
     expect(classifyUrl(new URL('https://user:secret@example.test/private'), policy)).toEqual({
       kind: 'REJECTED_INVALID',
-      rawUrl: 'https://user:secret@example.test/private',
-      reason: 'credential-bearing HTTP(S) URL',
+      rawUrl: 'https://[REDACTED]@example.test/private',
+      reason: 'CREDENTIALS_NOT_ALLOWED',
     });
+  });
+
+  it.each([
+    ['https://user:secret@example.test/private', 'https://[REDACTED]@example.test/private'],
+    ['https://user@external.test/', 'https://[REDACTED]@external.test/'],
+    ['ftp://user:secret@example.test/file', 'ftp://[REDACTED]@example.test/file'],
+    ['ftp://:secret@example.test/file', 'ftp://[REDACTED]@example.test/file'],
+  ])('never records the credentials of %s in rawUrl', (rawUrl, redactedUrl) => {
+    const admission = classifyUrl(new URL(rawUrl), policy);
+
+    expect(admission).toMatchObject({ rawUrl: redactedUrl });
+    expect(JSON.stringify(admission)).not.toContain('secret');
+    expect(JSON.stringify(admission)).not.toContain('user');
   });
 
   it('canonicalizes equivalent allowed-origin spellings and ignores invalid policy entries', () => {

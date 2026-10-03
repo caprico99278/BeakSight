@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { Ajv, type ErrorObject, type ValidateFunction } from 'ajv';
 
-export type ArtifactSchemaName = 'run' | 'audit' | 'page' | 'finding';
+export type ArtifactSchemaName = 'run' | 'audit' | 'page' | 'finding' | 'checkpoint' | 'checkpoint-page';
 
 export type ArtifactValidationResult =
   | { readonly ok: true }
@@ -12,6 +12,8 @@ const schemaIdByName: Readonly<Record<ArtifactSchemaName, string>> = {
   audit: 'urn:beaksight:schema:audit:1.0',
   page: 'urn:beaksight:schema:page:1.0',
   finding: 'urn:beaksight:schema:finding:1.0',
+  checkpoint: 'urn:beaksight:schema:checkpoint:1.0',
+  'checkpoint-page': 'urn:beaksight:schema:checkpoint-page:1.0',
 };
 
 let validatorsPromise: Promise<Readonly<Record<ArtifactSchemaName, ValidateFunction>>> | undefined;
@@ -65,6 +67,11 @@ export const validateArtifact = async (
   schemaName: ArtifactSchemaName,
   value: unknown,
 ): Promise<ArtifactValidationResult> => {
+  // 検証関数の表は普通のオブジェクトなので、`constructor` などの継承したプロパティ名で引くと、`Object` などの無関係な関数が
+  // 検証関数として呼ばれ、検証を素通りする。スキーマ名は、自身のプロパティかどうかで確かめる（DEF-002）。
+  if (!Object.hasOwn(schemaIdByName, schemaName)) {
+    throw new RangeError(`unsupported artifact schema name: ${schemaName}`);
+  }
   const validate = (await loadValidators())[schemaName];
   if (validate(value)) {
     return { ok: true };

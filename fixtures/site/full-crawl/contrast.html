@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Contrast</title>
+    <style>
+      #low-contrast { color: rgb(119, 119, 119); background-color: rgb(136, 136, 136); font-size: 16px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ2。壊した箇所: 灰色の地に灰色の、コントラストの低い文字 → axe の color-contrast → COLOR_CONTRAST_VIOLATION。
+    -->
+    <main>
+      <h1>Full crawl fixture low contrast</h1>
+      <p id="low-contrast">Difficult to read low contrast text.</p>
+      <p><a href="/full-crawl/index.html">Back to the start</a></p>
+    </main>
+  </body>
+</html>

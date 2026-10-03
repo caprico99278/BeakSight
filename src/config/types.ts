@@ -1,43 +1,13 @@
-export interface Viewport {
-  readonly width: number;
-  readonly height: number;
-}
+import type { EffectiveAuditConfig, ViewportSizeEvidence } from '../core/evidence-types.js';
 
-export interface AuditConfig {
-  readonly site: {
-    readonly startUrl: string;
-    readonly allowedOrigins: readonly string[];
-  };
-  readonly crawl: {
-    readonly maxPages: number;
-    readonly maxDepth: number;
-    readonly maxRuntimeMs: number;
-    readonly navigationTimeoutMs: number;
-    readonly overallPageTimeoutMs: number;
-    readonly resourceSettlingTimeoutMs: number;
-    readonly interactionTimeoutMs: number;
-    readonly allowedQueryParameters: readonly string[];
-  };
-  readonly browser: {
-    readonly headed: boolean;
-    readonly locale: string;
-    readonly timezone: string;
-  };
-  readonly viewports: {
-    readonly primaryDesktop: Viewport;
-    readonly primaryMobile: Viewport;
-    readonly stressWidths: readonly number[];
-  };
-  readonly audit: {
-    readonly performance: boolean;
-    readonly accessibility: boolean;
-    readonly interactions: boolean;
-    readonly screenshots: boolean;
-  };
-  readonly output: {
-    readonly directory: string;
-  };
-}
+/** ビューポートの大きさ。定義は `src/core/evidence-types.ts` に1か所だけ置く。 */
+export type Viewport = ViewportSizeEvidence;
+
+/** 確定後の監査の設定。定義は `src/core/evidence-types.ts` に1か所だけ置く（run.json の `effectiveConfig` と同じ型）。 */
+export type AuditConfig = EffectiveAuditConfig;
+
+/** 対象に依存しない既定の設定の型。`target` は対象の設定ファイルだけが決める。 */
+export type AuditConfigDefaults = Omit<AuditConfig, 'target'>;
 
 export type ConfigValidationResult =
   | { readonly ok: true; readonly value: AuditConfig }

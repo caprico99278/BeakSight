@@ -1,11 +1,28 @@
-import type { Page, Request, Response } from 'playwright';
+import type { Frame, Page, Request, Response } from 'playwright';
 import { describe, expect, it } from 'vitest';
+import { ERROR_MESSAGE_FALLBACK } from '../../src/core/errors.js';
+import {
+  MAX_ERROR_MESSAGE_LENGTH,
+  MAX_HEADER_VALUE_LENGTH,
+  MAX_NETWORK_REQUESTS,
+  MAX_URL_LENGTH,
+} from '../../src/core/limits.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
+import { createDeferred } from '../helpers/deferred.js';
 
 type Listener = (...arguments_: readonly unknown[]) => void;
 
+const MAIN_FRAME = { name: () => 'main' } as unknown as Frame;
+const CHILD_FRAME = { name: () => 'child' } as unknown as Frame;
+
+type RequestSizes = Awaited<ReturnType<Request['sizes']>>;
+
 class FakePage {
   readonly #listeners = new Map<string, Set<Listener>>();
+
+  mainFrame(): Frame {
+    return MAIN_FRAME;
+  }
 
   on(event: string, listener: Listener): this {
     const listeners = this.#listeners.get(event) ?? new Set<Listener>();
@@ -50,6 +67,9 @@ interface FakeRequestOptions {
   readonly allHeaders?: () => Promise<Record<string, string>>;
   readonly redirectedFrom?: Request | null;
   readonly failure?: string | null;
+  readonly isNavigationRequest?: boolean;
+  readonly frame?: () => Frame;
+  readonly sizes?: () => Promise<RequestSizes>;
 }
 
 function fakeRequest(options: FakeRequestOptions): Request {
@@ -67,6 +87,11 @@ function fakeRequest(options: FakeRequestOptions): Request {
     failure: () => options.failure === undefined || options.failure === null
       ? null
       : { errorText: options.failure },
+    isNavigationRequest: () => options.isNavigationRequest ?? false,
+    frame: options.frame ?? (() => MAIN_FRAME),
+    sizes: options.sizes ?? (async () => {
+      throw new Error('sizes are not available in this fake');
+    }),
     __setRedirectedTo: (next: Request) => {
       redirectedTo = next;
     },
@@ -104,22 +129,6 @@ function fakeResponse(
     headers: () => ({ ...headers }),
     allHeaders,
   } as unknown as Response;
-}
-
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(reason: unknown): void;
-}
-
-function deferred<T>(): Deferred<T> {
-  let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (reason: unknown) => void;
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 describe('NetworkCollector', () => {
@@ -321,10 +330,10 @@ describe('NetworkCollector', () => {
 
   it('awaits the invocation-boundary header reads without reordering, cross-contamination, or post-detach events', async () => {
     const page = new FakePage();
-    const firstRequestHeaders = deferred<Record<string, string>>();
-    const firstResponseHeaders = deferred<Record<string, string>>();
-    const secondRequestHeaders = deferred<Record<string, string>>();
-    const secondResponseHeaders = deferred<Record<string, string>>();
+    const firstRequestHeaders = createDeferred<Record<string, string>>();
+    const firstResponseHeaders = createDeferred<Record<string, string>>();
+    const secondRequestHeaders = createDeferred<Record<string, string>>();
+    const secondResponseHeaders = createDeferred<Record<string, string>>();
     const handle = NetworkCollector.attach(page as unknown as Page);
     const firstRequest = fakeRequest({
       url: 'https://fixture.test/first',
@@ -425,5 +434,213 @@ describe('NetworkCollector', () => {
     expect(JSON.stringify(evidence)).not.toContain('"status":"OBSERVED","values":{}');
     expect(Object.isFrozen(evidence.requests[0]?.headers)).toBe(true);
     expect(Object.isFrozen(evidence.responses[0]?.headers)).toBe(true);
+  });
+
+  it('records hostile or oversized allHeaders rejection reasons safely and within the shared error message limit', async () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const hostileReason = new Error('hidden');
+    Object.defineProperty(hostileReason, 'message', {
+      get(): string {
+        throw new Error('message getter must not be trusted');
+      },
+    });
+    const request = fakeRequest({
+      url: 'https://fixture.test/hostile-header-failure',
+      allHeaders: () => Promise.reject(hostileReason),
+    });
+    page.emit('request', request);
+    page.emit('response', fakeResponse(
+      request,
+      200,
+      {},
+      () => Promise.reject(new Error('x'.repeat(MAX_ERROR_MESSAGE_LENGTH + 100))),
+    ));
+
+    const evidence = await handle.snapshot();
+    expect(evidence.requests[0]?.headers).toEqual({ status: 'FAILED', errorText: ERROR_MESSAGE_FALLBACK });
+    expect(evidence.responses[0]?.headers).toEqual({
+      status: 'FAILED',
+      errorText: 'x'.repeat(MAX_ERROR_MESSAGE_LENGTH),
+    });
+  });
+  it('bounds the number of recorded requests and counts omitted requests, responses, and failures', async () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const extra = 5;
+    for (let index = 0; index < MAX_NETWORK_REQUESTS + extra; index += 1) {
+      const request = fakeRequest({ url: `https://fixture.test/item/${index}`, resourceType: 'image' });
+      page.emit('request', request);
+      page.emit('response', fakeResponse(request, 200, {}));
+      page.emit('requestfinished', request);
+    }
+    const lateFailure = fakeRequest({ url: 'https://fixture.test/late-failure', failure: 'net::ERR_FAILED' });
+    page.emit('request', lateFailure);
+    page.emit('requestfailed', lateFailure);
+
+    const evidence = await handle.snapshot();
+    expect(evidence.requests).toHaveLength(MAX_NETWORK_REQUESTS);
+    expect(evidence.responses).toHaveLength(MAX_NETWORK_REQUESTS);
+    expect(evidence.requests.at(-1)?.url).toBe(`https://fixture.test/item/${MAX_NETWORK_REQUESTS - 1}`);
+    expect(evidence.failures).toEqual([]);
+    expect(evidence.omittedRequestCount).toBe(extra + 1);
+    expect(evidence.omittedResponseCount).toBe(extra);
+    expect(evidence.omittedFailureCount).toBe(1);
+  });
+
+  it('bounds URLs, header values, and failure text and marks each truncated record', async () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const longUrl = `https://fixture.test/${'u'.repeat(MAX_URL_LENGTH)}`;
+    const request = fakeRequest({
+      url: longUrl,
+      allHeaders: async () => ({ 'x-request-id': 'v'.repeat(MAX_HEADER_VALUE_LENGTH + 10) }),
+    });
+    const failed = fakeRequest({
+      url: 'https://fixture.test/failed.js',
+      resourceType: 'script',
+      failure: 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 10),
+    });
+    const small = fakeRequest({ url: 'https://fixture.test/small' });
+
+    page.emit('request', request);
+    page.emit('response', fakeResponse(
+      request,
+      200,
+      {},
+      async () => ({ 'x-request-id': 'r'.repeat(MAX_HEADER_VALUE_LENGTH + 10) }),
+    ));
+    page.emit('request', failed);
+    page.emit('requestfailed', failed);
+    page.emit('request', small);
+    page.emit('response', fakeResponse(small, 200, {}));
+
+    const evidence = await handle.snapshot();
+    expect(evidence.requests[0]?.url).toBe(longUrl.slice(0, MAX_URL_LENGTH));
+    expect(evidence.requests[0]?.headers).toEqual({
+      status: 'OBSERVED',
+      values: { 'x-request-id': 'v'.repeat(MAX_HEADER_VALUE_LENGTH) },
+    });
+    expect(evidence.requests[0]?.truncated).toBe(true);
+    expect(evidence.responses[0]?.url).toBe(longUrl.slice(0, MAX_URL_LENGTH));
+    expect(evidence.responses[0]?.headers).toEqual({
+      status: 'OBSERVED',
+      values: { 'x-request-id': 'r'.repeat(MAX_HEADER_VALUE_LENGTH) },
+    });
+    expect(evidence.responses[0]?.truncated).toBe(true);
+    expect(evidence.failures[0]?.errorText).toBe('e'.repeat(MAX_ERROR_MESSAGE_LENGTH));
+    expect(evidence.failures[0]?.truncated).toBe(true);
+    expect(evidence.requests[1]?.truncated).toBe(false);
+    expect(evidence.requests[2]?.truncated).toBe(false);
+    expect(evidence.responses[1]?.truncated).toBe(false);
+  });
+
+  it('marks main-frame and navigation requests so subframe documents are distinguishable', async () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const mainDocument = fakeRequest({ url: 'https://fixture.test/', isNavigationRequest: true });
+    const frameDocument = fakeRequest({
+      url: 'https://fixture.test/missing-frame.html',
+      isNavigationRequest: true,
+      frame: () => CHILD_FRAME,
+    });
+    const subresource = fakeRequest({ url: 'https://fixture.test/app.js', resourceType: 'script' });
+    const workerRequest = fakeRequest({
+      url: 'https://fixture.test/worker-fetch',
+      resourceType: 'fetch',
+      frame: () => {
+        throw new Error('Service Worker requests have no frame');
+      },
+    });
+
+    for (const request of [mainDocument, frameDocument, subresource, workerRequest]) {
+      page.emit('request', request);
+    }
+    page.emit('response', fakeResponse(frameDocument, 404, {}));
+    page.emit('requestfailed', fakeRequest({
+      url: 'https://fixture.test/failed-frame.html',
+      isNavigationRequest: true,
+      frame: () => CHILD_FRAME,
+      failure: 'net::ERR_ABORTED',
+    }));
+
+    const evidence = await handle.snapshot();
+    expect(evidence.requests.map(({ url, isNavigationRequest, isMainFrame }) => ({
+      url,
+      isNavigationRequest,
+      isMainFrame,
+    }))).toEqual([
+      { url: 'https://fixture.test/', isNavigationRequest: true, isMainFrame: true },
+      { url: 'https://fixture.test/missing-frame.html', isNavigationRequest: true, isMainFrame: false },
+      { url: 'https://fixture.test/app.js', isNavigationRequest: false, isMainFrame: true },
+      { url: 'https://fixture.test/worker-fetch', isNavigationRequest: false, isMainFrame: null },
+      { url: 'https://fixture.test/failed-frame.html', isNavigationRequest: true, isMainFrame: false },
+    ]);
+    expect(evidence.responses[0]).toMatchObject({
+      url: 'https://fixture.test/missing-frame.html',
+      status: 404,
+      isNavigationRequest: true,
+      isMainFrame: false,
+    });
+    expect(evidence.failures[0]).toMatchObject({ isNavigationRequest: true, isMainFrame: false });
+  });
+
+  it('records response transfer size after the request finishes and never invents it before', async () => {
+    const page = new FakePage();
+    const handle = NetworkCollector.attach(page as unknown as Page);
+    const finished = fakeRequest({
+      url: 'https://fixture.test/finished.css',
+      resourceType: 'stylesheet',
+      sizes: async () => ({
+        requestBodySize: 0,
+        requestHeadersSize: 300,
+        responseBodySize: 1_234,
+        responseHeadersSize: 200,
+      }),
+    });
+    const unfinished = fakeRequest({
+      url: 'https://fixture.test/unfinished.js',
+      resourceType: 'script',
+      sizes: async () => ({
+        requestBodySize: 0,
+        requestHeadersSize: 300,
+        responseBodySize: 99,
+        responseHeadersSize: 99,
+      }),
+    });
+    const unavailable = fakeRequest({
+      url: 'https://fixture.test/unavailable.png',
+      resourceType: 'image',
+      sizes: async () => {
+        throw new Error('sizes unavailable');
+      },
+    });
+    const invalid = fakeRequest({
+      url: 'https://fixture.test/invalid.png',
+      resourceType: 'image',
+      sizes: async () => ({
+        requestBodySize: 0,
+        requestHeadersSize: 0,
+        responseBodySize: -1,
+        responseHeadersSize: Number.NaN,
+      }),
+    });
+
+    for (const request of [finished, unfinished, unavailable, invalid]) {
+      page.emit('request', request);
+      page.emit('response', fakeResponse(request, 200, {}));
+    }
+    page.emit('requestfinished', finished);
+    page.emit('requestfinished', unavailable);
+    page.emit('requestfinished', invalid);
+
+    const evidence = await handle.snapshot();
+    expect(evidence.responses.map((response) => response.transferSize)).toEqual([
+      { status: 'OBSERVED', headersBytes: 200, bodyBytes: 1_234, totalBytes: 1_434 },
+      { status: 'NOT_OBSERVED' },
+      { status: 'FAILED', errorText: 'sizes unavailable' },
+      { status: 'FAILED', errorText: expect.stringContaining('size') },
+    ]);
+    expect(Object.isFrozen(evidence.responses[0]?.transferSize)).toBe(true);
   });
 });

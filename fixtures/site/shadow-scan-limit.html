@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Many elements in an open shadow root fixture</title>
+  <style>
+    /* 文書は、light DOM の高い要素の分だけスクロールできる。 */
+    body { font-family: sans-serif; }
+    #tall-content { height: 2000px; }
+  </style>
+</head>
+<body>
+  <div id="tall-content"><h1>Many elements in an open shadow root fixture</h1></div>
+  <div id="shadow-host"></div>
+  <script>
+    // 内側の領域を探す走査の上限を超える数の要素を、open な shadow root の中に置く。light DOM の要素は少ない。
+    const root = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < 20000; index += 1) {
+      fragment.append(document.createElement('span'));
+    }
+    root.append(fragment);
+  </script>
+</body>
+</html>

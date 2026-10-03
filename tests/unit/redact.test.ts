@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { REDACTED } from '../../src/core/redaction.js';
+import { redactUrlCredentials } from '../../src/crawl/normalize-url.js';
 import { redactHeaders } from '../../src/safety/redact.js';
 
 describe('redactHeaders', () => {
@@ -47,5 +49,11 @@ describe('redactHeaders', () => {
 
     expect(redactHeaders(headers)).toEqual(headers);
     expect(redactHeaders(headers)).not.toBe(headers);
+  });
+
+  it('uses the single shared redaction marker for header values and URL credentials', () => {
+    expect(REDACTED).toBe('[REDACTED]');
+    expect(redactHeaders({ Authorization: 'Bearer secret' })).toEqual({ Authorization: REDACTED });
+    expect(redactUrlCredentials('https://user:secret@host.test/path')).toBe(`https://${REDACTED}@host.test/path`);
   });
 });

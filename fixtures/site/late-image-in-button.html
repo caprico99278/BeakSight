@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Late Image In Button</title>
+    <style>
+      html, body { overflow-anchor: none; }
+      body { margin: 8px; }
+      #spacer { height: 2000px; }
+      /* 大きさを指定しない画像の代わり。初めは大きさがない。 */
+      .thumb { display: inline-block; width: 0; height: 0; vertical-align: middle; }
+    </style>
+  </head>
+  <body>
+    <div id="spacer"></div>
+    <button type="button"><span class="thumb"></span>Late image inert</button>
+    <script>
+      // 遅延読み込みの画像の代わり: ボタンが画面に入ってから遅れて、ボタンの中の画像の大きさが決まり、ボタンが大きくなる。
+      // 通信を使わないので、凍結の後にも起きる。ボタン自身の属性は変わらず、ボタンは何もしない。
+      const button = document.querySelector('button');
+      const thumb = document.querySelector('.thumb');
+      const observer = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        setTimeout(() => {
+          thumb.style.width = '48px';
+          thumb.style.height = '48px';
+        }, 400);
+      });
+      observer.observe(button);
+    </script>
+  </body>
+</html>

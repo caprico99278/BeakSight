@@ -1,4 +1,8 @@
 import type { Page } from 'playwright';
+import type { IncompleteReasonCode, PartialFailureReason } from '../core/contracts.js';
+import { awaitBeforeDeadline, wait } from '../core/deadline.js';
+import { isPositiveFiniteNumber } from '../core/guards.js';
+import { pageFailureReason } from './page-failure.js';
 
 export interface PageSettlingPolicy {
   readonly deadlineAtMs: number;
@@ -18,55 +22,19 @@ export type PageSettlingResult = Readonly<{
   readonly observations: readonly Readonly<PageSettlingObservation>[];
 }> | Readonly<{
   readonly status: 'PARTIAL';
-  readonly reason: 'DEADLINE_EXCEEDED' | 'PAGE_CLOSED' | 'DOM_READINESS_FAILED' | 'EVALUATION_FAILED';
+  readonly reason: PartialFailureReason | Extract<IncompleteReasonCode, 'DOM_READINESS_FAILED'>;
   readonly observations: readonly Readonly<PageSettlingObservation>[];
 }>;
-
-const DEADLINE = Symbol('deadline');
-type OperationOutcome<T> =
-  | { readonly status: 'FULFILLED'; readonly value: T }
-  | { readonly status: 'REJECTED'; readonly reason: unknown };
 
 function validatePolicy(policy: PageSettlingPolicy): void {
   if (!Number.isFinite(policy.deadlineAtMs)) {
     throw new Error('Page settling deadline must be finite');
   }
-  if (!Number.isFinite(policy.pollIntervalMs) || policy.pollIntervalMs <= 0) {
+  if (!isPositiveFiniteNumber(policy.pollIntervalMs)) {
     throw new Error('Page settling poll interval must be positive and finite');
   }
-  if (!Number.isFinite(policy.stableWindowMs) || policy.stableWindowMs <= 0) {
+  if (!isPositiveFiniteNumber(policy.stableWindowMs)) {
     throw new Error('Page settling stable window must be positive and finite');
-  }
-}
-
-async function beforeDeadline<T>(operation: Promise<T>, deadlineAtMs: number): Promise<T | typeof DEADLINE> {
-  const outcome = operation.then<OperationOutcome<T>, OperationOutcome<T>>(
-    (value) => ({ status: 'FULFILLED', value }),
-    (reason: unknown) => ({ status: 'REJECTED', reason }),
-  );
-  const remainingMs = deadlineAtMs - Date.now();
-  if (remainingMs <= 0) {
-    return DEADLINE;
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const result = await Promise.race([
-      outcome,
-      new Promise<typeof DEADLINE>((resolve) => {
-        timer = setTimeout(() => resolve(DEADLINE), remainingMs);
-      }),
-    ]);
-    if (result === DEADLINE || Date.now() >= deadlineAtMs) {
-      return DEADLINE;
-    }
-    if (result.status === 'REJECTED') {
-      throw result.reason;
-    }
-    return result.value;
-  } finally {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
   }
 }
 
@@ -99,10 +67,6 @@ function settledBeforeDeadline(
     : settled;
 }
 
-function wait(delayMs: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, delayMs));
-}
-
 export async function waitForPageSettled(
   page: Page,
   policy: PageSettlingPolicy,
@@ -117,15 +81,14 @@ export async function waitForPageSettled(
     return partial('PAGE_CLOSED', observations);
   }
 
-  try {
-    const domReady = await beforeDeadline(
-      page.waitForLoadState('domcontentloaded', { timeout: Math.max(1, deadlineAtMs - Date.now()) }),
-      deadlineAtMs,
-    );
-    if (domReady === DEADLINE) {
-      return partial('DEADLINE_EXCEEDED', observations);
-    }
-  } catch {
+  const domReady = await awaitBeforeDeadline(
+    page.waitForLoadState('domcontentloaded', { timeout: Math.max(1, deadlineAtMs - Date.now()) }),
+    deadlineAtMs,
+  );
+  if (domReady.status === 'DEADLINE_EXCEEDED') {
+    return partial('DEADLINE_EXCEEDED', observations);
+  }
+  if (domReady.status === 'REJECTED') {
     return partial(page.isClosed() ? 'PAGE_CLOSED' : 'DOM_READINESS_FAILED', observations);
   }
 
@@ -135,18 +98,17 @@ export async function waitForPageSettled(
     if (page.isClosed()) {
       return partial('PAGE_CLOSED', observations);
     }
-    let documentState: { readonly readyState: DocumentReadyState; readonly scrollHeight: number } | typeof DEADLINE;
-    try {
-      documentState = await beforeDeadline(page.evaluate(() => ({
-        readyState: document.readyState,
-        scrollHeight: document.documentElement.scrollHeight,
-      })), deadlineAtMs);
-    } catch {
-      return partial(page.isClosed() ? 'PAGE_CLOSED' : 'EVALUATION_FAILED', observations);
+    const evaluated = await awaitBeforeDeadline(page.evaluate(() => ({
+      readyState: document.readyState,
+      scrollHeight: document.documentElement.scrollHeight,
+    })), deadlineAtMs);
+    if (evaluated.status === 'REJECTED') {
+      return partial(pageFailureReason(page), observations);
     }
-    if (documentState === DEADLINE) {
+    if (evaluated.status === 'DEADLINE_EXCEEDED') {
       return partial('DEADLINE_EXCEEDED', observations);
     }
+    const documentState = evaluated.value;
 
     const observedAtMs = Date.now();
     if (observedAtMs >= deadlineAtMs) {

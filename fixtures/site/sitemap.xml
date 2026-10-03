@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  クロールの fixture（/crawl/）の sitemap。loc の Origin の置き換えの文字列は、fixture のサーバが自分の Origin に置き換える。
+  - クロールで発見されるページ: index、level-1、level-2
+  - クロールでは発見されないページ: sitemap-only（どのページからもリンクしない）
+  - 深さ3の level-3 は、クロールで発見されるが、sitemap に載せない。
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>{{FIXTURE_ORIGIN}}/crawl/index.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/crawl/level-1.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/crawl/level-2.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/crawl/sitemap-only.html</loc></url>
+</urlset>

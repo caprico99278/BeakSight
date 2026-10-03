@@ -1,8 +1,25 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { INTERACTION_HREF_KINDS, INTERACTION_REJECTION_REASONS } from '../../src/core/evidence-types.js';
 import {
   classifyInteractionCandidate,
+  freezeInteractionCandidate,
+  INTERACTION_CANDIDATE_LIMITS,
+  interactionRejectionLedgerRecord,
   type InteractionCandidate,
+  type InteractionRejectionReason,
 } from '../../src/safety/interaction-policy.js';
+
+// F20b（設計書 2026-09-23 4.4.1「長い class」）: class の値だけは、ほかの属性より長い、class 専用の上限まで記録する。
+describe('INTERACTION_CANDIDATE_LIMITS (F20b)', () => {
+  it('keeps a dedicated class limit of 4096 that is longer than the limit of the other attributes', () => {
+    expect(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength).toBe(4_096);
+    expect(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength).toBe(512);
+    expect(INTERACTION_CANDIDATE_LIMITS.maxClassAttributeLength).toBeGreaterThan(INTERACTION_CANDIDATE_LIMITS.maxAttributeLength);
+    expect(Object.isFrozen(INTERACTION_CANDIDATE_LIMITS)).toBe(true);
+  });
+});
 
 function candidate(overrides: Partial<InteractionCandidate> = {}): InteractionCandidate {
   return {
@@ -133,6 +150,19 @@ describe('classifyInteractionCandidate', () => {
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
   });
 
+  it.each(INTERACTION_HREF_KINDS)('accepts the closed href kind %s as a well-formed candidate', (hrefKind) => {
+    const href = hrefKind === 'NONE' ? null : 'https://example.test/next';
+
+    expect(() => freezeInteractionCandidate(candidate({ tagName: 'a', href, hrefKind }))).not.toThrow();
+  });
+
+  it('rejects an href kind outside the closed list as malformed', () => {
+    const unknownKind = candidate({ tagName: 'a', href: 'https://example.test/next', hrefKind: 'UNKNOWN' as never });
+
+    expect(classifyInteractionCandidate(unknownKind)).toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+    expect(() => freezeInteractionCandidate(unknownKind)).toThrow('Interaction candidate is malformed');
+  });
+
   it('rejects unsupported ARIA state values as malformed', () => {
     expect(classifyInteractionCandidate(candidate({ ariaExpanded: 'banana' })))
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
@@ -156,5 +186,65 @@ describe('classifyInteractionCandidate', () => {
   ] as const)('rejects inconsistent controlled state: %s', (_label, controlledVisible, controlledHidden) => {
     expect(classifyInteractionCandidate(candidate({ controlledVisible, controlledHidden })))
       .toEqual({ action: 'REJECT', reason: 'MALFORMED_CANDIDATE' });
+  });
+});
+
+describe('interactionRejectionLedgerRecord (M2)', () => {
+  it.each([
+    ['EXTERNAL_ACTION', 'BLOCKED_EXTERNAL_ACTION'],
+    ['DOWNLOAD', 'BLOCKED_EXTERNAL_ACTION'],
+    ['SUBMISSION_CONTROL', 'EXCLUDED_CANDIDATE'],
+    ['RESET_CONTROL', 'EXCLUDED_CANDIDATE'],
+    ['FORM_ASSOCIATED', 'EXCLUDED_CANDIDATE'],
+    ['NAVIGATION_HREF', 'EXCLUDED_CANDIDATE'],
+    ['DISABLED', 'NONE'],
+    ['NOT_VISIBLE', 'NONE'],
+    ['MALFORMED_CANDIDATE', 'NONE'],
+  ] as const)('ledgers %s as %s', (reason, record) => {
+    expect(interactionRejectionLedgerRecord(reason)).toBe(record);
+  });
+
+  // T12d0: 除外理由の閉じた一覧は core の `INTERACTION_REJECTION_REASONS` に1回だけ書き、ここでは値を並べ直さない。
+  it('assigns a ledger record to every reason of the core closed list (T12d0)', () => {
+    expect(INTERACTION_REJECTION_REASONS.length).toBeGreaterThan(0);
+    for (const reason of INTERACTION_REJECTION_REASONS) {
+      expect(['BLOCKED_EXTERNAL_ACTION', 'EXCLUDED_CANDIDATE', 'NONE'], reason)
+        .toContain(interactionRejectionLedgerRecord(reason));
+    }
+  });
+
+  // DEF-003: 表にない理由（Object の既定のプロパティ名を含む）は、記録先を決めずに例外にする（fail-closed）。
+  it.each([
+    'constructor',
+    'toString',
+    'hasOwnProperty',
+    '__proto__',
+    'valueOf',
+    'UNKNOWN_REASON',
+  ])('throws instead of choosing a ledger record for the reason %s that is not in the table (DEF-003)', (reason) => {
+    expect(() => interactionRejectionLedgerRecord(reason as InteractionRejectionReason)).toThrow(TypeError);
+  });
+
+  it('defines InteractionRejectionReason only as an alias of the core type (T12d0)', async () => {
+    const source = await readFile(resolve(process.cwd(), 'src/safety/interaction-policy.ts'), 'utf8');
+
+    expect([...source.matchAll(/^export (?:interface|type) InteractionRejectionReason\b.*$/gmu)].map((match) => match[0]))
+      .toEqual(['export type InteractionRejectionReason = InteractionRejectionReasonEvidence;']);
+    expect(source).not.toMatch(/\|\s*'SUBMISSION_CONTROL'/u);
+  });
+});
+
+describe('freezeInteractionCandidate (Q6)', () => {
+  it('rejects a null bounding box with the bounded contract message instead of a TypeError', () => {
+    const malformed = { ...candidate(), boundingBox: null } as unknown as InteractionCandidate;
+    let rejection: unknown;
+    try {
+      freezeInteractionCandidate(malformed);
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect(rejection).not.toBeInstanceOf(TypeError);
+    expect((rejection as Error).message).toBe('Interaction candidate is malformed or exceeds bounded contract');
   });
 });

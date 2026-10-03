@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Body scroll fixture</title>
+  <style>
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; margin: 0; overflow: auto; font-family: sans-serif; }
+    main > section { box-sizing: border-box; min-height: 900px; padding: 24px; }
+    [data-lazy-batch] { box-sizing: border-box; min-height: 700px; padding: 24px; }
+    #below-fold-color { color: rgb(90, 30, 120); background: rgb(250, 250, 250); }
+  </style>
+</head>
+<body>
+  <main id="content">
+    <section><h1>Body scroll fixture</h1></section>
+    <section><p>Middle content</p></section>
+    <section><p id="below-fold-color">Below the fold body-scroll text.</p></section>
+  </main>
+  <script>
+    (() => {
+      const content = document.querySelector('#content');
+      let batches = 0;
+      let pending = false;
+      const appendNearBottom = () => {
+        if (pending || batches >= 2) return;
+        const scroller = document.body;
+        const remaining = scroller.scrollHeight - (scroller.scrollTop + scroller.clientHeight);
+        if (remaining > 180) return;
+        pending = true;
+        setTimeout(() => {
+          batches += 1;
+          const batch = document.createElement('section');
+          batch.dataset.lazyBatch = String(batches);
+          batch.textContent = `Body lazy batch ${batches}`;
+          content.append(batch);
+          pending = false;
+          appendNearBottom();
+        }, 10);
+      };
+      document.body.addEventListener('scroll', appendNearBottom, { passive: true });
+    })();
+  </script>
+</body>
+</html>

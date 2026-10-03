@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  全体の巡回の fixture（/full-crawl/）の sitemap（T19a-fix-round-1）。fixture のサーバを `siteMetadataDirectory: 'full-crawl'` で
+  起動すると、/sitemap.xml として、このファイルを返す。loc の Origin の置き換えの文字列は、サーバが自分の Origin に置き換える。
+  - 入口から発見される、実在する7ページを載せる。
+  - 404 になる missing.html は載せない（DISCOVERED_URL_NOT_IN_SITEMAP は、このページだけに出る）。
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/index.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/links.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/technical.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/layout.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/control.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/contrast.html</loc></url>
+  <url><loc>{{FIXTURE_ORIGIN}}/full-crawl/accessibility.html</loc></url>
+</urlset>

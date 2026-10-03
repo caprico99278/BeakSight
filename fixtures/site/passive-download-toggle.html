@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Passive Download Toggle</title></head>
+  <body>
+    <button type="button" aria-expanded="false" aria-controls="passive-download-panel">Toggle after passive download</button>
+    <div id="passive-download-panel" hidden>Expanded fixture content</div>
+    <script>
+      const link = document.createElement('a');
+      link.href = 'data:text/plain,passive-fixture-download';
+      link.download = 'passive-fixture.txt';
+      link.click();
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#passive-download-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>

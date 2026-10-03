@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Slow Load Class Toggle</title>
+  </head>
+  <body>
+    <!-- 読み込みの遅いページ（R6 の I-2）。fixture サーバの遅い応答（/__slow。応答までの時間はサーバの起動の設定で決める）を画像として読むので、load が遅れる。 -->
+    <img src="/__slow" alt="" width="1" height="1">
+    <button type="button">Slow load toggle</button>
+    <script>
+      // 押すと、自分の class を切り替える。
+      const button = document.querySelector('button');
+      button.addEventListener('click', () => {
+        button.classList.toggle('active');
+      });
+    </script>
+  </body>
+</html>

@@ -7,6 +7,7 @@
     "pageId",
     "pageUrl",
     "status",
+    "viewports",
     "evidence",
     "findings",
     "incompleteReasons"
@@ -16,131 +17,2647 @@
     "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
     "pageUrl": { "type": "string", "minLength": 1 },
     "status": { "enum": ["AUDITED", "PARTIAL", "SKIPPED", "FAILED"] },
+    "viewports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desktop", "mobile"],
+      "properties": {
+        "desktop": { "$ref": "#/$defs/viewportAuditResult" },
+        "mobile": { "$ref": "#/$defs/viewportAuditResult" }
+      }
+    },
     "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
     "findings": { "type": "array", "items": { "$ref": "urn:beaksight:schema:finding:1.0" } },
     "incompleteReasons": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": { "$ref": "urn:beaksight:schema:run:1.0#/$defs/incompleteReason" }
     }
   },
   "$defs": {
+    "viewportAuditResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestedUrl", "finalUrl", "httpStatus", "status", "incompleteReasons", "navigationOutcome"],
+      "properties": {
+        "requestedUrl": { "type": "string", "minLength": 1 },
+        "finalUrl": { "type": ["string", "null"], "minLength": 1 },
+        "httpStatus": { "type": ["integer", "null"], "minimum": 0 },
+        "status": { "enum": ["AUDITED", "PARTIAL", "SKIPPED", "FAILED"] },
+        "incompleteReasons": {
+          "type": "array",
+          "items": { "$ref": "urn:beaksight:schema:run:1.0#/$defs/incompleteReason" }
+        },
+        "navigationOutcome": { "enum": ["OK", "TIMEOUT", "FAILED", "BLOCKED_EXTERNAL_REDIRECT", null] }
+      }
+    },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
       "required": ["evidenceId", "type", "pageId", "viewport", "observedAt", "payload"],
       "properties": {
         "evidenceId": { "type": "string", "pattern": "^EV-[A-Z0-9_]+-[0-9]{6,}$" },
-        "type": { "enum": ["network", "console", "dom", "layout", "performance", "accessibility", "interaction", "screenshot", "metadata"] },
+        "type": {
+          "enum": [
+            "network",
+            "console",
+            "dom",
+            "link",
+            "layout",
+            "color",
+            "performance",
+            "accessibility",
+            "interaction",
+            "screenshot",
+            "scroll",
+            "metadata",
+            "safety"
+          ]
+        },
         "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
-        "viewport": { "type": "string", "minLength": 1 },
+        "viewport": { "enum": ["desktop", "mobile", null] },
         "observedAt": { "type": "string", "minLength": 1 },
         "payload": true
       },
-      "allOf": [
+      "oneOf": [
         {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-NET-[0-9]{6,}$" },
+            "type": { "const": "network" },
+            "payload": { "$ref": "#/$defs/networkEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-CONSOLE-[0-9]{6,}$" },
+            "type": { "const": "console" },
+            "payload": { "$ref": "#/$defs/consoleEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-DOM-[0-9]{6,}$" },
+            "type": { "const": "dom" },
+            "payload": { "$ref": "#/$defs/domEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-LINK-[0-9]{6,}$" },
+            "type": { "const": "link" },
+            "payload": { "$ref": "#/$defs/linkDiscoveryEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-LAYOUT-[0-9]{6,}$" },
+            "type": { "const": "layout" },
+            "payload": { "$ref": "#/$defs/layoutEvidencePayload" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-COLOR-[0-9]{6,}$" },
+            "type": { "const": "color" },
+            "payload": { "$ref": "#/$defs/colorEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-PERF-[0-9]{6,}$" },
+            "type": { "const": "performance" },
+            "payload": { "$ref": "#/$defs/performanceEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-A11Y-[0-9]{6,}$" },
+            "type": { "const": "accessibility" },
+            "payload": { "$ref": "#/$defs/accessibilityEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-INTERACTION-[0-9]{6,}$" },
+            "type": { "const": "interaction" },
+            "payload": { "$ref": "#/$defs/interactionEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-SHOT-[0-9]{6,}$" },
+            "type": { "const": "screenshot" },
+            "payload": { "$ref": "#/$defs/screenshotEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-SCROLL-[0-9]{6,}$" },
+            "type": { "const": "scroll" },
+            "payload": { "$ref": "#/$defs/scrollEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-META-[0-9]{6,}$" },
+            "type": { "const": "metadata" },
+            "payload": { "$ref": "#/$defs/metadataEvidence" }
+          }
+        },
+        {
+          "properties": {
+            "evidenceId": { "type": "string", "pattern": "^EV-SAFETY-[0-9]{6,}$" },
+            "type": { "const": "safety" },
+            "payload": { "$ref": "#/$defs/safetyEventsEvidence" }
+          }
+        }
+      ]
+    },
+    "scrollPosition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scrollX", "scrollY"],
+      "properties": { "scrollX": { "type": "number" }, "scrollY": { "type": "number" } }
+    },
+    "headerEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "values"],
+          "properties": {
+            "status": { "const": "OBSERVED" },
+            "values": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "errorText"],
+          "properties": { "status": { "const": "FAILED" }, "errorText": { "type": "string" } }
+        }
+      ]
+    },
+    "responseTransferSize": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "headersBytes", "bodyBytes", "totalBytes"],
+          "properties": {
+            "status": { "const": "OBSERVED" },
+            "headersBytes": { "type": "integer", "minimum": 0 },
+            "bodyBytes": { "type": "integer", "minimum": 0 },
+            "totalBytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": { "status": { "const": "NOT_OBSERVED" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "errorText"],
+          "properties": { "status": { "const": "FAILED" }, "errorText": { "type": "string" } }
+        }
+      ]
+    },
+    "networkTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startTime",
+        "domainLookupStart",
+        "domainLookupEnd",
+        "connectStart",
+        "secureConnectionStart",
+        "connectEnd",
+        "requestStart",
+        "responseStart",
+        "responseEnd"
+      ],
+      "properties": {
+        "startTime": { "type": "number" },
+        "domainLookupStart": { "type": "number" },
+        "domainLookupEnd": { "type": "number" },
+        "connectStart": { "type": "number" },
+        "secureConnectionStart": { "type": "number" },
+        "connectEnd": { "type": "number" },
+        "requestStart": { "type": "number" },
+        "responseStart": { "type": "number" },
+        "responseEnd": { "type": "number" }
+      }
+    },
+    "networkRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isNavigationRequest",
+        "isMainFrame",
+        "requestId",
+        "url",
+        "method",
+        "resourceType",
+        "headers",
+        "timing",
+        "redirectFromRequestId",
+        "redirectToRequestId",
+        "redirectChainRequestIds",
+        "truncated"
+      ],
+      "properties": {
+        "isNavigationRequest": { "type": "boolean" },
+        "isMainFrame": { "type": ["boolean", "null"] },
+        "requestId": { "type": "string" },
+        "url": { "type": "string" },
+        "method": { "type": "string" },
+        "resourceType": { "type": "string" },
+        "headers": { "$ref": "#/$defs/headerEvidence" },
+        "timing": { "$ref": "#/$defs/networkTiming" },
+        "redirectFromRequestId": { "type": ["string", "null"] },
+        "redirectToRequestId": { "type": ["string", "null"] },
+        "redirectChainRequestIds": { "type": "array", "items": { "type": "string" } },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "networkResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isNavigationRequest",
+        "isMainFrame",
+        "requestId",
+        "url",
+        "status",
+        "statusText",
+        "headers",
+        "contentLengthHeader",
+        "timing",
+        "transferSize",
+        "truncated"
+      ],
+      "properties": {
+        "isNavigationRequest": { "type": "boolean" },
+        "isMainFrame": { "type": ["boolean", "null"] },
+        "requestId": { "type": "string" },
+        "url": { "type": "string" },
+        "status": { "type": "integer" },
+        "statusText": { "type": "string" },
+        "headers": { "$ref": "#/$defs/headerEvidence" },
+        "contentLengthHeader": { "type": ["string", "null"] },
+        "timing": { "$ref": "#/$defs/networkTiming" },
+        "transferSize": { "$ref": "#/$defs/responseTransferSize" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "networkFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isNavigationRequest",
+        "isMainFrame",
+        "requestId",
+        "url",
+        "method",
+        "resourceType",
+        "errorText",
+        "timing",
+        "truncated"
+      ],
+      "properties": {
+        "isNavigationRequest": { "type": "boolean" },
+        "isMainFrame": { "type": ["boolean", "null"] },
+        "requestId": { "type": "string" },
+        "url": { "type": "string" },
+        "method": { "type": "string" },
+        "resourceType": { "type": "string" },
+        "errorText": { "type": "string" },
+        "timing": { "$ref": "#/$defs/networkTiming" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "networkEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requests",
+        "responses",
+        "failures",
+        "omittedRequestCount",
+        "omittedResponseCount",
+        "omittedFailureCount"
+      ],
+      "properties": {
+        "requests": { "type": "array", "items": { "$ref": "#/$defs/networkRequest" } },
+        "responses": { "type": "array", "items": { "$ref": "#/$defs/networkResponse" } },
+        "failures": { "type": "array", "items": { "$ref": "#/$defs/networkFailure" } },
+        "omittedRequestCount": { "type": "integer", "minimum": 0 },
+        "omittedResponseCount": { "type": "integer", "minimum": 0 },
+        "omittedFailureCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "consoleEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["consoleMessages", "pageErrors", "omittedConsoleMessageCount", "omittedPageErrorCount"],
+      "properties": {
+        "consoleMessages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "text", "location", "truncated"],
+            "properties": {
+              "type": { "enum": ["error", "warning"] },
+              "text": { "type": "string" },
+              "location": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url", "lineNumber", "columnNumber"],
+                "properties": {
+                  "url": { "type": "string" },
+                  "lineNumber": { "type": "integer", "minimum": 0 },
+                  "columnNumber": { "type": "integer", "minimum": 0 }
+                }
+              },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "pageErrors": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "message", "stack", "truncated"],
+            "properties": {
+              "name": { "type": "string" },
+              "message": { "type": "string" },
+              "stack": { "type": ["string", "null"] },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "omittedConsoleMessageCount": { "type": "integer", "minimum": 0 },
+        "omittedPageErrorCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "linkEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourcePageId", "anchorText", "ariaLabel", "title", "rawHref", "normalized", "admission", "truncated"],
+      "properties": {
+        "sourcePageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+        "anchorText": { "type": "string" },
+        "ariaLabel": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "rawHref": { "type": "string" },
+        "normalized": {
           "oneOf": [
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ok", "url"],
+              "properties": { "ok": { "const": true }, "url": { "type": "string" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ok", "rawUrl", "reason"],
               "properties": {
-                "type": { "const": "network" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["requestUrl", "status"],
-                  "properties": { "requestUrl": { "type": "string" }, "status": { "type": ["integer", "null"] } }
-                }
+                "ok": { "const": false },
+                "rawUrl": { "type": "string" },
+                "reason": { "$ref": "#/$defs/urlRejectionReason" }
+              }
+            }
+          ]
+        },
+        "admission": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "url"],
+              "properties": { "kind": { "const": "INTERNAL_NAVIGABLE" }, "url": { "type": "string" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "url"],
+              "properties": { "kind": { "const": "EXTERNAL_RECORD_ONLY" }, "url": { "type": "string" } }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "rawUrl", "scheme"],
+              "properties": {
+                "kind": { "const": "SPECIAL_SCHEME_RECORD_ONLY" },
+                "rawUrl": { "type": "string" },
+                "scheme": { "type": "string" }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "rawUrl", "reason"],
               "properties": {
-                "type": { "const": "console" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["level", "message"],
-                  "properties": { "level": { "enum": ["ERROR", "WARN", "INFO"] }, "message": { "type": "string" } }
+                "kind": { "const": "REJECTED_INVALID" },
+                "rawUrl": { "type": "string" },
+                "reason": { "$ref": "#/$defs/urlRejectionReason" }
+              }
+            }
+          ]
+        },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "urlRejectionReason": { "enum": ["INVALID_URL", "UNSUPPORTED_SCHEME", "CREDENTIALS_NOT_ALLOWED", "URL_TOO_LONG"] },
+    "linkDiscoveryEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["links", "omittedLinkCount"],
+      "properties": {
+        "links": { "type": "array", "items": { "$ref": "#/$defs/linkEvidence" } },
+        "omittedLinkCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "formFieldEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "name",
+        "required",
+        "visible",
+        "labels",
+        "hasAriaLabel",
+        "hasAriaLabelledby",
+        "hasTitle",
+        "truncated"
+      ],
+      "properties": {
+        "type": { "type": "string" },
+        "name": { "type": "string" },
+        "required": { "type": "boolean" },
+        "visible": { "type": "boolean" },
+        "labels": { "type": "array", "items": { "type": "string" } },
+        "hasAriaLabel": { "type": "boolean" },
+        "hasAriaLabelledby": { "type": "boolean" },
+        "hasTitle": { "type": "boolean" },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "domEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pageId",
+        "scrollPosition",
+        "title",
+        "metaDescription",
+        "canonicalUrl",
+        "lang",
+        "headings",
+        "visibleText",
+        "images",
+        "forms",
+        "unassociatedFields",
+        "duplicateIds",
+        "truncation"
+      ],
+      "properties": {
+        "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+        "title": { "type": ["string", "null"] },
+        "metaDescription": { "type": ["string", "null"] },
+        "canonicalUrl": { "type": ["string", "null"] },
+        "lang": { "type": ["string", "null"] },
+        "headings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["level", "text", "truncated"],
+            "properties": {
+              "level": { "type": "integer", "minimum": 1, "maximum": 6 },
+              "text": { "type": "string" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "visibleText": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "text",
+            "truncated",
+            "nodeLimitReached",
+            "ariaHiddenText",
+            "regions",
+            "omittedRegionCount"
+          ],
+          "properties": {
+            "source": { "enum": ["SEMANTIC_LANDMARKS", "BODY_FALLBACK"] },
+            "text": { "type": "string" },
+            "truncated": { "type": "boolean" },
+            "nodeLimitReached": { "type": "boolean" },
+            "ariaHiddenText": { "type": "string" },
+            "regions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "text", "ariaHidden", "truncated"],
+                "properties": {
+                  "kind": { "enum": ["header", "navigation", "main", "aside", "footer", "form", "other"] },
+                  "text": { "type": "string" },
+                  "ariaHidden": { "type": "boolean" },
+                  "truncated": { "type": "boolean" }
                 }
               }
             },
-            {
-              "properties": {
-                "type": { "const": "dom" },
-                "payload": {
+            "omittedRegionCount": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["src", "resolvedUrl", "alt", "complete", "naturalWidth", "naturalHeight", "truncated"],
+            "properties": {
+              "src": { "type": ["string", "null"] },
+              "resolvedUrl": { "type": ["string", "null"] },
+              "alt": { "type": ["string", "null"] },
+              "complete": { "type": "boolean" },
+              "naturalWidth": { "type": "integer", "minimum": 0 },
+              "naturalHeight": { "type": "integer", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "forms": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "method",
+              "action",
+              "fields",
+              "submitControls",
+              "omittedFieldCount",
+              "omittedSubmitControlCount",
+              "truncated"
+            ],
+            "properties": {
+              "method": { "type": "string" },
+              "action": { "type": "string" },
+              "fields": { "type": "array", "items": { "$ref": "#/$defs/formFieldEvidence" } },
+              "submitControls": {
+                "type": "array",
+                "items": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["title", "visibleText"],
-                  "properties": { "title": { "type": ["string", "null"] }, "visibleText": { "type": "string" } }
+                  "required": ["type", "name", "value", "text", "truncated"],
+                  "properties": {
+                    "type": { "enum": ["submit", "image"] },
+                    "name": { "type": "string" },
+                    "value": { "type": "string" },
+                    "text": { "type": "string" },
+                    "truncated": { "type": "boolean" }
+                  }
                 }
+              },
+              "omittedFieldCount": { "type": "integer", "minimum": 0 },
+              "omittedSubmitControlCount": { "type": "integer", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "unassociatedFields": { "type": "array", "items": { "$ref": "#/$defs/formFieldEvidence" } },
+        "duplicateIds": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "count", "truncated"],
+            "properties": {
+              "id": { "type": "string" },
+              "count": { "type": "integer", "minimum": 2 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "truncation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "documentFields",
+            "omittedHeadingCount",
+            "omittedImageCount",
+            "omittedFormCount",
+            "omittedUnassociatedFieldCount",
+            "omittedDuplicateIdCount"
+          ],
+          "properties": {
+            "documentFields": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["title", "metaDescription", "canonicalUrl", "lang"],
+              "properties": {
+                "title": { "type": "boolean" },
+                "metaDescription": { "type": "boolean" },
+                "canonicalUrl": { "type": "boolean" },
+                "lang": { "type": "boolean" }
+              }
+            },
+            "omittedHeadingCount": { "type": "integer", "minimum": 0 },
+            "omittedImageCount": { "type": "integer", "minimum": 0 },
+            "omittedFormCount": { "type": "integer", "minimum": 0 },
+            "omittedUnassociatedFieldCount": { "type": "integer", "minimum": 0 },
+            "omittedDuplicateIdCount": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "rectangle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "top", "right", "bottom", "left", "width", "height"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "top": { "type": "number" },
+        "right": { "type": "number" },
+        "bottom": { "type": "number" },
+        "left": { "type": "number" },
+        "width": { "type": "number" },
+        "height": { "type": "number" }
+      }
+    },
+    "intersection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "top", "right", "bottom", "left", "width", "height", "area"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "top": { "type": "number" },
+        "right": { "type": "number" },
+        "bottom": { "type": "number" },
+        "left": { "type": "number" },
+        "width": { "type": "number" },
+        "height": { "type": "number" },
+        "area": { "type": "number", "minimum": 0 }
+      }
+    },
+    "visibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["visible", "display", "visibility", "opacity", "hiddenAttribute", "ariaHidden", "clientRectCount"],
+      "properties": {
+        "visible": { "type": "boolean" },
+        "display": { "type": "string" },
+        "visibility": { "type": "string" },
+        "opacity": { "type": "number" },
+        "hiddenAttribute": { "type": "boolean" },
+        "ariaHidden": { "type": "boolean" },
+        "clientRectCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "layoutElement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector",
+        "kind",
+        "rect",
+        "area",
+        "visibility",
+        "position",
+        "zIndex",
+        "overflowX",
+        "overflowY",
+        "fixedOrStickyAncestor"
+      ],
+      "properties": {
+        "selector": { "type": "string" },
+        "kind": { "enum": ["heading", "paragraph", "image", "button", "link", "input", "table", "media", "other"] },
+        "rect": { "$ref": "#/$defs/rectangle" },
+        "area": { "type": "number", "minimum": 0 },
+        "visibility": { "$ref": "#/$defs/visibility" },
+        "position": { "type": "string" },
+        "zIndex": { "type": "string" },
+        "overflowX": { "type": "string" },
+        "overflowY": { "type": "string" },
+        "fixedOrStickyAncestor": { "type": "boolean" }
+      }
+    },
+    "layoutEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scrollPosition",
+        "document",
+        "boxesOutsideViewport",
+        "zeroSizeInteractive",
+        "clippedText",
+        "fixedHeadingOverlaps",
+        "elementOverlaps",
+        "fixedElements",
+        "truncation"
+      ],
+      "properties": {
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+        "document": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "viewportWidth",
+            "viewportHeight",
+            "documentElementClientWidth",
+            "documentElementClientHeight",
+            "documentElementScrollWidth",
+            "documentElementScrollHeight",
+            "bodyScrollWidth",
+            "bodyScrollHeight",
+            "bodyClientWidth",
+            "bodyClientHeight",
+            "horizontalOverflowPx",
+            "viewportHorizontalClip"
+          ],
+          "properties": {
+            "viewportWidth": { "type": "number" },
+            "viewportHeight": { "type": "number" },
+            "documentElementClientWidth": { "type": "number" },
+            "documentElementClientHeight": { "type": "number" },
+            "documentElementScrollWidth": { "type": "number" },
+            "documentElementScrollHeight": { "type": "number" },
+            "bodyScrollWidth": { "type": "number" },
+            "bodyScrollHeight": { "type": "number" },
+            "bodyClientWidth": { "type": "number" },
+            "bodyClientHeight": { "type": "number" },
+            "horizontalOverflowPx": { "type": "number", "minimum": 0 },
+            "viewportHorizontalClip": { "enum": ["NONE", "CLIPPED", "SCROLLABLE"] }
+          }
+        },
+        "boxesOutsideViewport": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "kind",
+              "rect",
+              "visibility",
+              "position",
+              "zIndex",
+              "overflowX",
+              "overflowY",
+              "horizontalClipAncestor",
+              "nearestListedAncestorIndex",
+              "outside",
+              "truncated"
+            ],
+            "properties": {
+              "selector": { "type": "string" },
+              "kind": { "enum": ["heading", "paragraph", "image", "button", "link", "input", "table", "media", "other"] },
+              "rect": { "$ref": "#/$defs/rectangle" },
+              "visibility": { "$ref": "#/$defs/visibility" },
+              "position": { "type": "string" },
+              "zIndex": { "type": "string" },
+              "overflowX": { "type": "string" },
+              "overflowY": { "type": "string" },
+              "horizontalClipAncestor": { "enum": ["NONE", "CLIPPED", "SCROLLABLE"] },
+              "nearestListedAncestorIndex": { "type": ["integer", "null"], "minimum": 0 },
+              "outside": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["left", "right", "top", "bottom"],
+                "properties": {
+                  "left": { "type": "boolean" },
+                  "right": { "type": "boolean" },
+                  "top": { "type": "boolean" },
+                  "bottom": { "type": "boolean" }
+                }
+              },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "zeroSizeInteractive": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "tagName",
+              "role",
+              "rect",
+              "visibility",
+              "position",
+              "zIndex",
+              "overflowX",
+              "overflowY",
+              "hasRenderedDescendant",
+              "truncated"
+            ],
+            "properties": {
+              "selector": { "type": "string" },
+              "tagName": { "type": "string" },
+              "role": { "type": ["string", "null"] },
+              "rect": { "$ref": "#/$defs/rectangle" },
+              "visibility": { "$ref": "#/$defs/visibility" },
+              "position": { "type": "string" },
+              "zIndex": { "type": "string" },
+              "overflowX": { "type": "string" },
+              "overflowY": { "type": "string" },
+              "hasRenderedDescendant": { "type": "boolean" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "clippedText": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "text",
+              "rect",
+              "visibility",
+              "position",
+              "zIndex",
+              "overflowX",
+              "overflowY",
+              "clientWidth",
+              "clientHeight",
+              "scrollWidth",
+              "scrollHeight",
+              "widthClipped",
+              "heightClipped",
+              "partiallyClippedText",
+              "truncated"
+            ],
+            "properties": {
+              "selector": { "type": "string" },
+              "text": { "type": "string" },
+              "rect": { "$ref": "#/$defs/rectangle" },
+              "visibility": { "$ref": "#/$defs/visibility" },
+              "position": { "type": "string" },
+              "zIndex": { "type": "string" },
+              "overflowX": { "type": "string" },
+              "overflowY": { "type": "string" },
+              "clientWidth": { "type": "number" },
+              "clientHeight": { "type": "number" },
+              "scrollWidth": { "type": "number" },
+              "scrollHeight": { "type": "number" },
+              "widthClipped": { "type": "boolean" },
+              "heightClipped": { "type": "boolean" },
+              "partiallyClippedText": { "type": "boolean" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "fixedHeadingOverlaps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "overlaySelector",
+              "headingSelector",
+              "overlayRect",
+              "headingRect",
+              "overlayVisibility",
+              "headingVisibility",
+              "overlayPosition",
+              "overlayZIndex",
+              "overlayOverflowX",
+              "overlayOverflowY",
+              "headingPosition",
+              "headingZIndex",
+              "headingOverflowX",
+              "headingOverflowY",
+              "intersection",
+              "truncated"
+            ],
+            "properties": {
+              "overlaySelector": { "type": "string" },
+              "headingSelector": { "type": "string" },
+              "overlayRect": { "$ref": "#/$defs/rectangle" },
+              "headingRect": { "$ref": "#/$defs/rectangle" },
+              "overlayVisibility": { "$ref": "#/$defs/visibility" },
+              "headingVisibility": { "$ref": "#/$defs/visibility" },
+              "overlayPosition": { "enum": ["fixed", "sticky"] },
+              "overlayZIndex": { "type": "string" },
+              "overlayOverflowX": { "type": "string" },
+              "overlayOverflowY": { "type": "string" },
+              "headingPosition": { "type": "string" },
+              "headingZIndex": { "type": "string" },
+              "headingOverflowX": { "type": "string" },
+              "headingOverflowY": { "type": "string" },
+              "intersection": { "$ref": "#/$defs/intersection" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "elementOverlaps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["first", "second", "intersection", "truncated"],
+            "properties": {
+              "first": { "$ref": "#/$defs/layoutElement" },
+              "second": { "$ref": "#/$defs/layoutElement" },
+              "intersection": { "$ref": "#/$defs/intersection" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "fixedElements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "kind",
+              "rect",
+              "area",
+              "visibility",
+              "position",
+              "zIndex",
+              "overflowX",
+              "overflowY",
+              "fixedOrStickyAncestor",
+              "viewportIntersectionArea",
+              "viewportArea",
+              "viewportAreaRatio",
+              "truncated"
+            ],
+            "properties": {
+              "selector": { "type": "string" },
+              "kind": { "enum": ["heading", "paragraph", "image", "button", "link", "input", "table", "media", "other"] },
+              "rect": { "$ref": "#/$defs/rectangle" },
+              "area": { "type": "number", "minimum": 0 },
+              "visibility": { "$ref": "#/$defs/visibility" },
+              "position": { "enum": ["fixed", "sticky"] },
+              "zIndex": { "type": "string" },
+              "overflowX": { "type": "string" },
+              "overflowY": { "type": "string" },
+              "fixedOrStickyAncestor": { "type": "boolean" },
+              "viewportIntersectionArea": { "type": "number", "minimum": 0 },
+              "viewportArea": { "type": "number", "minimum": 0 },
+              "viewportAreaRatio": { "type": "number", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "truncation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "omittedOutsideViewportCount",
+            "omittedZeroSizeInteractiveCount",
+            "omittedClippedTextCount",
+            "omittedFixedHeadingOverlapCount",
+            "omittedElementOverlapCount",
+            "omittedFixedElementCount",
+            "overlapComparisonLimitReached",
+            "clippedTextNodeScanLimitReachedCount",
+            "renderedDescendantScanLimitReachedCount"
+          ],
+          "properties": {
+            "omittedOutsideViewportCount": { "type": "integer", "minimum": 0 },
+            "omittedZeroSizeInteractiveCount": { "type": "integer", "minimum": 0 },
+            "omittedClippedTextCount": { "type": "integer", "minimum": 0 },
+            "omittedFixedHeadingOverlapCount": { "type": "integer", "minimum": 0 },
+            "omittedElementOverlapCount": { "type": "integer", "minimum": 0 },
+            "omittedFixedElementCount": { "type": "integer", "minimum": 0 },
+            "overlapComparisonLimitReached": { "type": "boolean" },
+            "clippedTextNodeScanLimitReachedCount": { "type": "integer", "minimum": 0 },
+            "renderedDescendantScanLimitReachedCount": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "layoutCollectionResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "layout"],
+          "properties": { "status": { "const": "COMPLETE" }, "layout": { "$ref": "#/$defs/layoutEvidence" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "layout"],
+          "properties": {
+            "status": { "const": "PARTIAL" },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "LAYOUT_COMPARISON_LIMIT_REACHED"] },
+            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidence" }] }
+          }
+        }
+      ]
+    },
+    "stressLayoutEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "status", "layout"],
+          "properties": {
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "status": { "const": "COMPLETE" },
+            "layout": { "$ref": "#/$defs/layoutEvidence" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "status", "reason", "layout"],
+          "properties": {
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "status": { "const": "PARTIAL" },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "LAYOUT_COMPARISON_LIMIT_REACHED"] },
+            "layout": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/layoutEvidence" }] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["width", "height", "status", "stage", "reason", "message", "layout"],
+          "properties": {
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "status": { "const": "FAILED" },
+            "stage": { "enum": ["NOT_STARTED", "NAVIGATION", "COLLECTION"] },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED"] },
+            "message": { "type": ["string", "null"] },
+            "layout": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "layoutEvidencePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "stressSweep"],
+      "properties": {
+        "primary": { "$ref": "#/$defs/layoutCollectionResult" },
+        "stressSweep": {
+          "anyOf": [{ "type": "null" }, { "type": "array", "items": { "$ref": "#/$defs/stressLayoutEvidence" } }]
+        }
+      }
+    },
+    "cssColor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["css", "red", "green", "blue", "alpha"],
+      "properties": {
+        "css": { "type": "string" },
+        "red": { "type": "number", "minimum": 0, "maximum": 255 },
+        "green": { "type": "number", "minimum": 0, "maximum": 255 },
+        "blue": { "type": "number", "minimum": 0, "maximum": 255 },
+        "alpha": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "colorEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scrollPosition",
+        "textSamples",
+        "textSamplesTruncated",
+        "foregroundDistribution",
+        "omittedDistributionEntryCount",
+        "observedArea"
+      ],
+      "properties": {
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+        "textSamples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "selector",
+              "text",
+              "foreground",
+              "background",
+              "contrast",
+              "boundingArea",
+              "visibleArea",
+              "truncated"
+            ],
+            "properties": {
+              "selector": { "type": "string" },
+              "text": { "type": "string" },
+              "foreground": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "color"],
+                    "properties": { "status": { "const": "OBSERVED" }, "color": { "$ref": "#/$defs/cssColor" } }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "reason", "serialized"],
+                    "properties": {
+                      "status": { "const": "UNAVAILABLE" },
+                      "reason": { "const": "INVALID_COLOR" },
+                      "serialized": { "type": "string" }
+                    }
+                  }
+                ]
+              },
+              "background": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "color"],
+                    "properties": { "status": { "const": "OBSERVED" }, "color": { "$ref": "#/$defs/cssColor" } }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "reason"],
+                    "properties": {
+                      "status": { "const": "UNAVAILABLE" },
+                      "reason": {
+                        "enum": ["BACKGROUND_IMAGE", "TRANSPARENT_CHAIN", "INVALID_COLOR", "PARTIAL_OPACITY"]
+                      }
+                    }
+                  }
+                ]
+              },
+              "contrast": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "ratio", "effectiveForeground"],
+                    "properties": {
+                      "status": { "const": "OBSERVED" },
+                      "ratio": { "type": "number", "minimum": 0 },
+                      "effectiveForeground": { "$ref": "#/$defs/cssColor" }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["status", "reason"],
+                    "properties": {
+                      "status": { "const": "UNAVAILABLE" },
+                      "reason": {
+                        "enum": ["BACKGROUND_IMAGE", "TRANSPARENT_CHAIN", "INVALID_COLOR", "PARTIAL_OPACITY"]
+                      }
+                    }
+                  }
+                ]
+              },
+              "boundingArea": { "type": "number", "minimum": 0 },
+              "visibleArea": { "type": "number", "minimum": 0 },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "textSamplesTruncated": { "type": "boolean" },
+        "foregroundDistribution": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["color", "area", "proportion", "sampleCount"],
+            "properties": {
+              "color": { "$ref": "#/$defs/cssColor" },
+              "area": { "type": "number", "minimum": 0 },
+              "proportion": { "type": "number", "minimum": 0, "maximum": 1 },
+              "sampleCount": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "omittedDistributionEntryCount": { "type": "integer", "minimum": 0 },
+        "observedArea": { "type": "number", "minimum": 0 }
+      }
+    },
+    "clsAttribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "largestShiftTarget": { "type": "string" },
+        "largestShiftTime": { "type": "number" },
+        "largestShiftValue": { "type": "number" },
+        "loadState": { "type": "string" }
+      }
+    },
+    "lcpAttribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "target": { "type": "string" },
+        "url": { "type": "string" },
+        "timeToFirstByte": { "type": "number" },
+        "resourceLoadDelay": { "type": "number" },
+        "resourceLoadDuration": { "type": "number" },
+        "elementRenderDelay": { "type": "number" }
+      }
+    },
+    "inpAttribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "interactionTarget": { "type": "string" },
+        "interactionTime": { "type": "number" },
+        "interactionType": { "enum": ["pointer", "keyboard"] },
+        "nextPaintTime": { "type": "number" },
+        "inputDelay": { "type": "number" },
+        "processingDuration": { "type": "number" },
+        "presentationDelay": { "type": "number" },
+        "loadState": { "type": "string" }
+      }
+    },
+    "webVitals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["CLS", "FCP", "INP", "LCP", "TTFB"],
+      "properties": {
+        "CLS": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "value": { "type": "number" },
+                "id": { "type": ["string", "null"] },
+                "navigationType": {
+                  "anyOf": [
+                    { "type": "null" },
+                    {
+                      "enum": [
+                        "navigate",
+                        "reload",
+                        "back-forward",
+                        "back-forward-cache",
+                        "prerender",
+                        "restore",
+                        "soft-navigation"
+                      ]
+                    }
+                  ]
+                },
+                "attribution": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/clsAttribution" }] }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
               "properties": {
-                "type": { "const": "layout" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["condition", "affectedSelectors"],
-                  "properties": { "condition": { "type": "string" }, "affectedSelectors": { "type": "array", "items": { "type": "string" } } }
-                }
+                "status": { "enum": ["NOT_OBSERVED", "UNSUPPORTED"] },
+                "value": { "type": "null" },
+                "id": { "type": "null" },
+                "navigationType": { "type": "null" },
+                "attribution": { "type": "null" }
+              }
+            }
+          ]
+        },
+        "FCP": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "value": { "type": "number" },
+                "id": { "type": ["string", "null"] },
+                "navigationType": {
+                  "anyOf": [
+                    { "type": "null" },
+                    {
+                      "enum": [
+                        "navigate",
+                        "reload",
+                        "back-forward",
+                        "back-forward-cache",
+                        "prerender",
+                        "restore",
+                        "soft-navigation"
+                      ]
+                    }
+                  ]
+                },
+                "attribution": { "type": "null" }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
               "properties": {
-                "type": { "const": "performance" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["metric", "value", "status"],
-                  "properties": { "metric": { "type": "string" }, "value": { "type": ["number", "null"] }, "status": { "enum": ["OBSERVED", "NOT_OBSERVED"] } }
-                }
+                "status": { "enum": ["NOT_OBSERVED", "UNSUPPORTED"] },
+                "value": { "type": "null" },
+                "id": { "type": "null" },
+                "navigationType": { "type": "null" },
+                "attribution": { "type": "null" }
+              }
+            }
+          ]
+        },
+        "INP": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "value": { "type": "number" },
+                "id": { "type": ["string", "null"] },
+                "navigationType": {
+                  "anyOf": [
+                    { "type": "null" },
+                    {
+                      "enum": [
+                        "navigate",
+                        "reload",
+                        "back-forward",
+                        "back-forward-cache",
+                        "prerender",
+                        "restore",
+                        "soft-navigation"
+                      ]
+                    }
+                  ]
+                },
+                "attribution": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/inpAttribution" }] }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
               "properties": {
-                "type": { "const": "accessibility" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["ruleId", "impact", "targetSelectors"],
-                  "properties": { "ruleId": { "type": "string" }, "impact": { "type": ["string", "null"] }, "targetSelectors": { "type": "array", "items": { "type": "string" } } }
-                }
+                "status": { "enum": ["NOT_OBSERVED", "UNSUPPORTED"] },
+                "value": { "type": "null" },
+                "id": { "type": "null" },
+                "navigationType": { "type": "null" },
+                "attribution": { "type": "null" }
+              }
+            }
+          ]
+        },
+        "LCP": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "value": { "type": "number" },
+                "id": { "type": ["string", "null"] },
+                "navigationType": {
+                  "anyOf": [
+                    { "type": "null" },
+                    {
+                      "enum": [
+                        "navigate",
+                        "reload",
+                        "back-forward",
+                        "back-forward-cache",
+                        "prerender",
+                        "restore",
+                        "soft-navigation"
+                      ]
+                    }
+                  ]
+                },
+                "attribution": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/lcpAttribution" }] }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
               "properties": {
-                "type": { "const": "interaction" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["candidateId", "status"],
-                  "properties": { "candidateId": { "type": "string" }, "status": { "enum": ["VERIFIED", "REJECTED_UNSAFE", "BLOCKED_BY_SAFETY", "NOT_VERIFIABLE", "EXECUTION_FAILED"] } }
-                }
+                "status": { "enum": ["NOT_OBSERVED", "UNSUPPORTED"] },
+                "value": { "type": "null" },
+                "id": { "type": "null" },
+                "navigationType": { "type": "null" },
+                "attribution": { "type": "null" }
+              }
+            }
+          ]
+        },
+        "TTFB": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
+              "properties": {
+                "status": { "const": "OBSERVED" },
+                "value": { "type": "number" },
+                "id": { "type": ["string", "null"] },
+                "navigationType": {
+                  "anyOf": [
+                    { "type": "null" },
+                    {
+                      "enum": [
+                        "navigate",
+                        "reload",
+                        "back-forward",
+                        "back-forward-cache",
+                        "prerender",
+                        "restore",
+                        "soft-navigation"
+                      ]
+                    }
+                  ]
+                },
+                "attribution": { "type": "null" }
               }
             },
             {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["status", "value", "id", "navigationType", "attribution"],
               "properties": {
-                "type": { "const": "screenshot" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["relativePath", "captureType"],
-                  "properties": { "relativePath": { "type": "string" }, "captureType": { "enum": ["VIEWPORT", "FULL_PAGE"] } }
-                }
-              }
-            },
-            {
-              "properties": {
-                "type": { "const": "metadata" },
-                "payload": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["source", "value"],
-                  "properties": { "source": { "type": "string" }, "value": { "type": "string" } }
-                }
+                "status": { "enum": ["NOT_OBSERVED", "UNSUPPORTED"] },
+                "value": { "type": "null" },
+                "id": { "type": "null" },
+                "navigationType": { "type": "null" },
+                "attribution": { "type": "null" }
               }
             }
           ]
         }
+      }
+    },
+    "serverTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "url", "name", "description", "duration"],
+      "properties": {
+        "source": { "enum": ["NAVIGATION", "RESOURCE"] },
+        "url": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "duration": { "type": "number" }
+      }
+    },
+    "navigationTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "navigationType",
+        "startTime",
+        "duration",
+        "responseStart",
+        "responseEnd",
+        "domContentLoadedEventStart",
+        "domContentLoadedEventEnd",
+        "loadEventStart",
+        "loadEventEnd",
+        "transferSize",
+        "encodedBodySize",
+        "decodedBodySize",
+        "serverTiming"
+      ],
+      "properties": {
+        "url": { "type": "string" },
+        "navigationType": { "type": "string" },
+        "startTime": { "type": "number" },
+        "duration": { "type": "number" },
+        "responseStart": { "type": "number" },
+        "responseEnd": { "type": "number" },
+        "domContentLoadedEventStart": { "type": "number" },
+        "domContentLoadedEventEnd": { "type": "number" },
+        "loadEventStart": { "type": "number" },
+        "loadEventEnd": { "type": "number" },
+        "transferSize": { "type": "number", "minimum": 0 },
+        "encodedBodySize": { "type": "number", "minimum": 0 },
+        "decodedBodySize": { "type": "number", "minimum": 0 },
+        "serverTiming": { "type": "array", "items": { "$ref": "#/$defs/serverTiming" } }
+      }
+    },
+    "resourceTiming": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url",
+            "initiatorType",
+            "startTime",
+            "duration",
+            "responseStart",
+            "responseEnd",
+            "requestId",
+            "networkResourceType",
+            "category",
+            "categoryBasis",
+            "serverTiming",
+            "sizeStatus",
+            "transferSize",
+            "encodedBodySize",
+            "decodedBodySize"
+          ],
+          "properties": {
+            "url": { "type": "string" },
+            "initiatorType": { "type": "string" },
+            "startTime": { "type": "number" },
+            "duration": { "type": "number" },
+            "responseStart": { "type": "number" },
+            "responseEnd": { "type": "number" },
+            "requestId": { "type": ["string", "null"] },
+            "networkResourceType": { "type": ["string", "null"] },
+            "category": { "anyOf": [{ "type": "null" }, { "enum": ["script", "stylesheet", "image", "fetch-xhr"] }] },
+            "categoryBasis": { "enum": ["NETWORK_EVIDENCE", "INITIATOR_TYPE", "UNKNOWN"] },
+            "serverTiming": { "type": "array", "items": { "$ref": "#/$defs/serverTiming" } },
+            "sizeStatus": { "const": "OBSERVED" },
+            "transferSize": { "type": "number", "minimum": 0 },
+            "encodedBodySize": { "type": "number", "minimum": 0 },
+            "decodedBodySize": { "type": "number", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url",
+            "initiatorType",
+            "startTime",
+            "duration",
+            "responseStart",
+            "responseEnd",
+            "requestId",
+            "networkResourceType",
+            "category",
+            "categoryBasis",
+            "serverTiming",
+            "sizeStatus",
+            "transferSize",
+            "encodedBodySize",
+            "decodedBodySize"
+          ],
+          "properties": {
+            "url": { "type": "string" },
+            "initiatorType": { "type": "string" },
+            "startTime": { "type": "number" },
+            "duration": { "type": "number" },
+            "responseStart": { "type": "number" },
+            "responseEnd": { "type": "number" },
+            "requestId": { "type": ["string", "null"] },
+            "networkResourceType": { "type": ["string", "null"] },
+            "category": { "anyOf": [{ "type": "null" }, { "enum": ["script", "stylesheet", "image", "fetch-xhr"] }] },
+            "categoryBasis": { "enum": ["NETWORK_EVIDENCE", "INITIATOR_TYPE", "UNKNOWN"] },
+            "serverTiming": { "type": "array", "items": { "$ref": "#/$defs/serverTiming" } },
+            "sizeStatus": { "const": "CROSS_ORIGIN_RESTRICTED" },
+            "transferSize": { "type": "null" },
+            "encodedBodySize": { "type": "null" },
+            "decodedBodySize": { "type": "null" }
+          }
+        }
       ]
+    },
+    "resourceSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "sizeUnknownCount", "transferSize", "encodedBodySize", "decodedBodySize"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "sizeUnknownCount": { "type": "integer", "minimum": 0 },
+        "transferSize": { "type": "number", "minimum": 0 },
+        "encodedBodySize": { "type": "number", "minimum": 0 },
+        "decodedBodySize": { "type": "number", "minimum": 0 }
+      }
+    },
+    "performanceEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason",
+            "webVitals",
+            "navigationTiming",
+            "resources",
+            "resourceSummaries",
+            "resourceCoverage",
+            "serverTiming",
+            "telemetryHeaders",
+            "telemetryCandidates",
+            "truncation"
+          ],
+          "properties": {
+            "status": { "const": "COMPLETE" },
+            "reason": { "const": "COLLECTED" },
+            "webVitals": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/webVitals" }] },
+            "navigationTiming": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/navigationTiming" }] },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/resourceTiming" } },
+            "resourceSummaries": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["script", "stylesheet", "image", "fetch-xhr"],
+                  "properties": {
+                    "script": { "$ref": "#/$defs/resourceSummary" },
+                    "stylesheet": { "$ref": "#/$defs/resourceSummary" },
+                    "image": { "$ref": "#/$defs/resourceSummary" },
+                    "fetch-xhr": { "$ref": "#/$defs/resourceSummary" }
+                  }
+                }
+              ]
+            },
+            "resourceCoverage": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["bufferSize", "bufferFull", "retainedEntryCount", "omittedEntryCount"],
+                  "properties": {
+                    "bufferSize": { "type": ["integer", "null"], "minimum": 0 },
+                    "bufferFull": { "type": "boolean" },
+                    "retainedEntryCount": { "type": "integer", "minimum": 0 },
+                    "omittedEntryCount": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              ]
+            },
+            "serverTiming": { "type": "array", "items": { "$ref": "#/$defs/serverTiming" } },
+            "telemetryHeaders": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["direction", "requestId", "url", "status", "values"],
+                    "properties": {
+                      "direction": { "enum": ["REQUEST", "RESPONSE"] },
+                      "requestId": { "type": "string" },
+                      "url": { "type": "string" },
+                      "status": { "const": "OBSERVED" },
+                      "values": { "type": "object", "additionalProperties": { "type": "string" } }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["direction", "requestId", "url", "status", "errorText"],
+                    "properties": {
+                      "direction": { "enum": ["REQUEST", "RESPONSE"] },
+                      "requestId": { "type": "string" },
+                      "url": { "type": "string" },
+                      "status": { "const": "FAILED" },
+                      "errorText": { "type": "string" }
+                    }
+                  }
+                ]
+              }
+            },
+            "telemetryCandidates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "requestId",
+                  "url",
+                  "method",
+                  "resourceType",
+                  "matchingBasis",
+                  "matchedHeaderNames",
+                  "matchedHints"
+                ],
+                "properties": {
+                  "requestId": { "type": "string" },
+                  "url": { "type": "string" },
+                  "method": { "type": "string" },
+                  "resourceType": { "type": "string" },
+                  "matchingBasis": {
+                    "type": "array",
+                    "items": { "enum": ["TRACE_OR_CORRELATION_HEADER", "GENERIC_URL_HINT"] }
+                  },
+                  "matchedHeaderNames": { "type": "array", "items": { "type": "string" } },
+                  "matchedHints": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            },
+            "truncation": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "omittedServerTimingCount",
+                    "omittedTelemetryHeaderCount",
+                    "omittedTelemetryCandidateCount",
+                    "omittedNetworkRequestCount",
+                    "omittedNetworkResponseCount",
+                    "textTruncated"
+                  ],
+                  "properties": {
+                    "omittedServerTimingCount": { "type": ["integer", "null"], "minimum": 0 },
+                    "omittedTelemetryHeaderCount": { "type": "integer", "minimum": 0 },
+                    "omittedTelemetryCandidateCount": { "type": "integer", "minimum": 0 },
+                    "omittedNetworkRequestCount": { "type": "integer", "minimum": 0 },
+                    "omittedNetworkResponseCount": { "type": "integer", "minimum": 0 },
+                    "textTruncated": { "type": "boolean" }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason",
+            "webVitals",
+            "navigationTiming",
+            "resources",
+            "resourceSummaries",
+            "resourceCoverage",
+            "serverTiming",
+            "telemetryHeaders",
+            "telemetryCandidates",
+            "truncation"
+          ],
+          "properties": {
+            "status": { "const": "PARTIAL" },
+            "reason": {
+              "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "INVALID_BROWSER_DATA", "RESOURCE_LIMIT_REACHED"]
+            },
+            "webVitals": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/webVitals" }] },
+            "navigationTiming": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/navigationTiming" }] },
+            "resources": { "type": "array", "items": { "$ref": "#/$defs/resourceTiming" } },
+            "resourceSummaries": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["script", "stylesheet", "image", "fetch-xhr"],
+                  "properties": {
+                    "script": { "$ref": "#/$defs/resourceSummary" },
+                    "stylesheet": { "$ref": "#/$defs/resourceSummary" },
+                    "image": { "$ref": "#/$defs/resourceSummary" },
+                    "fetch-xhr": { "$ref": "#/$defs/resourceSummary" }
+                  }
+                }
+              ]
+            },
+            "resourceCoverage": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["bufferSize", "bufferFull", "retainedEntryCount", "omittedEntryCount"],
+                  "properties": {
+                    "bufferSize": { "type": ["integer", "null"], "minimum": 0 },
+                    "bufferFull": { "type": "boolean" },
+                    "retainedEntryCount": { "type": "integer", "minimum": 0 },
+                    "omittedEntryCount": { "type": "integer", "minimum": 0 }
+                  }
+                }
+              ]
+            },
+            "serverTiming": { "type": "array", "items": { "$ref": "#/$defs/serverTiming" } },
+            "telemetryHeaders": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["direction", "requestId", "url", "status", "values"],
+                    "properties": {
+                      "direction": { "enum": ["REQUEST", "RESPONSE"] },
+                      "requestId": { "type": "string" },
+                      "url": { "type": "string" },
+                      "status": { "const": "OBSERVED" },
+                      "values": { "type": "object", "additionalProperties": { "type": "string" } }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["direction", "requestId", "url", "status", "errorText"],
+                    "properties": {
+                      "direction": { "enum": ["REQUEST", "RESPONSE"] },
+                      "requestId": { "type": "string" },
+                      "url": { "type": "string" },
+                      "status": { "const": "FAILED" },
+                      "errorText": { "type": "string" }
+                    }
+                  }
+                ]
+              }
+            },
+            "telemetryCandidates": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "requestId",
+                  "url",
+                  "method",
+                  "resourceType",
+                  "matchingBasis",
+                  "matchedHeaderNames",
+                  "matchedHints"
+                ],
+                "properties": {
+                  "requestId": { "type": "string" },
+                  "url": { "type": "string" },
+                  "method": { "type": "string" },
+                  "resourceType": { "type": "string" },
+                  "matchingBasis": {
+                    "type": "array",
+                    "items": { "enum": ["TRACE_OR_CORRELATION_HEADER", "GENERIC_URL_HINT"] }
+                  },
+                  "matchedHeaderNames": { "type": "array", "items": { "type": "string" } },
+                  "matchedHints": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            },
+            "truncation": {
+              "anyOf": [
+                { "type": "null" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "omittedServerTimingCount",
+                    "omittedTelemetryHeaderCount",
+                    "omittedTelemetryCandidateCount",
+                    "omittedNetworkRequestCount",
+                    "omittedNetworkResponseCount",
+                    "textTruncated"
+                  ],
+                  "properties": {
+                    "omittedServerTimingCount": { "type": ["integer", "null"], "minimum": 0 },
+                    "omittedTelemetryHeaderCount": { "type": "integer", "minimum": 0 },
+                    "omittedTelemetryCandidateCount": { "type": "integer", "minimum": 0 },
+                    "omittedNetworkRequestCount": { "type": "integer", "minimum": 0 },
+                    "omittedNetworkResponseCount": { "type": "integer", "minimum": 0 },
+                    "textTruncated": { "type": "boolean" }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "accessibilityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ruleId", "impact", "help", "helpUrl", "tags", "nodes", "omittedNodeCount"],
+      "properties": {
+        "ruleId": { "type": "string" },
+        "impact": { "enum": ["minor", "moderate", "serious", "critical", null] },
+        "help": { "type": "string" },
+        "helpUrl": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["impact", "targetSelectors", "failureSummary", "htmlSnippet", "truncated"],
+            "properties": {
+              "impact": { "enum": ["minor", "moderate", "serious", "critical", null] },
+              "targetSelectors": {
+                "type": "array",
+                "items": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] }
+              },
+              "failureSummary": { "type": ["string", "null"] },
+              "htmlSnippet": { "type": "string" },
+              "truncated": { "type": "boolean" }
+            }
+          }
+        },
+        "omittedNodeCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "accessibilityEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "scrollPosition", "frameScope", "violations", "incomplete"],
+          "properties": {
+            "status": { "const": "COMPLETE" },
+            "scrollPosition": { "$ref": "#/$defs/scrollPosition" },
+            "frameScope": { "const": "SAME_ORIGIN_ONLY" },
+            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } },
+            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "scrollPosition", "frameScope", "violations", "incomplete"],
+          "properties": {
+            "status": { "const": "PARTIAL" },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED"] },
+            "scrollPosition": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] },
+            "frameScope": { "const": "SAME_ORIGIN_ONLY" },
+            "violations": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } },
+            "incomplete": { "type": "array", "items": { "$ref": "#/$defs/accessibilityRule" } }
+          }
+        }
+      ]
+    },
+    "interactionCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId",
+        "ordinal",
+        "tagName",
+        "role",
+        "accessibleName",
+        "textFingerprint",
+        "ariaExpanded",
+        "ariaControls",
+        "ariaSelected",
+        "controlledVisible",
+        "controlledHidden",
+        "formAssociated",
+        "formMethod",
+        "formAction",
+        "href",
+        "hrefKind",
+        "download",
+        "type",
+        "disabled",
+        "visible",
+        "boundingBox"
+      ],
+      "properties": {
+        "candidateId": { "type": "string" },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "tagName": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "accessibleName": { "type": "string" },
+        "textFingerprint": { "type": "string" },
+        "ariaExpanded": { "type": ["string", "null"] },
+        "ariaControls": { "type": ["string", "null"] },
+        "ariaSelected": { "type": ["string", "null"] },
+        "controlledVisible": { "type": ["boolean", "null"] },
+        "controlledHidden": { "type": ["boolean", "null"] },
+        "formAssociated": { "type": "boolean" },
+        "formMethod": { "type": ["string", "null"] },
+        "formAction": { "type": ["string", "null"] },
+        "href": { "type": ["string", "null"] },
+        "hrefKind": { "enum": ["NONE", "SAME_ORIGIN_HTTP", "EXTERNAL_ORIGIN_HTTP", "SPECIAL_SCHEME", "MALFORMED"] },
+        "download": { "type": "boolean" },
+        "type": { "type": ["string", "null"] },
+        "disabled": { "type": "boolean" },
+        "visible": { "type": "boolean" },
+        "boundingBox": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "width", "height", "top", "right", "bottom", "left"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "width": { "type": "number" },
+            "height": { "type": "number" },
+            "top": { "type": "number" },
+            "right": { "type": "number" },
+            "bottom": { "type": "number" },
+            "left": { "type": "number" }
+          }
+        }
+      }
+    },
+    "interactionChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before",
+        "after",
+        "identityStatus",
+        "changedFields",
+        "changedAttributes",
+        "changedAttributesTruncated",
+        "detailsOpenBefore",
+        "detailsOpenAfter"
+      ],
+      "properties": {
+        "before": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/interactionCandidate" }] },
+        "after": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/interactionCandidate" }] },
+        "identityStatus": { "enum": ["MATCHED", "MISSING", "AMBIGUOUS", "REPLACED", "UNESTABLISHED"] },
+        "changedFields": { "type": "array", "items": { "type": "string" } },
+        "changedAttributes": { "type": "array", "items": { "type": "string" } },
+        "changedAttributesTruncated": { "type": "boolean" },
+        "detailsOpenBefore": { "type": ["boolean", "null"] },
+        "detailsOpenAfter": { "type": ["boolean", "null"] }
+      }
+    },
+    "interactionReasonCode": {
+      "enum": [
+        "OBSERVABLE_STATE_CHANGED",
+        "SUBMISSION_CONTROL",
+        "RESET_CONTROL",
+        "FORM_ASSOCIATED",
+        "NAVIGATION_HREF",
+        "EXTERNAL_ACTION",
+        "DOWNLOAD",
+        "DISABLED",
+        "NOT_VISIBLE",
+        "MALFORMED_CANDIDATE",
+        "SAFETY_FREEZE_BLOCKED",
+        "OWNER_CLOSE_SAFETY_FAILURE",
+        "SESSION_OPEN_DEADLINE",
+        "INITIAL_LOAD_BEFORE_LOAD",
+        "INITIAL_LOAD_DURING_LOAD",
+        "INITIAL_LOAD_AFTER_LOAD",
+        "INITIAL_LOAD_BEFORE_RENDER",
+        "SCROLL_PREPARATION_DEADLINE",
+        "SCROLL_PREPARATION_DOM_WORK_EXHAUSTED",
+        "SCROLL_PREPARATION_FAILED",
+        "SCROLL_PREPARATION_SETTLE_DEADLINE",
+        "HOVER_PREPARATION_DEADLINE",
+        "HOVER_PREPARATION_FAILED",
+        "FOCUS_PREPARATION_DEADLINE",
+        "FOCUS_PREPARATION_FAILED",
+        "FOCUS_PREPARATION_DOM_WORK_EXHAUSTED",
+        "FOCUS_PREPARATION_TARGET_DISCONNECTED",
+        "FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED",
+        "FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED",
+        "FOCUS_PREPARATION_STATE_CHANGED",
+        "FOCUS_PREPARATION_STATE_UNCOMPARABLE",
+        "STABILITY_CHECK_DEADLINE",
+        "STABILITY_CHECK_DOM_WORK_EXHAUSTED",
+        "STABILITY_CHECK_TARGET_DISCONNECTED",
+        "STABILITY_CHECK_CANDIDATE_LIMIT_REACHED",
+        "STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED",
+        "DEADLINE_AFTER_SAFETY_FREEZE",
+        "DEADLINE_DURING_CANDIDATE_REDISCOVERY",
+        "DOM_WORK_EXHAUSTED",
+        "CANDIDATE_REDISCOVERY_INCOMPLETE",
+        "CANDIDATE_IDENTITY_NOT_REDISCOVERED",
+        "CANDIDATE_IDENTITY_AMBIGUOUS",
+        "DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION",
+        "DEADLINE_DURING_TARGET_HANDLE_ACQUISITION",
+        "TARGET_HANDLE_NOT_RESOLVED",
+        "TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED",
+        "DEADLINE_DURING_TARGET_FACT_COLLECTION",
+        "TARGET_INSPECTION_DOM_WORK_EXHAUSTED",
+        "TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED",
+        "TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED",
+        "TARGET_DISCONNECTED_BEFORE_ADMISSION",
+        "TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION",
+        "DEADLINE_DURING_EXACT_NODE_ADMISSION",
+        "TARGET_NOT_SCROLL_PREPARED",
+        "DEADLINE_BEFORE_EXACT_NODE_CLICK",
+        "CLICK_TIMED_OUT",
+        "DEADLINE_BEFORE_POST_CONDITION_OBSERVATION",
+        "DEADLINE_DURING_POST_CONDITION_OBSERVATION",
+        "PERSISTENCE_CHECK_DEADLINE",
+        "NO_OBSERVABLE_CHANGE",
+        "GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED",
+        "GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE",
+        "GEOMETRY_ONLY_CHANGED",
+        "RETAINED_INSPECTION_DOM_WORK_EXHAUSTED",
+        "RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED",
+        "RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED",
+        "RETAINED_IDENTITY_LOST",
+        "EXECUTION_FAILED",
+        "CLICK_FAILED"
+      ]
+    },
+    "interactionStatusReason": {
+      "type": "object",
+      "allOf": [
+        {
+          "if": { "required": ["status"], "properties": { "status": { "const": "VERIFIED" } } },
+          "then": { "properties": { "reason": { "enum": ["OBSERVABLE_STATE_CHANGED"] } } }
+        },
+        {
+          "if": { "required": ["status"], "properties": { "status": { "const": "REJECTED_UNSAFE" } } },
+          "then": { "properties": { "reason": { "enum": [
+                  "SUBMISSION_CONTROL",
+                  "RESET_CONTROL",
+                  "FORM_ASSOCIATED",
+                  "NAVIGATION_HREF",
+                  "EXTERNAL_ACTION",
+                  "DOWNLOAD",
+                  "DISABLED",
+                  "NOT_VISIBLE",
+                  "MALFORMED_CANDIDATE"
+                ] } } }
+        },
+        {
+          "if": { "required": ["status"], "properties": { "status": { "const": "BLOCKED_BY_SAFETY" } } },
+          "then": { "properties": { "reason": { "enum": ["SAFETY_FREEZE_BLOCKED", "OWNER_CLOSE_SAFETY_FAILURE"] } } }
+        },
+        {
+          "if": { "required": ["status"], "properties": { "status": { "const": "NOT_VERIFIABLE" } } },
+          "then": { "properties": { "reason": { "enum": [
+                  "SESSION_OPEN_DEADLINE",
+                  "INITIAL_LOAD_BEFORE_LOAD",
+                  "INITIAL_LOAD_DURING_LOAD",
+                  "INITIAL_LOAD_AFTER_LOAD",
+                  "INITIAL_LOAD_BEFORE_RENDER",
+                  "SCROLL_PREPARATION_DEADLINE",
+                  "SCROLL_PREPARATION_DOM_WORK_EXHAUSTED",
+                  "SCROLL_PREPARATION_FAILED",
+                  "SCROLL_PREPARATION_SETTLE_DEADLINE",
+                  "HOVER_PREPARATION_DEADLINE",
+                  "HOVER_PREPARATION_FAILED",
+                  "FOCUS_PREPARATION_DEADLINE",
+                  "FOCUS_PREPARATION_FAILED",
+                  "FOCUS_PREPARATION_DOM_WORK_EXHAUSTED",
+                  "FOCUS_PREPARATION_TARGET_DISCONNECTED",
+                  "FOCUS_PREPARATION_CANDIDATE_LIMIT_REACHED",
+                  "FOCUS_PREPARATION_TEXT_NODE_LIMIT_REACHED",
+                  "FOCUS_PREPARATION_STATE_CHANGED",
+                  "FOCUS_PREPARATION_STATE_UNCOMPARABLE",
+                  "STABILITY_CHECK_DEADLINE",
+                  "STABILITY_CHECK_DOM_WORK_EXHAUSTED",
+                  "STABILITY_CHECK_TARGET_DISCONNECTED",
+                  "STABILITY_CHECK_CANDIDATE_LIMIT_REACHED",
+                  "STABILITY_CHECK_TEXT_NODE_LIMIT_REACHED",
+                  "DEADLINE_AFTER_SAFETY_FREEZE",
+                  "DEADLINE_DURING_CANDIDATE_REDISCOVERY",
+                  "DOM_WORK_EXHAUSTED",
+                  "CANDIDATE_REDISCOVERY_INCOMPLETE",
+                  "CANDIDATE_IDENTITY_NOT_REDISCOVERED",
+                  "CANDIDATE_IDENTITY_AMBIGUOUS",
+                  "DEADLINE_BEFORE_TARGET_HANDLE_ACQUISITION",
+                  "DEADLINE_DURING_TARGET_HANDLE_ACQUISITION",
+                  "TARGET_HANDLE_NOT_RESOLVED",
+                  "TARGET_HANDLE_RESOLUTION_DOM_WORK_EXHAUSTED",
+                  "DEADLINE_DURING_TARGET_FACT_COLLECTION",
+                  "TARGET_INSPECTION_DOM_WORK_EXHAUSTED",
+                  "TARGET_INSPECTION_CANDIDATE_LIMIT_REACHED",
+                  "TARGET_INSPECTION_TEXT_NODE_LIMIT_REACHED",
+                  "TARGET_DISCONNECTED_BEFORE_ADMISSION",
+                  "TARGET_CHANGED_DURING_EXACT_NODE_RESOLUTION",
+                  "DEADLINE_DURING_EXACT_NODE_ADMISSION",
+                  "TARGET_NOT_SCROLL_PREPARED",
+                  "DEADLINE_BEFORE_EXACT_NODE_CLICK",
+                  "CLICK_TIMED_OUT",
+                  "DEADLINE_BEFORE_POST_CONDITION_OBSERVATION",
+                  "DEADLINE_DURING_POST_CONDITION_OBSERVATION",
+                  "PERSISTENCE_CHECK_DEADLINE",
+                  "NO_OBSERVABLE_CHANGE",
+                  "GEOMETRY_ONLY_CHANGED_WHILE_SCROLLED",
+                  "GEOMETRY_ONLY_CHANGED_SCROLL_UNCOMPARABLE",
+                  "GEOMETRY_ONLY_CHANGED",
+                  "RETAINED_INSPECTION_DOM_WORK_EXHAUSTED",
+                  "RETAINED_INSPECTION_CANDIDATE_LIMIT_REACHED",
+                  "RETAINED_INSPECTION_TEXT_NODE_LIMIT_REACHED",
+                  "RETAINED_IDENTITY_LOST"
+                ] } } }
+        },
+        {
+          "if": { "required": ["status"], "properties": { "status": { "const": "EXECUTION_FAILED" } } },
+          "then": { "properties": { "reason": { "enum": ["EXECUTION_FAILED", "CLICK_FAILED"] } } }
+        }
+      ]
+    },
+    "interactionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateId", "status", "reason", "reasonDetail", "evidence", "work", "lifecycle", "notVerifiableKind"],
+      "allOf": [{ "$ref": "#/$defs/interactionStatusReason" }],
+      "if": { "required": ["status"], "properties": { "status": { "const": "NOT_VERIFIABLE" } } },
+      "then": { "properties": { "notVerifiableKind": { "not": { "type": "null" } } } },
+      "else": { "properties": { "notVerifiableKind": { "type": "null" } } },
+      "properties": {
+        "candidateId": { "type": "string" },
+        "status": {
+          "enum": ["VERIFIED", "REJECTED_UNSAFE", "BLOCKED_BY_SAFETY", "NOT_VERIFIABLE", "EXECUTION_FAILED"]
+        },
+        "reason": { "$ref": "#/$defs/interactionReasonCode" },
+        "reasonDetail": { "type": ["string", "null"] },
+        "evidence": { "$ref": "#/$defs/interactionChange" },
+        "work": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "reasonDetail", "evidence"],
+          "allOf": [{ "$ref": "#/$defs/interactionStatusReason" }],
+          "properties": {
+            "status": {
+              "enum": ["VERIFIED", "REJECTED_UNSAFE", "BLOCKED_BY_SAFETY", "NOT_VERIFIABLE", "EXECUTION_FAILED"]
+            },
+            "reason": { "$ref": "#/$defs/interactionReasonCode" },
+            "reasonDetail": { "type": ["string", "null"] },
+            "evidence": { "$ref": "#/$defs/interactionChange" }
+          }
+        },
+        "lifecycle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "reasonDetail"],
+          "if": { "required": ["reason"], "properties": { "reason": { "const": null } } },
+          "then": { "properties": { "reasonDetail": { "type": "null" } } },
+          "properties": {
+            "status": { "const": "CLOSED" },
+            "reason": { "enum": ["SESSION_NOT_OPENED", "OWNER_CLOSE_TIMED_OUT", "OWNER_CLOSE_FAILED", "OWNER_CLOSE_NON_TERMINAL", null] },
+            "reasonDetail": { "type": ["string", "null"] }
+          }
+        },
+        "notVerifiableKind": { "enum": ["OBSERVED_NO_CHANGE", "CHECK_NOT_COMPLETED", null] }
+      }
+    },
+    "screenshotEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pageId", "viewport", "relativePath", "captureType", "scrollPosition"],
+      "properties": {
+        "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
+        "viewport": { "enum": ["desktop", "mobile"] },
+        "relativePath": { "type": "string", "minLength": 1 },
+        "captureType": { "enum": ["VIEWPORT", "FULL_PAGE"] },
+        "scrollPosition": { "$ref": "#/$defs/scrollPosition" }
+      }
+    },
+    "scrollObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observedAtMs",
+        "scrollTarget",
+        "scrollY",
+        "viewportHeight",
+        "scrollHeight",
+        "contentHeight",
+        "documentScrollRange",
+        "bodyScrollRange",
+        "heightGrew",
+        "atBottom"
+      ],
+      "properties": {
+        "observedAtMs": { "type": "number" },
+        "scrollTarget": { "enum": ["SCROLLING_ELEMENT", "BODY", null] },
+        "scrollY": { "type": "number" },
+        "viewportHeight": { "type": "number" },
+        "scrollHeight": { "type": "number" },
+        "contentHeight": { "type": "number" },
+        "documentScrollRange": { "type": "number" },
+        "bodyScrollRange": { "type": "number" },
+        "heightGrew": { "type": "boolean" },
+        "atBottom": { "type": "boolean" }
+      }
+    },
+    "innerScrollScan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scannedElementCount", "scanLimitReached", "containerCount", "representative"],
+      "properties": {
+        "scannedElementCount": { "type": "integer", "minimum": 0 },
+        "scanLimitReached": { "type": "boolean" },
+        "containerCount": { "type": "integer", "minimum": 0 },
+        "representative": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["clientHeight", "scrollHeight"],
+              "properties": {
+                "clientHeight": { "type": "integer", "minimum": 1 },
+                "scrollHeight": { "type": "integer", "minimum": 1 }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "scrollRestoration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "position"],
+          "properties": {
+            "status": { "const": "RESTORED" },
+            "position": { "$ref": "#/$defs/scrollPosition" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "position"],
+          "properties": {
+            "status": { "const": "NOT_RESTORED" },
+            "reason": { "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "POSITION_NOT_AT_ORIGIN"] },
+            "position": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollPosition" }] }
+          }
+        }
+      ]
+    },
+    "scrollEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason",
+            "heightGrowthCount",
+            "observations",
+            "omittedObservationCount",
+            "targetSwitchCount",
+            "restoration",
+            "innerScrollScan",
+            "finalSnapshot"
+          ],
+          "properties": {
+            "status": { "const": "COMPLETE" },
+            "reason": { "const": "BOTTOM_AND_HEIGHT_STABLE" },
+            "heightGrowthCount": { "type": "integer", "minimum": 0 },
+            "observations": { "type": "array", "items": { "$ref": "#/$defs/scrollObservation" } },
+            "omittedObservationCount": { "type": "integer", "minimum": 0 },
+            "targetSwitchCount": { "type": "integer", "minimum": 0 },
+            "restoration": { "$ref": "#/$defs/scrollRestoration" },
+            "innerScrollScan": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/innerScrollScan" }] },
+            "finalSnapshot": { "$ref": "#/$defs/scrollObservation" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason",
+            "heightGrowthCount",
+            "observations",
+            "omittedObservationCount",
+            "targetSwitchCount",
+            "restoration",
+            "innerScrollScan",
+            "finalSnapshot"
+          ],
+          "properties": {
+            "status": { "const": "PARTIAL" },
+            "reason": {
+              "enum": [
+                "DEADLINE_EXCEEDED",
+                "EVALUATION_FAILED",
+                "PAGE_CLOSED",
+                "SCROLL_TARGET_UNRESOLVED",
+                "SCROLL_NOT_ADVANCED",
+                "INNER_SCROLL_CONTAINER_NOT_TRAVERSED",
+                "INNER_SCROLL_SCAN_LIMIT_REACHED",
+                "SCROLL_TARGET_UNSTABLE"
+              ]
+            },
+            "heightGrowthCount": { "type": "integer", "minimum": 0 },
+            "observations": { "type": "array", "items": { "$ref": "#/$defs/scrollObservation" } },
+            "omittedObservationCount": { "type": "integer", "minimum": 0 },
+            "targetSwitchCount": { "type": "integer", "minimum": 0 },
+            "restoration": { "$ref": "#/$defs/scrollRestoration" },
+            "innerScrollScan": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/innerScrollScan" }] },
+            "finalSnapshot": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/scrollObservation" }] }
+          }
+        }
+      ]
+    },
+    "metadataEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "url", "outcome", "httpStatus", "text", "textTruncated", "sitemapUrls", "sitemapUrlsTruncated"],
+      "properties": {
+        "kind": { "enum": ["ROBOTS_TXT", "SITEMAP_XML"] },
+        "url": { "type": "string", "minLength": 1 },
+        "outcome": { "enum": ["OK", "NOT_FOUND", "FAILED"] },
+        "httpStatus": { "type": ["integer", "null"], "minimum": 0 },
+        "text": { "type": ["string", "null"] },
+        "textTruncated": { "type": "boolean" },
+        "sitemapUrls": { "anyOf": [{ "type": "null" }, { "type": "array", "items": { "type": "string" } }] },
+        "sitemapUrlsTruncated": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["kind"], "properties": { "kind": { "const": "ROBOTS_TXT" } } },
+          "then": { "properties": { "sitemapUrls": { "type": "null" }, "sitemapUrlsTruncated": { "const": false } } }
+        },
+        {
+          "if": { "required": ["outcome"], "properties": { "outcome": { "not": { "const": "OK" } } } },
+          "then": { "properties": { "sitemapUrls": { "type": "null" } } }
+        },
+        {
+          "if": { "required": ["text"], "properties": { "text": { "type": "null" } } },
+          "then": { "properties": { "textTruncated": { "const": false } } }
+        },
+        {
+          "if": { "required": ["sitemapUrls"], "properties": { "sitemapUrls": { "type": "null" } } },
+          "then": { "properties": { "sitemapUrlsTruncated": { "const": false } } }
+        }
+      ]
+    },
+    "blockedRequestEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "url": { "type": "string" },
+        "reason": { "enum": ["NON_READ_METHOD"] }
+      }
+    },
+    "blockedNavigationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "url": { "type": "string" },
+        "reason": { "enum": ["EXTERNAL_MAIN_FRAME_NAVIGATION"] }
+      }
+    },
+    "blockedWebSocketEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "reason"],
+      "properties": {
+        "url": { "type": "string" },
+        "reason": { "enum": ["PASSIVE_WEBSOCKET"] }
+      }
+    },
+    "blockedExternalActionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateId", "url", "reason"],
+      "properties": {
+        "candidateId": { "type": "string" },
+        "url": { "type": ["string", "null"] },
+        "reason": { "enum": ["EXTERNAL_ACTION", "DOWNLOAD"] }
+      }
+    },
+    "excludedInteractionCandidateEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateId", "reason"],
+      "properties": {
+        "candidateId": { "type": "string" },
+        "reason": {
+          "enum": [
+            "SUBMISSION_CONTROL",
+            "RESET_CONTROL",
+            "FORM_ASSOCIATED",
+            "NAVIGATION_HREF",
+            "EXTERNAL_ACTION",
+            "DOWNLOAD",
+            "DISABLED",
+            "NOT_VISIBLE",
+            "MALFORMED_CANDIDATE"
+          ]
+        }
+      }
+    },
+    "blockedInteractionRequestEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "url": { "type": "string" },
+        "reason": { "enum": ["INTERACTION_FROZEN"] }
+      }
+    },
+    "blockedPopupEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "reason"],
+      "properties": {
+        "url": { "type": "string" },
+        "reason": { "enum": ["INTERACTION_FROZEN"] }
+      }
+    },
+    "blockedDownloadEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "suggestedFilename", "reason"],
+      "properties": {
+        "url": { "type": "string" },
+        "suggestedFilename": { "type": "string" },
+        "reason": { "enum": ["PASSIVE_DOWNLOAD", "INTERACTION_FROZEN"] }
+      }
+    },
+    "blockedInteractionWebSocketEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "reason"],
+      "properties": {
+        "url": { "type": "string" },
+        "reason": { "enum": ["INTERACTION_FROZEN"] }
+      }
+    },
+    "externalSchemeNavigationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "scheme", "frame", "phase", "reason"],
+      "properties": {
+        "url": { "type": "string" },
+        "scheme": { "type": "string" },
+        "frame": { "enum": ["MAIN", "SUB"] },
+        "phase": { "enum": ["PASSIVE", "INTERACTION"] },
+        "reason": { "enum": ["EXTERNAL_SCHEME_NAVIGATION", "EXTERNAL_SCHEME_REDIRECT_BLOCKED"] }
+      }
+    },
+    "safetyLedgerRecordLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["truncated", "droppedEventCount", "uncountedBlockedRequestCount", "truncatedTextCount", "reachedCategories"],
+      "properties": {
+        "truncated": { "type": "boolean" },
+        "droppedEventCount": { "type": "integer", "minimum": 0 },
+        "uncountedBlockedRequestCount": { "type": "integer", "minimum": 0 },
+        "truncatedTextCount": { "type": "integer", "minimum": 0 },
+        "reachedCategories": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "safetyEventsEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "blockedRequestsByMethod",
+        "blockedRequests",
+        "blockedNavigations",
+        "blockedWebSockets",
+        "blockedExternalActions",
+        "excludedInteractionCandidates",
+        "blockedInteractionRequests",
+        "blockedInteractionNavigations",
+        "blockedPopups",
+        "blockedDownloads",
+        "blockedInteractionWebSockets",
+        "externalSchemeNavigations",
+        "recordLimits"
+      ],
+      "properties": {
+        "scope": { "enum": ["PASSIVE", "INTERACTION"] },
+        "blockedRequestsByMethod": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "blockedRequests": { "type": "array", "items": { "$ref": "#/$defs/blockedRequestEvent" } },
+        "blockedNavigations": { "type": "array", "items": { "$ref": "#/$defs/blockedNavigationEvent" } },
+        "blockedWebSockets": { "type": "array", "items": { "$ref": "#/$defs/blockedWebSocketEvent" } },
+        "blockedExternalActions": { "type": "array", "items": { "$ref": "#/$defs/blockedExternalActionEvent" } },
+        "excludedInteractionCandidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/excludedInteractionCandidateEvent" }
+        },
+        "blockedInteractionRequests": { "type": "array", "items": { "$ref": "#/$defs/blockedInteractionRequestEvent" } },
+        "blockedInteractionNavigations": { "type": "array", "items": { "$ref": "#/$defs/blockedInteractionRequestEvent" } },
+        "blockedPopups": { "type": "array", "items": { "$ref": "#/$defs/blockedPopupEvent" } },
+        "blockedDownloads": { "type": "array", "items": { "$ref": "#/$defs/blockedDownloadEvent" } },
+        "blockedInteractionWebSockets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/blockedInteractionWebSocketEvent" }
+        },
+        "externalSchemeNavigations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/externalSchemeNavigationEvent" }
+        },
+        "recordLimits": { "$ref": "#/$defs/safetyLedgerRecordLimits" }
+      }
     }
   }
 }

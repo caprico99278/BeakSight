@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Covered Offscreen Inert Button</title>
+    <style>
+      html, body { height: 100%; margin: 0; overflow: hidden; }
+      #s { box-sizing: border-box; height: 100%; overflow-y: auto; }
+      .spacer { height: 2000px; }
+      #ov { position: fixed; top: 300px; left: 0; right: 0; height: 100px; background: #ddd; }
+    </style>
+  </head>
+  <body>
+    <div id="s">
+      <div class="spacer"></div>
+      <button type="button">Covered offscreen inert</button>
+      <div class="spacer"></div>
+    </div>
+    <div id="ov"></div>
+  </body>
+</html>

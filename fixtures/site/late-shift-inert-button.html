@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Late Shift Inert Button</title>
+    <style>
+      /* スクロールの位置の補正（scroll anchoring）を止め、差し込みでボタンが平行移動するようにする。 */
+      html, body { overflow-anchor: none; }
+      body { margin: 8px; }
+      #spacer { height: 2000px; }
+    </style>
+  </head>
+  <body>
+    <div id="spacer"></div>
+    <div id="late-slot"></div>
+    <button type="button">Late shift inert</button>
+    <script>
+      // 遅延読み込みの画像の代わり: ボタンが画面に入ってから遅れて、直上に大きさのある要素を差し込み、ボタンを下へずらす。
+      // 通信を使わないので、凍結の後にも起きる。ボタン自身は何もしない。
+      const button = document.querySelector('button');
+      const slot = document.querySelector('#late-slot');
+      const observer = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        observer.disconnect();
+        setTimeout(() => {
+          const block = document.createElement('div');
+          block.style.height = '120px';
+          slot.append(block);
+        }, 400);
+      });
+      observer.observe(button);
+    </script>
+  </body>
+</html>

@@ -7,7 +7,13 @@ import type {
   Request,
   Route,
 } from 'playwright';
-import { classifyPassiveRequest, type PassiveRequestDecision } from './request-policy.js';
+import type { ResourceDeliveryDecision, ResourceDeliveryRequestFacts } from '../browser/resource-delivery.js';
+import { safeErrorMessage } from '../core/errors.js';
+import { NON_EXTERNAL_NAVIGATION_SCHEMES } from '../core/evidence-types.js';
+import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../core/limits.js';
+import { isHttpProtocol } from '../crawl/normalize-url.js';
+import { isNetworkLayerFailure } from './network-layer-failure.js';
+import { classifyPassiveRequest, isReadMethod, type PassiveRequestDecision } from './request-policy.js';
 import type { SafetyLedger } from './safety-ledger.js';
 
 type BlockDecision = Extract<PassiveRequestDecision, { readonly action: 'BLOCK' }>;
@@ -23,6 +29,11 @@ type GuardPhase =
 type PageGuardStatus = 'INSTALLING' | 'READY' | 'FAILED';
 const OWNER_PAGE_CLOSE_MARKER_RETENTION_MS = 100;
 const EXPECTED_CDP_FAILURE_RETENTION_MS = 1_000;
+/**
+ * リダイレクトの対応付けの登録を保持する時間（ms。C18h）。リクエストの段階の登録は、リクエストの開始から数える。リダイレクトの
+ * 応答（3xx）を受けたときは、その時点から数え直す。3xx を返すまでのサーバの時間は、数えない（DEF-013）。
+ */
+const REDIRECT_PREDECESSOR_RETENTION_MS = 1_000;
 const GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS = 1_000;
 const GUARD_PENDING_TASK_DRAIN_TIMEOUT_MESSAGE =
   'Guard-owned listener tasks did not settle before cleanup deadline';
@@ -30,11 +41,49 @@ const MAX_PENDING_GUARD_TASKS = 256;
 const MAX_GUARD_PAGE_LISTENER_GROUPS = 64;
 const MAX_EXPECTED_CDP_FAILURES = 64;
 const MAX_REDIRECT_PREDECESSORS = 64;
-const MAX_CORRELATION_METHOD_LENGTH = 32;
-const MAX_CORRELATION_URL_LENGTH = 2_048;
 const MAX_REDIRECT_REQUEST_ID_LENGTH = 256;
-const MAX_GUARD_ERROR_MESSAGE_LENGTH = 2_048;
+/**
+ * 1つの page の中で、同時に横取りを付けておく、別のプロセスの iframe（OOPIF）の session の数の上限（入れ子を含む。C18i）。
+ * 超えた OOPIF は、一時停止のまま進めず、`OOPIF_GUARD_ATTACH_FAILED` の違反にして Context を閉じる（fail-closed）。
+ */
+const MAX_GUARD_OOPIF_SESSIONS = 64;
 const GUARD_ERROR_NORMALIZATION_FALLBACK = 'Guard error could not be safely normalized';
+
+/**
+ * Guard が、許可（ALLOW）した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。
+ * factory（`BrowserContextFactory`）が、読み込み直しの Context（役割 `REVISIT`）ごとに作り、Guard の取り付けの指定で渡す。
+ * Guard が尋ねるのは、段階が `PASSIVE_ACTIVE` で、許可の判定（`classifyPassiveRequest`）が ALLOW で、ナビゲーションの要求でない
+ * 要求だけである。凍結の段階、閉じている段階、BLOCK の要求は、尋ねる前に Guard が止める。許可の判定は、この部品には委ねない。
+ * 判断の意味の owner は `src/browser/resource-delivery.ts`（`decideResourceDelivery`）である。
+ */
+export interface GuardResourceDelivery {
+  /** 届け方を決める。例外を投げない（投げた場合は、Guard が今のままネットワークに送る）。 */
+  decide(request: ResourceDeliveryRequestFacts): ResourceDeliveryDecision;
+  /** キャッシュから返す直前に呼ぶ（factory の印と、LoadMeter の印を付ける）。例外を投げない。 */
+  beforeServeFromRunCache(request: Request): void;
+  /** 送らないと決めた直後に呼ぶ（LoadMeter で数える）。例外を投げない。 */
+  afterWithhold(request: Request): void;
+}
+
+/**
+ * Guard の取り付けの指定（省略できる）。
+ * - `resourceDelivery`: 許可した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。省略した場合は、
+ *   今のまま、許可した要求をすべてネットワークに送る。
+ * Guard は、headed かどうかを受け取らない（中断した Run の再開の設計書 4.10）。外部スキームへの移動は、headed と headless を問わず、
+ * 不変条件の違反として Context を閉じるためである。
+ */
+export interface PassiveRequestGuardOptions {
+  readonly resourceDelivery?: GuardResourceDelivery | undefined;
+}
+
+/**
+ * navigation の URL が外部スキーム（`NON_EXTERNAL_NAVIGATION_SCHEMES` にないスキーム）なら、そのスキーム（末尾の `:` を除いた形）を返す。
+ * 外部スキームでなければ `null` を返す。解析できない URL は例外を投げる（呼び出し側が fail-closed にする）。
+ */
+function externalNavigationScheme(url: string): string | null {
+  const { protocol } = new URL(url);
+  return (NON_EXTERNAL_NAVIGATION_SCHEMES as readonly string[]).includes(protocol) ? null : protocol.slice(0, -1);
+}
 
 interface ExpectedCdpFailure {
   readonly method: string;
@@ -53,6 +102,56 @@ interface PausedDocumentEvent {
   readonly redirectedRequestId?: string;
   readonly frameId: string;
   readonly request: CorrelationRequest;
+  /**
+   * 応答の段階（Response stage）の事象だけが持つ項目（C18g）。CDP では、`responseStatusCode` か `responseErrorReason` の
+   * どちらかがあれば応答の段階、どちらもなければリクエストの段階である。
+   */
+  readonly responseStatusCode?: number;
+  readonly responseErrorReason?: string;
+  readonly responseHeaders?: readonly { readonly name: string; readonly value: string }[];
+}
+
+/** 一時停止した Document の事象が、応答の段階のものか（C18g）。 */
+function isPausedDocumentResponse(event: PausedDocumentEvent): boolean {
+  return event.responseStatusCode !== undefined || event.responseErrorReason !== undefined;
+}
+
+/** 外部スキームへのリダイレクトの宛先（`Location` を解決した URL と、そのスキーム）。 */
+interface ExternalSchemeRedirect {
+  readonly url: string;
+  readonly scheme: string;
+}
+
+/**
+ * 応答の段階の Document の事象が、外部スキームへのリダイレクト（3xx で、`Location` が外部スキーム）なら、その宛先を返す（C18g。
+ * Task 19 の前の整理の設計書 4.2）。そうでなければ `null` を返す。
+ * - `Location` は、相対の URL も、元のリクエストの URL を基準に解決する。
+ * - `Location` が複数ある場合（1つの項目の中の改行で区切ったものを含む）は、どれか1つでも外部スキームなら、その宛先を返す。
+ * - 解析できない `Location` は例外を投げる（呼び出し側が fail-closed にする）。
+ */
+function externalSchemeRedirect(event: PausedDocumentEvent): ExternalSchemeRedirect | null {
+  for (const location of redirectLocations(event)) {
+    const url = new URL(location.trim(), event.request.url).href;
+    const scheme = externalNavigationScheme(url);
+    if (scheme !== null) {
+      return { url, scheme };
+    }
+  }
+  return null;
+}
+
+/**
+ * 応答の段階の Document の事象が、リダイレクトの応答（3xx で、`Location` を持つ）なら、`Location` の値（1つの項目の中の改行で
+ * 区切ったものを分けた、解決の前の値）を返す。そうでなければ空の配列を返す（C18g・C18h）。
+ */
+function redirectLocations(event: PausedDocumentEvent): string[] {
+  const status = event.responseStatusCode;
+  if (status === undefined || status < 300 || status > 399) {
+    return [];
+  }
+  return (event.responseHeaders ?? [])
+    .filter((header) => header.name.toLowerCase() === 'location')
+    .flatMap((header) => header.value.split('\n'));
 }
 
 interface RedirectPredecessor {
@@ -68,6 +167,178 @@ type RedirectPredecessorLookup =
 interface PageDocumentGuard {
   readonly session: CDPSession;
   readonly rootFrameId: string;
+}
+
+/**
+ * Document の横取りを付ける CDP の session（page の session か、別のプロセスの iframe（OOPIF）の session。C18i）。
+ * 横取りの判定（`createDocumentInterception`）は、この形の session を引数に取り、page と OOPIF で同じ処理を使う。
+ */
+interface GuardCdpChannel {
+  readonly send: CDPSession['send'];
+}
+
+/** 1つの session の Document の横取り（C18i）。`clear` は、その session のリダイレクトの対応付けの登録を消す。 */
+interface DocumentInterception {
+  readonly onRequestPaused: (event: PausedDocumentEvent) => void;
+  readonly clear: () => void;
+}
+
+/** Document の横取りを付ける（page の session と OOPIF の session で同じパターン。C18g、C18i）。 */
+async function enableDocumentInterception(channel: GuardCdpChannel): Promise<void> {
+  // Document は、リクエストの段階（許可 Origin とメソッドの判定）と、応答の段階（外部スキームへのリダイレクトを、たどる前に
+  // 止める。C18g）の両方で横取りする。
+  await channel.send('Fetch.enable', {
+    patterns: [
+      { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
+      { urlPattern: '*', resourceType: 'Document', requestStage: 'Response' },
+    ],
+  });
+}
+
+/**
+ * session の子の、別のプロセスの iframe（OOPIF）に、自動で session を付ける（C18i。RC18b の N1）。
+ * - `waitForDebuggerOnStart`: 新しい OOPIF は、その Document を確定する前に止まる。Guard が横取りを付けてから
+ *   `Runtime.runIfWaitingForDebugger` で進めるので、横取りを付けるまでの間に、その OOPIF の中の移動は始まらない。
+ * - `flatten: false`: 子の session には、この session の `Target.sendMessageToTarget` で命令を送り、
+ *   `Target.receivedMessageFromTarget` で応答と事象を受ける（Playwright の CDP の session は、flatten の子の session を扱えないため）。
+ * - `filter`: iframe の target だけを付ける（worker などは付けない）。
+ * サイトの分離を無効にする起動の引数は、使わない（ブラウザの安全の仕組みを弱めるため）。
+ */
+async function enableOopifAutoAttach(channel: GuardCdpChannel): Promise<void> {
+  await channel.send('Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: false,
+    filter: [{ type: 'iframe', exclude: false }],
+  });
+}
+
+/** OOPIF の session が閉じた（target が消えた、または Guard が後片付けをした）ことを表す（C18i）。 */
+const OOPIF_SESSION_CLOSED_MESSAGE = 'OOPIF interception session was detached';
+
+/**
+ * 別のプロセスの iframe（OOPIF）の target に付けた、CDP の session（C18i）。flatten でない auto-attach の子の session なので、
+ * 親の session（page の session か、親の OOPIF の session）の `Target.sendMessageToTarget` で命令を送り、親が受けた
+ * `Target.receivedMessageFromTarget` を `dispatch` に渡して、応答と事象を受ける。
+ * - 命令の応答は、命令ごとの番号で対応付ける。session が閉じたら（`close`）、応答を待つ命令をすべて失敗させる（Guard の
+ *   後片付けの drain が、応答の来ない命令を待ち続けないため）。
+ * - 事象（`Fetch.requestPaused`、入れ子の OOPIF の `Target.*`）は、`onEvent` に渡す。
+ */
+class OopifTargetChannel implements GuardCdpChannel {
+  readonly #parent: GuardCdpChannel;
+  readonly #sessionId: string;
+  readonly #onEvent: (method: string, params: unknown) => void;
+  readonly #pending = new Map<number, { readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void }>();
+  #lastId = 0;
+  #closed = false;
+
+  constructor(parent: GuardCdpChannel, sessionId: string, onEvent: (method: string, params: unknown) => void) {
+    this.#parent = parent;
+    this.#sessionId = sessionId;
+    this.#onEvent = onEvent;
+  }
+
+  readonly send = ((method: string, params?: object): Promise<unknown> => this.#send(method, params)) as CDPSession['send'];
+
+  /** session が閉じたか（target が消えたか、Guard が後片付けをしたか）。 */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  #send(method: string, params: object | undefined): Promise<unknown> {
+    if (this.#closed) {
+      return Promise.reject(new Error(OOPIF_SESSION_CLOSED_MESSAGE));
+    }
+    this.#lastId += 1;
+    const id = this.#lastId;
+    const response = new Promise<unknown>((resolve, reject) => {
+      this.#pending.set(id, { resolve, reject });
+    });
+    // 送る命令そのものが失敗した場合は、下の連鎖が失敗を返す。そのときの応答の待ちの失敗は、ここで封じ込める。
+    void response.catch(() => undefined);
+    const message = JSON.stringify({ id, method, params: params ?? {} });
+    return this.#parent.send('Target.sendMessageToTarget', { sessionId: this.#sessionId, message }).then(
+      () => response,
+      (error: unknown) => {
+        this.#pending.delete(id);
+        throw error;
+      },
+    );
+  }
+
+  /** 親が受けた、この session の `Target.receivedMessageFromTarget` の `message` を処理する。解析できない場合は例外を投げる。 */
+  dispatch(message: unknown): void {
+    if (typeof message !== 'string') {
+      throw new Error('OOPIF interception session message is not a string');
+    }
+    const parsed: unknown = JSON.parse(message);
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('OOPIF interception session message is not an object');
+    }
+    const { id, method, params, error, result } = parsed as {
+      readonly id?: unknown;
+      readonly method?: unknown;
+      readonly params?: unknown;
+      readonly error?: unknown;
+      readonly result?: unknown;
+    };
+    if (id !== undefined) {
+      if (typeof id !== 'number') {
+        throw new Error('OOPIF interception session response has an invalid id');
+      }
+      const entry = this.#pending.get(id);
+      if (entry === undefined) {
+        return;
+      }
+      this.#pending.delete(id);
+      if (error !== undefined) {
+        const reason = typeof error === 'object' && error !== null && typeof (error as { message?: unknown }).message === 'string'
+          ? (error as { message: string }).message
+          : 'OOPIF interception session command failed';
+        entry.reject(new Error(reason));
+      } else {
+        entry.resolve(result);
+      }
+      return;
+    }
+    if (typeof method !== 'string') {
+      throw new Error('OOPIF interception session event has no method');
+    }
+    this.#onEvent(method, params);
+  }
+
+  /** session を閉じる。応答を待つ命令は、すべて失敗させる。2回目以降は何もしない。 */
+  close(): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    const pending = [...this.#pending.values()];
+    this.#pending.clear();
+    for (const entry of pending) {
+      entry.reject(new Error(OOPIF_SESSION_CLOSED_MESSAGE));
+    }
+  }
+}
+
+/** 横取りを付けた OOPIF の session と、その子（入れ子の OOPIF）の session（C18i）。 */
+interface OopifGuardNode {
+  readonly channel: OopifTargetChannel;
+  readonly interception: DocumentInterception;
+  readonly children: Map<string, OopifGuardNode>;
+}
+
+/** `Target.attachedToTarget` の事象のうち、Guard が使う項目。 */
+interface AttachedTargetEvent {
+  readonly sessionId?: unknown;
+  readonly targetInfo?: { readonly type?: unknown };
+  readonly waitingForDebugger?: unknown;
+}
+
+/** `Target.receivedMessageFromTarget` と `Target.detachedFromTarget` の事象のうち、Guard が使う項目。 */
+interface TargetSessionEvent {
+  readonly sessionId?: unknown;
+  readonly message?: unknown;
 }
 
 interface PageGuardRecord {
@@ -136,32 +407,7 @@ function invalidatingPhase(phase: GuardPhase): GuardPhase {
 }
 
 function errorMessage(error: unknown): string {
-  if (error === null) return 'null';
-  switch (typeof error) {
-    case 'string':
-      return error.slice(0, MAX_GUARD_ERROR_MESSAGE_LENGTH);
-    case 'undefined':
-      return 'undefined';
-    case 'boolean':
-      return error ? 'true' : 'false';
-    case 'number':
-      return String(error).slice(0, MAX_GUARD_ERROR_MESSAGE_LENGTH);
-    case 'bigint':
-      return GUARD_ERROR_NORMALIZATION_FALLBACK;
-    case 'symbol':
-      return 'symbol';
-    case 'object':
-    case 'function':
-      try {
-        const message = Reflect.get(error, 'message') as unknown;
-        return typeof message === 'string'
-          ? message.slice(0, MAX_GUARD_ERROR_MESSAGE_LENGTH)
-          : GUARD_ERROR_NORMALIZATION_FALLBACK;
-      } catch {
-        return GUARD_ERROR_NORMALIZATION_FALLBACK;
-      }
-  }
-  return GUARD_ERROR_NORMALIZATION_FALLBACK;
+  return safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH, GUARD_ERROR_NORMALIZATION_FALLBACK);
 }
 
 class GuardTaskDrainTimeoutError extends Error {
@@ -172,10 +418,10 @@ class GuardTaskDrainTimeoutError extends Error {
 }
 
 function boundedCorrelationRequest(method: string, url: string): CorrelationRequest | null {
-  if (method.length > MAX_CORRELATION_METHOD_LENGTH || url.length > MAX_CORRELATION_URL_LENGTH) {
+  if (method.length > MAX_HTTP_METHOD_LENGTH || url.length > MAX_URL_LENGTH) {
     return null;
   }
-  return { method: method.slice(0, MAX_CORRELATION_METHOD_LENGTH).toUpperCase(), url };
+  return { method: method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(), url };
 }
 
 class ExpectedCdpFailureRegistry {
@@ -190,8 +436,8 @@ class ExpectedCdpFailureRegistry {
 
   register(page: Page, request: CorrelationRequest, now: number): ExpectedCdpFailure | null {
     if (
-      request.method.length > MAX_CORRELATION_METHOD_LENGTH
-      || request.url.length > MAX_CORRELATION_URL_LENGTH
+      request.method.length > MAX_HTTP_METHOD_LENGTH
+      || request.url.length > MAX_URL_LENGTH
     ) {
       this.#recordIdentityRejected(page);
       return null;
@@ -209,7 +455,7 @@ class ExpectedCdpFailureRegistry {
       return null;
     }
     const expected = {
-      method: request.method.slice(0, MAX_CORRELATION_METHOD_LENGTH).toUpperCase(),
+      method: request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(),
       url: request.url,
       errorText: 'net::ERR_BLOCKED_BY_CLIENT',
       expiresAt: now + EXPECTED_CDP_FAILURE_RETENTION_MS,
@@ -231,10 +477,10 @@ class ExpectedCdpFailureRegistry {
     now: number,
   ): boolean {
     if (
-      request.method.length > MAX_CORRELATION_METHOD_LENGTH
-      || request.url.length > MAX_CORRELATION_URL_LENGTH
+      request.method.length > MAX_HTTP_METHOD_LENGTH
+      || request.url.length > MAX_URL_LENGTH
     ) return false;
-    const method = request.method.slice(0, MAX_CORRELATION_METHOD_LENGTH).toUpperCase();
+    const method = request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase();
     const live = (this.#entries.get(page) ?? []).filter((entry) => entry.expiresAt >= now);
     const index = live.findIndex((entry) => entry.method === method
       && entry.url === request.url
@@ -267,6 +513,15 @@ class ExpectedCdpFailureRegistry {
   }
 }
 
+/**
+ * Document のリクエストの requestId と、そのリクエスト（メソッドと URL）の対応付け。リダイレクトの後のリクエスト
+ * （`redirectedRequestId` を持つもの）が、元のリクエストを引くために使う（C18h で、登録と消去の時点を整理した）。
+ * - 登録: リクエストの段階（`remember`）。応答の段階では、まず登録を消し（`forget`。元のリクエストが終わった）、リダイレクトの
+ *   応答（3xx で `Location` を持つ）なら登録し直して、期限をその時点から数える。
+ * - 消去: リダイレクトの後のリクエストで使われたとき（`take`）、元のリクエストが終わったとき（`forget`。応答を受けたとき、
+ *   Guard がリクエストを失敗させたとき）、期限が切れたとき、Context や page が閉じたとき（`clear`）。
+ * - 件数は `MAX_REDIRECT_PREDECESSORS` までとし、超える登録は違反を記録して `false` を返す（呼び出し側が fail-closed にする）。
+ */
 class RedirectPredecessorRegistry {
   readonly #entries = new Map<string, RedirectPredecessor>();
   readonly #ledger: SafetyLedger;
@@ -281,8 +536,8 @@ class RedirectPredecessorRegistry {
     this.#purge(now);
     if (
       requestId.length > MAX_REDIRECT_REQUEST_ID_LENGTH
-      || request.method.length > MAX_CORRELATION_METHOD_LENGTH
-      || request.url.length > MAX_CORRELATION_URL_LENGTH
+      || request.method.length > MAX_HTTP_METHOD_LENGTH
+      || request.url.length > MAX_URL_LENGTH
     ) {
       this.#recordIdentityRejected();
       return false;
@@ -298,10 +553,15 @@ class RedirectPredecessorRegistry {
       return false;
     }
     this.#entries.set(requestId, {
-      request: { method: request.method.slice(0, MAX_CORRELATION_METHOD_LENGTH).toUpperCase(), url: request.url },
-      expiresAt: now + EXPECTED_CDP_FAILURE_RETENTION_MS,
+      request: { method: request.method.slice(0, MAX_HTTP_METHOD_LENGTH).toUpperCase(), url: request.url },
+      expiresAt: now + REDIRECT_PREDECESSOR_RETENTION_MS,
     });
     return true;
+  }
+
+  /** 元のリクエストが終わったとき（完了か失敗）に、その登録を消す（C18h）。登録がなければ何もしない。 */
+  forget(requestId: string): void {
+    this.#entries.delete(requestId);
   }
 
   take(requestId: string, now: number): RedirectPredecessorLookup {
@@ -696,7 +956,7 @@ async function continueNative(requestInvalidation: () => void, route: Route, led
 
 async function failPausedDocumentForLifecycle(
   context: BrowserContext,
-  session: CDPSession,
+  session: GuardCdpChannel,
   requestId: string,
   ledger: SafetyLedger,
   expectedCdpFailures: ExpectedCdpFailureRegistry,
@@ -806,7 +1066,7 @@ export async function activateInteractionFreeze(page: Page): Promise<void> {
   } catch {
     return failClosed('Interaction freeze requires a completed initial HTTP(S) load');
   }
-  if (currentUrl.protocol !== 'http:' && currentUrl.protocol !== 'https:') {
+  if (!isHttpProtocol(currentUrl.protocol)) {
     return failClosed('Interaction freeze requires a completed initial HTTP(S) load');
   }
   guardState.phase = 'FROZEN_ACTIVE';
@@ -865,6 +1125,7 @@ export async function installPassiveRequestGuard(
   context: BrowserContext,
   ledger: SafetyLedger,
   allowedOrigins: ReadonlySet<string>,
+  options: PassiveRequestGuardOptions = {},
 ): Promise<void> {
   const existingState = guardStates.get(context);
   if (existingState !== undefined) {
@@ -924,9 +1185,435 @@ export async function installPassiveRequestGuard(
         const session = await context.newCDPSession(page);
         const frameTree = await session.send('Page.getFrameTree');
         const rootFrameId = frameTree.frameTree.frame.id;
-        const redirectedPredecessors = new RedirectPredecessorRegistry(ledger);
+        // C18i（RC18b の N1）: 1つの CDP の session（page の session か、別のプロセスの iframe（OOPIF）の session）の Document の
+        // 横取り。page と OOPIF で同じ判定（リダイレクトの対応付け、`expectedCdpFailures`、外部スキームへのリダイレクトの判定、閉じる
+        // 途中と凍結の後の扱い）を使う。リダイレクトの対応付けの登録は、session ごとに持つ（requestId は、その session の中で対応付く）。
+        // OOPIF の事象の frame は、page の root frame ではないので、main frame として扱わない。
+        const createDocumentInterception = (channel: GuardCdpChannel): DocumentInterception => {
+          const redirectedPredecessors = new RedirectPredecessorRegistry(ledger);
+          // C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」、4.2.1）:
+          // Document の応答の段階で、3xx の `Location` が外部スキームなら、リダイレクトをたどる前にリクエストを失敗させ、
+          // `externalSchemeNavigations` に `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない
+          // （止められないページのスクリプトによる移動とは違う）。ほかの応答は、そのまま続ける（リクエストの段階の判定、許可 Origin と
+          // メソッドの判定は、変えない）。
+          // - 凍結の後に届いた応答（凍結の前に続けたリクエストの応答）も、同じく調べる（段階は `INTERACTION`）。凍結の後に始まった
+          //   リクエストは、これまでどおりリクエストの段階で `INTERACTION_FROZEN` として止まるので、応答の段階に来ない。
+          // - 解析できない `Location` は、fail-closed にする（リクエストを失敗させ、違反を記録して Context を閉じる）。
+          // - main frame のリダイレクトを止めた場合も記録する。Guard 自身が止めたそのリクエストの失敗は、予期した失敗として登録し、
+          //   `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない（RC18a の指摘3。設計者の判断）。ナビゲーション自体は失敗のまま残る。
+          // C18h（DEF-013。設計書 4.6）: 応答を受けた時点で、元のリクエストは終わる（完了か失敗）ので、リダイレクトの対応付けの登録を
+          // まず消す。続けるリダイレクトの応答（3xx で `Location` を持つ）だけ、登録し直して、期限をこの時点から数える。3xx を返すまでの
+          // サーバの時間を、期限に数えないためである。登録できない場合（件数の上限など）は、登録の側が違反を記録し、この応答を失敗させて
+          // Context を閉じる（リクエストの段階の登録と同じ fail-closed）。
+          const handlePausedDocumentResponse = async (event: PausedDocumentEvent, phase: GuardPhase): Promise<void> => {
+            redirectedPredecessors.forget(event.requestId);
+            if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
+              await failPausedDocumentForLifecycle(
+                context,
+                channel,
+                event.requestId,
+                ledger,
+                expectedCdpFailures,
+                page,
+                event.request,
+              );
+              return;
+            }
+            if (phase !== 'PASSIVE_ACTIVE' && phase !== 'FROZEN_ACTIVE') {
+              ledger.recordInvariantViolation({
+                code: 'CDP_DOCUMENT_PHASE_INVALID',
+                message: `Paused Document response observed during ${phase}`,
+              });
+              await failPausedDocumentForLifecycle(
+                context,
+                channel,
+                event.requestId,
+                ledger,
+                expectedCdpFailures,
+                page,
+                event.request,
+              );
+              return;
+            }
+            let redirect: ExternalSchemeRedirect | null;
+            try {
+              redirect = externalSchemeRedirect(event);
+            } catch (error) {
+              ledger.recordInvariantViolation({ code: 'EXTERNAL_SCHEME_DETECTION_FAILED', message: errorMessage(error) });
+              try {
+                await channel.send('Fetch.failRequest', {
+                  requestId: event.requestId,
+                  errorReason: 'BlockedByClient',
+                });
+              } catch (failError) {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_FAIL_REQUEST_FAILED',
+                  message: errorMessage(failError),
+                });
+              }
+              initiateInvalidation(context, ledger);
+              return;
+            }
+            if (redirect === null) {
+              if (
+                redirectLocations(event).length > 0
+                && !redirectedPredecessors.remember(event.requestId, event.request, Date.now())
+              ) {
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                }
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              try {
+                await channel.send('Fetch.continueRequest', { requestId: event.requestId });
+              } catch (error) {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_CONTINUE_REQUEST_FAILED',
+                  message: errorMessage(error),
+                });
+                initiateInvalidation(context, ledger);
+              }
+              return;
+            }
+            const isMainFrame = event.frameId === rootFrameId;
+            // main frame では、Guard 自身が止めたこのリクエストの失敗（`requestfailed` の `net::ERR_BLOCKED_BY_CLIENT`）を、
+            // 予期した失敗として1回だけ登録する（`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない。設計者の判断）。`requestfailed` が
+            // `failRequest` の完了より先に届きうるので、送る前に登録し、送れなかった場合は取り消す（違反のまま）。subframe の失敗は
+            // 違反の判定に使わないので、登録しない。登録できない場合（上限など）は、登録の側が違反を記録し、失敗は違反のまま残る。
+            const expectedFailure = isMainFrame
+              ? expectedCdpFailures.register(page, event.request, Date.now())
+              : null;
+            try {
+              await channel.send('Fetch.failRequest', {
+                requestId: event.requestId,
+                errorReason: 'BlockedByClient',
+              });
+            } catch (error) {
+              if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
+              // 止められたか分からないので、止めた記録にはしない。
+              ledger.recordInvariantViolation({
+                code: 'CDP_FAIL_REQUEST_FAILED',
+                message: errorMessage(error),
+              });
+              initiateInvalidation(context, ledger);
+              return;
+            }
+            ledger.recordExternalSchemeNavigation({
+              url: redirect.url,
+              scheme: redirect.scheme,
+              frame: isMainFrame ? 'MAIN' : 'SUB',
+              phase: phase === 'FROZEN_ACTIVE' ? 'INTERACTION' : 'PASSIVE',
+              reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED',
+            });
+          };
+          const onRequestPaused = (event: PausedDocumentEvent): void => {
+            trackGuardTask(guardState, 'paused CDP Document request', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
+              const phase = guardState.phase;
+              if (isPausedDocumentResponse(event)) {
+                await handlePausedDocumentResponse(event, phase);
+                return;
+              }
+              const interceptedRequest = boundedCorrelationRequest(event.request.method, event.request.url);
+              if (interceptedRequest === null) {
+                expectedCdpFailures.register(page, event.request, Date.now());
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                }
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              const redirectedLookup = event.redirectedRequestId === undefined
+                ? undefined
+                : redirectedPredecessors.take(event.redirectedRequestId, Date.now());
+              if (redirectedLookup !== undefined && redirectedLookup.kind !== 'FOUND') {
+                if (redirectedLookup.kind === 'MISSING') {
+                  ledger.recordInvariantViolation({
+                    code: 'REDIRECT_PREDECESSOR_MISSING',
+                    message: 'Supplied redirect predecessor was unavailable',
+                  });
+                }
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                }
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              const redirectedFrom = redirectedLookup?.request;
+              const playwrightVisibleRequest = redirectedFrom ?? interceptedRequest;
+              if (isFrozenPhase(phase)) {
+                const expectedFailure = expectedCdpFailures.register(page, playwrightVisibleRequest, Date.now());
+                ledger.recordBlockedInteractionRequest({
+                  method: interceptedRequest.method,
+                  url: interceptedRequest.url,
+                  reason: 'INTERACTION_FROZEN',
+                });
+                ledger.recordBlockedInteractionNavigation({
+                  method: interceptedRequest.method,
+                  url: interceptedRequest.url,
+                  reason: 'INTERACTION_FROZEN',
+                });
+                let invalidationNeeded = expectedFailure === null;
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                } catch (error) {
+                  if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
+                  ledger.recordInvariantViolation({
+                    code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                  invalidationNeeded = true;
+                }
+                if (invalidationNeeded) initiateInvalidation(context, ledger);
+                return;
+              }
+              if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
+                await failPausedDocumentForLifecycle(
+                  context,
+                  channel,
+                  event.requestId,
+                  ledger,
+                  expectedCdpFailures,
+                  page,
+                  playwrightVisibleRequest,
+                );
+                return;
+              }
+              if (phase !== 'PASSIVE_ACTIVE') {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_DOCUMENT_PHASE_INVALID',
+                  message: `Paused Document observed during ${phase}`,
+                });
+                await failPausedDocumentForLifecycle(
+                  context,
+                  channel,
+                  event.requestId,
+                  ledger,
+                  expectedCdpFailures,
+                  page,
+                  playwrightVisibleRequest,
+                );
+                return;
+              }
+              if (!redirectedPredecessors.remember(event.requestId, interceptedRequest, Date.now())) {
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                }
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              const decision = classifyPassiveRequest({
+                kind: 'HTTP',
+                method: interceptedRequest.method,
+                url: event.request.url,
+                isNavigationRequest: true,
+                isMainFrame: event.frameId === rootFrameId,
+              }, authoritySnapshot);
+              if (decision.action === 'BLOCK') {
+                // C18h: Guard がこのリクエストを失敗させるので、リクエストは終わる。リダイレクトの対応付けの登録を消す。
+                redirectedPredecessors.forget(event.requestId);
+                let expectedFailure: ExpectedCdpFailure | undefined;
+                if (redirectedFrom !== undefined) {
+                  expectedFailure = expectedCdpFailures.register(page, redirectedFrom, Date.now()) ?? undefined;
+                }
+                try {
+                  await channel.send('Fetch.failRequest', {
+                    requestId: event.requestId,
+                    errorReason: 'BlockedByClient',
+                  });
+                  recordBlockedDecision(ledger, decision, {
+                    method: event.request.method,
+                    url: event.request.url,
+                  });
+                } catch (error) {
+                  if (expectedFailure !== undefined) {
+                    expectedCdpFailures.remove(page, expectedFailure);
+                  }
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_FAIL_REQUEST_FAILED',
+                    message: errorMessage(error),
+                  });
+                  initiateInvalidation(context, ledger);
+                }
+                if (redirectedFrom !== undefined && expectedFailure === undefined) {
+                  initiateInvalidation(context, ledger);
+                }
+                return;
+              }
+              try {
+                await channel.send('Fetch.continueRequest', { requestId: event.requestId });
+              } catch (error) {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_CONTINUE_REQUEST_FAILED',
+                  message: errorMessage(error),
+                });
+                initiateInvalidation(context, ledger);
+              }
+            });
+          };
+          return Object.freeze({ onRequestPaused, clear: () => redirectedPredecessors.clear() });
+        };
+        const pageInterception = createDocumentInterception(session);
+        // C18i: page の子の OOPIF の session（入れ子の OOPIF の session は、その親の OOPIF の node の `children` に持つ）。
+        const pageOopifSessions = new Map<string, OopifGuardNode>();
+        let oopifSessionCount = 0;
+        const failOopifGuard = (code: string, message: string): void => {
+          ledger.recordInvariantViolation({ code, message });
+          initiateInvalidation(context, ledger);
+        };
+        /** OOPIF の session を閉じ、その登録（リダイレクトの対応付け）と、入れ子の OOPIF の session を消す。 */
+        const disposeOopifSession = (node: OopifGuardNode): void => {
+          node.channel.close();
+          node.interception.clear();
+          disposeOopifSessions(node.children);
+          oopifSessionCount -= 1;
+        };
+        const disposeOopifSessions = (sessions: Map<string, OopifGuardNode>): void => {
+          const nodes = [...sessions.values()];
+          sessions.clear();
+          for (const node of nodes) disposeOopifSession(node);
+        };
+        /**
+         * 親の session（page か OOPIF）に、子の OOPIF が付いた（`Target.attachedToTarget`）。子は、その Document を確定する前に
+         * 止まっている（`waitForDebuggerOnStart`）。子の session に、page と同じ横取りと、入れ子の OOPIF への自動の付与を付けてから、
+         * `Runtime.runIfWaitingForDebugger` で進める（横取りを付けるまでの間に、子の中の移動は始まらない）。
+         * fail-closed: 付けられなかった場合（命令を送れない、`Fetch.enable` などが失敗の応答を受ける、止まっていない、iframe でない、
+         * 上限を超えた）は、`OOPIF_GUARD_ATTACH_FAILED` の違反にして Context を閉じ、子は進めない。
+         * - 付ける途中で子の target が消えた（`Target.detachedFromTarget` で session が閉じた）場合は、横取りする frame がもうないので、
+         *   違反にしない。
+         * - Guard が閉じる途中（page の閉じる途中を含む）の場合は、子を進めない（止めたまま、page や Context とともに閉じる）。
+         */
+        const onOopifAttached = (parent: GuardCdpChannel, sessions: Map<string, OopifGuardNode>, params: unknown): void => {
+          const event = (typeof params === 'object' && params !== null ? params : {}) as AttachedTargetEvent;
+          const { sessionId } = event;
+          if (typeof sessionId !== 'string' || sessionId.length === 0) {
+            failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', 'OOPIF target was attached without a session id');
+            return;
+          }
+          if (sessions.has(sessionId)) {
+            return;
+          }
+          if (oopifSessionCount >= MAX_GUARD_OOPIF_SESSIONS) {
+            failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', 'OOPIF guard session limit reached');
+            return;
+          }
+          const children = new Map<string, OopifGuardNode>();
+          let interception: DocumentInterception | undefined;
+          const channel = new OopifTargetChannel(parent, sessionId, (method, eventParams) => {
+            if (method === 'Fetch.requestPaused') {
+              interception?.onRequestPaused(eventParams as PausedDocumentEvent);
+              return;
+            }
+            onTargetEvent(channel, children, method, eventParams);
+          });
+          interception = createDocumentInterception(channel);
+          sessions.set(sessionId, { channel, interception, children });
+          oopifSessionCount += 1;
+          trackGuardTask(guardState, 'OOPIF document interception attach', 'GUARD_OOPIF_ATTACH_TASK_FAILED', async () => {
+            const closing = (): boolean => isClosingOrInvalidatingPhase(guardState.phase) || ownerClosingPages.has(page);
+            if (closing() || channel.closed) {
+              return;
+            }
+            if (event.targetInfo?.type !== 'iframe') {
+              failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', 'An auto-attached target was not an iframe');
+              return;
+            }
+            if (event.waitingForDebugger !== true) {
+              failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', 'OOPIF target was attached after it had started running');
+              return;
+            }
+            try {
+              await enableDocumentInterception(channel);
+              await enableOopifAutoAttach(channel);
+              if (closing() || channel.closed) {
+                return;
+              }
+              await channel.send('Runtime.runIfWaitingForDebugger');
+            } catch (error) {
+              if (!channel.closed) {
+                failOopifGuard('OOPIF_GUARD_ATTACH_FAILED', errorMessage(error));
+              }
+            }
+          });
+        };
+        /** 親の session（page か OOPIF）が受けた、子の OOPIF の事象を扱う。扱った場合は真を返す。 */
+        const onTargetEvent = (
+          parent: GuardCdpChannel,
+          sessions: Map<string, OopifGuardNode>,
+          method: string,
+          params: unknown,
+        ): boolean => {
+          if (method === 'Target.attachedToTarget') {
+            onOopifAttached(parent, sessions, params);
+            return true;
+          }
+          const event = (typeof params === 'object' && params !== null ? params : {}) as TargetSessionEvent;
+          const node = typeof event.sessionId === 'string' ? sessions.get(event.sessionId) : undefined;
+          if (method === 'Target.receivedMessageFromTarget') {
+            try {
+              node?.channel.dispatch(event.message);
+            } catch (error) {
+              failOopifGuard('OOPIF_GUARD_PROTOCOL_FAILED', errorMessage(error));
+            }
+            return true;
+          }
+          if (method === 'Target.detachedFromTarget') {
+            // OOPIF が閉じた（iframe が消えた、または親と同じプロセスに移った）。その session と登録を消す。違反にはしない。
+            if (node !== undefined && typeof event.sessionId === 'string') {
+              sessions.delete(event.sessionId);
+              disposeOopifSession(node);
+            }
+            return true;
+          }
+          return false;
+        };
+        const onPageOopifAttached = (params: unknown): void => {
+          onTargetEvent(session, pageOopifSessions, 'Target.attachedToTarget', params);
+        };
+        const onPageOopifMessage = (params: unknown): void => {
+          onTargetEvent(session, pageOopifSessions, 'Target.receivedMessageFromTarget', params);
+        };
+        const onPageOopifDetached = (params: unknown): void => {
+          onTargetEvent(session, pageOopifSessions, 'Target.detachedFromTarget', params);
+        };
         const onSessionClose = (): void => {
-          redirectedPredecessors.clear();
+          pageInterception.clear();
+          disposeOopifSessions(pageOopifSessions);
           expectedCdpFailures.clear(page);
           releasePageListenerGroup(guardState, page);
           if (
@@ -940,181 +1627,28 @@ export async function installPassiveRequestGuard(
             initiateInvalidation(context, ledger);
           }
         };
-        const onRequestPaused = (event: PausedDocumentEvent): void => {
-          trackGuardTask(guardState, 'paused CDP Document request', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
-            const phase = guardState.phase;
-            const interceptedRequest = boundedCorrelationRequest(event.request.method, event.request.url);
-            if (interceptedRequest === null) {
-              expectedCdpFailures.register(page, event.request, Date.now());
-              try {
-                await session.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_FAIL_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-              }
-              initiateInvalidation(context, ledger);
-              return;
-            }
-            const redirectedLookup = event.redirectedRequestId === undefined
-              ? undefined
-              : redirectedPredecessors.take(event.redirectedRequestId, Date.now());
-            if (redirectedLookup !== undefined && redirectedLookup.kind !== 'FOUND') {
-              if (redirectedLookup.kind === 'MISSING') {
-                ledger.recordInvariantViolation({
-                  code: 'REDIRECT_PREDECESSOR_MISSING',
-                  message: 'Supplied redirect predecessor was unavailable',
-                });
-              }
-              try {
-                await session.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_FAIL_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-              }
-              initiateInvalidation(context, ledger);
-              return;
-            }
-            const redirectedFrom = redirectedLookup?.request;
-            const playwrightVisibleRequest = redirectedFrom ?? interceptedRequest;
-            if (isFrozenPhase(phase)) {
-              const expectedFailure = expectedCdpFailures.register(page, playwrightVisibleRequest, Date.now());
-              ledger.recordBlockedInteractionRequest({
-                method: interceptedRequest.method,
-                url: interceptedRequest.url,
-                reason: 'INTERACTION_FROZEN',
-              });
-              ledger.recordBlockedInteractionNavigation({
-                method: interceptedRequest.method,
-                url: interceptedRequest.url,
-                reason: 'INTERACTION_FROZEN',
-              });
-              let invalidationNeeded = expectedFailure === null;
-              try {
-                await session.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
-              } catch (error) {
-                if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
-                ledger.recordInvariantViolation({
-                  code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-                invalidationNeeded = true;
-              }
-              if (invalidationNeeded) initiateInvalidation(context, ledger);
-              return;
-            }
-            if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
-              await failPausedDocumentForLifecycle(
-                context,
-                session,
-                event.requestId,
-                ledger,
-                expectedCdpFailures,
-                page,
-                playwrightVisibleRequest,
-              );
-              return;
-            }
-            if (phase !== 'PASSIVE_ACTIVE') {
-              ledger.recordInvariantViolation({
-                code: 'CDP_DOCUMENT_PHASE_INVALID',
-                message: `Paused Document observed during ${phase}`,
-              });
-              await failPausedDocumentForLifecycle(
-                context,
-                session,
-                event.requestId,
-                ledger,
-                expectedCdpFailures,
-                page,
-                playwrightVisibleRequest,
-              );
-              return;
-            }
-            if (!redirectedPredecessors.remember(event.requestId, interceptedRequest, Date.now())) {
-              try {
-                await session.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
-              } catch (error) {
-                ledger.recordInvariantViolation({
-                  code: 'CDP_FAIL_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-              }
-              initiateInvalidation(context, ledger);
-              return;
-            }
-            const decision = classifyPassiveRequest({
-              kind: 'HTTP',
-              method: interceptedRequest.method,
-              url: event.request.url,
-              isNavigationRequest: true,
-              isMainFrame: event.frameId === rootFrameId,
-            }, authoritySnapshot);
-            if (decision.action === 'BLOCK') {
-              let expectedFailure: ExpectedCdpFailure | undefined;
-              if (redirectedFrom !== undefined) {
-                expectedFailure = expectedCdpFailures.register(page, redirectedFrom, Date.now()) ?? undefined;
-              }
-              try {
-                await session.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
-                recordBlockedDecision(ledger, decision, {
-                  method: event.request.method,
-                  url: event.request.url,
-                });
-              } catch (error) {
-                if (expectedFailure !== undefined) {
-                  expectedCdpFailures.remove(page, expectedFailure);
-                }
-                ledger.recordInvariantViolation({
-                  code: 'CDP_FAIL_REQUEST_FAILED',
-                  message: errorMessage(error),
-                });
-                initiateInvalidation(context, ledger);
-              }
-              if (redirectedFrom !== undefined && expectedFailure === undefined) {
-                initiateInvalidation(context, ledger);
-              }
-              return;
-            }
-            try {
-              await session.send('Fetch.continueRequest', { requestId: event.requestId });
-            } catch (error) {
-              ledger.recordInvariantViolation({
-                code: 'CDP_CONTINUE_REQUEST_FAILED',
-                message: errorMessage(error),
-              });
-              initiateInvalidation(context, ledger);
-            }
-          });
-        };
         if (!listenerGroup.active || guardState.listenerCleanups.pages.get(page) !== listenerGroup) {
           throw new Error('Passive request guard page listener cleanup owner was released during setup');
         }
         session.on('close', onSessionClose);
         listenerGroup.cleanups.push(() => session.off('close', onSessionClose));
-        session.on('Fetch.requestPaused', onRequestPaused);
-        listenerGroup.cleanups.push(() => session.off('Fetch.requestPaused', onRequestPaused));
-        await session.send('Fetch.enable', {
-          patterns: [{ urlPattern: '*', resourceType: 'Document', requestStage: 'Request' }],
-        });
+        session.on('Fetch.requestPaused', pageInterception.onRequestPaused);
+        listenerGroup.cleanups.push(() => session.off('Fetch.requestPaused', pageInterception.onRequestPaused));
+        session.on('Target.attachedToTarget', onPageOopifAttached);
+        listenerGroup.cleanups.push(() => session.off('Target.attachedToTarget', onPageOopifAttached));
+        session.on('Target.receivedMessageFromTarget', onPageOopifMessage);
+        listenerGroup.cleanups.push(() => session.off('Target.receivedMessageFromTarget', onPageOopifMessage));
+        session.on('Target.detachedFromTarget', onPageOopifDetached);
+        listenerGroup.cleanups.push(() => session.off('Target.detachedFromTarget', onPageOopifDetached));
+        // C18h: page の listener を外すとき（page が閉じたとき、Context が閉じたとき）に、リダイレクトの対応付けの登録を消す。
+        // CDP の session の `close`（`onSessionClose`）が先に届いた場合も、同じく消える。
+        // C18i: OOPIF の session も閉じ、その登録を消す（応答を待つ命令を失敗させ、後片付けの drain が待ち続けないようにする）。
+        listenerGroup.cleanups.push(() => pageInterception.clear());
+        listenerGroup.cleanups.push(() => disposeOopifSessions(pageOopifSessions));
+        await enableDocumentInterception(session);
+        // C18i: 横取りを付けた後に、OOPIF への自動の付与を始める。どちらかが失敗したら、page の準備の失敗（`CDP_SETUP_FAILED`）として
+        // Context を閉じる（fail-closed）。
+        await enableOopifAutoAttach(session);
         const guard = { session, rootFrameId };
         record.status = 'READY';
         resolveReady(guard);
@@ -1202,26 +1736,29 @@ export async function installPassiveRequestGuard(
     }
     const listenerGroup: ListenerCleanupGroup = { active: true, cleanups: [] };
     guardState.listenerCleanups.pages.set(page, listenerGroup);
+    // Contextは acceptDownloads: false で作るので、ブラウザはダウンロードを保存しない。
+    // ここでは、どのフェーズでページが起こしたダウンロードも記録し、念のため取り消す。
     const onDownload = (download: Download): void => {
       const downloadPhase = guardState.phase;
-      if (!isFrozenPhase(downloadPhase)) {
+      if (downloadPhase === 'CLOSED') {
         return;
       }
+      const frozen = isFrozenPhase(downloadPhase);
       ledger.recordBlockedDownload({
         url: download.url(),
         suggestedFilename: download.suggestedFilename(),
-        reason: 'INTERACTION_FROZEN',
+        reason: frozen ? 'INTERACTION_FROZEN' : 'PASSIVE_DOWNLOAD',
       });
       trackGuardTask(
         guardState,
-        'frozen download cancel',
+        frozen ? 'frozen download cancel' : 'passive download cancel',
         'GUARD_DOWNLOAD_CANCEL_TASK_FAILED',
         async (): Promise<void> => {
           try {
             await download.cancel();
           } catch (error) {
             ledger.recordInvariantViolation({
-              code: 'INTERACTION_DOWNLOAD_CANCEL_FAILED',
+              code: frozen ? 'INTERACTION_DOWNLOAD_CANCEL_FAILED' : 'PASSIVE_DOWNLOAD_CANCEL_FAILED',
               message: errorMessage(error),
             });
             initiateInvalidation(context, ledger);
@@ -1315,6 +1852,15 @@ export async function installPassiveRequestGuard(
           ) {
             return;
           }
+          // DEF-004: 許可した読み取りのナビゲーションの、閉じた一覧に載るネットワークの層の失敗は、Guard の違反ではない。
+          // DEF-004b: 凍結中は、これまでどおり違反とする（fail-closed）。
+          if (
+            !isFrozenPhase(guardState.phase)
+            && isReadMethod(request.method())
+            && isNetworkLayerFailure(message)
+          ) {
+            return;
+          }
           ledger.recordInvariantViolation({ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message });
           requestInvalidation();
         }
@@ -1322,12 +1868,57 @@ export async function installPassiveRequestGuard(
     );
     void completion.catch(() => undefined);
   };
+  // C18a（DEF-012）: 外部スキームはネットワークを通らないので、route と CDP の Fetch は働かない。Playwright の `request` の
+  // 事象は、ページのスクリプトによる移動の経路（main frame・subframe、凍結の前後）で来るので、ここで検出して記録する。止めることはできない。
+  // サーバのリダイレクト（3xx の `Location` が外部スキーム）は、この事象が来ないので、Document の応答の段階で、たどる前に止める（C18g）。
+  // 中断した Run の再開の設計書 4.10（R7d）: CLI の Chromium は、headless でも通常の Chromium の本体を使うので、headed と headless を
+  // 問わず、外部のアプリが起動したかもしれない。そのため、不変条件の違反として記録し、Context を閉じる（起きた可能性を隠さずに止める）。
+  // 検出の処理が例外を投げた場合は、違反を記録して Context を閉じる（fail-closed）。
+  const onRequest = (request: Request): void => {
+    const phase = guardState.phase;
+    if (phase === 'CLOSED') {
+      return;
+    }
+    try {
+      if (!request.isNavigationRequest()) {
+        return;
+      }
+      const url = request.url();
+      const scheme = externalNavigationScheme(url);
+      if (scheme === null) {
+        return;
+      }
+      ledger.recordInvariantViolation({
+        code: 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
+        message: `Navigation to the external scheme ${scheme} was attempted; `
+          + 'the browser may have launched an external application',
+      });
+      // popup（`window.open`）の navigation は frame ができる前に出るので、frame の種類が分からない。推し量って記録せず、
+      // 既存の frame の分類の失敗（`FRAME_CLASSIFICATION_FAILED`）も記録する。
+      const isMainFrame = classifyMainFrame(request, ledger);
+      if (isMainFrame !== undefined) {
+        ledger.recordExternalSchemeNavigation({
+          url,
+          scheme,
+          frame: isMainFrame ? 'MAIN' : 'SUB',
+          phase: isFrozenPhase(phase) ? 'INTERACTION' : 'PASSIVE',
+          reason: 'EXTERNAL_SCHEME_NAVIGATION',
+        });
+      }
+      initiateInvalidation(context, ledger);
+    } catch (error) {
+      ledger.recordInvariantViolation({ code: 'EXTERNAL_SCHEME_DETECTION_FAILED', message: errorMessage(error) });
+      initiateInvalidation(context, ledger);
+    }
+  };
 
   try {
     context.on('page', onPage);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('page', onPage));
     context.on('requestfailed', onRequestFailed);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('requestfailed', onRequestFailed));
+    context.on('request', onRequest);
+    guardState.listenerCleanups.context.cleanups.push(() => context.off('request', onRequest));
 
     await context.routeWebSocket(/.*/, (webSocketRoute) => runGuardProtocolTask(
       guardState, 'WebSocket route callback', 'GUARD_WEBSOCKET_ROUTE_TASK_FAILED', async (requestInvalidation) => {
@@ -1473,6 +2064,65 @@ export async function installPassiveRequestGuard(
             method: request.method(),
             url: request.url(),
           });
+          return;
+        }
+        // サイトへの負荷の制御の設計書 4.7: ここに来るのは、段階が `PASSIVE_ACTIVE` で、許可の判定が ALLOW の要求だけである
+        // （凍結の段階、閉じている段階、BLOCK は、ここより前で止めている）。ナビゲーションの要求と、届け方の部品がない場合は、今のまま
+        // ネットワークに送る。部品があれば、届け方を尋ねる。部品が選べるのは、ネットワーク、キャッシュから返す、送らない、の3つだけで、
+        // 後の2つはネットワークに何も送らない（その前に `expectedRouteFailures` に登録する）。部品の例外では、今のままネットワークに
+        // 送る。部品の例外と、キャッシュから返す・送らない処理の失敗は、Guard の外に投げず、Ledger にも記録しない（安全のための遮断では
+        // なく、安全には関わらないため）。
+        const resourceDelivery = options.resourceDelivery;
+        if (isNavigationRequest || resourceDelivery === undefined) {
+          await continueNative(requestInvalidation, route, ledger);
+          return;
+        }
+        let delivery: ResourceDeliveryDecision | undefined;
+        try {
+          delivery = resourceDelivery.decide({
+            method: request.method(),
+            resourceType: request.resourceType(),
+            url: request.url(),
+            isNavigationRequest,
+          });
+        } catch {
+          delivery = undefined;
+        }
+        if (delivery?.kind === 'FROM_RUN_CACHE') {
+          expectedRouteFailures.add(request);
+          try {
+            resourceDelivery.beforeServeFromRunCache(request);
+          } catch {
+            // 印の失敗は、外に投げない（キャッシュから返す）。
+          }
+          try {
+            const { status, headers, body } = delivery.resource;
+            await route.fulfill({
+              status,
+              headers: { ...headers },
+              body: Buffer.from(body.buffer, body.byteOffset, body.byteLength),
+            });
+          } catch {
+            try {
+              await route.abort('blockedbyclient');
+            } catch {
+              // 返すのにも止めるのにも失敗した場合も、外に投げない（ネットワークには送っていない）。
+            }
+          }
+          return;
+        }
+        if (delivery?.kind === 'WITHHOLD') {
+          expectedRouteFailures.add(request);
+          try {
+            await route.abort('blockedbyclient');
+          } catch {
+            // 止めるのに失敗しても、外に投げない（ネットワークには送っていない）。
+          }
+          try {
+            resourceDelivery.afterWithhold(request);
+          } catch {
+            // 数えるのに失敗しても、外に投げない。
+          }
           return;
         }
         await continueNative(requestInvalidation, route, ledger);

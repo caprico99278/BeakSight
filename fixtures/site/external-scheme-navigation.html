@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture External Scheme Navigation</title></head>
+  <body>
+    <h1>Fixture External Scheme Navigation</h1>
+    <p id="attempt">not attempted</p>
+    <script>
+      // ページのスクリプトが、読み込みの後に、外部スキームへの移動を自分で試みる（C18b。DEF-012、GATE-S03 の Passive の段階）。
+      // - 経路はクエリの via で、スキームはクエリの to で選ぶ（例: ?via=location-href&to=tel）。
+      // - 宛先は、下の一覧の、実在しないものだけである。クエリで任意の URL を渡すことはできない。
+      // - 一覧にない値の場合は、何もしない。
+      const destinations = {
+        tel: 'tel:+10000000000',
+        mailto: 'mailto:nobody@example.invalid',
+        custom: 'beaksight-test-app:probe',
+      };
+      const routes = {
+        'location-href': (target) => { location.href = target; },
+        'location-assign': (target) => { location.assign(target); },
+        'meta-refresh': (target) => {
+          const meta = document.createElement('meta');
+          meta.httpEquiv = 'refresh';
+          meta.content = `0;url=${target}`;
+          document.head.append(meta);
+        },
+        'iframe-src': (target) => {
+          const frame = document.createElement('iframe');
+          frame.title = 'External scheme frame';
+          frame.src = target;
+          document.body.append(frame);
+        },
+        'anchor-click': (target) => {
+          const anchor = document.createElement('a');
+          anchor.href = target;
+          anchor.textContent = 'External scheme link';
+          document.body.append(anchor);
+          anchor.click();
+        },
+        'form-action': (target) => {
+          const form = document.createElement('form');
+          form.method = 'get';
+          form.action = target;
+          document.body.append(form);
+          form.submit();
+        },
+      };
+      const query = new URLSearchParams(location.search);
+      const via = query.get('via');
+      const to = query.get('to');
+      if (Object.hasOwn(routes, via) && Object.hasOwn(destinations, to)) {
+        // load の事象の処理が終わった後（次のタスク）に試みる。読み込みの完了と、移動の試みの順序を決めておくためである。
+        window.addEventListener('load', () => {
+          setTimeout(() => {
+            document.getElementById('attempt').textContent = `attempted: ${via} ${to}`;
+            routes[via](destinations[to]);
+          }, 0);
+        });
+      }
+    </script>
+  </body>
+</html>

@@ -1,4 +1,25 @@
-import type { Page, Request, Response } from 'playwright';
+import type { Frame, Page, Request, Response } from 'playwright';
+import { safeErrorMessage } from '../core/errors.js';
+import type {
+  HeaderEvidence,
+  NetworkEvidence,
+  NetworkFailureEvidence,
+  NetworkRequestEvidence,
+  NetworkResponseEvidence,
+  NetworkTimingEvidence,
+  RequestOriginFlags,
+  ResponseTransferSizeEvidence,
+} from '../core/evidence-types.js';
+import { isNonNegativeSafeInteger } from '../core/guards.js';
+import { createRequestId } from '../core/ids.js';
+import {
+  MAX_ERROR_MESSAGE_LENGTH,
+  MAX_HEADER_VALUE_LENGTH,
+  MAX_HTTP_METHOD_LENGTH,
+  MAX_NETWORK_REQUESTS,
+  MAX_URL_LENGTH,
+} from '../core/limits.js';
+import { truncateText } from '../core/text.js';
 import { redactHeaders } from '../safety/redact.js';
 import { createCollectorHandle, type CollectorHandle } from './collector-handle.js';
 
@@ -48,79 +69,38 @@ const RESPONSE_HEADER_NAMES = new Set([
   'x-session-id',
 ]);
 
-export type HeaderEvidence =
-  | {
-      readonly status: 'OBSERVED';
-      readonly values: Readonly<Record<string, string>>;
-    }
-  | {
-      readonly status: 'FAILED';
-      readonly errorText: string;
-    };
+interface HeaderObservation {
+  readonly evidence: HeaderEvidence;
+  readonly truncated: boolean;
+}
 
-export interface NetworkRequestEvidence {
+interface MutableNetworkRequestEvidence extends RequestOriginFlags {
   readonly requestId: string;
   readonly url: string;
   readonly method: string;
   readonly resourceType: string;
-  readonly headers: HeaderEvidence;
-  readonly timing: NetworkTimingEvidence;
-  readonly redirectFromRequestId: string | null;
-  readonly redirectToRequestId: string | null;
-  readonly redirectChainRequestIds: readonly string[];
-}
-
-export interface NetworkResponseEvidence {
-  readonly requestId: string;
-  readonly url: string;
-  readonly status: number;
-  readonly statusText: string;
-  readonly headers: HeaderEvidence;
-  readonly contentLengthHeader: string | null;
-  readonly timing: NetworkTimingEvidence;
-}
-
-export interface NetworkFailureEvidence {
-  readonly requestId: string;
-  readonly url: string;
-  readonly method: string;
-  readonly resourceType: string;
-  readonly errorText: string;
-  readonly timing: NetworkTimingEvidence;
-}
-
-export interface NetworkEvidence {
-  readonly requests: readonly NetworkRequestEvidence[];
-  readonly responses: readonly NetworkResponseEvidence[];
-  readonly failures: readonly NetworkFailureEvidence[];
-}
-
-interface MutableNetworkRequestEvidence {
-  readonly requestId: string;
-  readonly url: string;
-  readonly method: string;
-  readonly resourceType: string;
-  readonly headers: Promise<HeaderEvidence>;
+  readonly headers: Promise<HeaderObservation>;
   timing: NetworkTimingEvidence;
   readonly redirectFromRequestId: string | null;
   redirectToRequestId: string | null;
   readonly redirectChainRequestIds: readonly string[];
+  readonly truncated: boolean;
+  transferSize: Promise<ResponseTransferSizeEvidence> | null;
 }
 
-interface MutableNetworkResponseEvidence {
+interface MutableNetworkResponseEvidence extends RequestOriginFlags {
+  readonly request: MutableNetworkRequestEvidence;
   readonly requestId: string;
   readonly url: string;
   readonly status: number;
   readonly statusText: string;
-  readonly headers: Promise<HeaderEvidence>;
+  readonly headers: Promise<HeaderObservation>;
   timing: NetworkTimingEvidence;
+  readonly truncated: boolean;
 }
 
-function formatRequestId(sequence: number): string {
-  return `REQ-${String(sequence).padStart(6, '0')}`;
-}
-
-type NetworkTimingEvidence = Readonly<ReturnType<Request['timing']>>;
+const TRANSFER_SIZE_NOT_OBSERVED: ResponseTransferSizeEvidence = Object.freeze({ status: 'NOT_OBSERVED' });
+const INVALID_TRANSFER_SIZE_TEXT = 'Response transfer size is not a non-negative safe integer';
 
 function copyTiming(timing: ReturnType<Request['timing']>): NetworkTimingEvidence {
   return Object.freeze({ ...timing });
@@ -129,38 +109,71 @@ function copyTiming(timing: ReturnType<Request['timing']>): NetworkTimingEvidenc
 function selectedHeaders(
   headers: Record<string, string>,
   selectedNames: ReadonlySet<string>,
-): Readonly<Record<string, string>> {
+): HeaderObservation {
   const selected = Object.fromEntries(Object.entries(headers).filter(([name]) => (
     selectedNames.has(name.toLowerCase())
   )));
-  return Object.freeze(redactHeaders(selected));
+  let truncated = false;
+  const bounded = Object.fromEntries(Object.entries(redactHeaders(selected)).map(([name, value]) => {
+    const boundedValue = truncateText(value, MAX_HEADER_VALUE_LENGTH);
+    truncated ||= boundedValue.truncated;
+    return [name, boundedValue.text];
+  }));
+  return Object.freeze({
+    evidence: Object.freeze({ status: 'OBSERVED', values: Object.freeze(bounded) }),
+    truncated,
+  });
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function failedHeaders(error: unknown): HeaderEvidence {
-  return Object.freeze({ status: 'FAILED', errorText: errorMessage(error) });
+function failedHeaders(error: unknown): HeaderObservation {
+  return Object.freeze({
+    evidence: Object.freeze({ status: 'FAILED', errorText: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH) }),
+    truncated: false,
+  });
 }
 
 function startHeaderObservation(
   readAllHeaders: () => Promise<Record<string, string>>,
   selectedNames: ReadonlySet<string>,
-): Promise<HeaderEvidence> {
+): Promise<HeaderObservation> {
   let allHeaders: Promise<Record<string, string>>;
   try {
     allHeaders = readAllHeaders();
   } catch (error) {
     return Promise.resolve(failedHeaders(error));
   }
-  return allHeaders.then(
-    (headers) => Object.freeze({
-      status: 'OBSERVED' as const,
-      values: selectedHeaders(headers, selectedNames),
-    }),
-    failedHeaders,
-  );
+  return allHeaders.then((headers) => selectedHeaders(headers, selectedNames), failedHeaders);
+}
+
+function failedTransferSize(error: unknown): ResponseTransferSizeEvidence {
+  return Object.freeze({ status: 'FAILED', errorText: safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH) });
+}
+
+function transferSizeFrom(sizes: unknown): ResponseTransferSizeEvidence {
+  const headersBytes = typeof sizes === 'object' && sizes !== null
+    ? Reflect.get(sizes, 'responseHeadersSize') as unknown
+    : undefined;
+  const bodyBytes = typeof sizes === 'object' && sizes !== null
+    ? Reflect.get(sizes, 'responseBodySize') as unknown
+    : undefined;
+  if (!isNonNegativeSafeInteger(headersBytes) || !isNonNegativeSafeInteger(bodyBytes)) {
+    return failedTransferSize(INVALID_TRANSFER_SIZE_TEXT);
+  }
+  const totalBytes = headersBytes + bodyBytes;
+  return isNonNegativeSafeInteger(totalBytes)
+    ? Object.freeze({ status: 'OBSERVED', headersBytes, bodyBytes, totalBytes })
+    : failedTransferSize(INVALID_TRANSFER_SIZE_TEXT);
+}
+
+/** 完了したリクエストの転送量を読む。読み取りの失敗は `FAILED` として記録し、例外を投げない。 */
+function startTransferSizeObservation(request: Request): Promise<ResponseTransferSizeEvidence> {
+  let sizes: Promise<unknown>;
+  try {
+    sizes = request.sizes();
+  } catch (error) {
+    return Promise.resolve(failedTransferSize(error));
+  }
+  return sizes.then(transferSizeFrom, failedTransferSize);
 }
 
 function copyHeaders(headers: HeaderEvidence): HeaderEvidence {
@@ -169,37 +182,68 @@ function copyHeaders(headers: HeaderEvidence): HeaderEvidence {
     : Object.freeze({ status: 'FAILED', errorText: headers.errorText });
 }
 
-interface RequestSnapshotSeed extends Omit<NetworkRequestEvidence, 'headers'> {
-  readonly headers: Promise<HeaderEvidence>;
+function copyTransferSize(transferSize: ResponseTransferSizeEvidence): ResponseTransferSizeEvidence {
+  return Object.freeze({ ...transferSize });
 }
 
-interface ResponseSnapshotSeed extends Omit<NetworkResponseEvidence, 'headers' | 'contentLengthHeader'> {
-  readonly headers: Promise<HeaderEvidence>;
+interface RequestSnapshotSeed extends Omit<NetworkRequestEvidence, 'headers'> {
+  readonly headers: Promise<HeaderObservation>;
+}
+
+interface ResponseSnapshotSeed extends Omit<NetworkResponseEvidence, 'headers' | 'contentLengthHeader' | 'transferSize'> {
+  readonly headers: Promise<HeaderObservation>;
+  readonly transferSize: Promise<ResponseTransferSizeEvidence> | null;
 }
 
 function captureRequest(request: MutableNetworkRequestEvidence): RequestSnapshotSeed {
   return {
-    ...request,
+    requestId: request.requestId,
+    url: request.url,
+    method: request.method,
+    resourceType: request.resourceType,
+    headers: request.headers,
     timing: Object.freeze({ ...request.timing }),
+    redirectFromRequestId: request.redirectFromRequestId,
+    redirectToRequestId: request.redirectToRequestId,
     redirectChainRequestIds: Object.freeze([...request.redirectChainRequestIds]),
+    isNavigationRequest: request.isNavigationRequest,
+    isMainFrame: request.isMainFrame,
+    truncated: request.truncated,
   };
 }
 
 async function materializeRequest(request: RequestSnapshotSeed): Promise<NetworkRequestEvidence> {
+  const headers = await request.headers;
   return Object.freeze({
     ...request,
-    headers: copyHeaders(await request.headers),
+    headers: copyHeaders(headers.evidence),
     timing: Object.freeze({ ...request.timing }),
     redirectChainRequestIds: Object.freeze([...request.redirectChainRequestIds]),
+    truncated: request.truncated || headers.truncated,
   });
 }
 
 function captureResponse(response: MutableNetworkResponseEvidence): ResponseSnapshotSeed {
-  return { ...response, timing: Object.freeze({ ...response.timing }) };
+  return {
+    requestId: response.requestId,
+    url: response.url,
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+    timing: Object.freeze({ ...response.timing }),
+    isNavigationRequest: response.isNavigationRequest,
+    isMainFrame: response.isMainFrame,
+    transferSize: response.request.transferSize,
+    truncated: response.truncated,
+  };
 }
 
 async function materializeResponse(response: ResponseSnapshotSeed): Promise<NetworkResponseEvidence> {
-  const headers = copyHeaders(await response.headers);
+  const [observation, transferSize] = await Promise.all([
+    response.headers,
+    response.transferSize ?? TRANSFER_SIZE_NOT_OBSERVED,
+  ]);
+  const headers = copyHeaders(observation.evidence);
   const contentLengthHeader = headers.status === 'OBSERVED'
     ? Object.entries(headers.values).find(([name]) => name.toLowerCase() === 'content-length')?.[1] ?? null
     : null;
@@ -208,6 +252,8 @@ async function materializeResponse(response: ResponseSnapshotSeed): Promise<Netw
     headers,
     contentLengthHeader,
     timing: Object.freeze({ ...response.timing }),
+    transferSize: copyTransferSize(transferSize),
+    truncated: response.truncated || observation.truncated,
   });
 }
 
@@ -215,38 +261,70 @@ function copyFailure(failure: NetworkFailureEvidence): NetworkFailureEvidence {
   return Object.freeze({ ...failure, timing: Object.freeze({ ...failure.timing }) });
 }
 
+/** リクエストのフレームがメインフレームか。フレームを得られない場合（Service Worker のリクエストなど）は `null`。 */
+function isMainFrameRequest(page: Page, request: Request): boolean | null {
+  let frame: Frame;
+  let mainFrame: Frame;
+  try {
+    frame = request.frame();
+    mainFrame = page.mainFrame();
+  } catch {
+    return null;
+  }
+  return frame === mainFrame;
+}
+
 export class NetworkCollector {
   static attach(page: Page): CollectorHandle<NetworkEvidence> {
     let nextRequestSequence = 1;
     const requestIds = new WeakMap<Request, string>();
     const requestRecords = new WeakMap<Request, MutableNetworkRequestEvidence>();
+    const omittedRequests = new WeakSet<Request>();
     const requests: MutableNetworkRequestEvidence[] = [];
     const responses: MutableNetworkResponseEvidence[] = [];
     const failures: NetworkFailureEvidence[] = [];
+    let omittedRequestCount = 0;
+    let omittedResponseCount = 0;
+    let omittedFailureCount = 0;
 
-    const ensureRequest = (request: Request): MutableNetworkRequestEvidence => {
+    // 件数の上限を超えたリクエストは記録せず、件数だけを数えて `null` を返す。
+    const ensureRequest = (request: Request): MutableNetworkRequestEvidence | null => {
       const existing = requestRecords.get(request);
       if (existing !== undefined) {
         return existing;
       }
+      if (omittedRequests.has(request)) {
+        return null;
+      }
 
       const redirectedFrom = request.redirectedFrom();
       const predecessor = redirectedFrom === null ? null : ensureRequest(redirectedFrom);
-      const requestId = formatRequestId(nextRequestSequence);
+      if (requests.length >= MAX_NETWORK_REQUESTS) {
+        omittedRequests.add(request);
+        omittedRequestCount += 1;
+        return null;
+      }
+      const requestId = createRequestId(nextRequestSequence);
       nextRequestSequence += 1;
       const redirectChainRequestIds = predecessor === null
         ? []
         : [...predecessor.redirectChainRequestIds, predecessor.requestId];
+      const url = truncateText(request.url(), MAX_URL_LENGTH);
+      const method = truncateText(request.method(), MAX_HTTP_METHOD_LENGTH);
       const record: MutableNetworkRequestEvidence = {
         requestId,
-        url: request.url(),
-        method: request.method(),
+        url: url.text,
+        method: method.text,
         resourceType: request.resourceType(),
         headers: startHeaderObservation(() => request.allHeaders(), REQUEST_HEADER_NAMES),
         timing: copyTiming(request.timing()),
         redirectFromRequestId: predecessor?.requestId ?? null,
         redirectToRequestId: null,
         redirectChainRequestIds: Object.freeze(redirectChainRequestIds),
+        isNavigationRequest: request.isNavigationRequest(),
+        isMainFrame: isMainFrameRequest(page, request),
+        truncated: url.truncated || method.truncated,
+        transferSize: null,
       };
       requestIds.set(request, requestId);
       requestRecords.set(request, record);
@@ -263,30 +341,53 @@ export class NetworkCollector {
     const onResponse = (response: Response): void => {
       const request = response.request();
       const requestRecord = ensureRequest(request);
+      if (requestRecord === null) {
+        omittedResponseCount += 1;
+        return;
+      }
+      const url = truncateText(response.url(), MAX_URL_LENGTH);
       responses.push({
+        request: requestRecord,
         requestId: requestIds.get(request) ?? requestRecord.requestId,
-        url: response.url(),
+        url: url.text,
         status: response.status(),
         statusText: response.statusText(),
         headers: startHeaderObservation(() => response.allHeaders(), RESPONSE_HEADER_NAMES),
         timing: copyTiming(request.timing()),
+        isNavigationRequest: requestRecord.isNavigationRequest,
+        isMainFrame: requestRecord.isMainFrame,
+        truncated: url.truncated,
       });
     };
     const onRequestFailed = (request: Request): void => {
       const requestRecord = ensureRequest(request);
+      if (requestRecord === null) {
+        omittedFailureCount += 1;
+        return;
+      }
+      const url = truncateText(request.url(), MAX_URL_LENGTH);
+      const method = truncateText(request.method(), MAX_HTTP_METHOD_LENGTH);
+      const errorText = truncateText(request.failure()?.errorText ?? 'UNKNOWN_REQUEST_FAILURE', MAX_ERROR_MESSAGE_LENGTH);
       failures.push(Object.freeze({
         requestId: requestRecord.requestId,
-        url: request.url(),
-        method: request.method(),
+        url: url.text,
+        method: method.text,
         resourceType: request.resourceType(),
-        errorText: request.failure()?.errorText ?? 'UNKNOWN_REQUEST_FAILURE',
+        errorText: errorText.text,
         timing: copyTiming(request.timing()),
+        isNavigationRequest: requestRecord.isNavigationRequest,
+        isMainFrame: requestRecord.isMainFrame,
+        truncated: url.truncated || method.truncated || errorText.truncated,
       }));
     };
     const onRequestFinished = (request: Request): void => {
       const requestRecord = ensureRequest(request);
+      if (requestRecord === null) {
+        return;
+      }
       const finalTiming = copyTiming(request.timing());
       requestRecord.timing = finalTiming;
+      requestRecord.transferSize ??= startTransferSizeObservation(request);
       for (const response of responses) {
         if (response.requestId === requestRecord.requestId) {
           response.timing = finalTiming;
@@ -304,6 +405,11 @@ export class NetworkCollector {
         const requestBoundary = requests.map(captureRequest);
         const responseBoundary = responses.map(captureResponse);
         const failureBoundary = failures.map(copyFailure);
+        const omitted = {
+          omittedRequestCount,
+          omittedResponseCount,
+          omittedFailureCount,
+        };
         const [requestSnapshots, responseSnapshots] = await Promise.all([
           Promise.all(requestBoundary.map(materializeRequest)),
           Promise.all(responseBoundary.map(materializeResponse)),
@@ -312,6 +418,7 @@ export class NetworkCollector {
           requests: Object.freeze(requestSnapshots),
           responses: Object.freeze(responseSnapshots),
           failures: Object.freeze(failureBoundary),
+          ...omitted,
         });
       },
       () => {

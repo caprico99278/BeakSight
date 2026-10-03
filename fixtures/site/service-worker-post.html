@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Service Worker Post</title></head>
+  <body>
+    <h1>Fixture Service Worker Post</h1>
+    <button type="button">Register posting worker</button>
+    <script>
+      // Worker 自身が POST を試みる Service Worker を登録する（Task 18 の S08）。
+      // Passive の段階でも試みるように読み込みの時に登録し、Interaction の段階でも試みるようにボタンでも登録する。
+      // ページのスクリプトは、GET・HEAD 以外のリクエストを送らない。
+      const registerPostingWorker = () => navigator.serviceWorker.register('/service-worker-post-worker.js').catch(() => undefined);
+      void registerPostingWorker();
+      document.querySelector('button').addEventListener('click', () => {
+        void registerPostingWorker();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Page Auditor Busy Loop</title>
+  </head>
+  <body>
+    <h1>Fixture Page Auditor Busy Loop</h1>
+    <p>After the load event, this page blocks its main thread forever.</p>
+    <script>
+      // 読み込みの後で、ページのメインスレッドを止め続ける（R14 の I1 の再現条件）。
+      window.addEventListener('load', () => {
+        setTimeout(() => {
+          while (true) { /* busy loop */ }
+        }, 0);
+      });
+    </script>
+  </body>
+</html>
