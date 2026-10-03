@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Unscrollable overflow fixture</title>
+  <style>
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; margin: 0; overflow: clip; font-family: sans-serif; }
+    #tall-content { box-sizing: border-box; height: 3000px; padding: 24px; }
+  </style>
+</head>
+<body>
+  <main id="tall-content"><h1>Content taller than an unscrollable body</h1></main>
+</body>
+</html>

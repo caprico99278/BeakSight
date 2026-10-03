@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Resource delivery fixture</title>
+    <!-- 許可 Origin（このページのサーバ）のスクリプト（サイトへの負荷の制御の設計書 4.6、4.7。L5b）。 -->
+    <script src="/resource-delivery.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Resource delivery fixture</h1>
+      <!-- 許可 Origin の画像（大きさ 8x8）。 -->
+      <img id="allowed-image" src="/resource-delivery.svg" alt="An image of the allowed origin">
+      <!-- Interaction の候補は、aria-expanded を切り替えるこのボタン1つだけ。クリックの後に要求を送らない。 -->
+      <button type="button" aria-expanded="false" aria-controls="toggle-panel">Toggle details</button>
+      <div id="toggle-panel" hidden>Expanded fixture content</div>
+    </main>
+    <script>
+      // 2つ目の Origin（許可 Origin の外）の画像とスクリプトを読む。2つ目の Origin は、テストが起動するもう1つの fixture のサーバで、
+      // ポートをクエリの otherPort で受け取る（ホストとスキームは、このページと同じ。インターネット上のサイトは使わない）。
+      // - other-image（/external-image.svg）と /external-script.js は、読み込みごとに同じ URL（Run 全体のキャッシュに入る）。
+      // - アクセス解析の計測の画像のように、読み込みごとに違う URL の画像も1つ読む（Run 全体のキャッシュにない）。
+      const otherPort = new URLSearchParams(location.search).get('otherPort');
+      if (otherPort !== null && /^[0-9]{1,5}$/u.test(otherPort)) {
+        const otherOrigin = `${location.protocol}//${location.hostname}:${otherPort}`;
+        const otherImage = document.createElement('img');
+        otherImage.id = 'other-image';
+        otherImage.alt = 'An image of the other origin';
+        otherImage.src = `${otherOrigin}/external-image.svg`;
+        document.querySelector('main').append(otherImage);
+        const otherScript = document.createElement('script');
+        otherScript.src = `${otherOrigin}/external-script.js`;
+        document.head.append(otherScript);
+        new Image().src = `${otherOrigin}/external-image.svg?beacon=${Date.now()}-${Math.random()}`;
+      }
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#toggle-panel');
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>

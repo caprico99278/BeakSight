@@ -218,6 +218,13 @@ immutable AuditConfig
 | Cross-page rule evaluation   | `src/audit/cross-page-rules.ts`    |
 | JSON Schema validation       | `src/core/schema-validator.ts`     |
 | Final artifact serialization | `src/report/artifact-writer.ts`    |
+| Navigation pacing（ページの読み込みの間隔） | `src/crawl/navigation-pacer.ts` |
+| Site load record（サイトへの負荷の記録） | `src/crawl/load-meter.ts` |
+| Resource delivery after Passive ALLOW（Run 全体のキャッシュと、送らない要求） | `src/browser/resource-delivery.ts` |
+| Run checkpoint content and resumption（再開のための保存の中身と、再開の判定） | `src/orchestration/run-checkpoint.ts` |
+| Run checkpoint session（保存、ロック、ハートビート） | `src/orchestration/run-checkpoint-session.ts` |
+
+> 2026-10-01 追補: 表の最後の5行は、ユーザーの承認を得た追補設計書 `2026-10-01-beaksight-site-load-control-design.md`（第5章）と `2026-10-01-beaksight-resumable-run-design.md`（第5章）で加えた owner である。許可の判定（Passive HTTP authority）は、引き続き `request-policy.ts` だけが行い、届け方の部品は、許可された要求の届け方（ネットワーク、キャッシュから返す、送らない）を選ぶだけである。保存とロックのファイルの読み書きは、引き続き `artifact-writer.ts` だけが行う。
 
 新しい実装で第二ownerが必要に見えた場合は、第二ownerを追加せず停止して設計上の問題として報告してください。
 

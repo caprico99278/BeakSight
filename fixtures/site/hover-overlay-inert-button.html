@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Hover Overlay Inert Button</title>
+    <style>
+      html, body { height: 100%; margin: 0; overflow: hidden; }
+      #s { box-sizing: border-box; height: 100%; overflow-y: auto; }
+      #lead { height: 320px; }
+      .spacer { height: 2000px; }
+      /* 初めは表示しない固定表示の帯。表示すると、初めの位置のボタンを覆う。 */
+      #ov { display: none; position: fixed; top: 300px; left: 0; right: 0; height: 100px; background: #ddd; }
+      #ov.shown { display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="s">
+      <div id="lead"></div>
+      <button type="button">Hover overlay inert</button>
+      <div class="spacer"></div>
+    </div>
+    <div id="ov"></div>
+    <script>
+      // マウスが乗った後、2回目の mousemove（下準備の hover の後の、click の移動）で固定表示の帯が現れ、ボタンを覆う。
+      // click の再試行は、内側の領域をスクロールしてボタンを帯の外に出す。ボタン自身の属性は変わらず、ボタンは何もしない。
+      const button = document.querySelector('button');
+      const overlay = document.querySelector('#ov');
+      let moves = 0;
+      button.addEventListener('mousemove', () => {
+        moves += 1;
+        if (moves === 2) overlay.classList.add('shown');
+      });
+    </script>
+  </body>
+</html>

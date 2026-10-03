@@ -1,7 +1,11 @@
+import { createServer, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import type { Browser, BrowserContext, CDPSession, Download, Page, Request, Route, WebSocketRoute } from 'playwright';
-import { chromium } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import type { CachedResource } from '../../src/browser/resource-delivery.js';
+import { wait } from '../../src/core/deadline.js';
+import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
 import {
@@ -12,16 +16,22 @@ import {
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
+  type GuardResourceDelivery,
+  type PassiveRequestGuardOptions,
 } from '../../src/safety/passive-request-guard.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { useHeadlessChromium } from '../helpers/chromium.js';
+import { createDeferred } from '../helpers/deferred.js';
 
+/** Chromium がナビゲーションの失敗の後に表示するエラーのページの URL。 */
+const CHROMIUM_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
 const servers: FixtureServer[] = [];
 const contexts: BrowserContext[] = [];
 let browser: Browser;
 
-beforeAll(async () => {
-  browser = await chromium.launch({ headless: true });
+useHeadlessChromium((launched) => {
+  browser = launched;
 });
 
 afterEach(async () => {
@@ -35,15 +45,73 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
 });
 
-afterAll(async () => {
-  await browser.close();
-});
-
 async function startServer(options?: Parameters<typeof startFixtureServer>[0]): Promise<FixtureServer> {
   const server = await startFixtureServer(options);
   servers.push(server);
   return server;
 }
+
+interface HangingServer {
+  readonly origin: string;
+  /** `/hang` へのリクエストをサーバが受け取るまで待つ。 */
+  readonly hangReceived: Promise<void>;
+  /** 受け取った `/hang` のソケットを、応答を送らずに切る。これ以後の `/hang`（Chromium の送り直しを含む）も、受け取ってすぐに切る。 */
+  cutHang(): void;
+  close(): Promise<void>;
+}
+
+const hangingServers: HangingServer[] = [];
+
+/**
+ * `/` に小さな HTML を返し、`/hang` には応答しないローカルのサーバ（DEF-004b）。
+ * テストは、受け取った `/hang` のソケットを切ることで、ナビゲーションをネットワークの層の失敗で終わらせる。
+ */
+async function startHangingServer(): Promise<HangingServer> {
+  let resolveHang: () => void = () => undefined;
+  const hangReceived = new Promise<void>((resolve) => {
+    resolveHang = resolve;
+  });
+  const pendingHangs: ServerResponse[] = [];
+  let cut = false;
+  const server = createServer((request, response) => {
+    if (request.url === '/hang') {
+      if (cut) {
+        response.socket?.destroy();
+        return;
+      }
+      pendingHangs.push(response);
+      resolveHang();
+      return;
+    }
+    if (request.url === '/') {
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', connection: 'close' });
+      response.end('<!doctype html><title>hang</title><h1>hang</h1>');
+      return;
+    }
+    response.writeHead(404, { connection: 'close' });
+    response.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const hanging: HangingServer = {
+    origin: `http://127.0.0.1:${port}`,
+    hangReceived,
+    cutHang: () => {
+      cut = true;
+      for (const response of pendingHangs.splice(0)) response.socket?.destroy();
+    },
+    close: async () => {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+  hangingServers.push(hanging);
+  return hanging;
+}
+
+afterEach(async () => {
+  await Promise.all(hangingServers.splice(0).map((server) => server.close()));
+});
 
 async function createGuardedContext(
   ledger: SafetyLedger,
@@ -71,26 +139,12 @@ interface GuardHarness {
   readonly httpHandler: ((route: Route) => Promise<unknown> | unknown) | undefined;
   readonly webSocketHandler: ((route: WebSocketRoute) => Promise<unknown> | unknown) | undefined;
   readonly requestFailedHandler: ((request: Request) => Promise<unknown> | unknown) | undefined;
+  /** Guard の `request` の事象の listener（C18a。外部スキームへの移動の検出）。 */
+  readonly requestHandler: ((request: Request) => unknown) | undefined;
   readonly pageHandler: ((page: Page) => void) | undefined;
   readonly cdpRequestPausedHandler: ((event: FakeCdpPausedEvent) => void) | undefined;
   readonly cdpCloseHandler: (() => void) | undefined;
   registerPage(page: Page): void;
-}
-
-interface Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve(value: T): void;
-  reject(error: unknown): void;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
 }
 
 function createHostileGuardError(): object {
@@ -112,6 +166,10 @@ interface FakeCdpPausedEvent {
   readonly redirectedRequestId?: string;
   readonly frameId: string;
   readonly request: { readonly method: string; readonly url: string };
+  /** 応答の段階（Response stage）の事象だけが持つ項目（C18g）。 */
+  readonly responseStatusCode?: number;
+  readonly responseErrorReason?: string;
+  readonly responseHeaders?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
 }
 
 function createGuardHarness(options: {
@@ -140,6 +198,7 @@ function createGuardHarness(options: {
   let httpHandler: GuardHarness['httpHandler'];
   let webSocketHandler: GuardHarness['webSocketHandler'];
   let requestFailedHandler: GuardHarness['requestFailedHandler'];
+  let requestHandler: GuardHarness['requestHandler'];
   let pageHandler: GuardHarness['pageHandler'];
   let cdpRequestPausedHandler: GuardHarness['cdpRequestPausedHandler'];
   let cdpCloseHandler: GuardHarness['cdpCloseHandler'];
@@ -152,6 +211,8 @@ function createGuardHarness(options: {
       calls.push(`ON:${event}`);
       if (event === 'requestfailed') {
         requestFailedHandler = handler as GuardHarness['requestFailedHandler'];
+      } else if (event === 'request') {
+        requestHandler = handler as GuardHarness['requestHandler'];
       } else if (event === 'page') {
         pageHandler = handler as (page: Page) => void;
       }
@@ -160,6 +221,7 @@ function createGuardHarness(options: {
       removedListeners.push(`CONTEXT:${event}`);
       if (event === 'page' && pageHandler === handler) pageHandler = undefined;
       if (event === 'requestfailed' && requestFailedHandler === handler) requestFailedHandler = undefined;
+      if (event === 'request' && requestHandler === handler) requestHandler = undefined;
     },
     async newCDPSession(): Promise<CDPSession> {
       calls.push('CDP');
@@ -253,6 +315,9 @@ function createGuardHarness(options: {
     },
     get requestFailedHandler(): GuardHarness['requestFailedHandler'] {
       return requestFailedHandler;
+    },
+    get requestHandler(): GuardHarness['requestHandler'] {
+      return requestHandler;
     },
     get pageHandler(): GuardHarness['pageHandler'] {
       return pageHandler;
@@ -733,7 +798,7 @@ describe('installPassiveRequestGuard installation', () => {
     emitFailedMainFrameRequest(harness, page, {
       method: 'GET',
       url: 'https://example.test/invalidation',
-      errorText: 'net::ERR_CONNECTION_RESET',
+      errorText: 'net::ERR_FAILED',
     });
     await expect.poll(() => harness.closeCount).toBe(1);
 
@@ -746,7 +811,7 @@ describe('installPassiveRequestGuard installation', () => {
     cancelGate.resolve(undefined);
     await Promise.resolve();
     await Promise.resolve();
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await wait(0);
     const afterDrain = createHarnessRoute(page, {
       method: 'GET', url: 'https://example.test/after-invalidation', navigation: true,
     });
@@ -852,7 +917,7 @@ describe('installPassiveRequestGuard installation', () => {
       settled = true;
     });
     await expect.poll(() => harness.closeCount).toBe(1);
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await wait(20);
     expect(settled).toBe(false);
 
     cancelGate.resolve(undefined);
@@ -880,14 +945,14 @@ describe('installPassiveRequestGuard installation', () => {
       url: () => 'https://example.test/failed-owner',
       isNavigationRequest: () => true,
       frame: () => ({ parentFrame: () => null, page: () => page }),
-      failure: () => ({ errorText: 'net::ERR_CONNECTION_RESET' }),
+      failure: () => ({ errorText: 'net::ERR_FAILED' }),
     } as unknown as Request;
 
     harness.requestFailedHandler?.(failure);
     harness.requestFailedHandler?.(failure);
     await expect.poll(() => harness.closeCount).toBe(1);
     closeGate.resolve(undefined);
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await wait(0);
     const routed = createHarnessRoute(page, {
       method: 'GET', url: 'https://example.test/after-failed-invalidation', navigation: true,
     });
@@ -919,7 +984,7 @@ describe('installPassiveRequestGuard installation', () => {
           url: () => 'https://example.test/reentrant-requestfailed',
           isNavigationRequest: () => true,
           frame: () => ({ parentFrame: () => null, page: () => page }),
-          failure: () => ({ errorText: 'net::ERR_CONNECTION_RESET' }),
+          failure: () => ({ errorText: 'net::ERR_FAILED' }),
         } as unknown as Request;
         listenerReturn = handler(request);
       },
@@ -948,7 +1013,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(listenerReturn).toBeUndefined();
 
     closeGate.resolve(undefined);
-    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    await wait(20);
     cancelGate.resolve(undefined);
     const deadline = new Promise<never>((_resolve, reject) => {
       setTimeout(() => reject(new Error('re-entrant invalidation waiter deadlocked')), 500);
@@ -1031,6 +1096,89 @@ describe('installPassiveRequestGuard installation', () => {
     expect(ledger.snapshot().blockedInteractionNavigations).toEqual([]);
   });
 
+  it('V1: records and cancels a download started by the page during the passive phase', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    const handlers = new Map<string, (...arguments_: unknown[]) => void>();
+    let cancelCalls = 0;
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, {
+      url: 'https://example.test/download-button.html',
+      onEvent: (event, handler) => handlers.set(event, handler),
+    });
+    await awaitPassiveRequestGuardReady(page);
+
+    handlers.get('download')?.({
+      url: () => 'https://example.test/__download',
+      suggestedFilename: () => 'fixture-http.txt',
+      cancel: async () => { cancelCalls += 1; },
+    } as unknown as Download);
+    await expect.poll(() => cancelCalls).toBe(1);
+
+    expect(ledger.snapshot().blockedDownloads).toEqual([{
+      url: 'https://example.test/__download',
+      suggestedFilename: 'fixture-http.txt',
+      reason: 'PASSIVE_DOWNLOAD',
+    }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(() => assertPassiveRequestGuardActive(harness.context)).not.toThrow();
+    await closePassiveGuardedContext(harness.context);
+    expect(ledger.snapshot().blockedDownloads).toHaveLength(1);
+  });
+
+  it('V1: distinguishes passive and frozen downloads by reason in the same Ledger', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    const handlers = new Map<string, (...arguments_: unknown[]) => void>();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, {
+      url: 'https://example.test/download-button.html',
+      onEvent: (event, handler) => handlers.set(event, handler),
+    });
+    await awaitPassiveRequestGuardReady(page);
+
+    handlers.get('download')?.({
+      url: () => 'data:text/plain,passive', suggestedFilename: () => 'passive.txt', cancel: async () => undefined,
+    } as unknown as Download);
+    await activateInteractionFreeze(page);
+    handlers.get('download')?.({
+      url: () => 'data:text/plain,frozen', suggestedFilename: () => 'frozen.txt', cancel: async () => undefined,
+    } as unknown as Download);
+
+    expect(ledger.snapshot().blockedDownloads.map((event) => [event.suggestedFilename, event.reason])).toEqual([
+      ['passive.txt', 'PASSIVE_DOWNLOAD'],
+      ['frozen.txt', 'INTERACTION_FROZEN'],
+    ]);
+  });
+
+  it('V1: treats a failed passive download cancel as an invariant violation and invalidates', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    const handlers = new Map<string, (...arguments_: unknown[]) => void>();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, {
+      url: 'https://example.test/download-button.html',
+      onEvent: (event, handler) => handlers.set(event, handler),
+    });
+    await awaitPassiveRequestGuardReady(page);
+
+    handlers.get('download')?.({
+      url: () => 'data:text/plain,passive-cancel',
+      suggestedFilename: () => 'passive-cancel.txt',
+      cancel: () => Promise.reject(new Error('passive cancel failed')),
+    } as unknown as Download);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    expect(ledger.snapshot().blockedDownloads).toEqual([
+      expect.objectContaining({ reason: 'PASSIVE_DOWNLOAD' }),
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([{
+      code: 'PASSIVE_DOWNLOAD_CANCEL_FAILED',
+      message: 'passive cancel failed',
+    }]));
+    expect(() => assertPassiveRequestGuardActive(harness.context)).toThrow(/invalidated/i);
+  });
+
   it('records popup download frame and WebSocket activity while frozen owner close is pending', async () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
@@ -1071,7 +1219,7 @@ describe('installPassiveRequestGuard installation', () => {
 
     await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
-    expect(harness.calls).toEqual(['ON:page', 'ON:requestfailed', 'WEBSOCKET', 'HTTP']);
+    expect(harness.calls).toEqual(['ON:page', 'ON:requestfailed', 'ON:request', 'WEBSOCKET', 'HTTP']);
     expect(harness.closeCount).toBe(0);
   });
 
@@ -1090,6 +1238,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(harness.removedListeners).toEqual(expect.arrayContaining([
       'CONTEXT:page',
       'CONTEXT:requestfailed',
+      'CONTEXT:request',
       'CDP:Fetch.requestPaused',
       'CDP:close',
     ]));
@@ -1098,6 +1247,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(new Set(pageRemoved).size).toBe(pageRemoved.length);
     expect(harness.pageHandler).toBeUndefined();
     expect(harness.requestFailedHandler).toBeUndefined();
+    expect(harness.requestHandler).toBeUndefined();
     expect(harness.cdpRequestPausedHandler).toBeUndefined();
     expect(harness.cdpCloseHandler).toBeUndefined();
     await Promise.resolve();
@@ -1162,6 +1312,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(harness.removedListeners.slice(removalsBeforeContextClose)).toEqual([
       'CONTEXT:page',
       'CONTEXT:requestfailed',
+      'CONTEXT:request',
     ]);
     expect(pageRemoved).toHaveLength(pageRemovalsBeforeContextClose);
     expect(pageRemoved).toHaveLength(70 * 3);
@@ -1216,6 +1367,7 @@ describe('installPassiveRequestGuard installation', () => {
     ]));
     expect(harness.removedListeners).not.toContain('CONTEXT:page');
     expect(harness.removedListeners).not.toContain('CONTEXT:requestfailed');
+    expect(harness.removedListeners).not.toContain('CONTEXT:request');
     expect(harness.removedListeners).not.toContain('CDP:Fetch.requestPaused');
   });
 
@@ -1762,7 +1914,13 @@ describe('installPassiveRequestGuard installation', () => {
       };
       let page!: Page;
       const elementHandle = {
-        evaluate: async () => ({ status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate }),
+        // 本物の `inspectInteractionCandidateHandle` と同じく、対象自身の属性の記録も返す（F20b。設計書 4.4.1、4.4.2 手順4）。
+        evaluate: async () => ({
+          status: 'CONNECTED',
+          domWorkUsed: 0,
+          attributes: { complete: true, entries: [] },
+          raw: rawCandidate,
+        }),
         click: async () => {
           if (kind === 'download') {
             eventHandlers.get('download')?.({
@@ -1777,6 +1935,10 @@ describe('installPassiveRequestGuard installation', () => {
             close: () => cleanupGate.promise,
           } as unknown as Page);
         },
+        scrollIntoViewIfNeeded: async () => undefined,
+        hover: async () => undefined,
+        // F16（設計書 4.4.1）: 凍結の前の下準備で、hover の後に focus する。
+        focus: async () => undefined,
         dispose: async () => undefined,
         asElement: () => elementHandle,
       };
@@ -1810,7 +1972,12 @@ describe('installPassiveRequestGuard installation', () => {
         locator: () => ({
           nth: () => ({
             elementHandle: async () => ({
-              evaluate: async () => ({ status: 'CONNECTED', domWorkUsed: 0, raw: rawCandidate }),
+              evaluate: async () => ({
+                status: 'CONNECTED',
+                domWorkUsed: 0,
+                attributes: { complete: true, entries: [] },
+                raw: rawCandidate,
+              }),
               click: async () => {
                 if (kind === 'download') {
                   eventHandlers.get('download')?.({
@@ -1859,6 +2026,7 @@ describe('installPassiveRequestGuard installation', () => {
         targetUrl: 'https://example.test/fixture',
         candidate,
         viewport: { width: 900, height: 700 },
+        navigationTimeoutMs: 5_000,
         timeoutMs: 2_000,
         deadlineAtMs: Date.now() + 5_000,
       }).finally(() => {
@@ -2168,7 +2336,7 @@ describe('installPassiveRequestGuard installation', () => {
         : [{ outcome: 'RESOLVE' }],
       onContextClose: () => {
         if (harness.closeCount === 1) emitFailedMainFrameRequest(harness, page, {
-          method: 'GET', url: 'https://example.test/re-entry', errorText: 'net::ERR_CONNECTION_RESET',
+          method: 'GET', url: 'https://example.test/re-entry', errorText: 'net::ERR_FAILED',
         });
       },
     });
@@ -2315,7 +2483,7 @@ describe('installPassiveRequestGuard installation', () => {
         url: () => 'https://example.test/catalog',
         isNavigationRequest: () => true,
         frame: () => frame,
-        failure: () => ({ errorText: 'net::ERR_CONNECTION_RESET' }),
+        failure: () => ({ errorText: 'net::ERR_FAILED' }),
       } as unknown as Request);
       await expect.poll(() => harness.closeCount).toBe(1);
 
@@ -2345,7 +2513,7 @@ describe('installPassiveRequestGuard installation', () => {
       expect(ledger.snapshot().blockedNavigations).toEqual([]);
       expect(ledger.snapshot().invariantViolations).toEqual([{
         code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
-        message: 'net::ERR_CONNECTION_RESET',
+        message: 'net::ERR_FAILED',
       }]);
       closeGate?.resolve();
     },
@@ -2602,7 +2770,7 @@ describe('installPassiveRequestGuard installation', () => {
       url: () => 'https://example.test/catalog',
       isNavigationRequest: () => true,
       frame: () => frame,
-      failure: () => ({ errorText: 'net::ERR_CONNECTION_RESET' }),
+      failure: () => ({ errorText: 'net::ERR_FAILED' }),
     } as unknown as Request;
 
     harness.requestFailedHandler?.(failedAllowedRequest);
@@ -2610,8 +2778,104 @@ describe('installPassiveRequestGuard installation', () => {
     await expect.poll(() => harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
       code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
-      message: 'net::ERR_CONNECTION_RESET',
+      message: 'net::ERR_FAILED',
     }]);
+  });
+
+  // DEF-004: 閉じた一覧に載るネットワークの層の失敗は、許可した読み取りのメインフレームのナビゲーションに限って違反にしない。
+  // 対照として、あとから一覧にない失敗を起こし、それだけが違反として記録されることを確かめる（先の失敗の処理が終わっていることの確認を兼ねる）。
+  it.each([
+    { method: 'GET', errorText: 'net::ERR_CONNECTION_REFUSED' },
+    { method: 'GET', errorText: 'net::ERR_CONNECTION_RESET' },
+    { method: 'GET', errorText: 'net::ERR_NAME_NOT_RESOLVED' },
+    { method: 'GET', errorText: 'net::ERR_SSL_PROTOCOL_ERROR' },
+    { method: 'GET', errorText: 'net::ERR_CERT_AUTHORITY_INVALID' },
+    { method: 'head', errorText: 'net::ERR_TIMED_OUT' },
+  ])('does not record listed network-layer failure $errorText of an allowed $method main-frame navigation', async ({ method, errorText }) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = await readyHarnessPage(harness);
+
+    emitFailedMainFrameRequest(harness, page, { method, url: 'https://example.test/network-layer', errorText });
+    emitFailedMainFrameRequest(harness, page, {
+      method: 'GET', url: 'https://example.test/control', errorText: 'net::ERR_FAILED',
+    });
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      message: 'net::ERR_FAILED',
+    }]);
+    await expect.poll(() => harness.closeCount).toBe(1);
+  });
+
+  it.each([
+    'net::ERR_FAILED',
+    'net::ERR_ABORTED',
+    'net::ERR_BLOCKED_BY_CLIENT',
+    'net::ERR_BLOCKED_BY_RESPONSE',
+    'net::ERR_UNSAFE_REDIRECT',
+    'net::ERR_UNSAFE_PORT',
+    'net::ERR_INVALID_RESPONSE',
+    'net::ERR_INVALID_REDIRECT',
+    'net::ERR_SSL_',
+    'ERR_CONNECTION_REFUSED',
+    'net::ERR_CONNECTION_REFUSED ',
+  ])('still records unlisted failure %j of an allowed main-frame navigation as an invariant', async (errorText) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = await readyHarnessPage(harness);
+
+    emitFailedMainFrameRequest(harness, page, { method: 'GET', url: 'https://example.test/unlisted', errorText });
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      message: errorText,
+    }]);
+    await expect.poll(() => harness.closeCount).toBe(1);
+  });
+
+  it('still records a listed failure without a bounded correlation request as an invariant', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = await readyHarnessPage(harness);
+
+    emitFailedMainFrameRequest(harness, page, {
+      method: 'GET',
+      url: `https://example.test/${'a'.repeat(MAX_URL_LENGTH)}`,
+      errorText: 'net::ERR_CONNECTION_REFUSED',
+    });
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      message: 'net::ERR_CONNECTION_REFUSED',
+    }]);
+    await expect.poll(() => harness.closeCount).toBe(1);
+  });
+
+  // DEF-004b: 違反から外すのは、凍結中でない場合に限る。凍結中は、一覧に載る失敗でも、これまでどおり違反とする（fail-closed）。
+  it.each([
+    { method: 'GET', errorText: 'net::ERR_CONNECTION_REFUSED' },
+    { method: 'GET', errorText: 'net::ERR_EMPTY_RESPONSE' },
+    { method: 'GET', errorText: 'net::ERR_SSL_PROTOCOL_ERROR' },
+    { method: 'HEAD', errorText: 'net::ERR_NAME_NOT_RESOLVED' },
+  ])('still records listed network-layer failure $errorText of an allowed $method main-frame navigation during interaction freeze', async ({ method, errorText }) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = await readyHarnessPage(harness);
+    Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
+    await activateInteractionFreeze(page);
+
+    emitFailedMainFrameRequest(harness, page, { method, url: 'https://example.test/network-layer', errorText });
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      message: errorText,
+    }]);
+    await expect.poll(() => harness.closeCount).toBe(1);
   });
 
   it('contains the reserved overflow owner when 256 admitted tasks time out', async () => {
@@ -2801,7 +3065,7 @@ describe('installPassiveRequestGuard installation', () => {
       void Promise.resolve(returned).catch(() => undefined);
       expect(returned).toBeUndefined();
       await expect.poll(() => harness.closeCount).toBe(1);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await wait(0);
       expect(unhandled).toEqual([]);
       expect(ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([
         { code: 'GUARD_REQUEST_FAILED_TASK_FAILED', message: 'requestfailed task exploded' },
@@ -2840,7 +3104,7 @@ describe('installPassiveRequestGuard installation', () => {
         () => { closeSettled = true; return 'RESOLVED'; },
         (error: unknown) => { closeSettled = true; return error; },
       );
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      await wait(20);
       const settledBeforeProtocol = closeSettled;
       const terminalBeforeProtocol = isPassiveRequestGuardClosed(harness.context);
       gate.reject(new Error(`round 5 late ${protocol} failure`));
@@ -2886,7 +3150,7 @@ describe('installPassiveRequestGuard installation', () => {
       const admitted = Array.from({ length: 256 }, invoke);
       await expect.poll(() => protocolCalls).toBe(256);
       const overflow = invoke();
-      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      await wait(20);
       const callsAtOverflow = protocolCalls;
       const closesAtOverflow = harness.closeCount;
       gate.resolve(undefined);
@@ -3222,6 +3486,13 @@ describe('installPassiveRequestGuard installation', () => {
       stage: 'Fetch.enable',
       options: { cdpSendErrorMethod: 'Fetch.enable' },
       message: 'Fetch.enable failed',
+    },
+    // C18i（RC18b の N1）: 別のプロセスの iframe（OOPIF）に自動で session を付ける設定も、page の横取りの準備の一部である。
+    // 付けられなければ、OOPIF の中の移動を横取りできないので、page の準備の失敗として Context を閉じる（fail-closed）。
+    {
+      stage: 'Target.setAutoAttach',
+      options: { cdpSendErrorMethod: 'Target.setAutoAttach' },
+      message: 'Target.setAutoAttach failed',
     },
   ])('invalidates and rejects readiness when $stage setup fails', async ({ options, message }) => {
     const harness = createGuardHarness(options);
@@ -3701,20 +3972,118 @@ describe('passive request guard server boundary', () => {
     await expect(awaitPassiveRequestGuardReady(pageFromEvent as Page)).rejects.toThrow(/invalidated/i);
   });
 
-  it('records a failed allowed main-frame delivery as an invariant', async () => {
+  // DEF-004: 許可した GET のメインフレームのナビゲーションが、閉じた一覧に載るネットワークの層の失敗で終わっても、
+  // Guard の違反にはならず、Context も無効にならない。後続の許可したナビゲーションが通ることで、Guard が生きていることを確かめる。
+  it('does not record a network-layer failure of an allowed main-frame GET as an invariant (connection refused)', async () => {
+    const closed = await startServer();
+    const live = await startServer();
+    const ledger = new SafetyLedger();
+    const context = await createGuardedContext(ledger, new Set([closed.origin, live.origin]));
+    const page = await createGuardedPage(context);
+    await closed.close();
+
+    await expect(page.goto(`${closed.origin}/index.html`)).rejects.toThrow(/ERR_CONNECTION_REFUSED/);
+    // Chromium は失敗の後にエラーのページを読み込む。その読み込みが終わってから、次のナビゲーションを始める。
+    await expect.poll(() => page.url()).toBe(CHROMIUM_ERROR_PAGE_URL);
+    const response = await page.goto(`${live.origin}/index.html`);
+
+    expect(response?.status()).toBe(200);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(page.isClosed()).toBe(false);
+    expect(() => assertPassiveRequestGuardActive(context)).not.toThrow();
+  });
+
+  it('does not record a network-layer failure of an allowed main-frame GET as an invariant (name not resolved)', async () => {
+    // RFC 2606 で予約された .invalid のドメインは、名前解決に必ず失敗する。
+    const unresolvableOrigin = 'http://beaksight-nonexistent.invalid';
+    const live = await startServer();
+    const ledger = new SafetyLedger();
+    const context = await createGuardedContext(ledger, new Set([unresolvableOrigin, live.origin]));
+    const page = await createGuardedPage(context);
+
+    await expect(page.goto(`${unresolvableOrigin}/`)).rejects.toThrow(/ERR_NAME_(?:NOT_RESOLVED|RESOLUTION_FAILED)/);
+    await expect.poll(() => page.url()).toBe(CHROMIUM_ERROR_PAGE_URL);
+    const response = await page.goto(`${live.origin}/index.html`);
+
+    expect(response?.status()).toBe(200);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(page.isClosed()).toBe(false);
+    expect(() => assertPassiveRequestGuardActive(context)).not.toThrow();
+  });
+
+  it('records an unlisted failure (net::ERR_FAILED) of an allowed main-frame GET as an invariant', async () => {
     const server = await startServer();
     const ledger = new SafetyLedger();
     const context = await createGuardedContext(ledger, new Set([server.origin]));
     const page = await createGuardedPage(context);
-    await server.close();
+    // ページの route は、Guard の Context の route より先に動く。Guard が中断したものではない失敗を起こす。
+    await page.route(`${server.origin}/index.html`, (route) => route.abort('failed'));
 
     await expect(page.goto(`${server.origin}/index.html`)).rejects.toThrow();
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
       code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
-      message: expect.stringMatching(/ERR_CONNECTION_REFUSED|ERR_FAILED/),
+      message: 'net::ERR_FAILED',
     }]);
     await expect.poll(() => page.isClosed()).toBe(true);
+    expect(() => assertPassiveRequestGuardActive(context)).toThrow(/invalidated/i);
+  });
+
+  // DEF-004b（RDEF4 Minor-1）: 許可した GET のメインフレームのナビゲーションを、サーバが受け取った後にソケットを切って失敗させる。
+  // 凍結の前（Passive）は違反にならず、凍結中は違反として記録して Context を無効にする。
+  // ソケットを切った失敗は、Chromium では net::ERR_EMPTY_RESPONSE になる（一覧に載る接続の失敗も許す）。
+  const LISTED_SOCKET_CLOSE_FAILURE = /^net::ERR_(?:EMPTY_RESPONSE|CONNECTION_RESET|CONNECTION_CLOSED)$/u;
+
+  function waitForHangFailure(page: Page, origin: string): Promise<string | undefined> {
+    return new Promise<string | undefined>((resolve) => {
+      page.on('requestfailed', (request) => {
+        if (request.url() === `${origin}/hang`) resolve(request.failure()?.errorText);
+      });
+    });
+  }
+
+  it('does not record a listed network-layer failure of an allowed main-frame GET before interaction freeze', async () => {
+    const server = await startHangingServer();
+    const ledger = new SafetyLedger();
+    const context = await createGuardedContext(ledger, new Set([server.origin]));
+    const page = await createGuardedPage(context);
+    const hangFailure = waitForHangFailure(page, server.origin);
+    expect((await page.goto(`${server.origin}/`))?.status()).toBe(200);
+
+    await page.evaluate(() => { location.href = '/hang'; });
+    await server.hangReceived;
+    server.cutHang();
+
+    expect(await hangFailure).toMatch(LISTED_SOCKET_CLOSE_FAILURE);
+    await expect.poll(() => page.url()).toBe(CHROMIUM_ERROR_PAGE_URL);
+    const response = await page.goto(`${server.origin}/`);
+
+    expect(response?.status()).toBe(200);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(page.isClosed()).toBe(false);
+    expect(() => assertPassiveRequestGuardActive(context)).not.toThrow();
+  });
+
+  it('records a listed network-layer failure of an allowed main-frame GET during interaction freeze and invalidates', async () => {
+    const server = await startHangingServer();
+    const ledger = new SafetyLedger();
+    const context = await createGuardedContext(ledger, new Set([server.origin]));
+    const page = await createGuardedPage(context);
+    const hangFailure = waitForHangFailure(page, server.origin);
+    expect((await page.goto(`${server.origin}/`))?.status()).toBe(200);
+
+    await page.evaluate(() => { location.href = '/hang'; });
+    await server.hangReceived;
+    await activateInteractionFreeze(page);
+    server.cutHang();
+
+    expect(await hangFailure).toMatch(LISTED_SOCKET_CLOSE_FAILURE);
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      message: expect.stringMatching(LISTED_SOCKET_CLOSE_FAILURE),
+    }]);
+    await expect.poll(() => page.isClosed()).toBe(true);
+    expect(() => assertPassiveRequestGuardActive(context)).toThrow(/invalidated/i);
   });
 
   it('blocks a multi-hop internal redirect before its external final hop', async () => {
@@ -3803,5 +4172,1122 @@ describe('passive request guard server boundary', () => {
       reason: 'PASSIVE_WEBSOCKET',
     }]);
     expect(ledger.snapshot().invariantViolations).toHaveLength(0);
+  });
+});
+
+// C18a（DEF-012。Task 19 の前の整理の設計書 4.2）: 外部スキームへの移動の検出（`request` の事象）。
+// R7d（中断した Run の再開の設計書 4.10）: ページのスクリプトによる外部スキームへの移動は、headed と headless を問わず、安全の
+// 不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）として記録し、Context を閉じる。移動の試みの記録も、今のとおり残す。
+// Guard は、headed かどうかを受け取らない（型でも、実行時でも）。
+// 本物の Chromium での経路ごとの確認は、`tests/integration/external-scheme-navigation.test.ts` で行う（headless だけ）。
+describe('C18a: external scheme navigation detection', () => {
+  /** `request` の事象に渡す、偽の Playwright の Request。`frame` を省くと、frame ができる前のリクエスト（`window.open`）にする。 */
+  function fakeRequest(facts: {
+    readonly url: string;
+    readonly navigation?: boolean;
+    readonly frame?: 'MAIN' | 'SUB';
+  }): Request {
+    const parent = { parentFrame: () => null };
+    return {
+      method: () => 'GET',
+      url: () => facts.url,
+      isNavigationRequest: () => facts.navigation ?? true,
+      frame(): unknown {
+        if (facts.frame === undefined) {
+          throw new Error('Frame for this navigation request is not available');
+        }
+        return { parentFrame: () => (facts.frame === 'MAIN' ? null : parent) };
+      },
+    } as unknown as Request;
+  }
+
+  /** 外部スキームへの移動の試みの、不変条件の違反（R7d。中断した Run の再開の設計書 4.10）。 */
+  const attemptedViolation = (scheme: string): { readonly code: string; readonly message: string } => ({
+    code: 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
+    message: `Navigation to the external scheme ${scheme} was attempted; the browser may have launched an external application`,
+  });
+
+  it('installs the request listener and detaches it on close', async () => {
+    const harness = createGuardHarness();
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
+
+    expect(harness.requestHandler).toBeTypeOf('function');
+    await closePassiveGuardedContext(harness.context);
+    expect(harness.requestHandler).toBeUndefined();
+  });
+
+  it.each([
+    ['tel:+10000000000', 'tel', 'MAIN'],
+    ['mailto:nobody@example.invalid', 'mailto', 'MAIN'],
+    ['beaksight-test-app:probe', 'beaksight-test-app', 'SUB'],
+  ] as const)('records a Passive navigation to %s, records the violation, and closes the Context through the invalidation path', async (
+    url,
+    scheme,
+    frame,
+  ) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.requestHandler?.(fakeRequest({ url, frame }));
+
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(harness.closeCount).toBe(1);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([
+      { url, scheme, frame, phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation(scheme)]);
+    await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
+  });
+
+  it('records the Interaction phase after the freeze, records the violation, and closes the Context', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+
+    harness.requestHandler?.(fakeRequest({ url: 'tel:+10000000000', frame: 'MAIN' }));
+
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(harness.closeCount).toBe(1);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([
+      { url: 'tel:+10000000000', scheme: 'tel', frame: 'MAIN', phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation('tel')]);
+  });
+
+  it.each([
+    ['https://example.test/next', true],
+    ['http://external.test/', true],
+    ['about:blank', true],
+    ['about:srcdoc', true],
+    ['data:text/html,ok', true],
+    ['blob:https://example.test/0b8c7d2e-0000-4000-8000-000000000000', true],
+    ['tel:+10000000000', false],
+  ] as const)('does not record %s (navigation: %s)', async (url, navigation) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.requestHandler?.(fakeRequest({ url, navigation, frame: 'MAIN' }));
+
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it.each([
+    ['beaksight-test-app:probe', 'beaksight-test-app'],
+    ['tel:+10000000000', 'tel'],
+  ] as const)('keeps FRAME_CLASSIFICATION_FAILED when the frame of %s is not available, adds the violation, and fails closed', async (
+    url,
+    scheme,
+  ) => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.requestHandler?.(fakeRequest({ url }));
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      attemptedViolation(scheme),
+      { code: 'FRAME_CLASSIFICATION_FAILED', message: 'Frame for this navigation request is not available' },
+    ]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+  });
+
+  it('fails closed when the detection itself throws', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.requestHandler?.({
+      isNavigationRequest(): never {
+        throw new Error('request inspection failed');
+      },
+    } as unknown as Request);
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{
+      code: 'EXTERNAL_SCHEME_DETECTION_FAILED',
+      message: 'request inspection failed',
+    }]);
+  });
+
+  it('fails closed on a request URL that cannot be parsed', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.requestHandler?.(fakeRequest({ url: 'not a url', frame: 'MAIN' }));
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toEqual(['EXTERNAL_SCHEME_DETECTION_FAILED']);
+  });
+
+  // R7d: Guard は `headed` を受け取らない。取り付けの指定は省略でき、`headed` は型で受け付けない。実行時に `headed` の値が
+  // 紛れ込んでも、外部スキームへの移動の扱いは変わらない（違反として Context を閉じる）。
+  it('installs without options and without a headed flag, without a violation', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    expect(harness.requestHandler).toBeTypeOf('function');
+    expect(harness.closeCount).toBe(0);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
+  });
+
+  it('does not accept headed in the type of the options, and ignores a headed value given at run time', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    // @ts-expect-error R7d: Guard の取り付けの指定は `headed` を持たない（中断した Run の再開の設計書 4.10）。
+    const options: PassiveRequestGuardOptions = { headed: false };
+
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), options);
+    await readyHarnessPage(harness);
+    harness.requestHandler?.(fakeRequest({ url: 'tel:+10000000000', frame: 'MAIN' }));
+
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation('tel')]);
+  });
+});
+
+// C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」）: Guard は、Document の
+// 応答の段階（CDP の Fetch の Response stage）で 3xx の Location を調べる。Location（相対の URL は、元のリクエストの URL を基準に
+// 解決する）が外部スキームなら、リダイレクトをたどる前にリクエストを失敗させ、`externalSchemeNavigations` に
+// `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない（ページのスクリプトによる移動は違反にする
+// のと違う。中断した Run の再開の設計書 4.10）。
+// 本物の Chromium での確認は、`tests/integration/external-scheme-navigation.test.ts` と GATE-S03 で行う（headless だけ）。
+describe('C18g: server redirects to an external scheme are stopped at the Document response stage', () => {
+  /** 応答の段階の、偽の `Fetch.requestPaused` の事象。 */
+  function responseEvent(facts: {
+    readonly requestId?: string;
+    readonly frameId?: string;
+    readonly url?: string;
+    readonly status?: number;
+    readonly errorReason?: string;
+    readonly headers?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
+  }): FakeCdpPausedEvent {
+    return {
+      requestId: facts.requestId ?? 'redirect-response',
+      frameId: facts.frameId ?? 'child-frame',
+      request: { method: 'GET', url: facts.url ?? 'https://example.test/redirect/source' },
+      ...(facts.status === undefined ? {} : { responseStatusCode: facts.status }),
+      ...(facts.errorReason === undefined ? {} : { responseErrorReason: facts.errorReason }),
+      responseHeaders: facts.headers ?? [],
+    };
+  }
+
+  const commandsOf = (harness: GuardHarness, method: string): ReadonlyArray<{ readonly method: string; readonly params: unknown }> =>
+    harness.cdpCommandLog.filter((entry) => entry.method === method);
+
+  const failed = (requestId: string): { readonly method: string; readonly params: unknown } => ({
+    method: 'Fetch.failRequest',
+    params: { requestId, errorReason: 'BlockedByClient' },
+  });
+
+  async function readyGuard(): Promise<{
+    readonly harness: GuardHarness;
+    readonly ledger: SafetyLedger;
+    readonly page: Page;
+  }> {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = await readyHarnessPage(harness);
+    return { harness, ledger, page };
+  }
+
+  it('enables the Document interception at the Response stage in addition to the Request stage', async () => {
+    const { harness } = await readyGuard();
+
+    expect(commandsOf(harness, 'Fetch.enable')).toEqual([{
+      method: 'Fetch.enable',
+      params: {
+        patterns: [
+          { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
+          { urlPattern: '*', resourceType: 'Document', requestStage: 'Response' },
+        ],
+      },
+    }]);
+  });
+
+  it.each([
+    ['tel:+10000000000', 'tel', 302, 'child-frame', 'SUB'],
+    ['mailto:nobody@example.invalid', 'mailto', 301, 'root-frame', 'MAIN'],
+    ['beaksight-test-app:probe', 'beaksight-test-app', 307, 'child-frame', 'SUB'],
+  ] as const)('fails the redirect to %s before it is followed and records it as EXTERNAL_SCHEME_REDIRECT_BLOCKED', async (
+    location,
+    scheme,
+    status,
+    frameId,
+    frame,
+  ) => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ frameId, status, headers: [{ name: 'Location', value: location }] }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([
+      { url: location, scheme, frame, phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('does not make a stopped redirect a violation, and matches the Location header name case-insensitively', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      status: 308,
+      headers: [{ name: 'content-length', value: '0' }, { name: 'LOCATION', value: 'mailto:nobody@example.invalid' }],
+    }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([{
+      url: 'mailto:nobody@example.invalid',
+      scheme: 'mailto',
+      frame: 'SUB',
+      phase: 'PASSIVE',
+      reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED',
+    }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('stops the redirect when any of several Location headers is an external scheme', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      status: 302,
+      headers: [{ name: 'Location', value: '/next' }, { name: 'location', value: 'tel:+10000000000' }],
+    }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([
+      { url: 'tel:+10000000000', scheme: 'tel', frame: 'SUB', phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED' },
+    ]);
+  });
+
+  it.each([
+    ['a relative path', 302, [{ name: 'Location', value: '/next' }]],
+    ['a scheme-relative URL', 302, [{ name: 'Location', value: '//other.example.test/next' }]],
+    ['a relative path that looks like a scheme-less name', 303, [{ name: 'Location', value: 'tel' }]],
+    ['an absolute http URL', 301, [{ name: 'Location', value: 'http://example.test/next' }]],
+    ['an about:blank URL', 302, [{ name: 'Location', value: 'about:blank' }]],
+    ['a 3xx without a Location', 304, []],
+    ['a 200 response', 200, [{ name: 'Content-Type', value: 'text/html' }]],
+    ['a 200 response with a Location header', 200, [{ name: 'Location', value: 'tel:+10000000000' }]],
+    ['a 404 response', 404, []],
+  ] as const)('continues the response with %s, without a record or a violation', async (_name, status, headers) => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ status, headers }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([
+      { method: 'Fetch.continueRequest', params: { requestId: 'redirect-response' } },
+    ]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    expect(ledger.snapshot().blockedNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('continues a response-stage network error without a record', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ errorReason: 'ConnectionRefused' }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([
+      { method: 'Fetch.continueRequest', params: { requestId: 'redirect-response' } },
+    ]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('fails closed on a Location that cannot be parsed: the request fails, a violation is recorded, and the Context closes', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ status: 302, headers: [{ name: 'Location', value: 'http://[' }] }));
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toEqual(['EXTERNAL_SCHEME_DETECTION_FAILED']);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+  });
+
+  // C18g の追加（RC18a の指摘3。設計者の判断）: Guard 自身が外部スキームへのリダイレクトとして止めた main frame のリクエストの失敗は、
+  // 予期した失敗であり、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない。緩めるのは、止めたそのリクエストの失敗（1回）だけである。
+  describe('the main frame failure of a redirect that the Guard itself stopped', () => {
+    const SOURCE_URL = 'https://example.test/redirect/source';
+
+    async function stopMainFrameRedirect(): Promise<{
+      readonly harness: GuardHarness;
+      readonly ledger: SafetyLedger;
+      readonly page: Page;
+    }> {
+      const ready = await readyGuard();
+      ready.harness.cdpRequestPausedHandler?.(responseEvent({
+        frameId: 'root-frame',
+        url: SOURCE_URL,
+        status: 302,
+        headers: [{ name: 'Location', value: 'tel:+10000000000' }],
+      }));
+      await expect.poll(() => commandsOf(ready.harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+      return ready;
+    }
+
+    it('is not a violation: the record stays and the Context stays open', async () => {
+      const { harness, ledger, page } = await stopMainFrameRedirect();
+
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+      await flushGuardProtocolCallbacks();
+      await wait(10);
+
+      expect(ledger.snapshot().externalSchemeNavigations).toEqual([{
+        url: 'tel:+10000000000',
+        scheme: 'tel',
+        frame: 'MAIN',
+        phase: 'PASSIVE',
+        reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED',
+      }]);
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(harness.closeCount).toBe(0);
+    });
+
+    it('keeps the violation for a main frame failure of another URL (control)', async () => {
+      const { harness, ledger, page } = await stopMainFrameRedirect();
+
+      emitFailedMainFrameRequest(harness, page, {
+        method: 'GET',
+        url: 'https://example.test/another-page',
+        errorText: 'net::ERR_BLOCKED_BY_CLIENT',
+      });
+
+      await expect.poll(() => harness.closeCount).toBe(1);
+      expect(ledger.snapshot().invariantViolations).toEqual([
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      ]);
+    });
+
+    it('keeps the violation for a main frame failure of the same URL with another reason (control)', async () => {
+      const { harness, ledger, page } = await stopMainFrameRedirect();
+
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_ABORTED' });
+
+      await expect.poll(() => harness.closeCount).toBe(1);
+      expect(ledger.snapshot().invariantViolations).toEqual([
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_ABORTED' },
+      ]);
+    });
+
+    it('excuses the stopped request only once: a second failure of the same request is a violation', async () => {
+      const { harness, ledger, page } = await stopMainFrameRedirect();
+
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+      await flushGuardProtocolCallbacks();
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+
+      await expect.poll(() => harness.closeCount).toBe(1);
+      expect(ledger.snapshot().invariantViolations).toEqual([
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      ]);
+    });
+
+    it('does not excuse a main frame failure after a stopped subframe redirect of the same URL (control)', async () => {
+      const { harness, ledger, page } = await readyGuard();
+      harness.cdpRequestPausedHandler?.(responseEvent({
+        frameId: 'child-frame',
+        url: SOURCE_URL,
+        status: 302,
+        headers: [{ name: 'Location', value: 'tel:+10000000000' }],
+      }));
+      await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+
+      await expect.poll(() => harness.closeCount).toBe(1);
+      expect(ledger.snapshot().invariantViolations).toEqual([
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      ]);
+    });
+
+    it('keeps both violations when the main frame redirect cannot be failed', async () => {
+      const closeGate = createDeferred<void>();
+      const harness = createGuardHarness({ cdpSendErrorMethod: 'Fetch.failRequest', contextCloseGate: closeGate.promise });
+      const ledger = new SafetyLedger();
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+      const page = await readyHarnessPage(harness);
+
+      harness.cdpRequestPausedHandler?.(responseEvent({
+        frameId: 'root-frame',
+        url: SOURCE_URL,
+        status: 302,
+        headers: [{ name: 'Location', value: 'tel:+10000000000' }],
+      }));
+      await expect.poll(() => harness.closeCount).toBe(1);
+      emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+      await expect.poll(() => ledger.snapshot().invariantViolations.map(({ code }) => code)).toEqual([
+        'CDP_FAIL_REQUEST_FAILED',
+        'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      ]);
+      closeGate.resolve();
+      expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    });
+  });
+
+  it('fails closed when the external scheme redirect cannot be failed, without recording it as stopped', async () => {
+    const harness = createGuardHarness({ cdpSendErrorMethod: 'Fetch.failRequest' });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ status: 302, headers: [{ name: 'Location', value: 'tel:+10000000000' }] }));
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{
+      code: 'CDP_FAIL_REQUEST_FAILED',
+      message: 'Fetch.failRequest failed',
+    }]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+  });
+
+  it('records the Interaction phase for an external scheme redirect response that arrives after the freeze', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      frameId: 'root-frame',
+      status: 302,
+      headers: [{ name: 'Location', value: 'beaksight-test-app:probe' }],
+    }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([{
+      url: 'beaksight-test-app:probe',
+      scheme: 'beaksight-test-app',
+      frame: 'MAIN',
+      phase: 'INTERACTION',
+      reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED',
+    }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('continues an ordinary response that arrives after the freeze (the Request stage keeps INTERACTION_FROZEN)', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ frameId: 'root-frame', status: 200 }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([
+      { method: 'Fetch.continueRequest', params: { requestId: 'redirect-response' } },
+    ]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('keeps the Request-stage redirect correlation: a followed same-origin redirect is still continued without a violation', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.({
+      requestId: 'predecessor',
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://example.test/predecessor' },
+    });
+    await Promise.resolve();
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      requestId: 'predecessor',
+      frameId: 'root-frame',
+      url: 'https://example.test/predecessor',
+      status: 302,
+      headers: [{ name: 'Location', value: '/redirect-current' }],
+    }));
+    await Promise.resolve();
+    harness.cdpRequestPausedHandler?.({
+      requestId: 'redirect-current',
+      redirectedRequestId: 'predecessor',
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://example.test/redirect-current' },
+    });
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([
+      { method: 'Fetch.continueRequest', params: { requestId: 'predecessor' } },
+      { method: 'Fetch.continueRequest', params: { requestId: 'predecessor' } },
+      { method: 'Fetch.continueRequest', params: { requestId: 'redirect-current' } },
+    ]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('keeps the existing Request-stage block of a redirect to a disallowed origin in the main frame', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.({
+      requestId: 'predecessor',
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://example.test/predecessor' },
+    });
+    await Promise.resolve();
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      requestId: 'predecessor',
+      frameId: 'root-frame',
+      url: 'https://example.test/predecessor',
+      status: 302,
+      headers: [{ name: 'Location', value: 'https://outside.example.test/' }],
+    }));
+    await Promise.resolve();
+    harness.cdpRequestPausedHandler?.({
+      requestId: 'redirect-current',
+      redirectedRequestId: 'predecessor',
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://outside.example.test/' },
+    });
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-current')]);
+    expect(ledger.snapshot().blockedNavigations).toEqual([
+      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+    ]);
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('fails a response that arrives while the Context is closing, without a record', async () => {
+    const closeGate = createDeferred<void>();
+    const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(responseEvent({ status: 302, headers: [{ name: 'Location', value: 'tel:+10000000000' }] }));
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-response')]);
+
+    closeGate.resolve();
+    await closing;
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+});
+
+// C18h（DEF-013。Task 19 の前の整理の設計書 4.6）: リダイレクトの対応付けの期限を、リクエストの開始からではなく、
+// リダイレクトの応答（3xx）を受けた時点から数える。元のリクエストが終わったとき（完了か失敗）に登録を消し、件数の上限を超えた
+// 場合と、対応付けが見つからない場合は、これまでどおり違反にする（fail-closed）。
+describe('C18h: the redirect correlation is counted from the 3xx response and forgotten when the request ends', () => {
+  const ORIGIN = 'https://example.test';
+  /** 対応付けの保持の時間（1,000ms）を超える、遅いリダイレクトの応答の時間（ms。fixture の `/__slow-redirect` と同じ）。 */
+  const SLOW_RESPONSE_MS = 1_500;
+  /** 対応付けの保持の時間（1,000ms）を、ちょうど超える時間（ms）。 */
+  const PAST_RETENTION_MS = 1_001;
+  /** リダイレクトの対応付けの件数の上限（Guard の `MAX_REDIRECT_PREDECESSORS`）。 */
+  const PREDECESSOR_LIMIT = 64;
+
+  /** リクエストの段階の、偽の `Fetch.requestPaused` の事象。 */
+  function requestEvent(requestId: string, path: string, redirectedRequestId?: string): FakeCdpPausedEvent {
+    return {
+      requestId,
+      ...(redirectedRequestId === undefined ? {} : { redirectedRequestId }),
+      frameId: 'root-frame',
+      request: { method: 'GET', url: `${ORIGIN}${path}` },
+    };
+  }
+
+  /** 応答の段階の、偽の `Fetch.requestPaused` の事象。 */
+  function responseEvent(requestId: string, path: string, facts: {
+    readonly status?: number;
+    readonly errorReason?: string;
+    readonly location?: string;
+  }): FakeCdpPausedEvent {
+    return {
+      ...requestEvent(requestId, path),
+      ...(facts.status === undefined ? {} : { responseStatusCode: facts.status }),
+      ...(facts.errorReason === undefined ? {} : { responseErrorReason: facts.errorReason }),
+      responseHeaders: facts.location === undefined ? [] : [{ name: 'Location', value: facts.location }],
+    };
+  }
+
+  const requestIdsOf = (harness: GuardHarness, method: string): unknown[] =>
+    harness.cdpCommandLog
+      .filter((entry) => entry.method === method)
+      .map((entry) => (entry.params as { readonly requestId: string }).requestId);
+
+  const missingPredecessor = Object.freeze({
+    code: 'REDIRECT_PREDECESSOR_MISSING',
+    message: 'Supplied redirect predecessor was unavailable',
+  });
+
+  async function readyGuard(): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger; readonly page: Page }> {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = await readyHarnessPage(harness);
+    return { harness, ledger, page };
+  }
+
+  /** 偽の CDP の事象を渡し、Guard の処理が終わるまで（偽の時計のまま）進める。 */
+  async function emit(harness: GuardHarness, event: FakeCdpPausedEvent): Promise<void> {
+    harness.cdpRequestPausedHandler?.(event);
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('follows a redirect whose 3xx response arrives later than the retention after the request started', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    await emit(harness, requestEvent('slow', '/slow'));
+    await vi.advanceTimersByTimeAsync(SLOW_RESPONSE_MS);
+    await emit(harness, responseEvent('slow', '/slow', { status: 302, location: '/target' }));
+    await emit(harness, requestEvent('target', '/target', 'slow'));
+
+    expect(requestIdsOf(harness, 'Fetch.continueRequest')).toEqual(['slow', 'slow', 'target']);
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('still fails closed when the redirect request does not follow its 3xx response within the retention', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    await emit(harness, requestEvent('late', '/late'));
+    await emit(harness, responseEvent('late', '/late', { status: 302, location: '/target' }));
+    await vi.advanceTimersByTimeAsync(PAST_RETENTION_MS);
+    await emit(harness, requestEvent('late-target', '/target', 'late'));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual(['late-target']);
+    expect(ledger.snapshot().invariantViolations).toEqual([missingPredecessor]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it.each([
+    { ending: 'a 200 response', facts: { status: 200 } },
+    { ending: 'a 3xx response without Location', facts: { status: 304 } },
+    { ending: 'a response error', facts: { errorReason: 'ConnectionReset' } },
+    { ending: 'an external scheme redirect stopped by the Guard', facts: { status: 302, location: 'mailto:nobody@example.invalid' } },
+  ])('forgets the predecessor when the original request ends with $ending', async ({ facts }) => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    await emit(harness, requestEvent('ended', '/ended'));
+    await emit(harness, responseEvent('ended', '/ended', facts));
+    await emit(harness, requestEvent('after-end', '/after-end', 'ended'));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest').at(-1)).toBe('after-end');
+    expect(ledger.snapshot().invariantViolations).toEqual([missingPredecessor]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('forgets the predecessor when the Guard fails the original request at the request stage', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.({
+      requestId: 'blocked',
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://outside.test/' },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual(['blocked']);
+    await emit(harness, requestEvent('after-blocked', '/after-blocked', 'blocked'));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual(['blocked', 'after-blocked']);
+    expect(ledger.snapshot().invariantViolations).toEqual([missingPredecessor]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('fails the 3xx response closed when its correlation cannot be registered within the count limit', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    await emit(harness, requestEvent('slow', '/slow'));
+    await vi.advanceTimersByTimeAsync(PAST_RETENTION_MS);
+    for (let index = 0; index < PREDECESSOR_LIMIT; index += 1) {
+      await emit(harness, requestEvent(`pending-${index}`, `/pending-${index}`));
+    }
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    await emit(harness, responseEvent('slow', '/slow', { status: 302, location: '/target' }));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual(['slow']);
+    expect(ledger.snapshot().invariantViolations).toEqual([{
+      code: 'REDIRECT_PREDECESSOR_LIMIT_REACHED',
+      message: 'Redirect predecessor correlation limit reached',
+    }]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('refreshes a registered predecessor at its 3xx response without counting it twice', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger } = await readyGuard();
+
+    for (let index = 0; index < PREDECESSOR_LIMIT; index += 1) {
+      await emit(harness, requestEvent(`pending-${index}`, `/pending-${index}`));
+    }
+    await emit(harness, responseEvent('pending-0', '/pending-0', { status: 302, location: '/target' }));
+    await emit(harness, requestEvent('pending-0-target', '/target', 'pending-0'));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(requestIdsOf(harness, 'Fetch.continueRequest').slice(-2)).toEqual(['pending-0', 'pending-0-target']);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('keeps the correlation of a slow 3xx response that arrives after the Interaction freeze', async () => {
+    vi.useFakeTimers();
+    const { harness, ledger, page } = await readyGuard();
+    Object.defineProperty(page, 'url', { value: () => `${ORIGIN}/fixture` });
+
+    await emit(harness, requestEvent('slow', '/slow'));
+    await activateInteractionFreeze(page);
+    await vi.advanceTimersByTimeAsync(SLOW_RESPONSE_MS);
+    await emit(harness, responseEvent('slow', '/slow', { status: 302, location: '/target' }));
+    await emit(harness, requestEvent('frozen-target', '/target', 'slow'));
+
+    expect(requestIdsOf(harness, 'Fetch.failRequest')).toEqual(['frozen-target']);
+    expect(ledger.snapshot().blockedInteractionNavigations).toEqual([
+      { method: 'GET', url: `${ORIGIN}/target`, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+});
+
+// L5b（サイトへの負荷の制御の設計書 4.7）: Guard は、段階が PASSIVE_ACTIVE で、許可の判定が ALLOW の、ナビゲーションでない要求の
+// 届け方だけを、注入された部品（`resourceDelivery`）に尋ねる。部品が選べるのは、ネットワーク（今のまま）、キャッシュから返す、
+// 送らない、の3つだけで、後の2つはネットワークに何も送らない。部品の例外と、`route.fulfill` と `route.abort` の失敗は、Guard の外に
+// 投げず、違反にもしない（安全には関わらない）。送らなかった要求は、Safety の記録に入れない。
+describe('resource delivery of the requests the Guard allowed (L5b)', () => {
+  const ORIGIN = 'https://example.test';
+  const OTHER_ORIGIN = 'https://other.test';
+  const CACHED_RESOURCE: CachedResource = Object.freeze({
+    url: `${ORIGIN}/asset.svg`,
+    status: 200,
+    headers: Object.freeze({ 'content-type': 'image/svg+xml' }),
+    body: new Uint8Array(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>')),
+  });
+
+  /** 届け方の部品の呼び出しを記録する偽の部品。`decide` は注入する。 */
+  function recordingDelivery(decide: GuardResourceDelivery['decide']): {
+    readonly delivery: GuardResourceDelivery;
+    readonly calls: string[];
+    readonly decided: Parameters<GuardResourceDelivery['decide']>[0][];
+  } {
+    const calls: string[] = [];
+    const decided: Parameters<GuardResourceDelivery['decide']>[0][] = [];
+    return {
+      calls,
+      decided,
+      delivery: {
+        decide: (request) => {
+          calls.push('decide');
+          decided.push(request);
+          return decide(request);
+        },
+        beforeServeFromRunCache: (request) => {
+          calls.push(`beforeServeFromRunCache:${request.url()}`);
+        },
+        afterWithhold: (request) => {
+          calls.push(`afterWithhold:${request.url()}`);
+        },
+      },
+    };
+  }
+
+  /** route の操作を `calls` に記録する偽の route。fulfill と abort の失敗を注入できる。 */
+  function deliveryRoute(
+    calls: string[],
+    facts: {
+      readonly method?: string;
+      readonly url: string;
+      readonly resourceType?: string;
+      readonly navigationPage?: Page;
+      readonly fulfillError?: Error;
+      readonly abortError?: Error;
+    },
+  ): { readonly route: Route; readonly request: Request; readonly fulfilled: unknown[] } {
+    const fulfilled: unknown[] = [];
+    const request = {
+      method: () => facts.method ?? 'GET',
+      url: () => facts.url,
+      resourceType: () => facts.resourceType ?? 'image',
+      isNavigationRequest: () => facts.navigationPage !== undefined,
+      frame: () => ({ parentFrame: () => null, page: () => facts.navigationPage }),
+    } as unknown as Request;
+    const route = {
+      request: () => request,
+      fulfill: async (options: unknown): Promise<void> => {
+        calls.push('fulfill');
+        fulfilled.push(options);
+        if (facts.fulfillError !== undefined) throw facts.fulfillError;
+      },
+      abort: async (errorCode?: string): Promise<void> => {
+        calls.push(`abort:${errorCode ?? ''}`);
+        if (facts.abortError !== undefined) throw facts.abortError;
+      },
+      fallback: async (): Promise<void> => {
+        calls.push('fallback');
+      },
+    } as unknown as Route;
+    return { route, request, fulfilled };
+  }
+
+  async function guardWith(delivery: GuardResourceDelivery): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger }> {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), { resourceDelivery: delivery });
+    return { harness, ledger };
+  }
+
+  /** Safety の記録が、何もないこと（送らなかった要求も、キャッシュから返した要求も、記録しない）。 */
+  function expectNoSafetyRecords(ledger: SafetyLedger): void {
+    const snapshot = ledger.snapshot();
+    expect(snapshot.blockedRequests).toEqual([]);
+    expect(snapshot.blockedInteractionRequests).toEqual([]);
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.invariantViolationCount).toBe(0);
+  }
+
+  it('serves FROM_RUN_CACHE with route.fulfill, marking the request before serving, without the network or a Safety record', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.decided).toEqual([
+      { method: 'GET', resourceType: 'image', url: CACHED_RESOURCE.url, isNavigationRequest: false },
+    ]);
+    expect(recording.calls).toEqual(['decide', `beforeServeFromRunCache:${CACHED_RESOURCE.url}`, 'fulfill']);
+    const [options] = routed.fulfilled as [{ readonly status: number; readonly headers: Record<string, string>; readonly body: Buffer }];
+    expect(options.status).toBe(200);
+    expect(options.headers).toEqual({ 'content-type': 'image/svg+xml' });
+    // 本文は、写さずに包んだ Buffer（キャッシュの本文と同じメモリー）。
+    expect(Buffer.isBuffer(options.body)).toBe(true);
+    expect(options.body.buffer).toBe(CACHED_RESOURCE.body.buffer);
+    expect(options.body.equals(Buffer.from(CACHED_RESOURCE.body))).toBe(true);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('withholds WITHHOLD with route.abort and then tells the delivery part, without the network or a Safety record', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'WITHHOLD' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const url = `${OTHER_ORIGIN}/tag.js`;
+    const routed = deliveryRoute(recording.calls, { url, resourceType: 'script' });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.calls).toEqual(['decide', 'abort:blockedbyclient', `afterWithhold:${url}`]);
+    // Guard が自分で止めた要求なので、その失敗の事象は違反にしない（`expectedRouteFailures` に登録してある）。
+    harness.requestFailedHandler?.(routed.request);
+    await flushGuardProtocolCallbacks();
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('sends NETWORK through the native fallback, as without the delivery part', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'NETWORK' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: `${ORIGIN}/fresh.svg` });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['decide', 'fallback']);
+    expectNoSafetyRecords(ledger);
+  });
+
+  it('does not ask the delivery part for a navigation request', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'WITHHOLD' }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const page = await readyHarnessPage(harness);
+    const routed = deliveryRoute(recording.calls, { url: `${ORIGIN}/next.html`, resourceType: 'document', navigationPage: page });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['fallback']);
+    expectNoSafetyRecords(ledger);
+  });
+
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])('does not ask the delivery part for a %s request; the Guard blocks and records it', async (method) => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { method, url: CACHED_RESOURCE.url, resourceType: 'fetch' });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    expect(ledger.snapshot().blockedRequests).toEqual([expect.objectContaining({ method, url: CACHED_RESOURCE.url })]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('does not ask the delivery part after the freeze, even for a cached URL; the Guard blocks and records it', async () => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const page = createHarnessPage(harness, { url: `${ORIGIN}/fixture` });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await harness.httpHandler?.(routed.route);
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([
+      { method: 'GET', url: CACHED_RESOURCE.url, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  // RL-fix（RL の Minor-4 (c)）: Guard が閉じている段階（閉じかけ、無効化の途中）では、届け方の部品に尋ねず、Guard が今のまま止める
+  // （キャッシュにある URL でも、キャッシュから返さない）。対照として、同じ Guard と同じ要求で、PASSIVE_ACTIVE の段階では部品に
+  // 尋ねることを先に確かめる（この確かめが、部品に尋ねる経路を通る要求で行われていることを示す）。
+  it.each([
+    ['closing (owner close pending)', 'closing'],
+    ['invalidating (safety invalidation pending)', 'invalidating'],
+  ] as const)('does not ask the delivery part while the Guard is %s; the Guard aborts the request', async (_label, phase) => {
+    const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+    const closeGate = createDeferred<void>();
+    const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), {
+      resourceDelivery: recording.delivery,
+    });
+    const page = await readyHarnessPage(harness);
+
+    // 対照: PASSIVE_ACTIVE の段階では、同じ要求の届け方を部品に尋ねる。
+    const active = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+    await harness.httpHandler?.(active.route);
+    expect(recording.calls).toEqual(['decide', `beforeServeFromRunCache:${CACHED_RESOURCE.url}`, 'fulfill']);
+    recording.calls.splice(0);
+
+    // 閉じかけ: 持ち主が Context を閉じる（閉じる処理は、門で止めておく）。無効化: 違反（main frame の要求の失敗）で、Guard が Context を
+    // 無効にする（閉じる処理は、門で止めておく）。
+    const closing = phase === 'closing'
+      ? closePassiveGuardedContext(harness.context).then(() => undefined)
+      : Promise.resolve(emitFailedMainFrameRequest(harness, page, {
+        method: 'GET',
+        url: `${ORIGIN}/catalog`,
+        errorText: 'net::ERR_FAILED',
+      }));
+    await expect.poll(() => harness.closeCount).toBe(1);
+    // 閉じている段階である（動いている段階でも、閉じた後でもない）。
+    expect(() => assertPassiveRequestGuardActive(harness.context)).toThrow();
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
+    const late = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+    await harness.httpHandler?.(late.route);
+    closeGate.resolve(undefined);
+    await closing;
+
+    expect(recording.calls).toEqual(['abort:blockedbyclient']);
+    // 部品に尋ねたのは、対照の1回だけである。
+    expect(recording.decided).toHaveLength(1);
+    expect(late.fulfilled).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual(
+      phase === 'closing' ? [] : [{ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_FAILED' }],
+    );
+  });
+
+  it('falls back to the network without a violation when the delivery part throws', async () => {
+    const recording = recordingDelivery(() => {
+      throw new Error('delivery decision failed');
+    });
+    const { harness, ledger } = await guardWith(recording.delivery);
+    const routed = deliveryRoute(recording.calls, { url: CACHED_RESOURCE.url });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(recording.calls).toEqual(['decide', 'fallback']);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('aborts without a violation when route.fulfill fails, and contains a failed abort as well', async () => {
+    for (const abortError of [undefined, new Error('abort failed')]) {
+      const recording = recordingDelivery(() => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }));
+      const { harness, ledger } = await guardWith(recording.delivery);
+      const routed = deliveryRoute(recording.calls, {
+        url: CACHED_RESOURCE.url,
+        fulfillError: new Error('fulfill failed'),
+        ...(abortError === undefined ? {} : { abortError }),
+      });
+
+      await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+      expect(recording.calls).toEqual([
+        'decide',
+        `beforeServeFromRunCache:${CACHED_RESOURCE.url}`,
+        'fulfill',
+        'abort:blockedbyclient',
+      ]);
+      harness.requestFailedHandler?.(routed.request);
+      await flushGuardProtocolCallbacks();
+      expectNoSafetyRecords(ledger);
+      expect(harness.closeCount).toBe(0);
+    }
+  });
+
+  it('contains a failed abort of WITHHOLD and failures of the delivery part callbacks without a violation', async () => {
+    const { harness, ledger } = await guardWith({
+      decide: () => ({ kind: 'WITHHOLD' }),
+      beforeServeFromRunCache: () => {
+        throw new Error('mark failed');
+      },
+      afterWithhold: () => {
+        throw new Error('count failed');
+      },
+    });
+    const calls: string[] = [];
+    const routed = deliveryRoute(calls, { url: `${OTHER_ORIGIN}/tag.js`, abortError: new Error('abort failed') });
+
+    await expect(Promise.resolve(harness.httpHandler?.(routed.route))).resolves.toBeUndefined();
+
+    expect(calls).toEqual(['abort:blockedbyclient']);
+    expectNoSafetyRecords(ledger);
+    expect(harness.closeCount).toBe(0);
+
+    // キャッシュから返す前の印の失敗も、Guard の外に投げず、キャッシュから返す。
+    const served = await guardWith({
+      decide: () => ({ kind: 'FROM_RUN_CACHE', resource: CACHED_RESOURCE }),
+      beforeServeFromRunCache: () => {
+        throw new Error('mark failed');
+      },
+      afterWithhold: () => undefined,
+    });
+    const servedCalls: string[] = [];
+    const servedRoute = deliveryRoute(servedCalls, { url: CACHED_RESOURCE.url });
+    await expect(Promise.resolve(served.harness.httpHandler?.(servedRoute.route))).resolves.toBeUndefined();
+    expect(servedCalls).toEqual(['fulfill']);
+    expectNoSafetyRecords(served.ledger);
   });
 });

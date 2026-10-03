@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auditor Gate Hub</title>
+  </head>
+  <body>
+    <main>
+      <h1>Auditor gate hub</h1>
+      <!--
+        C18d（CC-029。Task 18 の Auditor の Gate）: Finding になる問題を持つページへのリンクを集めた、共通のハブのページ。
+        このページから1回の Run でたどれば、Auditor の Gate の A01〜A06 の Finding を、1つの Run で確かめられる。
+        - 404 のページ（このサーバにないパス）
+        - 壊れた画像と、捕まえられない JS の例外のページ（js-error.html）
+        - 横のはみ出しのページ（overflow.html）
+        - 低いコントラストのページ（bad-contrast.html）
+        このページ自身は、どの Finding にもならない（対照のページ）。ただし、404 のページへのリンクは、このページの
+        BROKEN_INTERNAL_LINK になる。
+      -->
+      <p>Links to the fixture pages that have problems for the Auditor gates.</p>
+      <ul>
+        <li><a href="/auditor-hub-missing.html">Missing page (404)</a></li>
+        <li><a href="/js-error.html">Broken image and uncaught JS exception</a></li>
+        <li><a href="/overflow.html">Horizontal overflow</a></li>
+        <li><a href="/bad-contrast.html">Low contrast text</a></li>
+      </ul>
+    </main>
+  </body>
+</html>

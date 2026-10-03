@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Many stylesheets fixture</title>
+    <script>
+      // 読み込む stylesheet の件数は URL の fragment（例: #300）で指定する。fragment はサーバに送られない。
+      const requestedCount = Number.parseInt(location.hash.slice(1), 10);
+      const stylesheetCount = Number.isSafeInteger(requestedCount) && requestedCount > 0 ? requestedCount : 300;
+      for (let index = 0; index < stylesheetCount; index += 1) {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = `/resource-item.css?item=${index}`;
+        document.head.append(link);
+      }
+    </script>
+  </head>
+  <body>
+    <h1>Many stylesheets fixture</h1>
+  </body>
+</html>

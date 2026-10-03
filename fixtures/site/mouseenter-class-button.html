@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Mouseenter Class Button</title>
+    <style>
+      body { margin: 8px; }
+      button.hovered { padding: 16px 32px; }
+    </style>
+  </head>
+  <body>
+    <button type="button">Mouseenter class inert</button>
+    <script>
+      // マウスが乗ると、JavaScript で自分に class を付けて大きくなる。click では何もしない。
+      const button = document.querySelector('button');
+      button.addEventListener('mouseenter', () => {
+        button.classList.add('hovered');
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Body scroll with default margin fixture</title>
+  <style>
+    /* body の余白は既定（8px）のまま。文書も余白の分だけスクロールできるが、本文は body がスクロールする。 */
+    html { height: 100%; overflow: hidden; }
+    body { height: 100%; overflow: auto; font-family: sans-serif; }
+    #tall-content { height: 5000px; }
+  </style>
+</head>
+<body>
+  <div id="tall-content">
+    <h1>Body scroll with default margin fixture</h1>
+  </div>
+</body>
+</html>

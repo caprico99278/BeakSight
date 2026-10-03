@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Full Crawl Fixture Layout</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      #wide-block { width: 1200px; height: 40px; background: rgb(220, 220, 220); }
+    </style>
+  </head>
+  <body>
+    <!--
+      T19a: 深さ1。壊した箇所: 幅 1200px の要素による、横方向のはみ出し → DOCUMENT_HORIZONTAL_OVERFLOW。
+      Mobile（390px）と、1200px より狭い幅の走査で、はみ出す。Desktop（1440px）では、はみ出さない。
+    -->
+    <main>
+      <h1>Full crawl fixture layout problem</h1>
+      <p>Depth 1.</p>
+      <div id="wide-block">Wide block</div>
+      <p><a href="/full-crawl/index.html">Back to the start</a></p>
+    </main>
+  </body>
+</html>

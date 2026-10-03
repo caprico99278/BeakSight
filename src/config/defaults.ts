@@ -1,6 +1,6 @@
-import type { AuditConfig } from './types.js';
+import type { AuditConfigDefaults } from './types.js';
 
-export const DEFAULT_CONFIG: AuditConfig = {
+export const DEFAULT_CONFIG: AuditConfigDefaults = {
   site: {
     startUrl: '',
     allowedOrigins: [],
@@ -13,6 +13,8 @@ export const DEFAULT_CONFIG: AuditConfig = {
     overallPageTimeoutMs: 60_000,
     resourceSettlingTimeoutMs: 5_000,
     interactionTimeoutMs: 3_000,
+    minNavigationIntervalMs: 5_000,
+    maxInteractionsPerPage: 20,
     allowedQueryParameters: [],
   },
   browser: {

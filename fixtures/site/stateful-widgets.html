@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Stateful Widgets</title>
+    <style>
+      #dialog { position: fixed; top: 10px; right: 10px; width: 200px; padding: 8px; background: white; border: 1px solid black; }
+    </style>
+  </head>
+  <body>
+    <div role="tablist">
+      <button type="button" role="tab" aria-selected="true">First tab</button>
+      <button type="button" role="tab" aria-selected="false">Second tab</button>
+    </div>
+    <button type="button" id="class-toggle">Class toggle</button>
+    <button type="button" id="pressed-toggle" aria-pressed="false">Pressed toggle</button>
+    <button type="button" id="dialog-opener" aria-controls="dialog">Open dialog</button>
+    <div id="dialog" role="dialog" hidden>Dialog content</div>
+    <script>
+      // 押すと、それぞれの部品の状態が変わる。
+      const tabs = [...document.querySelectorAll('[role="tab"]')];
+      for (const tab of tabs) {
+        tab.addEventListener('click', () => {
+          for (const other of tabs) other.setAttribute('aria-selected', String(other === tab));
+        });
+      }
+      const classToggle = document.querySelector('#class-toggle');
+      classToggle.addEventListener('click', () => classToggle.classList.toggle('active'));
+      const pressedToggle = document.querySelector('#pressed-toggle');
+      pressedToggle.addEventListener('click', () => {
+        pressedToggle.setAttribute('aria-pressed', String(pressedToggle.getAttribute('aria-pressed') !== 'true'));
+      });
+      const dialog = document.querySelector('#dialog');
+      document.querySelector('#dialog-opener').addEventListener('click', () => {
+        dialog.hidden = false;
+      });
+    </script>
+  </body>
+</html>

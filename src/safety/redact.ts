@@ -1,3 +1,5 @@
+import { REDACTED } from '../core/redaction.js';
+
 export function redactHeaders(headers: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(headers).map(([name, value]) => {
     const lowerName = name.toLowerCase();
@@ -11,6 +13,6 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
       || compactName.includes('authkey')
       || compactName.includes('subscriptionkey')
       || compactName.includes('secret');
-    return [name, isSensitive ? '[REDACTED]' : value];
+    return [name, isSensitive ? REDACTED : value];
   }));
 }

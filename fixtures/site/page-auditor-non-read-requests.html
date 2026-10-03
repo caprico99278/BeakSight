@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Page Auditor Non-Read Requests</title>
+  </head>
+  <body>
+    <h1>Fixture Page Auditor Non-Read Requests</h1>
+    <p>This page sends non-read requests (POST, sendBeacon, PUT, and a delayed DELETE) without any user action.</p>
+    <script>
+      // 利用者の操作なしに、GET・HEAD 以外のリクエストを送る（R14 の m4）。Passive では、どれもサーバに届いてはいけない。
+      void fetch('/__mutation', { method: 'POST', body: 'fixture' }).catch(() => undefined);
+      try {
+        navigator.sendBeacon('/__mutation', 'fixture');
+      } catch {
+        // 遮断された場合の例外は、ページの失敗にしない。
+      }
+      const request = new XMLHttpRequest();
+      request.open('PUT', '/__mutation');
+      request.onerror = () => undefined;
+      request.send('fixture');
+      setTimeout(() => {
+        void fetch('/__mutation', { method: 'DELETE' }).catch(() => undefined);
+      }, 100);
+    </script>
+  </body>
+</html>

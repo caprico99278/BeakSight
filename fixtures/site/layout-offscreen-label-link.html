@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Offscreen link label fixture</title>
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      main { position: relative; width: 400px; }
+      section { position: relative; margin: 0 0 24px; }
+      /* 文書の左の外に丸ごと置いて、画面から隠すテキスト（RT12r2 の M2）。 */
+      .offscreen-left { position: absolute; left: -9999px; }
+      /* 文書の上の外に丸ごと置いて、画面から隠すテキスト。 */
+      .offscreen-top { position: absolute; top: -9999px; }
+      /* 左に少しずらして置いた、見えるアイコン（対照）。親の中で負の位置にあるが、文書の中にある。 */
+      #shifted-icon-holder { margin-left: 60px; height: 40px; }
+      #shifted-icon-link span { position: absolute; left: -32px; top: 0; width: 24px; height: 24px; background: #333; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <a id="offscreen-left-label-link" href="#left"><span class="offscreen-left">Skip to the content</span></a>
+      </section>
+      <section>
+        <a id="offscreen-top-label-link" href="#top"><span class="offscreen-top">Back to the top</span></a>
+      </section>
+      <section id="shifted-icon-holder">
+        <a id="shifted-icon-link" href="#icon"><span></span></a>
+      </section>
+    </main>
+  </body>
+</html>

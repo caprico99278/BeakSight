@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Inner Scroll Accordion</title>
+    <style>
+      html, body { height: 100%; margin: 0; overflow: hidden; }
+      #scroller { box-sizing: border-box; height: 100%; overflow-y: auto; }
+      #spacer { height: 2000px; }
+    </style>
+  </head>
+  <body>
+    <div id="scroller">
+      <div id="spacer"></div>
+      <button type="button" aria-expanded="false" aria-controls="inner-panel">Inner offscreen toggle</button>
+      <div id="inner-panel" hidden>Inner expanded content</div>
+    </div>
+    <script>
+      const toggle = document.querySelector('button');
+      const panel = document.querySelector('#inner-panel');
+      // 画面内にスクロールされたときに、遅延読み込みの GET を1回だけ送る（Passive フェーズの通信として Guard の判定を受ける）。
+      const observer = new IntersectionObserver((entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          fetch('/resource-item.css').catch(() => undefined);
+        }
+      });
+      observer.observe(toggle);
+      toggle.addEventListener('click', () => {
+        const expanded = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(expanded));
+        panel.hidden = !expanded;
+      });
+    </script>
+  </body>
+</html>

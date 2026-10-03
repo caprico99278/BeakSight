@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Animation Frame Style Button</title>
+  </head>
+  <body>
+    <button type="button">Animation frame style inert</button>
+    <script>
+      // 描画のたびに（requestAnimationFrame で）自分の style を書き換え続ける。click では何もしない。
+      const button = document.querySelector('button');
+      let frame = 0;
+      const step = () => {
+        frame += 1;
+        button.style.setProperty('--phase', String(frame % 360));
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    </script>
+  </body>
+</html>
