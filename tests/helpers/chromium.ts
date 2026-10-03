@@ -7,6 +7,13 @@ import { afterAll, beforeAll } from 'vitest';
  */
 export const SITE_PER_PROCESS_ARGS = Object.freeze(['--site-per-process'] as const);
 
+/**
+ * ブラウザ（Chromium）自身が、ページのアイコンを取りに行くときの既定のパス（ページにアイコンの指定がない場合）。
+ * Guard の付いた Context では、ふつうは Playwright が止めるが、まれにサーバに届く（DEF-024。サイトへの負荷の制御の設計書 4.9）。
+ * サーバに届いた要求を確かめるテストは、このパスへの GET だけを、ブラウザ自身の要求として、期待する要求の一覧の確かめから除く。
+ */
+export const BROWSER_DEFAULT_FAVICON_PATH = '/favicon.ico';
+
 /** `launchHeadlessChromium` の指定。 */
 export interface HeadlessChromiumOptions {
   /** 起動の引数（例: `SITE_PER_PROCESS_ARGS`）。headless を変える引数は渡さない。 */

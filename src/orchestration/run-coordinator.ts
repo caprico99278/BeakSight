@@ -39,7 +39,7 @@ import {
   type RunStatusInput,
 } from '../core/status.js';
 import { createLoadMeter, type LoadMeter } from '../crawl/load-meter.js';
-import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
+import { createNavigationPacer, type NavigationPacer, type NavigationPacerSnapshot } from '../crawl/navigation-pacer.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import { collectSiteMetadata as collectSiteMetadataDefault, type SiteMetadataResult } from '../crawl/site-metadata.js';
 import { sitemapEvidenceFromMetadata } from '../crawl/sitemap-evidence.js';
@@ -72,6 +72,7 @@ import {
   decideRunResumption,
   RESUME_REQUEUE_SKIP_REASON_CODES,
   type RunCheckpoint,
+  type RunCheckpointConclusion,
   type RunCheckpointConclusionAction,
   type RunCheckpointExecution,
   type RunCheckpointInput,
@@ -106,14 +107,19 @@ export type RunCoordinatorCheckpointSession = Pick<RunCheckpointSession, 'start'
 /**
  * Run の後に、CLI が行う保存の終わり方（中断した Run の再開の設計書 4.3.2。`RunCoordinator.checkpointConclusion()` の値）。
  * - `FINISH`: 最後の状態の保存（`checkpoint`）を持つ。CLI は、最後の出力を書き終えた後に、セッションの `finish` にそれを渡す。
+ *   `finishEvenIfOutputFails` が真なら、CLI は、最後の出力の書き出しに失敗した場合も `finish` を行う（設計書 4.10 の Important-1 の (b)）。
  * - `ABANDON`: 保存の状態を変えない。CLI は、最後の出力を書き終えた後に、セッションの `abandon` を呼ぶ。
  * - `NONE`: セッションを渡されていない、またはセッションを始めなかった。CLI は何もしない。
  * どれを行うかは、`decideRunCheckpointConclusion`（`run-checkpoint.ts`）だけが決める。`action` の値は、その閉じた一覧
  * （`RunCheckpointConclusionAction`）から導く。判定の結果の型（`RunCheckpointConclusion`）とは別の型で、`FINISH` は、作った最後の状態の
- * 保存だけを持つ。
+ * 保存と、判定の `finishEvenIfOutputFails` の値（そのまま写す。Run Coordinator は決めない）だけを持つ。
  */
 export type RunCoordinatorCheckpointConclusion =
-  | { readonly action: Extract<RunCheckpointConclusionAction, 'FINISH'>; readonly checkpoint: RunCheckpoint }
+  | {
+    readonly action: Extract<RunCheckpointConclusionAction, 'FINISH'>;
+    readonly checkpoint: RunCheckpoint;
+    readonly finishEvenIfOutputFails: Extract<RunCheckpointConclusion, { readonly action: 'FINISH' }>['finishEvenIfOutputFails'];
+  }
   | { readonly action: Extract<RunCheckpointConclusionAction, 'ABANDON'> }
   | { readonly action: Extract<RunCheckpointConclusionAction, 'NONE'> };
 
@@ -384,6 +390,12 @@ const CHECKPOINT_WRITE_FAILED_SKIP_REASON: IncompleteReason = Object.freeze({ co
  * Run の理由にも、同じ値を1件だけ加える（`#finalize`）。
  */
 const RUN_INTERRUPTED_SKIP_REASON: IncompleteReason = Object.freeze({ code: 'RUN_INTERRUPTED', detail: null });
+
+/**
+ * 再開した実行で PREFLIGHT に失敗したため、監査しなかった URL の理由（中断した Run の再開の設計書 4.10 の DEF-022。R7b）。Run の理由の
+ * `PREFLIGHT_FAILED`（この実行の PREFLIGHT の失敗。`detail` は失敗した項目。PREFLIGHT が作る）は、今のとおり1件で、この理由からは加えない。
+ */
+const PREFLIGHT_FAILED_SKIP_REASON: IncompleteReason = Object.freeze({ code: 'PREFLIGHT_FAILED', detail: null });
 
 /** 保存の終わり方の `NONE`（セッションがない、始めなかった、`run()` が始める前に reject した。設計書 4.3.2）。 */
 const NONE_CHECKPOINT_CONCLUSION: RunCoordinatorCheckpointConclusion = Object.freeze({ action: 'NONE' });
@@ -682,9 +694,14 @@ export class RunCoordinator {
    *   実行時間の上限は、この実行の開始から数える。
    * - Run のディレクトリは作らず、前の回のものを使う。保存のセッションを `RESUME` で始め、始められなければ、PREFLIGHT も Browser の起動も
    *   せず、Run を確定せずに、`RunResumeUnavailableError` で reject する。PREFLIGHT と環境の事実は、新しい Run と同じく行う。
-   * - pacer と meter は、保存の負荷の記録から続ける。採番器、巡回の記録、理由、再試行の記録、違反のフラグ、未処理の失敗の件数、監査を
-   *   始めたページの数、終わったページの結果と再試行の前の Evidence、robots.txt と sitemap.xml の Evidence（取得し直さない）、保存した
-   *   Safety Ledger の snapshot を、保存から作り直す。
+   * - pacer と meter は、保存の負荷の記録から続ける。pacer の最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻の遅い方にする
+   *   （設計書 4.9。監査の途中のページの読み込みは保存に入らないため。`resumedNavigationPacerRecord`）。採番器、巡回の記録、理由、再試行の
+   *   記録、違反のフラグ、未処理の失敗の件数、監査を始めたページの数、終わったページの結果と再試行の前の Evidence、robots.txt と sitemap.xml の
+   *   Evidence（取得し直さない）、保存した Safety Ledger の snapshot を、保存から作り直す。採番器、巡回の記録、robots.txt と sitemap.xml の
+   *   Evidence は、PREFLIGHT の前に、PREFLIGHT の結果によらず作り直す（設計書 4.10 の DEF-022。`restoredCrawlProgress`）。
+   * - PREFLIGHT に失敗した場合（Browser がない）は、巡回を行わずに、残りの URL（待ち行列のもの。保存の時点で待ち行列に戻したものを含む）を、
+   *   理由 `PREFLIGHT_FAILED`（`detail` は `null`）の SKIPPED にする。出力には、前の回までに終わったページの結果と、SKIPPED のページが入る。
+   *   Run の理由の `PREFLIGHT_FAILED` は、この実行の PREFLIGHT の失敗の1件で、Run Status は `preflightFailed` から `deriveRunStatus` が導く。
    * - 保存した snapshot に違反があれば（保存のフラグが偽でも。守り）、`#safetyViolationRecorded` が真を返すので、新しいページを始めず、残りの URL を
    *   理由 `SAFETY_VIOLATION_ABORT` の SKIPPED にして、最後の処理だけを行う。
    * - 保存は、保存した分（終わったページの ID、ページの外の Ledger の snapshot、実行の記録）に続けて行う。
@@ -754,14 +771,17 @@ export class RunCoordinator {
       ? []
       : closeInterruptedRunExecutions(saved.executions, saved.savedAt);
     const previousRunExecutions = previousExecutions.map(runExecutionRecord);
+    // この実行の開始の時刻（`now()` で1回だけ読む）。実行時間の上限は、新しい Run でも再開のときでも、ここから数える（設計書 4.6）。再開のときは、
+    // pacer の最後の読み込みの開始の時刻にも使う（下の `resumedNavigationPacerRecord`。設計書 4.9）。
+    const startedAtMs = this.#now();
     // 設定の間隔が不正なら、ここで `RangeError` を投げる（Run のディレクトリを作る前、Browser を起動する前）。再開のときは、pacer と meter を
-    // 保存の負荷の記録から続ける（中断した Run の再開の設計書 4.9。再開の直後の最初の読み込みも、前の回の最後の読み込みの開始から、
-    // 最小の間隔以上空ける）。
+    // 保存の負荷の記録から続ける（中断した Run の再開の設計書 4.9）。pacer の最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻の
+    // 遅い方にする（再開の直後の最初の読み込みも、前の回の実際の最後の読み込みから、最小の間隔以上空ける。RR の Minor-1。R7b）。
     const navigationPacer = createNavigationPacer({
       minIntervalMs: config.crawl.minNavigationIntervalMs,
       now: this.#now,
       sleep: this.#sleep,
-      ...(saved === undefined ? {} : { initial: saved.load.pacer }),
+      ...(saved === undefined ? {} : { initial: resumedNavigationPacerRecord(saved.load.pacer, startedAtMs) }),
     });
     const loadMeter = createLoadMeter({
       allowedOrigins: config.site.allowedOrigins,
@@ -770,13 +790,11 @@ export class RunCoordinator {
     });
     // Run 全体のリソースのキャッシュ（設計書 4.6）。Run（再開のときは、この実行）ごとに空から始め、終わりに捨てる（ファイルには書かない）。
     const resourceCache = new ResourceCache();
-    // この実行の開始の時刻。再開のときは、Run の ID、BeakSight の版、Run の開始の時刻（最初の実行の開始）は、保存のものを使う。実行時間の
-    // 上限は、どちらの場合も、この実行の開始から数える（`startedAtMs`。設計書 4.6）。
+    // この実行の開始の時刻（時計）。再開のときは、Run の ID、BeakSight の版、Run の開始の時刻（最初の実行の開始）は、保存のものを使う。
     const executionStartedAt = this.#clock();
     const runId = saved === undefined ? createRunIdFromTime(executionStartedAt) : saved.runId;
     const executionStartedAtIso = executionStartedAt.toISOString();
     const runStartedAt = saved === undefined ? executionStartedAtIso : saved.startedAt;
-    const startedAtMs = this.#now();
     const toolVersion = saved === undefined ? await this.#readToolVersion() : saved.toolVersion;
 
     const progress: RunProgress = {
@@ -791,10 +809,9 @@ export class RunCoordinator {
       executionComplete: false,
       preflightFailed: false,
       guardEnabled: false,
-      frontier: null,
-      allocator: null,
-      startUrl: null,
-      metadata: null,
+      // 再開のときは、採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の Evidence も、ここで（PREFLIGHT の前に、PREFLIGHT の結果に
+      // よらず）保存から作り直す（`restoredCrawlProgress`。設計書 4.10 の DEF-022）。新しい Run では、`#crawl` が作る。
+      ...restoredCrawlProgress(config, saved),
     };
 
     // この Run の Ledger は、すべて、この factory で作る（PREFLIGHT が作る Context の factory も、これを使う）。作った Ledger は、
@@ -896,15 +913,37 @@ export class RunCoordinator {
           };
         crawl = await this.#crawl(factory, runDirectory, startedAtMs, progress, checkpoint, saved ?? null);
         crawlEndContent = crawl.crawlEndContent;
-      } else if (session.started) {
-        // 巡回を始めなかった（PREFLIGHT の失敗など）。巡回の記録は空、採番器は新しい採番器の値、終わったページはなし、robots.txt と
-        // sitemap.xml はなし、ページの外の Ledger は、この実行のすべての Ledger にした中身を、この時点（Browser を閉じる前）で写す（設計書 4.3.2）。
-        crawlEndContent = runCheckpointContent({
-          config,
-          identity: { runId, toolVersion, startedAt: runStartedAt },
-          progress,
-          crawl: null,
-        });
+      } else {
+        // 巡回を始めなかった（PREFLIGHT の失敗など）。
+        // 再開した実行（PREFLIGHT に失敗した。保存のセッションを始められなかった場合は、PREFLIGHT の前に reject している）では、PREFLIGHT の前に
+        // 保存から作り直した巡回の記録の、残りの URL（待ち行列のもの。保存の時点で待ち行列に戻したものを含む）を、理由 `PREFLIGHT_FAILED` の
+        // SKIPPED にする（設計書 4.10 の DEF-022）。前の回までに終わったページの結果（`restoredRunProgress`）は、そのまま、この実行の出力に入る。
+        const restoredCrawl: RunCrawlRecord | null = saved === undefined || progress.frontier === null || progress.allocator === null
+          ? null
+          : {
+            frontier: progress.frontier,
+            allocator: progress.allocator,
+            pagesStarted: saved.progress.pagesStarted,
+            outsidePageSnapshots: outsidePageLedgerSnapshots(saved.safetyLedgerSnapshots, progress.safetyLedgers, new Set()),
+            completedPageIds: saved.completedPageIds,
+          };
+        if (restoredCrawl !== null) {
+          for (const entry of restoredCrawl.frontier.drain()) {
+            restoredCrawl.frontier.markSkipped(entry.url, PREFLIGHT_FAILED_SKIP_REASON);
+          }
+        }
+        if (session.started) {
+          // この時点（Browser を閉じる前）の中身を写す（設計書 4.3.2）。再開した実行では、作り直した巡回の記録（残りを SKIPPED にした後）、
+          // 採番器、保存の監査を始めたページの数と終わったページの ID、ページの外の Ledger の snapshot（保存のものと、この実行のもの）、保存の
+          // robots.txt と sitemap.xml の Evidence。新しい Run では、巡回の記録は空、採番器は新しい採番器の値、終わったページはなし、
+          // robots.txt と sitemap.xml はなし、ページの外の Ledger は、この実行のすべての Ledger にした中身。
+          crawlEndContent = runCheckpointContent({
+            config,
+            identity: { runId, toolVersion, startedAt: runStartedAt },
+            progress,
+            crawl: restoredCrawl,
+          });
+        }
       }
     } finally {
       // 7. Browser を閉じる。閉じる処理の失敗と、期限（`BROWSER_CLOSE_TIMEOUT_MS`）を過ぎたことは、Run の理由にする（R15 の Minor-2）。
@@ -951,8 +990,9 @@ export class RunCoordinator {
 
   /**
    * 設計書 5.6.1 の手順4〜6（採番器、metadata、BFS、再試行）。予期しない例外は、数えて、クロールを止める。
-   * 再開のとき（`saved` が保存の値）は、採番器、巡回の記録、robots.txt と sitemap.xml の Evidence、監査を始めたページの数、保存の続き
-   * （終わったページの ID、ページの外の Ledger の snapshot）を、保存から作り直して、続きから巡回する（中断した Run の再開の設計書 4.1、4.2）。
+   * 再開のとき（`saved` が保存の値）は、PREFLIGHT の前に保存から作り直した採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の
+   * Evidence（`progress` の値。`restoredCrawlProgress`）を使い、監査を始めたページの数と、保存の続き（終わったページの ID、ページの外の
+   * Ledger の snapshot）を、保存から作り直して、続きから巡回する（中断した Run の再開の設計書 4.1、4.2、4.10 の DEF-022）。
    * 止める印が付いていれば、次のページを始めず、残りの URL を理由 `RUN_INTERRUPTED` の SKIPPED にする（設計書 4.6.1）。
    * 保存のセッションがあれば、巡回の終わり（残りの URL を SKIPPED にした後。例外で止まった経路でも、SKIPPED にした後）の値を、最後の
    * 状態の保存の中身として写して返す（設計書 4.3.2。R4b2）。この後の Browser を閉じる処理と `#finalize` で加わる理由、件数、Finding の
@@ -980,33 +1020,22 @@ export class RunCoordinator {
     const completedPageIds: PageId[] = [...(saved?.completedPageIds ?? [])];
     const savedOutsidePageSnapshots: readonly SafetyLedgerSnapshot[] = saved?.safetyLedgerSnapshots ?? [];
     const pageLedgers = new Set<SafetyLedger>();
-    const outsidePageSnapshots = (): SafetyLedgerSnapshot[] => [
-      ...savedOutsidePageSnapshots,
-      ...progress.safetyLedgers.filter((ledger) => !pageLedgers.has(ledger)).map((ledger) => ledger.snapshot()),
-    ];
+    const outsidePageSnapshots = (): SafetyLedgerSnapshot[] =>
+      outsidePageLedgerSnapshots(savedOutsidePageSnapshots, progress.safetyLedgers, pageLedgers);
     try {
-      const allowedQueryParameters: ReadonlySet<string> = new Set(config.crawl.allowedQueryParameters);
-      const startUrl = normalizeUrl(config.site.startUrl, config.site.startUrl, allowedQueryParameters);
-      if (!startUrl.ok) {
-        throw new Error(`start URL could not be normalized: ${startUrl.reason}`);
-      }
-      progress.startUrl = startUrl.url;
+      // 開始の URL（再開のときは、PREFLIGHT の前に作った値。`restoredCrawlProgress`）。
+      const startUrl = progress.startUrl ?? normalizedStartUrl(config);
+      progress.startUrl = startUrl;
 
-      // 4. 採番器を作り、開始の URL のページの ID を採番する（metadata の取得の前）。再開のときは、採番器と巡回の記録を保存から作り直す
-      // （監査の途中だった URL と、待ち行列に戻す理由の SKIPPED の URL は、`QUEUED` に戻る。設計書 3.2、4.2）。
-      const allocator = saved === null ? new IdAllocator() : IdAllocator.restore(saved.allocator);
+      // 4. 採番器を作り、開始の URL のページの ID を採番する（metadata の取得の前）。再開のときは、PREFLIGHT の前に保存から作り直した採番器と
+      // 巡回の記録を使う（`restoredCrawlProgress`。監査の途中だった URL と、待ち行列に戻す理由の SKIPPED の URL は、`QUEUED` に戻っている。
+      // 設計書 3.2、4.2、4.10 の DEF-022）。
+      const allocator = progress.allocator ?? new IdAllocator();
       progress.allocator = allocator;
-      const frontier = saved === null
-        ? new CrawlFrontier(config.crawl.maxDepth, allocator)
-        : CrawlFrontier.restore(saved.frontier, {
-          maxDepth: config.crawl.maxDepth,
-          allocator,
-          allowedQueryParameters,
-          requeueSkipReasonCodes: RESUME_REQUEUE_SKIP_REASON_CODE_SET,
-        });
+      const frontier = progress.frontier ?? new CrawlFrontier(config.crawl.maxDepth, allocator);
       progress.frontier = frontier;
       if (saved === null) {
-        frontier.discover(startUrl.url, 0);
+        frontier.discover(startUrl, 0);
       }
       const [startEntry] = frontier.entries();
       if (startEntry === undefined) {
@@ -1016,11 +1045,11 @@ export class RunCoordinator {
       // 5. robots.txt と sitemap.xml。違反（PREFLIGHT や環境の事実の Ledger など）を検出した後は、対象のサイトへの新しいアクセスなので、
       // 取得を始めない（Task 19 の前の整理の設計書 4.5）。始めなかったことは Run の理由に残し、metadata の Evidence は作らない
       // （sitemap がないものとして、Cross-page rule は sitemap の判定をしない）。
-      // 再開のときは、取得し直さない。保存に Evidence があれば、そこから作り直す（sitemap は `sitemapEvidenceFromMetadata` で作り直す。
-      // 閉じる処理の失敗などの理由は、保存の理由にある）。前の回が、違反のため取得を始めなかった場合は、そのことが保存の理由にあるので、
-      // 理由も加えない（中断しなかった場合と同じ理由にする）。どちらでもない保存のときだけ、今の決まりのとおり取得する。
+      // 再開のときは、取得し直さない。保存に Evidence があれば、PREFLIGHT の前に、そこから作り直してある（`restoredCrawlProgress`。閉じる処理の
+      // 失敗などの理由は、保存の理由にある）。前の回が、違反のため取得を始めなかった場合は、そのことが保存の理由にあるので、理由も加えない
+      // （中断しなかった場合と同じ理由にする）。どちらでもない保存のときだけ、今の決まりのとおり取得する。
       if (saved !== null && saved.siteMetadata !== null) {
-        progress.metadata = restoredSiteMetadata(saved.siteMetadata);
+        // 保存の Evidence から作り直してある。
       } else if (saved !== null && saved.progress.reasons.some(isSiteMetadataSafetyAbortReason)) {
         // 前の回が、違反のため取得を始めず、Run の理由に記録した（Evidence は作らない）。
       } else if (this.#safetyViolationRecorded(progress, 0)) {
@@ -1028,7 +1057,7 @@ export class RunCoordinator {
       } else {
         const metadata = await this.#collectSiteMetadata({
           contextFactory: factory,
-          origin: new URL(startUrl.url).origin,
+          origin: new URL(startUrl).origin,
           config,
           pageId: startEntry.pageId,
           allocator,
@@ -1602,6 +1631,83 @@ function restoredSiteMetadata(siteMetadata: RunCheckpointSiteMetadata): RunSiteM
   return { records: siteMetadata.records, sitemap: sitemapEvidenceFromMetadata(sitemap) };
 }
 
+/**
+ * 設定の開始の URL を、正規化の owner の `normalizeUrl` で正規化する（Run の開始の URL。発見の順の最初の URL）。正規化できなければ `Error` を
+ * 投げる（設定は検証済みで、PREFLIGHT の `START_URL` も確かめるので、ふつうは起きない）。
+ */
+function normalizedStartUrl(config: AuditConfig): NormalizedHttpUrlEvidence {
+  const startUrl = normalizeUrl(config.site.startUrl, config.site.startUrl, new Set(config.crawl.allowedQueryParameters));
+  if (!startUrl.ok) {
+    throw new Error(`start URL could not be normalized: ${startUrl.reason}`);
+  }
+  return startUrl.url;
+}
+
+/**
+ * 再開の入力の保存から、`RunProgress` のうち巡回の値（採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の取得の結果）を作り直す
+ * （中断した Run の再開の設計書 4.2、4.10 の DEF-022。R7b）。Run Coordinator は、再開した実行の初め（PREFLIGHT の前）に、PREFLIGHT の結果に
+ * よらず呼ぶ。PREFLIGHT に失敗して巡回を行わない実行でも、その出力と最後の状態の保存に、前の回までのページが入るようにするためである。
+ * - 採番器は `IdAllocator.restore`、巡回の記録は `CrawlFrontier.restore` で作り直す。監査の途中だった URL と、待ち行列に戻す理由
+ *   （`RESUME_REQUEUE_SKIP_REASON_CODES`）の SKIPPED の URL は、`QUEUED` に戻る（設計書 3.2、4.2）。
+ * - 開始の URL は、新しい Run と同じく、設定の開始の URL を正規化したもの（`normalizedStartUrl`）。
+ * - robots.txt と sitemap.xml は、保存に Evidence があれば、そこから作り直す（`restoredSiteMetadata`。取得し直さない）。なければ `null`。
+ * 新しい Run（保存なし）では、すべて `null` にする（`#crawl` が作る）。保存の巡回の記録や採番器が不正なら、それぞれの作り直しの例外を投げる。
+ */
+function restoredCrawlProgress(
+  config: AuditConfig,
+  saved: RunCheckpoint | undefined,
+): Pick<RunProgress, 'frontier' | 'allocator' | 'startUrl' | 'metadata'> {
+  if (saved === undefined) {
+    return { frontier: null, allocator: null, startUrl: null, metadata: null };
+  }
+  const allocator = IdAllocator.restore(saved.allocator);
+  const frontier = CrawlFrontier.restore(saved.frontier, {
+    maxDepth: config.crawl.maxDepth,
+    allocator,
+    allowedQueryParameters: new Set(config.crawl.allowedQueryParameters),
+    requeueSkipReasonCodes: RESUME_REQUEUE_SKIP_REASON_CODE_SET,
+  });
+  return {
+    frontier,
+    allocator,
+    startUrl: normalizedStartUrl(config),
+    metadata: saved.siteMetadata === null ? null : restoredSiteMetadata(saved.siteMetadata),
+  };
+}
+
+/**
+ * 再開した実行の pacer の `initial`（中断した Run の再開の設計書 4.9 の最後の項目。RR の Minor-1。R7b）。読み込みの回数と待ちの合計は、保存の
+ * 値のまま。最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻（`run()` の初めに `now()` で1回読んだ値）の遅い方にする（保存の
+ * 値が `null` なら、この実行の開始の時刻）。
+ * 理由: 監査の途中のページの読み込みは、保存に入らない（ページの保存は、そのページの監査を終えた後に書く）。そのため、保存の値は、前の回の
+ * 実際の最後の読み込みより前の時刻になりうる（2回目の Ctrl+C や停電で、そのページの保存の前に終わった場合）。前の回の実際の最後の読み込みは、
+ * この実行の開始より前なので、この実行の開始から最小の間隔を空ければ、実際の最後の読み込みからも、最小の間隔以上空く（再開のたびに、最大で
+ * 最小の間隔の分だけ待つ）。
+ */
+function resumedNavigationPacerRecord(saved: NavigationPacerSnapshot, executionStartedAtMs: number): NavigationPacerSnapshot {
+  const { lastNavigationStartedAtMs } = saved;
+  return {
+    navigationCount: saved.navigationCount,
+    totalWaitMs: saved.totalWaitMs,
+    lastNavigationStartedAtMs: lastNavigationStartedAtMs === null
+      ? executionStartedAtMs
+      : Math.max(lastNavigationStartedAtMs, executionStartedAtMs),
+  };
+}
+
+/**
+ * 状態の保存に入れる、ページの外の Safety Ledger の snapshot（中断した Run の再開の設計書 4.1）。保存した分（再開した Run の、前の回までの
+ * ページの外の Ledger の snapshot）に続けて、この実行の Ledger のうち、ページの中で作ったもの（`pageLedgers`）を除いたものの snapshot を、
+ * 作った順に並べる。
+ */
+function outsidePageLedgerSnapshots(
+  saved: readonly SafetyLedgerSnapshot[],
+  ledgers: readonly SafetyLedger[],
+  pageLedgers: ReadonlySet<SafetyLedger>,
+): SafetyLedgerSnapshot[] {
+  return [...saved, ...ledgers.filter((ledger) => !pageLedgers.has(ledger)).map((ledger) => ledger.snapshot())];
+}
+
 /** 違反を検出したため、robots.txt と sitemap.xml の取得を始めなかったことを表す Run の理由か（`SITE_METADATA_SAFETY_ABORT_REASON`）。 */
 function isSiteMetadataSafetyAbortReason(reason: IncompleteReason): boolean {
   return reason.code === SITE_METADATA_SAFETY_ABORT_REASON.code && reason.detail === SITE_METADATA_SAFETY_ABORT_REASON.detail;
@@ -1636,9 +1742,10 @@ function runCheckpointState(input: {
  * sitemap.xml の Evidence、負荷の記録、終わったページの ID を、この時点の値で写す（後で `progress` が変わっても、写した中身は変わらない）。
  * Safety Ledger は、ページの外で作ったものの snapshot（`crawl.outsidePageSnapshots`。再開した Run では、前の回までの分を含む）だけを入れる。
  * robots.txt と sitemap.xml は、`metadata` の Evidence だけを入れる（取得しなかった場合は `null`）。
- * 巡回を始めなかった場合（`crawl` が `null`。新しい Run の PREFLIGHT の失敗など。設計書 4.3.2）は、巡回の記録と採番器を、新しい採番器と、
+ * 新しい Run で巡回を始めなかった場合（`crawl` が `null`。PREFLIGHT の失敗など。設計書 4.3.2）は、巡回の記録と採番器を、新しい採番器と、
  * それで作った巡回の記録の値（空）にし、監査を始めたページの数を 0、終わったページを空、robots.txt と sitemap.xml を `null` にして、
- * ページの外の Ledger の snapshot を、この実行のすべての Ledger の snapshot にする。
+ * ページの外の Ledger の snapshot を、この実行のすべての Ledger の snapshot にする。再開した実行で PREFLIGHT に失敗した場合は、保存から
+ * 作り直した巡回の値（`crawl`）を渡す（設計書 4.10 の DEF-022）。
  */
 function runCheckpointContent(input: {
   readonly config: AuditConfig;
@@ -1727,7 +1834,11 @@ function checkpointConclusionOf(input: {
     savedAt: execution.finishedAt,
     executions: executionsEndingWith(input.previousExecutions, { ...execution, environment: input.environment }),
   });
-  const finish = (checkpoint: RunCheckpoint): RunCoordinatorCheckpointConclusion => Object.freeze({ action: decision.action, checkpoint });
+  const finish = (checkpoint: RunCheckpoint): RunCoordinatorCheckpointConclusion => Object.freeze({
+    action: decision.action,
+    checkpoint,
+    finishEvenIfOutputFails: decision.finishEvenIfOutputFails,
+  });
   if (decision.content === 'CRAWL_END' && input.crawlEndContent !== null) {
     const checkpoint = finalCheckpoint(input.crawlEndContent);
     if (checkRunCheckpointConsistency(checkpoint).ok) {

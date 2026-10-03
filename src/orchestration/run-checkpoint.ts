@@ -14,16 +14,19 @@ import type {
   RunRetryRecord,
   RunStatus,
 } from '../core/contracts.js';
+import { safeErrorMessage } from '../core/errors.js';
 import type { EffectiveAuditConfig, NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
+import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import { REDACTED } from '../core/redaction.js';
 import type { ArtifactValidationResult } from '../core/schema-validator.js';
 import { compareCodeUnits } from '../core/text.js';
 import type { NavigationPacerSnapshot } from '../crawl/navigation-pacer.js';
 import type { SiteMetadataResult } from '../crawl/site-metadata.js';
 import type { SafetyLedgerSnapshot } from '../safety/safety-ledger.js';
-import type { CrawlFrontierSnapshot, CrawlUrlEntry } from './crawl-frontier.js';
-import type { IdAllocatorSnapshot } from './id-allocator.js';
+import { CrawlFrontier, type CrawlFrontierSnapshot, type CrawlUrlEntry } from './crawl-frontier.js';
+import { IdAllocator, type IdAllocatorSnapshot } from './id-allocator.js';
 
 // 中断した Run の再開のための保存（チェックポイント）の内容の作成、整合の確かめ、再開できるかの判定、設定と版の比べ、再開する Run の選び方、
 // ロックの判定、実行の終わり方と保存の終わり方の判定（中断した Run の再開の設計書 3.2、4.1、4.2、4.3.2、4.4、4.7、4.7.1、4.8、5章。この意味の owner）。
@@ -225,6 +228,46 @@ const collectExecutionInconsistencies = (checkpoint: RunCheckpoint, errors: stri
 };
 
 /**
+ * 作り直しの例外のメッセージ（`collectRestorationInconsistencies`）。巡回の記録の URL を伏せ字（`REDACTED`）にしてから、上限
+ * （`MAX_ERROR_MESSAGE_LENGTH`）付きの文字列にする。`CrawlFrontier.restore` と `CrawlQueue.restore` は、同じ URL が2回ある場合のメッセージに
+ * URL を入れるが、保存の整合の食い違いの文には、URL を入れないためである。長い URL から伏せる（ほかの URL を前の部分に含む URL を、残さない）。
+ * 伏せる前に切り詰めると、URL の前の部分が残りうるので、切り詰めは伏せた後に行う。
+ */
+const restorationFailureMessage = (error: unknown, checkpoint: RunCheckpoint): string => {
+  const urls = checkpoint.frontier.entries.map(({ url }) => url).sort((left, right) => right.length - left.length);
+  const message = urls.reduce((text, url) => text.replaceAll(url, REDACTED), safeErrorMessage(error, Number.MAX_SAFE_INTEGER));
+  return safeErrorMessage(message, MAX_ERROR_MESSAGE_LENGTH);
+};
+
+/**
+ * 保存の値から、採番器と巡回の記録を作り直せるかを確かめ、作り直せなければ、英語の技術的な詳細で `errors` に加える
+ * （`checkRunCheckpointConsistency` の一部。設計書 4.2、4.10 の DEF-022。R8）。Run Coordinator が再開の初めに作り直すときと同じく、採番器は
+ * `IdAllocator.restore`、巡回の記録は `CrawlFrontier.restore`（保存の実効の設定の深さの上限と、URL の正規化で残す query の引数、待ち行列に
+ * 戻す理由 `RESUME_REQUEUE_SKIP_REASON_CODES`）で作り直す。作り直したものは使わない。採番器を作り直せない場合も、すべての食い違いを返すため、
+ * 巡回の記録は、新しい採番器で確かめる。
+ */
+const collectRestorationInconsistencies = (checkpoint: RunCheckpoint, errors: string[]): void => {
+  let allocator: IdAllocator;
+  try {
+    allocator = IdAllocator.restore(checkpoint.allocator);
+  } catch (error) {
+    errors.push(`/allocator cannot be restored: ${restorationFailureMessage(error, checkpoint)}`);
+    allocator = new IdAllocator();
+  }
+  const { maxDepth, allowedQueryParameters } = checkpoint.effectiveConfig.crawl;
+  try {
+    CrawlFrontier.restore(checkpoint.frontier, {
+      maxDepth,
+      allocator,
+      allowedQueryParameters: new Set(allowedQueryParameters),
+      requeueSkipReasonCodes,
+    });
+  } catch (error) {
+    errors.push(`/frontier cannot be restored: ${restorationFailureMessage(error, checkpoint)}`);
+  }
+};
+
+/**
  * スキーマの検証の済んだ `state.json` の値の、スキーマでは確かめられない整合を確かめる（設計書 4.2、4.3、4.8）。
  * - 終わったページの ID（`completedPageIds`）は、すべて巡回の記録にあり、その状態が `AUDITED` か `FAILED` である。
  * - 巡回の記録で `AUDITED` か `FAILED` の URL は、すべて終わったページの ID にある（ページの保存を先に書き、その後で `state.json` を
@@ -232,8 +275,11 @@ const collectExecutionInconsistencies = (checkpoint: RunCheckpoint, errors: stri
  * - 実行の記録（R4b1。設計書 4.8）: 最後のもの以外は、終わり方と終わりの時刻が `null` でない。最後のものは、保存の状態が
  *   `IN_PROGRESS` なら、終わり方と終わりの時刻がともに `null`。`STOPPED` と `FINISHED` なら、ともに `null` でない。最後のものの
  *   終わり方は、`INTERRUPTED_ABNORMALLY` でない（再開のときに、前の回の記録を閉じるときだけ使う）。
+ * - 作り直し（R8。設計書 4.10 の DEF-022。`collectRestorationInconsistencies`）: 採番器と巡回の記録を、Run Coordinator が再開で使うのと同じ
+ *   引数で作り直せる。巡回の記録そのものの正しさ（URL の正規形、深さの上限、同じ URL の重複など）は、作り直す `CrawlFrontier.restore` が
+ *   確かめる。作り直せない保存を CLI が選ぶと、再開を始めた後に Run Coordinator の作り直しが失敗し、`--new` を付けるまで、毎回の起動が
+ *   予期しない失敗で終わるため、ここで食い違いとし、壊れた保存として扱わせる。
  * 採番器の連番と、巡回の記録のページの ID の整合は確かめない（`src/core/ids.ts` に、ページの ID から連番を読む関数がないため）。
- * 巡回の記録そのものの正しさ（URL の正規形、同じ URL の重複など）は、`CrawlFrontier.restore` が確かめる。
  * 例外を投げずに、すべての食い違いを、英語の技術的な詳細で返す（URL は、エラーの文に入れない）。
  */
 export function checkRunCheckpointConsistency(checkpoint: RunCheckpoint): ArtifactValidationResult {
@@ -254,6 +300,7 @@ export function checkRunCheckpointConsistency(checkpoint: RunCheckpoint): Artifa
     }
   });
   collectExecutionInconsistencies(checkpoint, errors);
+  collectRestorationInconsistencies(checkpoint, errors);
   return consistencyResult(errors);
 }
 
@@ -393,7 +440,10 @@ export type RunCheckpointConclusionAction = (typeof RUN_CHECKPOINT_CONCLUSION_AC
 export const RUN_CHECKPOINT_FINAL_CONTENTS = Object.freeze(['CRAWL_END', 'LAST_WRITTEN'] as const);
 export type RunCheckpointFinalContent = (typeof RUN_CHECKPOINT_FINAL_CONTENTS)[number];
 
-/** 保存の終わり方（設計書 4.3.2）。`FINISH` のときだけ、最後の状態と、その中身を何で作るかを持つ。 */
+/**
+ * 保存の終わり方（設計書 4.3.2）。`FINISH` のときだけ、最後の状態と、その中身を何で作るかと、出力の書き出しに失敗しても `finish` を行うか
+ * （`finishEvenIfOutputFails`。設計書 4.10 の Important-1 の (b)）を持つ。
+ */
 export type RunCheckpointConclusion =
   | { readonly action: Extract<RunCheckpointConclusionAction, 'NONE'> }
   | { readonly action: Extract<RunCheckpointConclusionAction, 'ABANDON'> }
@@ -401,6 +451,12 @@ export type RunCheckpointConclusion =
     readonly action: Extract<RunCheckpointConclusionAction, 'FINISH'>;
     readonly state: Exclude<RunCheckpointState, 'IN_PROGRESS'>;
     readonly content: RunCheckpointFinalContent;
+    /**
+     * CLI が、最後の出力の書き出しに失敗した場合も、`finish` を行うか。違反を検出した Run（Run Status が `ABORTED_BY_SAFETY`）だけ真にする。
+     * 出力を書けなくても、違反の後に再開しない状態（`FINISHED`）にするためである。偽なら、出力をやり直せるよう、保存の状態を変えない
+     * （`abandon`）。
+     */
+    readonly finishEvenIfOutputFails: boolean;
   };
 
 /** 保存の終わり方の判定の入力（設計書 4.3.2。すべて、Run が終わった後の事実）。 */
@@ -423,9 +479,32 @@ export interface RunCheckpointConclusionFacts {
 
 const NONE_CONCLUSION: RunCheckpointConclusion = Object.freeze({ action: 'NONE' });
 const ABANDON_CONCLUSION: RunCheckpointConclusion = Object.freeze({ action: 'ABANDON' });
-const FINISHED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({ action: 'FINISH', state: 'FINISHED', content: 'CRAWL_END' });
-const FINISHED_FROM_LAST_WRITTEN: RunCheckpointConclusion = Object.freeze({ action: 'FINISH', state: 'FINISHED', content: 'LAST_WRITTEN' });
-const STOPPED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({ action: 'FINISH', state: 'STOPPED', content: 'CRAWL_END' });
+/** 違反を検出した Run の `FINISH`（出力の書き出しに失敗しても `finish` を行う。設計書 4.10）。 */
+const FINISHED_AFTER_VIOLATION_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
+  action: 'FINISH',
+  state: 'FINISHED',
+  content: 'CRAWL_END',
+  finishEvenIfOutputFails: true,
+});
+const FINISHED_AFTER_VIOLATION_FROM_LAST_WRITTEN: RunCheckpointConclusion = Object.freeze({
+  action: 'FINISH',
+  state: 'FINISHED',
+  content: 'LAST_WRITTEN',
+  finishEvenIfOutputFails: true,
+});
+/** 違反のない Run の `FINISH`（出力の書き出しに失敗したら `finish` を行わない）。 */
+const FINISHED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
+  action: 'FINISH',
+  state: 'FINISHED',
+  content: 'CRAWL_END',
+  finishEvenIfOutputFails: false,
+});
+const STOPPED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
+  action: 'FINISH',
+  state: 'STOPPED',
+  content: 'CRAWL_END',
+  finishEvenIfOutputFails: false,
+});
 
 /**
  * この実行の終わり方を決める（設計書 4.8）。上から順に、最初に当てはまるもの:
@@ -454,7 +533,8 @@ export function decideRunExecutionEndReason(
  * 4. 再開した実行で、PREFLIGHT に失敗した → `ABANDON`
  * 5. それ以外 → 巡回の終わりの値で、この実行の終わり方（`decideRunExecutionEndReason`）が、実行時間の上限か止める印なら `STOPPED`、
  *    ほかは `FINISHED`
- * 凍結した値を返す。
+ * `FINISH` の `finishEvenIfOutputFails`（出力の書き出しに失敗しても `finish` を行うか。設計書 4.10）は、2 の行（Run Status が
+ * `ABORTED_BY_SAFETY`）だけ真、5 の行は偽にする（この規則は、ここだけに置く）。凍結した値を返す。
  */
 export function decideRunCheckpointConclusion(facts: RunCheckpointConclusionFacts): RunCheckpointConclusion {
   if (!facts.sessionStarted) {
@@ -462,9 +542,9 @@ export function decideRunCheckpointConclusion(facts: RunCheckpointConclusionFact
   }
   if (isSafetyAbortedRun(facts.runStatus)) {
     if (!facts.checkpointWriteFailed) {
-      return FINISHED_FROM_CRAWL_END;
+      return FINISHED_AFTER_VIOLATION_FROM_CRAWL_END;
     }
-    return facts.hasWrittenCheckpoint ? FINISHED_FROM_LAST_WRITTEN : ABANDON_CONCLUSION;
+    return facts.hasWrittenCheckpoint ? FINISHED_AFTER_VIOLATION_FROM_LAST_WRITTEN : ABANDON_CONCLUSION;
   }
   if (facts.checkpointWriteFailed) {
     return ABANDON_CONCLUSION;
@@ -542,8 +622,9 @@ const RESUME_CONFIG_IGNORED_PATH_SET: ReadonlySet<string> = new Set(RESUME_CONFI
 
 /**
  * 再開のときに、保存したものと同じでなければならない版の項目の閉じた一覧（設計書 4.7、4.7.1。この順に比べる）。
- * Chromium の版は比べない。BeakSight は、Playwright に同梱の Chromium だけを使い（`chromium.launch` に `channel` も実行ファイルのパスも
- * 渡さない）、Chromium の版は Playwright の版で決まるためである（R5a の設計）。各実行の Chromium の版は、保存の実行の記録に残る。
+ * Chromium の版は比べない。BeakSight は、Playwright に同梱の Chromium だけを使い（`chromium.launch` に実行ファイルのパスは渡さない。
+ * `channel` は、Playwright に同梱の Chromium を使う `'chromium'` だけである。設計書 4.10）、Chromium の版は Playwright の版で決まるためで
+ * ある（R5a の設計）。各実行の Chromium の版は、保存の実行の記録に残る。
  */
 export const RUN_VERSION_FIELDS = Object.freeze(['toolVersion', 'playwrightVersion'] as const);
 export type RunVersionField = (typeof RUN_VERSION_FIELDS)[number];

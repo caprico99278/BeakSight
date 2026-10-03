@@ -1660,10 +1660,10 @@ export const NON_EXTERNAL_NAVIGATION_SCHEMES = Object.freeze(['http:', 'https:',
 /**
  * 外部スキームへの移動の試みを記録した理由の閉じた一覧（C18a、C18g）。
  * - `EXTERNAL_SCHEME_NAVIGATION`: ページのスクリプトなどによる移動の試み。外部スキームはネットワークを通らないので、Guard は
- *   止められない（記録だけ。headed では不変条件の違反も記録する）。
+ *   止められない。headed と headless を問わず、記録し、不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）も記録する。
  * - `EXTERNAL_SCHEME_REDIRECT_BLOCKED`: サーバのリダイレクト（3xx の `Location` が外部スキーム）。Guard が Document の応答の
- *   段階で、リダイレクトをたどる前にリクエストを失敗させた（止めた）もの。止めて防げるので、headed でも違反にしない
- *   （Task 19 の前の整理の設計書 4.2、4.2.1）。
+ *   段階で、リダイレクトをたどる前にリクエストを失敗させた（止めた）もの。止めて防げるので、headed と headless を問わず
+ *   違反にしない（Task 19 の前の整理の設計書 4.2、4.2.1。中断した Run の再開の設計書 4.10）。
  */
 export const EXTERNAL_SCHEME_NAVIGATION_REASONS = Object.freeze([
   'EXTERNAL_SCHEME_NAVIGATION',
@@ -1742,11 +1742,13 @@ export interface BlockedInteractionWebSocketEvent {
 }
 
 /**
- * 外部スキーム（`NON_EXTERNAL_NAVIGATION_SCHEMES` にないスキーム）への移動の試み（C18a、DEF-012）。どの経路かは `reason` で
- * 区別する（`EXTERNAL_SCHEME_NAVIGATION_REASONS`）。
+ * 外部スキーム（`NON_EXTERNAL_NAVIGATION_SCHEMES` にないスキーム）への移動の試み（C18a、DEF-012。中断した Run の再開の設計書
+ * 4.10）。どの経路かは `reason` で区別する（`EXTERNAL_SCHEME_NAVIGATION_REASONS`）。
  * - ページのスクリプトなどによる移動（`EXTERNAL_SCHEME_NAVIGATION`）: 外部スキームはネットワークを通らないので、Guard は
- *   止められない。起きたことを記録する（headless では記録だけ、headed では不変条件の違反も記録する）。
- * - サーバのリダイレクト（`EXTERNAL_SCHEME_REDIRECT_BLOCKED`。C18g）: Guard が、リダイレクトをたどる前に止めた。
+ *   止められない。headed と headless を問わず、起きたことを記録し、不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）も
+ *   記録する。
+ * - サーバのリダイレクト（`EXTERNAL_SCHEME_REDIRECT_BLOCKED`。C18g）: Guard が、リダイレクトをたどる前に止めた。止めて防げるので、
+ *   headed と headless を問わず違反にしない。
  * - `url`: 移動の先の URL（リダイレクトでは、`Location` を元のリクエストの URL を基準に解決した URL）。認証情報は伏せ字にし
  *   （`redactUrlCredentials`）、Ledger の上限の長さまで切り詰める。
  * - `scheme`: URL のスキーム（末尾の `:` を除いた形。例: `tel`、`mailto`）。

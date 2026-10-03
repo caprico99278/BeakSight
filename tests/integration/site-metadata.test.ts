@@ -25,7 +25,7 @@ import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, useHeadlessChromium } from '../helpers/chromium.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_TIMEOUT_MS = 120_000;
@@ -424,7 +424,7 @@ describe('collectSiteMetadata', () => {
     const counters = server.getCounters();
     expect(counters).toMatchObject({ post: 0, put: 0, patch: 0, delete: 0, options: 0, other: 0, webSocketUpgrade: 0 });
     const requests = server.getRequestObservations().map(({ method, pathname }) => `${method} ${pathname}`);
-    expect(requests.filter((request) => request !== 'GET /favicon.ico')).toEqual(['GET /robots.txt', 'GET /sitemap.xml']);
+    expect(requests.filter((request) => request !== `GET ${BROWSER_DEFAULT_FAVICON_PATH}`)).toEqual(['GET /robots.txt', 'GET /sitemap.xml']);
   }, TEST_TIMEOUT_MS);
 
   it('leaves no Context behind, and returns FAILED Evidence when the Passive Context cannot be constructed', async () => {

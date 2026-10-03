@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { CLI_OPTION_NAMES, parseCliArguments } from '../../src/cli/arguments.js';
 import {
   CONFIG_ERROR_EXIT_CODE,
@@ -39,7 +39,16 @@ import {
 import { streamOutput, type CliOutput } from '../../src/cli/output-stream.js';
 import { PRODUCTION_RUN_DEPENDENCIES, type RunCommandDependencies } from '../../src/cli/run-command.js';
 import { isConfigError } from '../../src/config/config-error.js';
+import {
+  RUN_ARTIFACT_FILE_NAMES,
+  artifactFilePath,
+  checkpointArtifactRelativePath,
+  checkpointPageArtifactRelativePath,
+  runArtifactDirectory,
+} from '../../src/core/artifact-layout.js';
 import type { RunLoad, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
+import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
+import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import type { RunCoordinatorCheckpointConclusion } from '../../src/orchestration/run-coordinator.js';
 import {
   RUN_STATUS_CATALOG,
@@ -67,9 +76,18 @@ import {
   resumingRunText,
   unreadableCheckpointText,
 } from '../../src/presentation/messages.js';
+import { ArtifactWriter } from '../../src/report/artifact-writer.js';
 import { buildReportViewModel } from '../../src/report/view-model.js';
-import { auditRun, edgeCaseAuditRun, executionsDisplaySample, loadDisplaySample } from '../helpers/audit-run-fixture.js';
+import {
+  FIXTURE_RUN_ID,
+  PAGE_1,
+  auditRun,
+  edgeCaseAuditRun,
+  executionsDisplaySample,
+  loadDisplaySample,
+} from '../helpers/audit-run-fixture.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { sampleRunCheckpoint, sampleRunCheckpointPage } from '../helpers/run-checkpoint-samples.js';
 import { captureCliOutput } from '../helpers/run-harness.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
 
@@ -945,6 +963,160 @@ describe('CLI run: failures, in process without a browser', () => {
     expect(stderr.text()).not.toMatch(STACK_TRACE_LINE);
     const detailLines = stderr.text().split('\n').filter((line) => line.startsWith('  - '));
     expect(detailLines).toHaveLength(1);
+  });
+});
+
+// R7c（中断した Run の再開の設計書 4.7.1 の「Run の後」、4.10 の Important-1 の (b)）: 出力の書き出し（`finishAuditRun`）に失敗したときの、
+// 保存の終わり方。偽の Run Coordinator が、CLI の保存のセッションを始め、ページの保存と状態の保存（IN_PROGRESS）を1回ずつ書き、run.json の
+// 場所にディレクトリを置いて、出力の書き出しを失敗させる。どの場合も、出力の失敗を日本語の文言で示し、終了コード 1 で終える。
+// - `FINISH` で `finishEvenIfOutputFails` が真（違反を検出した Run）: `finish` を行う（保存は FINISHED になり、ロックは外れる）。出力がない
+//   ので、終わった Run の保存の片付け（`removeFinishedCheckpointFiles`）はしない。`finish` も失敗したら、`abandon` を呼ぶ。
+// - `FINISH` で偽と、`ABANDON`: `abandon` を呼ぶ（保存は IN_PROGRESS のまま、ロックも残る）。`NONE`: どちらもしない。
+describe('CLI run: the checkpoint conclusion when the output cannot be written (resumable run design 4.10, R7c)', () => {
+  const failingLaunch = async (): Promise<never> => {
+    throw new Error('browser launch is not allowed in this test');
+  };
+  /** 偽の Run Coordinator が `finish` に渡す、最後の状態の保存。 */
+  const FINAL_CHECKPOINT: RunCheckpoint = sampleRunCheckpoint({ state: 'FINISHED' });
+  /** 偽の Run Coordinator が書く、IN_PROGRESS の状態の保存。 */
+  const SAVED_CHECKPOINT: RunCheckpoint = sampleRunCheckpoint({ startPageFinished: true });
+  const finishConclusion = (finishEvenIfOutputFails: boolean): RunCoordinatorCheckpointConclusion =>
+    ({ action: 'FINISH', checkpoint: FINAL_CHECKPOINT, finishEvenIfOutputFails });
+
+  interface OutputFailureRun {
+    readonly code: number;
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly runDirectory: string;
+    readonly finish: MockInstance<RunCheckpointSession['finish']>;
+    readonly abandon: MockInstance<RunCheckpointSession['abandon']>;
+    readonly cleanUp: MockInstance<ArtifactWriter['removeFinishedCheckpointFiles']>;
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** 偽の Run Coordinator で、出力の書き出しに失敗する `run` を行う。CLI が作った保存のセッションの `finish` と `abandon` を見張る。 */
+  async function runWithOutputFailure(
+    name: string,
+    conclusion: RunCoordinatorCheckpointConclusion,
+    options: { readonly failFinish?: boolean } = {},
+  ): Promise<OutputFailureRun> {
+    const path = await writeConfig(`${name}.json`, validTarget);
+    const output = join(workDirectory, `${name}-output`);
+    const runDirectory = runArtifactDirectory(output, FIXTURE_RUN_ID);
+    const cleanUp = vi.spyOn(ArtifactWriter.prototype, 'removeFinishedCheckpointFiles');
+    let finish: MockInstance<RunCheckpointSession['finish']> | undefined;
+    let abandon: MockInstance<RunCheckpointSession['abandon']> | undefined;
+    const stdout = captureCliOutput();
+    const stderr = captureCliOutput();
+
+    const code = await runCli(['run', '--config', path, '--output', output], { stdout: stdout.output, stderr: stderr.output }, {
+      run: {
+        launchBrowser: failingLaunch,
+        clock: () => new Date(),
+        now: () => Date.now(),
+        createRunCoordinator: (dependencies) => {
+          const session = dependencies.checkpointSession as RunCheckpointSession;
+          expect(session).toBeInstanceOf(RunCheckpointSession);
+          finish = vi.spyOn(session, 'finish');
+          if (options.failFinish === true) {
+            finish.mockRejectedValueOnce(new Error('simulated failure of the final checkpoint'));
+          }
+          abandon = vi.spyOn(session, 'abandon');
+          return {
+            run: async () => {
+              if (conclusion.action !== 'NONE') {
+                await mkdir(runDirectory, { recursive: true });
+                await expect(session.start(runDirectory, { mode: 'NEW_RUN' })).resolves.toEqual({ ok: true });
+                await session.savePage(sampleRunCheckpointPage());
+                await session.saveState(SAVED_CHECKPOINT);
+              }
+              // run.json の場所にディレクトリを置き、出力の書き出しを失敗させる。
+              await mkdir(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run), { recursive: true });
+              return auditRun();
+            },
+            checkpointConclusion: () => conclusion,
+          };
+        },
+      },
+    });
+
+    if (finish === undefined || abandon === undefined) {
+      throw new Error('the fake Run Coordinator was not created');
+    }
+    return { code, stdout: stdout.text(), stderr: stderr.text(), runDirectory, finish, abandon, cleanUp };
+  }
+
+  const checkpointPath = (runDirectory: string, file: 'state' | 'previousState' | 'lock'): string =>
+    artifactFilePath(runDirectory, checkpointArtifactRelativePath(file));
+  const readState = async (runDirectory: string): Promise<unknown> =>
+    JSON.parse(await readFile(checkpointPath(runDirectory, 'state'), 'utf8')) as unknown;
+
+  /** 出力の失敗を、日本語の文言と、出力の書き出しの失敗（`ArtifactWriteError`）の1行の詳細で示し、終了コード 1 で終えた。 */
+  const expectOutputFailure = (run: OutputFailureRun): void => {
+    expect(run.code, run.stderr).toBe(FAILURE_EXIT_CODE);
+    expect(run.stderr).toContain(CLI_TEXT.failure.artifactWriteFailed);
+    expect(run.stderr).toContain('failed to write the artifact');
+    expect(run.stderr).not.toMatch(STACK_TRACE_LINE);
+    expect(run.stdout).not.toContain(CLI_TEXT.run.resultHeading);
+    // 出力がないので、終わった Run の保存の片付けはしない。
+    expect(run.cleanUp).not.toHaveBeenCalled();
+  };
+
+  it('finishes the session with the final checkpoint for FINISH with finishEvenIfOutputFails true, without the cleanup, and exits with 1', async () => {
+    const run = await runWithOutputFailure('output-failure-finish', finishConclusion(true));
+
+    expectOutputFailure(run);
+    expect(run.finish).toHaveBeenCalledTimes(1);
+    expect(run.finish).toHaveBeenCalledWith(FINAL_CHECKPOINT);
+    expect(run.abandon).not.toHaveBeenCalled();
+    expect(run.stderr).not.toContain(CLI_TEXT.resume.finishFailed);
+    // 保存は FINISHED（次の起動で再開しない）。ロックは外れる。ページの保存と state.prev.json は残る（片付けをしないため）。
+    expect(await readState(run.runDirectory)).toEqual(FINAL_CHECKPOINT);
+    expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(false);
+    expect(existsSync(checkpointPath(run.runDirectory, 'previousState'))).toBe(true);
+    expect(existsSync(artifactFilePath(run.runDirectory, checkpointPageArtifactRelativePath(PAGE_1)))).toBe(true);
+  });
+
+  it('abandons the session after the final checkpoint also fails, and exits with 1 for the failure of the output', async () => {
+    const run = await runWithOutputFailure('output-failure-finish-failure', finishConclusion(true), { failFinish: true });
+
+    expectOutputFailure(run);
+    expect(run.stderr).not.toContain('simulated failure of the final checkpoint');
+    expect(run.finish).toHaveBeenCalledTimes(1);
+    expect(run.abandon).toHaveBeenCalledTimes(1);
+    expect(run.abandon.mock.invocationCallOrder[0]).toBeGreaterThan(run.finish.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY);
+    // 保存は、最後に書けた IN_PROGRESS のまま。ロックも残る。
+    expect(await readState(run.runDirectory)).toEqual(SAVED_CHECKPOINT);
+    expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(true);
+  });
+
+  it.each([
+    ['FINISH with finishEvenIfOutputFails false', 'output-failure-finish-false', finishConclusion(false)],
+    ['ABANDON', 'output-failure-abandon', { action: 'ABANDON' }],
+  ] as const satisfies readonly (readonly [string, string, RunCoordinatorCheckpointConclusion])[])(
+    'abandons the session without finishing it for %s, and exits with 1',
+    async (_name, outputName, conclusion) => {
+      const run = await runWithOutputFailure(outputName, conclusion);
+
+      expectOutputFailure(run);
+      expect(run.abandon).toHaveBeenCalledTimes(1);
+      expect(run.finish).not.toHaveBeenCalled();
+      // 保存の状態は変えない（出力をやり直せるよう、IN_PROGRESS のまま）。ロックも残る。
+      expect(await readState(run.runDirectory)).toEqual(SAVED_CHECKPOINT);
+      expect(existsSync(checkpointPath(run.runDirectory, 'lock'))).toBe(true);
+    },
+  );
+
+  it('neither finishes nor abandons the session for NONE, and exits with 1', async () => {
+    const run = await runWithOutputFailure('output-failure-none', { action: 'NONE' });
+
+    expectOutputFailure(run);
+    expect(run.finish).not.toHaveBeenCalled();
+    expect(run.abandon).not.toHaveBeenCalled();
+    expect(existsSync(checkpointPath(run.runDirectory, 'state'))).toBe(false);
   });
 });
 

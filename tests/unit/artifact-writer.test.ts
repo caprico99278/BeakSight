@@ -3,7 +3,7 @@
 // rename で書く。書き出すテキストは、UTF-8 と LF にする。
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   RUN_ARTIFACT_FILE_NAMES,
@@ -37,6 +37,9 @@ import {
 import {
   ArtifactWriteError,
   ArtifactWriter,
+  RENAME_MAX_ATTEMPTS,
+  RENAME_RETRY_DELAY_MS,
+  RENAME_RETRY_ERROR_CODES,
   type CheckpointFileHandle,
   type CheckpointFileOperations,
 } from '../../src/report/artifact-writer.js';
@@ -1287,8 +1290,10 @@ describe('ArtifactWriter: removing the checkpoint files a finished Run does not 
   });
 });
 
+/** ロックの見本の、プロセスと OS の値（ロックのテストと、名前の変更のやり直しのテストで使う）。 */
+const HOST: RunLockHost = Object.freeze({ processId: 4_321, nowMs: 1_000_000, bootedAtMs: 400_000 });
+
 describe('ArtifactWriter: the run lock (resumable run design 4.4)', () => {
-  const HOST: RunLockHost = Object.freeze({ processId: 4_321, nowMs: 1_000_000, bootedAtMs: 400_000 });
 
   it('creates checkpoint/run.lock exclusively with the given lock, and fsyncs it', async () => {
     const { runDirectory } = await runDirectoryInWork();
@@ -1557,5 +1562,220 @@ describe('ArtifactWriter: cleaning up a run directory before resuming (resumable
     await putFiles(runDirectory, ['pages/PAGE-000002/page.json']);
     await expect(new ArtifactWriter().cleanUpForResume(runDirectory, ['../x' as PageId])).rejects.toBeInstanceOf(RangeError);
     expect(await filesUnder(runDirectory)).toEqual(['pages/PAGE-000002/page.json']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// R7c（中断した Run の再開の設計書 4.10。RR の Minor-5）: 名前の変更の一時的な失敗のやり直し。Windows で、ウイルス対策や同期のソフトが
+// 一時的にファイルを開いていると、名前の変更が `EPERM`・`EBUSY`・`EACCES` で失敗する。ArtifactWriter の名前の変更（出力の書き出し、保存と
+// ロックの書き出し、`state.json` から `state.prev.json` への移し替え）は、1つの関数を通り、これらの失敗のときだけ、短く待ってやり直す。
+// 待ちは差し替えて（`wait`）、実際には待たずに確かめる。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** `node:fs/promises` と同じく、`code` を持つ名前の変更の失敗。 */
+const renameFailure = (code: string): Error => Object.assign(new Error(`${code}: simulated failure, rename`), { code });
+
+/**
+ * ファイルの操作（`base`）のうち、行き先の名前（`basename`）が `target` の名前の変更だけを、`failures` のコードで順に失敗させる
+ * （使い切った後は、`base` で名前を変える）。行き先が `target` の名前の変更を試みた回数を、`attempts()` で返す。
+ */
+function flakyRenameOperations(
+  base: CheckpointFileOperations,
+  target: string,
+  failures: readonly string[],
+): { readonly operations: CheckpointFileOperations; readonly attempts: () => number } {
+  let attempts = 0;
+  return {
+    operations: {
+      ...base,
+      rename: async (oldPath, newPath) => {
+        if (basename(newPath) === target) {
+          attempts += 1;
+          const code = failures[attempts - 1];
+          if (code !== undefined) {
+            throw renameFailure(code);
+          }
+        }
+        await base.rename(oldPath, newPath);
+      },
+    },
+    attempts: () => attempts,
+  };
+}
+
+/** 待った時間を記録するだけで、実際には待たない待ち（`ArtifactWriterOptions.wait`）。 */
+function recordingWait(): { readonly wait: (delayMs: number) => Promise<void>; readonly waits: number[] } {
+  const waits: number[] = [];
+  return {
+    wait: async (delayMs) => {
+      waits.push(delayMs);
+    },
+    waits,
+  };
+}
+
+/** やり直しを確かめる書き出し。 */
+interface RetriedWrite {
+  /** 失敗させる名前の変更の、行き先の名前。 */
+  readonly target: string;
+  /** 前の状態を、差し替えない ArtifactWriter で用意する（省略できる）。 */
+  readonly prepare?: (runDirectory: string) => Promise<void>;
+  /** 書き出す。 */
+  readonly write: (writer: ArtifactWriter, root: string, runDirectory: string) => Promise<unknown>;
+  /** 書き出しが成功した後の中身を確かめる。 */
+  readonly expectWritten: (runDirectory: string) => Promise<void>;
+}
+
+const RUN_LOCK_SAMPLE = createRunLock(HOST);
+/** `state.json` から `state.prev.json` への移し替えの書き出しの名前（`ENOENT` を、移すものがないとして扱う。今のとおり）。 */
+const MOVE_TO_PREVIOUS_STATE = 'state.json to state.prev.json of the state checkpoint';
+
+const RETRIED_WRITES: Readonly<Record<string, RetriedWrite>> = {
+  'run.json of writeRun (the output)': {
+    target: RUN_ARTIFACT_FILE_NAMES.run,
+    write: async (writer, root) => writer.writeRun(auditRun(), { outputDirectory: root }),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run))).toMatchObject({ runId: RUN_ID });
+    },
+  },
+  'report.html of writePresentation (the output)': {
+    target: RUN_ARTIFACT_FILE_NAMES.report,
+    write: async (writer, _root, runDirectory) => writer.writePresentation({ runDirectory }, { reportHtml: '<p>レポート</p>' }),
+    expectWritten: async (runDirectory) => {
+      expect(await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.report), 'utf8')).toBe('<p>レポート</p>');
+    },
+  },
+  'the page checkpoint': {
+    target: basename(checkpointPageArtifactRelativePath(PAGE_1)),
+    write: async (writer, _root, runDirectory) => writer.writeCheckpointPage(runDirectory, samplePage(PAGE_1)),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(checkpointPageFile(runDirectory, PAGE_1))).toEqual(samplePage(PAGE_1));
+    },
+  },
+  'state.json of the state checkpoint': {
+    target: basename(checkpointArtifactRelativePath('state')),
+    prepare: async (runDirectory) => new ArtifactWriter().writeCheckpointState(runDirectory, sampleCheckpoint(1)),
+    write: async (writer, _root, runDirectory) => writer.writeCheckpointState(runDirectory, sampleCheckpoint(2)),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(checkpointFile(runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
+      expect(await readJson(checkpointFile(runDirectory, 'previousState'))).toEqual(sampleCheckpoint(1));
+    },
+  },
+  [MOVE_TO_PREVIOUS_STATE]: {
+    target: basename(checkpointArtifactRelativePath('previousState')),
+    prepare: async (runDirectory) => new ArtifactWriter().writeCheckpointState(runDirectory, sampleCheckpoint(1)),
+    write: async (writer, _root, runDirectory) => writer.writeCheckpointState(runDirectory, sampleCheckpoint(2)),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(checkpointFile(runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
+      expect(await readJson(checkpointFile(runDirectory, 'previousState'))).toEqual(sampleCheckpoint(1));
+    },
+  },
+  'the run lock': {
+    target: basename(checkpointArtifactRelativePath('lock')),
+    write: async (writer, _root, runDirectory) => writer.rewriteRunLock(runDirectory, RUN_LOCK_SAMPLE),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(RUN_LOCK_SAMPLE);
+    },
+  },
+};
+
+const RETRIED_WRITE_NAMES = Object.keys(RETRIED_WRITES);
+
+/** `count` 個の `value` の一覧。 */
+const repeated = <T>(count: number, value: T): T[] => Array.from({ length: count }, () => value);
+
+describe('ArtifactWriter: retrying a rename that fails for a while (resumable run design 4.10, RR Minor-5)', () => {
+  /** 書き出しを、`target` の名前の変更を `failures` で失敗させる ArtifactWriter で行う。失敗（なければ `null`）も返す。 */
+  async function writeWithFlakyRename(name: string, failures: readonly string[]) {
+    const retried = RETRIED_WRITES[name];
+    if (retried === undefined) {
+      throw new Error(`unknown write: ${name}`);
+    }
+    const { root, runDirectory } = await runDirectoryInWork();
+    await retried.prepare?.(runDirectory);
+    const calls: string[] = [];
+    const flaky = flakyRenameOperations(recordingFileOperations(runDirectory, calls), retried.target, failures);
+    const waiting = recordingWait();
+    const writer = new ArtifactWriter({ fileOperations: flaky.operations, platform: 'win32', wait: waiting.wait });
+    const failure = await retried.write(writer, root, runDirectory).then(() => null, (error: unknown) => error);
+    return { retried, root, runDirectory, failure, attempts: flaky.attempts(), waits: waiting.waits };
+  }
+
+  it('keeps the transient error codes, the maximum number of attempts and the wait as named constants', () => {
+    expect([...RENAME_RETRY_ERROR_CODES]).toEqual(['EPERM', 'EBUSY', 'EACCES']);
+    expect(Object.isFrozen(RENAME_RETRY_ERROR_CODES)).toBe(true);
+    expect(RENAME_MAX_ATTEMPTS).toBe(5);
+    expect(RENAME_RETRY_DELAY_MS).toBe(100);
+  });
+
+  it.each(RETRIED_WRITE_NAMES)('succeeds when the rename of %s fails twice with EBUSY and then succeeds, waiting before each retry', async (name) => {
+    const written = await writeWithFlakyRename(name, ['EBUSY', 'EBUSY']);
+
+    expect(written.failure).toBeNull();
+    expect(written.attempts).toBe(3);
+    expect(written.waits).toEqual([RENAME_RETRY_DELAY_MS, RENAME_RETRY_DELAY_MS]);
+    await written.retried.expectWritten(written.runDirectory);
+    expect((await listTree(written.root)).filter((path) => path.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it.each([...RENAME_RETRY_ERROR_CODES])('retries %s, and succeeds on the last attempt', async (code) => {
+    for (const name of RETRIED_WRITE_NAMES) {
+      const written = await writeWithFlakyRename(name, repeated(RENAME_MAX_ATTEMPTS - 1, code));
+
+      expect(written.failure, name).toBeNull();
+      expect(written.attempts, name).toBe(RENAME_MAX_ATTEMPTS);
+      expect(written.waits, name).toEqual(repeated(RENAME_MAX_ATTEMPTS - 1, RENAME_RETRY_DELAY_MS));
+      await written.retried.expectWritten(written.runDirectory);
+    }
+  });
+
+  it.each(RETRIED_WRITE_NAMES)('fails as before with the last error when the rename of %s fails RENAME_MAX_ATTEMPTS times', async (name) => {
+    const failures = [...repeated(RENAME_MAX_ATTEMPTS - 1, 'EBUSY'), 'EACCES'];
+
+    const written = await writeWithFlakyRename(name, failures);
+
+    expect(written.failure).toBeInstanceOf(ArtifactWriteError);
+    expect((written.failure as ArtifactWriteError).cause).toMatchObject({ code: 'EACCES' });
+    expect(written.attempts).toBe(RENAME_MAX_ATTEMPTS);
+    expect(written.waits).toEqual(repeated(RENAME_MAX_ATTEMPTS - 1, RENAME_RETRY_DELAY_MS));
+    // 今のとおり、一時ファイルは消す。
+    expect((await listTree(written.root)).filter((path) => path.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it.each(['ENOENT', 'EXDEV', 'EISDIR', 'ENOSPC'])('does not retry %s: the write fails at once as before', async (code) => {
+    for (const name of RETRIED_WRITE_NAMES.filter((candidate) => candidate !== MOVE_TO_PREVIOUS_STATE)) {
+      const written = await writeWithFlakyRename(name, [code]);
+
+      expect(written.failure, name).toBeInstanceOf(ArtifactWriteError);
+      expect((written.failure as ArtifactWriteError).cause, name).toMatchObject({ code });
+      expect(written.attempts, name).toBe(1);
+      expect(written.waits, name).toEqual([]);
+    }
+  });
+
+  it('does not retry ENOENT when it moves state.json to state.prev.json: there is nothing to move, as before', async () => {
+    const written = await writeWithFlakyRename(MOVE_TO_PREVIOUS_STATE, ['ENOENT']);
+
+    expect(written.failure).toBeNull();
+    expect(written.attempts).toBe(1);
+    expect(written.waits).toEqual([]);
+    expect(await readJson(checkpointFile(written.runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
+  });
+
+  it('does not retry another error when it moves state.json to state.prev.json, and keeps the current state.json', async () => {
+    const written = await writeWithFlakyRename(MOVE_TO_PREVIOUS_STATE, ['EXDEV']);
+
+    expect(written.failure).toBeInstanceOf(ArtifactWriteError);
+    expect((written.failure as ArtifactWriteError).cause).toMatchObject({ code: 'EXDEV' });
+    expect(written.attempts).toBe(1);
+    expect(written.waits).toEqual([]);
+    expect(await readJson(checkpointFile(written.runDirectory, 'state'))).toEqual(sampleCheckpoint(1));
+  });
+
+  it('refuses a wait that is not a function', () => {
+    for (const wait of ['100', 100, null, {}]) {
+      expect(() => new ArtifactWriter({ wait: wait as unknown as (delayMs: number) => Promise<void> }), String(wait)).toThrow(TypeError);
+    }
+    expect(() => new ArtifactWriter({ wait: async () => undefined })).not.toThrow();
   });
 });

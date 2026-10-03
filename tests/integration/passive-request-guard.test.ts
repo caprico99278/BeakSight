@@ -17,16 +17,12 @@ import {
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
   type GuardResourceDelivery,
+  type PassiveRequestGuardOptions,
 } from '../../src/safety/passive-request-guard.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
-
-/** headless の Guard の取り付けの指定（製品では、factory が設定の `browser.headed` から渡す。C18a）。 */
-const HEADLESS_GUARD = Object.freeze({ headed: false });
-/** headed の Guard の取り付けの指定（headless のブラウザのまま、Guard に「headed である」と注入する。C18a）。 */
-const HEADED_GUARD = Object.freeze({ headed: true });
 
 /** Chromium がナビゲーションの失敗の後に表示するエラーのページの URL。 */
 const CHROMIUM_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
@@ -123,7 +119,7 @@ async function createGuardedContext(
 ): Promise<BrowserContext> {
   const context = await browser.newContext({ serviceWorkers: 'block' });
   contexts.push(context);
-  await installPassiveRequestGuard(context, ledger, allowedOrigins, HEADLESS_GUARD);
+  await installPassiveRequestGuard(context, ledger, allowedOrigins);
   return context;
 }
 
@@ -696,7 +692,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('records frozen HTTP activity before a failed abort invalidates the context', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -724,7 +720,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('records frozen CDP activity before a failed Fetch.failRequest invalidates the context', async () => {
     const harness = createGuardHarness({ cdpSendErrorMethod: 'Fetch.failRequest' });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -752,7 +748,7 @@ describe('installPassiveRequestGuard installation', () => {
       contextCloseGate: closeGate.promise,
     });
     const ledger = new SafetyLedger();
-    const installing = installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    const installing = installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let installationSettled = false;
     const installationOutcome = installing.then(
       () => ({ status: 'FULFILLED' as const }),
@@ -789,7 +785,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const cancelGate = createDeferred<void>();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/fixture',
       onEvent: (event, handler) => handlers.set(event, handler),
@@ -838,7 +834,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const cancelGate = createDeferred<void>();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       closeError: new Error('page close failed'),
       url: 'https://example.test/fixture',
@@ -901,7 +897,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const cancelGate = createDeferred<void>();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       closeError: new Error('page close failed'),
       url: 'https://example.test/fixture',
@@ -940,7 +936,7 @@ describe('installPassiveRequestGuard installation', () => {
       contextCloseGate: closeGate.promise,
     });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -996,7 +992,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
     let activePage: Page | undefined;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       closeError: new Error('page close failed'),
       url: 'https://example.test/fixture',
@@ -1032,7 +1028,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -1057,7 +1053,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -1081,7 +1077,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const routed = createHarnessRoute(page, {
       method: 'GET',
@@ -1105,7 +1101,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
     let cancelCalls = 0;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/download-button.html',
       onEvent: (event, handler) => handlers.set(event, handler),
@@ -1134,7 +1130,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/download-button.html',
       onEvent: (event, handler) => handlers.set(event, handler),
@@ -1159,7 +1155,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/download-button.html',
       onEvent: (event, handler) => handlers.set(event, handler),
@@ -1188,7 +1184,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
     const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/fixture',
       onEvent: (event, handler) => handlers.set(event, handler),
@@ -1221,7 +1217,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('installs WebSocket and HTTP interception before resolving', async () => {
     const harness = createGuardHarness();
 
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
     expect(harness.calls).toEqual(['ON:page', 'ON:requestfailed', 'ON:request', 'WEBSOCKET', 'HTTP']);
     expect(harness.closeCount).toBe(0);
@@ -1231,7 +1227,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent: (event) => pageRemoved.push(event),
     });
@@ -1263,7 +1259,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
     let downloadRemovalAttempts = 0;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent: (event) => {
         pageRemoved.push(event);
@@ -1298,7 +1294,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
 
     for (let index = 0; index < 70; index += 1) {
       const page = createHarnessPage(harness, {
@@ -1328,7 +1324,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('fails closed once instead of admitting an unowned page listener set at the group cap', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
 
     for (let index = 0; index < 64; index += 1) {
       await awaitPassiveRequestGuardReady(createHarnessPage(harness, {
@@ -1355,7 +1351,7 @@ describe('installPassiveRequestGuard installation', () => {
     });
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent: (event) => pageRemoved.push(event),
     });
@@ -1385,7 +1381,7 @@ describe('installPassiveRequestGuard installation', () => {
       });
       const ledger = new SafetyLedger();
       const deniedPageRemovals: string[] = [];
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       await readyHarnessPage(harness);
       for (let index = 0; index < 256; index += 1) {
         harness.cdpRequestPausedHandler?.({
@@ -1423,7 +1419,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     let downloadHandler: ((download: Download) => void) | undefined;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/hostile-task',
       onEvent(event, handler) {
@@ -1451,7 +1447,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent(event) {
         pageRemoved.push(event);
@@ -1479,7 +1475,7 @@ describe('installPassiveRequestGuard installation', () => {
     const hostileError = createHostileGuardError();
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const routed = createHarnessRoute(page, {
       method: 'POST',
@@ -1506,7 +1502,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('preserves an undefined abort rejection while invalidating an unready navigation', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { url: 'https://example.test/unready' });
     const routed = createHarnessRoute(page, {
       method: 'GET',
@@ -1532,7 +1528,7 @@ describe('installPassiveRequestGuard installation', () => {
     const hugeBigint = 2n ** 1_000_000n;
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const routed = createHarnessRoute(page, {
       method: 'POST',
@@ -1560,7 +1556,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness({ contextCloseError: new Error('context close failed') });
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent: (event) => pageRemoved.push(event),
     });
@@ -1589,7 +1585,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness({ contextCloseRejection: { value: undefined } });
     const ledger = new SafetyLedger();
     const pageRemoved: string[] = [];
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       onOffEvent: (event) => pageRemoved.push(event),
     });
@@ -1620,7 +1616,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
     let downloadHandler: ((download: Download) => void) | undefined;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/fixture',
       onEvent(event, handler) {
@@ -1674,7 +1670,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     let downloadHandler: ((download: Download) => void) | undefined;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/fixture',
       onEvent(event, handler) {
@@ -1710,7 +1706,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     const cancelGate = createDeferred<void>();
     let downloadHandler: ((download: Download) => void) | undefined;
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, {
       url: 'https://example.test/fixture',
       onEvent(event, handler) {
@@ -1746,7 +1742,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     const popupCloseGate = createDeferred<void>();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -1777,7 +1773,7 @@ describe('installPassiveRequestGuard installation', () => {
       const ledger = new SafetyLedger();
       const neverSettles = createDeferred<void>();
       let downloadHandler: ((download: Download) => void) | undefined;
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = createHarnessPage(harness, {
         url: 'https://example.test/fixture',
         onEvent(event, handler) {
@@ -1831,7 +1827,7 @@ describe('installPassiveRequestGuard installation', () => {
       const ledger = new SafetyLedger();
       const neverSettles = createDeferred<void>();
       let downloadHandler: ((download: Download) => void) | undefined;
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = createHarnessPage(harness, {
         url: 'https://example.test/fixture',
         onEvent(event, handler) {
@@ -1870,7 +1866,7 @@ describe('installPassiveRequestGuard installation', () => {
 
   it('does not admit new ordinary page-guard work after guarded context close starts', async () => {
     const harness = createGuardHarness();
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
     await closePassiveGuardedContext(harness.context);
     createHarnessPage(harness, { url: 'https://example.test/late-page' });
@@ -2001,7 +1997,7 @@ describe('installPassiveRequestGuard installation', () => {
           }),
         }),
       } as unknown as Page;
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       harness.registerPage(page);
       harness.pageHandler?.(page);
       await awaitPassiveRequestGuardReady(page);
@@ -2060,7 +2056,6 @@ describe('installPassiveRequestGuard installation', () => {
       harness.context,
       ledger,
       new Set(),
-      HEADLESS_GUARD,
     )).rejects.toThrow(/installation failed/);
     expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
@@ -2072,13 +2067,12 @@ describe('installPassiveRequestGuard installation', () => {
   it('rejects repeat installation without widening or duplicating handlers', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
 
     await expect(installPassiveRequestGuard(
       harness.context,
       ledger,
       new Set(['https://attacker.test']),
-      HEADLESS_GUARD,
     )).rejects.toThrow('already installed');
 
     expect(harness.calls.filter((call) => call === 'WEBSOCKET')).toHaveLength(1);
@@ -2098,7 +2092,6 @@ describe('installPassiveRequestGuard installation', () => {
       harness.context,
       ledger,
       new Set(),
-      HEADLESS_GUARD,
     )).rejects.toThrow('before creating any pages');
     expect(harness.calls).toEqual(['CLOSE']);
     expect(ledger.snapshot().invariantViolations).toEqual([{
@@ -2128,7 +2121,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('rejects guarded close APIs after the guard context is invalidated', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     harness.cdpCloseHandler?.();
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2140,7 +2133,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('ledgers page close failure and invalidates without leaving stale owner intent', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { closeError: new Error('page close failed') });
     await awaitPassiveRequestGuardReady(page);
 
@@ -2157,7 +2150,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('ledgers context close failure and retains retry ownership while failures persist', async () => {
     const harness = createGuardHarness({ contextCloseError: new Error('context close failed') });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
 
     await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow('context close failed');
 
@@ -2176,7 +2169,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness({ contextCloseAttempts: [
       { outcome: 'REJECT', error: firstFailure }, { outcome: 'RESOLVE' },
     ] });
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
     await expect(closePassiveGuardedContext(harness.context)).rejects.toBe(firstFailure);
     expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
@@ -2193,7 +2186,7 @@ describe('installPassiveRequestGuard installation', () => {
       contextCloseAttempts: [{ outcome: 'REJECT', error: firstFailure }, { outcome: 'RESOLVE' }],
       contextCloseGate: retryGate.promise,
     });
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
     await expect(closePassiveGuardedContext(harness.context)).rejects.toBe(firstFailure);
     let settled = 0;
     const observe = (): Promise<unknown> => closePassiveGuardedContext(harness.context).then(
@@ -2218,7 +2211,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('overlapping ordinary close callers share the active close attempt without retry', async () => {
     const gate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: gate.promise });
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
     let settled = 0;
     const observe = (): Promise<unknown> => closePassiveGuardedContext(harness.context).then(
       () => { settled += 1; return 'RESOLVED'; },
@@ -2245,7 +2238,7 @@ describe('installPassiveRequestGuard installation', () => {
       const harness = createGuardHarness({ contextCloseAttempts: [
         { outcome: 'REJECT', error: closeFailure }, { outcome: 'RESOLVE' },
       ] });
-      await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       const route = createHarnessRoute(page, {
         method: 'POST', url: 'https://example.test/blocked', navigation: false,
@@ -2278,7 +2271,7 @@ describe('installPassiveRequestGuard installation', () => {
       if (timing === 'SYNC_THROW') throw closeFailure;
       return Promise.reject(closeFailure);
     });
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const route = createHarnessRoute(page, {
       method: 'POST', url: 'https://example.test/blocked', navigation: false,
@@ -2310,7 +2303,7 @@ describe('installPassiveRequestGuard installation', () => {
         { outcome: 'REJECT', error: createHostileGuardError() }, { outcome: 'RESOLVE' },
       ] });
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       await readyHarnessPage(harness);
       void harness.requestFailedHandler?.({
         isNavigationRequest: () => true,
@@ -2347,7 +2340,7 @@ describe('installPassiveRequestGuard installation', () => {
         });
       },
     });
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
     page = await readyHarnessPage(harness);
     const closing = closePassiveGuardedContext(harness.context);
     if (failsFirst) {
@@ -2363,7 +2356,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('fails a paused Document after guarded context close rejects instead of continuing it', async () => {
     const harness = createGuardHarness({ contextCloseError: new Error('context close failed') });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow('context close failed');
 
@@ -2394,7 +2387,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const closing = closePassiveGuardedContext(harness.context);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2426,7 +2419,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { closeGate: closeGate.promise });
     await awaitPassiveRequestGuardReady(page);
     const closing = closePassiveGuardedPage(page);
@@ -2457,7 +2450,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('detaches lifecycle listeners after a guarded page close failure successfully invalidates its Context', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { closeError: new Error('page close failed') });
     await awaitPassiveRequestGuardReady(page);
     await expect(closePassiveGuardedPage(page)).rejects.toThrow('page close failed');
@@ -2482,7 +2475,7 @@ describe('installPassiveRequestGuard installation', () => {
         closeGate === undefined ? {} : { contextCloseGate: closeGate.promise },
       );
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       const frame = { parentFrame: () => null, page: () => page };
       harness.requestFailedHandler?.({
@@ -2532,7 +2525,7 @@ describe('installPassiveRequestGuard installation', () => {
       cdpSendErrorMethod: 'Fetch.failRequest',
     });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow('context close failed');
 
@@ -2562,7 +2555,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const closing = closePassiveGuardedContext(harness.context);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2614,7 +2607,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     harness.cdpRequestPausedHandler?.({
       requestId: 'allowed-predecessor',
@@ -2654,7 +2647,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const closing = closePassiveGuardedContext(harness.context);
     try {
@@ -2693,7 +2686,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('ledgers fallback and abort failures while keeping the request fail-closed', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let abortCount = 0;
     const request = {
       method: () => 'GET',
@@ -2733,7 +2726,7 @@ describe('installPassiveRequestGuard installation', () => {
   ])('invalidates and ledgers $operation uncertainty', async ({ operation, requestUrl, expectedCode }) => {
     const harness = createGuardHarness({ cdpSendErrorMethod: operation });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.cdpRequestPausedHandler?.({
@@ -2753,7 +2746,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('does not let a blocked CDP request suppress an unrelated allowed request failure', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     harness.cdpRequestPausedHandler?.({
       requestId: 'allowed-document',
@@ -2801,7 +2794,7 @@ describe('installPassiveRequestGuard installation', () => {
   ])('does not record listed network-layer failure $errorText of an allowed $method main-frame navigation', async ({ method, errorText }) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
 
     emitFailedMainFrameRequest(harness, page, { method, url: 'https://example.test/network-layer', errorText });
@@ -2831,7 +2824,7 @@ describe('installPassiveRequestGuard installation', () => {
   ])('still records unlisted failure %j of an allowed main-frame navigation as an invariant', async (errorText) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
 
     emitFailedMainFrameRequest(harness, page, { method: 'GET', url: 'https://example.test/unlisted', errorText });
@@ -2846,7 +2839,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('still records a listed failure without a bounded correlation request as an invariant', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
 
     emitFailedMainFrameRequest(harness, page, {
@@ -2871,7 +2864,7 @@ describe('installPassiveRequestGuard installation', () => {
   ])('still records listed network-layer failure $errorText of an allowed $method main-frame navigation during interaction freeze', async ({ method, errorText }) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -2898,7 +2891,7 @@ describe('installPassiveRequestGuard installation', () => {
       const eventHandlers = new Map<string, (value: unknown) => void>();
       const gates = Array.from({ length: 257 }, () => createDeferred<void>());
       let cancelCalls = 0;
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = createHarnessPage(harness, {
         url: 'https://example.test/fixture',
         onEvent: (event, handler) => eventHandlers.set(event, handler as (value: unknown) => void),
@@ -2958,7 +2951,7 @@ describe('installPassiveRequestGuard installation', () => {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
       const handlers = new Map<string, (...arguments_: unknown[]) => void>();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = createHarnessPage(harness, {
         url: 'https://example.test/fixture',
         onEvent: (event, handler) => handlers.set(event, handler),
@@ -3009,7 +3002,7 @@ describe('installPassiveRequestGuard installation', () => {
       },
     });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     page = await readyHarnessPage(harness);
 
     await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
@@ -3027,7 +3020,7 @@ describe('installPassiveRequestGuard installation', () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const request = {
       isNavigationRequest: () => false,
@@ -3060,7 +3053,7 @@ describe('installPassiveRequestGuard installation', () => {
         { outcome: 'RESOLVE' },
       ] });
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       const returned = harness.requestFailedHandler?.({
         isNavigationRequest: () => true,
@@ -3094,7 +3087,7 @@ describe('installPassiveRequestGuard installation', () => {
       // 自身を取り除く前に無効化を開始/awaitしてしまうとこのテストは失敗する。
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       const gate = createDeferred<void>();
       let started = false;
@@ -3139,7 +3132,7 @@ describe('installPassiveRequestGuard installation', () => {
       // raw closeの成功が受付を打ち切った後にdelivery/証跡作業を開始するとこのテストは失敗する。
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       const gate = createDeferred<void>();
       let protocolCalls = 0;
@@ -3178,7 +3171,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('bounds expected CDP failure correlations and fails the overflow request closed', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -3209,7 +3202,7 @@ describe('installPassiveRequestGuard installation', () => {
     try {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
       await activateInteractionFreeze(page);
@@ -3236,7 +3229,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('bounds redirect predecessors and consumes the exact predecessor once', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
     for (let index = 0; index < 64; index += 1) {
       harness.cdpRequestPausedHandler?.({
@@ -3269,7 +3262,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('rejects overlong method and URL correlation identities without truncation alias', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
@@ -3296,7 +3289,7 @@ describe('installPassiveRequestGuard installation', () => {
     try {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
       await activateInteractionFreeze(page);
@@ -3325,7 +3318,7 @@ describe('installPassiveRequestGuard installation', () => {
     try {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
       Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
       await activateInteractionFreeze(page);
@@ -3361,7 +3354,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('consumes an exact redirect predecessor once and fails the reused current request', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.cdpRequestPausedHandler?.({
@@ -3406,7 +3399,7 @@ describe('installPassiveRequestGuard installation', () => {
       for (const testCase of cases) {
         const harness = createGuardHarness();
         const ledger = new SafetyLedger();
-        await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+        await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
         await readyHarnessPage(harness);
         if (testCase.name === 'expired') {
           harness.cdpRequestPausedHandler?.({
@@ -3443,7 +3436,7 @@ describe('installPassiveRequestGuard installation', () => {
     try {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       await readyHarnessPage(harness);
       for (let index = 0; index < 64; index += 1) {
         harness.cdpRequestPausedHandler?.({
@@ -3504,7 +3497,7 @@ describe('installPassiveRequestGuard installation', () => {
   ])('invalidates and rejects readiness when $stage setup fails', async ({ options, message }) => {
     const harness = createGuardHarness(options);
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness);
 
     await expect(awaitPassiveRequestGuardReady(page)).rejects.toThrow(message);
@@ -3520,7 +3513,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('invalidates when a ready page CDP session detaches unexpectedly', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.cdpCloseHandler?.();
@@ -3535,7 +3528,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('invalidates when the requestfailed handler cannot look up the CDP page', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const frame = {
       parentFrame: () => null,
       page(): never {
@@ -3562,7 +3555,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('still ledgers an unexpected allowed-delivery abort while its page remains active', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     const frame = { parentFrame: () => null, page: () => page };
     const request = {
@@ -3585,7 +3578,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('aborts and invalidates when the route handler cannot look up the CDP page', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let abortCount = 0;
     const frame = {
       parentFrame: () => null,
@@ -3619,7 +3612,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('ledgers an abort failure without claiming the request was blocked', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const request = {
       method: () => 'POST',
       url: () => 'https://example.test/mutation',
@@ -3645,7 +3638,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('invalidates the context when navigation frame classification fails', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let abortCount = 0;
     const request = {
       method: () => 'GET',
@@ -3675,7 +3668,7 @@ describe('installPassiveRequestGuard installation', () => {
   it('records a WebSocket policy block independently from best-effort close failure', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let connected = false;
     const webSocketRoute = {
       url: () => 'wss://example.test/socket',
@@ -4183,6 +4176,9 @@ describe('passive request guard server boundary', () => {
 });
 
 // C18a（DEF-012。Task 19 の前の整理の設計書 4.2）: 外部スキームへの移動の検出（`request` の事象）。
+// R7d（中断した Run の再開の設計書 4.10）: ページのスクリプトによる外部スキームへの移動は、headed と headless を問わず、安全の
+// 不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）として記録し、Context を閉じる。移動の試みの記録も、今のとおり残す。
+// Guard は、headed かどうかを受け取らない（型でも、実行時でも）。
 // 本物の Chromium での経路ごとの確認は、`tests/integration/external-scheme-navigation.test.ts` で行う（headless だけ）。
 describe('C18a: external scheme navigation detection', () => {
   /** `request` の事象に渡す、偽の Playwright の Request。`frame` を省くと、frame ができる前のリクエスト（`window.open`）にする。 */
@@ -4205,9 +4201,15 @@ describe('C18a: external scheme navigation detection', () => {
     } as unknown as Request;
   }
 
+  /** 外部スキームへの移動の試みの、不変条件の違反（R7d。中断した Run の再開の設計書 4.10）。 */
+  const attemptedViolation = (scheme: string): { readonly code: string; readonly message: string } => ({
+    code: 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
+    message: `Navigation to the external scheme ${scheme} was attempted; the browser may have launched an external application`,
+  });
+
   it('installs the request listener and detaches it on close', async () => {
     const harness = createGuardHarness();
-    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
     expect(harness.requestHandler).toBeTypeOf('function');
     await closePassiveGuardedContext(harness.context);
@@ -4218,37 +4220,43 @@ describe('C18a: external scheme navigation detection', () => {
     ['tel:+10000000000', 'tel', 'MAIN'],
     ['mailto:nobody@example.invalid', 'mailto', 'MAIN'],
     ['beaksight-test-app:probe', 'beaksight-test-app', 'SUB'],
-  ] as const)('records a Passive navigation to %s without a violation in headless mode', async (url, scheme, frame) => {
+  ] as const)('records a Passive navigation to %s, records the violation, and closes the Context through the invalidation path', async (
+    url,
+    scheme,
+    frame,
+  ) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.requestHandler?.(fakeRequest({ url, frame }));
 
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().externalSchemeNavigations).toEqual([
       { url, scheme, frame, phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_NAVIGATION' },
     ]);
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-    await wait(10);
-    expect(harness.closeCount).toBe(0);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation(scheme)]);
+    await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
   });
 
-  it('records the Interaction phase after the freeze', async () => {
+  it('records the Interaction phase after the freeze, records the violation, and closes the Context', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
     await awaitPassiveRequestGuardReady(page);
     await activateInteractionFreeze(page);
 
     harness.requestHandler?.(fakeRequest({ url: 'tel:+10000000000', frame: 'MAIN' }));
 
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().externalSchemeNavigations).toEqual([
       { url: 'tel:+10000000000', scheme: 'tel', frame: 'MAIN', phase: 'INTERACTION', reason: 'EXTERNAL_SCHEME_NAVIGATION' },
     ]);
-    expect(ledger.snapshot().invariantViolations).toEqual([]);
-    expect(harness.closeCount).toBe(0);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation('tel')]);
   });
 
   it.each([
@@ -4259,10 +4267,10 @@ describe('C18a: external scheme navigation detection', () => {
     ['data:text/html,ok', true],
     ['blob:https://example.test/0b8c7d2e-0000-4000-8000-000000000000', true],
     ['tel:+10000000000', false],
-  ] as const)('does not record %s (navigation: %s), even in headed mode', async (url, navigation) => {
+  ] as const)('does not record %s (navigation: %s)', async (url, navigation) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADED_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.requestHandler?.(fakeRequest({ url, navigation, frame: 'MAIN' }));
@@ -4273,66 +4281,32 @@ describe('C18a: external scheme navigation detection', () => {
     expect(harness.closeCount).toBe(0);
   });
 
-  it('records the headed violation and closes the Context through the invalidation path', async () => {
+  it.each([
+    ['beaksight-test-app:probe', 'beaksight-test-app'],
+    ['tel:+10000000000', 'tel'],
+  ] as const)('keeps FRAME_CLASSIFICATION_FAILED when the frame of %s is not available, adds the violation, and fails closed', async (
+    url,
+    scheme,
+  ) => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADED_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
-    harness.requestHandler?.(fakeRequest({ url: 'mailto:nobody@example.invalid', frame: 'MAIN' }));
-
-    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
-    expect(harness.closeCount).toBe(1);
-    expect(ledger.snapshot().externalSchemeNavigations).toEqual([{
-      url: 'mailto:nobody@example.invalid',
-      scheme: 'mailto',
-      frame: 'MAIN',
-      phase: 'PASSIVE',
-      reason: 'EXTERNAL_SCHEME_NAVIGATION',
-    }]);
-    expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE',
-      message: 'Navigation to the external scheme mailto was attempted in headed mode; an external application may have been launched',
-    }]);
-    await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
-  });
-
-  it('keeps FRAME_CLASSIFICATION_FAILED when the frame is not available and adds the headed violation', async () => {
-    const harness = createGuardHarness();
-    const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADED_GUARD);
-    await readyHarnessPage(harness);
-
-    harness.requestHandler?.(fakeRequest({ url: 'beaksight-test-app:probe' }));
+    harness.requestHandler?.(fakeRequest({ url }));
 
     await expect.poll(() => harness.closeCount).toBe(1);
-    expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toEqual([
-      'EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE',
-      'FRAME_CLASSIFICATION_FAILED',
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      attemptedViolation(scheme),
+      { code: 'FRAME_CLASSIFICATION_FAILED', message: 'Frame for this navigation request is not available' },
     ]);
-    expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
-  });
-
-  it('fails closed on a frame classification failure in headless mode too', async () => {
-    const harness = createGuardHarness();
-    const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
-    await readyHarnessPage(harness);
-
-    harness.requestHandler?.(fakeRequest({ url: 'tel:+10000000000' }));
-
-    await expect.poll(() => harness.closeCount).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'FRAME_CLASSIFICATION_FAILED',
-      message: 'Frame for this navigation request is not available',
-    }]);
     expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
   });
 
   it('fails closed when the detection itself throws', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.requestHandler?.({
@@ -4351,7 +4325,7 @@ describe('C18a: external scheme navigation detection', () => {
   it('fails closed on a request URL that cannot be parsed', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.requestHandler?.(fakeRequest({ url: 'not a url', frame: 'MAIN' }));
@@ -4360,26 +4334,41 @@ describe('C18a: external scheme navigation detection', () => {
     expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toEqual(['EXTERNAL_SCHEME_DETECTION_FAILED']);
   });
 
-  it('rejects an installation without an explicit headed flag before touching the Context', async () => {
+  // R7d: Guard は `headed` を受け取らない。取り付けの指定は省略でき、`headed` は型で受け付けない。実行時に `headed` の値が
+  // 紛れ込んでも、外部スキームへの移動の扱いは変わらない（違反として Context を閉じる）。
+  it('installs without options and without a headed flag, without a violation', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
 
-    await expect(installPassiveRequestGuard(
-      harness.context,
-      ledger,
-      new Set(['https://example.test']),
-      {} as unknown as { readonly headed: boolean },
-    )).rejects.toThrow(/headed/);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    await readyHarnessPage(harness);
 
-    expect(harness.calls).toEqual([]);
+    expect(harness.requestHandler).toBeTypeOf('function');
+    expect(harness.closeCount).toBe(0);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
     expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
+  });
+
+  it('does not accept headed in the type of the options, and ignores a headed value given at run time', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    // @ts-expect-error R7d: Guard の取り付けの指定は `headed` を持たない（中断した Run の再開の設計書 4.10）。
+    const options: PassiveRequestGuardOptions = { headed: false };
+
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), options);
+    await readyHarnessPage(harness);
+    harness.requestHandler?.(fakeRequest({ url: 'tel:+10000000000', frame: 'MAIN' }));
+
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(ledger.snapshot().invariantViolations).toEqual([attemptedViolation('tel')]);
   });
 });
 
 // C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」）: Guard は、Document の
 // 応答の段階（CDP の Fetch の Response stage）で 3xx の Location を調べる。Location（相対の URL は、元のリクエストの URL を基準に
 // 解決する）が外部スキームなら、リダイレクトをたどる前にリクエストを失敗させ、`externalSchemeNavigations` に
-// `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、headed でも違反にしない。
+// `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない（ページのスクリプトによる移動は違反にする
+// のと違う。中断した Run の再開の設計書 4.10）。
 // 本物の Chromium での確認は、`tests/integration/external-scheme-navigation.test.ts` と GATE-S03 で行う（headless だけ）。
 describe('C18g: server redirects to an external scheme are stopped at the Document response stage', () => {
   /** 応答の段階の、偽の `Fetch.requestPaused` の事象。 */
@@ -4409,14 +4398,14 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
     params: { requestId, errorReason: 'BlockedByClient' },
   });
 
-  async function readyGuard(guard: { readonly headed: boolean } = HEADLESS_GUARD): Promise<{
+  async function readyGuard(): Promise<{
     readonly harness: GuardHarness;
     readonly ledger: SafetyLedger;
     readonly page: Page;
   }> {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), guard);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
     return { harness, ledger, page };
   }
@@ -4460,8 +4449,8 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
     expect(harness.closeCount).toBe(0);
   });
 
-  it('does not make a stopped redirect a violation in headed mode, and matches the Location header name case-insensitively', async () => {
-    const { harness, ledger } = await readyGuard(HEADED_GUARD);
+  it('does not make a stopped redirect a violation, and matches the Location header name case-insensitively', async () => {
+    const { harness, ledger } = await readyGuard();
 
     harness.cdpRequestPausedHandler?.(responseEvent({
       status: 308,
@@ -4549,12 +4538,12 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
   describe('the main frame failure of a redirect that the Guard itself stopped', () => {
     const SOURCE_URL = 'https://example.test/redirect/source';
 
-    async function stopMainFrameRedirect(guard: { readonly headed: boolean } = HEADLESS_GUARD): Promise<{
+    async function stopMainFrameRedirect(): Promise<{
       readonly harness: GuardHarness;
       readonly ledger: SafetyLedger;
       readonly page: Page;
     }> {
-      const ready = await readyGuard(guard);
+      const ready = await readyGuard();
       ready.harness.cdpRequestPausedHandler?.(responseEvent({
         frameId: 'root-frame',
         url: SOURCE_URL,
@@ -4565,11 +4554,8 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
       return ready;
     }
 
-    it.each([
-      ['headless', HEADLESS_GUARD],
-      ['headed', HEADED_GUARD],
-    ] as const)('is not a violation (%s): the record stays and the Context stays open', async (_mode, guard) => {
-      const { harness, ledger, page } = await stopMainFrameRedirect(guard);
+    it('is not a violation: the record stays and the Context stays open', async () => {
+      const { harness, ledger, page } = await stopMainFrameRedirect();
 
       emitFailedMainFrameRequest(harness, page, { method: 'GET', url: SOURCE_URL, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
       await flushGuardProtocolCallbacks();
@@ -4647,7 +4633,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
       const closeGate = createDeferred<void>();
       const harness = createGuardHarness({ cdpSendErrorMethod: 'Fetch.failRequest', contextCloseGate: closeGate.promise });
       const ledger = new SafetyLedger();
-      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+      await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
 
       harness.cdpRequestPausedHandler?.(responseEvent({
@@ -4670,7 +4656,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
   it('fails closed when the external scheme redirect cannot be failed, without recording it as stopped', async () => {
     const harness = createGuardHarness({ cdpSendErrorMethod: 'Fetch.failRequest' });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
 
     harness.cdpRequestPausedHandler?.(responseEvent({ status: 302, headers: [{ name: 'Location', value: 'tel:+10000000000' }] }));
@@ -4686,7 +4672,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
   it('records the Interaction phase for an external scheme redirect response that arrives after the freeze', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
     await awaitPassiveRequestGuardReady(page);
     await activateInteractionFreeze(page);
@@ -4712,7 +4698,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
   it('continues an ordinary response that arrives after the freeze (the Request stage keeps INTERACTION_FROZEN)', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = createHarnessPage(harness, { url: 'https://example.test/frozen-owner' });
     await awaitPassiveRequestGuardReady(page);
     await activateInteractionFreeze(page);
@@ -4797,7 +4783,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     await readyHarnessPage(harness);
     const closing = closePassiveGuardedContext(harness.context);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -4861,7 +4847,7 @@ describe('C18h: the redirect correlation is counted from the 3xx response and fo
   async function readyGuard(): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger; readonly page: Page }> {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), HEADLESS_GUARD);
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
     const page = await readyHarnessPage(harness);
     return { harness, ledger, page };
   }
@@ -5079,7 +5065,7 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
   async function guardWith(delivery: GuardResourceDelivery): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger }> {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), { ...HEADLESS_GUARD, resourceDelivery: delivery });
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), { resourceDelivery: delivery });
     return { harness, ledger };
   }
 
@@ -5194,7 +5180,6 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]), {
-      ...HEADLESS_GUARD,
       resourceDelivery: recording.delivery,
     });
     const page = await readyHarnessPage(harness);
