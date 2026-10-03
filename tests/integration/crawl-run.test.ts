@@ -372,9 +372,9 @@ describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', 
 // C18f（Task 19 の前の整理の設計書 4.5、RC18a の指摘2）: 違反を検出した後は、新しいページとビューポートを始めない。
 // RC18a の再現: 読み込みの後に外部スキームへ移動するページが3つあるサイトを、headed で実行すると、違反が6件（3ページ × 2ビューポート）
 // 起きた。修正の後は、最初の違反のページの Desktop の1件だけになる。
-// 厳守事項: Chromium は headless だけで起動する。headed の扱いは、設定（`browser.headed: true`）で Guard に「headed である」と
-// 注入して確かめる（起動する関数は、要求された `headless: false` を無視して、いつも headless で起動する）。外部スキームの宛先は、
-// 実在しないもの（`.invalid`）だけを使う。
+// R7d（中断した Run の再開の設計書 4.10）: ページのスクリプトによる外部スキームへの移動は、headed と headless を問わず違反になるので、
+// headless の設定のまま確かめる。
+// 厳守事項: Chromium は headless だけで起動する。外部スキームの宛先は、実在しないもの（`.invalid`）だけを使う。
 describe('RunCoordinator: no new page or viewport after a safety invariant violation (C18f, design 4.5)', () => {
   const HUB_PATH = '/hub.html';
   const VIOLATING_PATHS = ['/x1.html', '/x2.html', '/x3.html'] as const;
@@ -395,7 +395,7 @@ describe('RunCoordinator: no new page or viewport after a safety invariant viola
 
   /**
    * 開始のページ（`HUB_PATH`）は、違反を起こす3つのページへのリンクを持つ。違反を起こすページは、読み込みの後に、ページのスクリプトが
-   * 外部スキームへ移動する（headed では、Guard が違反として Context を閉じる）。ほかのパスは 404。
+   * 外部スキームへ移動する（Guard が違反として Context を閉じる）。ほかのパスは 404。
    */
   async function startViolatingSite(): Promise<ViolatingSite> {
     const gets: string[] = [];
@@ -451,22 +451,22 @@ describe('RunCoordinator: no new page or viewport after a safety invariant viola
     const callsBefore = runLauncher.calls.length;
     try {
       const result = await runCrawl(
-        { browser: { headed: true }, audit: { interactions: false, screenshots: false } },
+        { audit: { interactions: false, screenshots: false } },
         () => new SafetyLedger(),
         { origin: site.origin, startPath: HUB_PATH },
         { launchBrowser: runLauncher.launcher },
       );
 
-      // headed が注入された（起動の要求は headed だった）。
+      // headless の設定のまま、違反になる（起動の要求も headless だった）。
       const requestedHeadless = runLauncher.calls.slice(callsBefore).map(({ headless }) => headless);
       expect(requestedHeadless.length).toBeGreaterThan(0);
-      expect(requestedHeadless.every((headless) => !headless)).toBe(true);
-      expect(result.run.effectiveConfig.browser.headed).toBe(true);
+      expect(requestedHeadless.every((headless) => headless)).toBe(true);
+      expect(result.run.effectiveConfig.browser.headed).toBe(false);
 
       // 違反は、最初の違反のページの Desktop の1件だけである（修正の前は6件）。
       expect(result.run.safety.invariantViolationCount).toBe(1);
       expect(result.run.safety.invariantViolations.map((violation) => violation.code))
-        .toEqual(['EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE']);
+        .toEqual(['EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED']);
       // 2つ目以降の違反のページは、サーバに要求していない。
       expect(site.gets.filter((path) => path === '/x1.html')).toHaveLength(1);
       expect(site.gets).not.toContain('/x2.html');

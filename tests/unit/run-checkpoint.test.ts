@@ -698,6 +698,110 @@ describe('R2: consistency that the schemas cannot check', () => {
   });
 });
 
+// R8（設計書 4.2、4.10 の DEF-022。RR2 の指摘4）: 保存の値から、採番器（`IdAllocator.restore`）と巡回の記録（`CrawlFrontier.restore`。
+// 保存の実効の設定の深さの上限と query の引数、`RESUME_REQUEUE_SKIP_REASON_CODES`。Run Coordinator が再開で使うのと同じ引数）を作り直せるかも
+// 確かめる。スキーマと、ほかの整合の確かめを通っても、作り直せない保存は、食い違いとして返す（CLI は、壊れた保存として知らせ、新しい Run を
+// 始める。確かめないと、`--new` を付けるまで、毎回の起動が予期しない失敗で終わる）。食い違いの文には、URL を入れない。
+describe('R8: the allocator and the crawl frontier must be restorable from the checkpoint (design 4.2, 4.10 DEF-022)', () => {
+  const FRONTIER_NOT_RESTORABLE = '/frontier cannot be restored: ';
+  const ALLOCATOR_NOT_RESTORABLE = '/allocator cannot be restored: ';
+
+  /** frontier の記録のうち、ページの ID が `pageId` のものを `change` で変えた保存（`RunCheckpoint` の形のまま）。 */
+  const withEntry = (checkpoint: RunCheckpoint, pageId: PageId, change: (entry: CrawlUrlEntry) => CrawlUrlEntry): RunCheckpoint =>
+    withCheckpoint(checkpoint, {
+      frontier: { entries: checkpoint.frontier.entries.map((entry) => (entry.pageId === pageId ? change(entry) : entry)) },
+    });
+  /** 保存の実効の設定の `crawl` の一部を変えた保存。 */
+  const withCrawlConfig = (checkpoint: RunCheckpoint, crawl: Partial<EffectiveAuditConfig['crawl']>): RunCheckpoint =>
+    withCheckpoint(checkpoint, {
+      effectiveConfig: { ...checkpoint.effectiveConfig, crawl: { ...checkpoint.effectiveConfig.crawl, ...crawl } },
+    });
+  /** 食い違いの文の一覧（食い違いがなければ空）。 */
+  const errorsOf = (checkpoint: RunCheckpoint): readonly string[] => {
+    const result = checkRunCheckpointConsistency(checkpoint);
+    return result.ok ? [] : result.errors;
+  };
+  /** 保存の実効の設定が残さない query の引数を付けた、正規形でない URL。 */
+  const withUnkeptQuery = (url: typeof THIRD_URL): typeof THIRD_URL => `${url}?page=2` as typeof THIRD_URL;
+
+  it.each([
+    [
+      'a URL that is not in the normalized form (a query parameter that the saved configuration does not keep)',
+      (checkpoint: RunCheckpoint) => withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, url: withUnkeptQuery(entry.url) })),
+    ],
+    [
+      'a URL deeper than the max depth of the saved configuration, without MAX_DEPTH_REACHED',
+      (checkpoint: RunCheckpoint) => withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, depth: checkpoint.effectiveConfig.crawl.maxDepth + 1 })),
+    ],
+    [
+      'the same URL twice',
+      (checkpoint: RunCheckpoint) => withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, url: SECOND_URL })),
+    ],
+  ] as const)('rejects a crawl frontier that cannot be restored: %s, without the URL in the error', async (_name, breakCheckpoint) => {
+    const errors = errorsOf(breakCheckpoint(await sampleCheckpoint()));
+
+    // ほかの整合の確かめは通る（食い違いは、作り直せないことの1件だけ）。
+    expect(errors).toEqual([expect.stringContaining(FRONTIER_NOT_RESTORABLE)]);
+    expect(errors[0]?.startsWith(FRONTIER_NOT_RESTORABLE)).toBe(true);
+    expect(errors.join('\n')).not.toContain(FIXTURE_ORIGIN);
+  });
+
+  it('rejects an ID allocator that cannot be restored (a sequence beyond the safe integers, which the schema accepts)', async () => {
+    const checkpoint = await sampleCheckpoint();
+    const errors = errorsOf(withCheckpoint(checkpoint, {
+      allocator: { ...checkpoint.allocator, nextPageSequence: Number.MAX_SAFE_INTEGER + 1 },
+    }));
+
+    expect(errors).toEqual([expect.stringContaining(ALLOCATOR_NOT_RESTORABLE)]);
+    expect(errors[0]?.startsWith(ALLOCATOR_NOT_RESTORABLE)).toBe(true);
+  });
+
+  it('reports both the allocator and the crawl frontier that cannot be restored at once, without throwing', async () => {
+    const checkpoint = await sampleCheckpoint();
+    const broken = withCheckpoint(
+      withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, depth: checkpoint.effectiveConfig.crawl.maxDepth + 1 })),
+      { allocator: { ...checkpoint.allocator, nextEvidenceSequence: Number.MAX_SAFE_INTEGER + 1 } },
+    );
+
+    expect(errorsOf(broken)).toEqual([
+      expect.stringContaining(ALLOCATOR_NOT_RESTORABLE),
+      expect.stringContaining(FRONTIER_NOT_RESTORABLE),
+    ]);
+  });
+
+  it('restores the crawl frontier with the max depth and the query parameters of the saved effective configuration', async () => {
+    const checkpoint = await sampleCheckpoint();
+    const withQuery = withEntry(checkpoint, PAGE_3, (entry) => ({ ...entry, url: withUnkeptQuery(entry.url) }));
+
+    // 保存の設定が `page` を残すなら、その URL は正規形である。
+    expect(checkRunCheckpointConsistency(withCrawlConfig(withQuery, { allowedQueryParameters: ['page'] }))).toEqual({ ok: true });
+    // 保存の設定の深さの上限より深い URL（深さ 1 の記録）は、作り直せない。
+    expect(errorsOf(withCrawlConfig(checkpoint, { maxDepth: 0 }))).toEqual([expect.stringContaining(FRONTIER_NOT_RESTORABLE)]);
+  });
+
+  it.each([
+    ['AUDITING (it goes back to the queue)', (entry: CrawlUrlEntry): CrawlUrlEntry => ({ ...entry, state: 'AUDITING' })],
+    ...RESUME_REQUEUE_SKIP_REASON_CODES.map((code) => [
+      `SKIPPED by ${code} (it goes back to the queue)`,
+      (entry: CrawlUrlEntry): CrawlUrlEntry => ({ ...entry, state: 'SKIPPED', skipReason: { code, detail: null } }),
+    ] as const),
+  ] as const)('accepts a frontier entry that is %s', async (_name, change) => {
+    expect(checkRunCheckpointConsistency(withEntry(await sampleCheckpoint(), PAGE_3, change))).toEqual({ ok: true });
+  });
+
+  it('accepts a URL deeper than the max depth that is SKIPPED by MAX_DEPTH_REACHED', async () => {
+    const checkpoint = await sampleCheckpoint();
+    const deeper = withEntry(checkpoint, PAGE_3, (entry) => ({
+      ...entry,
+      depth: checkpoint.effectiveConfig.crawl.maxDepth + 1,
+      state: 'SKIPPED',
+      skipReason: { code: 'MAX_DEPTH_REACHED', detail: null },
+    }));
+
+    expect(checkRunCheckpointConsistency(deeper)).toEqual({ ok: true });
+  });
+});
+
 describe('R4b1: consistency of the executions (design 4.8)', () => {
   /** 保存の状態と実行の記録を置き換えた保存（`RunCheckpoint` の形のまま）。 */
   const withExecutions = (
@@ -1001,7 +1105,15 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
   const codes = (...values: IncompleteReasonCode[]): ReadonlySet<IncompleteReasonCode> => new Set(values);
   const NONE: RunCheckpointConclusion = { action: 'NONE' };
   const ABANDON: RunCheckpointConclusion = { action: 'ABANDON' };
-  const finish = (state: 'STOPPED' | 'FINISHED', content: RunCheckpointFinalContent): RunCheckpointConclusion => ({ action: 'FINISH', state, content });
+  /**
+   * `FINISH` の終わり方。`finishEvenIfOutputFails` は、出力の書き出しに失敗しても `finish` を行うか（R7c。設計書 4.10 の Important-1 の (b)。
+   * 違反を検出した Run だけが真）。
+   */
+  const finish = (
+    state: 'STOPPED' | 'FINISHED',
+    content: RunCheckpointFinalContent,
+    finishEvenIfOutputFails: boolean,
+  ): RunCheckpointConclusion => ({ action: 'FINISH', state, content, finishEvenIfOutputFails });
 
   it('keeps the closed lists of the actions and of the contents of the final state', () => {
     expect([...RUN_CHECKPOINT_CONCLUSION_ACTIONS]).toEqual(['FINISH', 'ABANDON', 'NONE']);
@@ -1012,6 +1124,7 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
     expectTypeOf<Extract<RunCheckpointConclusion, { readonly action: 'FINISH' }>['state']>()
       .toEqualTypeOf<Exclude<RunCheckpointState, 'IN_PROGRESS'>>();
     expectTypeOf<Extract<RunCheckpointConclusion, { readonly action: 'FINISH' }>['content']>().toEqualTypeOf<RunCheckpointFinalContent>();
+    expectTypeOf<Extract<RunCheckpointConclusion, { readonly action: 'FINISH' }>['finishEvenIfOutputFails']>().toEqualTypeOf<boolean>();
   });
 
   it.each([
@@ -1023,12 +1136,13 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
       checkpointWriteFailed: true,
       hasWrittenCheckpoint: false,
     }), NONE],
-    // 2. 違反: 必ず FINISHED。保存に失敗していれば、最後に書けた保存の中身。書けた保存がなければ ABANDON。
-    ['a violation', facts({ runStatus: 'ABORTED_BY_SAFETY', skipReasonCodes: codes('SAFETY_VIOLATION_ABORT') }), finish('FINISHED', 'CRAWL_END')],
+    // 2. 違反: 必ず FINISHED。保存に失敗していれば、最後に書けた保存の中身。書けた保存がなければ ABANDON。出力の書き出しに失敗しても
+    //    `finish` を行う（R7c）。
+    ['a violation', facts({ runStatus: 'ABORTED_BY_SAFETY', skipReasonCodes: codes('SAFETY_VIOLATION_ABORT') }), finish('FINISHED', 'CRAWL_END', true)],
     ['a violation and a failed save with a written checkpoint', facts({
       runStatus: 'ABORTED_BY_SAFETY',
       checkpointWriteFailed: true,
-    }), finish('FINISHED', 'LAST_WRITTEN')],
+    }), finish('FINISHED', 'LAST_WRITTEN', true)],
     ['a violation and a failed save without a written checkpoint', facts({
       runStatus: 'ABORTED_BY_SAFETY',
       checkpointWriteFailed: true,
@@ -1037,12 +1151,12 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
     ['a violation with the runtime limit and a stop signal (FINISHED, not STOPPED)', facts({
       runStatus: 'ABORTED_BY_SAFETY',
       skipReasonCodes: codes('MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED'),
-    }), finish('FINISHED', 'CRAWL_END')],
+    }), finish('FINISHED', 'CRAWL_END', true)],
     ['a violation in a resumed execution whose PREFLIGHT failed', facts({
       runStatus: 'ABORTED_BY_SAFETY',
       resumed: true,
       preflightFailed: true,
-    }), finish('FINISHED', 'CRAWL_END')],
+    }), finish('FINISHED', 'CRAWL_END', true)],
     // 3. この実行で、保存に失敗した。
     ['a failed save', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('CHECKPOINT_WRITE_FAILED'), checkpointWriteFailed: true }), ABANDON],
     ['a failed save with the runtime limit', facts({
@@ -1062,19 +1176,20 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
       runStatus: 'FAILED',
       preflightFailed: true,
       hasWrittenCheckpoint: false,
-    }), finish('FINISHED', 'CRAWL_END')],
-    // 5. それ以外: 実行時間の上限と止める印は STOPPED、ほかは FINISHED。
-    ['the runtime limit of one execution', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('MAX_RUNTIME_REACHED') }), finish('STOPPED', 'CRAWL_END')],
-    ['a stop signal', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('RUN_INTERRUPTED') }), finish('STOPPED', 'CRAWL_END')],
+    }), finish('FINISHED', 'CRAWL_END', false)],
+    // 5. それ以外: 実行時間の上限と止める印は STOPPED、ほかは FINISHED。出力の書き出しに失敗したら `finish` を行わない（出力をやり直せる
+    //    よう、保存の状態を変えない）。
+    ['the runtime limit of one execution', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('MAX_RUNTIME_REACHED') }), finish('STOPPED', 'CRAWL_END', false)],
+    ['a stop signal', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('RUN_INTERRUPTED') }), finish('STOPPED', 'CRAWL_END', false)],
     ['a stop signal in a resumed execution', facts({
       runStatus: 'PARTIAL',
       skipReasonCodes: codes('RUN_INTERRUPTED'),
       resumed: true,
-    }), finish('STOPPED', 'CRAWL_END')],
-    ['the page limit', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('MAX_PAGES_REACHED') }), finish('FINISHED', 'CRAWL_END')],
-    ['a complete Run', facts(), finish('FINISHED', 'CRAWL_END')],
-    ['a complete resumed Run', facts({ resumed: true }), finish('FINISHED', 'CRAWL_END')],
-    ['a complete Run without a written checkpoint', facts({ hasWrittenCheckpoint: false }), finish('FINISHED', 'CRAWL_END')],
+    }), finish('STOPPED', 'CRAWL_END', false)],
+    ['the page limit', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('MAX_PAGES_REACHED') }), finish('FINISHED', 'CRAWL_END', false)],
+    ['a complete Run', facts(), finish('FINISHED', 'CRAWL_END', false)],
+    ['a complete resumed Run', facts({ resumed: true }), finish('FINISHED', 'CRAWL_END', false)],
+    ['a complete Run without a written checkpoint', facts({ hasWrittenCheckpoint: false }), finish('FINISHED', 'CRAWL_END', false)],
   ] as const)('concludes %s', (_name, input, expected) => {
     const conclusion = decideRunCheckpointConclusion(input);
 
@@ -1089,9 +1204,49 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
         const skipReasonCodes = codes(...skipCodes.filter((_code, index) => (mask & (1 << index)) !== 0));
         const endReason = decideRunExecutionEndReason({ runStatus, skipReasonCodes });
         const stopped = endReason === 'STOPPED_BY_RUNTIME_LIMIT' || endReason === 'STOPPED_BY_SIGNAL';
-        expect(decideRunCheckpointConclusion(facts({ runStatus, skipReasonCodes }))).toEqual(finish(stopped ? 'STOPPED' : 'FINISHED', 'CRAWL_END'));
+        expect(decideRunCheckpointConclusion(facts({ runStatus, skipReasonCodes })))
+          .toEqual(finish(stopped ? 'STOPPED' : 'FINISHED', 'CRAWL_END', runStatus === 'ABORTED_BY_SAFETY'));
       }
     }
+  });
+
+  // R7c（設計書 4.10 の Important-1 の (b)）: 出力の書き出しに失敗しても `finish` を行うのは、Run Status が `ABORTED_BY_SAFETY` の `FINISH`
+  // だけ。違反を検出した Run を、出力を書けなくても再開しない状態（`FINISHED`）にするためである。違反のない Run は、出力をやり直せるよう、
+  // 出力に失敗したら保存の状態を変えない（偽）。
+  it('sets finishEvenIfOutputFails exactly for the FINISH of an ABORTED_BY_SAFETY Run, whatever the other facts are', () => {
+    const skipCodes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'CHECKPOINT_WRITE_FAILED'];
+    const flags = [false, true] as const;
+    let violationFinishes = 0;
+    for (const runStatus of RUN_STATUSES) {
+      for (let mask = 0; mask < 2 ** skipCodes.length; mask += 1) {
+        const skipReasonCodes = codes(...skipCodes.filter((_code, index) => (mask & (1 << index)) !== 0));
+        for (const checkpointWriteFailed of flags) {
+          for (const resumed of flags) {
+            for (const preflightFailed of flags) {
+              for (const hasWrittenCheckpoint of flags) {
+                const conclusion = decideRunCheckpointConclusion(facts({
+                  runStatus,
+                  skipReasonCodes,
+                  checkpointWriteFailed,
+                  resumed,
+                  preflightFailed,
+                  hasWrittenCheckpoint,
+                }));
+                if (conclusion.action !== 'FINISH') {
+                  continue;
+                }
+                expect(conclusion.finishEvenIfOutputFails).toBe(runStatus === 'ABORTED_BY_SAFETY');
+                violationFinishes += conclusion.finishEvenIfOutputFails ? 1 : 0;
+              }
+            }
+          }
+        }
+      }
+    }
+    // 違反の FINISH（巡回の終わりの値と、最後に書けた保存の値の両方）を、少なくとも1つずつ確かめた。
+    expect(violationFinishes).toBeGreaterThan(0);
+    expect(decideRunCheckpointConclusion(facts({ runStatus: 'ABORTED_BY_SAFETY', checkpointWriteFailed: true })))
+      .toEqual(finish('FINISHED', 'LAST_WRITTEN', true));
   });
 });
 

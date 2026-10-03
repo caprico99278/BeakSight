@@ -8,6 +8,8 @@
  *   安全な区切り1つかどうか（`isPortableArtifactPathSegment`。CC-027）の両方で確かめる。形の違う値は、何も書かずに `RangeError`。
  * - ファイルは、同じディレクトリの一時ファイルに書いてから rename する。テキストは UTF-8（BOM なし）で、改行は LF にする。
  *   JSON の書式は、`serializeArtifactJson`（`./artifact-json.ts`）だけで組み立てる（CC-026）。
+ *   rename は、すべて `renameWithRetry` を通し、一時的な失敗（`RENAME_RETRY_ERROR_CODES`）のときだけ、短く待ってやり直す（中断した Run の
+ *   再開の設計書 4.10。RR の Minor-5）。
  * - 入出力の失敗は、`ArtifactWriteError` を投げる。
  * - HTML レポートと ChatGPT 用バンドルは、描画する側が作った中身を `writePresentation` で書く（書き出しの owner は、ここだけ）。
  * - 中断した Run の再開のための保存（チェックポイント）の書き出しと読み込み（状態の保存だけの読み込みを含む）、ロックのファイルの作成・
@@ -52,6 +54,7 @@ import type {
   RunSummary,
   ViewportProfile,
 } from '../core/contracts.js';
+import { wait } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
 import { isPageId, isRunId } from '../core/ids.js';
@@ -272,11 +275,36 @@ const CHECKPOINT_FILE_OPERATION_NAMES = Object.freeze(['mkdir', 'open', 'rename'
 
 /** `ArtifactWriter` の設定（どれも省略できる）。 */
 export interface ArtifactWriterOptions {
-  /** 保存とロックの書き出しで使うファイルの操作。省略すると `node:fs/promises`。 */
+  /**
+   * 保存とロックの書き出しで使うファイルの操作。省略すると `node:fs/promises`。名前の変更（`rename`）は、最後の artifact の書き出しでも
+   * 使う（名前の変更のやり直しを1か所にするため。`renameWithRetry`）。
+   */
   readonly fileOperations?: CheckpointFileOperations;
   /** 実行している環境（`process.platform` の値）。省略すると `process.platform`。`win32` では、ディレクトリの `fsync` を行わない。 */
   readonly platform?: string;
+  /** 名前の変更をやり直す前の待ち。省略すると `wait`（`src/core/deadline.ts`）。テストで、実際には待たずに確かめるための差し替え口。 */
+  readonly wait?: typeof wait;
 }
+
+/**
+ * 名前の変更の一時的な失敗とみなす、失敗のコード（中断した Run の再開の設計書 4.10。RR の Minor-5）。Windows で、ウイルス対策や同期の
+ * ソフトが一時的にファイルを開いていると、名前の変更がこれらで失敗する。ほかの失敗（`ENOENT` など）は、やり直しても変わらないので、
+ * やり直さない。
+ */
+export const RENAME_RETRY_ERROR_CODES = Object.freeze(['EPERM', 'EBUSY', 'EACCES'] as const);
+const RENAME_RETRY_ERROR_CODE_SET: ReadonlySet<string> = new Set(RENAME_RETRY_ERROR_CODES);
+
+/**
+ * 名前の変更を試みる最大の回数（最初の1回を含む）。一時的にファイルを開くソフトは、ふつう短い間に閉じるので、数回で足りる。続けて
+ * 失敗する場合（本当に権限がないなど）に、保存と出力の書き出しを長く止めないよう、少なくする。
+ */
+export const RENAME_MAX_ATTEMPTS = 5;
+
+/**
+ * 名前の変更をやり直す前の待ち（ミリ秒）。一時的にファイルを開くソフトが閉じるのを待てる長さにする。最後まで失敗しても、待ちの合計は
+ * `(RENAME_MAX_ATTEMPTS - 1) * RENAME_RETRY_DELAY_MS` で、ページの監査の長さに比べて短い。
+ */
+export const RENAME_RETRY_DELAY_MS = 100;
 
 /**
  * 最後の状態が `FINISHED` の Run で消す、再開のための保存（Run のディレクトリからの相対パスと、その種類。消す順。中断した Run の再開の
@@ -321,8 +349,42 @@ const isTemporaryFileName = (fileName: string): boolean => {
   return separator > 0 && RANDOM_UUID_PATTERN.test(inner.slice(separator + TEMPORARY_FILE_UUID_SEPARATOR.length));
 };
 
-/** 同じディレクトリの一時ファイルに書いてから、rename する。失敗した場合は、一時ファイルを消してから `ArtifactWriteError` を投げる。 */
-async function writeFileAtomically(path: string, data: string | Uint8Array): Promise<void> {
+/** 名前の変更（`ArtifactWriter` の `#rename`。`renameWithRetry` を通したもの）。 */
+type RenameFile = (oldPath: string, newPath: string) => Promise<void>;
+
+/**
+ * 名前の変更を、`operations.rename` で行う（中断した Run の再開の設計書 4.10。RR の Minor-5）。ArtifactWriter の名前の変更（最後の
+ * artifact の書き出し、保存とロックの書き出し、`state.json` から `state.prev.json` への移し替え）は、すべてここを通る。
+ * - 失敗のコードが `RENAME_RETRY_ERROR_CODES` のどれかなら、`waitBeforeRetry(RENAME_RETRY_DELAY_MS)` の後にやり直す。試みは、最初の1回を含めて
+ *   最大 `RENAME_MAX_ATTEMPTS` 回。最後まで失敗したら、最後の失敗をそのまま投げる。
+ * - ほかの失敗（`ENOENT` など）は、やり直さずに、すぐにそのまま投げる。
+ * 失敗の扱い（一時ファイルを消す、`ENOENT` を移すものがないとみなす、`ArtifactWriteError` にする）は、呼び出し側が今のとおり行う。
+ */
+async function renameWithRetry(
+  operations: Pick<CheckpointFileOperations, 'rename'>,
+  waitBeforeRetry: typeof wait,
+  oldPath: string,
+  newPath: string,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await operations.rename(oldPath, newPath);
+      return;
+    } catch (error) {
+      const code = errorCodeOf(error);
+      if (attempt >= RENAME_MAX_ATTEMPTS || code === null || !RENAME_RETRY_ERROR_CODE_SET.has(code)) {
+        throw error;
+      }
+    }
+    await waitBeforeRetry(RENAME_RETRY_DELAY_MS);
+  }
+}
+
+/**
+ * 同じディレクトリの一時ファイルに書いてから、rename する（`renameFile`。`renameWithRetry` を通したもの）。失敗した場合は、一時ファイルを
+ * 消してから `ArtifactWriteError` を投げる。
+ */
+async function writeFileAtomically(path: string, data: string | Uint8Array, renameFile: RenameFile): Promise<void> {
   const temporaryPath = temporaryPathFor(path);
   try {
     await mkdir(dirname(path), { recursive: true });
@@ -331,7 +393,7 @@ async function writeFileAtomically(path: string, data: string | Uint8Array): Pro
     } else {
       await writeFile(temporaryPath, data);
     }
-    await rename(temporaryPath, path);
+    await renameFile(temporaryPath, path);
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
     throw new ArtifactWriteError(path, error);
@@ -649,10 +711,17 @@ function assertWritableRun(result: AuditRunResult, options: WriteRunOptions): vo
 export class ArtifactWriter {
   readonly #fileOperations: CheckpointFileOperations;
   readonly #platform: string;
+  readonly #wait: typeof wait;
+  /**
+   * この ArtifactWriter の名前の変更（差し替えたファイルの操作の `rename` を、待ち `#wait` で `renameWithRetry` に通したもの）。最後の
+   * artifact の書き出し、保存とロックの書き出し、`state.json` から `state.prev.json` への移し替えは、すべてこれを使う。
+   */
+  readonly #rename: RenameFile = async (oldPath, newPath) => renameWithRetry(this.#fileOperations, this.#wait, oldPath, newPath);
 
   /**
-   * `options` は省略できる（保存とロックの書き出しのファイルの操作と、実行している環境。テスト用の差し替え口）。
-   * 最後の artifact の書き出し（`writeRun`、`writePresentation`）は、差し替えたファイルの操作を使わない。
+   * `options` は省略できる（保存とロックの書き出しのファイルの操作、実行している環境、名前の変更をやり直す前の待ち。テスト用の差し替え口）。
+   * 最後の artifact の書き出し（`writeRun`、`writePresentation`）は、差し替えたファイルの操作のうち、名前の変更（`rename`）だけを使う
+   * （名前の変更のやり直しを、保存と同じ1か所にするため。`renameWithRetry`）。
    * 不正な設定は `TypeError` を投げる。
    */
   constructor(options: ArtifactWriterOptions = {}) {
@@ -661,7 +730,7 @@ export class ArtifactWriter {
     if (!isRecord(given)) {
       throw new TypeError('ArtifactWriter options must be an object');
     }
-    const { fileOperations = NODE_CHECKPOINT_FILE_OPERATIONS, platform = process.platform } = options;
+    const { fileOperations = NODE_CHECKPOINT_FILE_OPERATIONS, platform = process.platform, wait: retryWait = wait } = options;
     const operations: unknown = fileOperations;
     if (!isRecord(operations) || !CHECKPOINT_FILE_OPERATION_NAMES.every((name) => typeof operations[name] === 'function')) {
       throw new TypeError(`ArtifactWriter file operations must have ${CHECKPOINT_FILE_OPERATION_NAMES.join(', ')}`);
@@ -669,8 +738,12 @@ export class ArtifactWriter {
     if (typeof platform !== 'string' || platform.length === 0) {
       throw new TypeError('ArtifactWriter platform must be a non-empty string');
     }
+    if (typeof retryWait !== 'function') {
+      throw new TypeError('ArtifactWriter wait must be a function');
+    }
     this.#fileOperations = fileOperations;
     this.#platform = platform;
+    this.#wait = retryWait;
   }
 
   /**
@@ -731,7 +804,7 @@ export class ArtifactWriter {
     }
     const files: string[] = [];
     const write = async (relativePath: string, data: string): Promise<void> => {
-      await writeFileAtomically(artifactFilePath(runDirectory, relativePath), data);
+      await writeFileAtomically(artifactFilePath(runDirectory, relativePath), data, this.#rename);
       files.push(relativePath);
     };
     for (const page of final.pages) {
@@ -770,11 +843,11 @@ export class ArtifactWriter {
     }
     const writtenFiles: string[] = [];
     if (files.reportHtml !== undefined) {
-      await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.report), toLf(files.reportHtml));
+      await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.report), toLf(files.reportHtml), this.#rename);
       writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.report);
     }
     if (files.bundle !== undefined) {
-      await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.bundle), files.bundle);
+      await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.bundle), files.bundle, this.#rename);
       writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.bundle);
     }
     return Object.freeze(writtenFiles);
@@ -818,7 +891,7 @@ export class ArtifactWriter {
     const data = await checkpointJson('checkpoint', path, state);
     await this.#writeFileDurably(path, data, async () => {
       try {
-        await this.#fileOperations.rename(path, previousPath);
+        await this.#rename(path, previousPath);
       } catch (error) {
         // 今の `state.json` がない（最初の保存か、前の回が 2 と 3 の間で止まった）場合は、移すものがない。
         if (errorCodeOf(error) !== 'ENOENT') {
@@ -1063,7 +1136,7 @@ export class ArtifactWriter {
   // -------------------------------------------------------------------------------------------------------------
 
   /**
-   * 確定する書き方（設計書 4.3）。同じディレクトリの一時ファイルに書いて `fsync` し、`beforeRename`（あれば）の後に rename する。
+   * 確定する書き方（設計書 4.3）。同じディレクトリの一時ファイルに書いて `fsync` し、`beforeRename`（あれば）の後に rename する（`#rename`）。
    * Windows 以外では、その後にディレクトリを `fsync` する。失敗した場合は、一時ファイルを消してから `ArtifactWriteError` を投げる。
    */
   async #writeFileDurably(path: string, data: string, beforeRename?: () => Promise<void>): Promise<void> {
@@ -1073,7 +1146,7 @@ export class ArtifactWriter {
       await operations.mkdir(dirname(path), { recursive: true });
       await writeAndSync(await operations.open(temporaryPath, 'wx'), data);
       await beforeRename?.();
-      await operations.rename(temporaryPath, path);
+      await this.#rename(temporaryPath, path);
     } catch (error) {
       await operations.rm(temporaryPath, { force: true }).catch(() => undefined);
       throw new ArtifactWriteError(path, error);

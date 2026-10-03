@@ -254,7 +254,7 @@ Run の状態（`state.json`）:
 - **選び方**: 同じ対象の Run（`state.json` を読めたもの。終わった Run も含む）のうち、最初の実行の開始が最も新しいもの1つだけを候補にする。それが再開でき（`decideRunResumption` が `RESUME` か `FINALIZE_ONLY`）、実効の設定が同じなら、再開する。設定が違えば、知らせて新しい Run を始める。終わっていれば、何も示さずに新しい Run を始める。選び方は、保存の owner（`run-checkpoint.ts`）の関数で行い、CLI は読んだ値を渡すだけにする。
   - 最も新しいものだけにするのは、古い途中の Run を、後で思いがけず再開しないためである（例: 1日目の Run を止め、2日目に `--new` で最後まで監査した後、3日目に起動すると、1日目の Run を再開してしまう）。
   - 4.7 の「複数なら、最初の実行の開始が最も新しいもの」を、この決まりで置き換える。
-- **版の確かめ**: 起動の前に比べるのは、BeakSight と Playwright の版とする（`RUN_VERSION_FIELDS` から Chromium を外す）。BeakSight は、Playwright に同梱の Chromium だけを使い（`chromium.launch` に `channel` も実行ファイルのパスも渡さない）、Chromium の版は Playwright の版で決まるためである。各実行の Chromium の版は、保存の実行の記録に残る。
+- **版の確かめ**: 起動の前に比べるのは、BeakSight と Playwright の版とする（`RUN_VERSION_FIELDS` から Chromium を外す）。BeakSight は、Playwright に同梱の Chromium だけを使い（`chromium.launch` に実行ファイルのパスを渡さない。`channel` は Playwright に同梱の `'chromium'` だけ。4.10）、Chromium の版は Playwright の版で決まるためである。各実行の Chromium の版は、保存の実行の記録に残る。
 - **知らせ**: 再開するとき（`RESUME`）、最後の処理だけを行うとき（`FINALIZE_ONLY`。違反を検出した後なので、新しいページを始めないことを示す）、設定が違うので再開しない途中の Run があるとき（違う項目のパスを、最大 5 件と残りの件数で示す）、壊れた保存のとき、のそれぞれに1行の文言を示す。
 - **Run の後**: 出力（`finishAuditRun`）を書き終えた後に、Run Coordinator の `checkpointConclusion()` に従う。`FINISH` ならセッションの `finish` に最後の状態を渡し、`ABANDON` なら `abandon` を呼び、`NONE` なら何もしない。
   - 最後の状態が `FINISHED` なら、`finish` の後に、ページの保存（`checkpoint/pages/`）と `state.prev.json` を消し、`state.json` だけを残す（`ArtifactWriter` が行う。Run のディレクトリの外に及ばない）。ページの保存は出力の `page.json` とほぼ同じ中身で、終わった Run では使わないため、ディスクを2倍使わないようにする。`state.json` は、上の「選び方」で、同じ対象の最も新しい Run を知るために残す。消せなかった場合は、警告の1行を示す（終了コードは変えない）。出力の書き出しが失敗した場合は、`abandon` を呼んでから、今のとおり失敗として扱う。`finish` が失敗した場合は、警告の1行（次の起動で最後の処理をやり直すこと）を示し、終了コードは Run Status のとおりにする。
@@ -285,6 +285,32 @@ Run の状態（`state.json`）:
 - `NavigationPacer` は、保存した回数、待ちの合計、最後の読み込みの開始の時刻を `initial` として受け取る。再開の直後の最初の読み込みも、前の回の最後の読み込みから最小間隔以上空ける（実際の時刻で比べる）。
 - `LoadMeter` は、保存した状態から作り直す。1分あたりの最大は、前の回と今回の大きい方とする。
 - 負荷の制御の設計書 4.1 の `initial` に、最後の読み込みの開始の時刻（エポックからのミリ秒、または null）を加える。
+- 再開した実行では、最後の読み込みの開始の時刻を、保存の値と、この実行の開始の時刻の遅い方とする（RR の Minor-1。2026-10-02）。監査の途中のページの読み込みは保存に入らないので、保存の値だけでは、実際の最後の読み込みより前の時刻になりうる。前の回の実際の最後の読み込みは、この実行の開始より前なので、この実行の開始から最小の間隔を空ければ、実際の最後の読み込みからも最小の間隔以上空く（再開のたびに、最大で最小の間隔の分だけ待つ）。
+
+### 4.10 RR の指摘への対応（2026-10-02）
+
+RR（独立レビュー。作業記録置き場の `RR-review-result.md`）の指摘と、設計者が手で確かめた結果への対応を、次のとおり決める。
+
+- **Chromium の起動（Critical-1）**: CLI の Chromium の起動（`PRODUCTION_RUN_DEPENDENCIES.launchBrowser`）に、`channel: 'chromium'` を渡す（headless と headed の両方、すべての OS）。
+  - 理由: headless の既定の `chrome-headless-shell.exe` は、コンソールのプログラムである。Playwright は Windows で、Chromium を BeakSight と同じコンソールにつないで起動する。そのため、Ctrl+C の CTRL_C_EVENT を Chromium も受けて終わり、1回目の Ctrl+C で今のページが失敗のまま「終わったページ」として保存される。`handleSIGINT: false` では防げない（RR の実験と、設計者が本物の CLI で確かめた結果。2026-10-02）。`channel: 'chromium'` では、GUI のプログラムの `chrome.exe` を、新しい headless の方式で動かすので、CTRL_C_EVENT を受けない（RR の実験）。
+  - `channel: 'chromium'` は、Playwright に同梱の Chromium（`npx playwright install chromium` で入るもの）を使う。版は Playwright の版で決まるので、再開の版の比べ方（BeakSight と Playwright だけ。4.7.1）の理由は変わらない（`RUN_VERSION_FIELDS` のコメントを直す）。
+  - テストの Chromium（`tests/` の中で直接 `chromium.launch` するもの）は変えない。CLI を別のプロセスで動かす結合テスト（`tests/integration/cli.test.ts`、`fixture-full-crawl.test.ts`）は、CLI の起動を通るので、この起動で確かめられる。
+  - Windows では、本物の CTRL_C_EVENT を、CLI を動かしているコンソールに送る結合テストを加える（Windows だけで動かす。ほかの OS では、Playwright が Chromium を別のプロセスのグループで起動するので、この問題は起きない）。1回目の Ctrl+C の後に、監査の途中のページが失敗にならずに最後まで監査されることを確かめる。
+- **外部スキームへの移動（R7c の報告の発見事項3。ユーザーの判断「安全側に揃える」。2026-10-02）**: `channel: 'chromium'` では、headless でも、headed と同じ通常の Chromium の本体を使う。そのため、「headless のブラウザには、外部のアプリへ URL を渡す仕組みがない」（Task 19 の前の整理の設計書の DEF-012 の判断）という前提が、CLI の Run では成り立たなくなる。
+  - ページのスクリプトによる外部スキームへの移動を Guard が検出したら、headed と headless を問わず、安全の不変条件の違反として記録し、Context を閉じる（今の headed の扱いに揃える）。移動の試みの記録（`externalSchemeNavigations`）も、今のとおり残す。
+  - 違反のコードを `EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE` から `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED` に改める（headless でも使うので、名前を事実に合わせる）。
+  - Guard は、この判定のためだけに `headed` を受け取っていたので、受け取らないようにする（Context の factory も渡さない）。
+  - 影響: そうした移動をするサイトでは、headless でも Run が `ABORTED_BY_SAFETY` で止まる（ユーザーが受け入れた）。サーバのリダイレクトによる外部スキームへの移動（止めて防げる経路）と、Interaction の凍結の後の移動の扱いは変えない。
+- **違反のある Run の出力の失敗（Important-1 の (b)）**: 保存の終わり方の `FINISH` に、「出力の書き出しに失敗しても `finish` を行う」かどうかを持たせる。値は、保存の owner（`decideRunCheckpointConclusion`）が決め、Run Status が `ABORTED_BY_SAFETY` のときだけ真にする。CLI は、出力の書き出しに失敗したとき、この値が真なら `finish` を行い（失敗したら `abandon`）、偽なら今のとおり `abandon` する。その後、出力の失敗を今のとおり扱う。違反のない Run は、出力をやり直せるよう、今のとおり状態を変えない。
+- **違反を保存に載せる前のプロセスの終わり（Important-1 の (a)）**: 残る制約として受け入れ、5章と README に書く。違反を記録してから、そのページの保存までの間（そのページの残りの段階と、閉じる処理の間）にプロセスが終わると、違反は保存に残らない。次の起動では、そのページを最初から監査し直す。Guard と違反の確かめは同じく働くので、同じ違反が起きれば、そこで止まる。違反をページの途中で保存に書く仕組みは、保存の書き出しをページの監査と並べて行うことになり、複雑になるので作らない。
+- **DEF-022**: 再開した実行では、PREFLIGHT の結果によらず、保存から巡回の記録、採番器、終わったページの結果を作り直す（PREFLIGHT の前に作り直す）。PREFLIGHT に失敗した場合は、残りの URL を理由 `PREFLIGHT_FAILED`（`detail` は `null`）の SKIPPED にする。これで、その実行の出力に前の回までのページが入り、違反がある場合の最後の状態の保存（`FINISHED`）にも、終わったページが入る。保存の終わり方（違反がなければ `ABANDON`）は変えない。作り直しは、Run の初め（保存のセッションを始める前）に行う。保存がスキーマと整合の確かめを通った後でも作り直せない、まれな場合は、ロック、後始末、PREFLIGHT のどれも行わずに、例外で終える（保存は変えない。保存の終わり方は `NONE`。R7b の報告）。
+- **名前の変更の一時的な失敗（Minor-5）**: ArtifactWriter の、一時ファイルから本来の名前への名前の変更（出力と保存の両方で使う1か所）で、`EPERM`・`EBUSY`・`EACCES` の失敗は、短く待って数回やり直す（回数と待ちは名前付きの定数）。Windows で、ウイルス対策や同期のソフトが一時的にファイルを開いている場合に、Run を止めないためである。
+- **README（Minor-2、3、6 と Important-1 の (a)）**: 次を書く。
+  - 最も新しい Run が、最初の保存（robots.txt と sitemap.xml の取得の後）の前に止まった場合と、保存が壊れていた場合は、その Run は数えず、それより古い途中の Run を再開することがある。
+  - Windows で端末のウィンドウを閉じると、OS が数秒でプロセスを終えるので、今のページを終えてから止まるとは限らない（その場合は、プロセスが途中で終わった場合と同じく、次の起動で続きから再開する）。
+  - 2つの起動をほぼ同時に行わないこと（ロックを作るまでの間に、両方が確かめを通りうる）。「同時に1つ」は、起動の間が空いている場合の決まりであること。
+  - 違反を保存に載せる前のプロセスの終わりの制約（上の (a)）。
+- **受け入れる指摘**: Minor-4（時計の大きな変更でのロックの誤判定。まれで、README の注意の対象にもしない）、Minor-7（CLI の2か所の比べ。RR が問題なしと判断）。
 
 ## 5. SSOTと安全性への影響
 
@@ -301,6 +327,7 @@ Run の状態（`state.json`）:
 
 - 違反の後に新しい監査を始めない決まりは、保存した「違反の検出」のフラグと Ledger の snapshot で、再開の後も守る。
 - 違反を検出した Run は、保存に失敗した実行でも、最後に書けた保存を `FINISHED` にする（4.3.2）。最後の状態の保存も書けなかった場合は、次の起動で再開しうる（残る制約）。その場合も、再開の後の違反の確かめと Guard は、同じく働く。
+- 違反を記録してから、そのページの保存までの間にプロセスが終わった場合は、違反は保存に残らない（残る制約。4.10）。次の起動では、そのページを最初から監査し直し、Guard と違反の確かめが同じく働く。
 - 保存と後始末は、Run のディレクトリの外に書いたり消したりしない。
 
 ## 6. 共通部品と共通仕様
@@ -388,3 +415,5 @@ Run の状態（`state.json`）:
 | 2026-10-01 | Blocker: R5a の報告 | 一覧を短くする書式は既存の `truncatedListText` を使う。終了コード 4 は `CONFIG_ERROR` と `RUN_UNAVAILABLE` の2つの結果が同じ値を持つ（終了コードのテストの例外として明示する）。使い方の表示の終了コードの表に「Run を始められない」の行を加える。再開の知らせのページの数は、進み具合の行と同じ書き方（`監査を終えたページ <件数>`）にする | R5a、R5b |
 | 2026-10-02 | R5a と R5a-fix-round-1 の報告 | 保存を読むときの Run の ID とディレクトリの名前の確かめ、保存の違反のフラグを各ページの保存の前に調べてから書くことを 4.2 に加えた | R5a-fix-round-1、R4a2b-fix-round-1 |
 | 2026-10-02 | R5b と R4a2b-fix-round-2 の報告 | 再開の設定の比べ方から出力先を外した（4.7）。robots.txt と sitemap.xml の取得の後の保存の前は、Run の初めからのすべての Ledger を調べることにした（4.2） | R5-fix-round-1、README |
+| 2026-10-02 | RR の指摘と、設計者の手での確かめ（本物の CLI で、1回目の Ctrl+C で headless の Chromium が終わり、監査の途中のページが FAILED のまま保存されることを再現した） | 4.10 を加えた（Chromium を `channel: 'chromium'` で起動する、違反のある Run の出力の失敗でも `finish` を行う、違反を保存に載せる前の終わりを残る制約とする、DEF-022 の直し方、名前の変更のやり直し、README の追記）。4.9 に、再開した実行の最後の読み込みの時刻の決め方を加えた。5章に残る制約を加えた | R7a、R7b、R7c |
+| 2026-10-02 | R7c の報告の発見事項3と、ユーザーの判断（安全側に揃える） | 4.10 に、外部スキームへの移動を headless でも違反にすること、違反のコードの改名、Guard が `headed` を受け取らないことを加えた（Task 19 の前の整理の設計書の DEF-012 の、headless は記録だけとする判断を置き換える） | R7d、README |

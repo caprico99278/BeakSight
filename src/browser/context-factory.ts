@@ -97,8 +97,6 @@ export class BrowserContextFactory {
   readonly #locale: string;
   readonly #timezone: string;
   readonly #allowedOrigins: ReadonlySet<string>;
-  /** 画面を表示して実行するか。値の出どころは設定（`config.browser.headed`）の1つだけで、Guard の取り付けに渡す（C18a）。 */
-  readonly #headed: boolean;
   readonly #ledgerFactory: SafetyLedgerFactory;
   readonly #contextLedgers = new WeakMap<BrowserContext, SafetyLedger>();
   readonly #activeContexts = new WeakSet<BrowserContext>();
@@ -136,7 +134,6 @@ export class BrowserContextFactory {
     this.#locale = config.browser.locale;
     this.#timezone = config.browser.timezone;
     this.#allowedOrigins = canonicalPassiveAllowedOrigins(new Set(config.site.allowedOrigins));
-    this.#headed = config.browser.headed;
     this.#ledgerFactory = ledgerFactory;
     this.#loadMeter = loadMeter ?? null;
     this.#resourceCache = resourceCache ?? null;
@@ -180,9 +177,7 @@ export class BrowserContextFactory {
     this.#activeContexts.add(context);
     // 届け方の部品は、読み込み直しの Context（`REVISIT`）で、Run 全体のキャッシュがある場合だけ渡す（設計書 4.7）。
     const resourceDelivery = role === 'REVISIT' ? this.#createResourceDelivery() : undefined;
-    const guardOptions: PassiveRequestGuardOptions = Object.freeze(
-      resourceDelivery === undefined ? { headed: this.#headed } : { headed: this.#headed, resourceDelivery },
-    );
+    const guardOptions: PassiveRequestGuardOptions = Object.freeze(resourceDelivery === undefined ? {} : { resourceDelivery });
     try {
       await installPassiveRequestGuard(context, ledger, this.#allowedOrigins, guardOptions);
     } catch (error) {

@@ -291,6 +291,28 @@ export function createNavigationPacer(options: {
 - HTML レポートとバンドルには出さない（実行中だけの表示のため。最後の記録は 4.5 の `load`）。
 - headed でも headless でも同じに出す。
 
+### 4.9 ページの先読みを止める（DEF-023。2026-10-02）
+
+- 起きていること: ページに先読みの指定（speculation rules。`<script type="speculationrules">`、`Speculation-Rules` の応答の header）があると、Chromium が、指定のページを先に読み込む（prefetch）か、裏で描画する（prerender）。この要求は、Guard の route も、読み込みの間隔（4.1）も、負荷の記録（4.5）も通らずに、サイトに届く（独立レビュー RR2 の実験。headless shell と通常の Chromium の両方で起きた）。そのため、先読みを使うサイトでは、BeakSight の読み込みの間隔の外で読み込みが増え、記録にも出ない。prerender したページのスクリプトは、Guard の外で動く。
+- 方針: CLI の Chromium の起動（`PRODUCTION_RUN_DEPENDENCIES.launchBrowser`）で、Chromium の先読みの機能を、起動の引数で止める。BeakSight は、先読みの結果を監査に使わない（監査するページは、BeakSight が自分で読み込む）ので、止めても監査の結果は変わらない。
+- 起動の引数は、`src/browser/` の名前付きの定数の閉じた一覧にし、理由をコメントに書く。どの引数で止まるかは、Chromium の版によって変わりうるので、実装者が、ローカルの fixture のページで実際に確かめて決める。確かめる形:
+  - speculation rules の prefetch と prerender（すぐに行う設定）を持つページを開き、一定の時間待つ。先読みの対象のページへの要求が、サーバに1件も届かないこと。
+  - 先読みの対象のページは、ほかのどこからも読み込まない（届いたら、先読みによる要求と分かる）。
+  - 古い形の先読み（`<link rel="prefetch">`、`<link rel="prerender">`）も同じく確かめる。止まらない場合は、その要求が Guard の route を通ること（Guard に見えていること）を確かめ、報告する。
+  - 引数を外すと要求が届く（RED）ことを確かめてから、引数を加えて届かなくなる（GREEN）ことを確かめる。
+- Chromium の版が変わって引数が効かなくなった場合に気づけるよう、この確かめを結合テストとして残す（CLI の起動を通す）。
+- README の「サイトへの負荷」に、BeakSight が先読みを止めることを書く。
+- 結果（DEF-023 の実装。Chromium 151、Playwright 1.62.1。2026-10-02）:
+  - 先読みを「止める」feature は見つからなかった（`--disable-features` の `Prerender2`、`SpeculationRules` など、`--disable-blink-features` の候補は、どれも効かなかった）。効いたのは、`--enable-features` の `PrefetchMultipleActiveSetSizeLimitForBase`（同時に行う prefetch の数の上限）を 0 にする設定（speculation rules の prefetch と、prerender の前に行う prefetch が始まらない。hover と pointerdown で始まるものも止まる）と、`NoStatePrefetchHoldback`（`<link rel="prerender">`）。設計者は、この方式を受け入れた。止まる仕組みは推測を含むので、結合テスト（`tests/integration/preloading-disabled.test.ts`）で見張る。
+  - Chromium は `--enable-features` が複数あると最後の1つだけを使うので、Playwright が自分で加える既定の値（`CDPScreenshotNewSurface`）を、同じ引数に含めて引き継ぐ。`--disable-features` は使わない（使うと、Playwright の既定の `--disable-features` を上書きする）。Playwright の版が変わって既定が変わったら、同じ結合テストで気づく。
+  - `<link rel="prefetch">` は止められない。この要求は Guard の route を通り、許可の判定を受ける（ページの画像などと同じ扱いで、読み込みの間隔の対象ではない）。負荷の記録に数えられることは、R8 で確かめる。
+  - `Speculation-Rules` の応答の header による先読みは、確かめていない（ページの中の指定と同じ仕組みで、同じく止まると推測する）。
+- ページのアイコン（DEF-024。2026-10-03）: 通常の Chromium の本体（`channel: 'chromium'`）は、headless でもページのアイコンを取りに行く。
+  - 既定の `/favicon.ico`（ページにアイコンの指定がない場合）の要求は、Guard の付いた Context では、Playwright 自身が route の手続きを呼ばずに止める（`node_modules/playwright-core` の処理。事象も出さない）。そのため、ふつうはサイトに届かない。ただし、全体の検証で1回だけ、fixture のサーバに届いた（再現しなかった。まれなすり抜けと推測する）。届いた場合も、許可 Origin への GET の1件だけで、負荷の記録には数えられない。
+  - ページがアイコンの URL を指定している場合は、その要求は Guard の route を通り、負荷の記録に数えられる。読み込み直しの Context では、許可 Origin の外へは送らない（今の届け方の決まりのとおり）。
+  - 起動の引数で止める方法は見つからなかった（Chromium 151。調べた候補は DEF-024 の報告）。CDP の `Network.setBlockedURLs` で止める案は、安全の境界のコードを変える割に、得られるのはまれなすり抜けを防ぐことだけなので、採らない。
+  - 設計者の判断: 残る制約として受け入れ、README に書く。fixture の全体の監査のテストは、ブラウザ自身の `/favicon.ico` の GET だけを、「fixture のサイトの外」の確かめから除く（GET と HEAD だけであることの確かめは残す。`tests/integration/site-metadata.test.ts` と同じ扱い）。
+
 ## 5. SSOTと安全性への影響
 
 | 項目 | owner | この設計での扱い |
@@ -392,3 +414,5 @@ export function createNavigationPacer(options: {
 | 2026-10-01 | ユーザーの判断（Task 21 を headed で行い、実行中の表示を加える） | 4.8 を加えた（L7） | L7、Task 21 |
 | 2026-10-01 | L7 の報告 | 進み具合の行の例を、実装の文言に合わせた（4.8）。待った時間の合計も経過時間の書式で示す | L7 |
 | 2026-10-01 | RL の報告 | 4.5 に、数えない要求と間隔の対象外の読み込みの制約を加えた。Owner Matrix（実装タスク指示 第5章）、上位の設計書 24.1、共通部品台帳を更新した（Important-1） | なし |
+| 2026-10-02 | DEF-023（再開の機能の独立レビュー RR2 の指摘2） | 4.9 を加えた（ページの先読みを、CLI の Chromium の起動の引数で止める。確かめを結合テストとして残す） | CLI の Chromium の起動、README |
+| 2026-10-03 | DEF-024（Task 21 の前の全体の検証） | 4.9 に、ページのアイコンの扱い（既定の `/favicon.ico` は Playwright が止めるが、まれに届く。残る制約として受け入れる）を加えた | README、`fixture-full-crawl.test.ts` |

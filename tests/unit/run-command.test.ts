@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium, type Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { CHROMIUM_PRELOADING_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
 import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
@@ -152,18 +153,30 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 
 // R5a（中断した Run の再開の設計書 4.7）: Playwright の既定のシグナルの処理を止める。Ctrl+C などで、Playwright が Browser を閉じて
 // プロセスを終えると、最後の処理（出力の書き出し）が行われないため（シグナルは、R5b で BeakSight が受ける）。
+// R7a（中断した Run の再開の設計書 4.10。RR の Critical-1）: headless と headed の両方で、Playwright に同梱の Chromium の `channel: 'chromium'`
+// （GUI のプログラムの chrome.exe を、新しい headless の方式で動かす）で起動する。既定の headless の chrome-headless-shell.exe はコンソールの
+// プログラムなので、Windows では、1回目の Ctrl+C の CTRL_C_EVENT を受けて終わってしまうためである。
+// DEF-023（サイトへの負荷の制御の設計書 4.9）: ページの先読みを止める起動の引数（`CHROMIUM_PRELOADING_DISABLED_ARGS`）も渡す。値は
+// `src/browser/chromium-launch.ts` の1か所にあり、先読みが止まることは tests/integration/preloading-disabled.test.ts で確かめる。
 describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it.each([true, false])('launches Chromium with headless %s and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
     const browser = { marker: 'the fake browser' } as unknown as Browser;
     const launch = vi.spyOn(chromium, 'launch').mockResolvedValue(browser);
 
     await expect(PRODUCTION_RUN_DEPENDENCIES.launchBrowser({ headless })).resolves.toBe(browser);
 
     expect(launch).toHaveBeenCalledTimes(1);
-    expect(launch).toHaveBeenCalledWith({ headless, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
+    expect(launch).toHaveBeenCalledWith({
+      headless,
+      channel: 'chromium',
+      args: [...CHROMIUM_PRELOADING_DISABLED_ARGS],
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
+    });
   });
 });

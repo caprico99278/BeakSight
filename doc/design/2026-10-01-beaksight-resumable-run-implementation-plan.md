@@ -30,7 +30,15 @@
 | R5a | CLI の再開の流れ: 出力先の実行中の Run の確かめ、途中の Run を探して選ぶ（`state.json` だけで絞り込む）、`--new`、版の確かめ（BeakSight と Playwright）、知らせの文言、保存のセッションを作って渡すこと、Run の後の `finish`・`abandon`、終了コード 4 の結果 `RUN_UNAVAILABLE`、Browser の起動で Playwright のシグナルの処理を止めること | R4b2、L6 | 完了（2026-10-02 までに。fix-round を含む） |
 | R5b | シグナル（1回目は止める印、2回目はすぐに終える）、終了コード 5（`INTERRUPTED`）、README（再開、`--new`、Ctrl+C、終了コード、`maxRuntimeMs` の意味、同じ出力先で同時に1つ、タスク スケジューラの例、進み具合の行の数え方） | R5a | 完了（2026-10-02 までに。fix-round を含む） |
 | R6 | 実行の記録の表示（表示用モデル、HTML、CLI、`summary.json`） | R5b | 完了（2026-10-02 までに。fix-round を含む） |
-| RR | 独立レビュー（読み取り専用） | R6 | 未着手 |
+| RR | 独立レビュー（読み取り専用） | R6 | 完了（2026-10-02。修正が必要。Critical 1、Important 1） |
+| R7a | RR の Critical-1: CLI の Chromium を `channel: 'chromium'` で起動する。Windows で本物の CTRL_C_EVENT を送る結合テスト | RR | 完了（2026-10-02） |
+| R7b | DEF-022（再開した実行の PREFLIGHT の失敗でも、巡回の記録を作り直す）、再開の直後の読み込みの間隔（RR の Minor-1） | RR | 完了（2026-10-02） |
+| R7c | 違反のある Run の出力の失敗でも `finish` を行う（RR の Important-1 の (b)）、名前の変更のやり直し（Minor-5）、README（Important-1 の (a)、Minor-2・3・6、Chromium の起動） | R7b | 完了（2026-10-02） |
+| R7d | 外部スキームへの移動を、headed と headless を問わず違反にする（R7c の報告の発見事項3。ユーザーの判断「安全側に揃える」） | R7c | 完了（2026-10-02） |
+| R7e | R7d の後の古い記述（`evidence-types.ts` のコメント、README の headless を勧める理由）を直す | R7d | 完了（2026-10-02） |
+| RR2 | 修正の後の独立レビュー（読み取り専用） | R7a、R7b、R7c | 完了（2026-10-02。承認。Critical 0、Important 0、Minor 5） |
+| R8 | RR2 の Minor（テストの後片付けのプロセス ID、README の1文、保存を読むときの作り直しの確かめと、作り直せない場合のテスト） | RR2 | 未着手 |
+| DEF-023 | ページの先読み（speculation rules）を、CLI の Chromium の起動の引数で止める（RR2 の Minor-2。Task 21 の前に直す） | RR2 | 未着手 |
 
 R1 は、L のサブタスクとファイルが重ならないので、L2〜L4 と並行で行ってよい。
 
@@ -119,3 +127,9 @@ R1 は、L のサブタスクとファイルが重ならないので、L2〜L4 �
 
 - 読み取り専用のレビュー担当に、設計書と R1〜R6 の報告を渡す。とくに、再開の後も違反の後に監査を始めない決まりが守られること、保存と後始末が Run のディレクトリの外に及ばないこと、「中断しなかった場合と同じ」の確かめが十分なこと、ロックの判定が端末の再起動で誤らないことを確かめる。
 - Critical 0件、Important 0件で完了とする。
+
+## R7: RR の指摘への対応
+
+- 設計書 4.9、4.10。指示書: 作業記録置き場の `R7a-brief.md`、`R7b-brief.md`、`R7c-brief.md`。RR の結果は `RR-review-result.md`。
+- R7a と R7b は、変更するファイルが重ならないので並行で行う。R7c は、Run Coordinator の保存の終わり方の型に触れるので、R7b の後に行う。
+- RR2 で、Critical 0件、Important 0件になれば完了とする。

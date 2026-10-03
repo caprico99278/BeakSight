@@ -66,14 +66,13 @@ export interface GuardResourceDelivery {
 }
 
 /**
- * Guard の取り付けの指定（C18a）。
- * - `headed`: ブラウザの画面を表示して実行するか。値の出どころは設定（`config.browser.headed`）の1つだけで、factory
- *   （`BrowserContextFactory`）が渡す。headed で外部スキームへの移動を検出したら、不変条件の違反として Context を閉じる。
+ * Guard の取り付けの指定（省略できる）。
  * - `resourceDelivery`: 許可した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。省略した場合は、
  *   今のまま、許可した要求をすべてネットワークに送る。
+ * Guard は、headed かどうかを受け取らない（中断した Run の再開の設計書 4.10）。外部スキームへの移動は、headed と headless を問わず、
+ * 不変条件の違反として Context を閉じるためである。
  */
 export interface PassiveRequestGuardOptions {
-  readonly headed: boolean;
   readonly resourceDelivery?: GuardResourceDelivery | undefined;
 }
 
@@ -1126,14 +1125,8 @@ export async function installPassiveRequestGuard(
   context: BrowserContext,
   ledger: SafetyLedger,
   allowedOrigins: ReadonlySet<string>,
-  options: PassiveRequestGuardOptions,
+  options: PassiveRequestGuardOptions = {},
 ): Promise<void> {
-  if (typeof options?.headed !== 'boolean') {
-    const message = 'Passive request guard requires an explicit headed flag';
-    ledger.recordInvariantViolation({ code: 'GUARD_INSTALLATION_FAILED', message });
-    throw new Error(message);
-  }
-  const headed = options.headed;
   const existingState = guardStates.get(context);
   if (existingState !== undefined) {
     const message = `Passive request guard is already installed or invalidated (${existingState.phase})`;
@@ -1200,8 +1193,9 @@ export async function installPassiveRequestGuard(
           const redirectedPredecessors = new RedirectPredecessorRegistry(ledger);
           // C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」、4.2.1）:
           // Document の応答の段階で、3xx の `Location` が外部スキームなら、リダイレクトをたどる前にリクエストを失敗させ、
-          // `externalSchemeNavigations` に `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、headed でも
-          // 違反にしない。ほかの応答は、そのまま続ける（リクエストの段階の判定、許可 Origin とメソッドの判定は、変えない）。
+          // `externalSchemeNavigations` に `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない
+          // （止められないページのスクリプトによる移動とは違う）。ほかの応答は、そのまま続ける（リクエストの段階の判定、許可 Origin と
+          // メソッドの判定は、変えない）。
           // - 凍結の後に届いた応答（凍結の前に続けたリクエストの応答）も、同じく調べる（段階は `INTERACTION`）。凍結の後に始まった
           //   リクエストは、これまでどおりリクエストの段階で `INTERACTION_FROZEN` として止まるので、応答の段階に来ない。
           // - 解析できない `Location` は、fail-closed にする（リクエストを失敗させ、違反を記録して Context を閉じる）。
@@ -1877,7 +1871,8 @@ export async function installPassiveRequestGuard(
   // C18a（DEF-012）: 外部スキームはネットワークを通らないので、route と CDP の Fetch は働かない。Playwright の `request` の
   // 事象は、ページのスクリプトによる移動の経路（main frame・subframe、凍結の前後）で来るので、ここで検出して記録する。止めることはできない。
   // サーバのリダイレクト（3xx の `Location` が外部スキーム）は、この事象が来ないので、Document の応答の段階で、たどる前に止める（C18g）。
-  // headless では記録だけにし、headed では外部のアプリが起動したかもしれないので、不変条件の違反として Context を閉じる。
+  // 中断した Run の再開の設計書 4.10（R7d）: CLI の Chromium は、headless でも通常の Chromium の本体を使うので、headed と headless を
+  // 問わず、外部のアプリが起動したかもしれない。そのため、不変条件の違反として記録し、Context を閉じる（起きた可能性を隠さずに止める）。
   // 検出の処理が例外を投げた場合は、違反を記録して Context を閉じる（fail-closed）。
   const onRequest = (request: Request): void => {
     const phase = guardState.phase;
@@ -1893,21 +1888,15 @@ export async function installPassiveRequestGuard(
       if (scheme === null) {
         return;
       }
-      let invalidationNeeded = false;
-      if (headed) {
-        ledger.recordInvariantViolation({
-          code: 'EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE',
-          message: `Navigation to the external scheme ${scheme} was attempted in headed mode; `
-            + 'an external application may have been launched',
-        });
-        invalidationNeeded = true;
-      }
+      ledger.recordInvariantViolation({
+        code: 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
+        message: `Navigation to the external scheme ${scheme} was attempted; `
+          + 'the browser may have launched an external application',
+      });
       // popup（`window.open`）の navigation は frame ができる前に出るので、frame の種類が分からない。推し量って記録せず、
-      // 既存の frame の分類の失敗（`FRAME_CLASSIFICATION_FAILED`）として Context を閉じる。
+      // 既存の frame の分類の失敗（`FRAME_CLASSIFICATION_FAILED`）も記録する。
       const isMainFrame = classifyMainFrame(request, ledger);
-      if (isMainFrame === undefined) {
-        invalidationNeeded = true;
-      } else {
+      if (isMainFrame !== undefined) {
         ledger.recordExternalSchemeNavigation({
           url,
           scheme,
@@ -1916,9 +1905,7 @@ export async function installPassiveRequestGuard(
           reason: 'EXTERNAL_SCHEME_NAVIGATION',
         });
       }
-      if (invalidationNeeded) {
-        initiateInvalidation(context, ledger);
-      }
+      initiateInvalidation(context, ledger);
     } catch (error) {
       ledger.recordInvariantViolation({ code: 'EXTERNAL_SCHEME_DETECTION_FAILED', message: errorMessage(error) });
       initiateInvalidation(context, ledger);

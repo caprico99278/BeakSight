@@ -33,6 +33,7 @@ import type { EvidenceRecord, Finding, PageAuditResult, RunSummary } from '../..
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { CHATGPT_BUNDLE_FILE_NAMES, type ChatGptBundleManifest } from '../../src/report/chatgpt-bundle.js';
 import { HTML_REPORT_TEXT } from '../../src/presentation/messages.js';
+import { BROWSER_DEFAULT_FAVICON_PATH } from '../helpers/chromium.js';
 import {
   expectFinishedInTime,
   onlyRunDirectory,
@@ -271,8 +272,16 @@ describe('fixture full crawl through the built CLI with the default settings (Ta
 
   it('sends only GET and HEAD to the fixture server, and only for the fixture site', () => {
     expect(observations.length).toBeGreaterThan(0);
+    // GET と HEAD だけであることは、`/favicon.ico` の要求も含めた、すべての要求で確かめる。
     expectOnlyReadRequests(counters, observations);
-    const outside = [...new Set(observations.map(({ pathname }) => pathname))].filter((pathname) => !ALLOWED_REQUEST_PATH.test(pathname));
+    // DEF-024: 通常の Chromium の本体（CLI の `channel: 'chromium'`）は、headless でもページのアイコンを取りに行く。
+    // 既定の `/favicon.ico` の要求は、Guard の付いた Context では Playwright が止めるが、まれにサーバに届く。
+    // このブラウザ自身の要求（`/favicon.ico` への GET）だけを、fixture のサイトの外の確かめから除く（サイトへの負荷の制御の設計書 4.9）。
+    const isBrowserFaviconRequest = ({ method, pathname }: Readonly<FixtureRequestObservation>): boolean =>
+      method === 'GET' && pathname === BROWSER_DEFAULT_FAVICON_PATH;
+    const outside = [
+      ...new Set(observations.filter((observation) => !isBrowserFaviconRequest(observation)).map(({ pathname }) => pathname)),
+    ].filter((pathname) => !ALLOWED_REQUEST_PATH.test(pathname));
     expect(outside).toEqual([]);
   });
 

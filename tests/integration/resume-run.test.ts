@@ -22,11 +22,13 @@ import {
   artifactFilePath,
   CHECKPOINT_ARTIFACT_DIRECTORY,
   checkpointArtifactRelativePath,
+  pageArtifactRelativePath,
   PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, Finding, PageId, RunProgressReport } from '../../src/core/contracts.js';
+import type { AuditRunResult, Finding, PageAuditResult, PageId, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
+import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -57,6 +59,7 @@ import {
   expectSchemaValid,
   fastRunConfig,
   readJson,
+  readRunAudit,
 } from '../helpers/run-harness.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
@@ -689,5 +692,116 @@ describe('R4b2: a Run stopped by the stop signal after the k-th page and resumed
     expect(decideRunResumption(finalState)).toBe('NOT_RESUMABLE');
     // セッションの `finish` がロックを外した。
     expect(existsSync(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock')))).toBe(false);
+  });
+});
+
+// R7b（中断した Run の再開の設計書 4.10 の DEF-022）: 再開した実行で PREFLIGHT に失敗しても、その実行の出力（本物の `ArtifactWriter.writeRun`
+// で書いた run.json、audit.json、ページの page.json）に、前の回までに終わったページが入り、残りの URL は、理由 `PREFLIGHT_FAILED`
+// （`detail` は `null`）の SKIPPED になる。PREFLIGHT の失敗は、Chromium を起動できない launcher で起こす（本物の PREFLIGHT が `BROWSER_LAUNCH`
+// で失敗する。対象のサイトにはアクセスしない）。違反がないので、保存の終わり方は `ABANDON` で、保存は変わらない（次の起動で、もう一度再開できる）。
+describe('R7b: a resumed execution whose PREFLIGHT fails writes the pages finished before the interruption into its output (resumable run design 4.10 DEF-022)', () => {
+  /** 中断する前に保存を終えるページの数（k）。k+1 ページ目のページの保存の前に中断する。 */
+  const PAGES_BEFORE_INTERRUPTION = 2;
+  const PREFLIGHT_FAILED_SKIP = Object.freeze({ code: 'PREFLIGHT_FAILED', detail: null });
+
+  let interrupted: AuditRunResult;
+  let runDirectory: string;
+  let saved: { readonly state: RunCheckpoint; readonly pages: readonly RunCheckpointPage[] };
+  let resumed: AuditRunResult;
+  let conclusion: RunCoordinatorCheckpointConclusion;
+  let writtenRun: RunSummary;
+  let writtenAudit: Awaited<ReturnType<typeof readRunAudit>>;
+  let writtenPages: PageAuditResult[];
+  let savedAfterResume: { readonly state: RunCheckpoint; readonly pages: readonly RunCheckpointPage[] };
+  let pathsObservedByResumedRun: string[];
+  let launchAttempts = 0;
+
+  beforeAll(async () => {
+    const config = fastRunConfig(server.origin, START_PATH);
+    // k+1 ページ目のページの保存の前に中断する Run（ロックは、端末を再起動する前の OS で取る。再開のセッションが作り直す）。
+    const output = join(workDirectory, 'preflight-failed');
+    const interruptedSession = newSession(
+      wrappedStore(new ArtifactWriter(), [], { interruptBeforePage: PAGES_BEFORE_INTERRUPTION + 1 }),
+      lockHostBeforeOsRestart,
+    );
+    interrupted = await runCoordinator({ config, outputDirectory: output, session: interruptedSession });
+    // プロセスが終わったことを模す（ハートビートを止める。ロックのファイルは残る）。
+    await interruptedSession.abandon();
+    runDirectory = runArtifactDirectory(output, interrupted.run.runId);
+    saved = await readSavedCheckpoint(runDirectory);
+    expect(decideRunResumption(saved.state)).toBe('RESUME');
+
+    // 再開した実行。Chromium を起動できない（PREFLIGHT が BROWSER_LAUNCH で失敗する）。
+    const failingLauncher: BrowserLauncher = async () => {
+      launchAttempts += 1;
+      throw new Error('the browser cannot be launched in this test');
+    };
+    const resumedSession = newSession(new ArtifactWriter());
+    const coordinator = new RunCoordinator({
+      config,
+      launchBrowser: failingLauncher,
+      createSafetyLedger: () => new SafetyLedger(),
+      clock: () => new Date(),
+      now: () => Date.now(),
+      outputDirectory: join(workDirectory, 'preflight-failed-resumed-output-root'),
+      checkpointSession: resumedSession,
+      resumeFrom: { runDirectory, checkpoint: saved.state, pages: saved.pages },
+    });
+    server.resetCounters();
+    server.resetRequestObservations();
+    resumed = await coordinator.run();
+    pathsObservedByResumedRun = observedPaths();
+    // CLI と同じく、出力を書いた後に、保存の終わり方に従う（設計書 4.7.1）。出力は、前の回と同じ Run のディレクトリに書く。
+    await new ArtifactWriter().writeRun(resumed, { outputDirectory: output });
+    conclusion = coordinator.checkpointConclusion();
+    if (conclusion.action === 'ABANDON') {
+      await resumedSession.abandon();
+    }
+    writtenRun = await readJson(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run)) as RunSummary;
+    writtenAudit = await readRunAudit(runDirectory);
+    writtenPages = [];
+    for (const { pageId } of writtenAudit.pages) {
+      writtenPages.push(await readJson(artifactFilePath(runDirectory, pageArtifactRelativePath(pageId, 'page'))) as PageAuditResult);
+    }
+    savedAfterResume = await readSavedCheckpoint(runDirectory);
+  }, SUITE_TIMEOUT_MS);
+
+  it('writes the pages finished before the interruption into run.json, audit.json and their page.json, the rest as SKIPPED with PREFLIGHT_FAILED, and leaves the checkpoint as it was', async () => {
+    // PREFLIGHT は、Chromium を起動できずに失敗する（対象のサイトには、何も要求しない）。Run Status は FAILED、Run の理由の PREFLIGHT_FAILED は1件。
+    expect(launchAttempts).toBe(1);
+    expect(pathsObservedByResumedRun).toEqual([]);
+    expect(resumed.run.runStatus).toBe('FAILED');
+    expect(resumed.run.incompleteReasons).toEqual([{ code: 'PREFLIGHT_FAILED', detail: 'BROWSER_LAUNCH' }]);
+    expect(writtenRun.runStatus).toBe('FAILED');
+    expect(writtenRun.incompleteReasons).toEqual(resumed.run.incompleteReasons);
+
+    const finishedPageIds = saved.state.completedPageIds;
+    expect(finishedPageIds).toHaveLength(PAGES_BEFORE_INTERRUPTION);
+    // 終わったページの結果は、前の回の Run の結果（開始のページの robots.txt と sitemap.xml の Evidence を含む）と同じ。
+    const finishedPages = interrupted.pages.slice(0, PAGES_BEFORE_INTERRUPTION);
+    expect(finishedPages.map(({ pageId }) => pageId)).toEqual(finishedPageIds);
+    const asWritten = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown;
+    expect(writtenAudit.pages.slice(0, PAGES_BEFORE_INTERRUPTION)).toEqual(asWritten(finishedPages));
+    expect(writtenPages.slice(0, PAGES_BEFORE_INTERRUPTION)).toEqual(asWritten(finishedPages));
+    expect(writtenAudit.findings).toEqual(asWritten(finishedPages.flatMap(({ findings }) => findings)));
+    // 残りの URL は、保存の巡回の記録の、終わっていない URL（同じページの ID）。理由 PREFLIGHT_FAILED の SKIPPED。
+    const rest = saved.state.frontier.entries.filter(({ pageId }) => !finishedPageIds.includes(pageId));
+    expect(rest.length).toBeGreaterThan(0);
+    expect(writtenAudit.pages.map(({ pageId }) => pageId)).toEqual(saved.state.frontier.entries.map(({ pageId }) => pageId));
+    expect(writtenAudit.pages.slice(PAGES_BEFORE_INTERRUPTION).map(({ pageUrl, status, incompleteReasons }) => [pageUrl, status, incompleteReasons]))
+      .toEqual(rest.map(({ url }) => [url, 'SKIPPED', [PREFLIGHT_FAILED_SKIP]]));
+    expect(writtenPages.slice(PAGES_BEFORE_INTERRUPTION).map(({ status }) => status)).toEqual(rest.map(() => 'SKIPPED'));
+    expect(writtenRun).toMatchObject({
+      runId: saved.state.runId,
+      startedAt: saved.state.startedAt,
+      discoveredPageCount: saved.state.frontier.entries.length,
+      skippedPageCount: rest.length,
+    });
+    await expectSchemaValid(resumed);
+
+    // 違反はないので、保存の終わり方は ABANDON で、保存は変わらない（次の起動で、もう一度再開できる）。
+    expect(conclusion).toEqual({ action: 'ABANDON' });
+    expect(savedAfterResume.state).toEqual(saved.state);
+    expect(decideRunResumption(savedAfterResume.state)).toBe('RESUME');
   });
 });
