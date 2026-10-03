@@ -361,5 +361,34 @@
   - 違反がない場合は、保存の終わり方が `ABANDON` なので、保存の状態は変わらず、次の起動で再開して出力を書き直す（残る影響は、その間の出力が不完全なことだけ）。
   - 再開した実行の PREFLIGHT で違反も記録した場合は、最後の状態が `FINISHED`（巡回の記録が空の中身）になり、不完全な出力が残る。安全の決まり（違反の後に監査を始めない）は守られている。
 - 重大度: Minor（まれな場合で、安全には関わらない）。
-- 方針（案）: 再開のときは、PREFLIGHT の結果によらず、保存から巡回の記録と終わったページの結果を作り直し、残りの URL を PREFLIGHT の失敗の理由の SKIPPED にする。RR の独立レビューの後に扱いを決める。
-- 状態: 未着手。
+- 方針: 再開のときは、PREFLIGHT の結果によらず、保存から巡回の記録と終わったページの結果を作り直し、残りの URL を理由 `PREFLIGHT_FAILED` の SKIPPED にする（設計書 4.10）。
+- RR の判断（2026-10-02）: 違反がある場合は前の回までのページの結果を取り戻せないので、全体を Important とし、Task 21 の前に直す。
+- 状態: 完了（R7b。2026-10-02。設計者が関連の検証で確かめた）。
+
+## DEF-023 ページの先読み（speculation rules）の要求が、Guard・pacer・LoadMeter を通らずにサイトに届く（2026-10-02 RR2 の指摘2で登録）
+
+- 現象: ページに speculation rules（`<script type="speculationrules">` や、`Speculation-Rules` の応答の header）があると、Chromium が、指定のページを先に読み込む（prefetch）か、裏で描画する（prerender）。その要求は、Guard の route も、読み込みの間隔（NavigationPacer）も、負荷の記録（LoadMeter）も通らずに、サイトに届く。
+- 再現: RR2 のレビュー担当が、127.0.0.1 の自作のサーバに、prefetch と prerender の先読みの指定（すぐに行う設定）を持つページを置き、ビルド済みの `BrowserContextFactory` と `SafetyLedger` で読み込んだ。headless shell と `channel: 'chromium'` の両方で、サーバに `GET /prefetched.html`（`Sec-Purpose: prefetch`）と `GET /prerendered.html`（`prefetch;prerender`）が届いた。Ledger の記録も route の事象も0件だった。prerender したページからの POST は届かなかった。
+- 影響: 先読みを使うサイトでは、BeakSight の読み込みの間隔の外で、ページの読み込みが増える。その分は負荷の記録に出ない。prerender したページのスクリプトは、Guard の外で動く（今回の実験では、POST は届かなかった）。サイトへの負荷の決まり（短い時間に多くの要求を送らない）と、読み取り専用の保証の両方に関わる。
+- 発生の時期: 今回の変更（R7a）より前からある（2つの Chromium で違いがない）。負荷の制御の設計書 4.2.1 で「確かめていない」としていたものが、現に起きると分かった（推測ではなく、レビュー担当の実験による）。
+- 重大度: Task 21（本来の監査対象のサイト）の前に直す。
+- 状態: 設計中。
+- 対応（2026-10-02 DEF-023 の実装）: CLI の Chromium の起動の設定を `src/browser/chromium-launch.ts` にまとめ、`--enable-features` に `NoStatePrefetchHoldback` と `PrefetchMultipleActiveSetSizeLimitForBase:...value/0`（Playwright の既定の `CDPScreenshotNewSurface` を引き継ぐ）を渡す。speculation rules の prefetch と prerender、`<link rel="prerender">` の先読みは、サーバに届かなくなった。`<link rel="prefetch">` は止められないが、Guard の route を通る（負荷の記録に数えられるかは R8 で確かめる）。結合テスト `tests/integration/preloading-disabled.test.ts` で見張る。設計者の確認: 7ファイル 142件 PASS、`npm run typecheck` PASS。
+- 状態: 完了（R8 で、`<link rel="prefetch">` の要求が負荷の記録に数えられることを確かめた。2026-10-02）。
+
+## DEF-024 通常の Chromium が、ページのアイコン（favicon）を取りに行く（2026-10-02 Task 21 の前の全体の検証で登録）
+
+- 現象: Task 21 の前の `npm run verify` で、`tests/integration/fixture-full-crawl.test.ts` の「fixture のサーバに、GET と HEAD だけを、fixture のサイトの分だけ送る」が失敗した。サーバが、fixture のサイトの外の `/favicon.ico` の GET を受けていた（`expected [ '/favicon.ico' ] to deeply equal []`）。
+- 推定の原因: R7a で、CLI の Chromium を `channel: 'chromium'`（通常の Chromium の本体）で起動するようにした。通常の Chromium は、headless でもページのアイコンを取りに行く（以前の `chrome-headless-shell` では起きなかった）。R7a と DEF-023 の実装者の検証、R7 の後の全体の検証では、同じテストが PASS したので、時々起きる（推測）。
+- 影響（未確認）: GET だけで、送信の安全には関わらない。ただし、ブラウザ自身が出す要求なので、ページの先読み（DEF-023）と同じく、Guard の route、読み込みの間隔、負荷の記録を通らない可能性がある。ページが許可 Origin の外のアイコンを指していれば、その Origin にも要求が届く可能性がある。
+- 同じ検証で、vitest のワーカーの異常終了（DEF-015）も1回起きた。
+- 調査の結果（2026-10-03。実装者の報告）: 既定の `/favicon.ico` の要求は、Guard の付いた Context では Playwright 自身が止める（事象も出さない）。全体の検証で届いた1件は再現せず、まれなすり抜けと推測する。ページがアイコンの URL を指定している場合は、Guard を通り、負荷の記録に数えられ、読み込み直しでは許可 Origin の外へ送らない。起動の引数で止める方法は見つからなかった。
+- 設計者の判断: 残る制約として受け入れる（許可 Origin への GET の1件だけで、負荷も安全への影響もごく小さい）。README に書き、fixture の全体の監査のテストは、ブラウザ自身の `/favicon.ico` の GET だけを「fixture のサイトの外」の確かめから除く（負荷の制御の設計書 4.9）。
+- 状態: 完了（2026-10-03。残る制約として受け入れ、DEF-024-fix でテストと README を直した）。
+
+## DEF-025 Guard の付いた Context では、URL が `/favicon.ico` で終わる要求が、ページの画像なども含めて黙って止められる（2026-10-03 DEF-024 の調査で登録）
+
+- 現象（コードからの事実。実験は `<link rel="icon">` だけ）: Playwright 1.62.1 は、route のある Context で、URL が `/favicon.ico` で終わる要求を、route の手続きを呼ばずに `abort("aborted")` で止め、`request` などの事象も出さない（`node_modules/playwright-core/lib/coreBundle.js` の 13225 行、22762〜22795 行）。そのため、ページの `<img src=".../favicon.ico">` なども、Guard の Context では読み込まれない。
+- 影響（推測）: そうした画像を表示するページで、画像が壊れたように見え、監査の結果（スクリーンショット、画像の Finding など）が、利用者の見え方と違うことがある。Task 5 からある振る舞いで、今回の変更とは関係ない。
+- 重大度: 低い（Minor）。Task 21 の結果で、実際に起きているかを見る。
+- 状態: 記録だけ（Task 21 の後に扱いを決める）。

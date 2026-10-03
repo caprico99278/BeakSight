@@ -373,7 +373,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     tone: 'shield',
     // C18g: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
     description:
-      '外部スキーム（tel:、mailto: など）への移動の記録です。理由が EXTERNAL_SCHEME_NAVIGATION の記録は、ページが移動を試みたものです。ブラウザは移動していませんが、画面を表示する実行（headed）では、外部のアプリが起動した可能性があります。理由が EXTERNAL_SCHEME_REDIRECT_BLOCKED の記録は、サーバのリダイレクトを、ブラウザがたどる前に止めたものです。',
+      '外部スキーム（tel:、mailto: など）への移動の記録です。理由が EXTERNAL_SCHEME_NAVIGATION の記録は、ページが移動を試みたものです。ブラウザは移動していませんが、外部のアプリが起動した可能性があるので、安全の不変条件の違反として記録し、Run を止めます。理由が EXTERNAL_SCHEME_REDIRECT_BLOCKED の記録は、サーバのリダイレクトを、ブラウザがたどる前に止めたものです。',
   },
 } as const satisfies Record<SafetyEventKind, DisplaySpec>);
 

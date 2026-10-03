@@ -2607,3 +2607,123 @@
    - 端末の再起動を模したロックでも、再開できる。
 4. DEF-022 の扱いを、RR の判断を見て決める。
 5. Task 21 の手順書を書く（headed と実行中の進み具合の行で、負荷を見ながら行う。`crawl.maxPages` と `crawl.maxRuntimeMs` はユーザーと決める。本来の監査対象のサイトの名前と設定のファイル名は、Git に載るファイルに書かない）。
+
+### 2026-10-02 RR の結果と、設計者の手での確かめ
+
+- 作業の前に: 作業ツリーの変更は、ユーザーがコミット `9f01468`（「作業保存」）にしていた。`local/` と `artifacts/` が入っていないこと、本来の監査対象のサイトの名前がないことを確かめた。
+- RR: 修正が必要（Critical 1、Important 1、Minor 7）。中身は `RR-review-result.md`。
+- 設計者の手での確かめ（スクラッチパッドの `ctrlc-check/`。ローカルの 127.0.0.1:48731 だけが対象）:
+  - 1回目の Run（`run1`）: 普通に最後まで。`COMPLETE`、`checkpoint/` は `state.json` だけ、実行の記録は1件（`COMPLETED`）、ページの読み込みは 59秒で20回（間隔 3秒のとおり）。
+  - 2回目の Run（`run2`、`--new`、headless）: 2ページ目の後に、起動用のスクリプトから本物の CTRL_C_EVENT を送った。止める知らせが出て、`PARTIAL`、終了コード 2、`STOPPED`、残りは `RUN_INTERRUPTED`。ただし、監査の途中の3ページ目が `FAILED`（`browser.newContext: Target page, context or browser has been closed`）になり、終わったページとして保存された。RR の Critical-1 を、本物の CLI で再現した。
+  - 道具の注意: この環境では、ほかのプロセスのコンソールへの `AttachConsole` がエラー 1341 で失敗する。自分のコンソールで CLI を動かし、自分のコンソールに CTRL_C_EVENT を送る起動用のスクリプトにした。Windows PowerShell 5.1 は BOM のない `.ps1` を旧来の文字コードで読むので、スクリプトに日本語を入れると改行が失われる（英数字だけにした）。
+- 設計者の判断: 設計書に 4.10 を加えた（Chromium を `channel: 'chromium'` で起動する、違反のある Run の出力の失敗でも `finish` を行う、違反を保存に載せる前の終わりは残る制約とする、DEF-022 の直し方、名前の変更のやり直し、README の追記）。4.9 に再開した実行の最後の読み込みの時刻の決め方、5章に残る制約を加えた。
+- R7a（Chromium の起動と、Windows の本物の Ctrl+C の結合テスト）と R7b（DEF-022 と、再開の直後の読み込みの間隔）を、ファイルが重ならないことを確かめて並行で起動した。R7c（出力の失敗でも `finish`、名前の変更のやり直し、README）は R7b の後に行う。
+- 本来の監査対象のサイトには、今日は一度もつないでいない（ユーザーの問いに答えて確かめた。動いているプロセスは、ローカルの配信用のサーバだけだった）。
+
+### 2026-10-02 R7a、R7b 完了
+
+- R7a（Chromium の起動）: `PRODUCTION_CHROMIUM_CHANNEL = 'chromium'` を `chromium.launch` に渡す。`RUN_VERSION_FIELDS` のコメントを直した。Windows だけで動く結合テスト `tests/integration/cli-interrupt-windows.test.ts` と補助 `tests/helpers/windows-console-ctrl.ts` を加えた（自分のコンソールの PowerShell から本物の CTRL_C_EVENT を送る。`detached: true` では PowerShell がコンソールを持たないので、`windowsHide: true` と引き継がない標準入出力で起動する）。直す前は3ページ目が `FAILED` になり（RED）、直した後は PASS した。
+  - 設計者の確認: `tests/unit/run-command.test.ts`、`cli.test.ts`、`run-checkpoint.test.ts`、`tests/integration/cli-interrupt-windows.test.ts`、`fixture-full-crawl.test.ts`、`tests/architecture` の 8ファイル 376件 PASS（138秒）。`npm run typecheck` → PASS。
+  - 発見事項: 2回目の Ctrl+C の確かめの一部は、もとから RED の対象ではない → 受け入れる。直した後のテストで RED を実行し直していない1点 → 1回目の Ctrl+C の確かめで RED を確かめているので、受け入れる。
+- R7b（DEF-022 と、再開の直後の読み込みの間隔）: `restoredCrawlProgress` で、PREFLIGHT の前に巡回の記録と採番器を作り直す。再開した実行で PREFLIGHT に失敗すると、残りの URL を `PREFLIGHT_FAILED` の SKIPPED にし、出力に前の回までのページが入る。違反がある場合の最後の状態の保存にも、終わったページが入る。再開した実行の pacer の最後の読み込みの開始の時刻を、保存の値とこの実行の開始の遅い方にした。
+  - 設計者の確認: 関連の検証 10ファイル 613件 PASS。違反の件数を調べる場所は `#detectSafetyViolation` だけ、`deriveRunStatus` の呼び出しは1か所。
+  - 発見事項: 1（保存から作り直せないまれな場合は、セッションを始める前に例外で終える）→ 保存を変えないので安全側。設計書 4.10 に書き足した。2（PREFLIGHT にだけ違反がある場合の保存のフラグ）→ 状態が `FINISHED` なので振る舞いは変わらない。受け入れる。3（`FINALIZE_ONLY` の保存から再開して PREFLIGHT に失敗した場合の理由）→ Run Status は違反の件数から `ABORTED_BY_SAFETY` になるので、受け入れる。
+- DEF-022 は R7b で直した（状態を「完了（R7b）」とする）。
+- R7c を起動した。
+
+### 2026-10-02 R7c 完了と、外部スキームの扱いの判断
+
+- R7c: `RunCheckpointConclusion` と `RunCoordinatorCheckpointConclusion` の `FINISH` に `finishEvenIfOutputFails`（`ABORTED_BY_SAFETY` のときだけ真。規則は `run-checkpoint.ts` の1か所）。CLI は出力の失敗の後に、真なら `finish`（失敗なら `abandon`。片付けはしない）、偽なら `abandon`。ArtifactWriter の名前の変更を `renameWithRetry` に通した（`EPERM`・`EBUSY`・`EACCES` を、最大 5 回、100ms ごとにやり直す）。README に、Chromium の起動、最も新しい Run の数え方、ウィンドウを閉じた場合、同時の起動、違反を保存に載せる前の終わり、違反のある Run の出力の失敗を書いた。
+  - 設計者の確認: 関連の検証 11ファイル 801件 PASS。`npm run typecheck` → PASS。
+  - 発見事項: 1（出力の書き出しも差し替えたファイルの操作の `rename` を通る）→ 本番の振る舞いは変わらないので受け入れる。2（永続的な `EPERM` でも最大 400ms 待つ）→ 受け入れる。4（出力の失敗の後に `finish` も失敗したときの警告がない）→ 出力の失敗の文言が出るので受け入れる（この場合は、5章の残る制約のとおり再開しうる）。
+  - 発見事項3（重要）: README の「headless のブラウザには、外部のアプリへ URL を渡す仕組みがない」は、`chrome-headless-shell` の前提。R7a の `channel: 'chromium'` では、headless でも通常の Chromium の本体を使うので、この前提が成り立たない。Guard は `headed` の設定だけで、外部スキームへの移動を違反にするかを決めている。
+- ユーザーの判断（AskUserQuestion。2026-10-02）: 「安全側に揃える（推奨）」。headless でも headed と同じく、ページのスクリプトによる外部スキームへの移動を違反として止める。
+- 設計者の対応: 設計書 4.10 に、headed と headless を問わず違反にすること、違反のコードを `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED` に改めること、Guard が `headed` を受け取らないことを加えた。Task 19 の前の整理の設計書（DEF-012）に、置き換えた旨を追記した。R7d として依頼した。
+- Task 21 は headed で行うので、Task 21 の安全の性質は、この変更の前後で変わらない（headed は、もとから違反として止める）。
+
+### 2026-10-02 R7d 完了（外部スキームへの移動を、headed と headless を問わず違反に）
+
+- 実装者の報告: Guard が `headed` を受け取らないようにし、ページのスクリプトによる外部スキームへの移動を、必ず違反 `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED` として記録して Context を閉じる。移動の試みの記録は残す。factory の `#headed` を消した。表示カタログの説明、README の3か所を直した。テストは、headless で記録だけを確かめていたものを違反の確かめに直し、モードで二重になっていたものをまとめた（Gate の補助は `createGateFactory`）。`EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE` は残っていない。
+  - 実装者の検証: 指示書の3組（7ファイル 450件、23ファイル 562件、単体 59ファイル 2,875件）と型チェックが PASS。
+  - 発見事項: 1（`evidence-types.ts` の古いコメント）と 3（README で headless を勧める理由が消えた）→ R7e で直す。2（共通部品台帳）→ 設計者が更新した。4〜6（Interaction の結果の変化、click の数の確かめをやめたこと、テストの数の減少）→ 仕様の変更の結果で、確かめる内容を減らしていないので受け入れる。
+- R7e を起動した（コメントと README だけ）。
+
+### 2026-10-02 R7e 完了
+
+- `src/core/evidence-types.ts` の外部スキームのコメント2か所を、headed と headless を問わない今の扱いに直した（コメント以外の差分なし）。README の「headed で実行するときの注意」に、headless を勧める理由（Context ごとにウィンドウが開き、実行中は画面がほぼ使えない。外部のアプリの扱いは同じ）を書き足した。
+- 実装者の検証: `tests/architecture` と `core-contracts` の 175件 PASS、`npm run typecheck` PASS。
+- 全体の検証（`npm run verify`）を起動した。
+- 全体の検証: `npm run verify` → PASS（型チェック、115ファイル 4,726件、ビルド。終了コード 0。テストの所要時間 354秒）。記録はスクラッチパッドの `verify-20261002-r7.log`。
+
+### 2026-10-02 設計者の手での確かめ（R7 の後のビルド。設計書 第10章の完了条件）
+
+- 対象はローカルの 127.0.0.1:48731 の fixture だけ（スクラッチパッドの `ctrlc-check/`）。headless。本物の CTRL_C_EVENT を、起動用のスクリプトから CLI のコンソールに送った。
+- `run3`（`--new`、2ページ目の後に1回目の Ctrl+C）: 止める知らせ、`PARTIAL`、終了コード 2、`STOPPED`、違反 0。監査の途中の3ページ目は `AUDITED`（R7a の前は `FAILED` だった）。残りは `RUN_INTERRUPTED`。
+- `run4`（同じコマンド）: 再開の知らせ、同じ Run の ID、`COMPLETE`、8/8 ページ、終了コード 0。指摘の件数は、中断しなかった `run1` と同じ（エラー 16、警告 8、情報 1）。ページの読み込みは合計 20回で、`run1` と同じ。起動の記録は `STOPPED_BY_SIGNAL`、`COMPLETED`。`checkpoint/` は `state.json` だけ。
+- `run5`（`--new`、1回目の後に2回目の Ctrl+C）: 2つの知らせ、終了コード 5、`IN_PROGRESS`（終わったページ 2）、ロックが残る。Chromium と CLI のプロセスは残っていない。
+- `run7`・`run8`: `run5` と同じく2回目の Ctrl+C で止めた後、ロックを、動いているプロセス（配信用のサーバ）の ID・今の時刻のハートビート・1時間前の OS の起動の時刻に書き換えた（端末の再起動を模す）。同じコマンドで再開し、`COMPLETE`、8/8、起動の記録は `INTERRUPTED_ABNORMALLY`、`COMPLETED`。
+  - 注: `run6` では、ロックに入れたプロセスの ID が、検索に使った PowerShell 自身のものだった（すぐ終わる）ので、起動の時刻の確かめとしては数えない。
+- 配信用のサーバは止めた。本来の監査対象のサイトには、つないでいない。
+
+### 2026-10-02 RR2 の結果と、次の作業
+
+- RR2: 承認（Critical 0、Important 0、Minor 5）。中身は `RR2-review-result.md`。1回目の RR の指摘は、すべて直ったか、理由を付けて受け入れられた。再開の機能は、これで完了とする（Minor の対応は R8 と DEF-023 で行う）。
+- Minor の扱い:
+  - 1（テストの後片付けのプロセス ID）、3（README の1文）、4（保存を読むときの作り直しの確かめと、作り直せない場合のテスト）→ R8。
+  - 2（ページの先読みが Guard・pacer・LoadMeter を通らずにサイトに届く。前からある問題）→ DEF-023 として登録し、負荷の制御の設計書に 4.9 を加えた（CLI の Chromium の起動の引数で、先読みを止める）。Task 21 の前に直す。
+  - 5（実装計画の状態）→ 設計者が直した。
+- DEF-023 を起動した。R8 は README に触れるので、DEF-023 の後に起動する。
+
+### 2026-10-02 DEF-023 完了（ページの先読みを止める）
+
+- 実装者の報告と、設計者の確認は `defects.md` の DEF-023 のとおり。設計書（負荷の制御）4.9 に結果を書き、共通部品台帳を更新した。
+- 発見事項の扱い: 1（止め方が「上限を 0 にする」設定であること）と 2（Playwright の既定の `--enable-features` を引き継ぐこと）→ 結合テストで見張るので受け入れる。3（`<link rel="prefetch">` は止まらず、負荷の記録に数えられるかは未確認。README が言い過ぎ）→ R8 に加えた。4（台帳）→ 設計者が更新した。
+- R8 を起動する。
+
+### 2026-10-02 R8 完了（RR2 の Minor と、`<link rel="prefetch">` の負荷の記録）
+
+- 実装者の報告: 保存を読むときの整合の確かめで、採番器と巡回の記録を作り直せるかを確かめる（作り直せなければ壊れた保存。エラー文の URL は伏せる）。Run Coordinator の作り直せない場合（セッションの前に reject、`NONE`）のテスト。CLI が作り直せない保存を壊れた保存として知らせるテスト。テストの後片付けは、終了コードのファイルがあれば止めず、なければコマンド行を確かめてから止める。README に、違反のある Run で保存の終わりも書けなかった場合の1文と、`<link rel="prefetch">` の扱いを書いた。`<link rel="prefetch">` の要求は、`LoadMeter` の許可 Origin への要求の数に入ることを確かめた（Blocker なし）。
+- 設計者の確認: 関連の検証 7ファイル 523件 PASS。`npm run typecheck` PASS。
+- 発見事項の扱い: 1（エラー文の URL を伏せた）→ 受け入れる。2（作り直しの引数の組み立ての重複）→ CC-040 として登録した。3（README の表の行の言い過ぎ）→ R8-fix-round-1 で直す。4（起動のたびの作り直しの確かめで、起動が少し遅くなりうる。推測）と 5（前からある弱い確かめ）→ 記録だけ。
+- DEF-023 の R8 の確かめ（`<link rel="prefetch">` が負荷の記録に数えられること）が済んだので、DEF-023 を完了とする。
+
+### 2026-10-02 R8-fix-round-1 完了と、Task 21 の手順書
+
+- R8-fix-round-1: README の表の「安全の不変条件の違反を検出した」の行に、結果のファイルも保存の終わりも書けなかった場合は再開しうることを加えた（その1行だけ）。
+- ユーザーの判断（2026-10-02）: 「1時間の起動で監査できるのは、数十ページ程度で十分とする。まずは監査先の負荷を抑える形で開始したい」。設定は既定値のまま（間隔 5秒、1回の起動の上限 1時間、ページ数の上限 500、候補の上限 20）。本来の監査対象のサイトの設定（`local/targets/`）は `target` と `site` だけで、変えない。
+- Task 21 の手順書 `T21-procedure.md` を書いた（headed、ユーザーが Terminal の欄で起動し、設計者が画面と PC の受信を見張る。止める目安: 許可 Origin への要求の1分あたり最大が 600件を超える、受信が1分の平均で毎秒 2MB を超え続ける、違反、外部のアプリの起動、ユーザーの指示）。
+- 事前の Gate の全体の検証を起動した。
+
+### 2026-10-02 Task 21 の前の全体の検証で FAIL（DEF-024）
+
+- `npm run verify` → FAIL（116ファイル中1ファイル、4,751件中1件。ほかは PASS）。記録はスクラッチパッドの `verify-20261002-t21gate.log`。
+  - `tests/integration/fixture-full-crawl.test.ts` の「GET と HEAD だけを、fixture のサイトの分だけ送る」で、サーバが `/favicon.ico` の GET を受けていた → DEF-024 として登録した（通常の Chromium がページのアイコンを取りに行く。Guard・間隔・負荷の記録を通るかは未確認）。
+  - vitest のワーカーの異常終了（DEF-015）も1回起きた。
+- Task 21 の事前の Gate が FAIL なので、本来の監査対象のサイトにはつながない。DEF-024 の調査と修正を依頼した。
+
+### 2026-10-03 作業の再開
+
+- 前のセッションの終わりで、DEF-024 の実装者が途中で止まっていた。設計者が確かめたところ、リポジトリのファイルは依頼の前のまま（最後の変更は 10-02 14:57 の README）で、Chromium・node・PowerShell の残ったプロセスもなかった。
+- 同じ実装者を、続きから再開させた（指示書は `DEF-024-brief.md` のまま）。
+- 本来の監査対象のサイトには、つないでいない（Task 21 の事前の Gate が FAIL のまま）。
+
+### 2026-10-03 DEF-024 の調査の結果と判断
+
+- 実装者（再開した）の報告: Blocker（止める起動の引数が見つからない）。既定の `/favicon.ico` は、Guard の付いた Context では Playwright 自身が止める（事象なし）。全体の検証で届いた1件は再現しなかった（一時ビルドの CLI で 22回、閉じ方を変えた実験を各8回、関連の検証を3回）。ページがアイコンの URL を指定している場合は、Guard を通り、負荷の記録に数えられ、読み込み直しでは許可 Origin の外へ送らない。リポジトリのファイルは変えていない。
+- 設計者の判断: 残る制約として受け入れる（許可 Origin への GET の1件だけで、負荷も安全への影響もごく小さい）。CDP の `Network.setBlockedURLs` で止める案は、安全の境界のコードを変える割に得るものが小さいので採らない。負荷の制御の設計書 4.9 に書いた。fixture の全体の監査のテストは、ブラウザ自身の `/favicon.ico` の GET だけを「サイトの外」の確かめから除き、README に書く（DEF-024-fix として依頼した）。
+- 実装者の発見事項2（Guard の Context では、URL が `/favicon.ico` で終わる要求が、ページの画像も含めて黙って止められる）は、DEF-025 として登録した（Task 5 からの振る舞い。Task 21 の結果で見る）。
+
+### 2026-10-03 DEF-024-fix 完了
+
+- `tests/helpers/chromium.ts` に `BROWSER_DEFAULT_FAVICON_PATH` を置き、`fixture-full-crawl.test.ts`（GET の `/favicon.ico` だけを「サイトの外」の確かめから除く。GET と HEAD の確かめは残す）と `site-metadata.test.ts` で使う。README に「ページのアイコン」の項目を加えた。実装者の検証: 関連の 2ファイル 37件、Gate 50件、型チェックが PASS。台帳に定数を登録した。
+- DEF-024 の状態を完了（残る制約として受け入れ）とする。
+- Task 21 の前の全体の検証をやり直す。
+
+### 2026-10-03 Task 21 の事前の Gate（PASS）
+
+- `npm run verify` → PASS（型チェック、116ファイル 4,751件、ビルド。終了コード 0。テストの所要時間 355秒）。記録はスクラッチパッドの `verify-20261003-t21gate.log`。安全の Gate、先読みの停止、Windows の Ctrl+C の結合テストを含む。
+- `validate-config --config local/targets/<本来の対象>.json` → 終了コード 0（サイトにはつないでいない）。
+- 出力先 `artifacts/` には、2026-10-01 に止めた古い Run（保存もロックもない）だけで、実行中の Run はない。
+- Git に載るファイルに、本来の監査対象のサイトの名前がないことを確かめた。
+- 次: Task 21 を始めてよいかを、ユーザーに尋ねる。
+- ユーザーの判断（2026-10-03）: 「まだ始めない」。Task 21 は、ユーザーの改めての承認まで始めない。手順書（`T21-procedure.md`）と設定を見直してから決める。本来の監査対象のサイトには、つないでいない。

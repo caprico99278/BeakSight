@@ -5,8 +5,8 @@
  *   （`openServerWindow`）。`getCounters()` と `getRequestObservations()` を、印の時点の値と比べる。サーバの記録を消さない
  *   （`resetCounters` を呼ばない）ので、同じサーバを使うほかの確認と干渉しない。
  * - 対照の確認（Guard のない Context で、同じ操作がサーバに届くこと）に使う、Guard のない page を開く補助を置く。
- * - Guard の付いた Passive の page を開いて閉じる補助（`withGuardedPassivePage`）と、headless と headed の注入の、2つの設定の
- *   factory（`FACTORY_MODES`、`createModeFactories`）、遅れて起きる事象を待つ時間（`QUIET_PERIOD_MS`）を置く（CC-031）。
+ * - Guard の付いた Passive の page を開いて閉じる補助（`withGuardedPassivePage`）と、Gate の factory（`createGateFactory`）、
+ *   遅れて起きる事象を待つ時間（`QUIET_PERIOD_MS`）を置く（CC-031）。
  * - Interaction の段階の確認に使う、候補の探索と `auditInteraction` の入力の組み立てを置く。
  * - ほかの補助の置き場所（CC-029）:
  *   - Run の起動、CLI の出力の受け取り、artifact の読み取り、Run の結果の確かめ方: `run-harness.ts`
@@ -188,36 +188,16 @@ export async function withGuardedPassivePage<T>(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// headless と headed の注入
+// Gate の factory
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * Guard の設定の2つの形（テストの題名に使う）。
- * - `headless`: 設定も headless である。
- * - `headed (injected)`: headless のブラウザのまま、設定だけを headed（`browser.headed: true`）にして、Guard に「headed である」と
- *   注入する。実際の headed のブラウザは起動しない（端末の外部のアプリが起動するおそれがあるため）。
+ * `browser`（headless で起動したもの）で、Gate と Guard の統合テストの factory を作る。設定は `createTestConfig(origin)`（headless）。
+ * Safety Ledger は、Context ごとに新しく作る。
+ * Guard は headed かどうかを受け取らない（中断した Run の再開の設計書 4.10。R7d）ので、headed の設定を注入した factory は作らない。
  */
-export const FACTORY_MODES = Object.freeze(['headless', 'headed (injected)'] as const);
-export type FactoryMode = (typeof FACTORY_MODES)[number];
-
-/**
- * `browser`（headless で起動したもの）で、`FACTORY_MODES` のそれぞれの設定の factory を作る。
- * 設定は `createTestConfig(origin)` で、headed の注入だけが違う。Safety Ledger は、Context ごとに新しく作る。
- */
-export function createModeFactories(browser: Browser, origin: string): Readonly<Record<FactoryMode, BrowserContextFactory>> {
-  return Object.freeze({
-    headless: new BrowserContextFactory(browser, createTestConfig(origin), () => new SafetyLedger()),
-    'headed (injected)': new BrowserContextFactory(
-      browser,
-      createTestConfig(origin, '/', { browser: { headed: true } }),
-      () => new SafetyLedger(),
-    ),
-  });
-}
-
-/** `FACTORY_MODES` と `values` のすべての組み合わせ（`it.each` の行。設定の形の順に、`values` の順）。 */
-export function factoryModeCases<T>(values: readonly T[]): (readonly [FactoryMode, T])[] {
-  return FACTORY_MODES.flatMap((mode) => values.map((value) => [mode, value] as const));
+export function createGateFactory(browser: Browser, origin: string): BrowserContextFactory {
+  return new BrowserContextFactory(browser, createTestConfig(origin), () => new SafetyLedger());
 }
 
 // ---------------------------------------------------------------------------------------------------------------

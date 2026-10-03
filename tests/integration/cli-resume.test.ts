@@ -5,9 +5,10 @@
 // - 出力先の実行中の Run（動いている Run のロック）があれば、`--new` でもなくても、Run を始めない（終了コード 4）。
 // - 古いロック（OS の起動の時刻が違う。端末の再起動を模す）の、プロセスが途中で終わった Run は、再開する。
 // - 設定が違う途中の Run は、知らせて新しい Run を始める。版が違う途中の Run は、終了コード 4 で終え、`--new` なら新しい Run を始める。
-//   保存が壊れた途中の Run は、知らせて新しい Run を始める。
+//   保存が壊れた途中の Run（R8: スキーマと、ほかの整合の確かめは通るが、巡回の記録を作り直せない保存を含む）は、知らせて新しい Run を始める。
 // - Run の後の保存の終わり方（`FINISH`・`ABANDON`・`NONE`）、`finish` と片付けの失敗、出力の書き出しの失敗、Run Coordinator の例外、
 //   再開を始められない3つの理由は、偽の Run Coordinator（`createRunCoordinator`）で確かめる（Browser を起動しない）。
+// - R7c: 違反を検出した Run は、最後の出力の書き出しに失敗しても、保存を FINISHED にし、次の起動で再開しない（本物の Run Coordinator）。
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -27,8 +28,10 @@ import {
 } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, Finding, PageAuditResult, PageId, RunId, RunSummary } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
+import { validateArtifact } from '../../src/core/schema-validator.js';
 import { readToolVersion } from '../../src/orchestration/environment.js';
 import {
+  checkRunCheckpointConsistency,
   createRunLock,
   currentProcessRunLockHost,
   decideRunResumption,
@@ -142,6 +145,28 @@ async function runCommand(
   return { code, stdout: stdout.text(), stderr: stderr.text() };
 }
 
+/** `runCommandSettled` の結果。reject した場合は、`code` が `null` で、`rejection` が reject の値。 */
+interface SettledCommandOutcome {
+  readonly code: number | null;
+  readonly rejection: unknown;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** `runAuditCommand` を実行し、reject した場合も、それまでに標準出力・標準エラーに書いたものと、reject の値を返す。 */
+async function runCommandSettled(config: AuditConfig, dependencies: RunCommandDependencies): Promise<SettledCommandOutcome> {
+  const stdout = captureCliOutput();
+  const stderr = captureCliOutput();
+  let code: number | null = null;
+  let rejection: unknown = null;
+  try {
+    code = await runAuditCommand(config, { stdout: stdout.output, stderr: stderr.output }, dependencies);
+  } catch (error) {
+    rejection = error;
+  }
+  return { code, rejection, stdout: stdout.text(), stderr: stderr.text() };
+}
+
 /** `k` ページ目の監査が終わったときに、止める印を付ける Run Coordinator を作る関数（印は `controller` のもの）。 */
 const stoppingAfter = (controller: AbortController, pages: number): NonNullable<RunCommandDependencies['createRunCoordinator']> =>
   (dependencies) => new RunCoordinator({
@@ -229,6 +254,57 @@ const judgeNow = (lock: unknown): string => {
   const host = currentProcessRunLockHost(Date.now());
   return judgeRunLock(lock, { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning });
 };
+
+/** `violatingRunCoordinator` の指定。 */
+interface ViolatingRunOptions {
+  /** 違反を記録するページ（何番目に監査するページか。1から）。 */
+  readonly violationPage: number;
+  /**
+   * 違反のページで作る Ledger のうち、違反を記録するものの順番（1から）。Desktop、Mobile の順に作る（fixture のページには Interaction の
+   * 候補がない）。
+   */
+  readonly violationLedgerOrdinal: number;
+  /** Run の前に、CLI の保存のセッションに行うこと（`finish` を失敗させるなど）。 */
+  readonly prepareSession?: (session: RunCheckpointSession) => void;
+  /** Run Coordinator に渡す保存のセッションを包む（ページの保存を失敗させるなど）。省略すると、包まない。 */
+  readonly wrapSession?: (session: RunCoordinatorCheckpointSession) => RunCoordinatorCheckpointSession;
+}
+
+/**
+ * 違反を記録する本物の Run Coordinator を作る関数（R5a-fix-round-1、R7c）。`violationPage - 1` ページを終えた状態の保存の後に作る Ledger を
+ * 数え、`violationLedgerOrdinal` 番目に違反を記録する（`tests/integration/resume-run.test.ts` の違反の後の再開と同じく、`createSafetyLedger`
+ * で作る Ledger に記録し、ページの保存の Ledger の snapshot に入れる）。
+ */
+const violatingRunCoordinator = (options: ViolatingRunOptions): NonNullable<RunCommandDependencies['createRunCoordinator']> =>
+  (dependencies) => {
+    const session = dependencies.checkpointSession as RunCheckpointSession;
+    options.prepareSession?.(session);
+    let violationPageLedgers: number | null = null;
+    const watchedSession: RunCoordinatorCheckpointSession = {
+      start: async (directory, startOptions) => session.start(directory, startOptions),
+      savePage: async (page) => session.savePage(page),
+      saveState: async (state) => {
+        await session.saveState(state);
+        if (state.completedPageIds.length === options.violationPage - 1 && violationPageLedgers === null) {
+          violationPageLedgers = 0;
+        }
+      },
+    };
+    return new RunCoordinator({
+      ...dependencies,
+      checkpointSession: options.wrapSession?.(watchedSession) ?? watchedSession,
+      createSafetyLedger: () => {
+        const ledger = new SafetyLedger();
+        if (violationPageLedgers !== null) {
+          violationPageLedgers += 1;
+          if (violationPageLedgers === options.violationLedgerOrdinal) {
+            ledger.recordInvariantViolation({ code: 'TEST_INJECTED_VIOLATION', message: 'injected by the CLI resume test' });
+          }
+        }
+        return ledger;
+      },
+    });
+  };
 
 // ---------------------------------------------------------------------------------------------------------------
 // 中断しない Run（比べる相手）
@@ -592,6 +668,74 @@ describe('R5a: an interrupted Run whose state.json and state.prev.json are both 
   });
 });
 
+// R8（中断した Run の再開の設計書 4.2、4.7、4.10 の DEF-022。RR2 の指摘4）: スキーマと、ほかの整合の確かめは通るが、巡回の記録を作り直せない
+// 保存（深さの上限より深い URL が、深さの上限による SKIPPED でない）を持つ途中の Run は、壊れた保存として知らせ、新しい Run を始める。
+// 保存を読むときに作り直しを確かめないと、その保存で再開を始め、Run Coordinator の作り直しの例外で、`--new` を付けるまで、毎回の起動が
+// 予期しない失敗で終わる。`state.json` と `state.prev.json` の両方を、同じく作り直せない形にする（どちらからも再開しない）。
+describe('R8: an interrupted Run whose crawl frontier cannot be restored is not resumed (resumable run design 4.2, 4.10 DEF-022)', () => {
+  let stoppedRunId: RunId;
+  let stoppedRunDirectory: string;
+  let unrestorable: RunCheckpoint;
+  let outcome: SettledCommandOutcome;
+  let outputDirectory: string;
+
+  beforeAll(async () => {
+    const config = shortConfigFor('unrestorable');
+    outputDirectory = join(workDirectory, 'unrestorable');
+    expect((await runStoppedAfter(config, 1)).code).toBe(EXIT_CODES.PARTIAL);
+    stoppedRunDirectory = await onlyRunDirectoryIn(outputDirectory);
+    for (const file of ['state', 'previousState'] as const) {
+      const path = artifactFilePath(stoppedRunDirectory, checkpointArtifactRelativePath(file));
+      const saved = await readJson(path) as RunCheckpoint;
+      const lastIndex = saved.frontier.entries.length - 1;
+      const broken: RunCheckpoint = {
+        ...saved,
+        frontier: {
+          entries: saved.frontier.entries.map((entry, index) => (index === lastIndex
+            ? { ...entry, depth: saved.effectiveConfig.crawl.maxDepth + 1 }
+            : entry)),
+        },
+      };
+      await writeFile(path, JSON.stringify(broken), 'utf8');
+      if (file === 'state') {
+        unrestorable = broken;
+      }
+    }
+    stoppedRunId = unrestorable.runId;
+    outcome = await runCommandSettled(config, realDependencies());
+  }, SUITE_TIMEOUT_MS);
+
+  it('has a resumable checkpoint that matches the schema, whose only inconsistency is the crawl frontier that cannot be restored', async () => {
+    expect(unrestorable.frontier.entries.length).toBeGreaterThan(1);
+    await expect(validateArtifact('checkpoint', unrestorable)).resolves.toEqual({ ok: true });
+    expect(checkRunCheckpointConsistency(unrestorable)).toEqual({
+      ok: false,
+      errors: [expect.stringContaining('/frontier cannot be restored: ')],
+    });
+    expect(decideRunResumption(unrestorable)).toBe('RESUME');
+  });
+
+  it('tells that the checkpoint cannot be read, and starts a new Run instead of failing', async () => {
+    expect(outcome.rejection).toBeNull();
+    const lines = outcome.stdout.split('\n');
+    const notice = unreadableCheckpointText(stoppedRunId);
+
+    expect(lines.filter((line) => line === notice)).toHaveLength(1);
+    expect(lines.indexOf(notice)).toBeLessThan(lines.indexOf(CLI_TEXT.run.started));
+    expect(outcome.stdout).not.toContain(expectedResumeLine(stoppedRunId, 1));
+    expect(outcome.stderr).toBe('');
+    const names = await directoriesIn(outputDirectory);
+    expect(names).toHaveLength(2);
+    const newRunDirectory = join(outputDirectory, names.find((name) => name !== stoppedRunId) ?? '');
+    expect(outcome.code).toBe(exitCodeForRunStatus((await readRun(newRunDirectory)).runStatus));
+  });
+
+  it('keeps the checkpoint of the interrupted Run as it was', async () => {
+    expect(await readState(stoppedRunDirectory)).toEqual(unrestorable);
+    expect(existsSync(lockPath(stoppedRunDirectory))).toBe(false);
+  });
+});
+
 // R5a-fix-round-1（中断した Run の再開の設計書 4.2。R5a の報告の発見事項1）: 保存の Run の ID が、Run のディレクトリの名前と違う途中の Run
 // （ディレクトリを移した場合など）は、壊れた保存として知らせ、再開しない。再開すると、出力は `<出力先>/<保存の Run の ID>` に、保存は移した
 // ディレクトリに書かれ、別のディレクトリに分かれるためである。
@@ -663,10 +807,7 @@ describe.each([
 }) => {
   /** 違反を記録するページ（何番目に監査するページか。1から）。設定のページ数の上限（`SHORT_RUN_MAX_PAGES`）より前のページにする。 */
   const VIOLATION_PAGE = 1;
-  /**
-   * 違反のページで作る Ledger のうち、違反を記録するものの順番（1から）。Desktop、Mobile の順に作る（fixture のページには Interaction の
-   * 候補がない）。
-   */
+  /** 違反のページで作る Ledger のうち、違反を記録するものの順番（1から。`ViolatingRunOptions` の `violationLedgerOrdinal`）。 */
   const VIOLATION_LEDGER_ORDINAL = violationLedgerOrdinal;
   /** 監査するページの文書のパスの接頭辞（`START_PATH` のディレクトリ。fixture のサイトの `/crawl/` のページ）。 */
   const PAGE_PATH_PREFIX = START_PATH.slice(0, START_PATH.lastIndexOf('/') + 1);
@@ -684,46 +825,21 @@ describe.each([
   let finalState: RunCheckpoint;
   let startedAgain: CommandOutcome;
 
-  /**
-   * 違反を記録する Run Coordinator を作る関数。`VIOLATION_PAGE - 1` ページを終えた状態の保存の後に作る Ledger を数え、
-   * `VIOLATION_LEDGER_ORDINAL` 番目に違反を記録する。CLI の保存のセッションの `finish` は、実際には行わずに失敗させる。
-   */
-  const violatingRunCoordinator: NonNullable<RunCommandDependencies['createRunCoordinator']> = (dependencies) => {
-    const session = dependencies.checkpointSession as RunCheckpointSession;
-    vi.spyOn(session, 'finish').mockRejectedValueOnce(new Error('simulated end of the process before the final checkpoint'));
-    let violationPageLedgers: number | null = null;
-    const watchedSession: RunCoordinatorCheckpointSession = {
-      start: async (directory, options) => session.start(directory, options),
-      savePage: async (page) => session.savePage(page),
-      saveState: async (state) => {
-        await session.saveState(state);
-        if (state.completedPageIds.length === VIOLATION_PAGE - 1 && violationPageLedgers === null) {
-          violationPageLedgers = 0;
-        }
-      },
-    };
-    return new RunCoordinator({
-      ...dependencies,
-      checkpointSession: watchedSession,
-      createSafetyLedger: () => {
-        const ledger = new SafetyLedger();
-        if (violationPageLedgers !== null) {
-          violationPageLedgers += 1;
-          if (violationPageLedgers === VIOLATION_LEDGER_ORDINAL) {
-            ledger.recordInvariantViolation({ code: 'TEST_INJECTED_VIOLATION', message: 'injected by the CLI resume test' });
-          }
-        }
-        return ledger;
-      },
-    });
-  };
+  /** 違反を記録する Run Coordinator。CLI の保存のセッションの `finish` は、実際には行わずに失敗させる。 */
+  const violatingCoordinator = violatingRunCoordinator({
+    violationPage: VIOLATION_PAGE,
+    violationLedgerOrdinal: VIOLATION_LEDGER_ORDINAL,
+    prepareSession: (session) => {
+      vi.spyOn(session, 'finish').mockRejectedValueOnce(new Error('simulated end of the process before the final checkpoint'));
+    },
+  });
 
   beforeAll(async () => {
     const config = shortConfigFor(outputName);
     outputDirectory = join(workDirectory, outputName);
 
     // 1回目: 違反の後、最後の状態を書く前にプロセスが終わる。
-    first = await runCommand(config, realDependencies({ createRunCoordinator: violatingRunCoordinator }));
+    first = await runCommand(config, realDependencies({ createRunCoordinator: violatingCoordinator }));
     runDirectory = await onlyRunDirectoryIn(outputDirectory);
     savedState = await readState(runDirectory);
     const violationPageId = savedState.completedPageIds[VIOLATION_PAGE - 1];
@@ -800,6 +916,121 @@ describe.each([
   });
 });
 
+// R7c（中断した Run の再開の設計書 4.10 の Important-1 の (b)、4.7.1 の「Run の後」）: 違反を検出した Run は、最後の出力の書き出しに失敗した
+// 場合も、保存を `FINISHED` にする。次に同じコマンドを実行しても、続きから再開せず、最後の処理だけを行うこともしない（新しい Run を始める）。
+// - 本物の Run Coordinator で、違反を1ページ目の最初の Ledger（Desktop）に記録する（`violatingRunCoordinator`）。
+// - 出力の書き出しは、保存のセッションを始めた直後に、Run のディレクトリ（一時ディレクトリの中）の run.json の場所にディレクトリを置いて
+//   失敗させる。
+// - 次の2つの形で確かめる。
+//   - 違反のページの保存に成功した場合: 最後の状態の保存は、巡回の終わりの値（違反のフラグが真）。直す前は、保存が IN_PROGRESS（違反の
+//     フラグが真）のまま残り、次の起動で最後の処理だけを行っていた。
+//   - 違反のページの保存にも失敗した場合（RR の Important-1 の (b)）: 最後の状態の保存は、最後に書けた保存（robots.txt と sitemap.xml の
+//     取得の後。違反のフラグが偽）の値。直す前は、保存が IN_PROGRESS（違反のフラグが偽）のまま残り、ロックも残っていた（違反の後に、
+//     続きから再開しうる）。
+describe.each([
+  { form: 'the page checkpoint of the violation is written', failViolationPageSave: false, outputName: 'violation-output-failure' },
+  { form: 'the page checkpoint of the violation also fails', failViolationPageSave: true, outputName: 'violation-output-failure-unsaved' },
+] as const)('R7c: a Run with a safety invariant violation whose output cannot be written is finished and not resumed, when $form (resumable run design 4.10)', ({
+  failViolationPageSave,
+  outputName,
+}) => {
+  /** 違反を記録するページ（何番目に監査するページか。1から）。設定のページ数の上限（`SHORT_RUN_MAX_PAGES`）より前のページにする。 */
+  const VIOLATION_PAGE = 1;
+
+  let outputDirectory: string;
+  let first: SettledCommandOutcome;
+  let runDirectory: string;
+  let firstState: RunCheckpoint;
+  let checkpointFilesAfterFirst: string[];
+  let lockLeftByFirst: boolean;
+  let next: SettledCommandOutcome;
+
+  /**
+   * 保存のセッションの包み。セッションを始めた直後に、Run のディレクトリの run.json の場所にディレクトリを置き、最後の出力の書き出しを
+   * 失敗させる。`failViolationPageSave` なら、違反のページの保存も失敗させる。
+   */
+  const blockingOutput = (session: RunCoordinatorCheckpointSession): RunCoordinatorCheckpointSession => {
+    let pageSaves = 0;
+    return {
+      start: async (directory, options) => {
+        const started = await session.start(directory, options);
+        await mkdir(artifactFilePath(directory, RUN_ARTIFACT_FILE_NAMES.run), { recursive: true });
+        return started;
+      },
+      saveState: async (state) => session.saveState(state),
+      savePage: async (page) => {
+        pageSaves += 1;
+        if (failViolationPageSave && pageSaves === VIOLATION_PAGE) {
+          throw new Error('simulated failure of the page checkpoint of the violation');
+        }
+        await session.savePage(page);
+      },
+    };
+  };
+
+  beforeAll(async () => {
+    const config = shortConfigFor(outputName);
+    outputDirectory = join(workDirectory, outputName);
+
+    // 1回目: 違反を検出し、最後の出力の書き出しに失敗する（`run` は、出力の失敗で reject する）。
+    first = await runCommandSettled(config, realDependencies({
+      createRunCoordinator: violatingRunCoordinator({ violationPage: VIOLATION_PAGE, violationLedgerOrdinal: 1, wrapSession: blockingOutput }),
+    }));
+    runDirectory = await onlyRunDirectoryIn(outputDirectory);
+    firstState = await readState(runDirectory);
+    checkpointFilesAfterFirst = await checkpointFilesIn(runDirectory);
+    lockLeftByFirst = existsSync(lockPath(runDirectory));
+    // 1回目のプロセスが終わったことを模す。ロックが残っていれば（直す前は、`abandon` でロックが残った）、端末の再起動の前のもの（古いロック）
+    // にする。このテストのプロセスのロックのままだと、2回目は、動いている Run があるとして終わり、再開するかを確かめられないためである。
+    if (lockLeftByFirst) {
+      await new ArtifactWriter().rewriteRunLock(runDirectory, lockBeforeOsRestart(await readJson(lockPath(runDirectory)) as RunLock));
+    }
+
+    // 2回目: 同じ設定で実行する（直す前は、1回目の Run のディレクトリで再開し、残った run.json の場所のディレクトリで、出力の書き出しに
+    // 失敗していた）。
+    next = await runCommandSettled(config, realDependencies());
+  }, SUITE_TIMEOUT_MS);
+
+  it('rejects the first execution with the failure of the output', () => {
+    expect(first.code).toBeNull();
+    expect(first.rejection).toBeInstanceOf(ArtifactWriteError);
+    expect((first.rejection as ArtifactWriteError).path).toBe(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run));
+    expect(first.stderr).toBe('');
+  });
+
+  it('finishes the checkpoint as FINISHED (not resumable) after the violation, removes the lock, and keeps the page checkpoints', () => {
+    expect(firstState.state).toBe('FINISHED');
+    expect(decideRunResumption(firstState)).toBe('NOT_RESUMABLE');
+    expect(firstState.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SAFETY_VIOLATION']);
+    // 違反のページの保存に失敗した場合は、最後に書けた保存（robots.txt と sitemap.xml の取得の後）の値なので、違反のフラグは偽で、終わった
+    // ページもない。それでも FINISHED なので、再開しない。
+    expect(firstState.progress.safetyViolationDetected).toBe(!failViolationPageSave);
+    expect(firstState.completedPageIds).toHaveLength(failViolationPageSave ? 0 : VIOLATION_PAGE);
+    // 出力がないので、終わった Run の保存の片付け（ページの保存と state.prev.json の削除）はしない。ロックは外れる。
+    expect(checkpointFilesAfterFirst).toEqual(failViolationPageSave
+      ? ['state.json', 'state.prev.json']
+      : ['pages/PAGE-000001.json', 'state.json', 'state.prev.json']);
+    expect(lockLeftByFirst).toBe(false);
+  });
+
+  it('starts a new Run by the same command afterwards, without the resume or the finalizing notice', async () => {
+    const lines = next.stdout.split('\n');
+
+    expect(lines).not.toContain(finalizingRunText(firstState.runId));
+    expect(next.stdout).not.toContain(expectedResumeLine(firstState.runId, firstState.completedPageIds.length));
+    // 1回目の Run についての知らせ（再開、最後の処理だけ、設定の違い、壊れた保存）は、1行もない。
+    expect(lines.filter((line) => line.includes(firstState.runId))).toEqual([]);
+    expect(next.rejection).toBeNull();
+    expect(next.stderr).toBe('');
+    const names = await directoriesIn(outputDirectory);
+    expect(names).toHaveLength(2);
+    const newRunDirectory = join(outputDirectory, names.find((name) => name !== firstState.runId) ?? '');
+    expect(next.code).toBe(exitCodeForRunStatus((await readRun(newRunDirectory)).runStatus));
+    // 1回目の Run の保存は、FINISHED のまま。
+    expect((await readState(runDirectory)).state).toBe('FINISHED');
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------------------
 // Run の後（偽の Run Coordinator。Browser を起動しない）
 // ---------------------------------------------------------------------------------------------------------------
@@ -872,14 +1103,18 @@ describe('R5a: after the Run, the CLI follows the checkpoint conclusion of the R
     return { outcome, rejection, runDirectory, finish, abandon };
   }
 
-  const finishConclusion = (state: 'FINISHED' | 'STOPPED'): RunCoordinatorCheckpointConclusion =>
-    ({ action: 'FINISH', checkpoint: sampleRunCheckpoint({ state }) });
+  /**
+   * `FINISH` の終わり方。`finishEvenIfOutputFails`（出力の書き出しに失敗しても `finish` を行うか。R7c）は、省略すると偽（違反のない Run）。
+   * 出力の書き出しに失敗した場合の、真の扱いは `tests/unit/cli.test.ts` で確かめる。
+   */
+  const finishConclusion = (state: 'FINISHED' | 'STOPPED', finishEvenIfOutputFails = false): RunCoordinatorCheckpointConclusion =>
+    ({ action: 'FINISH', checkpoint: sampleRunCheckpoint({ state }), finishEvenIfOutputFails });
 
   it('FINISH with FINISHED: finishes the session with the final checkpoint, then leaves only state.json', async () => {
     const finalCheckpoint = sampleRunCheckpoint({ state: 'FINISHED' });
     const fake = await runWithFakeCoordinator('after-finish-finished', {
       startSession: true,
-      conclusion: { action: 'FINISH', checkpoint: finalCheckpoint },
+      conclusion: { action: 'FINISH', checkpoint: finalCheckpoint, finishEvenIfOutputFails: false },
     });
 
     expect(fake.outcome?.code).toBe(EXIT_CODES.COMPLETE);

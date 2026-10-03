@@ -15,6 +15,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { chromium } from 'playwright';
+import { chromiumLaunchOptions } from '../browser/chromium-launch.js';
 import type { AuditConfig } from '../config/types.js';
 import type { AuditRunResult, RunId, RunProgressReport } from '../core/contracts.js';
 import {
@@ -102,12 +103,12 @@ export interface RunAuditCommandOptions {
 const DEFAULT_RUN_AUDIT_COMMAND_OPTIONS: RunAuditCommandOptions = Object.freeze({ startNew: false });
 
 /**
- * 本番の依存（Playwright の Chromium と、実際の時計）。Chromium は、Playwright の既定のシグナルの処理（SIGINT・SIGTERM・SIGHUP で
- * Browser を閉じてプロセスを終える）を止めて起動する（中断した Run の再開の設計書 4.7）。Playwright がプロセスを終えると、最後の処理
- * （出力の書き出し）が行われないためである。シグナルは、BeakSight が受ける（R5b）。
+ * 本番の依存（Playwright の Chromium と、実際の時計）。Chromium は、CLI の起動の設定（`chromiumLaunchOptions`。channel、ページの先読みを
+ * 止める引数、Playwright の既定のシグナルの処理を止める指定）で起動する。設定の値と理由は、`src/browser/chromium-launch.ts` の1か所に置く
+ * （中断した Run の再開の設計書 4.7、4.10、サイトへの負荷の制御の設計書 4.9）。
  */
 export const PRODUCTION_RUN_DEPENDENCIES: RunCommandDependencies = Object.freeze<RunCommandDependencies>({
-  launchBrowser: (options) => chromium.launch({ headless: options.headless, handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false }),
+  launchBrowser: (options) => chromium.launch(chromiumLaunchOptions({ headless: options.headless })),
   clock: () => new Date(),
   now: () => Date.now(),
 });
@@ -151,7 +152,8 @@ export const artifactFileReader = (runDirectory: string): ReadArtifactFile => as
  *    1. `RunDirectoryUnavailableError` なら、今のとおり示して終える（保存の終わり方は `NONE`）。
  *    2. `RunResumeUnavailableError` なら、理由ごとの文言を標準エラーに示して終える（終了コード 4。出力を作らない）。
  *    3. ほかの例外なら、保存の終わり方が `ABANDON` のときに `abandon()` を呼んでから、例外を呼び出し側に返す。
- *    4. 出力を書く（`finishAuditRun`）。失敗したら、保存の終わり方が `NONE` でなければ `abandon()` を呼んでから、例外を返す。
+ *    4. 出力を書く（`finishAuditRun`）。失敗したら、保存の終わり方に従ってから（`concludeCheckpointAfterOutputFailure`。`FINISH` で
+ *       `finishEvenIfOutputFails` が真なら `finish`、ほかは `NONE` でなければ `abandon()`）、例外を返す。
  *    5. 保存の終わり方に従う（`concludeCheckpoint`）。終了コードは、Run Status のとおり。
  */
 export async function runAuditCommand(
@@ -229,9 +231,7 @@ export async function runAuditCommand(
   try {
     exitCode = await finishAuditRun(result, outputDirectory, streams.stdout);
   } catch (error) {
-    if (conclusion.action !== 'NONE') {
-      await session.abandon();
-    }
+    await concludeCheckpointAfterOutputFailure(conclusion, session);
     throw error;
   }
   const runDirectory = resumeFrom?.runDirectory ?? runArtifactDirectory(outputDirectory, result.run.runId);
@@ -367,6 +367,34 @@ async function concludeCheckpoint(input: {
     const path = error instanceof ArtifactWriteError ? error.path : runDirectory;
     await stderr.write(joinLines(finishedCheckpointCleanupFailedLines(path)));
   }
+}
+
+/**
+ * 最後の出力の書き出し（`finishAuditRun`）に失敗したときに、保存の終わり方（Run Coordinator の `checkpointConclusion()`）に従う（中断した
+ * Run の再開の設計書 4.7.1 の「Run の後」、4.10 の Important-1 の (b)）。呼び出し側は、この後に、出力の失敗を今のとおり返す。
+ * - `FINISH` で `finishEvenIfOutputFails` が真: セッションの `finish` に最後の状態の保存を渡す（違反を検出した Run を、出力がなくても再開
+ *   しない状態にする）。失敗したら、`abandon()` を呼ぶ。どちらの場合も、終わった Run の保存の片付け（`removeFinishedCheckpointFiles`）は
+ *   しない（出力がないので、ページの保存を残す）。
+ * - `FINISH` で偽と、`ABANDON`: `abandon()` を呼ぶ（出力をやり直せるよう、保存の状態を変えない）。
+ * - `NONE`: 何もしない。
+ * どれを行うかは、項目の値だけで決める（Run Status は見ない。真にするかは `decideRunCheckpointConclusion` が決める）。
+ */
+async function concludeCheckpointAfterOutputFailure(
+  conclusion: RunCoordinatorCheckpointConclusion,
+  session: RunCheckpointSession,
+): Promise<void> {
+  if (conclusion.action === 'NONE') {
+    return;
+  }
+  if (conclusion.action === 'FINISH' && conclusion.finishEvenIfOutputFails) {
+    try {
+      await session.finish(conclusion.checkpoint);
+      return;
+    } catch {
+      // 最後の状態を書けなかった場合も、出力の失敗を返す（下で `abandon()` を呼んで、セッションをやめる）。
+    }
+  }
+  await session.abandon();
 }
 
 /**

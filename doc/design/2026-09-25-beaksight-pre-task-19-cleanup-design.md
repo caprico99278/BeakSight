@@ -323,3 +323,5 @@ Task 19 は、実際の CLI で fixture を最後まで監査し、README を書
 | 2026-09-25 | C18g の報告 | 4.6（DEF-013。遅いリダイレクトの偽の違反）を加えた | C18h |
 | 2026-09-25 | RC18a | 4.1.1（訂正）、4.2 のリダイレクトの扱い、4.2.1（止められる経路の整理）、4.5（違反の後は監査を続けない）を加えた | C18f、C18g |
 | 2026-09-25 | ユーザーの判断 | 4.3 に、Task 20 の smoke を headed で行うことを記録した | Task 20 |
+
+> 2026-10-02 追記: 中断した Run の再開の設計書（`2026-10-01-beaksight-resumable-run-design.md`）4.10 で、CLI の Chromium を `channel: 'chromium'`（通常の Chromium の本体）で起動することにした。そのため、DEF-012 の「headless では記録だけにする」判断は、同じ 4.10 の決まり（headed と headless を問わず違反にする。違反のコードは `EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）で置き換えた（ユーザーの判断）。

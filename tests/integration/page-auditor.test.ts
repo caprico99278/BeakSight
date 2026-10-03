@@ -1478,8 +1478,8 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
         const page = await super.createPassivePage(context);
         this.passivePages += 1;
         if (this.passivePages === 2) {
-          // headed（headless のブラウザへの注入）では、外部スキームへの移動は違反になり、Guard が Context を閉じる。
-          // 宛先は実在しないものである。
+          // 外部スキームへの移動は違反になり、Guard が Context を閉じる（headed と headless を問わない。中断した Run の再開の
+          // 設計書 4.10）。宛先は実在しないものである。
           await page.addInitScript({ content: "window.location.href = 'mailto:nobody@example.invalid';" });
         }
         return page;
@@ -1489,7 +1489,7 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
     const ledgers = trackLedgers();
     let factory: ExternalSchemeInStressSessionFactory | undefined;
     const { outcome } = await auditFixture(server, '/index.html', {
-      overrides: { viewports: { stressWidths: [320] }, audit: { interactions: false }, browser: { headed: true } },
+      overrides: { viewports: { stressWidths: [320] }, audit: { interactions: false } },
       createFactory: (config) => (factory = new ExternalSchemeInStressSessionFactory(browser, config, ledgers.create)),
       safetyViolationRecorded: ledgers.violationRecorded,
     });

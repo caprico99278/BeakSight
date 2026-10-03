@@ -485,3 +485,10 @@
 - 問題: コメントでは「HTML レポートだけで使う」とされていて、置き場所が表示面に偏っている。
 - 方針: 複数の表示面で使う表示名を、`RUN_SUMMARY_TEXT` など、表示面に依らない置き場所に移す。
 - 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-040 保存からの巡回の記録の作り直しの引数が2か所にある（2026-10-02 R8 の報告で登録）
+
+- 場所: `src/orchestration/run-coordinator.ts` の `restoredCrawlProgress`（`CrawlFrontier.restore` の引数の組み立て）と、`src/orchestration/run-checkpoint.ts` の `checkRunCheckpointConsistency` の作り直しの確かめ（R8）。あわせて、`run-coordinator.ts` の `RESUME_REQUEUE_SKIP_REASON_CODE_SET` と `run-checkpoint.ts` の `requeueSkipReasonCodes` が、同じ Set。
+- 振る舞いの違い: なし（どちらも、保存の実効の設定の `maxDepth`・`allowedQueryParameters` と、`RESUME_REQUEUE_SKIP_REASON_CODES` を使う）。
+- 方針: 保存から採番器と巡回の記録を作り直す関数を `run-checkpoint.ts` に置き、Run Coordinator と整合の確かめの両方がそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。

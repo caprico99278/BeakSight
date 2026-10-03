@@ -5,7 +5,6 @@
 // 厳守事項:
 // - Chromium は headless だけで起動する。標準の headless は OOPIF を作らないので、`--site-per-process` を付ける。
 //   サイトの分離を無効にする起動の引数は、使わない。
-// - headed の扱いは、headless のブラウザのまま、factory の設定（`browser.headed: true`）で Guard に「headed である」と注入して確かめる。
 // - 別のサイトの iframe は、同じ fixture のサーバの別のホスト名（`127.0.0.1` と `localhost`）で作る。インターネット上のサイトは使わない。
 // - 外部スキームの宛先は、fixture のサーバの中の固定の一覧（実在しないもの）だけである。
 import type { Browser, BrowserContext, CDPSession, Frame, Page } from 'playwright';
@@ -31,13 +30,11 @@ import {
   stoppedRedirectRecord,
 } from '../helpers/external-scheme-fixture.js';
 import {
-  createModeFactories,
-  factoryModeCases,
+  createGateFactory,
   NO_NON_READ_REQUESTS,
   openServerWindow,
   QUIET_PERIOD_MS,
   withGuardedPassivePage,
-  type FactoryMode,
 } from '../helpers/gate-harness.js';
 
 const viewport: Viewport = Object.freeze({ width: 800, height: 600 });
@@ -50,7 +47,6 @@ const MANY_OOPIF_TEST_TIMEOUT_MS = 120_000;
 
 let browser: Browser;
 let server: FixtureServer;
-let factories: Readonly<Record<FactoryMode, BrowserContextFactory>>;
 let headlessFactory: BrowserContextFactory;
 /** 別のホスト名（`localhost`）の、同じ fixture のサーバの Origin。 */
 let crossSiteOrigin: string;
@@ -60,17 +56,13 @@ beforeAll(async () => {
   crossSiteOrigin = crossSiteOriginOf(server.origin);
   // headless だけで起動する。`--site-per-process` は、別のサイトの iframe を別のプロセス（OOPIF）にする（サイトの分離を強める側の引数）。
   browser = await launchHeadlessChromium({ args: SITE_PER_PROCESS_ARGS });
-  // headless のブラウザのまま、設定だけを headed にする factory も作る（Guard に「headed である」と注入する）。
-  factories = createModeFactories(browser, server.origin);
-  headlessFactory = factories.headless;
+  headlessFactory = createGateFactory(browser, server.origin);
 });
 
 afterAll(async () => {
   await browser?.close();
   await server?.close();
 });
-
-const MODE_CASES = factoryModeCases(EXTERNAL_SCHEME_KEYS);
 
 /** page の、別のホスト名（`localhost`）の frame。 */
 const crossSiteFrames = (page: Page): Frame[] => page.frames().filter((frame) => frame.url().startsWith(`${crossSiteOrigin}/`));
@@ -107,10 +99,10 @@ describe('C18i: the fixture makes a cross-site iframe that runs in a separate pr
 });
 
 describe('C18i: a server redirect to an external scheme, started by the OOPIF itself, is stopped before it is followed, and recorded', () => {
-  it.each(MODE_CASES)('Passive (%s): the OOPIF navigates itself to the redirect to %s; it is stopped and recorded without a violation', async (mode, key) => {
+  it.each(EXTERNAL_SCHEME_KEYS)('Passive: the OOPIF navigates itself to the redirect to %s; it is stopped and recorded without a violation', async (key) => {
     const window = openServerWindow(server);
     let failed: string[] = [];
-    await withGuardedPassivePage(factories[mode], viewport, async (page, context, ledger) => {
+    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
       const url = `${server.origin}${crossSiteFramePath(selfNavigatingFramePath(key))}`;
       await page.goto(url, { waitUntil: 'load' });
       await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
@@ -138,10 +130,10 @@ describe('C18i: a server redirect to an external scheme, started by the OOPIF it
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   });
 
-  it.each(MODE_CASES)('Passive (%s): a nested OOPIF (127.0.0.1 in localhost in 127.0.0.1) navigates itself to the redirect to %s; it is stopped and recorded', async (mode, key) => {
+  it.each(EXTERNAL_SCHEME_KEYS)('Passive: a nested OOPIF (127.0.0.1 in localhost in 127.0.0.1) navigates itself to the redirect to %s; it is stopped and recorded', async (key) => {
     const window = openServerWindow(server);
     let failed: string[] = [];
-    await withGuardedPassivePage(factories[mode], viewport, async (page, context, ledger) => {
+    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
       await page.goto(`${server.origin}${crossSiteFramePath(crossSiteFramePath(selfNavigatingFramePath(key)))}`, { waitUntil: 'load' });
       await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
       await wait(QUIET_PERIOD_MS);

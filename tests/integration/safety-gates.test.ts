@@ -49,16 +49,14 @@ import {
   type ExternalSchemeKey,
 } from '../helpers/external-scheme-fixture.js';
 import {
-  createModeFactories,
+  createGateFactory,
   discoverInteractionCandidate,
-  factoryModeCases,
   interactionAuditInput,
   NO_NON_READ_REQUESTS,
   openServerWindow,
   QUIET_PERIOD_MS,
   withGuardedPassivePage,
   withUnguardedPage,
-  type FactoryMode,
   type ServerWindow,
 } from '../helpers/gate-harness.js';
 import {
@@ -122,9 +120,7 @@ const FIXTURE_SECRET_VALUES = Object.freeze(['redirect-secret', 'fixture-respons
 
 let browser: Browser;
 let server: FixtureServer;
-let factories: Readonly<Record<FactoryMode, BrowserContextFactory>>;
 let factory: BrowserContextFactory;
-let headedFactory: BrowserContextFactory;
 let workDirectory: string;
 const launchers: RunLauncher[] = [];
 
@@ -149,11 +145,7 @@ useHeadlessChromium((launched) => {
 });
 
 beforeAll(() => {
-  // GATE-S03（C18b）: headless のブラウザのまま、設定だけを headed にする factory も作る（Guard に「headed である」と注入する）。
-  // 実際の headed のブラウザは、起動しない（外部のアプリが起動するおそれがあるため）。
-  factories = createModeFactories(browser, server.origin);
-  factory = factories.headless;
-  headedFactory = factories['headed (injected)'];
+  factory = createGateFactory(browser, server.origin);
 });
 
 const urlOf = (path: string): string => `${server.origin}${path}`;
@@ -403,21 +395,27 @@ describe('GATE-S03: mailto:, tel: and external application launches are not perf
 });
 
 // C18b（DEF-012。Task 19 の前の整理の設計書 4.2）: ページのスクリプトによる外部スキーム（`tel:`、`mailto:`、独自のスキーム）への
-// 移動の試みは、Guard が Safety Ledger の `externalSchemeNavigations` に記録する。headless では違反にせず、page はその場に留まる。
-// headed では違反として Context を閉じる。数え方は、ほかの Gate と同じく、サーバの境界の差分である（Ledger は記録の確認）。
+// 移動の試みは、Guard が Safety Ledger の `externalSchemeNavigations` に記録する。数え方は、ほかの Gate と同じく、サーバの境界の
+// 差分である（Ledger は記録の確認）。
+// R7d（中断した Run の再開の設計書 4.10）: CLI の Chromium は、headless でも通常の Chromium の本体を使うので、外部のアプリが
+// 起動しうる。そのため、headed と headless を問わず、この移動の試みは安全の不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）
+// になり、Guard が Context を閉じる。Run は `ABORTED_BY_SAFETY` になる。Guard は headed かどうかを受け取らない。
 // 対照の確認（Guard のない Context で、同じ fixture が、その外部スキームの URL への移動のリクエストを出す）は、
 // `tests/integration/gate-fixtures.test.ts` の C18b に置く。
-// 厳守事項: Chromium は headless だけで起動する。headed の扱いは、設定の注入（`headedFactory`）だけで確かめる。宛先は実在しない。
+// 厳守事項: Chromium は headless だけで起動する。宛先は実在しない。
+
+/** 外部スキームへの移動の試みの、不変条件の違反のコード（R7d。中断した Run の再開の設計書 4.10）。 */
+const EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE = 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED';
 
 /** ボタンのページで、ボタンを押す（`button-click` の経路の Passive の段階）。 */
 const clickExternalSchemeButton = async (page: Page): Promise<void> => {
   await page.getByRole('button', { name: EXTERNAL_SCHEME_BUTTON_NAME }).click();
 };
 
-describe('GATE-S03: navigations to external schemes by the page are recorded, and nothing but the page reaches the server', () => {
+describe('GATE-S03: navigations to external schemes by the page are recorded as invariant violations, and nothing but the page reaches the server', () => {
   const cases = EXTERNAL_SCHEME_ROUTES.flatMap((route) => EXTERNAL_SCHEME_KEYS.map((key) => [route, key] as const));
 
-  it.each(cases)('GATE-S03 Passive (headless): %s to %s is recorded without a violation, the page stays, and only its GET reaches the server', async (
+  it.each(cases)('GATE-S03 Passive: %s to %s is recorded, is an invariant violation, the Guard closes the Context, and only the page GET reaches the server', async (
     route,
     key,
   ) => {
@@ -425,76 +423,60 @@ describe('GATE-S03: navigations to external schemes by the page are recorded, an
 
     const { window, ledger, pageUrl, guardClosed } = await openGuardedPassivePage(
       path,
-      async (_page, pageLedger) => pageLedger.snapshot().externalSchemeNavigations.length > 0,
+      async (page) => isPassiveRequestGuardClosed(page.context()),
       route === 'button-click' ? { act: clickExternalSchemeButton } : {},
     );
 
     // 補助の確認（RC18a の指摘4）: 「サーバには、そのページへの GET だけが届く」と「page の URL は変わらない」は、Guard がなくても
-    // 同じ結果になる（外部スキームはネットワークを通らず、headless のブラウザは外部スキームへ移動しない）。Guard の働きを
-    // 見分けているのは、下の Ledger の記録の確認である。
+    // 同じ結果になる（外部スキームはネットワークを通らず、テストの headless のブラウザは外部スキームへ移動しない）。Guard の働きを
+    // 見分けているのは、下の Ledger の記録と違反、Context を閉じたことの確認である。
     // サーバには、そのページへの GET だけが届く。
     expect(window.requestLines()).toEqual([`GET ${externalSchemeFixturePathname(route)}`]);
     expectOnlyReadRequests(window.counters(), window.observations());
     // page の URL は変わらない。
     expect(pageUrl).toBe(urlOf(path));
-    // Ledger に、そのスキームと経路の記録がある（Guard の働きを見分ける確認）。headless では、違反にせず、Context も閉じない。
+    // Ledger に、そのスキームと経路の記録と、違反がある。Guard は Context を閉じた（Guard の働きを見分ける確認）。
+    expect(guardClosed).toBe(true);
     const snapshot = ledger.snapshot();
     expect(snapshot.externalSchemeNavigations).toEqual([externalSchemeAttemptRecord(route, key, 'PASSIVE')]);
-    expect(snapshot.invariantViolations).toEqual([]);
-    expect(guardClosed).toBe(false);
+    expect(snapshot.invariantViolations).toEqual([
+      expect.objectContaining({ code: EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE }),
+    ]);
   });
 
-  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Interaction (headless): the clicked button that navigates to %s is recorded, the result is BLOCKED_BY_SAFETY, and only the page GET reaches the server', async (
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Interaction: the clicked button that navigates to %s is recorded, is an invariant violation, the result is BLOCKED_BY_SAFETY, and only the page GET reaches the server', async (
     key,
   ) => {
     const path = externalSchemeFixturePath('button-click', key);
-    const observed: { clicks: number | null; pageUrl: string | null } = { clicks: null, pageUrl: null };
+    const observed: { pageUrl: string | null } = { pageUrl: null };
 
     const { window, result } = await auditGuardedInteraction(path, EXTERNAL_SCHEME_BUTTON_NAME, {
-      prepare: async (session) => {
-        await session.page.addInitScript({ content: COUNT_CLICKS_SCRIPT });
-      },
       beforeClose: async (session) => {
+        // Guard が閉じた page でも、最後の URL は読める（page の中のスクリプトは、閉じた後には動かせない）。
         observed.pageUrl = session.page.url();
-        observed.clicks = await session.page.evaluate(() => (globalThis as { __gateClicks?: number }).__gateClicks ?? -1);
       },
     });
 
-    // click は行われた（候補は、方針で拒否されていない）。
+    // click は行われた（候補は、方針で拒否されていない）。fixture のボタンは、押されたときにだけ外部スキームへ移動するので、
+    // 凍結の後の移動の試みの記録が、click が行われたことを示す（Guard が session の Context を閉じるので、page の中で数えた
+    // click の数は、閉じた後には読めない）。
     expect(result.status).not.toBe('REJECTED_UNSAFE');
-    expect(observed.clicks).toBe(1);
-    // 凍結の後の外部スキームへの移動の試みとして記録され、結果は BLOCKED_BY_SAFETY になる。headless では違反にしない。
     expect(result.safety.externalSchemeNavigations).toEqual([externalSchemeAttemptRecord('button-click', key, 'INTERACTION')]);
+    // 凍結の後の外部スキームへの移動の試みなので、結果は BLOCKED_BY_SAFETY になる。移動の試みは違反になり、Guard が session の
+    // Context を閉じる（その後の owner の close は、無効にした Context の close の失敗として記録される）。
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
-    expect(result.safety.invariantViolations).toEqual([]);
+    expect(result.reason).toBe('SAFETY_FREEZE_BLOCKED');
+    expect(result.safety.invariantViolations).toEqual([
+      expect.objectContaining({ code: EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE }),
+      expect.objectContaining({ code: 'INTERACTION_OWNER_CLOSE_FAILED' }),
+    ]);
     // page の URL は変わらず、サーバには、そのページへの GET だけが届く。
     expect(observed.pageUrl).toBe(urlOf(path));
     expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_BUTTON_PAGE}`]);
     expectOnlyReadRequests(window.counters(), window.observations());
   });
 
-  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive (headed injected into a headless browser): location-href to %s records EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE and closes the Context', async (
-    key,
-  ) => {
-    const path = externalSchemeFixturePath('location-href', key);
-
-    const { window, ledger, guardClosed } = await openGuardedPassivePage(
-      path,
-      async (page) => isPassiveRequestGuardClosed(page.context()),
-      { factory: headedFactory },
-    );
-
-    expect(guardClosed).toBe(true);
-    const snapshot = ledger.snapshot();
-    expect(snapshot.externalSchemeNavigations).toEqual([externalSchemeAttemptRecord('location-href', key, 'PASSIVE')]);
-    expect(snapshot.invariantViolations).toEqual([
-      expect.objectContaining({ code: 'EXTERNAL_SCHEME_NAVIGATION_IN_HEADED_MODE' }),
-    ]);
-    expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_NAVIGATION_PAGE}`]);
-    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  });
-
-  it('GATE-S03 CLI Run (headless): the Safety Evidence of the written page.json keeps the external scheme navigation, and the Run is not ABORTED_BY_SAFETY', async () => {
+  it('GATE-S03 CLI Run (headless): the page navigation to an external scheme ends with ABORTED_BY_SAFETY and exit code 3, and the written page.json keeps the record', async () => {
     const route = 'location-href';
     const key = 'mailto';
     const window = openServerWindow(server);
@@ -506,9 +488,11 @@ describe('GATE-S03: navigations to external schemes by the page are recorded, an
     });
 
     expect(cliRun.stderr).toBe('');
-    expect(cliRun.run.runStatus).not.toBe('ABORTED_BY_SAFETY');
-    expect(cliRun.code).toBe(exitCodeForRunStatus(cliRun.run.runStatus));
-    expect(cliRun.run.safety.invariantViolationCount).toBe(0);
+    // headless でも、違反として Run を止める（R7d）。
+    expect(cliRun.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(cliRun.code).toBe(EXIT_CODES.ABORTED_BY_SAFETY);
+    expect(cliRun.run.safety.invariantViolations.map((violation) => violation.code))
+      .toEqual([EXTERNAL_SCHEME_ATTEMPTED_VIOLATION_CODE]);
     // 書き出した page.json の Safety の Evidence に、外部スキームへの移動の記録が残る。
     const pages = writtenPageResults(await readRunArtifactFiles(cliRun.runDirectory));
     // 監査したページは、その fixture の1つだけである（page の identity の URL は、正規化でクエリの名前の順に並ぶ）。
@@ -529,15 +513,13 @@ describe('GATE-S03: navigations to external schemes by the page are recorded, an
 
 // C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」、4.2.1）: サーバのリダイレクト
 // （`302 Location: <外部スキーム>`）は、Guard が Document の応答の段階で、たどる前に止め、`externalSchemeNavigations` に
-// `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、headed（設定の注入）でも違反にしない。
+// `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない（ページのスクリプトによる移動は違反にする
+// のと違う。中断した Run の再開の設計書 4.10）。
 // 対照の確認（Guard のない Context では、同じ fixture がリダイレクトをたどり、外部スキームへの `request` の事象（`redirectedFrom`
 // 付き）が来ること）は、`tests/integration/gate-fixtures.test.ts` の C18g に置く。RC18a の再現（`probe3-frame.log`）では、
 // Run の artifact の記録が0件だった。
 describe('GATE-S03: server redirects to external schemes are stopped before they are followed, and recorded', () => {
-  const cases = factoryModeCases(EXTERNAL_SCHEME_KEYS);
-
-  it.each(cases)('GATE-S03 Passive (%s): the iframe redirect to %s is stopped and recorded without a violation; only the page and the redirect source reach the server', async (
-    mode,
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive: the iframe redirect to %s is stopped and recorded without a violation; only the page and the redirect source reach the server', async (
     key,
   ) => {
     const path = externalSchemeRedirectFramePath(key);
@@ -549,10 +531,9 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
         externalFrames = externalSchemeTargetFrameUrls(page);
         return pageLedger.snapshot().externalSchemeNavigations.length > 0;
       },
-      { factory: factories[mode] },
     );
 
-    // Guard の働きを見分ける確認: Ledger に、止めた記録がある。headless でも headed でも、違反にせず、Context も閉じない。
+    // Guard の働きを見分ける確認: Ledger に、止めた記録がある。違反にせず、Context も閉じない。
     const snapshot = ledger.snapshot();
     expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
     expect(snapshot.invariantViolations).toEqual([]);
@@ -564,12 +545,10 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
     expect(externalFrames).toEqual([]);
   });
 
-  it.each(cases)('GATE-S03 Passive (%s): the main frame redirect to %s is stopped and recorded without a violation; the navigation fails and only the redirect source reaches the server', async (
-    mode,
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive: the main frame redirect to %s is stopped and recorded without a violation; the navigation fails and only the redirect source reaches the server', async (
     key,
   ) => {
-    const passiveFactory = factories[mode];
-    await withGuardedPassivePage(passiveFactory, viewport, async (page, context, ledger) => {
+    await withGuardedPassivePage(factory, viewport, async (page, context, ledger) => {
       const window = openServerWindow(server);
 
       const navigation = await page.goto(urlOf(externalSchemeRedirectPath(key))).then(() => 'RESOLVED', () => 'REJECTED');
@@ -580,7 +559,7 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
       const snapshot = ledger.snapshot();
       expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'MAIN')]);
       // RC18a の指摘3（設計者の判断）: Guard 自身が止めた main frame のリクエストの失敗は、予期した失敗なので、
-      // `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない。headed でも違反は0件で、Context も閉じない。
+      // `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない。違反は0件で、Context も閉じない。
       expect(snapshot.invariantViolations).toEqual([]);
       expect(isPassiveRequestGuardClosed(context)).toBe(false);
       expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`]);
@@ -651,27 +630,24 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
 // Chromium で確かめる（サイトの分離を無効にする引数は使わない）。別のサイトの iframe は、同じ fixture のサーバの別のホスト名
 // （`localhost`）で作る。RC18b の再現では、この経路の記録は0件だった。
 describe('GATE-S03: server redirects to external schemes inside an out-of-process iframe (OOPIF) are stopped before they are followed, and recorded', () => {
-  const cases = factoryModeCases(EXTERNAL_SCHEME_KEYS);
-
   let isolatedBrowser: Browser | undefined;
-  let isolatedFactories: Readonly<Record<FactoryMode, BrowserContextFactory>>;
+  let isolatedFactory: BrowserContextFactory;
 
   beforeAll(async () => {
     // headless だけで起動する。`--site-per-process` は、別のサイトの iframe を別のプロセスにする（サイトの分離を強める側の引数）。
     const launched = await launchHeadlessChromium({ args: SITE_PER_PROCESS_ARGS });
     isolatedBrowser = launched;
-    isolatedFactories = createModeFactories(launched, server.origin);
+    isolatedFactory = createGateFactory(launched, server.origin);
   });
 
   afterAll(async () => {
     await isolatedBrowser?.close();
   });
 
-  it.each(cases)('GATE-S03 Passive OOPIF (%s): the redirect to %s started by the OOPIF is stopped and recorded without a violation; only the pages and the redirect source reach the server', async (
-    mode,
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive OOPIF: the redirect to %s started by the OOPIF is stopped and recorded without a violation; only the pages and the redirect source reach the server', async (
     key,
   ) => {
-    const passiveFactory = isolatedFactories[mode];
+    const passiveFactory = isolatedFactory;
     const crossSiteOrigin = crossSiteOriginOf(server.origin);
     const path = crossSiteFramePath(selfNavigatingFramePath(key));
     await withGuardedPassivePage(passiveFactory, viewport, async (page, context, ledger) => {
@@ -681,7 +657,7 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
       await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
       await wait(QUIET_PERIOD_MS);
 
-      // Guard の働きを見分ける確認: 移動は OOPIF の中で始まり、Ledger に止めた記録がある。headless でも headed でも、違反にしない。
+      // Guard の働きを見分ける確認: 移動は OOPIF の中で始まり、Ledger に止めた記録がある。違反にしない。
       expect((await oopifTargetUrls(isolatedBrowser!)).some((url) => url.startsWith(`${crossSiteOrigin}/`))).toBe(true);
       const snapshot = ledger.snapshot();
       expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
@@ -700,7 +676,7 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
   });
 
   it('GATE-S03 Passive OOPIF (headless): the redirect started by a nested OOPIF (127.0.0.1 in localhost) is stopped and recorded without a violation', async () => {
-    const passiveFactory = isolatedFactories.headless;
+    const passiveFactory = isolatedFactory;
     const key: ExternalSchemeKey = 'custom';
     await withGuardedPassivePage(passiveFactory, viewport, async (page, _context, ledger) => {
       const window = openServerWindow(server);
@@ -732,7 +708,7 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
     const crossSiteOrigin = crossSiteOriginOf(server.origin);
     const crossSiteFrames = (page: Page): ReturnType<Page['frames']> =>
       page.frames().filter((frame) => frame.url().startsWith(`${crossSiteOrigin}/`));
-    const session = await isolatedFactories.headless.createInteractionSession(viewport);
+    const session = await isolatedFactory.createInteractionSession(viewport);
     try {
       await session.page.goto(urlOf(crossSiteFramePath(selfNavigatingFramePath())), { waitUntil: 'load' });
       await expect.poll(() => crossSiteFrames(session.page).length).toBe(1);
