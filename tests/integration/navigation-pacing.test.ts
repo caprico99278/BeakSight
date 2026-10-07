@@ -180,6 +180,7 @@ function recordingPacer(pacer: NavigationPacer, starts: number[]): NavigationPac
       return waitedMs;
     },
     snapshot: () => pacer.snapshot(),
+    raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
   };
 }
 
@@ -343,6 +344,8 @@ describe('Navigation pacing waits do not use up the page deadlines (load control
         return delayMs;
       },
       snapshot: () => Object.freeze({ navigationCount, totalWaitMs, lastNavigationStartedAtMs }),
+      // 独立の偽物なので、最小の間隔を上げる操作（SU6）は何もしない。
+      raiseMinimumInterval: () => undefined,
     };
   }
 

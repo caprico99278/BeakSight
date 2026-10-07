@@ -10,6 +10,7 @@ import {
   CHECKPOINT_ARTIFACT_DIRECTORY,
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
+  DIAGNOSTICS_ARTIFACT_DIRECTORY,
   PAGE_ARTIFACT_FILE_NAMES,
   PAGES_ARTIFACT_DIRECTORY,
   PREFLIGHT_TEMPORARY_FILE_PREFIX,
@@ -30,6 +31,7 @@ import {
   pageArtifactRelativePath,
   runArtifactDirectory,
   screenshotRelativePath,
+  siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
 
 const RUN_ID = createRunId(20260924000000);
@@ -263,6 +265,35 @@ describe('artifact layout: the checkpoint and the PREFLIGHT temporary file (resu
     expect(isPreflightTemporaryFileName('.beaksight-preflight-0b7c9a43-4f8e-4a55-9d1e-3a5f2c6b7d80.tmp')).toBe(true);
     for (const name of ['.beaksight-preflight-.tmp', '.beaksight-preflight-x.txt', 'beaksight-preflight-x.tmp', 'run.json', '.run.json.x.tmp']) {
       expect(isPreflightTemporaryFileName(name), name).toBe(false);
+    }
+  });
+});
+
+// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録の置き場所。Run のディレクトリの直下の `diagnostics/` に、ページと
+// 実行の番号と試行の番号ごとに1つ置く。`checkpoint/` の外なので、Run の終わりの片付け（`checkpoint/` の中だけを消す）で消えない。
+// SU5（サイトが応答しないときに Run を止める設計書 3.5.2）: 同じ実行で同じページを 1 回確かめ直すので、名前に試行の番号（1 回目が 1）を加える。
+describe('artifact layout: the site-unavailable diagnostics (site-unavailable diagnostics design 2.3)', () => {
+  it('names the diagnostics directory directly under the run directory, outside checkpoint/', () => {
+    expect(DIAGNOSTICS_ARTIFACT_DIRECTORY).toBe('diagnostics');
+    expect(isPortableArtifactPathSegment(DIAGNOSTICS_ARTIFACT_DIRECTORY)).toBe(true);
+    expect(DIAGNOSTICS_ARTIFACT_DIRECTORY).not.toBe(CHECKPOINT_ARTIFACT_DIRECTORY);
+  });
+
+  it('makes the path of a diagnostic relative to the run directory, with the page ID, the execution number and the attempt number, separated by /', () => {
+    expect(siteUnavailableDiagnosticRelativePath(PAGE_12, 1, 1)).toBe('diagnostics/site-unavailable-PAGE-000012-1-1.json');
+    expect(siteUnavailableDiagnosticRelativePath(PAGE_12, 1, 2)).toBe('diagnostics/site-unavailable-PAGE-000012-1-2.json');
+    expect(siteUnavailableDiagnosticRelativePath(PAGE_1, 3, 1)).toBe('diagnostics/site-unavailable-PAGE-000001-3-1.json');
+    const path = siteUnavailableDiagnosticRelativePath(PAGE_12, 2, 1);
+    expect(isPortableRelativeArtifactPath(path)).toBe(true);
+    expect(path.startsWith(`${DIAGNOSTICS_ARTIFACT_DIRECTORY}/`)).toBe(true);
+    expect(path.split('/')).toHaveLength(2);
+    expect(artifactFilePath(join('out', RUN_ID), path)).toBe(join('out', RUN_ID, 'diagnostics', 'site-unavailable-PAGE-000012-2-1.json'));
+  });
+
+  it('rejects an execution number or an attempt number that is not a positive safe integer', () => {
+    for (const number of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => siteUnavailableDiagnosticRelativePath(PAGE_1, number, 1), `execution ${String(number)}`).toThrow(RangeError);
+      expect(() => siteUnavailableDiagnosticRelativePath(PAGE_1, 1, number), `attempt ${String(number)}`).toThrow(RangeError);
     }
   });
 });

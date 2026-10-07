@@ -2727,3 +2727,265 @@
 - Git に載るファイルに、本来の監査対象のサイトの名前がないことを確かめた。
 - 次: Task 21 を始めてよいかを、ユーザーに尋ねる。
 - ユーザーの判断（2026-10-03）: 「まだ始めない」。Task 21 は、ユーザーの改めての承認まで始めない。手順書（`T21-procedure.md`）と設定を見直してから決める。本来の監査対象のサイトには、つないでいない。
+
+### 2026-10-05 Task 21 の1回目の起動（ABORTED_BY_SAFETY で停止）
+
+- ユーザーの承認（2026-10-05「Task 21を進めて」）を得て、着手した。前回の確認から、ソースとビルドは変わっていない（ユーザーのコミット `6175481` にも、対象の名前と `local/`・`artifacts/` はない）。`validate-config` は終了コード 0。
+- 監査の前の PC の受信: 平均 毎秒 0.134MB（20秒）。
+- 設計者の Terminal の欄への入力は、アプリの Terminal の連携の部品（`claude-desktop.ps1`）が見つからず失敗した（何も実行されていない）。ユーザーが Terminal の欄で起動した（headed）。
+- 結果: 1ページ目の Interaction の段階で、安全の不変条件の違反が記録され、`ABORTED_BY_SAFETY` で止まった（経過 1分17秒、終了の記録 `STOPPED_BY_SAFETY_VIOLATION`）。出力は `artifacts/RUN-20261005010335/`（保存は `state.json` だけの FINISHED）。
+  - 違反: `CDP_CONTINUE_REQUEST_FAILED` 2件（`Fetch.continueRequest: Invalid InterceptionId.`）と、その結果の `INTERACTION_OWNER_CLOSE_FAILED` 1件。
+  - 起きた場所: 1ページ目の8番目の Interaction の Context（止めた要求は0件。ページの読み込みの初めの段階）。それまでの7つの Context では、POST を 12〜13件ずつ設計どおりに止めていた。Run 全体で POST 147件を止めた。
+  - 負荷: ページの読み込み 14回、許可 Origin への要求 96件（1分あたり最大 92件）、許可 Origin の外 295件（1分あたり最大 291件。Passive の読み込み）、キャッシュから返した要求 2,622件、許可 Origin の外へ送らなかった要求 240件。負荷は目安の中だった。
+- 推定の原因（未確認）: Guard の CDP の層（文書の要求を Request と Response の段階で一時停止して確かめる。`src/safety/passive-request-guard.ts` の `Fetch.continueRequest`）が、ブラウザ側で取り消された文書の要求（iframe の削除や、すぐの移動など）を先へ進めようとして失敗し、fail-closed で違反にした。サイトに余計な要求は送られていないと推測する。
+- 次: DEF-026 として登録し、ローカルの fixture で再現と原因の確定、直し方の設計、修正、独立レビューの後に、Task 21 をやり直す。本来の監査対象のサイトには、それまでつながない。
+
+### 2026-10-05 DEF-026 の調査の結果と、直し方の判断
+
+- 調査担当の報告（ファイルの変更なし。実験はスクラッチパッドの `def026/`）: 再現できた。読み込みの途中で iframe が消される・`src` が変わる・iframe の読み込み中に main frame が移ると、ブラウザがその iframe の文書の要求を取り消す。Guard の CDP の層は、route より先に文書の要求を一時停止するので、命令（continue、fail）が届く前に取り消されると `Invalid InterceptionId` で失敗し、fail-closed で違反になる。本番と同じ文言（page の session）を再現した。
+  - 安全: Request の段階で取り消された 287件は、サーバに1件も届かなかった。Response の段階の取り消しは、許可した GET の応答がページに渡らなかっただけ。`Fetch.failRequest` の失敗でも、止めたかった要求は届かなかった。route が CDP の層より先に要求を終わらせる経路はなかった。
+  - 取り消しの事象（Playwright の `requestfailed` 352/352、`Network.loadingFailed` の canceled 103/103）は、命令の失敗の応答より先に届いた。
+  - `REVISIT` では、キャッシュから返したスクリプトがすぐ動くので、起きやすい（20回中 3〜4回）。
+- 設計者の判断: 案 B（取り消しの証拠を ID で対応付けたときだけ違反にしない。証拠がなければ違反のまま）を採る。文言だけで判断する案 A は、Guard 自身の不具合を隠すので採らない。設計書 `doc/design/2026-10-05-beaksight-def-026-guard-canceled-document-design.md` を書いた。安全の境界の変更なので、実装の後に独立レビューを受ける。
+- DEF-026-fix を起動した。
+
+### 2026-10-05 DEF-026-fix の Blocker と解消
+
+- 実装者の報告: 設計どおりに実装したが、実際の Chromium の結合テスト6件が GREEN にならない。取り消しの証拠（`Network.loadingFailed` の canceled、type Document）は、ID で対応付けられる（282件すべて）が、一時停止の通知の 3〜55ms 前に届くので、「一時停止の時点で覚えた要求の証拠だけを受ける」作りでは必ず捨てられる。単体と偽の session のテストは GREEN。既存の Safety Gate などは PASS。作業ツリーには、今の設計どおりの実装が残っている（取り消しは、まだ違反になる。安全を弱める変更はない）。
+- 設計者の判断: 取り消しの証拠を、一時停止の有無によらず、文書の要求の取り消しだけを、session ごとに上限（256件、5秒）付きで覚える。命令の失敗のときに、`networkId` が覚えた中にあるかを見て、なければ 500ms 待ち、なければ違反（fail-closed）。安全の判断は変わらない。設計書の 2章と変更履歴を直した。同じ実装者に続けさせる。
+
+### 2026-10-05 DEF-026-fix 完了（Blocker の解消の後）と独立レビューの起動
+
+- 実装者の報告: 取り消しの証拠（canceled かつ type Document の `Network.loadingFailed`）を、一時停止の有無によらず、session ごとに上限（256件、5秒）付きで覚える。判定は `settlePausedDocumentCommand` の1か所。すべての `Fetch.continueRequest`・`Fetch.failRequest`（11か所）を通す。実際の Chromium の結合テスト（`guard-canceled-document.test.ts`）6件と、証拠を落とした対照1件が PASS（4回続けて）。偽の session のテスト 28件。
+- 設計者の確認: 関連の 13ファイル 542件 PASS、型チェック PASS。変更したファイルは指示の範囲（`playwright-errors.ts`、`passive-request-guard.ts`、テスト3つ、新しい結合テストと fixture）。
+- 発見事項の扱い: 1（成功した命令の要求の証拠も、期限か session を閉じるまで消さない）→ 受け入れ、設計書 2章と変更履歴に書いた。2（止める命令の失敗の文言は、結合テストでは起きていない）→ レビューで見る。3（`Network.enable` の速さへの影響は未計測）→ レビューで見る。4（main frame の `location.replace` の連続で `HTTP_MAIN_FRAME_DELIVERY_FAILED`）→ DEF-027 として登録した（Task 21 で起きるかを見る）。
+- 安全の境界の変更なので、読み取り専用の独立レビュー（`DEF-026-review-brief.md`）を起動した。
+
+### 2026-10-05 DEF-026 の独立レビュー（承認）
+
+- 結果は `DEF-026-review-result.md`。承認（Critical 0）。Important 1件は今回の変更の範囲外の既存の経路で、DEF-028 として登録した（fail-closed のまま。Task 21 で起きたら実データで調べる）。Minor 2〜4（テストの補強、定数の書き写し、リダイレクトの登録）は、Task 21 の後に直す（Task 21 の途中でビルドを変えないため）。Minor 5（速さ +12%）は許容。
+- DEF-026 の状態を完了とする。全体の検証を実行してから、Task 21 をやり直す。
+
+### 2026-10-05 Task 21 のやり直しの前の Gate（PASS）
+
+- `npm run verify` → PASS（117ファイル 4,806件、ビルド。終了コード 0。テストの所要時間 352秒）。記録はスクラッチパッドの `verify-20261005-t21gate.log`。
+- `validate-config` → 終了コード 0。Git に載るファイルに対象の名前なし。監査の前の PC の受信: 平均 毎秒 0.008MB。
+- 次: ユーザーに、Terminal の欄での起動を頼む（前回の Run は FINISHED なので、新しい Run として始まる）。
+
+### 2026-10-05 Task 21 の2回目の起動（サイトのメンテナンスと、DEF-027 の違反で停止）
+
+- ユーザーが Terminal の欄で起動した（headed）。13ページを監査したところで、サイトがメンテナンスに入り、ユーザーが Ctrl+C を押した。結果は `ABORTED_BY_SAFETY`（出力は `artifacts/RUN-20261005023434/`。保存は `state.json` だけの FINISHED。違反の Run なので再開できない）。
+- 負荷（進み具合の行と `run.json` の `load`）: 21分で、ページの読み込み 210回、許可 Origin への要求 872件（1分あたり最大 96件）、許可 Origin の外 4,571件（1分あたり最大 489件。Passive の読み込み）、キャッシュから返した要求 29,703件、許可 Origin の外へ送らなかった要求 4,029件。目安（1分あたり最大 600件）の中だった。設計者は、実行中の PC の受信を測れていない（ユーザーの知らせを待つ間に動いていなかったため。次は起動の直後から測る）。
+- 監査したページ: 13（AUDITED 6、PARTIAL 5（Interaction の予算）、FAILED 2）。残り 97件は `SAFETY_VIOLATION_ABORT`。
+- 違反: `HTTP_MAIN_FRAME_DELIVERY_FAILED`（`net::ERR_ABORTED`）1件だけ。13ページ目のモバイルの Passive の読み込みで、main frame の文書の要求が、接続も応答もないまま `ERR_ABORTED` で失敗した（`NAVIGATION_FAILED:FAILED:net::ERR_ABORTED`）。同じページのデスクトップと、12ページ目のモバイルは、時間切れ（`NAVIGATION_FAILED:TIMEOUT`）。サイトのメンテナンスで応答が止まった状態で起きた。Guard は、許可した main frame の読み込みの `ERR_ABORTED` を、閉じる途中でなければ違反にする（`passive-request-guard.ts` の `onRequestFailed`）。
+- Safety: POST 2,546件を止めた。外部アプリの起動、ポップアップ、ダウンロードは0件。
+- 次: DEF-027 を、ローカルで、メンテナンス中の状態（応答しない、503、接続を切る、など）を模して再現し、原因を確かめる。
+
+### 2026-10-05 ユーザーの指示: サイトが応答しないときに Run を止める
+
+- ユーザーの指示（2026-10-05）: 「タイムアウト後にページ読み込みが中断された場合もrun自体が終了せず、続行したことも問題と考える」。
+- ユーザーの判断（AskUserQuestion）: 止める時点は「最初の1回で止める」。止めた後は「再開できる状態で止める」。
+- 設計書 `doc/design/2026-10-05-beaksight-site-unavailability-stop-design.md` と実装計画を書いた。不調とみなすのは、BeakSight が始める main frame の読み込み（Passive、幅の走査、Interaction、robots.txt と sitemap.xml）の、時間切れ、ネットワークの層の失敗（既存の閉じた一覧）、429・502・503・504。`ERR_ABORTED` は含めない（DEF-027）。不調のページは SKIPPED（`SITE_UNAVAILABLE`。再開で待ち行列に戻す）、残りも SKIPPED、終わり方 `STOPPED_BY_SITE_UNAVAILABLE`、保存は `STOPPED`。今の再試行の対象は、すべて止める側に入るので、再試行は起きなくなる。
+- SU1（判定の owner、理由のコード、終わり方、保存の規則）を起動した。DEF-027 の調査（読み取り専用）は並行で動いている。
+
+### 2026-10-05 SU1 完了と、設計の見直し（SU1b を追加）
+
+- 設計者の見直し: 幅の走査と Interaction は `load` まで待つので、時間切れをすべて不調にすると、遅い外部のスクリプトがあるだけのページで毎回止まり、再開でも先へ進めない。時間切れは、main frame の最後の文書の要求に応答がない場合だけ不調にした（設計書 2.2）。読み込みの観測の部品 `src/browser/main-frame-load.ts` を加えた（2.1）。同じページが続けて2回止まるきっかけになったら、2回目は普通の結果として保存して止める決まりを加えた（3.2.1）。応答を受けた後の Desktop の時間切れは、今までどおり再試行する（3.3）。Owner Matrix に判定の owner の行を加えた。
+- SU1 完了（実装者の報告を設計者が確かめた）: `src/orchestration/site-availability.ts`（`siteUnavailabilityOf`、`SITE_UNAVAILABILITY_KINDS`、`SITE_UNAVAILABLE_HTTP_STATUSES`）、`SITE_UNAVAILABLE`、`STOPPED_BY_SITE_UNAVAILABLE`（契約、両スキーマ、文言、表示カタログ。`INTERRUPTED_ABNORMALLY` の order を 6 に）、`run-checkpoint.ts` の規則。設計者の再実行: 関連の 11 ファイル 1298 件 PASS、`npm run typecheck` PASS。変更は指示の範囲。
+- SU1 の発見事項: `site-availability.ts` が `page-auditor.ts` から `chromiumNetErrorCode` と `navigationFailureDetail` を import しており、SU2 で循環する。SU1b で、この2つを `page-navigation.ts`（ナビゲーションの結果の owner）に移す。
+
+### 2026-10-05 DEF-027 の調査の結果と DEF-029 の登録
+
+- DEF-027 の調査（読み取り専用、127.0.0.1、headless）: Task 21 の2回目の違反と同じ形を再現できたのは、読み込み中のタブを BeakSight の外から閉じた場合だけ（5/5）。サーバの状態、BeakSight 自身の期限と閉じる処理、本物の Ctrl+C では起きない。推測: headed の Run で、利用者がモバイルのウィンドウを閉じた。利用者に、止めたときの操作を確かめる。直し方の案は A（Guard の証拠で外からの取り消しを違反にしない）、B（運用で防ぐ）、C（採らない）。defects.md の DEF-027 に記録した。
+- 調査で見つかった別の不具合を DEF-029 に登録した（本文が空の 4xx・5xx、401 Basic、本文の途中の切断で、Guard が違反にする。空の 503 のメンテナンスのページや、本文の空の 404 の robots.txt で Run が止まる）。設計書 `doc/design/2026-10-05-beaksight-def-029-response-received-failures-design.md` を書き、DEF-029-fix を起動した（SU1b と並行。変更するファイルは重ならない）。
+- ユーザーの回答と判断（2026-10-05、AskUserQuestion）: Task 21 の2回目を止めたときの操作は「両方」（Ctrl+C と、ブラウザの画面を閉じる）。DEF-027 は「Guard も直す」。設計書 `doc/design/2026-10-05-beaksight-def-027-external-cancel-design.md` を書いた（Guard の session の証拠で、許可して進めた文書の要求が、応答のヘッダを受ける前にブラウザに取り消されたと確かめた場合だけ、違反にしない）。DEF-029-fix の後に起動する。README の運用の注意は SU4 で書く。
+- SU1b 完了（実装者の報告を設計者が確かめた）: `src/browser/main-frame-load.ts`（`trackMainFrameDocument`、`observeMainFrameLoad`、`MainFrameLoadObservation`。終わり方は既存の `DeadlineOutcome` を使う）。`siteUnavailabilityOf` の入力を観測に変え、応答のない時間切れだけを不調にした。`chromiumNetErrorCode` と `navigationFailureDetail` を `page-navigation.ts` に移した。設計者の再実行: 関連の 7 ファイル 399 件 PASS、`npm run typecheck` PASS。台帳を更新した。CC-041 を登録した。
+  - 設計者の書き漏れ: SU1b の指示書に「ほかの実装者は動いていない」と書いたまま、DEF-029-fix を並行で起動した。実装者は、一時的な型チェックの失敗に気づいて報告した。以後、並行で起動するときは、両方の指示書に相手の範囲を書く。
+  - 発見事項への判断: 本文の途中の切断（DEF-029 で `NETWORK_LAYER_FAILURE_CODES` に加えた2つ）は、ヘッダの後でも不調とみなす（DEF-029 の設計書 2.1 のとおり。サーバか経路が接続を切った失敗であり、同じページで止まり続ける場合は 3.2.1 の決まりで先へ進む）。`src/core/contracts.ts` の `navigationFailureDetail` の置き場所のコメントは、SU2a で直す。
+- DEF-029-fix 完了（設計者が確かめた）: `RESPONSE_RECEIVED_FAILURE_CODES` と `isResponseReceivedFailure`、本文の途中の切断の2つの理由を `NETWORK_LAYER_FAILURE_CODES` に加えた。Guard の `onRequestFailed` に、設計書 2.2 の5つの条件の分岐（18 行）を加えた。設計者の再実行: `network-layer-failure`、`guard-response-received-failures`、Guard の既存の3ファイル、architecture の 8 ファイル 404 件 PASS。台帳を更新し、CC-042（safety が audit の status の範囲を使う）と DEF-030（テストの Chromium と CLI の Chromium の振る舞いの違い）を登録した。
+- SU2a の Blocker（実装者は何も変えずに止まった）: 既存の `page-auditor.test.ts` の2件（応答のない時間切れ、接続の拒否で、両方のビューポートが FAILED になる）が、新しい決まりとぶつかる。`crawl-run.test.ts` の DEF-007 の再試行のテストも、最初の試行が `ERR_EMPTY_RESPONSE`（不調）なので失敗する見込み。判断: 決まりの変更による直しとして直してよい。元の意図は、ヘッダの後の時間切れ（不調ではない）の場面で残す。DEF-007 のテストは、最初の試行をヘッダの後の時間切れに変える（再試行の対象のまま）。`SU2a-blocker-resolution-brief.md` で再開した。
+- DEF-027-fix を起動した（SU2a と並行。変更するファイルは重ならない。両方の指示書に相手の範囲を書いた）。
+- SU2a 完了（設計者が確かめた）: `navigatePage` が観測（`loadObservation`）を持つ。Page Auditor は、Passive で不調を検知したら、収集せずに FAILED（`SITE_UNAVAILABLE:passive:<詳細>`）にし、次のビューポートを SKIPPED（`SITE_UNAVAILABLE`、`null`）にし、`precedesRetry` を呼ばない。`PageAuditOutcome.siteUnavailableDetail`。`SITE_UNAVAILABILITY_STAGES`、`siteUnavailableStageDetail`、`siteUnavailableDetail`。既存のテストの直しは3件（`page-auditor.test.ts` の2件、`crawl-run.test.ts` の DEF-007 の1件。どれも決まりの変更による直しで、元の意図は不調ではない場面に残した）。設計者の再実行: 9 ファイル 464 件 PASS、`npm run typecheck` PASS。実装者の追加の確認: Run Coordinator を使う結合テスト 9 ファイルも PASS。
+  - 発見事項への判断: 本文が止まった文書の応答の事象が約 0.5 秒遅れる件は、判定の既知の限界として設計書 2.2 に書いた。SU1b のテストの期限は、SU2b で 2 秒にする。`SITE_UNAVAILABLE_SKIP_REASON` は、SU2b で `site-availability.ts` に移して公開する（SU3a の Run Coordinator も使う）。CC-043 を登録した。
+- DEF-027-fix の Blocker: `onRequestFailed` の分岐（設計書 2.1）で、停止、再読み込み、別の URL への移動、`location.replace` の連続は、違反にならなくなった（RED 10 件 → 9 件 GREEN）。外からタブを閉じると、その直後に Guard の session が閉じ、`CDP_SESSION_DETACHED` が記録される（今の `onSessionClose` の意図した振る舞い）。既存のテスト1件（印のない page の close）の期待のコードが変わる。判断: `CDP_SESSION_DETACHED` は違反のまま残す（session が外れると、一時停止中の要求が Guard を通らずに届くことがある。DEF-028 と合わせて後で考える）。設計書 2.4 を改訂し、`DEF-027-fix-round-1-brief.md` で、同じ実装者に続けさせた（テストの期待の直し）。headed で画面を閉じると、今も違反で止まりうることを、ユーザーに伝え、README に書く。
+- DEF-027-fix 完了（修正1回目を含む。設計者が確かめた）: `CanceledDocumentRegistry` を広げ、main frame の文書の要求の記録（許可して進めた、応答を受けた）と、`net::ERR_ABORTED` の取り消しの証拠を `networkId` で対応付けた。Playwright の要求とは method と URL で1対1に対応付け、区別できなければ違反。既存のテスト1件（印のない page の close）の期待を `CDP_SESSION_DETACHED` に直した。設計者の再実行: Guard の 8 ファイル 487 件 PASS。CC-044 を登録した。DEF-029 と合わせて独立レビュー（`DEF-027-029-review-brief.md`）を起動した（SU2b と並行。レビューは読み取り専用）。
+- SU2b 完了（設計者が確かめた）: 幅の走査（`StressLayoutOptions.afterNavigation`）と Interaction（`InteractionAuditInput.afterTargetLoad`）の観測の受け口。Page Auditor は、ビューポートごとに最初の不調を1つだけ記録し（`ViewportSiteUnavailability`）、次の幅を `SiteUnavailableAbortError` で、次の候補を `interaction:SITE_UNAVAILABLE:remaining=<件数>` で止め、次のビューポートを SKIPPED にする。`SITE_UNAVAILABLE_SKIP_REASON` を `site-availability.ts` に移して公開。`main-frame-load.test.ts` のヘッダの後の時間切れの期限を 2 秒にした。設計者の再実行: 7 ファイル 200 件 PASS、`npm run typecheck` PASS。実装者の追加の確認: Run Coordinator を使う結合テスト 5 ファイル 137 件 PASS。
+  - 発見事項への判断: 幅の走査で検知した場合に、Interaction の止めた理由（`remaining=<件数>`）も付くのは、決まりのとおり（候補を1つも始めなかったことの記録）。`run-checkpoint.ts` の `'SITE_UNAVAILABLE'` の文字列は、型で一覧に結ばれている（既存の `'MAX_RUNTIME_REACHED'` などと同じ形）ので、変えない。
+- Guard の独立レビュー（DEF-027-029-review。読み取り専用）: 修正が必要。Critical 0、Important 1、Minor 4。安全の弱まりはない（DEF-029 の5条件、DEF-027 の 2.1 の条件、route・許可・凍結・閉じる段階・`onSessionClose`・DEF-026 の判定は変わらない、と確かめられた）。
+  - Important-1: DEF-027 の元の現象（0〜5ms の間隔の `location.replace` の連続）は、Guard が進める前に取り消されるので、今も違反（36/36）。要求はサーバに届いていない。台帳は「直した」と書いていた。判断: 限界として残す（DEF-027 の設計書 2.1.1。Guard が一度も進めなかった要求を送られていないと言い切るには、新しい安全の分析が要る。DEF-028 と同じく、実在のサイトで起きたら調べる）。台帳の記述を直した。対照のテストで固定する。
+  - Minor-2（直接タブを閉じるテストが0件も認める）: 完全一致にする。Minor-3（DEF-026 の設計書の証拠を消す時期）: 設計者が設計書を追補した。Minor-4（(b) の説明が強い）: 設計書 2.1.1 で書き分け、コードのコメントを直させる。Minor-5（時刻の順を見ない対応付け。推測）: 設計の決めの範囲。変えない。
+  - `DEF-027-fix-round-2-brief.md` で、同じ実装者に続けさせた（SU3a と並行。ファイルは重ならない）。修正の後、指摘の直しを設計者が確かめ、Important が閉じたことをもって、レビューの再確認とする（Guard の振る舞いは変えないため、再レビューは行わない予定）。
+- SU3a 完了（設計者が確かめた）: Run Coordinator は、ページの結果の不調の印で、そのページを捨て（`SITE_UNAVAILABLE` の SKIPPED、`detail` は不調の詳細。保存しない。Link を拾わない。`pagesStarted` から外す。再試行の記録を消す。捨てた後に状態を保存）、確かめの順（違反、保存の失敗、サイトの不調、ページ数、実行時間、止める印）で残りを SKIPPED にする。前の実行のきっかけのページは、また不調なら普通に保存して止める。不調の印があれば再試行しない。Run の理由は `#finalize` で、この実行の不調から作る。設計者の再実行: 7 ファイル 512 件 PASS、`npm run typecheck` PASS。
+  - 発見事項への判断: 違反と不調が同じページなら Run の理由に `SITE_UNAVAILABLE` を入れない（受け入れ。設計書 3.2 に追記）。CLI の1行は終わり方で出し分ける（設計書 3.4 に追記。SU4）。再開した Run の Evidence と Finding の ID が中断しなかった Run と違うこと、Safety の集計に捨てた試行の Ledger が入ること、`retry-1/` に参照されないファイルが残りうることは、設計どおりとする。
+  - 設計者の書き漏れ（2回目）: SU3a の指示書に「ほかの実装者は動いていない」と書いた後に、DEF-027-fix の修正2回目を並行で起動し、SU3a の実装者に伝えなかった。実装者は気づいて報告した。今後、並行で起動するときは、すでに動いている実装者にも必ず伝える。
+- DEF-027-fix の修正2回目 完了（設計者が確かめた）: 0ms の間隔の `location.replace` の連続が `HTTP_MAIN_FRAME_DELIVERY_FAILED` のまま残ることを対照のテストで固定（1回目の要求はサーバに届かない）。外からタブを直接閉じるテストを `CDP_SESSION_DETACHED` の1件への完全一致にした。Guard の (b)(c) のコメントを設計書 2.1.1 の言い方に直した。設計者の確かめ: 修正の前の版との差分が、コメントの行だけ（非コメントの行の差分は0）。`guard-external-cancel.test.ts` 31 件 PASS。
+- Guard の独立レビュー（DEF-027-029-review）の指摘は、すべて閉じた: Important-1（限界として設計書 2.1.1 に書き、対照のテストで固定、台帳を直した）、Minor-2（完全一致）、Minor-3（DEF-026 の設計書に追補）、Minor-4（設計書とコメントで書き分け）、Minor-5（変えない）。Guard の振る舞いは、レビューの後に変えていないので、再レビューはしない。
+- SU3b の Blocker（実装者は何も変えずに止まった）: `guard-response-received-failures.test.ts` の1件（本文の空の 404 の robots.txt を `FAILED` と確かめる）が、SU3b の決まり（観測した status から `NOT_FOUND`）で失敗する。実装者の実験で、CLI の Chromium の追跡は 404・503 を観測できると分かった。判断: 決まりの変更による直しとして、そのテストの期待を `NOT_FOUND` に直してよい。DEF-029 の設計書の記述と履歴を直した。同じ実装者に続けさせた。
+- SU4 を起動した（SU3b と並行。ファイルは重ならない。両方に相手の範囲を伝えた）。
+- SU4 完了（設計者が確かめた）: 表示用モデル `RunSummaryView.siteUnavailableStop`（最後の実行の終わり方が `STOPPED_BY_SITE_UNAVAILABLE` のときだけ）、文言 `siteUnavailableStopText`、CLI の結果の1行（実行の記録の行の次）。README: 「サイトが応答しないとき」の小節、`endReason` の表、「Ctrl+C で止める」の headed の注意、「CLI の表示」、「サイトへの負荷」、途中の Run の表、終了コードの表、headed の注意。設計者の再実行: 8 ファイル 292 件 PASS。README の追加分に、本来の監査対象のサイトの名前・URL がないことを確かめた。
+  - 発見事項への判断: バンドルの `summary.json` に `siteUnavailableStop` の鍵が出るのは、`load`・`executions` と同じ仕組みなので受け入れる。README の「停止・再読み込み・別の URL への移動は、違反にはなりません」は、DEF-027 の 2.1.1 の限界（凍結の段階、Guard が進める前の取り消し）と比べて無条件の言い方なので、SUR で確かめ、必要なら直す。
+- SU3b 完了（設計者が確かめた）: `SiteMetadataOptions.afterNavigation`。Run Coordinator は、取得の不調を `siteMetadataNavigationHooks` で検知し、sitemap.xml の前の待ちで `SiteMetadataNavigationSkippedError` を投げて読み込まない。取得の結果を保存しない（前の実行がこの段階で止まっていた場合は保存する。`stoppedAtSiteMetadataBefore`）。応答を受けた後の失敗は、観測の status から `NOT_FOUND` などを導く。既存のテストの直しは1件（`guard-response-received-failures.test.ts` の robots.txt の期待を `NOT_FOUND`、404 に）。設計者の再実行: 7 ファイル 533 件 PASS、`npm run typecheck` PASS。CC-045 を登録した。
+- SU3c を起動した（ほかの実装者は動いていない）。
+- SU3c 完了（設計者が確かめた）: `tests/integration/cli-site-unavailable.test.ts`（23 件）。fixture のサーバの前の中継のサーバ（`NORMAL`・`HANG`・`EMPTY_503`）と、CLI と同じ起動の設定の Chromium で、`runAuditCommand` の4つの場面（応答しなくなる、本文の空の 503、robots.txt の段階、戻る前に再開）を確かめた。切り替えた後にサイトに届いた要求は、きっかけのページの文書の GET 1件だけ（中断しない Run の記録を対照にして、空振りでないことも確かめた）。再開した Run は、中断しない Run と、ページの一覧・ID・状態・理由・Finding（fingerprint）で一致。設計者の再実行: 23 件 PASS（101 秒）。本番のコードの不具合はなかった。
+- SUR（独立レビュー。読み取り専用）を起動した（`SUR-review-brief.md`）。
+- ユーザーの指示（2026-10-05）: 「Task 21は本日は再開しない」。本日は、本来の監査対象のサイトへ接続しない。SUR と全体の検証（`npm run verify`）は続け、指摘があれば直し、次の日に Task 21 を再開できる状態に整える。
+- 全体の検証（`npm run verify`。SU1〜SU4、SU3c、DEF-027、DEF-029 の後の作業ツリー。SUR の実行中に並行で実行）: 型チェック PASS、123 ファイル 5062 件 PASS、ビルド PASS、終了コード 0（テストの Duration 359 秒）。記録は scratchpad の `verify-20261005-su.log`。SUR の指摘で直しが出たら、やり直す。
+- SUR（独立レビュー）: 承認。Critical 0、Important 0、Minor 4。不調を検知した後に新しい main frame の読み込みを始める経路はない（4か所、次のビューポート・幅・候補・sitemap.xml・ページ・再試行・pacer の待ちまで確かめられた）。3.2.1 で、2回以内の再開で必ず先へ進む。
+  - M1（README の「停止・再読み込みは違反にならない」が無条件）: README を直す（SUR-fix）。
+  - M2（応答の事象は、ヘッダではなく本文の始まりの後に出る。ヘッダだけを送って止まるページは不調とみなされる）: 受け入れ、設計書 2.2 の既知の限界を直した。README も直す（SUR-fix）。
+  - M3（幅の走査と Interaction で、503 などの読み込みの後も、そのページの続きの処理を行う）: 受け入れ、設計書 3.1 に書いた（新しい読み込みではなく、増えるのは1ページ分の部品）。
+  - M4（robots.txt と sitemap.xml で、時間切れでも 2xx 以外の status から結果を導く）: 受け入れ、DEF-029 の設計書の履歴に実装の決まりを書いた。
+  - SUR-fix（README の2か所）を起動した。README を読むテストはないので、全体の検証はやり直さない。
+- SUR-fix 完了（設計者が確かめた）: README の2か所（M1: 停止・再読み込みは「多くの場合は」違反にならない、Interaction の途中などでは違反で止まることがある。M2: 応答を受けたと分かるのは本文の始まりの後、ヘッダだけを送って止まるページは不調として止まる）。判定の表の「ヘッダ」の言い方は、既知の限界で説明しているので、変えない。
+- Task 21 の再開の前の確認（本日できる分）: Git に載るファイル（未コミットの新しいファイルを含む）に、本来の監査対象のサイトの名前がないことを確かめた（0 件）。`validate-config`（本来の対象の設定）は終了コード 0。手順書 `T21-procedure.md` に 3.2.1〜3.2.3（サイトが応答しないとき、headed の画面の扱い、次の起動は新しい Run）を追補した。
+- 実装計画のサブタスクの表の SUR を完了にした。サイトの不調で止める機能は、SU1〜SU4、SU3c、SUR で完了。
+- 次の作業（次の日）: Task 21 の再開（ユーザーの承認の後、ユーザーが Terminal の欄で起動。起動の前に、作業ツリーが今のままか、`npm run verify` を新しく実行して確かめる）。ユーザーは 2026-10-05 に、Task 21 の完了条件と Task 22 について尋ねた（Task 22 は計画にない、と答えた）。
+- ユーザーの指示（2026-10-05）: 「明日、Task 21 の再開はすぐにでも実行したい。そのために必要な準備や検証があれば今日のうちに済ませておいて」。
+- ユーザーの判断（2026-10-05、AskUserQuestion）: Task 21 の次の Run のページ数の上限は「既定の 500」（設定は変えない）。画面は「これまでどおり表示する（headed）」（`--headed`。画面を閉じない・停止や再読み込みをしない、を手順書 3.2.2 のとおり守る）。
+- 再開の前の確認（2026-10-05、設計者）: 出力先の Run は、2026-10-05 の2つが `FINISHED`、2026-10-01 のものは保存なし。ロックは残っていない（明日のコマンドは新しい Run を始める）。作業ツリーの新しいファイルは、すべて今日の作業のもの。テストの Chromium と Node のプロセスは残っていない。
+- Task 21 の事前の Gate（手順書 2章。2026-10-05 15:24〜15:33、最終の作業ツリー）:
+  - `npm run verify`: 型チェック PASS、123 ファイル 5062 件 PASS、ビルド PASS（`dist/` 15:30）、終了コード 0。記録は scratchpad の `verify-20261005-t21gate2.log`。
+  - `npx vitest run tests/integration/safety-gates.test.ts tests/integration/auditor-gates.test.ts tests/integration/preloading-disabled.test.ts tests/integration/cli-interrupt-windows.test.ts tests/architecture`: 7 ファイル 159 件 PASS（138 秒）。
+  - `validate-config`（本来の対象の設定。新しいビルド）: 終了コード 0（サイトにはつながない）。
+  - 出力先にロックなし、途中の Run なし（明日は新しい Run）。
+  - 手順書に 3.2.4（明日の起動の段取り）を追補した。明日は、作業ツリーが変わっていなければ、この Gate の結果を使って、そのまま起動に進める。
+
+### 2026-10-06 Task 21 の再開（3回目の Run）
+
+- ユーザーの指示（2026-10-06）: 「Task 21を進めて」（本来の監査対象のサイトへの接続の承認）。
+- 起動の前の確かめ（手順書 3.2.4）: `dist/` のビルド（2026-10-05 15:30）の後に変わったソース・テスト・スキーマ・fixture・設定は 0 件（2026-10-05 の Gate の結果を使う）。出力先にロックなし。PC 全体の受信の基準（10:00〜10:01、1分）: 平均 0.053 MB/s、最大 0.591 MB/s（一瞬）。
+- 起動 1（3回目の Run）: 10:02 ごろ、ユーザーが Terminal の欄で起動（`--headed`、既定の設定）。新しい Run。
+  - 最初の10分の見張り: 8分6秒で5ページ（発見 100、上限 500）、ページの読み込み 90回、許可 Origin への要求 365件（1分あたり最大 96件。目安 600件）、許可 Origin の外 1,868件。PC 全体の受信（1分の平均）: 0.043（起動の直後）、0.028、0.033、0.077、0.037、0.032 MB/s（目安 2 MB/s）。止める目安には当たらない。
+- 起動 1 の結果（3回目の Run。`artifacts/RUN-20261006010240`）: 01:02:40〜01:25:15 UTC（約22分半）、終了コード 2、`endReason` は `STOPPED_BY_SITE_UNAVAILABLE`（サイトの不調で止める機能が、初めて実サイトで働いた）。Run の理由は `SITE_UNAVAILABLE`（`mobile:passive:TIMEOUT`）。13ページ目（デスクトップの後のモバイルの Passive の読み込み）で応答がなく、そのページは捨てて SKIPPED、残りも SKIPPED（再開で監査し直す）。
+  - 監査したページ 12（AUDITED 6、PARTIAL 6、FAILED 0）、発見 110、スキップ 98。Finding: エラー 765、警告 309、情報 61、安全 36。
+  - Safety: `guardEnabled` true、`invariantViolationCount` 0、`recordTruncated` false。
+  - 負荷: ページの読み込み 236回、許可 Origin への要求 1,000件（1分あたり最大 96件）、許可 Origin の外 4,941件（最大 488件）、キャッシュから返した 33,940件、外へ送らなかった 4,542件。PC 全体の受信は、ほとんどの時間 0.03 MB/s 前後。10:12〜10:13 ごろに 10秒だけ 12.3 MB/s（その1分の平均は約 2.85 MB/s）、ほかは最大 1.6 MB/s。
+  - 本体の最初の応答までの時間（各ページのデスクトップとモバイル）は、0.07〜1.4 秒で、止まる前に増えていく様子はなかった。13ページ目で急に応答がなくなった。
+  - 設計者の推測（未確認）: 昨日の2回目の Run も、約21分、ページの読み込み約210回、許可 Origin への要求約870件の時点で、モバイルの時間切れで止まった。今日も約22分、236回、1,000件で同じ形。時刻の違う2回で同じ量のところで止まったので、メンテナンスの偶然より、サイト側の防御（短い時間の要求の量で、接続元を一時的に締め出す仕組み）が働いた可能性がある。ユーザーに、普段のブラウザ（同じ PC）と、別の回線（スマートフォンのモバイル回線など）で、サイトが見られるかを確かめてもらう（設計者はサイトにつながない）。
+- ユーザーの確かめ（2026-10-06）: この PC の普段のブラウザで、サイトのトップページが、ふつうに開けた（Run が止まってから十数分後）。
+- ユーザーの判断（2026-10-06、AskUserQuestion）: 「同じ設定で再開して確かめる」（13ページ目から続ける。また同じ量で止まれば、サイトの防御の可能性が高まる）。ほかの案（間隔を 10 秒にして新しい Run、間隔 10 秒と Interaction の候補 5 件まで、今日はここまで）は選ばなかった。
+- 起動 2（再開。同じ Run）: 10:33 にユーザーが起動。続きから再開（13ページ目から）。前回止まった量（ページの読み込み約236回、要求約1,000件）を超えても止まらなかった（約20分でこの実行の分 199回、1,075件）。同じ量で締め出されるという設計者の推測は、弱まった。
+  - 見張り: 許可 Origin への要求の1分あたり最大 105件。PC 全体の受信は、ふだん 0.03 MB/s 前後だが、10秒ほど 2〜8.8 MB/s に跳ねることがあり、1分の平均で 2 MB/s をわずかに超えた分が2回（2.04、2.12）。
+  - 応答の header から、対象のサイトは Cloudflare の後ろにある（`server: cloudflare`、`ssr`）。
+  - 受信の跳ね上がりの出どころ（保存の31ページ分の Passive の Network の Evidence の転送量。下限の値）: 対象のサイトの Origin 187 MB（大半は 2.1 MB の JavaScript の繰り返し）、許可 Origin の外 1,346 MB（サイトの画像と動画を置く外部のストレージ（Supabase）1,089 MB、Google Fonts 125 MB、Google Tag Manager 60 MB、Facebook 35 MB）。同じ URL を、ページごと・ビューポートごとに取り直している（例: 3 MB の画像を61回、184 MB）。各 URL を1回だけ取れば 264 MB で、実際の約1/6。動画（8.4 MB の mp4）は、範囲を指定した取り方（206、`bytes=0-`）で、Run 全体のキャッシュの対象外。
+  - 設計者がユーザーに、外部のストレージから毎回取り直していることを伝え、いったん止めることを勧めた。ユーザーが止めた。
+  - 止まり方: 端末の表示は残っていなかった（ターミナルの欄が新しい画面になっていた）。保存は `IN_PROGRESS`（終わったページ 31）、ロックは残ったまま（プロセス 33188 は動いていない。最後の生存の記録は 11:04 ごろ）。BeakSight の Chromium は残っていない。次の起動では、古いロックとして見分け、続きから再開する（この実行の終わり方は `INTERRUPTED_ABNORMALLY` になる）。
+- ユーザーの判断（2026-10-06、AskUserQuestion）: DEF-031 は「Run の中で使い回す」（画像、動画、スクリプト、フォントは、Run の中で最初の1回だけ取る）。ほかの案（モバイルだけ使い回す、今のまま続ける）は選ばなかった。
+- 設計: 負荷の制御の設計書に 4.10 を追補した（Passive（`PRIMARY`）も届け方の部品に尋ね、キャッシュにあれば返す。`WITHHOLD` は選ばない。`media` を入れる（200、または `bytes=0-` の全体の 206 を 200 として）。動画は全体を 200 で返す。1件の上限を 16 MiB に。Guard は変えない）。実装計画に PC1、PCR を加えた。
+- PC1 を起動した（ほかの実装者は動いていない）。PC1 の後、PCR（独立レビュー）、全体の検証、Task 21 の再開（続きから。32ページ目以降が新しい決まりになることを記録する）の順に進める。
+- ユーザーの問い（2026-10-06）: 「runが途中停止した理由は知っておきたい」。設計者の調べ（記録だけ。サイトにはつながない）:
+  - 2回目の停止（起動 2）: Windows の記録で、11:05:18 に Claude のデスクトップアプリのパッケージが更新され、サービスが起動し直した。BeakSight は Terminal の欄（アプリの中）で動いていたので、一緒に終わったと考えられる。ロックの生存の記録（60秒ごと）の最後は 11:04:20、保存の最後は 11:03:58（31ページ）。失ったのは監査中の32ページ目だけ。対策の案: 長い監査は、アプリの外の PowerShell で起動する（設計者は画面を読めなくなるので、進み具合の行を貼ってもらう）。
+  - 1回目の停止（起動 1）: 13ページ目のデスクトップは 200、モバイルで30秒応答（本文の始まり）がなかった。止まる前の応答は 0.2〜0.7 秒で安定。10:22〜10:27 の Windows の記録に、ネットワークの切断はない（10:24:24 に Restart Manager のセッションが1回あるだけ）。十数分後に普段のブラウザで開け、再開後は同じページを監査でき、前回より多い量でも止まらなかった。対象のサイトは Cloudflare の後ろで、サーバ側でページを組み立てる（`server-timing` の `ssr`、`cfWorker`）。原因は決められない（推測の順: サイト側の一時的な停滞、サイト側の防御（可能性は下がった）、BeakSight 側（根拠なし、否定もできない））。止まるきっかけのページは捨てるので、その読み込みの記録（Network の Evidence）が残らないことが、原因を絞れない理由。
+  - 提案（ユーザーの判断待ち）: 捨てたページの読み込みの記録を、診断用に別のファイルへ残す小さな改善（PC1 の後）。
+- ユーザーの指示（2026-10-06）: 「診断用の記録を残す改善も進めて」。設計書 `doc/design/2026-10-06-beaksight-site-unavailable-diagnostics-design.md` と実装計画を書いた（捨てたページの監査の結果と、Passive のページ本体の要求の観察（Guard と別の CDP の session で `Network.enable` だけ。ヘッダを送ったか、応答のヘッダが来たか、失敗の理由と時刻。header の中身は記録しない）を、`diagnostics/` の別のファイルに残す。Guard は変えない）。D1（観察の部品と Page Auditor）を起動した（PC1 と並行。ファイルは重ならない。両方に相手の範囲を伝えた）。
+- PC1 完了（設計者が確かめた）: `decideResourceDelivery` は、`PRIMARY` でもキャッシュにあれば `FROM_RUN_CACHE`（`WITHHOLD` は選ばない）。factory は `PRIMARY` の Context にも届け方の部品を渡す。キャッシュに `media` を加え、`bytes=0-` に全体を返した 206 を 200 として入れる（`Content-Range` を除く）。1件の上限 16 MiB。README の「サイトへの負荷」を直した。新しい fixture `fixtures/site/resource-delivery-video.mp4`（911 バイト）。既存のテストの直しは8件（どれも決まりの変更による）。Guard は変えていない（設計者が SHA-256 で確かめた。`cedb3855…` のまま）。設計者の再実行: 5 ファイル 221 件 PASS。実装者の確かめ: 2つ目の Passive の読み込みで、キャッシュにある部品（画像、スクリプト、スタイルシート、フォント、動画）が、許可 Origin と外の両方のサーバに届かない。headless-shell と CLI の Chromium の両方で同じ。8.66 MB の動画も `bytes=0-` の1回で全体を取ることを確かめた。
+  - 発見事項への判断: 設計書の古い記述（3.1 の5、3.3、4.6、4.7、7章）に 4.10 の注を加えた。Guard の `GuardResourceDelivery` の説明（REVISIT ごとに作る、のまま）は、コメントだけの直しとして D2 に含める。読み込みごとに URL の違う計測の画像もキャッシュに入るのは、今の決まりどおり（LRU で捨てられる）。
+- PC1 の2回目の報告（D1 の連絡で実装者が再び動いた。中身は1回目と同じ）の追加の発見: 動画がキャッシュに入らない場合（読み込みが終わる前に Context を閉じる、CDN が `bytes=0-` に一部だけを返す、16 MiB を超える）は未確認。Task 21 の再開の後に、`load`（`servedFromCache`、許可 Origin の外の件数）と PC の受信で、実際の効果を確かめる。テストのサーバの重複は CC-043 に追記した。
+- D1 完了（設計者が確かめた）: `src/browser/navigation-diagnostics.ts`（`startNavigationDiagnostics`、送る命令は `Page.getFrameTree` と `Network.enable` だけ）。Page Auditor が Passive の各ビューポートの読み込みの前後で観察し、`PageAuditOutcome.navigationDiagnostics` に持たせる（ページの結果と Evidence には入れない）。header の中身と本文は記録しない（テストで確かめた）。要求を止めている間は「発行あり、ヘッダの送信なし」と記録され、サーバに届かないことを確かめた。設計者の再実行: 7 ファイル 407 件 PASS、`npm run typecheck` PASS、Guard は変わっていない。台帳に登録した。CC-046 を登録した。
+  - 発見事項: 読み込みが終わらない間は、その page への CDP の命令に Chromium が答えないので、`finish` は `detach` の終わりを待たない。ヘッダの送信がなく応答のある hop は、ネットワークを通らずに応答を得た（キャッシュ、route の fulfill、内部のリダイレクト）ことを表す。D2 の README の読み方に入れる。
+- D2 完了（設計者が確かめた）: `diagnostics/site-unavailable-<pageId>-<実行の番号>.json`（スキーマ `site-unavailable-diagnostic-schema/1.0`。`validateArtifact` で検証してから `ArtifactWriter.writeSiteUnavailableDiagnostic` が書く）。Run Coordinator の口 `writeSiteUnavailableDiagnostic(runDirectory, record)` を、捨てた後と、前の実行のきっかけのページを保存した後に呼ぶ（違反の優先、robots.txt と sitemap.xml の段階では呼ばない。失敗は握りつぶす）。CLI が `ArtifactWriter` に配線。Guard は `GuardResourceDelivery` のコメントだけを直した（設計者が、作業の前の写し `cedb3855…` との差分で、コメント以外の行が0であることを確かめた）。README に置き場所と読み方を書いた。設計者の再実行: 9 ファイル 1101 件 PASS（104 秒）、`npm run typecheck` PASS。実装者の確かめ: 本文の空の 503 では status 503 と応答の時刻が記録され、応答しない場合は「ヘッダを送った、応答なし」が記録された。
+  - 発見事項への判断: 書き出しの途中でプロセスが終わると `diagnostics/` に一時ファイルが残りうる（再開の後始末の対象外）。害は小さいので、記録だけにする。記録の型は `run-coordinator.ts` のまま（core のスキーマの形との一致は、スキーマの検証で守る）。台帳に登録した。
+- PC1、D1、D2 の独立レビュー（`PCR-DR-review-brief.md`）と、全体の検証（並行）を起動した。
+- 全体の検証（`npm run verify`。PC1、D1、D2 の後。独立レビューと並行）: 型チェック PASS、124 ファイル 5199 件 PASS、ビルド PASS、終了コード 0（Duration 373 秒）。記録は scratchpad の `verify-20261006-pc-d.log`。レビューで直しが出たら、やり直す。
+- ユーザーの問い（2026-10-06）: 「現時点のサイト診断結果は取得できる？」。設計者が、保存の31ページ分のページの結果（指摘）を集計して伝えた（指摘 2,801 件。ERROR 1,973、WARN 563、INFO 172、SAFETY 93。最多はコントラストの不足 1,863 件（実際の表示の問題。ブランドのオレンジの文字が、ほぼ白の背景で 2.5〜3.0）。`IMAGE_LOAD_FAILED` 62件は広告の計測の通信の ORB で雑音（DEF-032 に登録）。12ページ分の HTML レポートの場所を伝えた。31ページ分のレポートは、再開の後に作られる。
+- PC1・D1・D2 の独立レビュー（PCR-DR）: 修正が必要。Critical 0、Important 1、Minor 5。安全の不変条件、D2 の書き出し、Guard のコメントだけの差分は問題なし。
+  - Important-1: 途中で切れた 200 の本文（`ERR_CONTENT_LENGTH_MISMATCH`）も、`response.body()` が途中までで解決し、キャッシュに入る。PC1 の後は2ページ目以降の Passive に壊れた応答を返す（レビュー担当が3回再現。script の SyntaxError）。判断: 要求が成功して終わった（`requestfinished`）応答だけを入れる（設計書 4.10.3 に追補）。
+  - Minor-1（キャッシュから返した応答は Evidence で見分けにくい）: 設計書 4.10.5 と README に書く。Minor-2（観察の session の開閉で Playwright が送る命令）: 設計書 2.1 とコメントに書く。Minor-3（README の「header を記録しない」の範囲）: README を直す。Minor-4（`bytes=0-` に 200 で全体を返した動画が入らない）: 入れる（設計書 4.10.3 に追補）。Minor-5（Owner Matrix）: 観察の部品の行を加えた。
+  - `PC-D-fix-round-1-brief.md` で修正を起動した。
+- PC-D-fix-round-1 完了（設計者が確かめた）: キャッシュに入れるきっかけを `requestfinished` にした（応答は `request.existingResponse()`、`body()` は await より前に始める。指示書の例の `await request.response()` では、読み込みの直後に閉じる既存のテスト3件で本文を取れなかったため。設計の決まりの範囲の実装の違いとして受け入れる）。`media` の `bytes=0-` に 200 で全体を返した応答も入れる。観察の命令の説明（コメントだけ）、README（制約、入れる条件、診断の記録の header の範囲）。新しい結合テスト `resource-cache-truncated.test.ts`（切り方2 × Chromium 2。途中で切れた応答が入らず、次の読み込みで取り直す）。設計者の再実行: 9 ファイル 283 件 PASS、`npm run typecheck` PASS、Guard は D2 の後のまま（`b5a330e9…`）。
+- 指摘したレビュー担当に、Important-1 の閉じの再確認を依頼した。並行して全体の検証をやり直している。
+- 全体の検証（PC-D-fix-round-1 の後）: Test Files  125 passed (125)、Tests  5211 passed (5211)、exit=0。記録は scratchpad の `verify-20261006-fix1.log`。
+- PCR-DR の再確認（同じレビュー担当）: 承認。Important-1 は閉じた（途中で切れた応答は入らず、次の読み込みで取り直す。2回再現）。`existingResponse()` と、await より前に `body()` を始める形に、新しい隙間はない（読み込みの直後に閉じても、ふつうの応答は 25/25 入る。未処理の拒否なし）。Minor-1〜5 も合っている。記録だけの点: HTTP/1.x で、長さの指定も chunked もなく、接続を閉じて本文の終わりを示す応答が途中で切れた場合は、Chromium が正常な終わりとみなすので入る（推測。ふつうの利用者も同じものを受け取る。今のサーバではまれ）。
+- PC1、D1、D2 は、独立レビューの承認と全体の検証（125 ファイル 5211 件 PASS）をもって完了とする。次は Task 21 の再開（同じ Run の続き。32ページ目以降は Passive でもキャッシュを使う。1つの Run の中で、読み込みの速さの測定の意味が混ざることを、Task 21 の記録に残す）。
+- 起動 3（再開。同じ Run。PC1・D1・D2 の後）: 13:30 ごろにユーザーが起動。続きから再開（31ページの後から）。受信の基準（13:29、30秒）は平均 0.108 MB/s。
+  - PC1 の効果（進み具合の行の差から）: 33〜34ページ目で、1ページあたり許可 Origin への要求 26〜28件（今朝は約79件）、許可 Origin の外 81〜90件（今朝は約300〜500件）。直近1分の許可 Origin への要求は 16〜17件。PC 全体の受信は、4分の平均 0.058 MB/s、最大 0.646 MB/s（今朝は 8〜12 MB/s の跳ね上がりがあった）。
+- 起動 3 の結果: 13:52 ごろ、サイトの不調で止まった（`desktop:interaction:TIMEOUT`。44ページ目の Interaction の9件目の候補の読み込みで、30秒、本文の始まりが来なかった）。終了コード 2。監査したページ 43（発見 184）。Run の書き出し（run.json、audit.json、report.html、バンドル）は、43ページ分で作り直された。
+  - 診断のファイル `diagnostics/site-unavailable-PAGE-000044-3.json` ができた（D2 の初めての実例）。同じページのデスクトップの Passive の読み込み（13:49:13）は、0.25 秒で 200（接続先は Cloudflare の IPv6 のアドレス）。止まるきっかけの Interaction の読み込みは、観察の対象外（D1 は Passive だけ）なので、送られたかは分からない。13:48〜13:53 の Windows の記録に、ネットワークの切断はない。
+  - 2回の停止（10:25 の Passive、13:52 の Interaction）は、どちらも、ふだんは速く応答するサイトで、1つの文書の要求だけが30秒応答しなかった形。
+- ユーザーの判断（2026-10-06、AskUserQuestion）: 1つの読み込みだけが30秒応答しなかった場合も「今のまま最初の 1 回で止める」（少し待って1回だけ確かめ直す案は選ばなかった）。原因を絞るための観察を Interaction と幅の走査に「広げない」。止まるたびに、ユーザーが同じコマンドで再開する。
+- ユーザーの指示（2026-10-06）: 「サイトが停止する要因がBeakSightにないか念のため確認して」。
+  - 設計者の調べ（負荷の面。記録だけ）: 各ページの本体の応答の `server-timing` を時刻の順に並べた。サイト側の組み立て（`ssr`）は、ふだん 80〜200 ms、ときどき 400〜950 ms で、止まる前に増えていく様子はない（10:22 のモバイル 97 ms、13:49 のデスクトップ 111 ms）。止まり方は突然。BeakSight の要求の速さも、止まった時点でふだんどおり（ページの読み込みは5秒に1回、許可 Origin への要求は1分あたり16〜50件）。負荷の面では、BeakSight がサイトを止めた様子は見当たらない。
+  - 調査（内部の面と、ブラウザの通信の層）を、調査担当に依頼した（`DEF-033-investigation-brief.md`。読み取り専用、127.0.0.1 だけ、`dist/` の CLI を長く回して、文書の要求が手元で止まることがないかを、サーバの記録で確かめる。QUIC（HTTP/3）の可能性も調べる）。
+- ユーザーの情報（2026-10-06）: 「サイトは実際に止まっていた。開発者が何か作業をしていた可能性はあるが、念のためこちら側の作業が原因がないかは引き続き確認したい」。BeakSight の検知（応答なしで止める）は、実際の停止を正しく捉えていた。DEF-033 の調査（BeakSight 側の要因。負荷の形と、手元で要求を止める経路）は続ける。
+- DEF-033 の調査の結果（BeakSight 側の要因の確認）: 要因は見つからなかった（defects.md の DEF-033）。ローカルで 2,433回の読み込みで、時間切れ 0、届かない要求 0、遅れ最大 31ms、同時の文書の要求は常に1。サーバに届いたのは GET だけ。本番の 13:50 の停止は、HTML が届かなかった形で、サイト側の停止と合う（ユーザーの情報とも一致）。参考の違い（同じ URL を約11回読み込む、新しい接続、no-cache の指定）をユーザーに伝えた。
+- 起動 4（再開。同じ Run）: 15:28 ごろにユーザーが起動。44ページ目（前回のきっかけのページ）は正常に監査できた。15:33 に、47ページ目の幅の走査の読み込みで応答がなく、サイトの不調で止まった（`desktop:stress-layout:TIMEOUT`）。診断のファイル `site-unavailable-PAGE-000047-4.json`: 同じページのデスクトップの Passive（15:32:18）は、要求を送って 0.48 秒で 200。その後の幅の読み込みが、期限（約45秒）まで本文の始まりを受けなかった。監査を終えたページ 46（発見 193）。今日のサイトの不調の停止は3回目。サイトがまだ不安定（開発者の作業の途中など）の可能性が高い（推測）。
+- ユーザーの問い（2026-10-06）: 「接続回数の問題はないか？」。設計者の調べ（記録と PC の状態）: サイトへの新しい接続は、読み込み1回につき1本（Passive 92 回で 92 本。全体の読み込みは 79 分で 761 回、1分あたり約 9.6 回なので、約10本/分、合計約760本）。外部への新しい接続は、Passive 1回につき約15本（読み込み直しでは外部へほぼ送らない）。今の PC の TCP は 138（TIME_WAIT 13）、一時的なポートは 16,384。判断: ふつうの利用者（接続を使い回す）より接続の数はずっと多いが、量は少なく、接続を受けるのは Cloudflare の入口（奥のサーバとの接続は別）。今回の停止の原因と考えられる記録はない。減らすなら Interaction の候補の上限を下げるのが効く（設定の変更なので新しい Run）。
+- ユーザーの判断（2026-10-06）: 「ひとまず再開してみよう」（Interaction の候補の上限は変えず、同じ Run を続きから再開する）。
+- 起動 5（再開。同じ Run）: 15:39 ごろにユーザーが起動。47ページ目（前回のきっかけのページ）の Interaction の読み込みで、また応答がなく、15:41 に止まった（`desktop:interaction:TIMEOUT`）。設計書 3.2.1 のとおり、47ページ目は捨てずに保存し（PARTIAL）、診断のファイル `site-unavailable-PAGE-000047-5.json` を書いた。次の再開は48ページ目から。
+- ユーザーの指示（2026-10-06）: 「停止した。今日はここまでにしよう」。
+
+### 2026-10-06 の終わりの状態（次の日の起点）
+
+- Task 21 の Run `RUN-20261006010240`: 保存は `STOPPED`（終わったページ 47、発見 194、上限 500）。ロックなし。実行は5回（終わり方: サイトの不調 4、途中で終わった 1（Claude のアプリの自動更新））。Safety: `guardEnabled` true、違反 0、記録の切れなし。負荷の累計: 読み込み 767回、許可 Origin への要求 3,295件（1分あたり最大 105件）、外 15,273件、キャッシュから返した要求 127,667件。
+- 今日入れた改善: DEF-031（Passive でも Run 全体のキャッシュを使う。PC1）、診断の記録（D1、D2）。独立レビューの承認と全体の検証（125 ファイル 5211 件 PASS）の後に、3〜5回目の起動に使った。キャッシュの効果: 1ページあたりの許可 Origin への要求は約79件から約26件、外は約300〜500件から約85件、PC の受信の大きな跳ね上がりはなくなった。
+- サイトの状態: 15:30〜15:41 の間にも、短い間隔で応答のない読み込みがあった。ユーザーの情報では、サイトは実際に止まっていた（開発者の作業の可能性）。DEF-033 の調査で、BeakSight 側の要因は見つからなかった。
+- 次に再開する前に: サイトが安定していること（普段のブラウザで開ける。できれば開発者の作業の状況）を確かめる。`dist/` が今のソースのビルドのままか（ソースの変更がなければ、2026-10-06 の検証の結果を使える）。受信の基準を測る。
+- 未決の判断（ユーザー）: 接続の数を減らすために Interaction の候補の上限を下げるか（下げると新しい Run）。DEF-030（テストの Chromium と CLI の Chromium の違い）、DEF-032（広告の計測の ORB の雑音）、DEF-016、DEF-014 の扱いは、Task 21 の結果の後に決める。
+- ユーザーの情報（2026-10-06）: 本来の監査対象のサイトは、あるプラットフォーム（名前は Git に載せない。「対象のサイトのプラットフォーム」と書く）の上で動いており、今日の停止は、プラットフォームの側から止まっていた。今日の4回のサイトの不調の停止の原因は、プラットフォーム全体の停止と考えてよい。BeakSight は設計どおり、最初の応答なしで止まり、それ以上の読み込みを送らなかった。今朝の大きな転送量の出どころだった外部のストレージは、プラットフォームの共通のストレージと考えられる（推測）。DEF-031 の改善は、プラットフォームの負担を減らす意味でも適切だった。
+- 次に再開する前に: 対象のサイトとプラットフォームが安定していることを確かめる。
+- 停止の原因の切り分け（2026-10-06。ユーザーとの対話と、PC の記録）:
+  - ユーザーの補足: 「止まった」と判断した根拠は、普段のブラウザからつながらなかったことだけ。そのとき、ほかのサイトは見られた。
+  - 設計者の確かめ（PC の中の記録。サイトにはつながない）: Windows Defender の運用の記録に、該当の時間帯の検出やネットワークの保護の記録なし。ESET Security 19.2（ファイアウォールあり）の記録のファイルのうち、ファイアウォールとネットワークの保護、Web の遮断、検出、HIPS の記録は、インストール以来空（最終の書き込み 2026-05-16）。今日書き込まれたのはイベントの記録（13:48:26）だけで、ユーザーが ESET の画面で確かめた中身は「匿名の統計情報の送信」だけだった。Windows ファイアウォールの遮断の記録は無効。
+  - 判断（設計者。確定ではない）: プラットフォーム（奥のサーバ）の停止の可能性がいちばん高い。この PC の接続元のブロック（すぐの拒否が1件もない、再開するたびにすぐ通った）、PC の回線（ほかのサイトは見られた）、セキュリティソフト（遮断の記録なし）、BeakSight 自身（DEF-033）は、どれも可能性が低い。
+  - 次に止まったときの確かめ方: スマートフォンのモバイル回線で同じサイトを開く（開けなければプラットフォームの停止で確定）。普段のブラウザの画面の種類（Cloudflare のエラー画面の番号か、ブラウザの「アクセスできません」か）。
+  - 未決の提案（ユーザーの判断待ち）: ページ本体の要求の観察を Interaction と幅の走査にも広げる。Cloudflare の確認の画面（`cf-mitigated`、403）と 52x を、サイトの不調として止める。予約や問い合わせのページを巡回から除く設定。プラットフォームと運営者への事前の連絡。
+
+### 2026-10-07 ユーザーの指示（外部の提案の査定の後）
+
+- 設計者が、外部で作られた提案（Task 21 の停止の原因調査と安全性の強化の指示）を査定し、ユーザーが次を決めた。
+  1. 停止 4 件の比較表を作る（観測できない項目は推測せず `NOT_OBSERVED`）。
+  2. ページ本体の要求の観察（D1）を、Interaction と幅の走査の読み込みにも広げる（昨日の「広げない」の判断は撤回。production の振る舞いは変えず、診断の範囲だけ広げる）。
+  3. その後、`demo.playwright.dev/todomvc` を 1 ページ・concurrency 1 で外部の HTTPS の smoke。
+  4. Origin 全体の部品の要求の burst の制限は、今は実装しない（負荷と停止の相関が未確認。選択肢として保留）。
+  5. 実サイトの再開の条件は「根本の原因の完全な確定」ではなく「BeakSight 側の危険な因果の経路を合理的に除外できたこと」。Interaction と幅の走査を含む診断の範囲、ローカルの回帰、todomvc の smoke が通り、未解決の Important がないこと。
+  6. プラットフォーム側の当該の時間帯の障害・WAF/CDN/rate-limit の情報は、取得できれば確かめる。取得できなければ `NOT_AVAILABLE` として残し、それだけを永久の停止の条件にはしない。
+  7. 上記の完了後はいったん停止して報告する。実サイトへの次回のアクセスは、人間の明示の承認の後、1 ページの最小 smoke からとし、Full Audit へ直接進まない。
+  8. Git: リポジトリは Git 管理下。設計者・実装者の commit/push 禁止だけを維持する。
+  9. 顧客名・domain などの target 固有の情報は、リポジトリの文書に書かず匿名化する。
+- 停止 4 件の比較（2026-10-07。記録から。URL とパスは、Git に載るこの記録には書かない。ユーザーにはチャットで URL つきの表を渡した）:
+  | 件 | 実行 | 停止（JST） | ページ | 段階 | 分類 | 観察 | 時間切れの長さ | 直前の処理 |
+  | 1 | 1 | 10:25:15 | PAGE-000013 | mobile passive | TIMEOUT（応答なし） | NOT_OBSERVED（捨てたページ。診断の機能の前） | 30 秒 | 同ページの desktop passive（NOT_OBSERVED。再監査時は 0.32 秒で 200） |
+  | 2 | 3 | 13:50:47 | PAGE-000044 | desktop interaction 9件目 | TIMEOUT（応答なし） | NOT_OBSERVED（Interaction は観察の対象外）。同ページの desktop passive は 13:49:13 に送信 55ms 後、応答 0.31 秒で 200（Cloudflare の IPv6、443） | 30 秒（13:50:16 ごろ開始、13:50:46.9 時間切れ） | 候補 1〜8 を約 5 秒おきに確かめ（8 件目は 13:50:16 に凍結で遮断） |
+  | 3 | 4 | 15:33:13 | PAGE-000047 | desktop stress-layout（幅は NOT_OBSERVED） | TIMEOUT（応答なし） | NOT_OBSERVED（幅の走査は対象外）。同ページの desktop passive は 15:32:18 に送信 49ms 後、応答 0.53 秒で 200 | ページの期限まで（開始 NOT_OBSERVED。約 40〜50 秒） | 同ページの desktop passive と収集（15:32:18〜22、サイトへの要求 32 件） |
+  | 4 | 5 | 15:41:09 | PAGE-000047 | desktop interaction 2件目 | TIMEOUT（応答なし） | NOT_OBSERVED（同上）。desktop passive は 15:40:01 に送信 65ms 後、応答 0.59 秒で 200 | 30 秒（15:40:38 ごろ開始、15:41:08.9 時間切れ） | passive（15:40:01〜13、要求 45 件）、幅の走査 3 幅 COMPLETE、候補 1 件目（15:40:36 に除外） |
+  - 共通: HTTP status、Playwright の error、remote IP/port、loading failure は、止まった読み込みそのものについては 4 件とも NOT_OBSERVED。直前 60 秒の対象 Origin の要求数と読み込み数は、正確には NOT_OBSERVED（最後の進み具合の行の「直近 1 分」は、件 2: 17、件 3: 17、件 4: 22。読み込みは 5 秒間隔の設計で最大 12/分）。再試行は 0。違反は 0。
+  - 設計者の読み取り: 4 件とも「同じページの直前の読み込みは正常（0.3〜0.6 秒で 200）」→「次の読み込みで応答なし」の形。境界は A（送信前）か B（送信後・応答なし）かを、3 件については見分けられない（D3 で見分けられるようにする）。
+- D3（観察を幅の走査と Interaction に広げる）を起動した。設計書 2.2 と実装計画を改訂した。
+- 6（プラットフォーム側の情報）: `NOT_AVAILABLE`（2026-10-07 ユーザーの回答。ユーザーも入手できない）。分かっている事実は「数分間、普段のブラウザからも対象のサイトにつながらなくなる事象が、2026-10-06 に複数回あった」ことだけ。決まり（5）のとおり、これだけを永久の停止の条件にはしない。
+- D3 完了（設計者が確かめた）: 幅の走査と Interaction の候補の読み込みも、同じ部品で観察し、受け口の第 2 引数で Page Auditor に渡す。`navigationDiagnostics` はビューポートごとに `{ passive, stressWidths, interactionCandidates }`。診断のファイルは `schemaVersion` 1.1（`$id` は 1.0 のまま。設計者の判断）。`tests/unit/artifact-writer.test.ts` の見本の形の直しは受け入れ。設計者の再実行: 11 ファイル 1260 件 PASS、typecheck PASS、Guard と `navigation-diagnostics.ts` は変わっていない。D3R（独立レビュー）と全体の検証を起動した。
+- 全体の検証（D3 の後。D3R と並行）: Test Files  125 passed (125)、Tests  5243 passed (5243)、exit=0。記録は scratchpad の `verify-20261007-d3.log`。
+- D3R（独立レビュー）: 承認。Critical 0、Important 1（README の診断のファイルの説明が 1.0 の形のまま）、Minor 4（観察の開始の期限に上限がない、幅の対応付けが呼び出し順に依存、64 幅超の黙った切り捨て、応答しない幅の実機のテストがない）。実機で、観察の有無で結果とサーバに届く要求が同じこと、観察の開始は約 2 ms であることを確かめられた。判断: Important-1、Minor-1、Minor-2（コメント）、Minor-4 を `D3-fix-round-1` で直す。Minor-3 は記録だけ。
+- D3-fix-round-1 完了（設計者が確かめた）: README を 1.1 の形に（Important-1）。観察の開始の期限に `sessionOpenTimeoutMs` の上限（Minor-1）。幅の対応付けの前提のコメント（Minor-2）。応答しない幅の結合テスト（Minor-4）。設計者の再実行: 4 ファイル 143 件 PASS、typecheck PASS、Guard と観察の部品は不変、README に対象の名前なし。D3R の Important は閉じた。記録だけ: Minor-3（64 幅超の切り捨て）、幅の走査の観察に注入した `sessionOpenTimeoutMs` が届かない（既定 10 秒と同じ値なので振る舞いは設計どおり。次の機会に 1 行で直す）、CC-047。
+- 全体の検証（D3-fix-round-1 の後）: 1 回目は `navigation-pacing.test.ts` の 1 件が CPU の混雑で失敗（DEF-034 に登録。単独 3/3 PASS）。やり直し: 125 ファイル 5247 件 PASS、typecheck・build PASS、終了コード 0（`verify-20261007-d3fix-2.log`）。`dist/` はこの時点のソースのビルド。
+- 次: todomvc の外部 smoke（設定 `local/targets/todomvc-smoke.json`。1 ページ、同時 1、headed、出力 `local/smoke-output`）。ユーザーが Terminal の欄で起動する。
+- todomvc の外部 smoke（2026-10-07 11:10 ごろ。ユーザーが Terminal の欄で起動。`local/smoke-output/RUN-20261007021011`）: `COMPLETE`、終了コード 0。1 ページ（AUDITED。desktop・mobile とも 200）、読み込み 7 回、許可 Origin への要求 11 件（1 分あたり最大 11 件）、外 0 件、キャッシュから返した 16 件、間隔の待ち 26.5 秒。Safety: `guardEnabled` true、違反 0、記録の切れなし。幅の走査 3 幅 COMPLETE。Network の失敗 0。診断のファイルなし（不調なし。期待どおり）。本来の監査対象のサイトには接続していない。
+- ここでいったん停止（ユーザーの指示 7）。設計者が報告する。
+- ユーザーの確かめ（2026-10-07）: 本来の監査対象のサイトは、普段のブラウザで安定して開ける。プラットフォーム側の状態は不明（`NOT_AVAILABLE` のまま）。
+- ユーザーの承認（2026-10-07、AskUserQuestion）: 本来の監査対象のサイトへの最小の smoke（1 ページ、同時 1、headed、出力 `local/smoke-output`）を承認。設計者が、本来の対象の設定を元に smoke 用の設定（`local/targets/<本来の対象>-smoke.json`。`maxPages` 1、headed。ほかは同じ）を Git の外に作り、`validate-config` が終了コード 0 であることを確かめた。`dist/` は最新。
+- 本来の監査対象のサイトへの最小の smoke（2026-10-07 11:19〜11:21。ユーザーが起動。`local/smoke-output/RUN-20261007021903`）: 終了コード 2（`PARTIAL`。理由は `MAX_PAGES_REACHED` だけ。上限 1 ページのため発見した 93 ページがスキップ）。終わり方 `COMPLETED`（サイトの不調なし）。トップページ: desktop PARTIAL（Interaction の予算切れ。候補 8 件を確かめ、残り 44 件は期限で止めた）、mobile AUDITED、両方 200。幅の走査 3 幅 COMPLETE。Safety: `guardEnabled` true、違反 0、記録の切れなし。負荷: 読み込み 16 回（1 分 47 秒）、許可 Origin への要求 100 件（1 分あたり最大 92 件）、外 373 件（最大 325 件）、キャッシュから返した 3,394 件、外へ送らなかった 244 件。PC 全体の受信は最初の 2 分で平均 0.20 MB/s、最大 1.65 MB/s（10 秒）。Network の失敗は部品の `ERR_ABORTED` と `ERR_BLOCKED_BY_CLIENT.Inspector`（Guard が止めた外部への要求など。main frame ではない）。診断のファイルなし。
+- 起動 6（Full Audit の再開。同じ Run。2026-10-07 11:25 ごろ）: ユーザーが Terminal の欄で起動（起動をもって再開の承認とみなす）。48 ページ目から。
+- 起動 6 の結果（11:44:12）: 60 ページ目の Interaction の 2 件目の候補の読み込みで応答がなく、サイトの不調で止まった（`desktop:interaction:TIMEOUT`）。監査したページ 59（発見 230）。違反 0。ユーザーの情報: 同じ時刻に、普段のブラウザでサイトは閲覧できていた（昨日のようなプラットフォーム単位の停止ではない）。
+  - **拡張した観察（D3）の初めての実例**（`diagnostics/site-unavailable-PAGE-000060-6.json`）: 同じページの読み込み 6 回のうち、Passive・幅 3 つ・候補 1 件目は、発行から 55〜330 ms でヘッダを送り、0.3〜1.9 秒で 200（Cloudflare の 2 つの IPv6 に分散）。止まった候補 2 件目は、11:43:40.565 に発行、11:43:40.620 に**要求のヘッダを送った**が、応答のヘッダを 30 秒受けなかった。→ 分類 **B（送信済み・応答なし）**。BeakSight 側（A: 送信前）は、この件については除外できた。
+  - 読み取り: サイトは同時刻に閲覧でき、同じページの直前 5 回も正常だったので、サイト全体の停止ではなく、**個々の要求がサーバ側（CDN か奥のサーバ）で応答されない**形。原因（サーバ側の処理の停滞か、接続元・要求の特徴による選択的な無応答か）は、こちら側の記録では決められない。候補 1 件目の応答は 1.9 秒で、ふだん（0.3 秒）より遅かった。
+- ユーザーの判断（2026-10-07）: 「2」= 応答がないときは 1 分待って 1 回だけ確かめ直す。設計書 3.5 を書き（定数 60 秒。設定にしない（再開の互換のため）。捨てた後に待ち、同じページを 1 回だけ再監査。2 回目も不調なら今までどおり止める。知らせの行。README）、SU5 を起動した。
+- SU5 の Blocker（実装者は何も変えずに止まった）: `CrawlFrontier` は `QUEUED → AUDITING` しか受け付けず、捨てた（`SKIPPED`）ページを `markAuditing` できない。判断: 専用の操作 `requeueForRecheck(url)`（`SITE_UNAVAILABLE` で `detail` のある `SKIPPED` → `AUDITING`。待ち行列を通さない。`snapshot`・`restore`・保存の形は変えない）を加える（設計書 3.5.2 に追記）。`crawl-frontier.ts` とその単体テストを SU5 の範囲に加える。ほかの決め: 知らせは事実（`{ kind, url, delayMs }`）を口で渡し、CLI が文言にする。秒の書式は既存の `formatDuration`。診断のファイル名に試行の番号（既存のテストの期待は決まりの変更として直す）。README の「出力の構成」のファイル名の 2 か所も直してよい。
+- ユーザーの観察（2026-10-07 12:00 ごろ）: プラットフォームの管理画面（運営者が使う画面）に、今アクセスできない。プラットフォームの公式ページと、本来の監査対象のページは開ける。このとき BeakSight は動いていない（11:44 に止まったまま）。→ プラットフォームの一部が BeakSight と無関係に応答しなくなることがある、という観察。昨日と今日の「個々の要求がサーバ側で応答されない」形の見立てと整合する。
+- SU5 完了（設計者が確かめた）: `SITE_UNAVAILABLE_RECHECK_DELAY_MS`（60 秒）、`CrawlFrontier.requeueForRecheck`、`onNotice`（`RunNotice`）と CLI の知らせの行、診断のファイル名に試行の番号、README。待つ前にも止める印と上限を確かめる（実装者の判断。受け入れ）。既存のテストの直しは決まりの変更によるものだけ（10 件 + ファイル名）。設計者の再実行: 単体 9 ファイル 887 件 PASS、typecheck PASS、Guard・Page Auditor・`run-checkpoint.ts`・スキーマは SU5 で不変。SU5R（独立レビュー）と全体の検証を起動した。
+- 全体の検証（SU5 の後。SU5R と並行）: 125 ファイル 5278 件 PASS、typecheck・build PASS、終了コード 0（`verify-20261007-su5.log`）。
+- SU5R（独立レビュー）: 承認。Critical 0、Important 0、Minor 4（記録だけ）: 止める印で打ち切っても本番の `setTimeout` が最長 60 秒残る（CLI は `process.exit` するので実害なし）、1 回目の Ctrl+C の文言が待ちの途中の動きと少し合わない、結合テストは `sleep` を即時にしているので実時間の無送信は観測していない（根拠は Context を閉じていること）、待ちの途中で止まった・プロセスが終わったページは次の再開で 3.2.1 のきっかけのページ扱いになり確かめ直されない（設計の帰結）。
+- 再開の前の確かめ: `dist/` は最新（5278 件 PASS のビルド）。保存は `STOPPED`、ロックなし。次の起動は 60 ページ目から（60 ページ目は前の実行のきっかけのページなので、また不調なら確かめ直さずに FAILED として残して止まる。61 ページ目以降の不調は、60 秒待って 1 回確かめ直す）。
+- 起動 7（再開。同じ Run。2026-10-07 12:40 ごろ。SU5 の後の初めての実サイトの起動）: ユーザーが起動。60 ページ目から。
+- 起動 7 の結果（13:27:15）: 76 ページ目で、幅の走査（768）の読み込みが 13:25:08 に送信後、応答なし（試行 1。`desktop:stress-layout:TIMEOUT`）。確かめ直し（SU5）が働き、60 秒待って 13:26:43 に同じページの Passive を読み込んだが、送信後、応答なし（試行 2。`desktop:passive:TIMEOUT`）→ 止めた。無応答は少なくとも約 2 分続いた。どちらも分類 B（サーバ側）。違反 0。監査したページ 75（発見 253）。診断のファイルは `-7-1` と `-7-2` の 2 つ。ユーザーの判断: 「サイトがまた瞬断したようだ。再開しよう」。
+- 起動 8（再開。同じ Run）: 76 ページ目から（前の実行のきっかけのページ。また不調なら FAILED として残して止まる）。
+- 起動 8 の結果（13:44:29）: 76〜79 ページ目は正常。80 ページ目の Interaction の 6 件目の候補（13:42:27 送信）で応答なし（その直前の 5 件目は応答に 7.5 秒かかっていた。ふだんは 0.3〜0.6 秒）。確かめ直し（13:43:57 送信）も応答なし → 止めた。どちらも分類 B。無応答は少なくとも約 2 分。違反 0。監査したページ 79（発見 254）。この日の無応答は 11:43、13:25、13:42 と、10〜25 分おきに起き、直前に応答が遅くなる兆し（1.9 秒、7.5 秒）がある。
+- ユーザーの確かめ（2026-10-07 13:50 ごろ。80 ページ目の停止の直後）: Wi-Fi を切ったスマートフォンの 4G 回線からも、対象のサイトにつながらない。→ この PC の接続元・回線の問題ではなく、サイト側（プラットフォーム側）の無応答であることが、独立した経路で確かめられた。BeakSight の記録（分類 B。送信済み・応答なし）と一致。BeakSight 側の因果の経路は、合理的に除外できた（決まり 5）。
+- ユーザーの判断（2026-10-07 13:55 ごろ）: 無応答は昨日から連続している事象。まず BeakSight を止めたまま 1〜2 時間サイトの様子を見る（ユーザーが普段のブラウザで数分おきに確かめる）。その間に無応答が起きなければ相関が強まったとみなし、負荷を下げて再開を試す。
+- 負荷を下げた設定を Git の外に用意した: `local/targets/<本来の対象>-lowload.json`（`crawl.minNavigationIntervalMs` 10,000、`crawl.maxInteractionsPerPage` 5。ほかは同じ。`validate-config` 終了コード 0）。使う場合は新しい Run になる（今の Run は 79 ページ監査済みのまま残る）。見込み: 1 ページの読み込みは最大 10 回（Passive 2、幅 3、候補 5）、HTML の組み立ては 1 分あたり約 3 回、1 時間で約 30 ページ。
+- ユーザーの意図の訂正（2026-10-07 14:00 ごろ）: 「60 秒・1 回」ではなく、待機の間隔と回数を増やし、段階的に負荷を減らして再開する。AskUserQuestion: 「延ばして確かめ直し、通った後も遅く続ける」、様子見は「改修の間に並行して」（ユーザーが数分おきにサイトを開く）。設計書 3.6（待ち 60 秒→2→4→8 分、最大 4 回。通ったら pacer の最小の間隔を 2 倍、上限は設定の 8 倍。設定も保存も変えない）を書き、SU6 を起動した。負荷を下げた設定（lowload）は、使わずに残す。
+- ユーザーの要望（2026-10-07）: 減速した読み込みの間隔は、利用者が Run を止めて再実行したら元（設定の値）に戻す。設計書 3.6.2 のとおり（保存しない）。テストで固定するよう SU6 に追加で指示した。
+- SU6 の報告（実装は完了。Blocker 1 件: `NavigationPacer` に `raiseMinimumInterval` を必須で加えたため、偽の pacer を持つ範囲外の 2 つのテストファイルが型エラー）。判断: 偽の pacer に 1 行ずつ加える（案 a。interface は必須のまま）。古い決まりの残るコメント 3 ファイルも直す（コメントだけ）。時間の書式は `formatDuration`（`120秒`）のまま。減速の知らせは、上限に達していて延びないときは出さない（実装者の判断。受け入れ）。
+- SU6 完了（設計者が確かめた）: `SITE_UNAVAILABLE_RECHECK_DELAYS_MS`（60 秒→2→4→8 分、最大 4 回）、`NavigationPacer.raiseMinimumInterval`、減速（2 倍、上限 8 倍、その実行だけ。再開で設定の値に戻ることをテストで固定）、知らせ 2 種類、README、古いコメントの直し。設計者の再実行: 単体 7 ファイル 681 件 PASS、typecheck PASS、保護するファイル不変。SU6R と全体の検証を起動した。
+- SU6R（独立レビュー）: 承認。Critical 0、Important 0、Minor 4（M1: 単体テスト 1 で、通った試行のページの保存の中身の確かめが消えた。M2: 結合テストで減速の後の実際の待ちが 2,000 ms になることを `sleeps` で確かめていない。M3: 設計書の例文の書式 → 設計者が直した。M4: 本番の `wait` の `setTimeout` が unref されず、Ctrl+C の後も最長 8 分残る（CLI は `process.exit` するので実害なし））。M1・M2・M4 は記録だけ（次の機会に直す）。
+- 全体の検証（SU6 の後）: 1 回目は、SU6R が同じ重い suite を同時に動かしていた間に、vitest の子プロセスが 1 つ落ちて 1 ファイル（40 件）が未完了（判定の失敗ではない）。やり直し（単独）: 125 ファイル 5294 件 PASS、typecheck・build PASS、終了コード 0（`verify-20261007-su6-2.log`）。`dist/` はこの時点のソースのビルド。
+- 再開の準備: 保存は `STOPPED`（79 ページ監査済み）、ロックなし。次の起動は 80 ページ目から（前の実行のきっかけのページ。また不調なら FAILED として残して止まる）。81 ページ目以降の不調は、60 秒→2→4→8 分の待ちで最大 4 回確かめ直し、通ったら読み込みの間隔を 2 倍にして続ける。
+- ユーザーの観察（2026-10-07 14:00〜14:50 ごろ。BeakSight は止まっていた）: 改修の間、サイトがつながらなかった時刻はなし。→ BeakSight が動いていない約 50 分の間は無応答が起きなかった（ただし、観察は人がときどき開く形で、数分の無応答を見逃す可能性はある）。相関を強める観察として記録する。今日の無応答（11:43、13:25、13:42）はいずれも BeakSight の実行中。12:00 ごろの管理画面の無応答は BeakSight の停止中。

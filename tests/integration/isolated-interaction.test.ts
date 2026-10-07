@@ -1,11 +1,15 @@
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { Socket } from 'node:net';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Browser, Page } from 'playwright';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory, type InteractionGuardedSession } from '../../src/browser/context-factory.js';
+import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
+import { NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE } from '../../src/browser/navigation-diagnostics.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
-import type { InteractionStatus } from '../../src/core/contracts.js';
+import type { InteractionStatus, NavigationDiagnostics } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import {
   INTERACTION_IDENTITY_STATUSES,
@@ -53,7 +57,12 @@ import {
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
-import { discoverInteractionCandidate, interactionAuditInput, withGuardedPassivePage } from '../helpers/gate-harness.js';
+import {
+  discoverInteractionCandidate,
+  GATE_INTERACTION_TIMING,
+  interactionAuditInput,
+  withGuardedPassivePage,
+} from '../helpers/gate-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 type ExpectedStructuredInteractionResult = Awaited<ReturnType<typeof auditInteraction>> & {
@@ -8270,6 +8279,248 @@ describe('P18c: deadlines of the Interaction session open and the freeze activat
       },
       ...invalid,
     } as unknown as InteractionAuditInput)).rejects.toThrow(/timeout|receiver/u);
+    expect(factoryCalls).toBe(0);
+  });
+});
+
+// SU2b（サイトが応答しないときに Run を止める設計書 2.1）: 候補の対象のページの読み込み（`page.goto`）の観測を、注入された受け口
+// （`afterTargetLoad`）に渡す。観測は `src/browser/main-frame-load.ts` の部品で作り、Interaction は判定をしない（判定は Page Auditor）。
+// 503 を返すページは、共通の fixture のサーバにないので、このテストの中の 127.0.0.1 のサーバで、accordion の fixture の文書を
+// 200 と 503 で返す。Guard の許可 Origin が、そのサーバになるよう、別の factory を作る。
+describe('the observation of the target load of an interaction candidate (site unavailability design 2.1)', () => {
+  /** 503 Service Unavailable（サイトの不調の代表。判定は Page Auditor が行う）。 */
+  const STATUS_SERVICE_UNAVAILABLE = 503;
+  const STATUS_OK = 200;
+  const STATUS_NOT_FOUND = 404;
+  /** パスごとの status。どのパスも、accordion の fixture の文書を返す。 */
+  const STATUS_PATHS = Object.freeze({
+    '/available.html': STATUS_OK,
+    '/unavailable.html': STATUS_SERVICE_UNAVAILABLE,
+  } as const);
+  type StatusPath = keyof typeof STATUS_PATHS;
+  const CANDIDATE_NAME = 'Toggle details';
+
+  let statusOrigin: string;
+  let statusFactory: BrowserContextFactory;
+  let closeStatusServer: (() => Promise<void>) | undefined;
+
+  beforeAll(async () => {
+    const accordion = await readFile(resolve(process.cwd(), 'fixtures/site/accordion.html'), 'utf8');
+    const sockets = new Set<Socket>();
+    const statusServer = createServer((request, response) => {
+      const path = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
+      const status = Object.hasOwn(STATUS_PATHS, path) ? STATUS_PATHS[path as StatusPath] : STATUS_NOT_FOUND;
+      response.writeHead(status, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(accordion),
+      });
+      response.end(accordion);
+    });
+    statusServer.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.once('close', () => sockets.delete(socket));
+    });
+    const port = await new Promise<number>((resolvePort, reject) => {
+      statusServer.once('error', reject);
+      statusServer.listen({ host: '127.0.0.1', port: 0 }, () => {
+        const address = statusServer.address();
+        if (address === null || typeof address === 'string') {
+          reject(new Error('status server did not bind to a TCP port'));
+          return;
+        }
+        resolvePort(address.port);
+      });
+    });
+    closeStatusServer = () => new Promise<void>((resolveClose, reject) => {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      statusServer.close((error) => (error === undefined ? resolveClose() : reject(error)));
+    });
+    statusOrigin = `http://127.0.0.1:${port}`;
+    statusFactory = new BrowserContextFactory(browser, configFor(statusOrigin), () => new SafetyLedger());
+  });
+
+  afterAll(async () => {
+    await closeStatusServer?.();
+  });
+
+  function statusInput(path: StatusPath, candidate: InteractionCandidate): InteractionAuditInput {
+    return interactionAuditInput({ factory: statusFactory, origin: statusOrigin, viewport, path, candidate });
+  }
+
+  /**
+   * `target`（凍結されていないもの）を包み、`overrides` にある名前の値だけを差し替える。ほかの関数は、`target` に束縛して返す（Playwright の
+   * page のメソッドが、包んだものではなく本物の `this` で動くようにする）。
+   */
+  function withBoundMethods<T extends object>(target: T, overrides: Readonly<Record<string, unknown>>): T {
+    return new Proxy(target, {
+      get(original, property) {
+        if (typeof property === 'string' && Object.hasOwn(overrides, property)) {
+          return overrides[property];
+        }
+        const value = Reflect.get(original, property, original) as unknown;
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(original) : value;
+      },
+    });
+  }
+
+  // D3（サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）: 受け口には、観測に加えて、候補の読み込みの間のページ本体の
+  // 要求の観察の結果（`startNavigationDiagnostics` の結果）を渡す。本物の Chromium では観察できる（`OBSERVED`）。
+  it.each(Object.entries(STATUS_PATHS) as [StatusPath, number][])(
+    'passes the observation of the target load of %s (HTTP %d) and its navigation diagnostics to afterTargetLoad, and audits as without it',
+    async (path, status) => {
+      const candidate = await discoverInteractionCandidate(statusFactory, statusOrigin, viewport, path, CANDIDATE_NAME, {
+        expectedCompleteness: 'COMPLETE',
+      });
+      const observations: MainFrameLoadObservation[] = [];
+      const diagnostics: NavigationDiagnostics[] = [];
+
+      const observed = await auditInteraction({
+        ...statusInput(path, candidate),
+        afterTargetLoad: (observation, navigationDiagnostics) => {
+          observations.push(observation);
+          diagnostics.push(navigationDiagnostics);
+        },
+      });
+      // 受け口を省略した監査（今までの呼び出し）と、結果の状態と理由が同じである（受け口は判定をせず、結果を変えない）。
+      const unobserved = await auditInteraction(statusInput(path, candidate));
+
+      expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: status, failureDetail: null }]);
+      expect(Object.isFrozen(observations[0])).toBe(true);
+      // D3: 候補の読み込みの観察。文書の要求は1つ（リダイレクトなし）で、ヘッダを送り、応答（status）を受け、読み込みが終わった。
+      expect(diagnostics).toHaveLength(1);
+      const [targetLoad] = diagnostics;
+      expect(targetLoad?.status, JSON.stringify(targetLoad)).toBe('OBSERVED');
+      if (targetLoad?.status !== 'OBSERVED') {
+        throw new Error('the target load was not observed');
+      }
+      expect(Object.isFrozen(targetLoad)).toBe(true);
+      expect(targetLoad.documentRequests).toHaveLength(1);
+      expect(targetLoad.omittedDocumentRequestCount).toBe(0);
+      expect(targetLoad.omittedEventCount).toBe(0);
+      const [request] = targetLoad.documentRequests;
+      expect(request?.hops).toHaveLength(1);
+      expect(request?.hops[0]).toMatchObject({ url: `${statusOrigin}${path}`, method: 'GET', httpStatus: status, remoteIpAddress: '127.0.0.1' });
+      expect(request?.hops[0]?.requestHeadersSentAtMs).toEqual(expect.any(Number));
+      expect(request?.hops[0]?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
+      expect(request?.loadingFinishedAtMs).toEqual(expect.any(Number));
+      expect(request?.loadingFailure).toBeNull();
+      expect(targetLoad.observationStartedAtMs).toBeLessThanOrEqual(request?.hops[0]?.issuedAtMs ?? Number.NEGATIVE_INFINITY);
+      expect(targetLoad.observationEndedAtMs).toBeGreaterThanOrEqual(request?.loadingFinishedAtMs ?? Number.POSITIVE_INFINITY);
+      expect({ status: observed.status, reason: observed.reason })
+        .toEqual({ status: unobserved.status, reason: unobserved.reason });
+    },
+  );
+
+  // D3R の Minor-1（診断の記録の設計書 2.2「長く待たない」）: 観察の開始は、読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方まで
+  // しか待たない（Passive と幅の走査の観察と同じ）。読み込みの期限は変えない（観察を始められなくても、読み込みは今までどおり行う）。
+  it('gives up starting the navigation diagnostics sessionOpenTimeoutMs after now, and loads the target as without it', async () => {
+    /** 注入する、session の作成と観察の開始を待つ上限（ms）。session は先に作っておくので、作成はこの上限の中で終わる。 */
+    const SHORT_SESSION_OPEN_TIMEOUT_MS = 200;
+    /** 観察の開始の期限を過ぎてから、読み込みが終わって受け口が呼ばれるまでの上限（ms）。読み込みの期限（5,000ms）まで待つ場合と区別する。 */
+    const RECEIVER_CALL_LIMIT_MS = 2_500;
+    const path: StatusPath = '/available.html';
+    const candidate = await discoverInteractionCandidate(statusFactory, statusOrigin, viewport, path, CANDIDATE_NAME, {
+      expectedCompleteness: 'COMPLETE',
+    });
+    // 本物の session の page を包み、Context の CDP の session を開く求め（観察の開始）だけを、いつまでも開かないようにする。本物の
+    // session は凍結されているので、包まずに、page だけを差し替えた session を作る（ほかは本物に委ねる）。
+    const neverOpeningContext = { newCDPSession: (): Promise<never> => new Promise<never>(() => undefined) };
+    const realSession = await statusFactory.createInteractionSession(viewport);
+    const session: InteractionGuardedSession = {
+      page: withBoundMethods(realSession.page, { context: () => neverOpeningContext }),
+      ledger: realSession.ledger,
+      isClosed: () => realSession.isClosed(),
+      activateInteractionFreeze: () => realSession.activateInteractionFreeze(),
+      close: () => realSession.close(),
+    };
+    const observations: MainFrameLoadObservation[] = [];
+    const diagnostics: NavigationDiagnostics[] = [];
+    /** 受け口が呼ばれた時刻（`Date.now()`）。 */
+    const receiverCalledAtMs: number[] = [];
+    const startedAtMs = Date.now();
+
+    const observed = await auditInteraction({
+      ...statusInput(path, candidate),
+      sessionFactory: async () => session,
+      sessionOpenTimeoutMs: SHORT_SESSION_OPEN_TIMEOUT_MS,
+      afterTargetLoad: (observation, navigationDiagnostics) => {
+        receiverCalledAtMs.push(Date.now());
+        observations.push(observation);
+        diagnostics.push(navigationDiagnostics);
+      },
+    });
+    const unobserved = await auditInteraction(statusInput(path, candidate));
+
+    expect(receiverCalledAtMs).toHaveLength(1);
+    const receiverDelayMs = (receiverCalledAtMs[0] ?? Number.POSITIVE_INFINITY) - startedAtMs;
+    expect(receiverDelayMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS);
+    expect(receiverDelayMs).toBeLessThan(RECEIVER_CALL_LIMIT_MS);
+    expect(diagnostics).toEqual([{ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE }]);
+    // 読み込みと監査の結果は、観察を始められなくても、受け口を省略した監査と同じである。
+    expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: STATUS_OK, failureDetail: null }]);
+    expect({ status: observed.status, reason: observed.reason }).toEqual({ status: unobserved.status, reason: unobserved.reason });
+    expect(realSession.isClosed()).toBe(true);
+  });
+
+  it('does not call afterTargetLoad nor start the navigation diagnostics when no budget is left to start the target load', async () => {
+    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
+    // 偽の時計の始まりの時刻と、読み込みの期限（ms）。session の作成が読み込みの期限の時刻に終わるので、読み込みの予算は 0 になる。
+    const startedAtMs = 1_000;
+    const navigationTimeoutMs = 2_000;
+    const navigationDeadlineAtMs = startedAtMs + navigationTimeoutMs;
+    let gotoCalls = 0;
+    const observations: MainFrameLoadObservation[] = [];
+    vi.useFakeTimers();
+    vi.setSystemTime(startedAtMs);
+    const session: InteractionGuardedSession = {
+      // D3: 読み込みを始めない候補では、ページ本体の要求の観察（CDP の session）も始めない。
+      page: {
+        goto: async () => { gotoCalls += 1; },
+        context: () => {
+          throw new Error('must not open a CDP session');
+        },
+      } as unknown as Page,
+      ledger: new SafetyLedger(),
+      activateInteractionFreeze: async () => undefined,
+      ...fakeCloseLifecycle(),
+    };
+    try {
+      const result = await auditInteraction({
+        ...input('/accordion.html', candidate),
+        navigationTimeoutMs,
+        timeoutMs: GATE_INTERACTION_TIMING.timeoutMs,
+        deadlineAtMs: navigationDeadlineAtMs + GATE_INTERACTION_TIMING.overallMs,
+        sessionFactory: async () => {
+          vi.setSystemTime(navigationDeadlineAtMs);
+          return session;
+        },
+        afterTargetLoad: (observation) => {
+          observations.push(observation);
+        },
+      });
+
+      expectReason(result, 'INITIAL_LOAD_BEFORE_LOAD');
+      expect(gotoCalls).toBe(0);
+      expect(observations).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects an afterTargetLoad that is not a function without opening a session', async () => {
+    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
+    let factoryCalls = 0;
+
+    await expect(auditInteraction({
+      ...input('/accordion.html', candidate),
+      sessionFactory: async () => {
+        factoryCalls += 1;
+        throw new Error('must not open a session');
+      },
+      afterTargetLoad: 'not a function',
+    } as unknown as InteractionAuditInput)).rejects.toThrow(/receiver/u);
     expect(factoryCalls).toBe(0);
   });
 });

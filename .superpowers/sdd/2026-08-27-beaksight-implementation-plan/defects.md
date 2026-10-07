@@ -392,3 +392,84 @@
 - 影響（推測）: そうした画像を表示するページで、画像が壊れたように見え、監査の結果（スクリーンショット、画像の Finding など）が、利用者の見え方と違うことがある。Task 5 からある振る舞いで、今回の変更とは関係ない。
 - 重大度: 低い（Minor）。Task 21 の結果で、実際に起きているかを見る。
 - 状態: 記録だけ（Task 21 の後に扱いを決める）。
+
+## DEF-026 実在のサイトの Interaction の Context で、Guard の CDP の層の `Fetch.continueRequest` が「Invalid InterceptionId」で失敗し、違反として Run が止まる（2026-10-05 Task 21 の1回目で登録）
+
+- 現象: 本来の監査対象のサイトの1ページ目の、8番目の Interaction の Context の読み込みの初めで、`CDP_CONTINUE_REQUEST_FAILED`（`cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.`）が2件記録され、Guard が Context を閉じ、`INTERACTION_OWNER_CLOSE_FAILED` も記録された。Run は `ABORTED_BY_SAFETY` で止まった。
+- 推定の原因（未確認）: Guard の CDP の層は、文書（Document）の要求を Request と Response の段階で一時停止し、確かめてから `Fetch.continueRequest` で進める。その間に、ブラウザ側で要求が取り消された（iframe が消えた、ページがすぐに別の URL へ移った、ほかの横取りの層が先に決めた、など）と、一時停止の ID が無効になり、進める命令が失敗する。Guard は fail-closed で、この失敗を違反にする。
+- 安全への影響（推測）: 取り消された要求は、Guard の命令で送られたものではない。ただし、ほかの横取りの層（Playwright の route）が先に進めた場合は送られうるので、その場合の扱いを確かめる必要がある。
+- 影響: 動的な iframe などを使う実在のサイトでは、Run が違反で止まり、監査を続けられない。fixture のテストでは起きていなかった。
+- 調査の結果（2026-10-05）: 原因を確定した（ブラウザが取り消した iframe の文書の要求への命令の失敗）。取り消された要求は、サーバに届かなかった（Request の段階）。
+- 方針: 取り消しの証拠（`Network.loadingFailed` の canceled）を ID で対応付けたときだけ違反にしない（設計書 `2026-10-05-beaksight-def-026-guard-canceled-document-design.md`）。
+- 修正（2026-10-05 DEF-026-fix）: Guard の CDP の session で `Network.enable` を行い、文書の要求の取り消しの証拠を、一時停止の有無によらず上限（256件、5秒）付きで覚える。命令が「一時停止の ID が無効」の文言で失敗し、その要求の証拠があるときだけ、違反にしない（止める命令の失敗は、止めた記録を残す）。証拠がなければ違反のまま。設計者の確認: 関連の 13ファイル 542件 PASS、型チェック PASS。
+- 独立レビュー（2026-10-05）: 承認（`DEF-026-review-result.md`）。
+- 状態: 完了（Minor のテストの補強などは、Task 21 の後に行う）。
+
+## DEF-027 main frame が `location.replace` を続けて行うページで、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反が起きうる（2026-10-05 DEF-026 の調査で登録）
+
+- 現象（調査の実験の記録 `exp1.out` の事実）: main frame が、読み込みの途中で `location.replace` を続けて行うローカルのページで、`HTTP_MAIN_FRAME_DELIVERY_FAILED`（`net::ERR_ABORTED`）が、`PRIMARY` と `REVISIT` の両方で毎回起きた。main frame の移動が、次の移動で取り消されるためと考えられる。DEF-026 とは別の経路である。
+- 影響: そうしたページを持つサイトでは、Run が違反で止まる（安全側の停止）。本来の監査対象のサイトで起きるかは、未確認。
+- Task 21 の2回目（2026-10-05）で起きた: サイトのメンテナンスで応答が止まった状態で、13ページ目のモバイルの Passive の main frame の要求が、接続も応答もないまま `net::ERR_ABORTED` で失敗し、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反で Run が止まった（`location.replace` の連続とは別の起き方の可能性がある）。
+- 調査の結果（2026-10-05。`DEF-027-investigation-brief.md`。127.0.0.1 のサーバと `dist/` の Page Auditor と CLI、headless）:
+  - 実際と同じ形（理由の並び、Network の Evidence の要求1件・応答0件・時刻がすべて -1、違反）を再現できたのは、読み込み中のタブを BeakSight の外から閉じた場合だけ（`Target.closeTarget`。5/5）。外からの停止・再読み込み・別の URL への移動も、`navigatePage` を直接使うと違反になる。
+  - サーバの状態（応答しない、途中で止まる、接続の拒否・切断・RST、503・502、リダイレクト、meta refresh など）、BeakSight 自身の期限と閉じる処理、本物の Ctrl+C では、起きなかった。
+  - 時刻の -1 は、応答がない場合の Playwright の初期値で、「接続も始まっていない」根拠にならない（要求はサーバに届いていることがある）。
+  - 推測: 実際の件は headed の Run で、利用者がモバイルのウィンドウを閉じた（または停止や再読み込みをした）。利用者に確かめる。
+  - 安全への影響: 取り消された要求は、Guard が許可した GET で、応答はページに渡っていない。GET 以外は送られていない。
+  - 直し方の案: A（Guard の証拠で、外からの取り消しを違反にしない。Guard の中核の変更）、B（運用で防ぐ。headed では Chromium の画面を操作しないと README と起動時の表示に書く）、C（応答のない ERR_ABORTED を違反にしない。安全を弱めるので採らない）。
+- 利用者の回答（2026-10-05）: 止めたときは、Ctrl+C と、ブラウザの画面を閉じる操作の両方をした。調査の推測と合う。
+- ユーザーの判断（2026-10-05）: 「Guard も直す」（案 A）。設計書 `doc/design/2026-10-05-beaksight-def-027-external-cancel-design.md`。README の運用の注意（画面を操作しない。止めるときは Ctrl+C）も、サイトの不調の機能の SU4 で書く。
+- 状態: 直した（2026-10-05、DEF-027-fix と修正1回目。設計者が確かめた: Guard の 8 ファイル 487 件 PASS）。停止、再読み込み、別の URL への移動、間隔の長い `location.replace` の連続（Guard が要求を進めた後の取り消し）は違反にならない。DEF-027 の元の現象（0〜5ms の間隔の `location.replace` の連続。Guard が進める前に取り消される）は、違反のまま残る（設計書 2.1.1 の限界。独立レビューの指摘1。要求はサーバに届いていない。実在のサイトで起きたら調べる）。外からタブを閉じたときの `CDP_SESSION_DETACHED` は違反のまま（設計書 2.4。DEF-028 と合わせて後で考える）。DEF-029 と合わせて独立レビューを受けている。調査で見つかった別の不具合は DEF-029 に登録した。
+
+## DEF-028 OOPIF の中の文書を一時停止している間に、その OOPIF の iframe が消されると、Guard の命令が「No session with given id」で失敗し、Run が止まる（2026-10-05 DEF-026 の独立レビューの指摘1で登録）
+
+- 現象（レビュー担当の一時ディレクトリでの再現。headless、CLI の起動の設定、`PRIMARY`）: 127.0.0.1 のページが localhost の iframe を20個作り、各 iframe が同じサイトの iframe を8個作る。親が、その iframe を0〜8ms 後に消すと、16回中16回、Context が閉じた（`CDP_CONTINUE_REQUEST_FAILED`: `cdpSession.send: Protocol error (Target.sendMessageToTarget): No session with given id`、52件）。消さない対照では 0/8。
+- 扱い: DEF-026 の設計書 3章のとおり、対象の session が閉じた失敗は違反のまま（fail-closed）。DEF-026 の調査で、CDP の session が外れると、一時停止中の要求がそのままサーバに届いた例があるため、この失敗を安全とみなすには、iframe（target）が壊されたことの確かな証拠が要る。
+- 影響: そうした iframe を使うサイトでは、Run が違反で止まりうる（安全側の停止）。本来の監査対象のサイトで起きるかは、未確認。
+- 状態: 記録だけ。Task 21 で起きたら、実データで調べる。
+
+## DEF-029 main frame の読み込みが、応答を受けた後に Chromium の都合で失敗すると（本文が空の 4xx・5xx、401 Basic、本文の途中の切断）、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反で Run が止まる（2026-10-05 DEF-027 の調査で登録）
+
+- 現象（調査の実験の事実）: 本文が空の 4xx・5xx の応答で、main frame の読み込みが `net::ERR_HTTP_RESPONSE_CODE_FAILURE` で失敗し、違反になった。空の 503 で起き、本文が空の 404 の robots.txt では、Run が開始直後に ABORTED_BY_SAFETY になった。本文の途中の切断（`net::ERR_CONTENT_LENGTH_MISMATCH`）、401 Basic（`net::ERR_INVALID_AUTH_CREDENTIALS`）も違反になった。
+- 原因（コードの事実）: Guard の `onRequestFailed` は、許可した main frame の読み取りの失敗を、閉じる途中の ERR_ABORTED、ネットワークの層の失敗（DEF-004 の閉じた一覧）、予期した失敗を除いて、違反にする。上の3つは、どれにも当たらない。
+- 影響: メンテナンス中のサイトが本文の空の 503 を返すと、サイトの不調で止める機能（SU）の前に、違反で Run が止まり、再開できない。robots.txt が本文の空の 404 のサイトは、Run を始められない。本来の監査対象のサイトで起きるかは、未確認。
+- 状態: 直した（2026-10-05、DEF-029-fix。設計者が確かめた: Guard と DEF-029 の 8 ファイル 404 件 PASS）。設計書 `doc/design/2026-10-05-beaksight-def-029-response-received-failures-design.md`。独立レビューは、DEF-027-fix と合わせて行う。
+
+## DEF-030 テストの Chromium（headless-shell）と CLI の Chromium（`chrome.exe` の新しい headless）で、振る舞いが違う（2026-10-05 DEF-029-fix の報告で登録）
+
+- 現象（DEF-029-fix の実装者の事実）: 本文が空の 4xx・5xx と 401 Basic の main frame の読み込みは、CLI と同じ起動の設定（`chromiumLaunchOptions`。R7a で `channel: chromium` にした）では `net::ERR_HTTP_RESPONSE_CODE_FAILURE` などで失敗するが、テストの補助の既定（`useHeadlessChromium`、`createRunLauncher` の `chrome-headless-shell`）では、503・404・401 の応答として成功する。
+- 影響: 多くの結合テストと Safety Gate のテストは、headless-shell で動く。CLI の Chromium でだけ起きる振る舞い（DEF-029 のような違反）を、テストで見落とすおそれがある。DEF-029 と DEF-027 の新しいテストは、CLI と同じ起動の設定で動かしている。
+- 方針の案: テストの補助の既定を CLI と同じ起動の設定にする、Safety Gate のテストだけ両方で動かす、など。テストの時間と安定への影響を確かめてから決める。
+- 状態: 記録だけ（Task 21 の後に、ユーザーに相談して決める）。
+
+## DEF-031 Passive の読み込みは、ページごと・ビューポートごとに、同じ画像・動画・スクリプトを取り直すので、ふつうの利用者より転送量がずっと多い（2026-10-06 Task 21 の3回目の Run で登録）
+
+- 事実（保存の31ページ分の Passive の Network の Evidence）: 許可 Origin と、その外の合計で約 1.5 GB。同じ URL を1回だけ取れば約 264 MB（約1/6）。大半は、サイトの画像と動画を置く外部のストレージ（許可 Origin の外）からの 1,089 MB。3 MB の画像を61回取るなど、同じものを繰り返し取っている。動画（8.4 MB）は、範囲を指定した取り方（206）。
+- 原因（設計の決まり）: Passive の2回の読み込みは「初めてページを開いた利用者と同じく、ページ全体をネットワークから取る」（サイトへの負荷の制御の設計書。README の「1つのページの読み込みの回数」）。Run 全体のキャッシュは、読み込み直し（幅の走査、Interaction）だけで使い、Passive では使わない。範囲を指定した要求は、キャッシュの対象外。
+- 影響: 対象のサイトの運営者の、外部のストレージの転送量（契約によっては上限や課金）を、ふつうの利用者が同じページを見て回る場合の数倍使う。対象のサイトの本体（Cloudflare の後ろ）への負荷は小さい。
+- 状態: Task 21 を止めて、直し方をユーザーと決める。
+
+## DEF-032 広告の計測の通信を、ブラウザが ORB で捨てたものが、画像の読み込みの失敗（`IMAGE_LOAD_FAILED`、ERROR）として全ページに出る（雑音。2026-10-06 Task 21 の途中の結果で登録）
+
+- 事実（Task 21 の3回目の Run の保存の31ページ）: `IMAGE_LOAD_FAILED` が 62件（全31ページ、ビューポートごとに1件）。どれも許可 Origin の外の広告の計測の URL（`/ccm/s/collect`）で、失敗の理由は `net::ERR_BLOCKED_BY_ORB`（Chromium の Opaque Response Blocking。画像でない応答を、画像として読まずに捨てる）。
+- 影響: 利用者には見えない計測の通信で、ふつうのブラウザでも同じく捨てられる。サイトの品質の ERROR として数えられ、件数と Run の結果の読み方を誤らせる（雑音）。安全や Run Status には影響しない。
+- 方針の案: 画面に出ない（大きさのない、DOM に描かれない）画像の要求や、`ERR_BLOCKED_BY_ORB` の失敗を、`IMAGE_LOAD_FAILED` の対象から外すか、INFO に下げる。DEF-016 と合わせて、Task 21 の結果の後に決める。
+- 状態: 記録だけ。
+
+## DEF-033 （調査）サイトが止まった要因が BeakSight にないかの確認（2026-10-06 ユーザーの指示で調査）
+
+- 契機: Task 21 の3回目の Run で、10:25 と 13:50 にサイトの不調で止まった。ユーザーの情報では、サイトは実際に止まっていた（開発者の作業の可能性あり）。
+- 調査の結果（`DEF-033-investigation-brief.md`。読み取り専用、127.0.0.1 だけ）:
+  - コード: Guard の文書の要求の Request の段階から `Fetch.continueRequest` までに、continue 自身のほかに待つものはない（DEF-026・DEF-027 の待ちは、命令の失敗の後か requestfailed の後だけ）。止まったままになりうる条件（Guard の未完了の作業の上限、page の準備ができていない、Guard の session が外れた）は、違反を記録して Context を閉じる（黙って止まらない）。
+  - 実験（`dist/` の CLI、間隔 0、3 Run、計約60分、読み込み 2,433回）: 時間切れ 0、サーバに届かなかった要求 0、開始から受付までの遅れは最大 31ms（p99 16〜19ms）、同時に処理中の文書の要求は常に1。サーバに届いたのは GET だけ。
+  - 本番の記録: 13:50 の Interaction の9件目の Context では、部品の要求も始まっていない（HTML が届かなかった）。サイト側（エッジか origin）の停止と合う。対象のサイトへの接続は TCP（QUIC ではない）。
+- 結論: BeakSight 側の要因（手元で要求を止める、過負荷）は見つからなかった。不具合ではない。
+- 参考（ふつうのブラウザとの違い。どれも重い負荷ではない）: 同じ URL を1ページにつき約11回読み込む（設計どおり。読み込みごとにサイト側でページを組み立てる）、読み込みごとに新しい接続、Playwright が route のある Context で `Network.setCacheDisabled(true)` を送るので要求に `Cache-Control: no-cache` と `Pragma: no-cache` が付く。
+- 状態: 調査を終えた（不具合なし）。
+
+## DEF-034 `navigation-pacing.test.ts` のサーバ側の間隔の確かめが、全テストの同時の実行（CPU の混雑）で、まれに失敗する（2026-10-07 D3-fix-round-1 の後の全体の検証で登録）
+
+- 現象: `npm run verify` で 1 回、「server-side interval before navigation 2: expected 900 to be greater than or equal to 950」で失敗（許容は 50 ms）。単独では 3/3 PASS。同日の前の 2 回の全体の検証（D3 の後、D3 の前）では PASS。
+- 原因（設計者の推測）: pacer が保証するのは、読み込みの開始（`beforeNavigation` の戻り）の間隔。サーバに届く時刻は、その後の Context の作成（Interaction で中央 113 ms）や、D3 で加わった観察の開始（ふだん 2 ms、混雑時は数十 ms）の分だけずれ、連続する読み込みでずれの差が 50 ms を超えると失敗する。production の間隔の保証は変わらない。
+- 方針の案: 観察の開始を pacer の待ちの前に移す（待ちの中に吸収される）、または、許容を Context の作成の揺らぎに合わせて見直す。
+- 状態: 記録だけ（全体の検証はやり直して PASS を確かめる）。

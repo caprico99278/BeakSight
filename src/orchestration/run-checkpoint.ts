@@ -338,12 +338,14 @@ export function checkRunCheckpointPageConsistency(page: RunCheckpointPage, check
 
 /**
  * 再開のときに、待ち行列に戻す SKIPPED の理由のコード（設計書 3.2）。再開の流れ（R4a2）は、`CrawlFrontier.restore` の
- * `requeueSkipReasonCodes` に、この一覧を渡す。1回の実行の時間の上限（`MAX_RUNTIME_REACHED`）と、止める印（Ctrl+C など）で
- * 止めた理由（`RUN_INTERRUPTED`。R4b1。設計書 4.6.1）の2つである。
+ * `requeueSkipReasonCodes` に、この一覧を渡す。1回の実行の時間の上限（`MAX_RUNTIME_REACHED`）、止める印（Ctrl+C など）で
+ * 止めた理由（`RUN_INTERRUPTED`。R4b1。設計書 4.6.1）、サイトの不調で止めた理由（`SITE_UNAVAILABLE`。不調を検知したページと、
+ * 始めなかったページ。サイトが応答しないときに Run を止める設計書 3.2）の3つである。
  */
 export const RESUME_REQUEUE_SKIP_REASON_CODES = Object.freeze([
   'MAX_RUNTIME_REACHED',
   'RUN_INTERRUPTED',
+  'SITE_UNAVAILABLE',
 ] as const satisfies readonly IncompleteReasonCode[]);
 
 /**
@@ -411,10 +413,13 @@ export function closeInterruptedRunExecutions(
 const isSafetyAbortedRun = (runStatus: RunStatus): boolean => runStatus === 'ABORTED_BY_SAFETY';
 
 /**
- * SKIPPED のページの理由のコードと、そのときの実行の終わり方（設計書 4.8。違反の次に、この順に確かめる）。ここにある終わり方の実行は、
- * 今のページを終えてから止まったので、保存の状態を `STOPPED` にする（設計書 4.3.2）。
+ * SKIPPED のページの理由のコードと、そのときの実行の終わり方（設計書 4.8。違反の次に、この順に確かめる）。順は、サイトの不調
+ * （サイトが応答しないときに Run を止める設計書 3.2）、実行時間の上限、止める印。ここにある終わり方の実行は、再開できるように止まった
+ * （実行時間の上限と止める印は今のページを終えてから、サイトの不調は不調を検知した時点で）ので、保存の状態を `STOPPED` にする
+ * （設計書 4.3.2）。
  */
 const STOPPING_SKIP_REASONS = Object.freeze([
+  { skipReasonCode: 'SITE_UNAVAILABLE', endReason: 'STOPPED_BY_SITE_UNAVAILABLE' },
   { skipReasonCode: 'MAX_RUNTIME_REACHED', endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
   { skipReasonCode: 'RUN_INTERRUPTED', endReason: 'STOPPED_BY_SIGNAL' },
 ] as const satisfies readonly { readonly skipReasonCode: IncompleteReasonCode; readonly endReason: RunExecutionEndReason }[]);
@@ -507,11 +512,13 @@ const STOPPED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
 });
 
 /**
- * この実行の終わり方を決める（設計書 4.8）。上から順に、最初に当てはまるもの:
+ * この実行の終わり方を決める（設計書 4.8。サイトが応答しないときに Run を止める設計書 3.2）。上から順に、最初に当てはまるもの:
  * 1. Run Status が `ABORTED_BY_SAFETY` → `STOPPED_BY_SAFETY_VIOLATION`
- * 2. 理由 `MAX_RUNTIME_REACHED` の SKIPPED がある → `STOPPED_BY_RUNTIME_LIMIT`
- * 3. 理由 `RUN_INTERRUPTED` の SKIPPED がある → `STOPPED_BY_SIGNAL`
- * 4. それ以外 → `COMPLETED`
+ * 2. 理由 `SITE_UNAVAILABLE` の SKIPPED がある → `STOPPED_BY_SITE_UNAVAILABLE`
+ * 3. 理由 `MAX_RUNTIME_REACHED` の SKIPPED がある → `STOPPED_BY_RUNTIME_LIMIT`
+ * 4. 理由 `RUN_INTERRUPTED` の SKIPPED がある → `STOPPED_BY_SIGNAL`
+ * 5. それ以外 → `COMPLETED`
+ * 2〜4 の順は、`STOPPING_SKIP_REASONS` の並びで決まる。
  * `INTERRUPTED_ABNORMALLY` は返さない（再開のときに、前の回の記録を閉じるときだけ使う。`closeInterruptedRunExecutions`）。
  */
 export function decideRunExecutionEndReason(
@@ -531,8 +538,8 @@ export function decideRunExecutionEndReason(
  *    書けた保存があれば、その値で `FINISHED`、なければ `ABANDON`（違反を検出した Run は、必ず `FINISHED` にする。5章）
  * 3. この実行で、保存に失敗した → `ABANDON`
  * 4. 再開した実行で、PREFLIGHT に失敗した → `ABANDON`
- * 5. それ以外 → 巡回の終わりの値で、この実行の終わり方（`decideRunExecutionEndReason`）が、実行時間の上限か止める印なら `STOPPED`、
- *    ほかは `FINISHED`
+ * 5. それ以外 → 巡回の終わりの値で、この実行の終わり方（`decideRunExecutionEndReason`）が、サイトの不調か実行時間の上限か止める印
+ *    （`STOPPING_SKIP_REASONS` の終わり方）なら `STOPPED`、ほかは `FINISHED`
  * `FINISH` の `finishEvenIfOutputFails`（出力の書き出しに失敗しても `finish` を行うか。設計書 4.10）は、2 の行（Run Status が
  * `ABORTED_BY_SAFETY`）だけ真、5 の行は偽にする（この規則は、ここだけに置く）。凍結した値を返す。
  */
