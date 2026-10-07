@@ -51,7 +51,7 @@ import type { AuditRunResult, RunExecutionEndReason, RunLoad, RunProgressReport,
 import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
-  SITE_UNAVAILABLE_RECHECK_DELAY_MS,
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
   type RunCoordinatorCheckpointConclusion,
   type RunNotice,
 } from '../../src/orchestration/run-coordinator.js';
@@ -80,6 +80,7 @@ import {
   progressItemsText,
   resumingRunText,
   siteUnavailableRecheckText,
+  siteUnavailableSlowdownText,
   siteUnavailableStopText,
   unreadableCheckpointText,
 } from '../../src/presentation/messages.js';
@@ -1362,18 +1363,33 @@ describe('CLI run: the progress line during the Run', () => {
   });
 });
 
-// SU5（サイトが応答しないときに Run を止める設計書 3.5.4）: Run Coordinator の知らせ（`RunNotice`。事実だけ）を、1行の文言にする。
-// 文言は `messages.ts` の `siteUnavailableRecheckText`、待つ時間の書式は `format.ts` の `formatDuration`（例: `60秒`）。表示の側で計算しない。
-describe('CLI run: the notice line of the site unavailability recheck', () => {
-  it('shows the recheck notice with the wait from the notice and the URL, in one line', () => {
-    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'http://127.0.0.1:4173/a.html', delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS };
+// SU5、SU6（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）: Run Coordinator の知らせ（`RunNotice`。事実だけ）を、1行の文言に
+// する。文言は `messages.ts` の `siteUnavailableRecheckText` と `siteUnavailableSlowdownText`、時間の書式は `format.ts` の `formatDuration`
+// （例: `60秒`）。表示の側で計算しない。
+describe('CLI run: the notice lines of the site unavailability recheck and slowdown', () => {
+  it('shows the recheck notice with the wait, the attempt of the maximum and the URL from the notice, in one line', () => {
+    const [firstDelayMs, secondDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS as readonly [number, number, ...number[]];
+    const maxAttempts = SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length;
+    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'http://127.0.0.1:4173/a.html', delayMs: firstDelayMs, attempt: 1, maxAttempts };
 
-    expect(runNoticeLines(notice)).toEqual([siteUnavailableRecheckText(notice.url, formatDuration(SITE_UNAVAILABLE_RECHECK_DELAY_MS))]);
+    expect(runNoticeLines(notice)).toEqual([siteUnavailableRecheckText(notice.url, formatDuration(firstDelayMs), 1, maxAttempts)]);
     expect(runNoticeLines(notice)).toEqual([
-      'サイトが応答しないため、60秒待ってから同じページを 1 回だけ確かめ直します（http://127.0.0.1:4173/a.html）。',
+      'サイトが応答しないため、60秒待ってから同じページを確かめ直します（1/4 回目。http://127.0.0.1:4173/a.html）。',
     ]);
-    // 待つ時間は、知らせの事実のまま書式にかける（定数ではない）。
-    expect(runNoticeLines({ ...notice, delayMs: 1_500 })).toEqual([siteUnavailableRecheckText(notice.url, formatDuration(1_500))]);
+    expect(runNoticeLines({ ...notice, delayMs: secondDelayMs, attempt: 2 })).toEqual([
+      'サイトが応答しないため、120秒待ってから同じページを確かめ直します（2/4 回目。http://127.0.0.1:4173/a.html）。',
+    ]);
+    // 待つ時間と回数は、知らせの事実のまま書式にかける（定数ではない）。
+    expect(runNoticeLines({ ...notice, delayMs: 1_500, attempt: 3, maxAttempts: 7 }))
+      .toEqual([siteUnavailableRecheckText(notice.url, formatDuration(1_500), 3, 7)]);
+  });
+
+  it('shows the slowdown notice with the new interval from the notice, in one line', () => {
+    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 };
+
+    expect(runNoticeLines(notice)).toEqual([siteUnavailableSlowdownText(formatDuration(10_000))]);
+    expect(runNoticeLines(notice)).toEqual(['確かめ直しで応答が戻ったので、ページの読み込みの間隔を 10秒 に延ばして続けます。']);
+    expect(runNoticeLines({ ...notice, minIntervalMs: 40_000 })).toEqual([siteUnavailableSlowdownText(formatDuration(40_000))]);
   });
 });
 

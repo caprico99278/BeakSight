@@ -684,6 +684,7 @@ describe('PageAuditor Interaction candidate limit per page (load control design 
             return pacer.beforeNavigation();
           },
           snapshot: () => pacer.snapshot(),
+          raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
         };
       },
       wrapSession: (session) => {

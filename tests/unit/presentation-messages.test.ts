@@ -28,6 +28,7 @@ import {
   runLockHeldText,
   runLockTakenOverText,
   siteUnavailableRecheckText,
+  siteUnavailableSlowdownText,
   siteUnavailableStopText,
   truncatedListText,
   unreadableCheckpointText,
@@ -309,16 +310,25 @@ describe('site unavailability stop text of the CLI', () => {
   });
 });
 
-// SU5（サイトが応答しないときに Run を止める設計書 3.5.4）: サイトの不調でページを捨てた後、待ってから同じページを 1 回だけ確かめ直す
-// ことを知らせる1行の文言。待つ時間の文言（`formatDuration` の結果。例: `60秒`）と、ページの URL は、呼び出し側が渡す。
+// SU5、SU6（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）: サイトの不調でページを捨てた後、待ってから同じページを確かめ直す
+// ことを知らせる1行の文言。待つ時間の文言（`formatDuration` の結果。例: `60秒`）、何回目か、最大の回数、ページの URL は、呼び出し側が渡す。
 describe('site unavailability recheck text of the CLI', () => {
-  it('tells that the same page is checked once more after the wait, with the wait and the URL as they are given', () => {
-    expect(siteUnavailableRecheckText('http://127.0.0.1:4173/a.html', '60秒')).toBe(
-      'サイトが応答しないため、60秒待ってから同じページを 1 回だけ確かめ直します（http://127.0.0.1:4173/a.html）。',
+  it('tells that the same page is checked again after the wait, with the wait, the attempt of the maximum, and the URL as they are given', () => {
+    expect(siteUnavailableRecheckText('http://127.0.0.1:4173/a.html', '60秒', 1, 4)).toBe(
+      'サイトが応答しないため、60秒待ってから同じページを確かめ直します（1/4 回目。http://127.0.0.1:4173/a.html）。',
     );
-    expect(siteUnavailableRecheckText('http://127.0.0.1:4173/b.html?page=2', '1.5秒')).toBe(
-      'サイトが応答しないため、1.5秒待ってから同じページを 1 回だけ確かめ直します（http://127.0.0.1:4173/b.html?page=2）。',
+    expect(siteUnavailableRecheckText('http://127.0.0.1:4173/b.html?page=2', '120秒', 2, 4)).toBe(
+      'サイトが応答しないため、120秒待ってから同じページを確かめ直します（2/4 回目。http://127.0.0.1:4173/b.html?page=2）。',
     );
+  });
+});
+
+// SU6（設計書 3.6.2）: 確かめ直しで応答が戻った後、ページの読み込みの間隔を延ばして続けることを知らせる1行の文言。新しい間隔の文言
+// （`formatDuration` の結果。例: `10秒`）は、呼び出し側が渡す。
+describe('site unavailability slowdown text of the CLI', () => {
+  it('tells that the site responded again and the navigation interval is extended to the given interval', () => {
+    expect(siteUnavailableSlowdownText('10秒')).toBe('確かめ直しで応答が戻ったので、ページの読み込みの間隔を 10秒 に延ばして続けます。');
+    expect(siteUnavailableSlowdownText('40秒')).toBe('確かめ直しで応答が戻ったので、ページの読み込みの間隔を 40秒 に延ばして続けます。');
   });
 });
 

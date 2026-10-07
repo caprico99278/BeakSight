@@ -35,6 +35,12 @@ export interface NavigationPacer {
   beforeNavigation(): Promise<number>;
   /** これまでの読み込みの回数、待った時間の合計、最後の読み込みの開始の時刻（凍結した値）。 */
   snapshot(): NavigationPacerSnapshot;
+  /**
+   * 最小の間隔を `minIntervalMs` に上げる（サイトが応答しないときに Run を止める設計書 3.6.2。確かめ直しで通った後の減速）。次の
+   * `beforeNavigation()` から、新しい間隔で待つ（最後の読み込みの開始から数える）。今の間隔より大きくない値は無視する（下げない）。
+   * 0 以上の安全な整数でなければ `RangeError` を投げる（間隔は変えない）。上げた間隔は記録（`snapshot`）に入れない（保存の形を変えない）。
+   */
+  raiseMinimumInterval(minIntervalMs: number): void;
 }
 
 /** `createNavigationPacer` の入力。 */
@@ -74,7 +80,9 @@ export function createNavigationPacer(options: NavigationPacerOptions): Navigati
   if (!isRecord(options)) {
     throw new TypeError('NavigationPacer options must be an object');
   }
-  const { minIntervalMs, now, sleep, initial } = options;
+  const { now, sleep, initial } = options;
+  // 最小の間隔。`raiseMinimumInterval` で上がることがある（下がらない）。
+  let minIntervalMs = options.minIntervalMs;
   if (!isNonNegativeSafeInteger(minIntervalMs)) {
     throw new RangeError('NavigationPacer minimum interval must be a non-negative safe integer of milliseconds');
   }
@@ -124,6 +132,14 @@ export function createNavigationPacer(options: NavigationPacerOptions): Navigati
     },
     snapshot(): NavigationPacerSnapshot {
       return state;
+    },
+    raiseMinimumInterval(raisedMinIntervalMs: number): void {
+      if (!isNonNegativeSafeInteger(raisedMinIntervalMs)) {
+        throw new RangeError('NavigationPacer raised minimum interval must be a non-negative safe integer of milliseconds');
+      }
+      if (raisedMinIntervalMs > minIntervalMs) {
+        minIntervalMs = raisedMinIntervalMs;
+      }
     },
   });
 }

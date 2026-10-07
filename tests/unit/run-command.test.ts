@@ -19,7 +19,7 @@ import type { PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
-  SITE_UNAVAILABLE_RECHECK_DELAY_MS,
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunNotice,
@@ -156,15 +156,21 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
     expect(coordinatorDependencies[0]?.stopSignal).toBe(controller.signal);
   });
 
-  // SU5（サイトが応答しないときに Run を止める設計書 3.5.4）: Run Coordinator の知らせの口（`onNotice`）を渡し、受けた知らせを、進み具合の
-  // 行と同じく標準出力に1行で書く（開始の行の後、結果の前）。文言は `runNoticeLines`。
+  // SU5、SU6（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）: Run Coordinator の知らせの口（`onNotice`）を渡し、受けた知らせ
+  // （確かめ直しと減速）を、進み具合の行と同じく標準出力に1行で書く（開始の行の後、結果の前）。文言は `runNoticeLines`。
   it('hands a notice receiver to the Run Coordinator, and writes each notice to stdout as one line between the start and the result', async () => {
     const outputDirectory = join(workDirectory, 'notice');
     const config = createTestConfig('http://127.0.0.1:9', '/', { output: { directory: outputDirectory } });
     const stdout = captureCliOutput();
     const stderr = captureCliOutput();
-    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'http://127.0.0.1:9/a.html', delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS };
-    const second: RunNotice = { ...notice, url: 'http://127.0.0.1:9/b.html' };
+    const notice: RunNotice = {
+      kind: 'SITE_UNAVAILABLE_RECHECK',
+      url: 'http://127.0.0.1:9/a.html',
+      delayMs: SITE_UNAVAILABLE_RECHECK_DELAYS_MS[0] as number,
+      attempt: 1,
+      maxAttempts: SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length,
+    };
+    const second: RunNotice = { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 };
 
     const code = await runAuditCommand(config, { stdout: stdout.output, stderr: stderr.output }, {
       launchBrowser: failingLaunch,

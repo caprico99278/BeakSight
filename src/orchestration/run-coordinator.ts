@@ -153,30 +153,53 @@ export interface RunCoordinatorResumeInput {
 export const SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION = 'site-unavailable-diagnostic-schema/1.1';
 
 /**
- * サイトの不調でページを捨てた後、同じページを 1 回だけ確かめ直すまでに待つ時間（ms。サイトが応答しないときに Run を止める設計書 3.5.2）。
+ * サイトの不調でページを捨てた後、同じページを確かめ直すまでに待つ時間の段階（ms。1 回目の確かめ直しの前は 60 秒、2 回目は 2 分、3 回目は
+ * 4 分、4 回目は 8 分。1 ページにつき、この段階の数（4 回）まで確かめ直す。サイトが応答しないときに Run を止める設計書 3.6.2）。
  * 設定の項目にしない: 設定の項目を増やすと、保存した設定と今の設定の比較が合わなくなり、今の途中の Run を続きから再開できなくなるため
  * （設定が違う Run は再開しない。中断した Run の再開の設計書 4.7）。待っている間は、サイトへ何も送らない。待ちは、止める印（Ctrl+C）で
  * 打ち切る。待った時間は、実行時間の上限に含める。
  */
-export const SITE_UNAVAILABLE_RECHECK_DELAY_MS = 60_000;
-
-/** サイトの不調で捨てた、1 回目の試行の番号（診断の記録のファイルの名前に使う。設計書 3.5.2）。 */
-const SITE_UNAVAILABLE_FIRST_ATTEMPT = 1;
-/** 待った後の確かめ直しの試行の番号（1 回目の次。1 つの実行の中で、同じ URL につき 1 回まで）。 */
-const SITE_UNAVAILABLE_RECHECK_ATTEMPT = SITE_UNAVAILABLE_FIRST_ATTEMPT + 1;
+export const SITE_UNAVAILABLE_RECHECK_DELAYS_MS: readonly number[] = Object.freeze([60_000, 120_000, 240_000, 480_000]);
 
 /**
- * Run Coordinator の、実行中の知らせ（サイトが応答しないときに Run を止める設計書 3.5.4）。進み具合（`RunProgressReport`）とは別の口
- * （`RunCoordinatorDependencies.onNotice`）に渡す、事実だけの値である（文言は、CLI が `messages.ts` で作る）。凍結する。
- * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページ（`url`）を捨てた後、`delayMs` だけ待ってから、同じページを 1 回だけ確かめ直す。
+ * 確かめ直しで通った後の減速の倍率（設計書 3.6.2）。通るたびに、Run で 1 つの pacer の最小の間隔を、この倍率で上げる（何回目の確かめ直しで
+ * 通ったかによらない）。設定の項目にしない（理由は `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` と同じ）。
  */
-export interface RunNotice {
-  readonly kind: 'SITE_UNAVAILABLE_RECHECK';
-  /** そのページの URL（巡回の記録の、正規化した URL）。 */
-  readonly url: string;
-  /** 待つ時間（ms。`SITE_UNAVAILABLE_RECHECK_DELAY_MS`）。 */
-  readonly delayMs: number;
-}
+export const SITE_UNAVAILABLE_SLOWDOWN_FACTOR = 2;
+
+/**
+ * 減速の上限（設定の `crawl.minNavigationIntervalMs` の倍率。設計書 3.6.2。既定の 5 秒なら 40 秒）。設定の項目にしない（理由は
+ * `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` と同じ）。設定の間隔が 0（ループバックのテスト）なら、上限も 0 で、減速しない。
+ */
+export const SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR = 8;
+
+/** サイトの不調で捨てた、1 回目の試行の番号（診断の記録のファイルの名前に使う。設計書 3.5.2）。確かめ直しの試行は、この次から数える。 */
+const SITE_UNAVAILABLE_FIRST_ATTEMPT = 1;
+
+/**
+ * Run Coordinator の、実行中の知らせ（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）。進み具合（`RunProgressReport`）とは別の口
+ * （`RunCoordinatorDependencies.onNotice`）に渡す、事実だけの値である（文言は、CLI が `messages.ts` で作る）。凍結する。
+ * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページ（`url`）を捨てた後、`delayMs` だけ待ってから、同じページを確かめ直す（`attempt` 回目。
+ *   最大 `maxAttempts` 回）。
+ * - `SITE_UNAVAILABLE_SLOWDOWN`: 確かめ直しで通ったので、ページの読み込みの最小の間隔を `minIntervalMs` に上げて続ける。
+ */
+export type RunNotice =
+  | {
+    readonly kind: 'SITE_UNAVAILABLE_RECHECK';
+    /** そのページの URL（巡回の記録の、正規化した URL）。 */
+    readonly url: string;
+    /** 待つ時間（ms。`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の、この回の値）。 */
+    readonly delayMs: number;
+    /** 何回目の確かめ直しか（1 から）。 */
+    readonly attempt: number;
+    /** 1 ページにつき確かめ直す回数の上限（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数）。 */
+    readonly maxAttempts: number;
+  }
+  | {
+    readonly kind: 'SITE_UNAVAILABLE_SLOWDOWN';
+    /** 新しい最小の間隔（ms）。 */
+    readonly minIntervalMs: number;
+  };
 
 /**
  * サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。Run Coordinator が組み立て、注入された書き出しの口
@@ -298,7 +321,7 @@ export interface RunCoordinatorDependencies {
   /**
    * サイトの不調で止めたときの診断の記録の書き出しの口（サイトの不調で止めたときの診断の記録の設計書 2.3）。省略すると、何もしない（今のまま）。
    * CLI は、`ArtifactWriter.writeSiteUnavailableDiagnostic` を渡す。Run Coordinator は、次の場合に、Run のディレクトリと記録と、その実行の中で
-   * そのページを監査した試行の番号（1 回目が 1。捨てた後に 1 回だけ確かめ直した試行は 2。同 3.5.2。ファイルの名前に使う）を渡して1回呼ぶ。
+   * そのページを監査した試行の番号（1 回目が 1。捨てた後の確かめ直しの試行は 2〜5。同 3.5.2、3.6.2。ファイルの名前に使う）を渡して1回呼ぶ。
    * - サイトの不調でページを捨てた場合（サイトが応答しないときに Run を止める設計書 3.2）。捨てた試行ごとに、捨てた後の状態の保存の後に呼ぶ
    *   （確かめ直しのために待つ前）。
    * - 前の実行のきっかけのページが、また不調で、普通の結果として保存した場合（同 3.2.1）。ページの保存と状態の保存の後に呼ぶ。
@@ -1146,10 +1169,12 @@ export class RunCoordinator {
    * 不調のページを捨てた場合と、前の実行のきっかけのページを普通の結果として保存した場合は、そのページの保存の後に、診断の記録を書き出しの
    * 口に渡す（`#passSiteUnavailableDiagnostic`。`diagnosticIdentity` は、記録の Run の ID と実行の番号。サイトの不調で止めたときの診断の
    * 記録の設計書 2.3）。
-   * 不調のページを捨てた後、その実行でそのページをまだ確かめ直していなければ、知らせてから `SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待ち
-   * （止める印で打ち切る）、待った後に止める印がなく、実行時間の上限にも達していなければ、同じページ（同じ `pageId`）を 1 回だけ監査し直す
-   * （サイトが応答しないときに Run を止める設計書 3.5.2。`#waitBeforeRecheck`）。2 回目に不調がなければ通常どおり保存して進み、2 回目も
-   * 不調なら今までどおり止める（不調の詳細は 2 回目のもの）。前の実行のきっかけのページは、確かめ直さない。
+   * 不調のページを捨てた後、その実行でそのページを確かめ直した回数が上限（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数）に達していなければ、
+   * 知らせてから次の段階の待ち（60 秒、2 分、4 分、8 分）で待ち（止める印で打ち切る）、待った後に止める印がなく、実行時間の上限にも達して
+   * いなければ、同じページ（同じ `pageId`）を監査し直す（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2。`#waitBeforeRecheck`）。
+   * 確かめ直しで不調がなければ、Run で 1 つの pacer の最小の間隔を上げて（減速。`SITE_UNAVAILABLE_SLOWDOWN_FACTOR` 倍。上限は設定の
+   * `SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR` 倍。この実行の間だけ）、通常どおり保存して進む。最後の確かめ直しも不調なら今までどおり止める
+   * （不調の詳細は最後の試行のもの）。前の実行のきっかけのページは、確かめ直さない。
    */
   async #crawl(
     factory: BrowserContextFactory,
@@ -1298,11 +1323,27 @@ export class RunCoordinator {
       let stopReason: IncompleteReason | null = null;
       // 監査を終えたページの数（進み具合の事実。サイトへの負荷の制御の設計書 4.8）。再開のときは、再開の前に終わったページを含める。
       let pagesFinished = saved?.completedPageIds.length ?? 0;
-      // 1 回だけ確かめ直す（サイトが応答しないときに Run を止める設計書 3.5.2）。不調で捨てたページを、待った後にもう 1 回監査するときは、
-      // 待ち行列を通さずに、その記録（`recheckEntry`）を次に監査する。確かめ直したページの URL は、1 つの実行の中で同じ URL につき 1 回まで
-      // にするために持つ（確かめ直しの試行でまた不調なら、今までどおり止める）。
+      // 段階的に確かめ直す（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2）。不調で捨てたページを、待った後にもう 1 回監査する
+      // ときは、待ち行列を通さずに、その記録（`recheckEntry`）を次に監査する。URL ごとの確かめ直しの回数（`recheckedUrls`）は、1 つの実行の
+      // 中で同じ URL につき `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` の数（4 回）までにするためと、診断の記録の試行の番号のために持つ（最後の
+      // 確かめ直しの試行でまた不調なら、今までどおり止める）。
       let recheckEntry: CrawlUrlEntry | null = null;
-      const recheckedUrls = new Set<string>();
+      const recheckedUrls = new Map<string, number>();
+      // この実行の、pacer の今の最小の間隔（設計書 3.6.2。確かめ直しで通るたびに、`SITE_UNAVAILABLE_SLOWDOWN_FACTOR` 倍にする。上限は設定の
+      // `SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR` 倍）。この実行の間だけで、保存しない（次の起動は設定の値から始める。保存の形を変えないため）。
+      // 間隔の意味の owner は pacer のまま（ここは倍率の規則だけを持つ）。
+      let slowedMinIntervalMs = config.crawl.minNavigationIntervalMs;
+      const slowDownAfterRecheckPassed = (): void => {
+        const maximumMs = config.crawl.minNavigationIntervalMs * SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR;
+        const raisedMs = Math.min(slowedMinIntervalMs * SITE_UNAVAILABLE_SLOWDOWN_FACTOR, maximumMs);
+        // すでに上限（設定の間隔が 0 なら 0）なら、上げず、知らせも出さない。
+        if (raisedMs <= slowedMinIntervalMs) {
+          return;
+        }
+        slowedMinIntervalMs = raisedMs;
+        progress.navigationPacer.raiseMinimumInterval(raisedMs);
+        this.#notify(Object.freeze({ kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: raisedMs }));
+      };
       const nextEntry = (): CrawlUrlEntry | undefined => {
         if (recheckEntry === null) {
           return frontier.next();
@@ -1312,8 +1353,10 @@ export class RunCoordinator {
         return entry;
       };
       for (let entry = nextEntry(); entry !== undefined; entry = nextEntry()) {
-        // この記録が、待った後の確かめ直しか（`requeueForRecheck` で `AUDITING` に戻してある）。
-        const rechecking = recheckedUrls.has(entry.url);
+        // この記録を、この実行で何回確かめ直したか（0 なら 1 回目の試行）。1 回以上なら、待った後の確かめ直し（`requeueForRecheck` で
+        // `AUDITING` に戻してある）。
+        const recheckCount = recheckedUrls.get(entry.url) ?? 0;
+        const rechecking = recheckCount > 0;
         // 違反を検出した後は、新しいページを始めない（Task 19 の前の整理の設計書 4.5）。ページを始める前に、Run の間に作ったすべての
         // Ledger を調べる。違反の後の URL は、保存の失敗と上限より先に、理由 `SAFETY_VIOLATION_ABORT` の SKIPPED にする。
         if (stopReason === null && this.#safetyViolationRecorded(progress, 0)) {
@@ -1349,7 +1392,7 @@ export class RunCoordinator {
         const { result, siteUnavailableDetail, navigationDiagnostics } = await this.#auditWithRetry(auditor, entry, progress);
         // 診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。不調で止めたページ（捨てたページと、普通の結果として保存した
         // 前の実行のきっかけのページ）だけに、そのページの保存の後に渡す。違反でページを捨てなかった場合は、渡さない。試行の番号は、
-        // 確かめ直しなら 2、それ以外は 1（ファイルの名前に使う。設計書 3.5.2）。
+        // 1 回目が 1、n 回目の確かめ直しが 1 + n（ファイルの名前に使う。設計書 3.5.2、3.6.2）。
         let diagnosticDetail: string | null = null;
         const passDiagnostic = (detail: string): Promise<void> => this.#passSiteUnavailableDiagnostic(
           runDirectory,
@@ -1360,7 +1403,7 @@ export class RunCoordinator {
             page: result,
             navigationDiagnostics,
           }),
-          rechecking ? SITE_UNAVAILABLE_RECHECK_ATTEMPT : SITE_UNAVAILABLE_FIRST_ATTEMPT,
+          SITE_UNAVAILABLE_FIRST_ATTEMPT + recheckCount,
         );
         // サイトの不調の印（サイトが応答しないときに Run を止める設計書 3.2、3.2.1）。まず、そのページの Ledger の違反を確かめる。違反が
         // あれば、ページを捨てずに、今のとおり普通の結果として保存し、違反で止める（違反の Evidence をページに残すため。違反の優先）。
@@ -1385,18 +1428,28 @@ export class RunCoordinator {
               await saveState(checkpoint);
             }
             await passDiagnostic(siteUnavailableDetail);
-            // 1 回だけ確かめ直す（設計書 3.5.2）。この実行でまだ確かめ直していないページで、状態を保存できていれば（保存に失敗した後は、
-            // 新しいページを始めないので、待たず、確かめ直さない）、知らせてから待ち、待った後に止める印がなく、実行時間の上限にも達して
-            // いなければ、この実行の不調の詳細を消し（このページを始める前は `null` だった。上の `??=` で入れた値）、巡回の記録をこの
-            // ページの `AUDITING` に戻して、同じ記録（同じ `pageId`）を次に監査する。待っている間は、サイトへ何も送らない。
-            if (!rechecking && !checkpointFailed && await this.#waitBeforeRecheck(entry.url, runtimeLimitReached)) {
-              recheckedUrls.add(entry.url);
+            // 段階的に確かめ直す（設計書 3.5.2、3.6.2）。この実行でこのページを確かめ直した回数が上限（待ちの段階の数）に達しておらず、状態を
+            // 保存できていれば（保存に失敗した後は、新しいページを始めないので、待たず、確かめ直さない）、知らせてから次の段階の待ちで待ち、
+            // 待った後に止める印がなく、実行時間の上限にも達していなければ、この実行の不調の詳細を消し（このページを始める前は `null`
+            // だった。上の `??=` で入れた値）、巡回の記録をこのページの `AUDITING` に戻して、同じ記録（同じ `pageId`）を次に監査する。
+            // 待っている間は、サイトへ何も送らない。上限に達していれば、今までどおり止める（無限には繰り返さない）。
+            const nextDelayMs = SITE_UNAVAILABLE_RECHECK_DELAYS_MS[recheckCount];
+            if (
+              nextDelayMs !== undefined
+              && !checkpointFailed
+              && await this.#waitBeforeRecheck(entry.url, nextDelayMs, recheckCount + 1, runtimeLimitReached)
+            ) {
+              recheckedUrls.set(entry.url, recheckCount + 1);
               progress.siteUnavailableDetail = null;
               frontier.requeueForRecheck(entry.url);
               recheckEntry = entry;
             }
             continue;
           }
+        }
+        // 確かめ直しで通った（その試行に不調の印がない）ので、減速して続ける（設計書 3.6.2。何回目の確かめ直しで通ったかによらず 1 回）。
+        if (rechecking && siteUnavailableDetail === null) {
+          slowDownAfterRecheckPassed();
         }
         progress.results.set(entry.url, result);
         frontier.markFinished(entry.url, result.status);
@@ -1622,19 +1675,30 @@ export class RunCoordinator {
   }
 
   /**
-   * サイトの不調で捨てたページ（`url`）を確かめ直す前の待ち（サイトが応答しないときに Run を止める設計書 3.5.2）。確かめ直してよければ真を
-   * 返す。
+   * サイトの不調で捨てたページ（`url`）を、`attempt` 回目に確かめ直す前の待ち（サイトが応答しないときに Run を止める設計書 3.5.2、3.6.2）。
+   * 確かめ直してよければ真を返す。
    * - 待つ前に、止める印が付いているか、実行時間の上限に達していれば、待たず（知らせも出さず）に偽を返す（待っても確かめ直せないため）。
-   * - 知らせ（`SITE_UNAVAILABLE_RECHECK`）を渡してから、`SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待つ（注入した `sleep`。止める印で打ち切る）。
-   *   待っている間は、サイトへ何も送らない（Page Auditor も、pacer の待ちも呼ばない）。
+   * - 知らせ（`SITE_UNAVAILABLE_RECHECK`。待つ時間、何回目か、最大の回数）を渡してから、`delayMs`（その回の段階の待ち）だけ待つ（注入した
+   *   `sleep`。止める印で打ち切る）。待っている間は、サイトへ何も送らない（Page Auditor も、pacer の待ちも呼ばない）。
    * - 待った後、止める印が付いているか、実行時間の上限に達していれば（待った時間は上限に含める）、偽を返す。
    */
-  async #waitBeforeRecheck(url: NormalizedHttpUrlEvidence, runtimeLimitReached: () => boolean): Promise<boolean> {
+  async #waitBeforeRecheck(
+    url: NormalizedHttpUrlEvidence,
+    delayMs: number,
+    attempt: number,
+    runtimeLimitReached: () => boolean,
+  ): Promise<boolean> {
     if (this.#stopRequested() || runtimeLimitReached()) {
       return false;
     }
-    this.#notify(Object.freeze({ kind: 'SITE_UNAVAILABLE_RECHECK', url, delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS }));
-    await this.#sleepUnlessStopped(SITE_UNAVAILABLE_RECHECK_DELAY_MS);
+    this.#notify(Object.freeze({
+      kind: 'SITE_UNAVAILABLE_RECHECK',
+      url,
+      delayMs,
+      attempt,
+      maxAttempts: SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length,
+    }));
+    await this.#sleepUnlessStopped(delayMs);
     return !this.#stopRequested() && !runtimeLimitReached();
   }
 

@@ -877,8 +877,8 @@ export class ArtifactWriter {
   /**
    * サイトの不調で止めたときの診断の記録（Run Coordinator の `SiteUnavailableDiagnosticRecord`）を、Run のディレクトリの
    * `diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`（`siteUnavailableDiagnosticRelativePath`）に書き、その相対パスを
-   * 返す。`attemptNumber` は、その実行の中でそのページを監査した試行の番号（1 回目が 1。捨てた後に 1 回だけ確かめ直した試行は 2。サイトが
-   * 応答しないときに Run を止める設計書 3.5.2）。記録の中には入れない（記録の形は変えない。名前にだけ使う）。
+   * 返す。`attemptNumber` は、その実行の中でそのページを監査した試行の番号（1 回目が 1。捨てた後の確かめ直しの試行は 2〜5。サイトが
+   * 応答しないときに Run を止める設計書 3.5.2、3.6.2）。記録の中には入れない（記録の形は変えない。名前にだけ使う）。
    * - 値を `site-unavailable-diagnostic` のスキーマで検証し、合わなければ何も書かずに `ArtifactWriteError` を投げる（呼び出し側が捨てる）。
    * - 合えば、今の artifact の書き方（同じディレクトリの一時ファイルに書いて、名前を変える。`renameWithRetry`）で書く。`diagnostics/`
    *   （と Run のディレクトリ）がなければ作る。同じ名前のファイルがあれば置き換える。ほかのファイルには触れない。
