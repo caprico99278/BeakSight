@@ -280,14 +280,23 @@ describe('RunCoordinator: the environment Context close does not finish (RP18 fi
 // これまでの場所に置く。最初の試行の `screenshot` の Evidence は、最初の試行の画像を指す。
 describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', () => {
   const FLAKY_PATH = '/flaky.html';
+  /**
+   * 読み込みの期限（ms）。最初の試行の Desktop の読み込みを、実際に時間切れにするので、既定（30秒）より短くする。
+   * ほかの読み込み（127.0.0.1 の小さなページ）は、この期限より十分に早く終わる。Chromium は、本文が止まった文書の応答の事象を、
+   * ヘッダを受けてから約 500ms 後に出す（2026-10-05 に確かめた）ので、応答を受けたことを観測できるよう、それより十分に長くする。
+   */
+  const SHORT_NAVIGATION_TIMEOUT_MS = 2_000;
   /** 撮影した画像を区別できるよう、応答ごとに背景の色を変える。 */
   const pageWithBackground = (color: string): string =>
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Flaky</title></head>`
     + `<body style="margin:0;background:${color}"><main><h1>Flaky page</h1></main></body></html>`;
 
   /**
-   * `FLAKY_PATH` の1回目の GET では、応答せずに接続を切る（`net::ERR_EMPTY_RESPONSE`。再試行の対象）。
+   * `FLAKY_PATH` の1回目の GET では、200 のヘッダと本文の始まりを返し、本文を止める（応答を受けた後の時間切れ。サイトの不調ではなく、
+   * 再試行の対象。サイトが応答しないときに Run を止める設計書 2.2、3.3）。止めた接続は、サーバを閉じるときに切る。
    * 2回目（最初の試行の Mobile）は赤、3回目以降（再試行）は青の背景のページを返す。ほかのパスは 404。
+   * SU2a の前は、1回目の GET で応答せずに接続を切っていた（`net::ERR_EMPTY_RESPONSE`）。それはサイトの不調に当たり、最初の試行の Mobile を
+   * 始めなくなったので、再試行の前の試行の Mobile のスクリーンショットを確かめられる、不調ではない失敗に変えた。
    */
   async function startFlakyServer(): Promise<{ readonly origin: string; readonly close: () => Promise<void> }> {
     let flakyRequests = 0;
@@ -300,7 +309,8 @@ describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', 
       }
       flakyRequests += 1;
       if (flakyRequests === 1) {
-        request.socket.destroy();
+        response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        response.write('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Flaky</title></head><body><main>');
         return;
       }
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', Connection: 'close' });
@@ -330,7 +340,11 @@ describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', 
     const flaky = await startFlakyServer();
     try {
       const result = await runCrawl(
-        { viewports: { stressWidths: [] }, audit: { screenshots: true, interactions: false } },
+        {
+          viewports: { stressWidths: [] },
+          audit: { screenshots: true, interactions: false },
+          crawl: { navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS },
+        },
         () => new SafetyLedger(),
         { origin: flaky.origin, startPath: FLAKY_PATH },
       );

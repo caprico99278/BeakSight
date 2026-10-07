@@ -944,8 +944,10 @@ describe('R2: whether a run can be resumed (design 3.2)', () => {
     return decideRunResumption({ state, frontier, progress: { ...checkpoint.progress, safetyViolationDetected } });
   };
 
-  it('requeues the URLs skipped by the runtime limit of one execution and by a stop signal (R4b1)', () => {
-    expect(RESUME_REQUEUE_SKIP_REASON_CODES).toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED']);
+  // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で始めなかったページと、不調を検知したページ
+  // （理由 `SITE_UNAVAILABLE`）も、再開のときに待ち行列に戻す。
+  it('requeues the URLs skipped by the runtime limit of one execution, by a stop signal (R4b1) and by site unavailability (SU1)', () => {
+    expect(RESUME_REQUEUE_SKIP_REASON_CODES).toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE']);
     expect(Object.isFrozen(RESUME_REQUEUE_SKIP_REASON_CODES)).toBe(true);
   });
 
@@ -965,6 +967,17 @@ describe('R2: whether a run can be resumed (design 3.2)', () => {
     ['FINISHED even with URLs skipped by RUN_INTERRUPTED', 'FINISHED', false, frontierOf(
       entry(1, 'AUDITED'),
       entry(2, 'SKIPPED', 'RUN_INTERRUPTED'),
+    ), 'NOT_RESUMABLE'],
+    // サイトの不調で止まった（STOPPED。SU1。設計書 3.2）: 理由 SITE_UNAVAILABLE の SKIPPED（不調を検知したページと、始めなかった
+    // ページ）だけが残っていても、続きから監査する。
+    ['STOPPED by site unavailability with only URLs skipped by SITE_UNAVAILABLE', 'STOPPED', false, frontierOf(
+      entry(1, 'AUDITED'),
+      entry(2, 'SKIPPED', 'SITE_UNAVAILABLE'),
+      entry(3, 'SKIPPED', 'SITE_UNAVAILABLE'),
+    ), 'RESUME'],
+    ['FINISHED even with URLs skipped by SITE_UNAVAILABLE', 'FINISHED', false, frontierOf(
+      entry(1, 'AUDITED'),
+      entry(2, 'SKIPPED', 'SITE_UNAVAILABLE'),
     ), 'NOT_RESUMABLE'],
     ['STOPPED with queued URLs', 'STOPPED', false, frontierOf(entry(1, 'AUDITED'), entry(2, 'QUEUED')), 'RESUME'],
     ['STOPPED with a page being audited', 'STOPPED', false, frontierOf(entry(1, 'AUDITED'), entry(2, 'AUDITING')), 'RESUME'],
@@ -1063,6 +1076,8 @@ describe('R4b1: how this execution ended (design 4.8)', () => {
     ['a safety violation', 'ABORTED_BY_SAFETY', ['SAFETY_VIOLATION_ABORT'], 'STOPPED_BY_SAFETY_VIOLATION'],
     ['the runtime limit of one execution', 'PARTIAL', ['MAX_RUNTIME_REACHED'], 'STOPPED_BY_RUNTIME_LIMIT'],
     ['a stop signal', 'PARTIAL', ['RUN_INTERRUPTED'], 'STOPPED_BY_SIGNAL'],
+    // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で止まった。
+    ['site unavailability', 'PARTIAL', ['SITE_UNAVAILABLE'], 'STOPPED_BY_SITE_UNAVAILABLE'],
     ['a complete Run', 'COMPLETE', [], 'COMPLETED'],
     ['the page limit', 'PARTIAL', ['MAX_PAGES_REACHED'], 'COMPLETED'],
     ['a failed save', 'PARTIAL', ['CHECKPOINT_WRITE_FAILED'], 'COMPLETED'],
@@ -1078,9 +1093,19 @@ describe('R4b1: how this execution ended (design 4.8)', () => {
     expect(decide('PARTIAL', 'MAX_PAGES_REACHED', 'RUN_INTERRUPTED')).toBe('STOPPED_BY_SIGNAL');
   });
 
+  // SU1（設計書 3.2）: 決め方の順は、違反、サイトの不調、実行時間の上限、止める印。
+  it('checks site unavailability after the safety violation, and before the runtime limit and the stop signal (SU1)', () => {
+    expect(decide('ABORTED_BY_SAFETY', 'SITE_UNAVAILABLE')).toBe('STOPPED_BY_SAFETY_VIOLATION');
+    expect(decide('ABORTED_BY_SAFETY', 'SITE_UNAVAILABLE', 'MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED')).toBe('STOPPED_BY_SAFETY_VIOLATION');
+    expect(decide('PARTIAL', 'MAX_RUNTIME_REACHED', 'SITE_UNAVAILABLE')).toBe('STOPPED_BY_SITE_UNAVAILABLE');
+    expect(decide('PARTIAL', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE')).toBe('STOPPED_BY_SITE_UNAVAILABLE');
+    expect(decide('PARTIAL', 'RUN_INTERRUPTED', 'MAX_RUNTIME_REACHED', 'SITE_UNAVAILABLE')).toBe('STOPPED_BY_SITE_UNAVAILABLE');
+    expect(decide('PARTIAL', 'MAX_PAGES_REACHED', 'SITE_UNAVAILABLE')).toBe('STOPPED_BY_SITE_UNAVAILABLE');
+  });
+
   it('never decides INTERRUPTED_ABNORMALLY (it only closes an earlier execution)', () => {
     expectTypeOf(decideRunExecutionEndReason).returns.toEqualTypeOf<Exclude<RunExecutionEndReason, 'INTERRUPTED_ABNORMALLY'>>();
-    const codes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'MAX_PAGES_REACHED'];
+    const codes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'MAX_PAGES_REACHED', 'SITE_UNAVAILABLE'];
     for (const runStatus of RUN_STATUSES) {
       for (let mask = 0; mask < 2 ** codes.length; mask += 1) {
         const subset = codes.filter((_code, index) => (mask & (1 << index)) !== 0);
@@ -1152,6 +1177,11 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
       runStatus: 'ABORTED_BY_SAFETY',
       skipReasonCodes: codes('MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED'),
     }), finish('FINISHED', 'CRAWL_END', true)],
+    // SU1（設計書 3.2）: 違反が同じ実行で起きていれば、サイトの不調より違反を優先する（FINISHED。再開しない）。
+    ['a violation with site unavailability (FINISHED, not STOPPED)', facts({
+      runStatus: 'ABORTED_BY_SAFETY',
+      skipReasonCodes: codes('SAFETY_VIOLATION_ABORT', 'SITE_UNAVAILABLE'),
+    }), finish('FINISHED', 'CRAWL_END', true)],
     ['a violation in a resumed execution whose PREFLIGHT failed', facts({
       runStatus: 'ABORTED_BY_SAFETY',
       resumed: true,
@@ -1186,6 +1216,22 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
       skipReasonCodes: codes('RUN_INTERRUPTED'),
       resumed: true,
     }), finish('STOPPED', 'CRAWL_END', false)],
+    // SU1（設計書 3.2）: サイトの不調で止まった実行も STOPPED（再開できる）。
+    ['site unavailability', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('SITE_UNAVAILABLE') }), finish('STOPPED', 'CRAWL_END', false)],
+    ['site unavailability in a resumed execution', facts({
+      runStatus: 'PARTIAL',
+      skipReasonCodes: codes('SITE_UNAVAILABLE'),
+      resumed: true,
+    }), finish('STOPPED', 'CRAWL_END', false)],
+    ['site unavailability with the page limit', facts({
+      runStatus: 'PARTIAL',
+      skipReasonCodes: codes('MAX_PAGES_REACHED', 'SITE_UNAVAILABLE'),
+    }), finish('STOPPED', 'CRAWL_END', false)],
+    ['site unavailability and a failed save', facts({
+      runStatus: 'PARTIAL',
+      skipReasonCodes: codes('CHECKPOINT_WRITE_FAILED', 'SITE_UNAVAILABLE'),
+      checkpointWriteFailed: true,
+    }), ABANDON],
     ['the page limit', facts({ runStatus: 'PARTIAL', skipReasonCodes: codes('MAX_PAGES_REACHED') }), finish('FINISHED', 'CRAWL_END', false)],
     ['a complete Run', facts(), finish('FINISHED', 'CRAWL_END', false)],
     ['a complete resumed Run', facts({ resumed: true }), finish('FINISHED', 'CRAWL_END', false)],
@@ -1197,13 +1243,25 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
     expect(Object.isFrozen(conclusion)).toBe(true);
   });
 
-  it('decides STOPPED exactly when this execution ended by the runtime limit or by a stop signal (the same rule as the end reason)', () => {
-    const skipCodes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'MAX_PAGES_REACHED', 'SAFETY_VIOLATION_ABORT'];
+  // SU1（設計書 3.2）: サイトの不調（`STOPPED_BY_SITE_UNAVAILABLE`）も、STOPPED にする終わり方に入る。
+  it('decides STOPPED exactly when this execution ended by site unavailability, the runtime limit or a stop signal (the same rule as the end reason)', () => {
+    const skipCodes: IncompleteReasonCode[] = [
+      'MAX_RUNTIME_REACHED',
+      'RUN_INTERRUPTED',
+      'SITE_UNAVAILABLE',
+      'MAX_PAGES_REACHED',
+      'SAFETY_VIOLATION_ABORT',
+    ];
+    const stoppingEndReasons: readonly RunExecutionEndReason[] = [
+      'STOPPED_BY_SITE_UNAVAILABLE',
+      'STOPPED_BY_RUNTIME_LIMIT',
+      'STOPPED_BY_SIGNAL',
+    ];
     for (const runStatus of RUN_STATUSES) {
       for (let mask = 0; mask < 2 ** skipCodes.length; mask += 1) {
         const skipReasonCodes = codes(...skipCodes.filter((_code, index) => (mask & (1 << index)) !== 0));
         const endReason = decideRunExecutionEndReason({ runStatus, skipReasonCodes });
-        const stopped = endReason === 'STOPPED_BY_RUNTIME_LIMIT' || endReason === 'STOPPED_BY_SIGNAL';
+        const stopped = stoppingEndReasons.includes(endReason);
         expect(decideRunCheckpointConclusion(facts({ runStatus, skipReasonCodes })))
           .toEqual(finish(stopped ? 'STOPPED' : 'FINISHED', 'CRAWL_END', runStatus === 'ABORTED_BY_SAFETY'));
       }
@@ -1214,7 +1272,7 @@ describe('R4b1: how the checkpoint is concluded after the Run (design 4.3.2)', (
   // だけ。違反を検出した Run を、出力を書けなくても再開しない状態（`FINISHED`）にするためである。違反のない Run は、出力をやり直せるよう、
   // 出力に失敗したら保存の状態を変えない（偽）。
   it('sets finishEvenIfOutputFails exactly for the FINISH of an ABORTED_BY_SAFETY Run, whatever the other facts are', () => {
-    const skipCodes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'CHECKPOINT_WRITE_FAILED'];
+    const skipCodes: IncompleteReasonCode[] = ['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'CHECKPOINT_WRITE_FAILED', 'SITE_UNAVAILABLE'];
     const flags = [false, true] as const;
     let violationFinishes = 0;
     for (const runStatus of RUN_STATUSES) {
@@ -1673,12 +1731,14 @@ describe('R2: the run lock (design 4.4)', () => {
 });
 
 describe('R2: closed lists used by the checkpoint', () => {
-  it('keeps the execution end reasons of design 4.8', () => {
+  // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で止まった終わり方を、違反で止まった終わり方の後に加えた。
+  it('keeps the execution end reasons of design 4.8, with the end by site unavailability (SU1)', () => {
     expect([...RUN_EXECUTION_END_REASONS]).toEqual([
       'COMPLETED',
       'STOPPED_BY_RUNTIME_LIMIT',
       'STOPPED_BY_SIGNAL',
       'STOPPED_BY_SAFETY_VIOLATION',
+      'STOPPED_BY_SITE_UNAVAILABLE',
       'INTERRUPTED_ABNORMALLY',
     ]);
     expect(Object.isFrozen(RUN_EXECUTION_END_REASONS)).toBe(true);

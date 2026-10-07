@@ -3,6 +3,7 @@ import type { AddressInfo } from 'node:net';
 import type { Browser, BrowserContext, CDPSession, Download, Page, Request, Route, WebSocketRoute } from 'playwright';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { INVALID_INTERCEPTION_ID_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
 import type { CachedResource } from '../../src/browser/resource-delivery.js';
 import { wait } from '../../src/core/deadline.js';
 import { MAX_URL_LENGTH } from '../../src/core/limits.js';
@@ -144,6 +145,8 @@ interface GuardHarness {
   readonly pageHandler: ((page: Page) => void) | undefined;
   readonly cdpRequestPausedHandler: ((event: FakeCdpPausedEvent) => void) | undefined;
   readonly cdpCloseHandler: (() => void) | undefined;
+  /** Guard の page の session の `Network.loadingFailed` の listener（DEF-026。取り消しの証拠）。 */
+  readonly cdpLoadingFailedHandler: ((event: FakeCdpLoadingFailedEvent) => void) | undefined;
   registerPage(page: Page): void;
 }
 
@@ -164,12 +167,23 @@ function createHostileGuardError(): object {
 interface FakeCdpPausedEvent {
   readonly requestId: string;
   readonly redirectedRequestId?: string;
+  /** Network の domain の要求の ID（DEF-026。取り消しの証拠の `Network.loadingFailed` の `requestId` と対応付ける）。 */
+  readonly networkId?: string;
   readonly frameId: string;
   readonly request: { readonly method: string; readonly url: string };
   /** 応答の段階（Response stage）の事象だけが持つ項目（C18g）。 */
   readonly responseStatusCode?: number;
   readonly responseErrorReason?: string;
   readonly responseHeaders?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
+}
+
+/** 偽の `Network.loadingFailed` の事象（DEF-026）。 */
+interface FakeCdpLoadingFailedEvent {
+  readonly requestId: string;
+  readonly canceled?: boolean;
+  /** 要求の種類（Network の domain の ResourceType。取り消しの証拠になるのは `Document` だけ）。 */
+  readonly type?: string;
+  readonly errorText?: string;
 }
 
 function createGuardHarness(options: {
@@ -181,6 +195,11 @@ function createGuardHarness(options: {
   readonly cdpOnErrorEvent?: string;
   readonly cdpSendErrorMethod?: string;
   readonly cdpSendGate?: { readonly method: string; readonly promise: Promise<void> };
+  /**
+   * 偽の page の session の `send` の差し替え（DEF-026）。Promise を返した命令は、その Promise を応答にする（失敗の注入、応答の保留）。
+   * `undefined` を返した命令は、ほかの指定のとおりに扱う。
+   */
+  readonly cdpSendOverride?: (method: string, params: unknown) => Promise<unknown> | undefined;
   readonly contextCloseError?: Error;
   readonly contextCloseRejection?: { readonly value: unknown };
   readonly contextCloseAttempts?: readonly (
@@ -202,6 +221,7 @@ function createGuardHarness(options: {
   let pageHandler: GuardHarness['pageHandler'];
   let cdpRequestPausedHandler: GuardHarness['cdpRequestPausedHandler'];
   let cdpCloseHandler: GuardHarness['cdpCloseHandler'];
+  let cdpLoadingFailedHandler: GuardHarness['cdpLoadingFailedHandler'];
   const registeredPages: Page[] = [];
   const rawContext = {
     pages(): object[] {
@@ -237,6 +257,8 @@ function createGuardHarness(options: {
             cdpRequestPausedHandler = handler as (event: FakeCdpPausedEvent) => void;
           } else if (event === 'close') {
             cdpCloseHandler = handler;
+          } else if (event === 'Network.loadingFailed') {
+            cdpLoadingFailedHandler = handler as (event: FakeCdpLoadingFailedEvent) => void;
           }
         },
         off(event: string, handler: (value?: FakeCdpPausedEvent) => void): void {
@@ -245,10 +267,15 @@ function createGuardHarness(options: {
             cdpRequestPausedHandler = undefined;
           }
           if (event === 'close' && cdpCloseHandler === handler) cdpCloseHandler = undefined;
+          if (event === 'Network.loadingFailed' && cdpLoadingFailedHandler === handler) cdpLoadingFailedHandler = undefined;
         },
         async send(method: string, params?: unknown): Promise<unknown> {
           cdpCommands.push(method);
           cdpCommandLog.push({ method, params });
+          const overridden = options.cdpSendOverride?.(method, params);
+          if (overridden !== undefined) {
+            return overridden;
+          }
           if (method === options.cdpSendErrorMethod) {
             throw new Error(`${method} failed`);
           }
@@ -327,6 +354,9 @@ function createGuardHarness(options: {
     },
     get cdpCloseHandler(): GuardHarness['cdpCloseHandler'] {
       return cdpCloseHandler;
+    },
+    get cdpLoadingFailedHandler(): GuardHarness['cdpLoadingFailedHandler'] {
+      return cdpLoadingFailedHandler;
     },
     registerPage(page: Page): void {
       registeredPages.push(page);
@@ -3774,10 +3804,19 @@ describe('passive request guard server boundary', () => {
     await page.close();
 
     await expect(navigation).resolves.toBe('REJECTED');
+    // DEF-027（設計書 `2026-10-05-beaksight-def-027-external-cancel-design.md` 2.1、2.4）: 印のない page の close は、今のとおり違反になり、
+    // Context が閉じる。違反のコードは、Guard の page の session が外れたことの `CDP_SESSION_DETACHED` である。読み込みの取り消し
+    // （`net::ERR_ABORTED`）は、Guard の証拠（許可して進めた要求が、応答を受けずに取り消された）がそろうので、
+    // `HTTP_MAIN_FRAME_DELIVERY_FAILED` にならない。Guard が証拠を待つ時間の後に記録される違反も見逃さないよう、その2倍待ってから確かめる。
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
-      message: 'net::ERR_ABORTED',
+      code: 'CDP_SESSION_DETACHED',
+      message: 'Document interception session detached while its page remained active',
     }]));
+    const { CANCELED_DOCUMENT_EVIDENCE_WAIT_MS } = await import('../../src/safety/passive-request-guard.js');
+    await wait(CANCELED_DOCUMENT_EVIDENCE_WAIT_MS * 2);
+    expect(ledger.snapshot().invariantViolations).not.toContainEqual(expect.objectContaining({
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+    }));
   });
 
   it('ledgers an unmarked context close while an allowed navigation is pending', async () => {
@@ -5289,5 +5328,365 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
     await expect(Promise.resolve(served.harness.httpHandler?.(servedRoute.route))).resolves.toBeUndefined();
     expect(servedCalls).toEqual(['fulfill']);
     expectNoSafetyRecords(served.ledger);
+  });
+});
+
+// DEF-026（設計書 `2026-10-05-beaksight-def-026-guard-canceled-document-design.md`）: Guard の CDP の層の命令（`Fetch.continueRequest`、
+// `Fetch.failRequest`）の失敗のうち、文言が一時停止の ID が無効の形で、同じ session の取り消しの証拠（`Network.loadingFailed` の canceled で、
+// type が Document。`requestId` が一時停止の通知の `networkId` と同じ）を受けたものだけを、ブラウザが取り消した要求として違反にしない。
+// 証拠は、実際の Chromium では一時停止の通知より先に届くので、一時停止の有無によらず覚える。証拠がなければ、今のとおり違反にする
+// （fail-closed）。ここでは、偽の page の session で、命令の応答と事象の順を決めて確かめる。
+describe('DEF-026: a Guard command that fails because the browser canceled the paused Document request', () => {
+  const ORIGIN = 'https://example.test';
+  const [PAGE_CONTINUE_INVALID, PAGE_FAIL_INVALID] = INVALID_INTERCEPTION_ID_FAILURE_TEXTS;
+  /** Guard が取り消しの証拠を待つ時間（ms。Guard の `CANCELED_DOCUMENT_EVIDENCE_WAIT_MS`）。 */
+  const EVIDENCE_WAIT_MS = 500;
+  /** 待ちの時間の中で、失敗の応答の後に証拠を送るまでの時間（ms）。 */
+  const EVIDENCE_DELAY_WITHIN_WAIT_MS = 100;
+  /** 待ちの時間が過ぎて、違反が記録されるのを待つ上限（ms）。 */
+  const PAST_EVIDENCE_WAIT_POLL_MS = EVIDENCE_WAIT_MS * 4;
+  /** 1つの session で覚える、取り消しの証拠の数の上限（Guard の `MAX_CANCELED_DOCUMENT_EVIDENCE`）。 */
+  const EVIDENCE_LIMIT = 256;
+  /** 取り消しの証拠を覚えておく時間（ms。Guard の `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS`）。 */
+  const EVIDENCE_RETENTION_MS = 5_000;
+  /** 証拠を覚えておく時間を、確実に過ぎるまで待つ時間（ms）。 */
+  const PAST_EVIDENCE_RETENTION_MS = EVIDENCE_RETENTION_MS + EVIDENCE_DELAY_WITHIN_WAIT_MS;
+  /** 証拠を覚えておく時間を待つテストの上限（ms）。 */
+  const EVIDENCE_RETENTION_TEST_TIMEOUT_MS = EVIDENCE_RETENTION_MS * 3;
+  const NETWORK_ID = 'network-1';
+  const CANCELED_EVIDENCE: FakeCdpLoadingFailedEvent = {
+    requestId: NETWORK_ID,
+    canceled: true,
+    type: 'Document',
+    errorText: 'net::ERR_ABORTED',
+  };
+
+  type CommandMethod = 'Fetch.continueRequest' | 'Fetch.failRequest';
+  /** 偽の page の session の命令の応答を決める（`undefined` なら、既定の成功）。 */
+  type Responder = (harness: GuardHarness, method: string, params: { readonly requestId?: string }) => Promise<unknown> | undefined;
+
+  /** Request の段階の、偽の `Fetch.requestPaused` の事象（既定は、子の frame の、許可 Origin の GET）。 */
+  const requestEvent = (overrides: Partial<FakeCdpPausedEvent> = {}): FakeCdpPausedEvent => ({
+    requestId: 'interception-1',
+    networkId: NETWORK_ID,
+    frameId: 'child-frame',
+    request: { method: 'GET', url: `${ORIGIN}/frame` },
+    ...overrides,
+  });
+
+  /** Response の段階の、偽の `Fetch.requestPaused` の事象（既定は、200 の応答）。 */
+  const responseEvent = (overrides: Partial<FakeCdpPausedEvent> = {}): FakeCdpPausedEvent => requestEvent({
+    responseStatusCode: 200,
+    responseHeaders: [],
+    ...overrides,
+  });
+
+  /** 証拠を送る時: 失敗の応答の前、失敗の応答の後（待ちの時間の中）、送らない。 */
+  type EvidenceTiming = 'BEFORE_FAILURE' | 'AFTER_FAILURE_WITHIN_WAIT' | 'NONE';
+
+  /** `method` の命令を、`text` の文言で失敗させる応答。`evidence` の時に、`loadingFailed` の事象を送る。 */
+  const failCommand = (
+    method: CommandMethod,
+    text: string,
+    evidence: EvidenceTiming,
+    loadingFailed: FakeCdpLoadingFailedEvent = CANCELED_EVIDENCE,
+  ): Responder => (harness, sentMethod) => {
+    if (sentMethod !== method) {
+      return undefined;
+    }
+    return Promise.resolve().then(() => {
+      if (evidence === 'BEFORE_FAILURE') {
+        harness.cdpLoadingFailedHandler?.(loadingFailed);
+      } else if (evidence === 'AFTER_FAILURE_WITHIN_WAIT') {
+        setTimeout(() => harness.cdpLoadingFailedHandler?.(loadingFailed), EVIDENCE_DELAY_WITHIN_WAIT_MS);
+      }
+      throw new Error(text);
+    });
+  };
+
+  async function readyGuard(respond: Responder, options: Parameters<typeof createGuardHarness>[0] = {}): Promise<{
+    readonly harness: GuardHarness;
+    readonly ledger: SafetyLedger;
+    readonly page: Page;
+  }> {
+    const harness: GuardHarness = createGuardHarness({
+      ...options,
+      cdpSendOverride: (method, params) => respond(harness, method, params as { readonly requestId?: string }),
+    });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = await readyHarnessPage(harness);
+    return { harness, ledger, page };
+  }
+
+  const commandsOf = (harness: GuardHarness, method: string): ReadonlyArray<{ readonly method: string; readonly params: unknown }> =>
+    harness.cdpCommandLog.filter((entry) => entry.method === method);
+
+  /** Guard の作業が終わるのを待つ（証拠を待つ時間より長く待ち、遅れて記録される違反と、Context を閉じる処理も見逃さない）。 */
+  const settleGuard = (): Promise<void> => wait(EVIDENCE_WAIT_MS * 2);
+
+  it('enables the Network domain on the page session before the Document interception, to receive the cancellation evidence', async () => {
+    const { harness } = await readyGuard(() => undefined);
+
+    expect(harness.cdpCommands.indexOf('Network.enable')).toBeGreaterThanOrEqual(0);
+    expect(harness.cdpCommands.indexOf('Network.enable')).toBeLessThan(harness.cdpCommands.indexOf('Fetch.enable'));
+    expect(harness.cdpLoadingFailedHandler).toBeTypeOf('function');
+  });
+
+  it('invalidates and rejects readiness when Network.enable fails (the same as the other setup failures)', async () => {
+    const harness = createGuardHarness({ cdpSendErrorMethod: 'Network.enable' });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = createHarnessPage(harness);
+
+    await expect(awaitPassiveRequestGuardReady(page)).rejects.toThrow('Network.enable failed');
+
+    expect(harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_SETUP_FAILED', message: 'Network.enable failed' }]);
+  });
+
+  it.each([
+    ['the Request stage', requestEvent()],
+    ['the Response stage', responseEvent()],
+  ])('continue at %s: the failure is not a violation when the evidence arrived before the failure, and nothing is recorded', async (_stage, event) => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'BEFORE_FAILURE'));
+
+    harness.cdpRequestPausedHandler?.(event);
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toHaveLength(1);
+    await settleGuard();
+
+    const snapshot = ledger.snapshot();
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.blockedRequests).toEqual([]);
+    expect(snapshot.blockedNavigations).toEqual([]);
+    expect(snapshot.externalSchemeNavigations).toEqual([]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('continue: the evidence that arrives after the failure, within the wait, prevents the violation', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'AFTER_FAILURE_WITHIN_WAIT'));
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    await settleGuard();
+
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('continue: without the evidence, the failure becomes a violation after the wait and the Context closes', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+  });
+
+  it('continue: a paused event without networkId cannot be matched to the evidence, so the failure is a violation', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'BEFORE_FAILURE'));
+    const { networkId: _omitted, ...withoutNetworkId } = requestEvent();
+
+    harness.cdpRequestPausedHandler?.(withoutNetworkId);
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+  });
+
+  it.each([
+    ['another failure text (the target closed)', 'cdpSession.send: Target page, context or browser has been closed'],
+    ['another protocol failure of the same command', 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid state for continueInterceptedRequest'],
+    ['a longer text that contains the invalid interception id text', `${PAGE_CONTINUE_INVALID} (retry)`],
+  ])('continue: %s is a violation even with the evidence', async (_name, text) => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', text, 'BEFORE_FAILURE'));
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: text }]);
+  });
+
+  it.each([
+    ['a loadingFailed that is not a cancellation', { requestId: NETWORK_ID, canceled: false, type: 'Document', errorText: 'net::ERR_FAILED' }],
+    ['a loadingFailed without canceled', { requestId: NETWORK_ID, type: 'Document', errorText: 'net::ERR_ABORTED' }],
+    ['a cancellation of another request', { requestId: 'network-other', canceled: true, type: 'Document', errorText: 'net::ERR_ABORTED' }],
+    ['a cancellation of a request that is not a Document', { requestId: NETWORK_ID, canceled: true, type: 'Other', errorText: 'net::ERR_ABORTED' }],
+    ['a cancellation without a type', { requestId: NETWORK_ID, canceled: true, errorText: 'net::ERR_ABORTED' }],
+  ] as const)('continue: %s is not the evidence, so the failure is a violation', async (_name, loadingFailed) => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'BEFORE_FAILURE', loadingFailed));
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+  });
+
+  // 実際の Chromium では、取り消しの証拠は、一時停止の通知より先に届く（DEF-026-fix の実験。282件のすべてで、3〜55ms 前）。
+  it.each([
+    ['continue at the Request stage', 'Fetch.continueRequest', PAGE_CONTINUE_INVALID, requestEvent()],
+    ['continue at the Response stage', 'Fetch.continueRequest', PAGE_CONTINUE_INVALID, responseEvent()],
+    ['fail (blocked main frame navigation)', 'Fetch.failRequest', PAGE_FAIL_INVALID, requestEvent({
+      frameId: 'root-frame',
+      request: { method: 'GET', url: 'https://outside.example.test/' },
+    })],
+  ] as const)('%s: the evidence that arrived before the paused event prevents the violation', async (_name, method, text, event) => {
+    const { harness, ledger } = await readyGuard(failCommand(method, text, 'NONE'));
+
+    harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE);
+    harness.cdpRequestPausedHandler?.(event);
+    await expect.poll(() => commandsOf(harness, method)).toHaveLength(1);
+    await settleGuard();
+
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('the evidence is kept only for its retention: evidence older than the retention does not prevent the violation', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+
+    harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE);
+    await wait(PAST_EVIDENCE_RETENTION_MS);
+    harness.cdpRequestPausedHandler?.(requestEvent());
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+  }, EVIDENCE_RETENTION_TEST_TIMEOUT_MS);
+
+  it('fail (blocked main frame navigation): with the evidence, the block is recorded as when the command succeeds, without a violation', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'BEFORE_FAILURE'));
+
+    harness.cdpRequestPausedHandler?.(requestEvent({ frameId: 'root-frame', request: { method: 'GET', url: 'https://outside.example.test/' } }));
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toHaveLength(1);
+    await settleGuard();
+
+    expect(ledger.snapshot().blockedNavigations).toEqual([
+      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('fail (blocked main frame navigation), control: without the evidence, it is CDP_FAIL_REQUEST_FAILED and the block is not recorded', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'NONE'));
+
+    harness.cdpRequestPausedHandler?.(requestEvent({ frameId: 'root-frame', request: { method: 'GET', url: 'https://outside.example.test/' } }));
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_FAIL_REQUEST_FAILED', message: PAGE_FAIL_INVALID }]);
+    expect(ledger.snapshot().blockedNavigations).toEqual([]);
+  });
+
+  it('fail (external scheme redirect of the main frame): with the evidence, it is recorded as stopped and its main frame failure stays excused', async () => {
+    const sourceUrl = `${ORIGIN}/redirect/source`;
+    const { harness, ledger, page } = await readyGuard(failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'BEFORE_FAILURE'));
+
+    harness.cdpRequestPausedHandler?.(responseEvent({
+      frameId: 'root-frame',
+      request: { method: 'GET', url: sourceUrl },
+      responseStatusCode: 302,
+      responseHeaders: [{ name: 'Location', value: 'tel:+10000000000' }],
+    }));
+    await expect.poll(() => ledger.snapshot().externalSchemeNavigations).toHaveLength(1);
+    // 止める命令が成功した場合と同じく、main frame の予期した失敗の登録が残る（違反にしない）。
+    emitFailedMainFrameRequest(harness, page, { method: 'GET', url: sourceUrl, errorText: 'net::ERR_BLOCKED_BY_CLIENT' });
+    await flushGuardProtocolCallbacks();
+    await settleGuard();
+
+    expect(ledger.snapshot().externalSchemeNavigations).toEqual([
+      { url: 'tel:+10000000000', scheme: 'tel', frame: 'MAIN', phase: 'PASSIVE', reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('fail (after the Interaction freeze): with the evidence, the frozen block is recorded without INTERACTION_CDP_FAIL_REQUEST_FAILED', async () => {
+    const harness: GuardHarness = createGuardHarness({
+      cdpSendOverride: (method) => failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'BEFORE_FAILURE')(harness, method, {}),
+    });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = createHarnessPage(harness, { url: `${ORIGIN}/frozen-owner` });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toHaveLength(1);
+    await settleGuard();
+
+    expect(ledger.snapshot().blockedInteractionNavigations).toEqual([
+      { method: 'GET', url: `${ORIGIN}/frame`, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('fail (while the Context is closing): with the evidence, the lifecycle failure is not a violation and the close is not invalidated', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard(
+      failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'BEFORE_FAILURE'),
+      { contextCloseGate: closeGate.promise },
+    );
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toHaveLength(1);
+    await flushGuardProtocolCallbacks();
+    closeGate.resolve();
+
+    await expect(closing).resolves.toBeUndefined();
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('fail (while the Context is closing), control: without the evidence, the lifecycle failure is recorded without waiting', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard(
+      failCommand('Fetch.failRequest', PAGE_FAIL_INVALID, 'NONE'),
+      { contextCloseGate: closeGate.promise },
+    );
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    // 閉じる処理の途中は、証拠を待たない（待ちの時間より前に記録される）。
+    await expect.poll(() => ledger.snapshot().invariantViolations, { timeout: EVIDENCE_WAIT_MS / 2 }).toEqual([
+      { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: PAGE_FAIL_INVALID },
+    ]);
+    closeGate.resolve();
+    await closing;
+  });
+
+  it('a close that starts while the Guard waits for the evidence ends the wait: the violation is recorded at once and the drain does not time out', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toHaveLength(1);
+    await flushGuardProtocolCallbacks();
+
+    const startedAt = Date.now();
+    await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
+
+    expect(Date.now() - startedAt).toBeLessThan(EVIDENCE_WAIT_MS);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(true);
+  });
+
+  it.each([
+    [`${EVIDENCE_LIMIT - 1} earlier cancellations: the ${EVIDENCE_LIMIT}th evidence is kept, and the canceled command is not a violation`, EVIDENCE_LIMIT - 1, []],
+    [`${EVIDENCE_LIMIT} earlier cancellations: the ${EVIDENCE_LIMIT + 1}th evidence is not kept, and the canceled command is a violation`, EVIDENCE_LIMIT, [
+      { code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID },
+    ]],
+  ] as const)('the number of kept evidence is bounded: %s', async (_name, earlierCount, expectedViolations) => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+
+    // ほかの文書の要求の取り消し（一時停止の通知の来ないものを含む）を、`earlierCount` 件受けた後に、確かめる要求の取り消しを受ける。
+    for (let index = 0; index < earlierCount; index += 1) {
+      harness.cdpLoadingFailedHandler?.({ ...CANCELED_EVIDENCE, requestId: `network-earlier-${index}` });
+    }
+    harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE);
+    harness.cdpRequestPausedHandler?.(requestEvent());
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toHaveLength(1);
+    await settleGuard();
+
+    expect(ledger.snapshot().invariantViolations).toEqual(expectedViolations);
   });
 });

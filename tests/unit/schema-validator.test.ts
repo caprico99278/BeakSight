@@ -8,12 +8,18 @@ import { describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { controlledScroll } from '../../src/browser/controlled-scroll.js';
+import {
+  MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS,
+  MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
+  NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE,
+} from '../../src/browser/navigation-diagnostics.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import type { Viewport } from '../../src/config/types.js';
 import {
   FINDING_CATEGORIES,
   INCOMPLETE_REASON_CODES,
   INTERACTION_STATUSES,
+  MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS,
   RUN_EXECUTION_END_REASONS,
   VIEWPORT_PROFILES,
   type AuditRunResult,
@@ -23,10 +29,16 @@ import {
   type EvidenceRecordFor,
   type EvidenceType,
   type Finding,
+  type InteractionCandidateNavigationDiagnostics,
   type InteractionStatus,
+  type NavigationDocumentRequestDiagnostics,
+  type NavigationDocumentRequestHop,
+  type NotObservedNavigationDiagnostics,
+  type ObservedNavigationDiagnostics,
   type PageAuditResult,
   type PageId,
   type RunSummary,
+  type StressWidthNavigationDiagnostics,
 } from '../../src/core/contracts.js';
 import type {
   InteractionCandidateEvidence,
@@ -52,7 +64,12 @@ import {
   createRunId,
   createSha256Fingerprint,
 } from '../../src/core/ids.js';
-import { MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../../src/core/limits.js';
+import {
+  MAX_ERROR_MESSAGE_LENGTH,
+  MAX_HTTP_METHOD_LENGTH,
+  MAX_URL_LENGTH,
+  MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
+} from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { discoverLinks } from '../../src/crawl/discover-links.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
@@ -65,6 +82,10 @@ import { PerformanceCollector } from '../../src/evidence/performance-collector.j
 import { captureScreenshots } from '../../src/evidence/screenshot-collector.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
+import {
+  SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+  type SiteUnavailableDiagnosticRecord,
+} from '../../src/orchestration/run-coordinator.js';
 import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
@@ -962,9 +983,12 @@ describe('validateArtifact', () => {
 
   // R2（中断した Run の再開の設計書 4.2）: 再開のための保存の2つのスキーマ（`state.json` とページの保存）を、スキーマの名前の
   // 閉じた一覧に加えた。保存の内容の詳しい検査は `tests/unit/run-checkpoint.test.ts` にある。
+  // D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録のスキーマも、スキーマの名前の閉じた一覧に加えた。中身の検査は、
+  // このファイルの末尾の「D2」にある。
   it.each([
     ['checkpoint', 'checkpoint-schema/1.0'],
     ['checkpoint-page', 'checkpoint-page-schema/1.0'],
+    ['site-unavailable-diagnostic', SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION],
   ] as const)('validates %s artifacts with their own schema', async (schemaName, schemaVersion) => {
     await expect(validateArtifact(schemaName, {})).resolves.toMatchObject({
       ok: false,
@@ -995,6 +1019,39 @@ describe('validateArtifact', () => {
 
     await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
     await expect(validateArtifact('audit', { ...validAudit, run })).resolves.toEqual({ ok: true });
+  });
+
+  // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で止めた Run の理由 `SITE_UNAVAILABLE`（`detail` は、最初に検知した
+  // 失敗）と、実行の終わり方 `STOPPED_BY_SITE_UNAVAILABLE` は、run.json の閉じた一覧にある。保存（state.json）でも、巡回の記録の
+  // SKIPPED の理由（`detail` は null）、Run の理由、実行の終わり方に使える。
+  it('accepts a run.json and an audit.json of a Run stopped by site unavailability (SU1)', async () => {
+    const run = {
+      ...validRun,
+      incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' }],
+      executions: [{ ...validRun.executions[0], endReason: 'STOPPED_BY_SITE_UNAVAILABLE' }],
+    };
+
+    await expect(validateArtifact('run', run)).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('audit', { ...validAudit, run })).resolves.toEqual({ ok: true });
+  });
+
+  it('accepts a checkpoint state stopped by site unavailability (SU1)', async () => {
+    const checkpoint = JSON.parse(JSON.stringify(sampleRunCheckpoint({ state: 'STOPPED' }))) as {
+      executions: Record<string, unknown>[];
+      progress: Record<string, unknown>;
+      frontier: { entries: Record<string, unknown>[] };
+    };
+    checkpoint.executions = checkpoint.executions.map((execution) => ({ ...execution, endReason: 'STOPPED_BY_SITE_UNAVAILABLE' }));
+    checkpoint.progress = { ...checkpoint.progress, reasons: [{ code: 'SITE_UNAVAILABLE', detail: 'mobile:passive:HTTP 503' }] };
+    checkpoint.frontier = {
+      entries: checkpoint.frontier.entries.map((entry) => ({
+        ...entry,
+        state: 'SKIPPED',
+        skipReason: { code: 'SITE_UNAVAILABLE', detail: null },
+      })),
+    };
+
+    await expect(validateArtifact('checkpoint', checkpoint)).resolves.toEqual({ ok: true });
   });
 
   // DEF-002: 検証関数の表は普通のオブジェクトなので、Object の既定のプロパティ名（継承したもの）や未知の名前を
@@ -2636,5 +2693,296 @@ describe('R15a: the confirmed run and the audit schema', () => {
     expect(schemaAt(auditSchema, ['required'])).toEqual(['schemaVersion', ...Object.keys(auditRun)]);
     expect(Object.keys(schemaAt(auditSchema, ['properties']) as object)).toEqual(['schemaVersion', ...Object.keys(auditRun)]);
     await expect(validateArtifact('audit', { schemaVersion: 'audit-schema/1.0', ...auditRun })).resolves.toEqual({ ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録（`diagnostics/site-unavailable-<pageId>-<実行の番号>.json`）の
+// スキーマ。ページの結果はページのスキーマのまま、ページ本体の要求の観察の結果は `contracts.ts` の型の形で持つ。header の中身は持たない。
+// 上限は、観察の部品（`navigation-diagnostics.ts`）の定数と、`limits.ts` の定数（定数との一致は `schema-enum-consistency.test.ts`）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 診断の記録の見本の時刻（`Date.now()` と同じ基準の ms）。 */
+const DIAGNOSTIC_ISSUED_AT_MS = 1_790_000_000_000;
+
+/** 要求のヘッダを送り、応答のない文書の要求の1回分（見本）。`overrides` で項目を変える。 */
+const diagnosticHop = (overrides: Partial<NavigationDocumentRequestHop> = {}): NavigationDocumentRequestHop => ({
+  url: validPage.pageUrl,
+  method: 'GET',
+  truncated: false,
+  issuedAtMs: DIAGNOSTIC_ISSUED_AT_MS,
+  requestHeadersSentAtMs: DIAGNOSTIC_ISSUED_AT_MS + 5,
+  responseHeadersReceivedAtMs: null,
+  httpStatus: null,
+  remoteIpAddress: null,
+  remotePort: null,
+  ...overrides,
+});
+
+/** 文書の要求1つ（見本）。読み込みは、取り消しで失敗した。 */
+const diagnosticDocumentRequest = (
+  hops: readonly NavigationDocumentRequestHop[] = [diagnosticHop()],
+): NavigationDocumentRequestDiagnostics => ({
+  hops,
+  loadingFinishedAtMs: null,
+  loadingFailure: { failedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 3_000, errorText: 'net::ERR_ABORTED', canceled: true },
+});
+
+/** 観察した結果（見本）。文書の要求は1つで、ヘッダを送り、応答がなく、取り消しで失敗した。 */
+const observedDiagnostics = (): ObservedNavigationDiagnostics => ({
+  status: 'OBSERVED',
+  observationStartedAtMs: DIAGNOSTIC_ISSUED_AT_MS - 10,
+  observationEndedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 3_010,
+  documentRequests: [diagnosticDocumentRequest()],
+  omittedDocumentRequestCount: 0,
+  omittedEventCount: 0,
+});
+
+/** 観察できなかった結果（見本）。 */
+const notObservedDiagnostics = (): NotObservedNavigationDiagnostics =>
+  ({ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE });
+
+/** 幅の走査の幅の観察（見本。D3）。 */
+const stressWidthDiagnostics = (width: number): StressWidthNavigationDiagnostics => ({ width, diagnostics: observedDiagnostics() });
+
+/** Interaction の候補の観察（見本。D3）。 */
+const interactionCandidateDiagnostics = (index: number): InteractionCandidateNavigationDiagnostics =>
+  ({ index, diagnostics: notObservedDiagnostics() });
+
+/**
+ * スキーマに合う診断の記録（D3 の形。設計書 2.2 の 2026-10-07 の改訂、2.3）。Desktop は、Passive を観察し、幅の走査の1つの幅と Interaction の
+ * 1つの候補の観察を持つ。Mobile は、Passive を観察できず、幅の走査と Interaction はない（Mobile では行わない）。
+ */
+const validSiteUnavailableDiagnostic = {
+  schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+  runId: createRunId(1),
+  executionNumber: 1,
+  writtenAt: '2026-08-27T00:01:00.000Z',
+  pageId,
+  url: validPage.pageUrl,
+  siteUnavailableDetail: 'desktop:interaction:TIMEOUT',
+  page: validPage,
+  navigationDiagnostics: {
+    desktop: {
+      passive: observedDiagnostics(),
+      stressWidths: [stressWidthDiagnostics(320)],
+      interactionCandidates: [interactionCandidateDiagnostics(0)],
+    },
+    mobile: { passive: notObservedDiagnostics(), stressWidths: [], interactionCandidates: [] },
+  },
+} satisfies SiteUnavailableDiagnosticRecord;
+
+/**
+ * D3 の前の形（`site-unavailable-diagnostic-schema/1.0`）の診断の記録。ビューポートごとの値は、Passive の観察の結果そのもので、幅ごとと
+ * 候補ごとの項目がない。1.1 のスキーマは、この形を拒む。
+ */
+const previousShapeSiteUnavailableDiagnostic = {
+  ...validSiteUnavailableDiagnostic,
+  schemaVersion: 'site-unavailable-diagnostic-schema/1.0',
+  siteUnavailableDetail: 'desktop:passive:TIMEOUT',
+  navigationDiagnostics: { desktop: observedDiagnostics(), mobile: notObservedDiagnostics() },
+};
+
+/** 見本の診断の記録の、変えてよい写し（JSON として読み戻した値）。 */
+const diagnosticCopy = (): Record<string, unknown> =>
+  JSON.parse(JSON.stringify(validSiteUnavailableDiagnostic)) as Record<string, unknown>;
+
+/** 記録の中の場所（項目の名前と、配列の位置の並び）。 */
+type DiagnosticPath = readonly (string | number)[];
+
+/** `record` の `path` の場所の、親の値と、最後の鍵。途中の値がなければ、テストの誤りとして例外を投げる。 */
+function parentAt(record: Record<string, unknown>, path: DiagnosticPath): { readonly parent: Record<string | number, unknown>; readonly key: string | number } {
+  let current: unknown = record;
+  for (const key of path.slice(0, -1)) {
+    current = (current as Record<string | number, unknown> | undefined)?.[key];
+  }
+  const key = path.at(-1);
+  if (typeof current !== 'object' || current === null || key === undefined) {
+    throw new Error(`no value at ${path.join('/')}`);
+  }
+  return { parent: current as Record<string | number, unknown>, key };
+}
+
+/** 写しの `path` の場所を `value` にする変更。 */
+const setAt = (path: DiagnosticPath, value: unknown) => (record: Record<string, unknown>): void => {
+  const { parent, key } = parentAt(record, path);
+  parent[key] = value;
+};
+
+/** 写しの `path` の場所の項目を消す変更。 */
+const deleteAt = (path: DiagnosticPath) => (record: Record<string, unknown>): void => {
+  const { parent, key } = parentAt(record, path);
+  delete parent[key];
+};
+
+/** Desktop のビューポートの観察の結果の中の場所（D3）。 */
+const DESKTOP_VIEWPORT = ['navigationDiagnostics', 'desktop'] as const;
+/** Desktop の Passive の観察の結果の中の場所。 */
+const DESKTOP = [...DESKTOP_VIEWPORT, 'passive'] as const;
+/** Desktop の最初の文書の要求の中の場所。 */
+const FIRST_REQUEST = [...DESKTOP, 'documentRequests', 0] as const;
+/** Desktop の最初の文書の要求の、最初の回の中の場所。 */
+const FIRST_HOP = [...FIRST_REQUEST, 'hops', 0] as const;
+/** Desktop の幅の走査の観察の配列と、その最初の幅の中の場所（D3）。 */
+const STRESS_WIDTHS = [...DESKTOP_VIEWPORT, 'stressWidths'] as const;
+const FIRST_STRESS_WIDTH = [...STRESS_WIDTHS, 0] as const;
+/** Desktop の Interaction の候補の観察の配列と、その最初の候補の中の場所（D3）。 */
+const INTERACTION_CANDIDATES = [...DESKTOP_VIEWPORT, 'interactionCandidates'] as const;
+const FIRST_INTERACTION_CANDIDATE = [...INTERACTION_CANDIDATES, 0] as const;
+
+describe('D2: the schema of the site-unavailable diagnostic (site-unavailable diagnostics design 2.3)', () => {
+  it('accepts the diagnostic with an observed Desktop and a Mobile that could not be observed', async () => {
+    await expect(validateArtifact('site-unavailable-diagnostic', diagnosticCopy())).resolves.toEqual({ ok: true });
+  });
+
+  // D3: スキーマの版は 1.1（形が変わった）。
+  it('has the schema version 1.1 (D3)', () => {
+    expect(SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION).toBe('site-unavailable-diagnostic-schema/1.1');
+  });
+
+  // D3: 幅の走査の幅ごとの観察と、Interaction の候補ごとの観察を、上限（幅の数の上限と、候補の数の上限）まで受け付ける。
+  it('accepts as many stress widths and interaction candidates as their limits, each observed or not observed (D3)', async () => {
+    const record = diagnosticCopy();
+    setAt(STRESS_WIDTHS, Array.from({ length: MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS }, (_, offset) => ({
+      ...stressWidthDiagnostics(320 + offset),
+      diagnostics: offset % 2 === 0 ? observedDiagnostics() : notObservedDiagnostics(),
+    })))(record);
+    setAt(INTERACTION_CANDIDATES, Array.from({ length: INTERACTION_CANDIDATE_LIMITS.maxCandidates }, (_, index) => ({
+      ...interactionCandidateDiagnostics(index),
+      diagnostics: index % 2 === 0 ? notObservedDiagnostics() : observedDiagnostics(),
+    })))(record);
+
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+  });
+
+  // D3: Passive の読み込みを始めなかったビューポート（Context と page を作れなかった）は、Passive が `null` で、幅と候補の配列は空。
+  it('accepts a viewport whose Passive load did not start, with a null Passive and no stress width nor candidate (D3)', async () => {
+    const record = diagnosticCopy();
+    setAt(DESKTOP_VIEWPORT, { passive: null, stressWidths: [], interactionCandidates: [] })(record);
+
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+  });
+
+  // D3: 1.0 の形（ビューポートごとの値が Passive の観察の結果そのもので、幅ごとと候補ごとの項目がない）は、版の値によらず拒む。
+  it.each([
+    ['with its schema version 1.0', (record: Record<string, unknown>): void => undefined],
+    ['with the schema version 1.1', setAt(['schemaVersion'], SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION)],
+  ])('rejects the previous shape (schema 1.0, without the stress widths and the interaction candidates) %s (D3)', async (_name, change) => {
+    const record = JSON.parse(JSON.stringify(previousShapeSiteUnavailableDiagnostic)) as Record<string, unknown>;
+    change(record);
+
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toMatchObject({ ok: false });
+  });
+
+  it('accepts null for a viewport that did not start, and a redirect with a 503 response and its remote address', async () => {
+    const record = diagnosticCopy();
+    setAt(['navigationDiagnostics', 'mobile'], null)(record);
+    setAt([...DESKTOP, 'documentRequests'], [{
+      ...diagnosticDocumentRequest([
+        diagnosticHop({ responseHeadersReceivedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 7, httpStatus: 302, remoteIpAddress: '127.0.0.1', remotePort: 80 }),
+        diagnosticHop({ responseHeadersReceivedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 9, httpStatus: 503, remoteIpAddress: '::1', remotePort: 8080 }),
+      ]),
+      loadingFinishedAtMs: DIAGNOSTIC_ISSUED_AT_MS + 11,
+      loadingFailure: null,
+    }])(record);
+    setAt(['siteUnavailableDetail'], 'desktop:passive:HTTP 503')(record);
+    setAt(['executionNumber'], 2)(record);
+
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+  });
+
+  it('accepts as many document requests as the limit of the observation, and as many hops as the limit of the events', async () => {
+    const record = diagnosticCopy();
+    setAt([...DESKTOP, 'documentRequests'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS }, () => diagnosticDocumentRequest()))(record);
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+
+    setAt([...FIRST_REQUEST, 'hops'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_EVENTS }, () => diagnosticHop()))(record);
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+  });
+
+  it.each<[string, (record: Record<string, unknown>) => void]>([
+    ['an extra top-level item', setAt(['unexpectedField'], true)],
+    ['the request headers in a hop', setAt([...FIRST_HOP, 'requestHeaders'], { cookie: 'session=1' })],
+    ['the response headers in a hop', setAt([...FIRST_HOP, 'responseHeaders'], { 'set-cookie': 'session=1' })],
+    ['the headers in a document request', setAt([...FIRST_REQUEST, 'headers'], { cookie: 'session=1' })],
+    ['an extra item in the observed result', setAt([...DESKTOP, 'body'], '<html></html>')],
+    [
+      'more document requests than the limit of the observation',
+      setAt([...DESKTOP, 'documentRequests'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS + 1 }, () => diagnosticDocumentRequest())),
+    ],
+    ['more hops than the limit of the events', setAt([...FIRST_REQUEST, 'hops'], Array.from({ length: MAX_NAVIGATION_DIAGNOSTICS_EVENTS + 1 }, () => diagnosticHop()))],
+    ['a document request without a hop', setAt([...FIRST_REQUEST, 'hops'], [])],
+    ['a URL longer than MAX_URL_LENGTH', setAt([...FIRST_HOP, 'url'], 'h'.repeat(MAX_URL_LENGTH + 1))],
+    ['a method longer than MAX_HTTP_METHOD_LENGTH', setAt([...FIRST_HOP, 'method'], 'G'.repeat(MAX_HTTP_METHOD_LENGTH + 1))],
+    ['an error text longer than MAX_ERROR_MESSAGE_LENGTH', setAt([...FIRST_REQUEST, 'loadingFailure', 'errorText'], 'e'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1))],
+    [
+      'a reason of the unobserved result longer than MAX_ERROR_MESSAGE_LENGTH',
+      setAt(['navigationDiagnostics', 'mobile', 'reason'], 'r'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1)),
+    ],
+    ['a status outside NAVIGATION_DIAGNOSTICS_STATUSES', setAt([...DESKTOP, 'status'], 'PARTIALLY_OBSERVED')],
+    ['an unobserved result with the items of an observed result', setAt([...DESKTOP, 'status'], 'NOT_OBSERVED')],
+    ['a negative time', setAt([...FIRST_HOP, 'issuedAtMs'], -1)],
+    ['a fractional time', setAt([...FIRST_HOP, 'requestHeadersSentAtMs'], DIAGNOSTIC_ISSUED_AT_MS + 0.5)],
+    ['a negative count of omitted events', setAt([...DESKTOP, 'omittedEventCount'], -1)],
+    ['no Mobile viewport', deleteAt(['navigationDiagnostics', 'mobile'])],
+    ['an unknown viewport', setAt(['navigationDiagnostics', 'tablet'], null)],
+    ['an execution number 0', setAt(['executionNumber'], 0)],
+    ['a fractional execution number', setAt(['executionNumber'], 1.5)],
+    ['an empty detail of the site unavailability', setAt(['siteUnavailableDetail'], '')],
+    ['an empty written time', setAt(['writtenAt'], '')],
+    ['a page ID that is not a page ID', setAt(['pageId'], 'page-1')],
+    ['a run ID that is not a run ID', setAt(['runId'], 'run-1')],
+    ['a page that does not match the page schema', setAt(['page', 'unexpectedField'], true)],
+    ['another schema version', setAt(['schemaVersion'], 'site-unavailable-diagnostic-schema/2.0')],
+    ['the previous schema version 1.0', setAt(['schemaVersion'], 'site-unavailable-diagnostic-schema/1.0')],
+    ['no page', deleteAt(['page'])],
+    // D3: ビューポートごとの観察の結果の形（Passive、幅ごと、候補ごと）。
+    ['no Passive item of a viewport', deleteAt(DESKTOP)],
+    ['no stress widths of a viewport', deleteAt(STRESS_WIDTHS)],
+    ['no interaction candidates of a viewport', deleteAt(INTERACTION_CANDIDATES)],
+    ['an extra item of a viewport', setAt([...DESKTOP_VIEWPORT, 'robots'], null)],
+    ['a null stress width observation', setAt([...FIRST_STRESS_WIDTH, 'diagnostics'], null)],
+    ['a stress width observation without the width', deleteAt([...FIRST_STRESS_WIDTH, 'width'])],
+    ['a stress width observation without the diagnostics', deleteAt([...FIRST_STRESS_WIDTH, 'diagnostics'])],
+    ['a stress width of 0', setAt([...FIRST_STRESS_WIDTH, 'width'], 0)],
+    ['a fractional stress width', setAt([...FIRST_STRESS_WIDTH, 'width'], 320.5)],
+    ['an extra item of a stress width observation', setAt([...FIRST_STRESS_WIDTH, 'height'], 900)],
+    ['a status outside NAVIGATION_DIAGNOSTICS_STATUSES in a stress width observation', setAt([...FIRST_STRESS_WIDTH, 'diagnostics', 'status'], 'PARTIALLY_OBSERVED')],
+    [
+      'more stress widths than the limit',
+      setAt(STRESS_WIDTHS, Array.from({ length: MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS + 1 }, (_, offset) => stressWidthDiagnostics(320 + offset))),
+    ],
+    ['a null interaction candidate observation', setAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics'], null)],
+    ['an interaction candidate observation without the index', deleteAt([...FIRST_INTERACTION_CANDIDATE, 'index'])],
+    ['an interaction candidate observation without the diagnostics', deleteAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics'])],
+    ['a negative candidate index', setAt([...FIRST_INTERACTION_CANDIDATE, 'index'], -1)],
+    ['a fractional candidate index', setAt([...FIRST_INTERACTION_CANDIDATE, 'index'], 0.5)],
+    ['an extra item of an interaction candidate observation', setAt([...FIRST_INTERACTION_CANDIDATE, 'selector'], 'button')],
+    [
+      'a reason of an unobserved candidate longer than MAX_ERROR_MESSAGE_LENGTH',
+      setAt([...FIRST_INTERACTION_CANDIDATE, 'diagnostics', 'reason'], 'r'.repeat(MAX_ERROR_MESSAGE_LENGTH + 1)),
+    ],
+    [
+      'more interaction candidates than the limit',
+      setAt(INTERACTION_CANDIDATES, Array.from({ length: INTERACTION_CANDIDATE_LIMITS.maxCandidates + 1 }, (_, index) => interactionCandidateDiagnostics(index))),
+    ],
+  ])('rejects %s', async (_name, change) => {
+    // 対照: 変える前の記録は受け付ける（拒むのは、変えた項目のため）。
+    const record = diagnosticCopy();
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+
+    change(record);
+
+    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toMatchObject({ ok: false });
+  });
+
+  it('refers to the page schema for the page, and to the run and page schemas for the IDs, the URL and the time', async () => {
+    const schema = await readSchema('site-unavailable-diagnostic');
+
+    expect(schemaAt(schema, ['properties', 'page'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0' });
+    expect(schemaAt(schema, ['properties', 'pageId'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0#/properties/pageId' });
+    expect(schemaAt(schema, ['properties', 'url'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0#/properties/pageUrl' });
+    expect(schemaAt(schema, ['properties', 'runId'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/runId' });
+    expect(schemaAt(schema, ['properties', 'writtenAt'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/startedAt' });
   });
 });

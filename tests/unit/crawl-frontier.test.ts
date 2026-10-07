@@ -423,3 +423,91 @@ describe('CrawlFrontier restore rejects invalid records', () => {
     expect(() => CrawlFrontier.restore({ entries: VALID_ENTRIES }, restoreOptions({ maxDepth }))).toThrow(RangeError);
   });
 });
+
+// SU5（サイトが応答しないときに Run を止める設計書 3.5.2）: サイトの不調で捨てた URL（理由 `SITE_UNAVAILABLE`、`detail` あり）を、同じ実行の
+// 中で 1 回だけ確かめ直すための操作。待ち行列を通さずに `AUDITING` に戻す（次に監査するのは、その URL である）。ほかの状態と理由からは戻さない。
+describe('CrawlFrontier requeueForRecheck (site unavailability design 3.5.2, SU5)', () => {
+  const SITE_UNAVAILABLE_TRIGGER = Object.freeze({ code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' } as const);
+  const SITE_UNAVAILABLE_REST = Object.freeze({ code: 'SITE_UNAVAILABLE', detail: null } as const);
+
+  /** 開始の URL を監査し、/a を取り出して監査の途中にした frontier（/b は待ち行列に残る）。 */
+  const auditingA = (): { readonly frontier: CrawlFrontier; readonly a: NormalizedHttpUrlEvidence } => {
+    const frontier = frontierAfter([
+      { kind: 'discover', path: '/', depth: 0 },
+      { kind: 'audit', status: 'AUDITED', links: ['/a', '/b'] },
+    ]);
+    const next = frontier.next();
+    if (next === undefined) {
+      throw new Error('the fixture must have /a queued');
+    }
+    frontier.markAuditing(next.url);
+    return { frontier, a: next.url };
+  };
+
+  it('puts a URL SKIPPED with SITE_UNAVAILABLE and a detail back to AUDITING without the skip reason, and leaves the queue as it is', () => {
+    const { frontier, a } = auditingA();
+    frontier.markSkipped(a, SITE_UNAVAILABLE_TRIGGER);
+    expect(frontier.entries()[1]).toMatchObject({ url: a, state: 'SKIPPED', skipReason: SITE_UNAVAILABLE_TRIGGER });
+
+    frontier.requeueForRecheck(a);
+
+    expect(frontier.entries()[1]).toEqual({ url: a, depth: 1, pageId: createPageId(2), state: 'AUDITING', skipReason: null });
+    // 待ち行列は変わらない（次は /b）。発見した URL の数も変わらない。
+    expect(frontier.discoveredCount).toBe(3);
+    expect(frontier.next()?.url).toBe(url('/b'));
+    // 戻した後は、今までどおりの遷移を受け付ける（終える、または、また捨てる）。
+    frontier.markSkipped(a, SITE_UNAVAILABLE_TRIGGER);
+    expect(frontier.entries()[1]).toMatchObject({ state: 'SKIPPED', skipReason: SITE_UNAVAILABLE_TRIGGER });
+    frontier.requeueForRecheck(a);
+    frontier.markFinished(a, 'AUDITED');
+    expect(frontier.entries()[1]).toMatchObject({ state: 'AUDITED', skipReason: null });
+  });
+
+  it('keeps the snapshot of the frontier in the same shape (no new state), before and after the requeue', () => {
+    const { frontier, a } = auditingA();
+    frontier.markSkipped(a, SITE_UNAVAILABLE_TRIGGER);
+    const skipped = throughJson(frontier.snapshot());
+
+    frontier.requeueForRecheck(a);
+
+    expect(skipped.entries[1]).toMatchObject({ state: 'SKIPPED', skipReason: SITE_UNAVAILABLE_TRIGGER });
+    expect(throughJson(frontier.snapshot()).entries[1]).toMatchObject({ state: 'AUDITING', skipReason: null });
+    // 戻した後の記録も、今までどおり作り直せる（`AUDITING` は `QUEUED` に戻る）。
+    const restored = CrawlFrontier.restore(throughJson(frontier.snapshot()), restoreOptions());
+    expect(restored.entries()[1]).toMatchObject({ url: a, state: 'QUEUED', skipReason: null });
+  });
+
+  it.each([
+    ['SKIPPED with SITE_UNAVAILABLE without a detail (a URL that was not started)', (frontier: CrawlFrontier, a: NormalizedHttpUrlEvidence): void => {
+      frontier.markSkipped(a, SITE_UNAVAILABLE_REST);
+    }],
+    ['SKIPPED with another reason', (frontier: CrawlFrontier, a: NormalizedHttpUrlEvidence): void => {
+      frontier.markSkipped(a, Object.freeze({ code: 'MAX_RUNTIME_REACHED', detail: null }));
+    }],
+    ['AUDITING', (): void => undefined],
+    ['AUDITED', (frontier: CrawlFrontier, a: NormalizedHttpUrlEvidence): void => {
+      frontier.markFinished(a, 'AUDITED');
+    }],
+    ['FAILED', (frontier: CrawlFrontier, a: NormalizedHttpUrlEvidence): void => {
+      frontier.markFinished(a, 'FAILED');
+    }],
+  ] as const)('throws and changes nothing for a URL that is %s', (_name, arrange) => {
+    const { frontier, a } = auditingA();
+    arrange(frontier, a);
+    const before = frontier.snapshot();
+
+    expect(() => frontier.requeueForRecheck(a)).toThrow(/invalid crawl URL state transition/u);
+
+    expect(frontier.snapshot()).toEqual(before);
+  });
+
+  it('throws for a QUEUED URL and for a URL that was not discovered', () => {
+    const { frontier } = auditingA();
+    const before = frontier.snapshot();
+
+    expect(() => frontier.requeueForRecheck(url('/b'))).toThrow(/invalid crawl URL state transition/u);
+    expect(() => frontier.requeueForRecheck(url('/unknown'))).toThrow(/not discovered/u);
+
+    expect(frontier.snapshot()).toEqual(before);
+  });
+});

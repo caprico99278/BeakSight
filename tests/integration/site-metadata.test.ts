@@ -1,9 +1,11 @@
 // R15b（Task 14〜17 の設計書 5.6.2）: robots.txt と sitemap.xml を、Guard の付いた Passive Context の GET のナビゲーションで取得し、
 // `metadata` の Evidence にする。sitemap の `<loc>` は、切り詰める前の本文から取り出して正規化する。
 import { createServer, type Server, type ServerResponse } from 'node:http';
-import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterEach, describe, expect, it } from 'vitest';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
+import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { EvidenceRecordFor } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
@@ -21,6 +23,7 @@ import {
   PassiveContextCloseDeadlineError,
 } from '../../src/orchestration/passive-session-close.js';
 import { PASSIVE_SESSION_OPEN_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-open.js';
+import { siteUnavailabilityOf } from '../../src/orchestration/site-availability.js';
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
@@ -73,29 +76,50 @@ async function startServer(options: FixtureServerOptions = {}): Promise<FixtureS
   return server;
 }
 
-/** テストだけで使う応答。`status` と `body` を返す。`hang` なら応答しない。 */
+/**
+ * テストだけで使う応答。`status` と `body` を返す。`hang` なら応答しない。`stallAfterHeaders` なら、ヘッダ（長さは書かない）と本文の始まり
+ * （`STALLED_HTML_START`）を送り、本文を止める（`end` しない）。
+ */
 interface CustomResponse {
   readonly status?: number;
   readonly contentType?: string;
   readonly body?: string;
   readonly hang?: boolean;
+  readonly stallAfterHeaders?: boolean;
 }
+
+/** 本文を止める応答で送る、本文の始まり（HTML の文書の途中）。 */
+const STALLED_HTML_START = '<!doctype html><html><head><title>stalled</title></head><body><p>the first part</p>';
 
 /**
  * `/robots.txt` と `/sitemap.xml` に、テストが決めた応答を返すローカルのサーバ（fixture のサーバは、sitemap.xml を1種類しか返さないため）。
- * 本文の `{{ORIGIN}}` は、このサーバの Origin に置き換える。GET・HEAD 以外のリクエストの数も数える。
+ * 本文の `{{ORIGIN}}` は、このサーバの Origin に置き換える。GET・HEAD 以外のリクエストの数と、受けた要求のパス（受けた順）も記録する。
  */
 async function startCustomServer(
   responses: Readonly<Record<string, CustomResponse>>,
-): Promise<{ readonly origin: string; readonly nonReadRequests: () => number }> {
+): Promise<{
+  readonly origin: string;
+  readonly nonReadRequests: () => number;
+  /** 受けた要求のパス（受けた順。ブラウザ自身のアイコンの要求 `BROWSER_DEFAULT_FAVICON_PATH` は除く）。 */
+  readonly requestedPaths: () => readonly string[];
+}> {
   let nonReadRequests = 0;
+  const requestedPaths: string[] = [];
   const server = createServer((request, response: ServerResponse) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       nonReadRequests += 1;
     }
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
+    if (pathname !== BROWSER_DEFAULT_FAVICON_PATH) {
+      requestedPaths.push(pathname);
+    }
     const entry = responses[pathname];
     if (entry?.hang === true) {
+      return;
+    }
+    if (entry?.stallAfterHeaders === true) {
+      response.writeHead(entry.status ?? 200, { 'Content-Type': entry.contentType ?? 'text/html; charset=utf-8' });
+      response.write(STALLED_HTML_START);
       return;
     }
     const origin = `http://127.0.0.1:${request.socket.localPort ?? 0}`;
@@ -117,7 +141,11 @@ async function startCustomServer(
       resolve(address.port);
     });
   });
-  return { origin: `http://127.0.0.1:${port}`, nonReadRequests: () => nonReadRequests };
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    nonReadRequests: () => nonReadRequests,
+    requestedPaths: () => [...requestedPaths],
+  };
 }
 
 interface CollectRun {
@@ -128,7 +156,7 @@ interface CollectRun {
 
 async function collect(
   origin: string,
-  overrides: Partial<Pick<SiteMetadataOptions, 'limits' | 'deadlines' | 'beforeNavigation'>> & {
+  overrides: Partial<Pick<SiteMetadataOptions, 'limits' | 'deadlines' | 'beforeNavigation' | 'afterNavigation'>> & {
     readonly navigationTimeoutMs?: number;
     readonly browser?: Browser;
     readonly createFactory?: (config: AuditConfig) => BrowserContextFactory;
@@ -152,6 +180,7 @@ async function collect(
     ...(overrides.deadlines === undefined ? {} : { deadlines: overrides.deadlines }),
     // 間隔の待ちは省略できない（RL-fix）。間隔を確かめないテストは、待たないことを明示して渡す。
     beforeNavigation: overrides.beforeNavigation ?? NO_PACING_WAIT,
+    ...(overrides.afterNavigation === undefined ? {} : { afterNavigation: overrides.afterNavigation }),
   };
   const result = await collectSiteMetadata(options);
   return { result, options, config };
@@ -702,6 +731,221 @@ describe('collectSiteMetadata navigation pacing (load control design 4.1, 4.4)',
       { kind: 'ROBOTS_TXT', timedOut: false, detail: 'injected pacing failure' },
       { kind: 'SITEMAP_XML', timedOut: false, detail: 'injected pacing failure' },
     ]);
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+});
+
+// SU3b（サイトが応答しないときに Run を止める設計書 2.1、3.1）: robots.txt と sitemap.xml の読み込みの観測を、省略できる受け口
+// （`afterNavigation`）に渡す。観測は `src/browser/main-frame-load.ts` の部品で作り、この部品は判定をしない。読み込みを始めなかった
+// ファイルでは、受け口を呼ばない。
+describe('collectSiteMetadata observations of the main frame load (site unavailability design 2.1, SU3b)', () => {
+  /** 本文を止める応答の、Playwright の読み込みの期限（ms。設計書 2.2 の既知の限界のため、2 秒以上にする）。 */
+  const STALL_AFTER_HEADERS_TIMEOUT_MS = 2_000;
+  /** 本文のある 503 の応答（標準の headless では、読み込みは応答として終わる）。 */
+  const MAINTENANCE_RESPONSE: CustomResponse = { status: 503, body: 'maintenance\n' };
+  /** 包んだ間隔の待ちが、不調を検知した後に投げる例外のメッセージ（Run Coordinator の包み方を模す）。 */
+  const SKIPPED_AFTER_UNAVAILABILITY = 'site metadata skipped after the site unavailability';
+
+  /** 受け口に渡った観測を、渡った順に記録する。 */
+  function observationRecorder(): {
+    readonly observations: MainFrameLoadObservation[];
+    readonly afterNavigation: (observation: MainFrameLoadObservation) => void;
+  } {
+    const observations: MainFrameLoadObservation[] = [];
+    return { observations, afterNavigation: (observation) => observations.push(observation) };
+  }
+
+  it('passes the observation of each file to afterNavigation: HTTP 200 for robots.txt and HTTP 503 for sitemap.xml', async () => {
+    const server = await startCustomServer({
+      '/robots.txt': { body: 'User-agent: *\n' },
+      '/sitemap.xml': MAINTENANCE_RESPONSE,
+    });
+    const { observations, afterNavigation } = observationRecorder();
+
+    const run = await collect(server.origin, { afterNavigation });
+
+    expect(observations).toEqual([
+      { navigationOutcome: 'OK', httpStatus: 200, failureDetail: null },
+      { navigationOutcome: 'OK', httpStatus: 503, failureDetail: null },
+    ]);
+    for (const observation of observations) {
+      expect(Object.isFrozen(observation)).toBe(true);
+    }
+    // 受け口は判定をしないので、記録は今のとおり（503 は FAILED で、応答の status を持つ）。
+    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
+    expect(run.result.failures).toEqual([]);
+    expect(server.requestedPaths()).toEqual(['/robots.txt', '/sitemap.xml']);
+
+    // 受け口を省略しても、記録は同じ（今のとおり動く）。
+    const without = await collect(server.origin);
+    expect(without.result.records.map(({ payload }) => payload)).toEqual(run.result.records.map(({ payload }) => payload));
+    expect(without.result.failures).toEqual(run.result.failures);
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  it('passes a TIMEOUT without an HTTP status when robots.txt does not respond, and then the observation of sitemap.xml', async () => {
+    const server = await startCustomServer({
+      '/robots.txt': { hang: true },
+      '/sitemap.xml': { contentType: 'application/xml', body: '<urlset><url><loc>{{ORIGIN}}/a.html</loc></url></urlset>' },
+    });
+    const { observations, afterNavigation } = observationRecorder();
+
+    const run = await collect(server.origin, { navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS, afterNavigation });
+
+    expect(observations).toEqual([
+      { navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: expect.any(String) as unknown },
+      { navigationOutcome: 'OK', httpStatus: 200, failureDetail: null },
+    ]);
+    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null });
+    expect(run.result.failures).toEqual([{ kind: 'ROBOTS_TXT', timedOut: true, detail: expect.any(String) as unknown }]);
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'OK', sitemapUrls: [`${server.origin}/a.html`] });
+    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  it('does not call afterNavigation for a file whose navigation did not start', async () => {
+    const server = await startServer();
+    server.resetRequestObservations();
+
+    // 間隔の待ちが失敗した（読み込みを始めない）。
+    const failedWait = observationRecorder();
+    await collect(server.origin, {
+      beforeNavigation: async () => {
+        throw new Error('injected pacing failure');
+      },
+      afterNavigation: failedWait.afterNavigation,
+    });
+    expect(failedWait.observations).toEqual([]);
+
+    // Passive Context を作れなかった（page を開かない）。
+    const failedContext = observationRecorder();
+    await collect(server.origin, {
+      browser: browserOpeningPageAfterNewContext(browser),
+      afterNavigation: failedContext.afterNavigation,
+    });
+    expect(failedContext.observations).toEqual([]);
+    expect(server.getRequestObservations()).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('rejects an afterNavigation that is not a function with a TypeError, before creating a Context', async () => {
+    const server = await startCustomServer({ '/robots.txt': { body: 'User-agent: *\n' } });
+
+    await expect(collect(server.origin, {
+      afterNavigation: 'observe' as unknown as (observation: MainFrameLoadObservation) => void,
+    })).rejects.toThrow(TypeError);
+
+    expect(browser.contexts()).toHaveLength(0);
+    expect(server.requestedPaths()).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('does not load sitemap.xml when the wrapped beforeNavigation throws after the unavailability of robots.txt, and records it as FAILED', async () => {
+    const server = await startCustomServer({
+      '/robots.txt': { hang: true },
+      '/sitemap.xml': { contentType: 'application/xml', body: '<urlset><url><loc>{{ORIGIN}}/a.html</loc></url></urlset>' },
+    });
+    const { observations, afterNavigation } = observationRecorder();
+    // Run Coordinator の包み方を模す: 受け口で不調を検知したら、次のファイルの前の待ちで、待たずに例外を投げる。
+    let unavailable = false;
+    let waits = 0;
+
+    const run = await collect(server.origin, {
+      navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
+      afterNavigation: (observation) => {
+        afterNavigation(observation);
+        unavailable ||= siteUnavailabilityOf(observation) !== null;
+      },
+      beforeNavigation: async () => {
+        waits += 1;
+        if (unavailable) {
+          throw new Error(SKIPPED_AFTER_UNAVAILABILITY);
+        }
+        return 0;
+      },
+    });
+
+    expect(waits).toBe(2);
+    expect(observations).toHaveLength(1);
+    // sitemap.xml の読み込みは、サーバに届かない。
+    expect(server.requestedPaths()).toEqual(['/robots.txt']);
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null, sitemapUrls: null });
+    expect(run.result.failures).toEqual([
+      { kind: 'ROBOTS_TXT', timedOut: true, detail: expect.any(String) as unknown },
+      { kind: 'SITEMAP_XML', timedOut: false, detail: SKIPPED_AFTER_UNAVAILABILITY },
+    ]);
+    expect(run.result.sitemap).toBeNull();
+    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  // DEF-029 の設計書 2.3: 読み込みが例外で終わっても、観測の status が 2xx でなければ、その status の応答として扱う。2xx なら、今のとおり
+  // 応答を得られなかった失敗にする。
+  it('records the status of a timeout after the headers of a non-2xx response, and keeps a timeout after a 2xx response as before', async () => {
+    const server = await startCustomServer({
+      '/robots.txt': { stallAfterHeaders: true },
+      '/sitemap.xml': { status: 503, stallAfterHeaders: true },
+    });
+    const { observations, afterNavigation } = observationRecorder();
+
+    const run = await collect(server.origin, { navigationTimeoutMs: STALL_AFTER_HEADERS_TIMEOUT_MS, afterNavigation });
+
+    expect(observations).toEqual([
+      { navigationOutcome: 'TIMEOUT', httpStatus: 200, failureDetail: expect.any(String) as unknown },
+      { navigationOutcome: 'TIMEOUT', httpStatus: 503, failureDetail: expect.any(String) as unknown },
+    ]);
+    expect(robotsOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null });
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
+    // 503 は応答として扱うので、応答を得られなかった取得（`failures`）には入らない。
+    expect(run.result.failures).toEqual([{ kind: 'ROBOTS_TXT', timedOut: true, detail: expect.any(String) as unknown }]);
+    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
+    await expectValidPageEvidence(run);
+  }, TEST_TIMEOUT_MS);
+});
+
+// DEF-029 の設計書 2.3、DEF-030: CLI と同じ起動の設定の Chromium は、本文が空の 4xx・5xx の読み込みを、応答を受けた後に
+// `net::ERR_HTTP_RESPONSE_CODE_FAILURE` で失敗にする（テストの既定の headless-shell では、この失敗が起きない）。その場合も、観測の
+// status から、`NOT_FOUND`（404）と `FAILED`（503。`httpStatus` は 503）を導く。
+describe('collectSiteMetadata with the Chromium of the CLI: failures after the response (DEF-029 design 2.3, SU3b)', () => {
+  let cliBrowser: Browser;
+
+  beforeAll(async () => {
+    cliBrowser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+  });
+
+  afterAll(async () => {
+    await cliBrowser?.close();
+  });
+
+  it('records an empty 404 robots.txt as NOT_FOUND and an empty 503 sitemap.xml as FAILED with HTTP 503', async () => {
+    const server = await startCustomServer({
+      '/robots.txt': { status: 404, body: '' },
+      '/sitemap.xml': { status: 503, body: '' },
+    });
+    const observations: MainFrameLoadObservation[] = [];
+
+    const run = await collect(server.origin, { browser: cliBrowser, afterNavigation: (observation) => observations.push(observation) });
+
+    // 読み込みは、応答を受けた後に例外で終わった（この Chromium の振る舞いが、このテストの前提）。
+    const responseCodeFailure = expect.stringContaining('net::ERR_HTTP_RESPONSE_CODE_FAILURE') as unknown;
+    expect(observations).toEqual([
+      { navigationOutcome: 'FAILED', httpStatus: 404, failureDetail: responseCodeFailure },
+      { navigationOutcome: 'FAILED', httpStatus: 503, failureDetail: responseCodeFailure },
+    ]);
+    expect(robotsOf(run.result).payload).toEqual({
+      kind: 'ROBOTS_TXT',
+      url: `${server.origin}/robots.txt`,
+      outcome: 'NOT_FOUND',
+      httpStatus: 404,
+      text: null,
+      textTruncated: false,
+      sitemapUrls: null,
+      sitemapUrlsTruncated: false,
+    });
+    expect(sitemapOf(run.result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: 503, text: null, sitemapUrls: null });
+    expect(run.result.failures).toEqual([]);
+    expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
+    expect(server.requestedPaths()).toEqual(['/robots.txt', '/sitemap.xml']);
+    expect(cliBrowser.contexts()).toHaveLength(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
 });

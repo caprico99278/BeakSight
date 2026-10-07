@@ -9,6 +9,7 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { evaluateCrossPageRules } from '../../src/audit/cross-page-rules.js';
 import type { BrowserContextFactory, SafetyLedgerFactory } from '../../src/browser/context-factory.js';
+import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { runArtifactDirectory } from '../../src/core/artifact-layout.js';
@@ -16,6 +17,7 @@ import {
   VIEWPORT_PROFILES,
   type AuditRunResult,
   type EvidenceRecord,
+  type EvidenceRecordFor,
   type Finding,
   type IncompleteReason,
   type PageAuditOutcome,
@@ -35,6 +37,7 @@ import {
   type LinkEvidence,
   type NavigationOutcomeKind,
   type NormalizedHttpUrlEvidence,
+  type SiteMetadataKind,
 } from '../../src/core/evidence-types.js';
 import { createFindingId, createSha256Fingerprint } from '../../src/core/ids.js';
 import { BROWSER_CLOSE_TIMEOUT_MS, CONTEXT_CLOSE_TIMEOUT_MS } from '../../src/core/limits.js';
@@ -44,6 +47,7 @@ import { classifyUrl } from '../../src/crawl/admission-policy.js';
 import { LOAD_PEAK_WINDOW_MS, type LoadMeter } from '../../src/crawl/load-meter.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import type { collectSiteMetadata, SiteMetadataResult } from '../../src/crawl/site-metadata.js';
+import { sitemapEvidenceFromMetadata } from '../../src/crawl/sitemap-evidence.js';
 import type { collectRunEnvironment } from '../../src/orchestration/environment.js';
 import { createEvidenceRecord } from '../../src/orchestration/evidence-builder.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
@@ -66,10 +70,14 @@ import {
   RunDirectoryUnavailableError,
   RunNotResumableError,
   RunResumeUnavailableError,
+  SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+  SITE_UNAVAILABLE_RECHECK_DELAY_MS,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunCoordinatorResumeInput,
+  type RunNotice,
   type RunPageAuditor,
+  type SiteUnavailableDiagnosticRecord,
 } from '../../src/orchestration/run-coordinator.js';
 import {
   checkRunCheckpointConsistency,
@@ -87,6 +95,7 @@ import type {
   RunCheckpointSessionStart,
   RunCheckpointSessionStartOptions,
 } from '../../src/orchestration/run-checkpoint-session.js';
+import { SITE_UNAVAILABLE_SKIP_REASON } from '../../src/orchestration/site-availability.js';
 import { safetyEventsEvidenceFromSnapshot, SafetyLedger, summarizePageSafety } from '../../src/safety/safety-ledger.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -115,6 +124,8 @@ afterAll(async () => {
 });
 /** 偽のページの監査1回で進む時間（既定）。 */
 const DEFAULT_AUDIT_DURATION_MS = 10;
+/** 待たない待ちの関数（ハーネスの既定の `sleep`。確かめ直しの前の待ち（SU5）を、実際に待たないため）。 */
+const NO_WAIT = async (_ms: number): Promise<void> => undefined;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 偽のサイトと、偽の Page Auditor
@@ -127,6 +138,16 @@ interface AttemptSpec {
   readonly httpStatus?: number;
   /** `OK` 以外の場合の、`NAVIGATION_FAILED` の detail。 */
   readonly detail?: string;
+  /**
+   * その試行の結果に付ける、サイトの不調の印（`PageAuditOutcome.siteUnavailableDetail`。SU3a）。省略すると `null`（不調を検知しない）。
+   * ビューポートの結果は、この印によらず、上の `outcome` と `detail` から作る。
+   */
+  readonly siteUnavailableDetail?: string;
+  /**
+   * その試行の結果に付ける、ページ本体の要求の観察の結果（`PageAuditOutcome.navigationDiagnostics`。診断の記録の設計書 2.2。D2）。
+   * 省略すると、どちらのビューポートも `null`（観察しない）。
+   */
+  readonly navigationDiagnostics?: PageAuditOutcome['navigationDiagnostics'];
 }
 
 interface InteractionSpec {
@@ -281,6 +302,13 @@ interface FakeWorld {
    * 真のときだけ記録する。R7b。再開の直後の最初の読み込みの開始を確かめるため）。
    */
   readonly navigationStartedAtMs: number[];
+  /**
+   * 観測を渡す偽の metadata の取得（`metadataObservations`。SU3b）が、間隔の待ちを終えて読み込みを始めた（受け口に観測を渡した）ファイル
+   * （読み込みの順）。
+   */
+  readonly metadataNavigations: SiteMetadataKind[];
+  /** 観測を渡す偽の metadata の取得で、間隔の待ち（Run Coordinator が渡した `beforeNavigation`）が投げた例外（呼び出しの順。SU3b）。 */
+  readonly metadataWaitErrors: unknown[];
 }
 
 /** Coordinator が PREFLIGHT に渡した factory で、Ledger を作る（本番の Context の factory と同じ経路）。 */
@@ -428,7 +456,13 @@ function fakePageAuditorFactory(
           }),
           ...(spec.schemaInvalid === true ? { unexpectedField: true } : {}),
         };
-        const outcome: PageAuditOutcome = { result, safety: summarizePageSafety(ledgers.map((ledger) => ledger.snapshot())) };
+        const outcome: PageAuditOutcome = {
+          result,
+          safety: summarizePageSafety(ledgers.map((ledger) => ledger.snapshot())),
+          siteUnavailableDetail: navigation.siteUnavailableDetail ?? null,
+          // ページ本体の要求の観察の結果（診断の記録の設計書 2.2）。偽の Page Auditor は観察せず、試行の指定の値を返す（既定は、どちらも `null`）。
+          navigationDiagnostics: navigation.navigationDiagnostics ?? { desktop: null, mobile: null },
+        };
         world.auditOutcomes.push(outcome);
         return outcome;
       },
@@ -483,10 +517,15 @@ interface HarnessOptions {
    * 設計書 4.1）。metadata は robots.txt と sitemap.xml の前に1回ずつ、Page Auditor はビューポートごとに1回呼ぶ。
    */
   readonly paceNavigations?: boolean;
-  /** Run Coordinator に注入する、ページの読み込みの間隔の待ち（L2）。省略すると、本番の待ち。 */
+  /**
+   * Run Coordinator に注入する、待ちの関数（ページの読み込みの間隔の待ち（L2）と、確かめ直しの前の待ち（SU5））。省略すると、待たない
+   * 関数（`NO_WAIT`）を渡す（テストの設定の間隔は 0 なので、間隔の待ちは起きない。確かめ直しの前の 60 秒の待ちを、実際に待たないため）。
+   */
   readonly sleep?: (ms: number) => Promise<void>;
   /** Run Coordinator に注入する、進み具合の受け手（L7）。省略すると、渡さない。 */
   readonly onProgress?: RunCoordinatorDependencies['onProgress'];
+  /** Run Coordinator に注入する、知らせの受け手（SU5。設計書 3.5.4）。省略すると、渡さない。 */
+  readonly onNotice?: RunCoordinatorDependencies['onNotice'];
   /** Run Coordinator に注入する、再開のための保存のセッション（R4a）。省略すると、渡さない。 */
   readonly checkpointSession?: RunCoordinatorDependencies['checkpointSession'];
   /** Run Coordinator に注入する、保存からの再開の入力（R4a2b）。省略すると、渡さない（新しい Run）。 */
@@ -502,6 +541,15 @@ interface HarnessOptions {
    * （RP18 の指摘1・2。作成か終了が終わらない偽の factory で、Run 全体が期限の中で確定することを確かめる）。
    */
   readonly realEnvironmentFactory?: BrowserContextFactory;
+  /**
+   * 偽の metadata の取得が、robots.txt と sitemap.xml の読み込みの観測として、受け口（`afterNavigation`）に渡すもの（この順。SU3b）。
+   * 指定すると、偽の取得は、本物と同じく、各ファイルの前に Run Coordinator が渡した間隔の待ち（`beforeNavigation`）を呼ぶ。待ちが例外を
+   * 投げたら、そのファイルを読み込まずに FAILED にし、受け口を呼ばない。待ちが返ったら、観測を受け口に渡し、観測から記録を作る
+   * （`observedSiteMetadataRecords`）。省略すると、今の偽の取得（受け口を呼ばない）。
+   */
+  readonly metadataObservations?: readonly [MainFrameLoadObservation, MainFrameLoadObservation];
+  /** Run Coordinator に注入する、診断の記録の書き出しの口（D2。診断の記録の設計書 2.3）。省略すると、渡さない。 */
+  readonly writeSiteUnavailableDiagnostic?: RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'];
 }
 
 interface Harness {
@@ -528,6 +576,8 @@ function createHarness(options: HarnessOptions): Harness {
     runDirectoryExistedAtPreflight: null,
     safetyChecks: [],
     navigationStartedAtMs: [],
+    metadataNavigations: [],
+    metadataWaitErrors: [],
   };
   harnessCount += 1;
   const outputDirectory = options.outputDirectory ?? join(workDirectory, `harness-${String(harnessCount)}`);
@@ -579,6 +629,20 @@ function createHarness(options: HarnessOptions): Harness {
     return ENVIRONMENT;
   });
   const metadata = vi.fn(async (metadataOptions: Parameters<typeof collectSiteMetadata>[0]): Promise<SiteMetadataResult> => {
+    if (options.metadataObservations !== undefined) {
+      // 観測を渡す偽の取得（SU3b）。各ファイルの前に間隔の待ちを呼び、読み込みを始めたファイルの観測を、受け口に渡す。
+      const records = await observedSiteMetadataRecords(metadataOptions, options.metadataObservations, world);
+      const ledger = ledgerFrom(world);
+      recordViolations(ledger, options.metadataViolations ?? 0, 'METADATA_VIOLATION');
+      return {
+        records,
+        sitemap: sitemapEvidenceFromMetadata(records[1]),
+        unnormalizableSitemapUrlCount: 0,
+        failures: [],
+        ledgerSnapshot: ledger.snapshot(),
+        closeFailures: options.metadataPageCloseFails === true ? [{ step: 'page', error: new Error('metadata page close failed') }] : [],
+      };
+    }
     if (options.paceNavigations === true) {
       // robots.txt と sitemap.xml の、それぞれの読み込みの前。
       for (let file = 0; file < 2; file += 1) {
@@ -647,11 +711,13 @@ function createHarness(options: HarnessOptions): Harness {
     readToolVersion: async () => '0.1.0-test',
     ...(options.browserCloseTimeoutMs === undefined ? {} : { browserCloseTimeoutMs: options.browserCloseTimeoutMs }),
     ...(options.deadlines === undefined ? {} : { deadlines: options.deadlines }),
-    ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    sleep: options.sleep ?? NO_WAIT,
     ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+    ...(options.onNotice === undefined ? {} : { onNotice: options.onNotice }),
     ...(options.checkpointSession === undefined ? {} : { checkpointSession: options.checkpointSession }),
     ...(options.resumeFrom === undefined ? {} : { resumeFrom: options.resumeFrom }),
     ...(options.stopSignal === undefined ? {} : { stopSignal: options.stopSignal }),
+    ...(options.writeSiteUnavailableDiagnostic === undefined ? {} : { writeSiteUnavailableDiagnostic: options.writeSiteUnavailableDiagnostic }),
   };
   return {
     coordinator: new RunCoordinator(dependencies),
@@ -664,6 +730,62 @@ function createHarness(options: HarnessOptions): Harness {
     environment,
     metadata,
   };
+}
+
+/** 観測を渡す偽の metadata の取得が、取得するファイルの種類（この順）。 */
+const OBSERVED_METADATA_KINDS = Object.freeze(['ROBOTS_TXT', 'SITEMAP_XML'] as const satisfies readonly SiteMetadataKind[]);
+
+/**
+ * 観測を渡す偽の metadata の取得の本体（SU3b）。本物の `collectSiteMetadata` と同じく、robots.txt、sitemap.xml の順に、各ファイルの前に
+ * Run Coordinator が渡した間隔の待ち（`beforeNavigation`）を呼ぶ。
+ * - 待ちが例外を投げたら、そのファイルを読み込まずに FAILED（`httpStatus` は `null`）にし、受け口を呼ばない（例外は `world` に記録する）。
+ * - 待ちが返ったら、読み込みを始めたものとして `world` に記録し、そのファイルの観測を受け口（`afterNavigation`）に渡す。記録は、観測が
+ *   `OK` で status が 200 なら `OK`、404 なら `NOT_FOUND`、ほかの `OK` は FAILED（その status）、`OK` でなければ FAILED（`httpStatus` は `null`）。
+ * 判定はしない（判定は、受け口を渡した Run Coordinator が行う）。
+ */
+async function observedSiteMetadataRecords(
+  metadataOptions: Parameters<typeof collectSiteMetadata>[0],
+  observations: readonly [MainFrameLoadObservation, MainFrameLoadObservation],
+  world: FakeWorld,
+): Promise<SiteMetadataResult['records']> {
+  const context = { allocator: metadataOptions.allocator, clock: metadataOptions.clock };
+  const records: EvidenceRecordFor<'metadata'>[] = [];
+  for (const [index, kind] of OBSERVED_METADATA_KINDS.entries()) {
+    let started = true;
+    try {
+      await metadataOptions.beforeNavigation();
+    } catch (error) {
+      started = false;
+      world.metadataWaitErrors.push(error);
+    }
+    const observation = observations[index];
+    if (started && observation !== undefined) {
+      world.metadataNavigations.push(kind);
+      metadataOptions.afterNavigation?.(observation);
+    }
+    const httpStatus = started && observation?.navigationOutcome === 'OK' ? observation.httpStatus : null;
+    const outcome = httpStatus === 200 ? 'OK' : httpStatus === 404 ? 'NOT_FOUND' : 'FAILED';
+    const base = {
+      url: `${metadataOptions.origin}/${kind === 'ROBOTS_TXT' ? 'robots.txt' : 'sitemap.xml'}`,
+      outcome,
+      httpStatus,
+      textTruncated: false,
+      sitemapUrlsTruncated: false,
+    } as const;
+    records.push(createEvidenceRecord({
+      type: 'metadata',
+      pageId: metadataOptions.pageId,
+      viewport: null,
+      payload: kind === 'ROBOTS_TXT'
+        ? { kind, ...base, text: outcome === 'OK' ? 'User-agent: *\n' : null, sitemapUrls: null }
+        : { kind, ...base, text: outcome === 'OK' ? '<urlset></urlset>' : null, sitemapUrls: outcome === 'OK' ? [] : null },
+    }, context));
+  }
+  const [robots, sitemap] = records;
+  if (robots === undefined || sitemap === undefined) {
+    throw new Error('the fake site metadata did not create both records');
+  }
+  return [robots, sitemap];
 }
 
 /** `count` 個のページ（開始のページと、そこからリンクする `count - 1` 個のページ）。どのページも Finding を1つ持つ。 */
@@ -3969,5 +4091,1292 @@ describe('RunCoordinator: resuming from the final checkpoint of a stopped execut
     expect(result.run.incompleteReasons).toEqual([]);
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_RUNTIME_LIMIT', 'COMPLETED']);
     await expectFinishCheckpoint(concluded, 'FINISHED');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// SU3a（サイトが応答しないときに Run を止める設計書 3.2、3.2.1、3.3）: Run Coordinator は、ページの結果のサイトの不調の印
+// （`PageAuditOutcome.siteUnavailableDetail`）を受けて、Run を再開できる状態で止める。不調のページは保存せずに、理由 `SITE_UNAVAILABLE`
+// （`detail` は不調の詳細）の SKIPPED にし、再開で監査し直す。残りの URL は、理由 `SITE_UNAVAILABLE`（`detail` は `null`）の SKIPPED にする。
+// 前の実行で止まるきっかけになったページが、また不調の印を返したら、普通の結果として保存して止める（同じページで止まり続けないため）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 5つのページ（開始のページが、4つのページにリンクする）。監査の順は、開始のページ、/a.html、/b.html、/c.html、/d.html。 */
+const UNAVAILABILITY_SITE: FakeSite = {
+  [START_PATH]: { links: ['/a.html', '/b.html', '/c.html', '/d.html'] },
+  '/a.html': {},
+  '/b.html': {},
+  '/c.html': {},
+  '/d.html': {},
+};
+
+/** 偽の Page Auditor が返す、サイトの不調の詳細（Desktop の Passive の読み込みの、応答のない時間切れ。形は `siteUnavailableDetail` のもの）。 */
+const DESKTOP_PASSIVE_TIMEOUT = 'desktop:passive:TIMEOUT';
+
+/** Desktop の読み込みが時間切れ（`NAVIGATION_FAILED:TIMEOUT`。不調の印がなければ、再試行の対象）で、サイトの不調の印を返す試行。 */
+const UNAVAILABLE_ATTEMPT: AttemptSpec = { outcome: 'TIMEOUT', detail: 'TIMEOUT', siteUnavailableDetail: DESKTOP_PASSIVE_TIMEOUT };
+
+/** 読み込みの時間切れの理由（偽の Page Auditor が、時間切れの試行のビューポートに付ける理由）。 */
+const NAVIGATION_TIMEOUT_REASON: IncompleteReason = { code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' };
+
+/**
+ * `UNAVAILABILITY_SITE` のうち、`path` のページだけを `spec` にしたサイト。既定は、2 回の試行とも、サイトの不調の印を返すページ（SU5 で、
+ * 捨てたページを 1 回確かめ直すようになったので、「不調で止まる」場面は、2 回とも不調のページで作る。設計書 3.5.2 の 5）。
+ */
+function unavailableAt(path: string, spec: FakePageSpec = { attempts: [UNAVAILABLE_ATTEMPT, UNAVAILABLE_ATTEMPT] }): FakeSite {
+  return { ...UNAVAILABILITY_SITE, [path]: spec };
+}
+
+/** 1 回目の試行の番号（診断の記録のファイルの名前。SU5）。 */
+const FIRST_ATTEMPT = 1;
+/** 確かめ直しの試行の番号（SU5）。 */
+const RECHECK_ATTEMPT = 2;
+
+/** 止まるきっかけのページの理由（`SITE_UNAVAILABLE`。`detail` は、ページの結果の不調の詳細）。Run の理由も、同じ形である。 */
+const siteUnavailableTrigger = (detail: string): IncompleteReason => ({ code: SITE_UNAVAILABLE_SKIP_REASON.code, detail });
+
+/** 状態の保存の巡回の記録の、URL ごとの状態と理由（発見の順）。 */
+const frontierStates = (checkpoint: RunCheckpoint) =>
+  checkpoint.frontier.entries.map(({ url, state, skipReason }) => [pathOf(url), state, skipReason] as const);
+
+describe('RunCoordinator: stopping the Run on site unavailability (site unavailability design 3.2, 3.3, SU3a)', () => {
+  it('skips the unavailable page with its detail without saving it, saves the state, skips the rest, and stops resumable', async () => {
+    const reports: RunProgressReport[] = [];
+    // 2 回の試行とも不調（確かめ直し（SU5）でも不調で、止まる場面）。
+    const site = unavailableAt('/b.html', { attempts: [UNAVAILABLE_ATTEMPT, UNAVAILABLE_ATTEMPT], blockedPosts: 2 });
+    const { harness, recorder } = checkpointHarness({ site, onProgress: (report) => reports.push(report) });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    // /b.html（3ページ目）で不調を検知した後は、1 回だけ確かめ直し（SU5）、また不調なら新しいページを始めない。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html']);
+    // 不調のページは、ページの結果を捨てて（Evidence も残さない）、理由 SITE_UNAVAILABLE（detail は不調の詳細）の SKIPPED にする。
+    // 残りは、理由 SITE_UNAVAILABLE（detail は null）の SKIPPED。
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.pages[2]?.evidence).toEqual([]);
+    // Run の理由は SITE_UNAVAILABLE の1件（detail は不調の詳細）。上限ではない。SKIPPED のページがあるので PARTIAL。
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(Object.isFrozen(result.run.incompleteReasons[0])).toBe(true);
+    expect(result.run.crawlLimits).toEqual(NO_CRAWL_LIMITS);
+    expect(result.statusInput.crawlLimitReached).toBe(false);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(deriveRunStatus(result.statusInput)).toBe('PARTIAL');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    // 不調のページの保存はせず、その後に状態を保存する（捨てた試行ごとに。SU5）。
+    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls])).toEqual([
+      ['start', 0],
+      ['state', 0],
+      ['page', 1],
+      ['state', 1],
+      ['page', 2],
+      ['state', 2],
+      ['state', 3],
+      ['state', 4],
+    ]);
+    const pageIds = result.pages.map(({ pageId }) => pageId);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(pageIds.slice(0, 2));
+    const states = recorder.states();
+    expect(states).toHaveLength(5);
+    const [, , beforeDiscard, afterFirstDiscard, afterDiscard] = states as [RunCheckpoint, RunCheckpoint, RunCheckpoint, RunCheckpoint, RunCheckpoint];
+    // 捨てた後の状態の保存（1 回目の後も、確かめ直しの後も）: 終わったページは2つ、監査を始めたページの数は2（不調のページを数えない）、
+    // 保存の理由は空。巡回の記録では、不調のページは理由 SITE_UNAVAILABLE（detail あり）の SKIPPED（待っている間に止まっても残る）。
+    for (const state of [afterFirstDiscard, afterDiscard]) {
+      expect(state.completedPageIds).toEqual(pageIds.slice(0, 2));
+      expect(state.progress).toMatchObject({ pagesStarted: 2, reasons: [] });
+      expect(frontierStates(state)).toEqual([
+        [START_PATH, 'AUDITED', null],
+        ['/a.html', 'AUDITED', null],
+        ['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)],
+        ['/c.html', 'QUEUED', null],
+        ['/d.html', 'QUEUED', null],
+      ]);
+      await expect(validateArtifact('checkpoint', JSON.parse(JSON.stringify(state)))).resolves.toEqual({ ok: true });
+      expect(checkRunCheckpointConsistency(state)).toEqual({ ok: true });
+    }
+    // 不調のページの Ledger（試行ごとに Desktop と Mobile の2つ。Desktop は、遮断した POST を2件記録した）は、ページの外の Ledger の
+    // snapshot として状態の保存に入り、Run の Safety の集計にも入る。
+    const outsideBefore = beforeDiscard.safetyLedgerSnapshots;
+    expect(afterFirstDiscard.safetyLedgerSnapshots.slice(0, outsideBefore.length)).toEqual(outsideBefore);
+    expect(afterFirstDiscard.safetyLedgerSnapshots.slice(outsideBefore.length).map(({ blockedRequests }) => blockedRequests.length))
+      .toEqual([2, 0]);
+    expect(afterDiscard.safetyLedgerSnapshots.slice(0, outsideBefore.length)).toEqual(outsideBefore);
+    expect(afterDiscard.safetyLedgerSnapshots.slice(outsideBefore.length).map(({ blockedRequests }) => blockedRequests.length))
+      .toEqual([2, 0, 2, 0]);
+    expect(result.run.safety.blockedActions.requests).toBe(4);
+    // 進み具合は、監査を終えたページ（開始のページと /a.html）の後だけ伝える（不調のページは数えない）。
+    expect(reports.map(({ pagesFinished, pagesDiscovered }) => [pagesFinished, pagesDiscovered])).toEqual([[1, 5], [2, 5]]);
+    // 最後の状態の保存は STOPPED（再開できる）。終わり方は STOPPED_BY_SITE_UNAVAILABLE。保存の理由には SITE_UNAVAILABLE を入れない。
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('STOPPED_BY_SITE_UNAVAILABLE');
+    expect(checkpoint.progress).toMatchObject({ pagesStarted: 2, reasons: [] });
+    expect(checkpoint.completedPageIds).toEqual(pageIds.slice(0, 2));
+    expect(frontierStates(checkpoint).slice(2)).toEqual([
+      ['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)],
+      ['/c.html', 'SKIPPED', SITE_UNAVAILABLE_SKIP_REASON],
+      ['/d.html', 'SKIPPED', SITE_UNAVAILABLE_SKIP_REASON],
+    ]);
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+    await expectValidRun(result);
+  });
+
+  it('does not discover the links of the discarded page, even when its Desktop collected them before the unavailability', async () => {
+    const DESKTOP_INTERACTION_TIMEOUT = 'desktop:interaction:TIMEOUT';
+    // 対照: 不調の印がなければ、/b.html の Link（/from-b.html）を発見して監査する。
+    const available = await createHarness({ site: unavailableAt('/b.html', { links: ['/from-b.html'] }) }).coordinator.run();
+    expect(available.pages.map(({ pageUrl }) => pathOf(pageUrl))).toContain('/from-b.html');
+    const harness = createHarness({
+      site: unavailableAt('/b.html', {
+        links: ['/from-b.html'],
+        attempts: [
+          { outcome: 'OK', siteUnavailableDetail: DESKTOP_INTERACTION_TIMEOUT },
+          { outcome: 'OK', siteUnavailableDetail: DESKTOP_INTERACTION_TIMEOUT },
+        ],
+      }),
+    });
+
+    const result = await harness.coordinator.run();
+
+    // 偽の Page Auditor は、/b.html の Desktop の Link の Evidence を返した（Interaction で不調を検知した形）。
+    expect(harness.world.auditOutcomes[2]?.result.evidence.filter(({ type }) => type === 'link')).toHaveLength(1);
+    expect(result.pages.map(({ pageUrl }) => pathOf(pageUrl))).toEqual([START_PATH, '/a.html', '/b.html', '/c.html', '/d.html']);
+    expect(result.run.discoveredPageCount).toBe(5);
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_INTERACTION_TIMEOUT)]]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_INTERACTION_TIMEOUT)]);
+  });
+
+  it('does not retry a page with the unavailability mark, even when its Desktop is a retryable NAVIGATION_FAILED:TIMEOUT (3.3)', async () => {
+    // SU5 の後: 不調の印のある試行の後は、再試行（試行 2）ではなく、待ってからの確かめ直し（また試行 1）になる。
+    const sleeps: number[] = [];
+    const harness = createHarness({
+      site: unavailableAt('/b.html', { attempts: [UNAVAILABLE_ATTEMPT, { outcome: 'OK' }] }),
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditOutcomes[2]?.result.viewports.desktop.incompleteReasons).toEqual([NAVIGATION_TIMEOUT_REASON]);
+    expect(RETRYABLE_NAVIGATION_FAILURE_DETAILS).toContain(NAVIGATION_TIMEOUT_REASON.detail);
+    expect(harness.world.auditCalls.map(({ url, attempt }) => [pathOf(url), attempt?.attempt])).toEqual([
+      [START_PATH, 1],
+      ['/a.html', 1],
+      ['/b.html', 1],
+      ['/b.html', 1],
+      ['/c.html', 1],
+      ['/d.html', 1],
+    ]);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(result.run.retries).toEqual([]);
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'AUDITED', []]);
+
+    // 対照: 不調の印がなければ、同じ時間切れ（応答を受けた後の時間切れ）は、今のとおり1回だけ再試行する。
+    const retried = createHarness({ site: unavailableAt('/b.html', { attempts: [{ outcome: 'TIMEOUT', detail: 'TIMEOUT' }, { outcome: 'OK' }] }) });
+    const retriedResult = await retried.coordinator.run();
+    expect(retried.world.auditCalls.filter(({ url }) => pathOf(url) === '/b.html').map(({ attempt }) => attempt?.attempt)).toEqual([1, 2]);
+    expect(retriedResult.run.retries).toHaveLength(1);
+    expect(retriedResult.run.runStatus).toBe('COMPLETE');
+  });
+
+  it('drops the retry record and the Evidence of the earlier attempt when the retry returns the unavailability mark', async () => {
+    const SECOND_ATTEMPT_DETAIL = 'mobile:passive:HTTP 503';
+    const unavailable503: AttemptSpec = { outcome: 'OK', httpStatus: 503, siteUnavailableDetail: SECOND_ATTEMPT_DETAIL };
+    // 3 回目の監査は、確かめ直し（SU5）。また不調なので、止まる。
+    const site = unavailableAt('/b.html', { attempts: [{ outcome: 'TIMEOUT', detail: 'TIMEOUT' }, unavailable503, unavailable503] });
+    const { harness, recorder } = checkpointHarness({ site });
+
+    const result = await harness.coordinator.run();
+
+    // 1回目の試行は、不調の印のない時間切れなので、今のとおり再試行する。2回目の試行が、不調の印を返す。確かめ直し（試行 1）も不調。
+    expect(harness.world.auditCalls.filter(({ url }) => pathOf(url) === '/b.html').map(({ attempt }) => attempt?.attempt)).toEqual([1, 2, 1]);
+    const [, , firstAttempt, secondAttempt] = harness.world.auditOutcomes;
+    const discardedIds = [...(firstAttempt?.result.evidence ?? []), ...(secondAttempt?.result.evidence ?? [])]
+      .map(({ evidenceId }) => evidenceId);
+    expect(discardedIds.length).toBeGreaterThan(0);
+    // ページは、2回目の試行の不調の詳細の SKIPPED。再試行の記録と、再試行の前の試行の Evidence は、Run にも状態の保存にも残らない。
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(SECOND_ATTEMPT_DETAIL)]]);
+    expect(result.run.retries).toEqual([]);
+    expect(result.pages.flatMap(({ evidence }) => evidence).filter(({ evidenceId }) => discardedIds.includes(evidenceId))).toEqual([]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SECOND_ATTEMPT_DETAIL)]);
+    expect(recorder.states().at(-1)?.progress.retries).toEqual([]);
+    await expectValidRun(result);
+  });
+
+  it('saves the unavailable page as an ordinary result and stops for the violation when the page also recorded a violation (the violation comes first)', async () => {
+    const { harness, recorder } = checkpointHarness({ site: unavailableAt('/b.html', { attempts: [UNAVAILABLE_ATTEMPT], violations: 1 }) });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'FAILED', [NAVIGATION_TIMEOUT_REASON]],
+      ['/c.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+      ['/d.html', 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]],
+    ]);
+    // 不調のページは捨てずに、普通の結果として保存する（違反の Evidence をページに残す）。監査を始めたページにも数える。
+    expect(result.pages[2]).toEqual(harness.world.auditOutcomes[2]?.result);
+    const pageIds = result.pages.map(({ pageId }) => pageId);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(pageIds.slice(0, 3));
+    expect(recorder.states().at(-1)?.progress).toMatchObject({ pagesStarted: 3, safetyViolationDetected: true });
+    // 今のとおり違反で止める（再開しない）。サイトの不調の理由と終わり方にはしない。
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('STOPPED_BY_SAFETY_VIOLATION');
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it('checks the failed save before the site unavailability: the rest is CHECKPOINT_WRITE_FAILED when the state after the discarded page cannot be saved', async () => {
+    // 4回目の状態の保存は、/b.html を捨てた後のもの（robots.txt と sitemap.xml の後、開始のページの後、/a.html の後に続く）。
+    const { harness, recorder } = checkpointHarness({ site: unavailableAt('/b.html') }, { failStateAt: 4 });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state', 'page', 'state', 'page', 'state', 'state']);
+    expect(pageStates(result).slice(2)).toEqual([
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+      ['/d.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([
+      siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT),
+      { code: 'CHECKPOINT_WRITE_FAILED', detail: STATE_CHECKPOINT_FAILURE_MESSAGE },
+    ]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    // この実行で保存に失敗したので、保存の状態は変えない。
+    expect(concluded.conclusion).toEqual({ action: 'ABANDON' });
+  });
+
+  it.each([
+    ['the runtime limit', (): Omit<HarnessOptions, 'site'> => ({ config: { crawl: { maxRuntimeMs: 1_500 } } }), { durationMs: 2_000 }],
+    ['the stop signal', (controller: AbortController): Omit<HarnessOptions, 'site'> => ({ stopSignal: controller.signal }), {}],
+  ] as const)('checks the site unavailability before %s reached at the same time', async (_name, options, spec) => {
+    const controller = new AbortController();
+    const site = unavailableAt('/b.html', { attempts: [UNAVAILABLE_ATTEMPT], ...spec, duringAudit: () => controller.abort() });
+
+    const result = await createHarness({ site, ...options(controller) }).coordinator.run();
+
+    expect(pageStates(result).slice(2)).toEqual([
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+  });
+
+  it('does not count the discarded page toward the page limit: the Run stops there without MAX_PAGES_REACHED, and the resume audits it within the limit', async () => {
+    const config = { crawl: { maxPages: 3 } };
+    const stopped = await recordedRun({ site: unavailableAt('/a.html'), config });
+
+    expect(pageStates(stopped.result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/b.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(stopped.result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(stopped.result.run.crawlLimits).toEqual(NO_CRAWL_LIMITS);
+    // 捨てた後の状態の保存（1 回目と、確かめ直しの後）のどちらも、不調のページを数えない。
+    expect(stopped.recorder.states().map(({ progress }) => progress.pagesStarted)).toEqual([0, 1, 1, 1]);
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    expect(checkpoint.progress.pagesStarted).toBe(1);
+
+    // 再開すると、捨てたページ（/a.html）を数えずに続けるので、上限の3ページ（開始のページ、/a.html、/b.html）まで監査する。
+    const { harness } = resumedHarness({ site: UNAVAILABILITY_SITE, config }, resumeInputFrom(stopped, checkpoint));
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/a.html', '/b.html']);
+    expect(pageStates(result).map(([path, status, reasons]) => [path, status, codesOf(reasons)])).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'AUDITED', []],
+      ['/c.html', 'SKIPPED', ['MAX_PAGES_REACHED']],
+      ['/d.html', 'SKIPPED', ['MAX_PAGES_REACHED']],
+    ]);
+    expect(codesOf(result.run.incompleteReasons)).toEqual(['MAX_PAGES_REACHED']);
+  });
+});
+
+describe('RunCoordinator: resuming a Run stopped by site unavailability (site unavailability design 3.2, 3.2.1, SU3a)', () => {
+  /** /b.html（3ページ目）が不調で止まった Run と、その最後の状態の保存（STOPPED）と、そこからの再開の入力。 */
+  async function stoppedAtB() {
+    const stopped = await recordedRun({ site: unavailableAt('/b.html') });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    expect(checkpoint.state).toBe('STOPPED');
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+    return { stopped, checkpoint, resumeFrom: resumeInputFrom(stopped, checkpoint) };
+  }
+
+  it('audits the unavailable page again with the same page ID and finishes, with the pages and states of the Run without the stop', async () => {
+    const uninterrupted = await recordedRun({ site: UNAVAILABILITY_SITE });
+    const { stopped, resumeFrom } = await stoppedAtB();
+    const { harness } = resumedHarness({ site: UNAVAILABILITY_SITE }, resumeFrom);
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    const audited = (calls: readonly AuditCall[]): (string | PageId)[][] => calls.map(({ url, pageId }) => [pathOf(url), pageId]);
+    // /b.html から、中断しなかった Run と同じページの ID で監査し直す（/b.html のページの ID は、止まった実行のものと同じ）。
+    expect(audited(harness.world.auditCalls)).toEqual(audited(uninterrupted.harness.world.auditCalls.slice(2)));
+    expect(harness.world.auditCalls[0]?.pageId).toBe(stopped.harness.world.auditCalls[2]?.pageId);
+    expect(pageStates(result)).toEqual(pageStates(uninterrupted.result));
+    expect(result.pages.map(({ pageId }) => pageId)).toEqual(uninterrupted.result.pages.map(({ pageId }) => pageId));
+    // この実行では不調を検知しなかったので、Run の理由に SITE_UNAVAILABLE は残らない。
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.runStatus).toBe('COMPLETE');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'COMPLETED']);
+    await expectFinishCheckpoint(concluded, 'FINISHED');
+    await expectValidRun(result);
+  });
+
+  it('saves the trigger page of the previous execution as an ordinary result when it is unavailable again, stops, and the next resume goes on from the next page (3.2.1)', async () => {
+    const { stopped, checkpoint: firstCheckpoint, resumeFrom } = await stoppedAtB();
+    const again = resumedHarness({ site: unavailableAt('/b.html') }, resumeFrom);
+
+    const concluded = await concludedRun(again.harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(again.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html']);
+    // /b.html は、また不調の印を返したので、普通の結果（FAILED）として保存し、監査を始めたページに数える。残りは SKIPPED（detail は null）。
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'FAILED', [NAVIGATION_TIMEOUT_REASON]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    const pageIdOfB = result.pages[2]?.pageId;
+    expect(again.recorder.pages().map(({ pageId }) => pageId)).toEqual([pageIdOfB]);
+    expect(again.recorder.states().at(-1)).toMatchObject({
+      progress: { pagesStarted: 3 },
+      completedPageIds: [...firstCheckpoint.completedPageIds, pageIdOfB],
+    });
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_SITE_UNAVAILABLE']);
+    const secondCheckpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(decideRunResumption(secondCheckpoint)).toBe('RESUME');
+
+    // 次の再開では、/b.html を監査し直さずに、/c.html から続ける。
+    const savedPages = [...stopped.recorder.pages(), ...again.recorder.pages()];
+    const next = resumedHarness({ site: UNAVAILABILITY_SITE }, {
+      runDirectory: resumeFrom.runDirectory,
+      checkpoint: secondCheckpoint,
+      pages: secondCheckpoint.completedPageIds.map((pageId) => savedPages.find((page) => page.pageId === pageId) as RunCheckpointPage),
+    });
+    const finalResult = await next.harness.coordinator.run();
+
+    expect(next.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/c.html', '/d.html']);
+    expect(pageStates(finalResult).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'AUDITED'],
+      ['/b.html', 'FAILED'],
+      ['/c.html', 'AUDITED'],
+      ['/d.html', 'AUDITED'],
+    ]);
+    expect(finalResult.run.incompleteReasons).toEqual([]);
+    expect(finalResult.run.executions.map(({ endReason }) => endReason)).toEqual([
+      'STOPPED_BY_SITE_UNAVAILABLE',
+      'STOPPED_BY_SITE_UNAVAILABLE',
+      'COMPLETED',
+    ]);
+  });
+
+  it('discards another page that becomes unavailable in the resumed execution, as it is not the trigger page of the previous execution', async () => {
+    const { resumeFrom } = await stoppedAtB();
+    const { harness, recorder } = resumedHarness({ site: unavailableAt('/c.html') }, resumeFrom);
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    // /c.html は、前の実行のきっかけのページではないので、1 回確かめ直してから（SU5）捨てる。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html', '/c.html', '/c.html']);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'AUDITED', []],
+      ['/c.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual([result.pages[2]?.pageId]);
+    expect(recorder.states().at(-1)?.progress.pagesStarted).toBe(3);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(checkpoint.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_SITE_UNAVAILABLE']);
+  });
+
+  it('checks the site unavailability before the page limit when the trigger page saved again reaches the limit', async () => {
+    const config = { crawl: { maxPages: 3 } };
+    const stopped = await recordedRun({ site: unavailableAt('/b.html'), config });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    const { harness } = resumedHarness({ site: unavailableAt('/b.html'), config }, resumeInputFrom(stopped, checkpoint));
+
+    const result = await harness.coordinator.run();
+
+    // /b.html を数えて、監査を始めたページの数は上限の3に達したが、サイトの不調を先に確かめる。
+    expect(pageStates(result).slice(2)).toEqual([
+      ['/b.html', 'FAILED', [NAVIGATION_TIMEOUT_REASON]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.run.crawlLimits.maxPagesReached).toBe(false);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// SU3b（サイトが応答しないときに Run を止める設計書 3.1、3.2、3.2.1 の最後の項目）: robots.txt と sitemap.xml の取得の観測で、サイトの不調を
+// 検知したら、sitemap.xml を読み込まず（包んだ間隔の待ちが例外を投げる）、ページの監査も始めずに、Run を再開できる状態で止める。取得の結果は
+// 保存せず、再開のときに取得し直す。前の実行がこの段階で止まっていて、また不調なら、取得の結果（FAILED の記録）を保存して止め、次の再開では
+// 取得し直さない。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 応答（ヘッダ）を1つも受けていない、読み込みの時間切れの観測（サイトの不調。判定の詳細は `TIMEOUT`）。 */
+const NO_RESPONSE_TIMEOUT: MainFrameLoadObservation = Object.freeze({
+  navigationOutcome: 'TIMEOUT',
+  httpStatus: null,
+  failureDetail: 'page.goto: Timeout 30000ms exceeded.',
+});
+/** 200 の応答で終わった読み込みの観測。 */
+const OK_200: MainFrameLoadObservation = Object.freeze({ navigationOutcome: 'OK', httpStatus: 200, failureDetail: null });
+/** 503 の応答で終わった読み込みの観測（サイトの不調。判定の詳細は `HTTP 503`）。 */
+const OK_503: MainFrameLoadObservation = Object.freeze({ navigationOutcome: 'OK', httpStatus: 503, failureDetail: null });
+
+/** robots.txt が応答しない（時間切れ）ときの、Run の理由の `detail`（`siteUnavailableDetail(null, 'site-metadata', <判定>)` の形）。 */
+const SITE_METADATA_TIMEOUT = 'site-metadata:TIMEOUT';
+/** sitemap.xml が 503 を返したときの、Run の理由の `detail`。 */
+const SITE_METADATA_HTTP_503 = 'site-metadata:HTTP 503';
+
+/** 開始のページ（Run の結果の最初のページ）の、robots.txt と sitemap.xml の記録の結果（この順）。 */
+const startMetadataOutcomes = (result: AuditRunResult): string[] =>
+  (result.pages[0]?.evidence ?? []).flatMap((record) => (record.type === 'metadata' ? [record.payload.outcome] : []));
+
+describe('RunCoordinator: stopping the Run on site unavailability in robots.txt and sitemap.xml (site unavailability design 3.1, 3.2, SU3b)', () => {
+  /** robots.txt が応答しない（時間切れ）で止まった Run と、その最後の状態の保存（STOPPED）と、そこからの再開の入力。 */
+  async function stoppedAtRobots() {
+    const { harness, recorder } = checkpointHarness({ site: UNAVAILABILITY_SITE, metadataObservations: [NO_RESPONSE_TIMEOUT, OK_200] });
+    const concluded = await concludedRun(harness);
+    const result = concluded.result as AuditRunResult;
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    return { stopped: { harness, recorder, result }, concluded, checkpoint, resumeFrom: resumeInputFrom({ harness, recorder, result }, checkpoint) };
+  }
+
+  it('does not load sitemap.xml nor start any page when robots.txt does not respond, and stops resumable without saving the metadata', async () => {
+    const { stopped, checkpoint } = await stoppedAtRobots();
+    const { harness, recorder, result } = stopped;
+
+    // robots.txt の観測で不調を検知した後、sitemap.xml の前の待ちが例外を投げ、sitemap.xml を読み込まない（pacer の読み込みは1回だけ）。
+    expect(harness.metadata).toHaveBeenCalledTimes(1);
+    expect(harness.world.metadataNavigations).toEqual(['ROBOTS_TXT']);
+    expect(harness.world.metadataWaitErrors).toHaveLength(1);
+    expect(harness.world.metadataWaitErrors[0]).toBeInstanceOf(Error);
+    expect(result.run.load.navigationCount).toBe(1);
+    // ページの監査を1つも始めない。開始の URL は、理由 SITE_UNAVAILABLE（detail は null）の SKIPPED。
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]]]);
+    // 取得の結果を残さないので、開始のページに metadata の Evidence はない。
+    expect(result.pages[0]?.evidence).toEqual([]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SITE_METADATA_TIMEOUT)]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    // 取得の後の状態の保存（5a）は、今のとおり行う。取得の結果は保存しない（再開のときに取得し直す）。
+    expect(recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    expect(recorder.states()[0]?.siteMetadata).toBeNull();
+    expect(checkpoint.siteMetadata).toBeNull();
+    expect(checkpoint.progress.reasons).toEqual([]);
+    expect(frontierStates(checkpoint)).toEqual([[START_PATH, 'SKIPPED', SITE_UNAVAILABLE_SKIP_REASON]]);
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+    await expectValidRun(result);
+  });
+
+  it('collects robots.txt and sitemap.xml again on the resume, and audits every page to the end when they are available', async () => {
+    const { resumeFrom } = await stoppedAtRobots();
+    const { harness } = resumedHarness({ site: UNAVAILABILITY_SITE, metadataObservations: [OK_200, OK_200] }, resumeFrom);
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(harness.metadata).toHaveBeenCalledTimes(1);
+    expect(harness.world.metadataNavigations).toEqual(['ROBOTS_TXT', 'SITEMAP_XML']);
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/c.html', '/d.html']);
+    expect(startMetadataOutcomes(result)).toEqual(['OK', 'OK']);
+    expect(result.pages.map(({ status }) => status)).toEqual(['AUDITED', 'AUDITED', 'AUDITED', 'AUDITED', 'AUDITED']);
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.runStatus).toBe('COMPLETE');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'COMPLETED']);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.siteMetadata?.records.map(({ payload }) => payload.outcome)).toEqual(['OK', 'OK']);
+    await expectValidRun(result);
+  });
+
+  it('saves the FAILED metadata and stops when the resume finds the site unavailable again at this stage, and the next resume does not collect it again (3.2.1)', async () => {
+    const { stopped, resumeFrom } = await stoppedAtRobots();
+    const again = resumedHarness({ site: UNAVAILABILITY_SITE, metadataObservations: [NO_RESPONSE_TIMEOUT, OK_200] }, resumeFrom);
+
+    const concluded = await concludedRun(again.harness);
+
+    const result = concluded.result as AuditRunResult;
+    // 前の実行がこの段階で止まっていたので、取り直した結果（FAILED の記録）を保存して、ページの監査を始めずに止める。
+    expect(again.harness.metadata).toHaveBeenCalledTimes(1);
+    expect(again.harness.world.metadataNavigations).toEqual(['ROBOTS_TXT']);
+    expect(again.harness.world.auditCalls).toEqual([]);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]]]);
+    expect(startMetadataOutcomes(result)).toEqual(['FAILED', 'FAILED']);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SITE_METADATA_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_SITE_UNAVAILABLE']);
+    expect(again.recorder.calls.map(({ kind }) => kind)).toEqual(['start', 'state']);
+    expect(again.recorder.states()[0]?.siteMetadata?.records.map(({ payload }) => payload.outcome)).toEqual(['FAILED', 'FAILED']);
+    const secondCheckpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(secondCheckpoint.siteMetadata).toEqual(again.recorder.states()[0]?.siteMetadata);
+    expect(decideRunResumption(secondCheckpoint)).toBe('RESUME');
+
+    // 次の再開では、取得し直さずに（観測は、また不調のものを渡すが、取得そのものを呼ばない）、ページの監査へ進む。
+    const next = resumedHarness({ site: UNAVAILABILITY_SITE, metadataObservations: [NO_RESPONSE_TIMEOUT, OK_200] }, {
+      runDirectory: resumeFrom.runDirectory,
+      checkpoint: secondCheckpoint,
+      pages: [],
+    });
+    const finalResult = await next.harness.coordinator.run();
+
+    expect(next.harness.metadata).not.toHaveBeenCalled();
+    expect(next.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/c.html', '/d.html']);
+    expect(startMetadataOutcomes(finalResult)).toEqual(['FAILED', 'FAILED']);
+    expect(finalResult.pages.map(({ status }) => status)).toEqual(['AUDITED', 'AUDITED', 'AUDITED', 'AUDITED', 'AUDITED']);
+    expect(finalResult.run.incompleteReasons).toEqual([]);
+    expect(finalResult.run.executions.map(({ endReason }) => endReason)).toEqual([
+      'STOPPED_BY_SITE_UNAVAILABLE',
+      'STOPPED_BY_SITE_UNAVAILABLE',
+      'COMPLETED',
+    ]);
+    expect(stopped.result.run.runId).toBe(finalResult.run.runId);
+    await expectValidRun(finalResult);
+  });
+
+  it('stops for the violation as before, without SITE_UNAVAILABLE, when the collection of robots.txt records a violation and finds the site unavailable', async () => {
+    const { harness } = checkpointHarness({
+      site: UNAVAILABILITY_SITE,
+      metadataObservations: [NO_RESPONSE_TIMEOUT, OK_200],
+      metadataViolations: 1,
+    });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    // 不調を検知したので、sitemap.xml は読み込まない。
+    expect(harness.world.metadataNavigations).toEqual(['ROBOTS_TXT']);
+    expect(harness.world.auditCalls).toEqual([]);
+    // 今のとおり違反で止める。取得の結果は今のとおり残し、Run の理由に SITE_UNAVAILABLE は入れない。
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SAFETY_VIOLATION_ABORT_SKIP]]]);
+    expect(startMetadataOutcomes(result)).toEqual(['FAILED', 'FAILED']);
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SAFETY_VIOLATION']);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.siteMetadata?.records.map(({ payload }) => payload.outcome)).toEqual(['FAILED', 'FAILED']);
+    expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
+  });
+
+  it('stops in the same way when robots.txt is available and sitemap.xml returns 503, keeping the reason of the failure to close the page', async () => {
+    const { harness, recorder } = checkpointHarness({
+      site: UNAVAILABILITY_SITE,
+      metadataObservations: [OK_200, OK_503],
+      metadataPageCloseFails: true,
+    });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(harness.world.metadataNavigations).toEqual(['ROBOTS_TXT', 'SITEMAP_XML']);
+    expect(harness.world.metadataWaitErrors).toEqual([]);
+    expect(result.run.load.navigationCount).toBe(2);
+    expect(harness.world.auditCalls).toEqual([]);
+    expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]]]);
+    expect(result.pages[0]?.evidence).toEqual([]);
+    // 閉じる処理の失敗の理由は、今のとおり記録する（保存の理由にも入る）。
+    const closeFailure = { code: 'UNHANDLED_FAILURE', detail: expect.stringMatching(/^site-metadata-page-close:.*metadata page close failed/u) };
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SITE_METADATA_HTTP_503), closeFailure]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    expect(recorder.states()[0]?.siteMetadata).toBeNull();
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(checkpoint.siteMetadata).toBeNull();
+    expect(checkpoint.progress.reasons).toEqual([closeFailure]);
+    expect(decideRunResumption(checkpoint)).toBe('RESUME');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: サイトの不調でページを捨てた場合と、前の実行のきっかけのページを、また不調で、
+// 普通の結果として保存した場合に、Run Coordinator は、注入された書き出しの口に、診断の記録を1回渡す。記録は、そのページの最終の試行の
+// ページの結果と観察の結果、不調の詳細、Run の ID、実行の番号（1から。再開した実行は、前の回の実行の数 + 1）、書いた時刻（注入した時計）。
+// 違反でページを捨てなかった場合と、robots.txt と sitemap.xml の段階では渡さない。口の失敗は、Run の結果を変えない。
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 偽の Page Auditor が、不調の印のある試行で返す、ページ本体の要求の観察の結果（D3 の形）。Desktop は、Passive でヘッダを送り、応答がない。
+ * 幅の走査の1つの幅（観察できなかった）と、Interaction の1つの候補（観察できなかった）の観察も持つ（Run Coordinator は、そのまま写す）。
+ * Mobile は始めなかった。
+ */
+const UNAVAILABLE_NAVIGATION_DIAGNOSTICS: PageAuditOutcome['navigationDiagnostics'] = Object.freeze({
+  desktop: Object.freeze({
+    passive: Object.freeze({
+      status: 'OBSERVED',
+      observationStartedAtMs: 1_000_000,
+      observationEndedAtMs: 1_030_000,
+      documentRequests: Object.freeze([Object.freeze({
+        hops: Object.freeze([Object.freeze({
+          url: urlOf('/b.html'),
+          method: 'GET',
+          truncated: false,
+          issuedAtMs: 1_000_001,
+          requestHeadersSentAtMs: 1_000_002,
+          responseHeadersReceivedAtMs: null,
+          httpStatus: null,
+          remoteIpAddress: null,
+          remotePort: null,
+        })]),
+        loadingFinishedAtMs: null,
+        loadingFailure: null,
+      })]),
+      omittedDocumentRequestCount: 0,
+      omittedEventCount: 0,
+    } as const),
+    stressWidths: Object.freeze([
+      Object.freeze({ width: 320, diagnostics: Object.freeze({ status: 'NOT_OBSERVED', reason: 'fake stress width observation' } as const) }),
+    ]),
+    interactionCandidates: Object.freeze([
+      Object.freeze({ index: 0, diagnostics: Object.freeze({ status: 'NOT_OBSERVED', reason: 'fake candidate observation' } as const) }),
+    ]),
+  }),
+  mobile: null,
+});
+
+/** サイトの不調の印と、ページ本体の要求の観察の結果を返す試行。 */
+const UNAVAILABLE_OBSERVED_ATTEMPT: AttemptSpec = { ...UNAVAILABLE_ATTEMPT, navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS };
+
+/** `path` のページだけが、不調の印と観察の結果を返すサイト（既定は、2 回の試行とも。SU5）。 */
+const observedUnavailableAt = (path: string, spec: FakePageSpec = {}): FakeSite =>
+  unavailableAt(path, { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, UNAVAILABLE_OBSERVED_ATTEMPT], ...spec });
+
+/** 書き出しの口の偽物。受けた Run のディレクトリと記録と試行の番号（SU5）を、受けた順に返す。 */
+function diagnosticWriter(write: () => Promise<void> = async () => undefined) {
+  const writer = vi.fn(
+    async (_runDirectory: string, _record: SiteUnavailableDiagnosticRecord, _attemptNumber: number): Promise<void> => write(),
+  );
+  return {
+    writer,
+    calls: (): { readonly runDirectory: string; readonly record: SiteUnavailableDiagnosticRecord; readonly attemptNumber: number }[] =>
+      writer.mock.calls.map(([runDirectory, record, attemptNumber]) => ({ runDirectory, record, attemptNumber })),
+  };
+}
+
+/** 状態の保存の写し（Run のディレクトリを含まない、保存の依頼の中身。比べるため）。 */
+const savedContents = (recorder: ReturnType<typeof checkpointRecorder>) => ({ pages: recorder.pages(), states: recorder.states() });
+
+describe('RunCoordinator: the diagnostic of a page stopped by site unavailability (site-unavailable diagnostics design 2.3, D2)', () => {
+  it('passes the record of each discarded attempt once, after saving the state: the result and the observation of that attempt, read by the clock', async () => {
+    let lastClockValue = STARTED_AT;
+    let clockCalls = 0;
+    const clock = (): Date => {
+      clockCalls += 1;
+      lastClockValue = new Date(STARTED_AT.getTime() + clockCalls * 1_000);
+      return lastClockValue;
+    };
+    const clockValuesAtWrite: Date[] = [];
+    const { writer, calls } = diagnosticWriter(async () => {
+      clockValuesAtWrite.push(lastClockValue);
+    });
+    const { harness, recorder } = checkpointHarness({ site: observedUnavailableAt('/b.html'), clock, writeSiteUnavailableDiagnostic: writer });
+
+    const result = await harness.coordinator.run();
+
+    // 1 回目の試行と、確かめ直しの試行（SU5）の、それぞれの記録を 1 回ずつ渡す（試行の番号は 1 と 2）。
+    expect(writer).toHaveBeenCalledTimes(2);
+    const [first, second] = calls();
+    const [, , firstOutcome, secondOutcome] = harness.world.auditOutcomes;
+    expect(firstOutcome?.siteUnavailableDetail).toBe(DESKTOP_PASSIVE_TIMEOUT);
+    expect(secondOutcome?.siteUnavailableDetail).toBe(DESKTOP_PASSIVE_TIMEOUT);
+    expect(firstOutcome?.result).not.toBe(secondOutcome?.result);
+    expect(first?.runDirectory).toBe(runArtifactDirectory(harness.outputDirectory, result.run.runId));
+    expect(second?.runDirectory).toBe(first?.runDirectory);
+    expect([first?.attemptNumber, second?.attemptNumber]).toEqual([FIRST_ATTEMPT, RECHECK_ATTEMPT]);
+    expect(first?.record).toEqual({
+      schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+      runId: result.run.runId,
+      executionNumber: 1,
+      writtenAt: clockValuesAtWrite[0]?.toISOString(),
+      pageId: result.pages[2]?.pageId,
+      url: urlOf('/b.html'),
+      siteUnavailableDetail: DESKTOP_PASSIVE_TIMEOUT,
+      page: firstOutcome?.result,
+      navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS,
+    });
+    expect(second?.record).toEqual({
+      ...first?.record,
+      writtenAt: clockValuesAtWrite[1]?.toISOString(),
+      page: secondOutcome?.result,
+    });
+    // 書いた時刻は、注入した時計で、記録を渡す直前に読んだ値（Run の開始の時刻ではない）。
+    expect(first?.record.writtenAt).not.toBe(result.run.startedAt);
+    expect(second?.record.writtenAt).not.toBe(first?.record.writtenAt);
+    // 記録は、診断の記録のスキーマに合う（偽の Page Auditor のページの結果は、ページのスキーマに合う）。
+    await expect(validateArtifact('site-unavailable-diagnostic', JSON.parse(JSON.stringify(first?.record)))).resolves.toEqual({ ok: true });
+    await expect(validateArtifact('site-unavailable-diagnostic', JSON.parse(JSON.stringify(second?.record)))).resolves.toEqual({ ok: true });
+    // それぞれ、捨てた後の状態の保存の後に渡す（状態の保存は、robots.txt と sitemap.xml の後、2 ページの後、捨てた試行ごとの 5 回）。
+    const saveOrders = recorder.session.saveState.mock.invocationCallOrder;
+    expect(saveOrders).toHaveLength(5);
+    expect(writer.mock.invocationCallOrder[0]).toBeGreaterThan(saveOrders[3] ?? Number.POSITIVE_INFINITY);
+    expect(writer.mock.invocationCallOrder[0]).toBeLessThan(saveOrders[4] ?? 0);
+    expect(writer.mock.invocationCallOrder[1]).toBeGreaterThan(saveOrders[4] ?? Number.POSITIVE_INFINITY);
+    // ページは、今のとおり捨てる（結果、ページの保存に入れない）。
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
+    expect(recorder.pages().map(({ pageId }) => pageId)).not.toContain(result.pages[2]?.pageId);
+  });
+
+  it('passes the record of the trigger page of the previous execution saved again as an ordinary result, with the execution number 2 (3.2.1)', async () => {
+    const stopped = await recordedRun({ site: unavailableAt('/b.html') });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    const resumeFrom = resumeInputFrom(stopped, checkpoint);
+    const { writer, calls } = diagnosticWriter();
+    const { harness, recorder } = resumedHarness({ site: observedUnavailableAt('/b.html'), writeSiteUnavailableDiagnostic: writer }, resumeFrom);
+
+    const result = await harness.coordinator.run();
+
+    expect(writer).toHaveBeenCalledOnce();
+    const [call] = calls();
+    const trigger = result.pages[2];
+    // きっかけのページは、今のとおり、普通の結果（FAILED）として保存した。
+    expect(trigger?.status).toBe('FAILED');
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual([trigger?.pageId]);
+    expect(call?.runDirectory).toBe(resumeFrom.runDirectory);
+    expect(call?.record).toMatchObject({
+      runId: stopped.result.run.runId,
+      executionNumber: 2,
+      pageId: trigger?.pageId,
+      url: urlOf('/b.html'),
+      siteUnavailableDetail: DESKTOP_PASSIVE_TIMEOUT,
+      navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS,
+    });
+    expect(call?.record.page).toEqual(harness.world.auditOutcomes[0]?.result);
+    expect(call?.record.page).toEqual(trigger);
+    // ページの保存と状態の保存の後に渡す。
+    expect(writer.mock.invocationCallOrder[0]).toBeGreaterThan(recorder.session.saveState.mock.invocationCallOrder.at(-1) ?? Number.POSITIVE_INFINITY);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_SITE_UNAVAILABLE']);
+  });
+
+  it('numbers the execution from the saved executions: another page discarded in the resumed execution has the execution number 2', async () => {
+    const stopped = await recordedRun({ site: unavailableAt('/b.html') });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    const { writer, calls } = diagnosticWriter();
+    const { harness } = resumedHarness(
+      { site: observedUnavailableAt('/c.html'), writeSiteUnavailableDiagnostic: writer },
+      resumeInputFrom(stopped, checkpoint),
+    );
+
+    const result = await harness.coordinator.run();
+
+    // 実行の番号は 2 のまま、試行の番号が 1 と 2（SU5）。
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber, record.pageId])).toEqual([
+      ['/c.html', 2, FIRST_ATTEMPT, result.pages[3]?.pageId],
+      ['/c.html', 2, RECHECK_ATTEMPT, result.pages[3]?.pageId],
+    ]);
+    expect(pageStates(result)[3]).toEqual(['/c.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
+  });
+
+  it('does not pass a record when the same page also recorded a violation and is kept as an ordinary result (the violation comes first)', async () => {
+    const { writer } = diagnosticWriter();
+    const harness = createHarness({ site: observedUnavailableAt('/b.html', { violations: 1 }), writeSiteUnavailableDiagnostic: writer });
+
+    const result = await harness.coordinator.run();
+
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(harness.world.auditOutcomes[2]?.siteUnavailableDetail).toBe(DESKTOP_PASSIVE_TIMEOUT);
+    expect(writer).not.toHaveBeenCalled();
+  });
+
+  it('does not pass a record when robots.txt does not respond, nor for pages without the unavailability mark', async () => {
+    const { writer } = diagnosticWriter();
+    const atRobots = createHarness({
+      site: UNAVAILABILITY_SITE,
+      metadataObservations: [NO_RESPONSE_TIMEOUT, OK_200],
+      writeSiteUnavailableDiagnostic: writer,
+    });
+    const stoppedAtRobots = await atRobots.coordinator.run();
+    expect(stoppedAtRobots.run.incompleteReasons).toEqual([siteUnavailableTrigger(SITE_METADATA_TIMEOUT)]);
+
+    // 観察の結果はあるが、不調の印のないページ（ふつうの Run）。
+    const observedSite = Object.fromEntries(Object.entries(UNAVAILABILITY_SITE).map(([path, spec]) => [
+      path,
+      { ...spec, attempts: [{ outcome: 'OK', navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS }] } satisfies FakePageSpec,
+    ]));
+    const ordinary = await createHarness({ site: observedSite, writeSiteUnavailableDiagnostic: writer }).coordinator.run();
+    expect(ordinary.run.runStatus).toBe('COMPLETE');
+
+    expect(writer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['throws', (): Promise<void> => {
+      throw new Error('diagnostic write failed');
+    }],
+    ['rejects', async (): Promise<void> => {
+      throw new Error('diagnostic write failed');
+    }],
+  ] as const)('keeps the Run, its reasons, its end and its saves unchanged when the writer %s, for both kinds of record', async (_name, write) => {
+    const stopped = await recordedRun({ site: unavailableAt('/b.html') });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    // 捨てたページ（2 回の試行の記録。SU5）と、前の実行のきっかけのページ（1 回）。
+    const scenarios: readonly [(options: Pick<HarnessOptions, 'writeSiteUnavailableDiagnostic'>) => ReturnType<typeof checkpointHarness>, number][] = [
+      [(options) => checkpointHarness({ site: observedUnavailableAt('/b.html'), ...options }), 2],
+      [(options) => resumedHarness({ site: observedUnavailableAt('/b.html'), ...options }, resumeInputFrom(stopped, checkpoint)), 1],
+    ];
+    for (const [scenario, records] of scenarios) {
+      const without = scenario({});
+      const expected = await concludedRun(without.harness);
+      const failing = vi.fn(write);
+      const withWriter = scenario({ writeSiteUnavailableDiagnostic: failing });
+
+      const concluded = await concludedRun(withWriter.harness);
+
+      expect(failing).toHaveBeenCalledTimes(records);
+      expect(concluded.error).toBeNull();
+      expect(concluded.result).toEqual(expected.result);
+      expect(concluded.result?.statusInput.unhandledFailures).toBe(0);
+      expect(concluded.result?.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+      expect(concluded.conclusion).toEqual(expected.conclusion);
+      expect(savedContents(withWriter.recorder)).toEqual(savedContents(without.recorder));
+    }
+  });
+
+  it('waits until the writer finishes before it closes the Browser', async () => {
+    const finished = vi.fn();
+    const { writer } = diagnosticWriter(async () => {
+      await new Promise<void>((resolveWait) => {
+        setTimeout(resolveWait, 10);
+      });
+      finished();
+    });
+    const harness = createHarness({ site: observedUnavailableAt('/b.html'), writeSiteUnavailableDiagnostic: writer });
+
+    await harness.coordinator.run();
+
+    // 2 回の試行の記録（SU5）のどちらも、Browser を閉じる前に書き終える。
+    expect(finished).toHaveBeenCalledTimes(2);
+    expect(harness.browserClose).toHaveBeenCalledOnce();
+    expect(finished.mock.invocationCallOrder[1]).toBeLessThan(harness.browserClose.mock.invocationCallOrder[0] ?? 0);
+  });
+
+  it('rejects a writer that is not a function with TypeError', () => {
+    expect(() => createHarness({
+      site: UNAVAILABILITY_SITE,
+      writeSiteUnavailableDiagnostic: 'write' as unknown as RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'],
+    })).toThrow(TypeError);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// SU5（サイトが応答しないときに Run を止める設計書 3.5）: サイトの不調でページを捨てた後、`SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待って
+// （止める印で打ち切る）、同じページ（同じ `pageId`）を 1 回だけ監査し直す。2 回目に不調がなければ通常どおり保存して進み、2 回目も不調なら
+// 今までどおり止める。確かめ直しは、1 つの実行の中で、同じ URL につき 1 回まで。前の実行のきっかけのページ（3.2.1）は確かめ直さない。
+// 知らせは、`onProgress` とは別の口（`onNotice`）に、事実（種類、URL、待つ時間）で渡す（3.5.4）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 待ちの記録（実際には待たない）。確かめ直しの前の待ちのときに `onRecheckWait` を呼ぶ（待っている間の事実を確かめるため）。 */
+function recordedSleep(onRecheckWait?: () => void | Promise<void>) {
+  const sleeps: number[] = [];
+  const sleep = vi.fn(async (ms: number): Promise<void> => {
+    sleeps.push(ms);
+    if (ms === SITE_UNAVAILABLE_RECHECK_DELAY_MS) {
+      await onRecheckWait?.();
+    }
+  });
+  return { sleeps, sleep };
+}
+
+/** 知らせの記録。 */
+function recordedNotices() {
+  const notices: RunNotice[] = [];
+  const onNotice = vi.fn((notice: RunNotice): void => {
+    notices.push(notice);
+  });
+  return { notices, onNotice };
+}
+
+/** `path` のページの確かめ直しの知らせ。 */
+const recheckNotice = (path: string): RunNotice =>
+  ({ kind: 'SITE_UNAVAILABLE_RECHECK', url: urlOf(path), delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS });
+
+/** 1 回目は不調で、確かめ直しで通るページ。 */
+const RECOVERING_PAGE: FakePageSpec = { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, { outcome: 'OK' }] };
+
+describe('RunCoordinator: checking an unavailable page once more after the wait (site unavailability design 3.5, SU5)', () => {
+  it('fixes the wait before the recheck at 60 seconds', () => {
+    expect(SITE_UNAVAILABLE_RECHECK_DELAY_MS).toBe(60_000);
+  });
+
+  it('1. discards the page, waits once, audits the same page ID again, and keeps the second attempt as an ordinary result when it is fine', async () => {
+    const auditCallsAtWait: number[] = [];
+    const { writer, calls } = diagnosticWriter();
+    const reports: RunProgressReport[] = [];
+    const { notices, onNotice } = recordedNotices();
+    const site = unavailableAt('/b.html', { ...RECOVERING_PAGE, links: ['/from-b.html'] });
+    let harness: Harness | null = null;
+    const { sleeps, sleep } = recordedSleep(() => {
+      auditCallsAtWait.push(harness?.world.auditCalls.length ?? -1);
+    });
+    const made = checkpointHarness({ site, sleep, onNotice, writeSiteUnavailableDiagnostic: writer, onProgress: (report) => reports.push(report) });
+    harness = made.harness;
+    const { recorder } = made;
+
+    const concluded = await concludedRun(made.harness);
+
+    const result = concluded.result as AuditRunResult;
+    const pageIdOf = (path: string): PageId | undefined => result.pages.find(({ pageUrl }) => pathOf(pageUrl) === path)?.pageId;
+    // 同じ pageId で、もう 1 回監査する（どちらも試行 1。再試行ではない）。待ちは 1 回だけ（60 秒）。その間、Page Auditor を呼ばない。
+    expect(made.harness.world.auditCalls.map(({ url, pageId, attempt }) => [pathOf(url), pageId, attempt?.attempt])).toEqual([
+      [START_PATH, pageIdOf(START_PATH), 1],
+      ['/a.html', pageIdOf('/a.html'), 1],
+      ['/b.html', pageIdOf('/b.html'), 1],
+      ['/b.html', pageIdOf('/b.html'), 1],
+      ['/c.html', pageIdOf('/c.html'), 1],
+      ['/d.html', pageIdOf('/d.html'), 1],
+      ['/from-b.html', pageIdOf('/from-b.html'), 1],
+    ]);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(auditCallsAtWait).toEqual([3]);
+    expect(result.run.retries).toEqual([]);
+    // 知らせは 1 回（事実: 種類、URL、待つ時間）。捨てた試行の診断の記録（試行 1）の後、待ちの前に渡す。
+    expect(notices).toEqual([recheckNotice('/b.html')]);
+    expect(Object.isFrozen(notices[0])).toBe(true);
+    expect(writer).toHaveBeenCalledOnce();
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber])).toEqual([['/b.html', 1, FIRST_ATTEMPT]]);
+    expect(calls()[0]?.record.page).toEqual(made.harness.world.auditOutcomes[2]?.result);
+    expect(writer.mock.invocationCallOrder[0]).toBeLessThan(onNotice.mock.invocationCallOrder[0] ?? 0);
+    expect(onNotice.mock.invocationCallOrder[0]).toBeLessThan(sleep.mock.invocationCallOrder[0] ?? 0);
+    // 2 回目は通常の結果（AUDITED）として残り、その Link（/from-b.html）も拾う。Run の理由に SITE_UNAVAILABLE は残らない。
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'AUDITED', []],
+      ['/c.html', 'AUDITED', []],
+      ['/d.html', 'AUDITED', []],
+      ['/from-b.html', 'AUDITED', []],
+    ]);
+    expect(result.pages[2]).toEqual(made.harness.world.auditOutcomes[3]?.result);
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.runStatus).toBe('COMPLETE');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['COMPLETED']);
+    // 保存: 捨てた後に状態を保存し（待っている間に止まっても、理由 SITE_UNAVAILABLE（detail あり）の SKIPPED が残る）、確かめ直しの後は
+    // 通常どおりページと状態を保存する（ページの保存は 1 回。終わったページに 1 回だけ入る）。
+    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls]).slice(0, 10)).toEqual([
+      ['start', 0],
+      ['state', 0],
+      ['page', 1],
+      ['state', 1],
+      ['page', 2],
+      ['state', 2],
+      ['state', 3],
+      ['page', 4],
+      ['state', 4],
+      ['page', 5],
+    ]);
+    const states = recorder.states();
+    expect(frontierStates(states[3] as RunCheckpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect((states[3] as RunCheckpoint).progress.pagesStarted).toBe(2);
+    expect(frontierStates(states[4] as RunCheckpoint)[2]).toEqual(['/b.html', 'AUDITED', null]);
+    expect((states[4] as RunCheckpoint).progress.pagesStarted).toBe(3);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(result.pages.map(({ pageId }) => pageId));
+    expect(recorder.pages().find(({ pageId }) => pageId === pageIdOf('/b.html'))?.result).toEqual(result.pages[2]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
+    expect(checkpoint.completedPageIds).toEqual(result.pages.map(({ pageId }) => pageId));
+    expect(checkpoint.progress.pagesStarted).toBe(6);
+    // 進み具合は、監査を終えたページの後だけ（捨てた試行の後には伝えない）。
+    expect(reports.map(({ pagesFinished }) => pagesFinished)).toEqual([1, 2, 3, 4, 5, 6]);
+    await expectValidRun(result);
+  });
+
+  it('2. stops as before when the second attempt is unavailable too: the detail of the second attempt, the diagnostics of both attempts, one wait', async () => {
+    const SECOND_DETAIL = 'mobile:passive:HTTP 503';
+    const secondAttempt: AttemptSpec = { outcome: 'OK', httpStatus: 503, siteUnavailableDetail: SECOND_DETAIL, navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS };
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const { writer, calls } = diagnosticWriter();
+    const { harness, recorder } = checkpointHarness({
+      site: unavailableAt('/b.html', { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, secondAttempt] }),
+      sleep,
+      onNotice,
+      writeSiteUnavailableDiagnostic: writer,
+    });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(harness.world.auditCalls.map(({ url, attempt }) => [pathOf(url), attempt?.attempt])).toEqual([
+      [START_PATH, 1],
+      ['/a.html', 1],
+      ['/b.html', 1],
+      ['/b.html', 1],
+    ]);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(notices).toEqual([recheckNotice('/b.html')]);
+    // 2 回目の不調の詳細で止める。残りも SKIPPED。
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(SECOND_DETAIL)]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SECOND_DETAIL)]);
+    expect(result.run.runStatus).toBe('PARTIAL');
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(frontierStates(checkpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(SECOND_DETAIL)]);
+    expect(checkpoint.progress.pagesStarted).toBe(2);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(result.pages.slice(0, 2).map(({ pageId }) => pageId));
+    // 診断の記録は、試行 1 と試行 2（それぞれの試行の結果と詳細）。
+    expect(calls().map(({ record, attemptNumber }) => [attemptNumber, record.executionNumber, record.siteUnavailableDetail, record.page])).toEqual([
+      [FIRST_ATTEMPT, 1, DESKTOP_PASSIVE_TIMEOUT, harness.world.auditOutcomes[2]?.result],
+      [RECHECK_ATTEMPT, 1, SECOND_DETAIL, harness.world.auditOutcomes[3]?.result],
+    ]);
+  });
+
+  it('3. cuts the wait short and does not check again when the stop signal is set during the wait: the Run stops with the first detail', async () => {
+    const controller = new AbortController();
+    // 待ちは決して終わらない（止める印で打ち切られることを確かめる）。
+    const sleep = vi.fn((ms: number): Promise<void> => {
+      if (ms === SITE_UNAVAILABLE_RECHECK_DELAY_MS) {
+        queueMicrotask(() => controller.abort());
+        return new Promise<void>(() => undefined);
+      }
+      return Promise.resolve();
+    });
+    const { notices, onNotice } = recordedNotices();
+    const { writer, calls } = diagnosticWriter();
+    const { harness, recorder } = checkpointHarness({
+      site: unavailableAt('/b.html', RECOVERING_PAGE),
+      sleep,
+      onNotice,
+      stopSignal: controller.signal,
+      writeSiteUnavailableDiagnostic: writer,
+    });
+
+    const concluded = await concludedRun(harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
+    expect(sleep).toHaveBeenCalledWith(SITE_UNAVAILABLE_RECHECK_DELAY_MS);
+    expect(notices).toEqual([recheckNotice('/b.html')]);
+    // 残りは、止める印（RUN_INTERRUPTED）ではなく、サイトの不調の SKIPPED（確かめの順）。1 回目の不調の詳細で止める。
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    expect(calls().map(({ attemptNumber }) => attemptNumber)).toEqual([FIRST_ATTEMPT]);
+    const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
+    expect(frontierStates(checkpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(recorder.states().at(-1)?.progress.pagesStarted).toBe(2);
+  });
+
+  it('3a. does not wait at all when the stop signal is already set when the page is discarded', async () => {
+    const controller = new AbortController();
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const site = unavailableAt('/b.html', { ...RECOVERING_PAGE, duringAudit: () => controller.abort() });
+
+    const result = await createHarness({ site, sleep, onNotice, stopSignal: controller.signal }).coordinator.run();
+
+    expect(sleeps).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+  });
+
+  it('4. does not check again when the runtime limit is reached after the wait (the wait counts toward the limit): the Run stops with the first detail', async () => {
+    const MAX_RUNTIME_MS = 1_500;
+    let harness: Harness | null = null;
+    // 待ちで、注入した時計を上限の先まで進める。
+    const { sleeps, sleep } = recordedSleep(() => {
+      if (harness !== null) {
+        harness.world.nowMs += MAX_RUNTIME_MS;
+      }
+    });
+    const { notices, onNotice } = recordedNotices();
+    const made = checkpointHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), config: { crawl: { maxRuntimeMs: MAX_RUNTIME_MS } }, sleep, onNotice });
+    harness = made.harness;
+
+    const concluded = await concludedRun(made.harness);
+
+    const result = concluded.result as AuditRunResult;
+    expect(made.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(notices).toEqual([recheckNotice('/b.html')]);
+    expect(pageStates(result)).toEqual([
+      [START_PATH, 'AUDITED', []],
+      ['/a.html', 'AUDITED', []],
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+      ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+    await expectFinishCheckpoint(concluded, 'STOPPED');
+  });
+
+  it('4a. does not wait at all when the runtime limit is already reached when the page is discarded', async () => {
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const site = unavailableAt('/b.html', { ...RECOVERING_PAGE, durationMs: 2_000 });
+
+    const result = await createHarness({ site, config: { crawl: { maxRuntimeMs: 1_500 } }, sleep, onNotice }).coordinator.run();
+
+    expect(sleeps).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
+  });
+
+  it('5. does not check again when the page also recorded a violation: the violation stops the Run as before', async () => {
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const { writer } = diagnosticWriter();
+    const harness = createHarness({
+      site: unavailableAt('/b.html', { ...RECOVERING_PAGE, violations: 1 }),
+      sleep,
+      onNotice,
+      writeSiteUnavailableDiagnostic: writer,
+    });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
+    expect(sleeps).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(writer).not.toHaveBeenCalled();
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'FAILED', [NAVIGATION_TIMEOUT_REASON]]);
+    expect(result.run.runStatus).toBe('ABORTED_BY_SAFETY');
+    expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
+  });
+
+  it('6. does not check the trigger page of the previous execution again: it is saved as an ordinary result and the Run stops (3.2.1)', async () => {
+    const stopped = await recordedRun({ site: unavailableAt('/b.html') });
+    const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const { writer, calls } = diagnosticWriter();
+    const { harness, recorder } = resumedHarness(
+      { site: unavailableAt('/b.html', RECOVERING_PAGE), sleep, onNotice, writeSiteUnavailableDiagnostic: writer },
+      resumeInputFrom(stopped, checkpoint),
+    );
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html']);
+    expect(sleeps).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(pageStates(result)[2]).toEqual(['/b.html', 'FAILED', [NAVIGATION_TIMEOUT_REASON]]);
+    expect(recorder.pages().map(({ pageId }) => pageId)).toEqual([result.pages[2]?.pageId]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_SITE_UNAVAILABLE']);
+    expect(calls().map(({ record, attemptNumber }) => [record.executionNumber, attemptNumber])).toEqual([[2, FIRST_ATTEMPT]]);
+  });
+
+  it('7. checks another page once more when it becomes unavailable after a page that passed the recheck', async () => {
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const { writer, calls } = diagnosticWriter();
+    const site: FakeSite = { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': RECOVERING_PAGE };
+    const harness = createHarness({ site, sleep, onNotice, writeSiteUnavailableDiagnostic: writer });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', '/d.html', '/d.html']);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS, SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(notices).toEqual([recheckNotice('/b.html'), recheckNotice('/d.html')]);
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([['/b.html', FIRST_ATTEMPT], ['/d.html', FIRST_ATTEMPT]]);
+    expect(pageStates(result).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'AUDITED'],
+      ['/b.html', 'AUDITED'],
+      ['/c.html', 'AUDITED'],
+      ['/d.html', 'AUDITED'],
+    ]);
+    expect(result.run.incompleteReasons).toEqual([]);
+    expect(result.run.runStatus).toBe('COMPLETE');
+
+    // 対照: 後のページが 2 回とも不調なら、そのページで止まる（試行 1 と 2 の記録）。
+    const stopping = createHarness({
+      site: { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, UNAVAILABLE_OBSERVED_ATTEMPT] } },
+      writeSiteUnavailableDiagnostic: writer,
+    });
+    const stoppedResult = await stopping.coordinator.run();
+    expect(stopping.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', '/d.html', '/d.html']);
+    expect(pageStates(stoppedResult)[4]).toEqual(['/d.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
+    expect(stoppedResult.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+    expect(calls().slice(2).map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([
+      ['/b.html', FIRST_ATTEMPT],
+      ['/d.html', FIRST_ATTEMPT],
+      ['/d.html', RECHECK_ATTEMPT],
+    ]);
+  });
+
+  it('does not wait or check again when the state after the discard could not be saved (the failed save stops the Run first)', async () => {
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    // 4回目の状態の保存は、/b.html を捨てた後のもの。
+    const { harness } = checkpointHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), sleep, onNotice }, { failStateAt: 4 });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
+    expect(sleeps).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(pageStates(result).slice(2)).toEqual([
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]],
+      ['/c.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+      ['/d.html', 'SKIPPED', [CHECKPOINT_WRITE_FAILED_SKIP]],
+    ]);
+  });
+
+  it('keeps the Run going, the same as without a receiver, when the notice receiver throws or returns a rejected promise', async () => {
+    const { sleep } = recordedSleep();
+    const expected = await createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), sleep }).coordinator.run();
+    for (const onNotice of [
+      (): void => {
+        throw new Error('notice failed');
+      },
+      (): Promise<void> => Promise.reject(new Error('notice rejected')),
+    ] as const) {
+      const harness = createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), sleep, onNotice: onNotice as RunCoordinatorDependencies['onNotice'] });
+
+      const result = await harness.coordinator.run();
+
+      expect(result.run.runStatus).toBe('COMPLETE');
+      expect(result.statusInput.unhandledFailures).toBe(0);
+      expect(pageStates(result)).toEqual(pageStates(expected));
+      expect(result.run.incompleteReasons).toEqual(expected.run.incompleteReasons);
+    }
+  });
+
+  it('rejects a notice receiver that is not a function with TypeError', () => {
+    expect(() => createHarness({ site: UNAVAILABILITY_SITE, onNotice: 'notice' as unknown as RunCoordinatorDependencies['onNotice'] }))
+      .toThrow(TypeError);
   });
 });

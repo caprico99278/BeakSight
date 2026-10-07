@@ -829,8 +829,9 @@ describe('BrowserContextFactory', () => {
     });
   });
 
-  // L5b（サイトへの負荷の制御の設計書 4.6、4.7）: Context の役割（既定は PRIMARY）と、Run 全体のキャッシュの配線。
-  // キャッシュを渡した factory は、作るすべての Context の応答をキャッシュに入れ、REVISIT の Context の Guard にだけ、届け方の部品を渡す。
+  // L5b（サイトへの負荷の制御の設計書 4.6、4.7）と DEF-031（設計書 4.10.3）: Context の役割（既定は PRIMARY）と、Run 全体のキャッシュの配線。
+  // キャッシュを渡した factory は、作るすべての Context の応答をキャッシュに入れ、すべての Context の Guard に、その役割の届け方の部品を
+  // 渡す（PRIMARY も、キャッシュにあるものはキャッシュから返す）。
   // キャッシュを渡さない factory は、今の振る舞いのまま（応答を受け取らず、どの役割でも、すべてネットワークに送る）。
   describe('L5b: Context roles and the Run cache', () => {
     /** 画像を1つ読むページと、その画像（Run 全体のキャッシュに入る種類）。 */
@@ -865,18 +866,56 @@ describe('BrowserContextFactory', () => {
     const imageRequests = (server: Awaited<ReturnType<typeof startFixtureServer>>): number =>
       server.getRequestObservations().filter((observation) => observation.pathname === IMAGE_PATH).length;
 
-    it('creates PRIMARY Contexts by default; they take every resource from the network even when the Run cache has it', async () => {
+    it('creates PRIMARY Contexts by default; their Guard also gets the delivery part and serves the cached image from the Run cache (DEF-031)', async () => {
       const server = await startFixtureServer();
       const { factory, cache } = cachedFactoryFor(server.origin);
       try {
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
         await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        // 空振りでないこと: 1回目（キャッシュが空）の読み込みでは、画像はサーバに届いた。
+        expect(imageRequests(server)).toBe(1);
 
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
 
-        // 役割を省略した Context も、PRIMARY と同じく、キャッシュにある画像をネットワークから取り直す（主の読み込みは今のまま）。
-        expect(imageRequests(server)).toBe(3);
+        // 役割を省略した Context も、PRIMARY と同じく、キャッシュにある画像をキャッシュから返す（サーバに届かない）。文書は毎回届く。
+        expect(server.getRequestObservations().filter((observation) => observation.pathname === IMAGE_PAGE)).toHaveLength(3);
+        expect(imageRequests(server)).toBe(1);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('marks the requests a PRIMARY Context served from the Run cache in the LoadMeter, as in a REVISIT Context (DEF-031)', async () => {
+      const server = await startFixtureServer();
+      const cache = new ResourceCache();
+      const served: object[] = [];
+      const loadMeter: LoadMeter = {
+        recordRequestFinished: () => undefined,
+        recordRequestFailed: () => undefined,
+        recordServedFromRunCache: (request) => {
+          served.push(request);
+        },
+        recordWithheld: () => undefined,
+        snapshot: () => {
+          throw new Error('not used in this test');
+        },
+        recentPerMinute: () => {
+          throw new Error('not used in this test');
+        },
+      };
+      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { resourceCache: cache, loadMeter });
+      try {
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
+        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        expect(served).toHaveLength(0);
+
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
+
+        // キャッシュから返した画像の要求に、1回だけ印を付けた。その応答は、キャッシュに入れ直さない（項目は1つのまま）。
+        expect(served.map((request) => new URL((request as { url(): string }).url()).pathname)).toEqual([IMAGE_PATH]);
+        expect(cache.stats().entryCount).toBe(1);
+        expect(imageRequests(server)).toBe(1);
       } finally {
         await server.close();
       }
@@ -908,7 +947,7 @@ describe('BrowserContextFactory', () => {
       }
     });
 
-    it('keeps the current behavior without a Run cache: no response listener, and REVISIT Contexts take everything from the network', async () => {
+    it('keeps the current behavior without a Run cache: no request end listener, and REVISIT Contexts take everything from the network', async () => {
       const server = await startFixtureServer();
       const factory = factoryFor(configFor(server.origin));
       const { factory: withCache } = cachedFactoryFor(server.origin);
@@ -917,9 +956,13 @@ describe('BrowserContextFactory', () => {
       const cachedContext = await withCache.createPassiveContext(viewport, 'REVISIT');
       contexts.push(cachedContext);
       try {
-        // キャッシュがなければ、応答の事象を受け取らない（キャッシュがあれば、factory が1つだけ受け取る）。
+        // キャッシュがなければ、要求が成功して終わった事象（`requestfinished`）を受け取らない（キャッシュがあれば、factory が1つだけ
+        // 受け取る。どちらの factory にも meter はない）。キャッシュに入れるのは、要求が成功して終わった応答だけなので、応答の事象
+        // （`response`）は、どちらも受け取らない（PCR-DR の Important-1。設計書 4.10.3）。
+        expect(listeners(context, 'requestfinished')).toBe(0);
+        expect(listeners(cachedContext, 'requestfinished')).toBe(1);
         expect(listeners(context, 'response')).toBe(0);
-        expect(listeners(cachedContext, 'response')).toBe(1);
+        expect(listeners(cachedContext, 'response')).toBe(0);
 
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'REVISIT');

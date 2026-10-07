@@ -7,12 +7,14 @@ import type {
   Request,
   Route,
 } from 'playwright';
+import { ERROR_HTTP_STATUS_RANGE, isHttpStatusInRange } from '../audit/rule-helpers.js';
+import { isInvalidInterceptionIdFailure } from '../browser/playwright-errors.js';
 import type { ResourceDeliveryDecision, ResourceDeliveryRequestFacts } from '../browser/resource-delivery.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { NON_EXTERNAL_NAVIGATION_SCHEMES } from '../core/evidence-types.js';
 import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../core/limits.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
-import { isNetworkLayerFailure } from './network-layer-failure.js';
+import { isNetworkLayerFailure, isResponseReceivedFailure } from './network-layer-failure.js';
 import { classifyPassiveRequest, isReadMethod, type PassiveRequestDecision } from './request-policy.js';
 import type { SafetyLedger } from './safety-ledger.js';
 
@@ -47,11 +49,53 @@ const MAX_REDIRECT_REQUEST_ID_LENGTH = 256;
  * 超えた OOPIF は、一時停止のまま進めず、`OOPIF_GUARD_ATTACH_FAILED` の違反にして Context を閉じる（fail-closed）。
  */
 const MAX_GUARD_OOPIF_SESSIONS = 64;
+/**
+ * 1つの CDP の session で覚える、文書の要求の、ブラウザによる取り消しの証拠（DEF-026。同じ session の `Network.loadingFailed` で、
+ * `canceled` が真で、`type` が `Document` のもの）の数の上限。証拠は、一時停止の通知より先に届く（DEF-026-fix の実験。282件のすべてで、
+ * 一時停止の通知の 3〜55ms 前）ので、一時停止の有無によらず覚える。一時停止の通知が来ないまま取り消された文書の要求の証拠も含むので、
+ * 40個の iframe を読み込みの途中で消すページで、同時に約40件になった。その数に余裕を見た値にする。
+ * 超えた証拠は覚えず、その要求への命令が失敗したら、今のとおり違反にする（fail-closed）。
+ * DEF-027: page の session で覚える、main frame の文書の要求の記録（`MainFrameDocumentRecord`）の数も、同じ値までにする。記録は、
+ * 要求が終わったら消すか縮めるので、同時に残るのは、ふつうは数件である。超えた要求は覚えず、その取り消しは違反のまま（fail-closed）。
+ */
+export const MAX_CANCELED_DOCUMENT_EVIDENCE = 256;
+/**
+ * 文書の要求の取り消しの証拠を覚えておく時間（ms。DEF-026）。証拠を受けた時点から数える。証拠は、一時停止の通知の数十 ms 前に届き、
+ * 一時停止から命令の失敗の応答までは、ふつうは数 ms である。Node の事象の処理が遅れた場合と、証拠を待つ時間
+ * （`CANCELED_DOCUMENT_EVIDENCE_WAIT_MS`）を足しても余る長さにする。過ぎた証拠は捨て、その要求への命令が失敗したら違反にする。
+ * DEF-027: main frame の文書の要求の記録も、その要求の `Network.loadingFailed` を受けた後は、この時間で捨てる（Playwright の
+ * `requestfailed` と対応付けるのに、同じ長さで足りる）。
+ */
+export const CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS = 5_000;
+/**
+ * Guard の命令が、一時停止の ID が無効な形で失敗したのに、その要求の取り消しの証拠をまだ受けていないときに、証拠を待つ時間（ms。DEF-026）。
+ * 実験では、証拠は、いつも一時停止の通知より先に届いた。この時間は、届く順が入れ替わる場合に備えた余裕で、ブラウザの中の事象の遅れ
+ * （数 ms から数十 ms）より十分に長く、Guard の作業を長く止めない長さにする。待っても届かなければ、違反にする。
+ * Context や page を閉じる途中なら、待たずに違反にする（閉じる処理の drain を止めない）。
+ * DEF-027: main frame の読み込みの `requestfailed` を受けて、取り消しの証拠がまだそろっていないときに待つ時間も、同じ値にする
+ * （`requestfailed` と、Guard の page の session の事象の順は決まっていない。調査では 1ms ほどの差だった）。
+ */
+export const CANCELED_DOCUMENT_EVIDENCE_WAIT_MS = 500;
+/**
+ * Guard が Request の段階で一時停止した main frame の文書の要求の記録（DEF-027。`MainFrameDocumentRecord`）を、その要求が終わる前に
+ * 覚えておく時間（ms）。一時停止の通知を受けた時点から数える。要求が終わったら、記録を消す（`Network.loadingFinished`）か、
+ * `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` に縮める（`Network.loadingFailed`）。
+ * 応答を待つ main frame の読み込みは、ページを開いている間（読み込みの期限は設定の `crawl.navigationTimeoutMs`、既定 30秒。ページの期限は
+ * `crawl.overallPageTimeoutMs`、既定 60秒）、利用者がタブを閉じるなどで、いつでも取り消されうる。Guard はこれらの設定を受け取らないので、
+ * 既定のページの期限の10倍にする。過ぎた記録は捨て、その要求がその後に取り消されたら、違反のまま（fail-closed）。
+ */
+export const PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS = 600_000;
+/**
+ * ブラウザが文書の要求を取り消したときの失敗の理由（Playwright の `requestfailed` の `errorText` と、CDP の `Network.loadingFailed` の
+ * `errorText`）。Guard や page を閉じる途中の取り消しと、DEF-027 の取り消しの証拠で使う。
+ */
+const NAVIGATION_ABORTED_ERROR_TEXT = 'net::ERR_ABORTED';
 const GUARD_ERROR_NORMALIZATION_FALLBACK = 'Guard error could not be safely normalized';
 
 /**
- * Guard が、許可（ALLOW）した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7）。
- * factory（`BrowserContextFactory`）が、読み込み直しの Context（役割 `REVISIT`）ごとに作り、Guard の取り付けの指定で渡す。
+ * Guard が、許可（ALLOW）した、ナビゲーションでない要求の届け方を尋ねる部品（サイトへの負荷の制御の設計書 4.7、4.10.3）。
+ * factory（`BrowserContextFactory`）が、Run 全体のキャッシュがある場合に、Passive の Context（役割 `PRIMARY` と `REVISIT` の両方）ごとに、
+ * その役割の部品を作り、Guard の取り付けの指定で渡す（`PRIMARY` にも渡すのは DEF-031 から）。
  * Guard が尋ねるのは、段階が `PASSIVE_ACTIVE` で、許可の判定（`classifyPassiveRequest`）が ALLOW で、ナビゲーションの要求でない
  * 要求だけである。凍結の段階、閉じている段階、BLOCK の要求は、尋ねる前に Guard が止める。許可の判定は、この部品には委ねない。
  * 判断の意味の owner は `src/browser/resource-delivery.ts`（`decideResourceDelivery`）である。
@@ -100,6 +144,11 @@ interface CorrelationRequest {
 interface PausedDocumentEvent {
   readonly requestId: string;
   readonly redirectedRequestId?: string;
+  /**
+   * Network の domain の要求の ID（DEF-026）。同じ session の `Network.loadingFailed` の `requestId` と同じ値で、ブラウザによる取り消しの
+   * 証拠を、この要求に対応付けるために使う。ない場合は、対応付けられない（その要求への命令の失敗は、違反のまま）。
+   */
+  readonly networkId?: string;
   readonly frameId: string;
   readonly request: CorrelationRequest;
   /**
@@ -167,6 +216,11 @@ type RedirectPredecessorLookup =
 interface PageDocumentGuard {
   readonly session: CDPSession;
   readonly rootFrameId: string;
+  /**
+   * page の session の証拠で、main frame の文書の要求（`request`）が、Guard が Request の段階で許可して進めた後に、応答を1つも受けずに
+   * ブラウザに取り消されたと確かめられるか（DEF-027。`CanceledDocumentRegistry.awaitMainFrameCancellation`）。
+   */
+  readonly awaitMainFrameCancellation: (request: CorrelationRequest, waitMs: number) => Promise<boolean>;
 }
 
 /**
@@ -177,14 +231,31 @@ interface GuardCdpChannel {
   readonly send: CDPSession['send'];
 }
 
-/** 1つの session の Document の横取り（C18i）。`clear` は、その session のリダイレクトの対応付けの登録を消す。 */
+/**
+ * 1つの session の Document の横取り（C18i）。
+ * - `onLoadingFailed`: その session の `Network.loadingFailed` を受ける（DEF-026。一時停止した文書の要求の取り消しの証拠）。
+ * - `onResponseReceived`・`onRequestWillBeSent`・`onLoadingFinished`: その session の `Network.responseReceived`・
+ *   `Network.requestWillBeSent`・`Network.loadingFinished` を受ける（DEF-027。main frame の文書の要求が、応答を受けたか、終わったか）。
+ *   page の session だけが受ける（OOPIF の session は、main frame の要求を扱わない）。
+ * - `awaitMainFrameCancellation`: main frame の文書の要求の取り消しを、証拠で確かめる（DEF-027。page の session だけが記録を持つ）。
+ * - `clear`: その session のリダイレクトの対応付けの登録と、取り消しの証拠の記録を消す（証拠を待っている命令の失敗の扱いは、待たずに
+ *   違反にする）。
+ */
 interface DocumentInterception {
   readonly onRequestPaused: (event: PausedDocumentEvent) => void;
+  readonly onLoadingFailed: (event: unknown) => void;
+  readonly onResponseReceived: (event: unknown) => void;
+  readonly onRequestWillBeSent: (event: unknown) => void;
+  readonly onLoadingFinished: (event: unknown) => void;
+  readonly awaitMainFrameCancellation: (request: CorrelationRequest, waitMs: number) => Promise<boolean>;
   readonly clear: () => void;
 }
 
 /** Document の横取りを付ける（page の session と OOPIF の session で同じパターン。C18g、C18i）。 */
 async function enableDocumentInterception(channel: GuardCdpChannel): Promise<void> {
+  // DEF-026: 一時停止した文書の要求の、ブラウザによる取り消しの証拠（`Network.loadingFailed` の canceled）を受けるため、横取りの前に
+  // Network の domain を有効にする。失敗したら、横取りの取り付けの失敗と同じく扱う（呼び出し側が fail-closed にする）。
+  await channel.send('Network.enable');
   // Document は、リクエストの段階（許可 Origin とメソッドの判定）と、応答の段階（外部スキームへのリダイレクトを、たどる前に
   // 止める。C18g）の両方で横取りする。
   await channel.send('Fetch.enable', {
@@ -598,6 +669,359 @@ class RedirectPredecessorRegistry {
   }
 }
 
+/** 取り消しの証拠になる `Network.loadingFailed` の、要求の種類（Network の domain の ResourceType。DEF-026）。 */
+const CANCELED_DOCUMENT_RESOURCE_TYPE = 'Document';
+
+/** 文書の要求の、ブラウザによる取り消しの証拠（DEF-026。同じ session の `Network.loadingFailed`）。 */
+interface CanceledDocumentEvidence {
+  /** 期限（ms）。 */
+  readonly expiresAt: number;
+  /** `Network.loadingFailed` の `errorText`（文字列でなければ `null`）。DEF-027 の対応付けで、`net::ERR_ABORTED` かを確かめる。 */
+  readonly errorText: string | null;
+}
+
+/**
+ * Guard の page の session で、Request の段階で一時停止した main frame の文書の要求の記録（DEF-027。Network の domain の要求の ID ごと）。
+ * リダイレクトの先の要求は、同じ ID の記録を上書きする（Network の domain の要求の ID は、リダイレクトの前後で同じ）。
+ */
+interface MainFrameDocumentRecord {
+  /** 最後に Request の段階で一時停止した要求（method と URL）。Playwright の要求との対応付けに使う。 */
+  request: CorrelationRequest;
+  /** その要求を、Guard が Request の段階で許可して進めた（`Fetch.continueRequest` が成功した）か。 */
+  continued: boolean;
+  /** 応答を1つでも受けたか（Response の段階の一時停止、`Network.responseReceived`、リダイレクト）。一度真になったら戻らない。 */
+  responded: boolean;
+  /** 期限（ms）。 */
+  expiresAt: number;
+}
+
+/** main frame の文書の要求の取り消しを、証拠で確かめた結果（DEF-027）。まだ決められなければ `PENDING`。 */
+type MainFrameCancellationState = 'CONFIRMED' | 'REJECTED' | 'PENDING';
+
+/** CDP の事象の `params` から、文字列の `requestId` を取り出す（取り出せなければ `null`）。 */
+function eventRequestId(event: unknown): string | null {
+  const { requestId } = (typeof event === 'object' && event !== null ? event : {}) as { readonly requestId?: unknown };
+  return typeof requestId === 'string' && requestId.length > 0 ? requestId : null;
+}
+
+/**
+ * 1つの CDP の session で受けた、文書の要求の、ブラウザによる取り消しの証拠を覚え、Guard の命令の失敗と対応付ける（DEF-026。設計書 2章）。
+ * - 証拠（`recordLoadingFailed`）: 同じ session の `Network.loadingFailed` で、`canceled` が真で、`type` が `Document` のもの。`requestId` で
+ *   覚える。証拠は、一時停止の通知より先に届くので、一時停止の有無によらず覚える。数の上限（`MAX_CANCELED_DOCUMENT_EVIDENCE`）を超える
+ *   証拠は覚えない（その要求への命令の失敗は、違反のまま）。覚えておく時間は `CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` で、過ぎたら捨てる。
+ * - 対応付け（`awaitCancellation`）: 命令が失敗した要求の、一時停止の通知の `networkId` の証拠があるか。なければ、決めた時間だけ待つ。
+ * - 閉じる（`clear`）: session を閉じたときに、すべての証拠を消し、証拠を待っている扱いを、証拠なしで終わらせる（違反にする）。
+ *   その後は、証拠を受けず、待たない。
+ *
+ * DEF-027（設計書 `2026-10-05-beaksight-def-027-external-cancel-design.md` 2.1、2.1.1、2.2）: page の session では、同じ証拠を、main frame
+ * の読み込みの `net::ERR_ABORTED` の確かめにも使う。そこでは、証拠を次の2つに分け、両方がそろって初めて違反にしない（設計書 2.1.1）。
+ * - (b) 取り消しの証拠: この部品の証拠（`canceled` が真の、`Document` の `Network.loadingFailed`）のうち、`errorText` が `net::ERR_ABORTED`
+ *   のもの。`canceled` は、204 やダウンロードへの切り替わり（応答を受けた後の取り消し）でも真になるので、これだけでは、応答がページに
+ *   渡っていないとは言えない。
+ * - (c) 応答がページに渡っていないことの証拠: その要求について、応答（Response の段階の一時停止、`Network.responseReceived`、
+ *   リダイレクト）を1つも受けていないこと（`MainFrameDocumentRecord.responded` が偽）。204 やダウンロードを外すのは、こちらである。
+ * そのため、main frame の文書の要求の記録（`MainFrameDocumentRecord`）を、同じ部品に置く（取り消しの証拠を2か所に持たない）。
+ * - 記録（`recordMainFramePaused`・`recordMainFrameContinued`・`recordResponseReceived`・`recordRequestWillBeSent`）: Request の段階の
+ *   一時停止で記録を作り、Guard が許可して進めた（命令が成功した。(a)）こと、応答を受けたこと（Response の段階の一時停止、
+ *   `Network.responseReceived`、`Network.requestWillBeSent` の `redirectResponse`、リダイレクトの先の一時停止）を記録する。
+ *   数の上限は `MAX_CANCELED_DOCUMENT_EVIDENCE`（超えた要求は覚えない）、時間の上限は `PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS`。
+ *   要求が終わったら、記録を消す（`recordLoadingFinished`）か、`CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS` に縮める（`recordLoadingFailed`）。
+ * - 確かめ（`awaitMainFrameCancellation`）: Playwright の要求（method と URL）と、記録を1対1に対応付け、(a) 許可して進めた、(b) 取り消しの
+ *   証拠がある、(c) 応答がページに渡っていないことの証拠がある、のすべてを満たすときだけ真。使った記録と証拠は消す（1回だけ使う）。
+ *   Guard が進める前に取り消された要求（例: 0〜5ms の間隔の `location.replace` の連続）は、(a) を満たさないので、違反のまま残る
+ *   （設計書 2.1.1 の限界）。
+ */
+class CanceledDocumentRegistry {
+  /** 証拠の `requestId` と、その期限と `errorText`。 */
+  readonly #evidence = new Map<string, CanceledDocumentEvidence>();
+  /** 証拠を待っている扱い（`requestId` ごと。証拠を受けたとき、session を閉じたときに呼ぶ）。 */
+  readonly #waiters = new Map<string, Set<() => void>>();
+  /** main frame の文書の要求の記録（DEF-027。Network の domain の要求の ID ごと。page の session だけが使う）。 */
+  readonly #mainFrameDocuments = new Map<string, MainFrameDocumentRecord>();
+  /** main frame の取り消しの確かめを待っている扱い（DEF-027。記録や証拠が変わったとき、session を閉じたときに呼ぶ）。 */
+  readonly #mainFrameWaiters = new Set<() => void>();
+  #cleared = false;
+
+  /** 同じ session の `Network.loadingFailed` を受けたとき。文書の要求の取り消しなら覚え、その要求の証拠を待っている扱いを起こす。 */
+  recordLoadingFailed(event: unknown, now: number): void {
+    const { requestId, canceled, type, errorText } = (typeof event === 'object' && event !== null ? event : {}) as {
+      readonly requestId?: unknown;
+      readonly canceled?: unknown;
+      readonly type?: unknown;
+      readonly errorText?: unknown;
+    };
+    if (this.#cleared || typeof requestId !== 'string' || requestId.length === 0) {
+      return;
+    }
+    // DEF-027: main frame の文書の要求が終わった。Playwright の要求と対応付けるのに要る時間だけ、記録を残す。
+    const record = this.#mainFrameDocuments.get(requestId);
+    if (record !== undefined) {
+      record.expiresAt = Math.min(record.expiresAt, now + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS);
+    }
+    if (canceled !== true || type !== CANCELED_DOCUMENT_RESOURCE_TYPE) {
+      this.#wakeMainFrameWaiters();
+      return;
+    }
+    this.#purge(now);
+    // 同じ要求の証拠をもう一度受けた場合は、期限を数え直す（数は増えない）。
+    if (!this.#evidence.has(requestId) && this.#evidence.size >= MAX_CANCELED_DOCUMENT_EVIDENCE) {
+      this.#wakeMainFrameWaiters();
+      return;
+    }
+    this.#evidence.set(requestId, {
+      expiresAt: now + CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS,
+      errorText: typeof errorText === 'string' ? errorText : null,
+    });
+    for (const wake of [...(this.#waiters.get(requestId) ?? [])]) wake();
+    this.#wakeMainFrameWaiters();
+  }
+
+  /**
+   * `networkId` の要求の取り消しの証拠を受けているか。まだ受けていなければ、`waitMs` まで待つ（待つ間に証拠を受けたら、すぐに真で解決する）。
+   * session を閉じた後は、待たずに偽。
+   */
+  awaitCancellation(networkId: string, waitMs: number): Promise<boolean> {
+    if (this.#hasEvidence(networkId) || waitMs <= 0 || this.#cleared) {
+      return Promise.resolve(this.#hasEvidence(networkId));
+    }
+    return new Promise<boolean>((resolve) => {
+      const waiters = this.#waiters.get(networkId) ?? new Set<() => void>();
+      this.#waiters.set(networkId, waiters);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (): void => {
+        clearTimeout(timer);
+        waiters.delete(settle);
+        if (waiters.size === 0 && this.#waiters.get(networkId) === waiters) this.#waiters.delete(networkId);
+        resolve(this.#hasEvidence(networkId));
+      };
+      waiters.add(settle);
+      timer = setTimeout(settle, waitMs);
+    });
+  }
+
+  /**
+   * main frame の文書の要求を、Request か Response の段階で一時停止した（DEF-027。page の session の、main frame の事象だけ）。
+   * - Request の段階: 記録を作る（同じ ID の記録があれば、リダイレクトの先の要求として上書きする）。リダイレクトの先の要求
+   *   （`redirectedRequestId` を持つ）は、応答を受けたものとして記録する。`networkId` がない、method や URL が上限を超える、記録の数が上限に
+   *   達している場合は、覚えない（その要求の取り消しは、違反のまま）。
+   * - Response の段階: 応答を受けたことを記録する。
+   */
+  recordMainFramePaused(event: PausedDocumentEvent, now: number): void {
+    const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
+    if (this.#cleared || networkId === null) {
+      return;
+    }
+    this.#purgeMainFrameDocuments(now);
+    const record = this.#mainFrameDocuments.get(networkId);
+    if (isPausedDocumentResponse(event)) {
+      if (record !== undefined) record.responded = true;
+      this.#wakeMainFrameWaiters();
+      return;
+    }
+    const request = boundedCorrelationRequest(event.request.method, event.request.url);
+    const redirected = event.redirectedRequestId !== undefined;
+    if (record !== undefined) {
+      if (request === null) {
+        this.#mainFrameDocuments.delete(networkId);
+      } else {
+        record.request = request;
+        record.continued = false;
+        record.responded ||= redirected;
+      }
+      this.#wakeMainFrameWaiters();
+      return;
+    }
+    if (request === null || this.#mainFrameDocuments.size >= MAX_CANCELED_DOCUMENT_EVIDENCE) {
+      return;
+    }
+    // 取り消しの証拠が一時停止の通知より先に届いていた（一時停止の間に取り消された）場合は、その証拠と同じ期限にする。
+    this.#mainFrameDocuments.set(networkId, {
+      request,
+      continued: false,
+      responded: redirected,
+      expiresAt: this.#evidence.get(networkId)?.expiresAt ?? now + PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS,
+    });
+    this.#wakeMainFrameWaiters();
+  }
+
+  /** Guard が、`networkId` の要求を Request の段階で許可して進めた（`Fetch.continueRequest` が成功した。DEF-027）。記録がなければ何もしない。 */
+  recordMainFrameContinued(networkId: string): void {
+    const record = this.#mainFrameDocuments.get(networkId);
+    if (this.#cleared || record === undefined) {
+      return;
+    }
+    record.continued = true;
+    this.#wakeMainFrameWaiters();
+  }
+
+  /** 同じ session の `Network.responseReceived` を受けたとき（DEF-027）。main frame の文書の要求の記録があれば、応答を受けたと記録する。 */
+  recordResponseReceived(event: unknown): void {
+    this.#markResponded(eventRequestId(event));
+  }
+
+  /** 同じ session の `Network.requestWillBeSent` を受けたとき（DEF-027）。リダイレクト（`redirectResponse` がある）なら、応答を受けたと記録する。 */
+  recordRequestWillBeSent(event: unknown): void {
+    const { redirectResponse } = (typeof event === 'object' && event !== null ? event : {}) as { readonly redirectResponse?: unknown };
+    if (redirectResponse !== undefined) {
+      this.#markResponded(eventRequestId(event));
+    }
+  }
+
+  /** 同じ session の `Network.loadingFinished` を受けたとき（DEF-027）。要求は読み込みを終えたので、main frame の文書の要求の記録を消す。 */
+  recordLoadingFinished(event: unknown): void {
+    const requestId = eventRequestId(event);
+    if (requestId !== null && this.#mainFrameDocuments.delete(requestId)) {
+      this.#wakeMainFrameWaiters();
+    }
+  }
+
+  /**
+   * Playwright の main frame の要求（`request`。method と URL）について、この session の証拠で、(a) Guard が Request の段階で許可して
+   * 進めた、(b) `net::ERR_ABORTED` で取り消された（取り消しの証拠）、(c) 応答を1つも受けていない（応答がページに渡っていないことの証拠）、
+   * の3つがそろったと確かめられるか（DEF-027。設計書 2.1 の3、4、2.1.1）。
+   * まだ決められなければ、`waitMs` まで待つ（待つ間に記録や証拠が変わったら、その場で確かめ直す）。session を閉じたら、偽。
+   */
+  awaitMainFrameCancellation(request: CorrelationRequest, waitMs: number): Promise<boolean> {
+    const state = this.#settleMainFrameCancellation(request);
+    if (state !== 'PENDING' || waitMs <= 0) {
+      return Promise.resolve(state === 'CONFIRMED');
+    }
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (confirmed: boolean): void => {
+        clearTimeout(timer);
+        this.#mainFrameWaiters.delete(check);
+        resolve(confirmed);
+      };
+      const check = (): void => {
+        const current = this.#settleMainFrameCancellation(request);
+        if (current !== 'PENDING') finish(current === 'CONFIRMED');
+      };
+      this.#mainFrameWaiters.add(check);
+      timer = setTimeout(() => finish(this.#settleMainFrameCancellation(request) === 'CONFIRMED'), waitMs);
+    });
+  }
+
+  /** session を閉じたときに、すべての証拠と記録を消し、証拠を待っている扱いを、証拠なしで終わらせる。 */
+  clear(): void {
+    this.#cleared = true;
+    this.#evidence.clear();
+    this.#mainFrameDocuments.clear();
+    const waiters = [...this.#waiters.values()].flatMap((set) => [...set]);
+    this.#waiters.clear();
+    for (const wake of waiters) wake();
+    this.#wakeMainFrameWaiters();
+  }
+
+  #hasEvidence(networkId: string): boolean {
+    const evidence = this.#evidence.get(networkId);
+    return evidence !== undefined && evidence.expiresAt >= Date.now();
+  }
+
+  #purge(now: number): void {
+    for (const [requestId, evidence] of this.#evidence) {
+      if (evidence.expiresAt < now) this.#evidence.delete(requestId);
+    }
+  }
+
+  #purgeMainFrameDocuments(now: number): void {
+    for (const [networkId, record] of this.#mainFrameDocuments) {
+      if (record.expiresAt < now) this.#mainFrameDocuments.delete(networkId);
+    }
+  }
+
+  #markResponded(networkId: string | null): void {
+    const record = networkId === null ? undefined : this.#mainFrameDocuments.get(networkId);
+    if (this.#cleared || record === undefined) {
+      return;
+    }
+    record.responded = true;
+    this.#wakeMainFrameWaiters();
+  }
+
+  #wakeMainFrameWaiters(): void {
+    for (const check of [...this.#mainFrameWaiters]) check();
+  }
+
+  /**
+   * DEF-027: `request` の取り消しを、いまの記録と証拠で確かめる（設計書 2.1、2.1.1）。(b) の取り消しの証拠（`canceled` が真で、`errorText`
+   * が `net::ERR_ABORTED`）は、204 やダウンロードへの切り替わりでもそろうので、(c) の応答がページに渡っていないことの証拠（応答を1つも
+   * 受けていない）と両方がそろって初めて `CONFIRMED` にする。
+   * - 同じ method と URL の記録（候補）が2つ以上ある: 区別できないので `REJECTED`。
+   * - 候補が1つで、応答を受けている（(c) がない）: `REJECTED`。証拠の `errorText` が `net::ERR_ABORTED` でない（(b) がない）: `REJECTED`。
+   * - 候補が1つで、(a) 許可して進めた記録、(b) 取り消しの証拠、(c) 応答を受けていないこと、がそろった: その記録と証拠を消して `CONFIRMED`。
+   * - 候補がない、(a) か (b) がまだない: `PENDING`。session を閉じた後は `REJECTED`。
+   */
+  #settleMainFrameCancellation(request: CorrelationRequest): MainFrameCancellationState {
+    if (this.#cleared) {
+      return 'REJECTED';
+    }
+    const now = Date.now();
+    this.#purge(now);
+    this.#purgeMainFrameDocuments(now);
+    const candidates = [...this.#mainFrameDocuments].filter(([, record]) => record.request.method === request.method
+      && record.request.url === request.url);
+    if (candidates.length > 1) {
+      return 'REJECTED';
+    }
+    const [candidate] = candidates;
+    if (candidate === undefined) {
+      return 'PENDING';
+    }
+    const [networkId, record] = candidate;
+    const evidence = this.#evidence.get(networkId);
+    if (record.responded || (evidence !== undefined && evidence.errorText !== NAVIGATION_ABORTED_ERROR_TEXT)) {
+      return 'REJECTED';
+    }
+    if (evidence === undefined || !record.continued) {
+      return 'PENDING';
+    }
+    this.#mainFrameDocuments.delete(networkId);
+    this.#evidence.delete(networkId);
+    return 'CONFIRMED';
+  }
+}
+
+/**
+ * 一時停止した1つの文書の要求への、Guard の命令（DEF-026）。どちらも `settlePausedDocumentCommand` で結果を決める（ブラウザが取り消した
+ * 要求への命令の失敗は、成功と同じに解決する。それ以外の失敗は投げる）。
+ */
+interface PausedDocumentCommands {
+  continueRequest(): Promise<void>;
+  failRequest(): Promise<void>;
+}
+
+/**
+ * 一時停止した文書の要求への Guard の命令（`send`）を送り、その結果を決める（DEF-026。設計書 2章）。page の session と OOPIF の session、
+ * Request の段階と Response の段階の、すべての `Fetch.continueRequest` と `Fetch.failRequest` は、この関数で結果を決める。
+ * - 成功: 解決する。
+ * - 失敗: 次のすべてを満たすときだけ、ブラウザが取り消した要求への命令として、成功と同じに解決する。
+ *   1. 失敗の文言が、一時停止の ID が無効な形（`isInvalidInterceptionIdFailure`）である。
+ *   2. 一時停止の通知に `networkId` がある。
+ *   3. 同じ session で、その `networkId` の取り消しの証拠を受けている（一時停止の通知より前に受けたものを含む）。まだなら、
+ *      `CANCELED_DOCUMENT_EVIDENCE_WAIT_MS` まで待つ。Guard や page が閉じる途中（`closing` が真）なら待たない。待つ間に session を
+ *      閉じた（`clear`）場合も、待つのをやめる。
+ *   どれかを満たさなければ、受けた失敗をそのまま投げる（呼び出し側が、今のとおり違反にする。fail-closed）。
+ */
+async function settlePausedDocumentCommand(
+  send: () => Promise<unknown>,
+  canceledDocuments: CanceledDocumentRegistry,
+  networkId: string | null,
+  closing: () => boolean,
+): Promise<void> {
+  try {
+    await send();
+  } catch (error) {
+    if (
+      networkId === null
+      || !isInvalidInterceptionIdFailure(errorMessage(error))
+      || !(await canceledDocuments.awaitCancellation(networkId, closing() ? 0 : CANCELED_DOCUMENT_EVIDENCE_WAIT_MS))
+    ) {
+      throw error;
+    }
+  }
+}
+
 function recordGuardTaskDrainTimeoutOnce(guardState: GuardState): void {
   if (guardState.drainTimeoutReported) return;
   guardState.drainTimeoutReported = true;
@@ -956,8 +1380,7 @@ async function continueNative(requestInvalidation: () => void, route: Route, led
 
 async function failPausedDocumentForLifecycle(
   context: BrowserContext,
-  session: GuardCdpChannel,
-  requestId: string,
+  commands: PausedDocumentCommands,
   ledger: SafetyLedger,
   expectedCdpFailures: ExpectedCdpFailureRegistry,
   page: Page,
@@ -965,10 +1388,7 @@ async function failPausedDocumentForLifecycle(
 ): Promise<void> {
   const expectedFailure = expectedCdpFailures.register(page, request, Date.now());
   try {
-    await session.send('Fetch.failRequest', {
-      requestId,
-      errorReason: 'BlockedByClient',
-    });
+    await commands.failRequest();
   } catch (error) {
     if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
     ledger.recordInvariantViolation({
@@ -1189,8 +1609,36 @@ export async function installPassiveRequestGuard(
         // 横取り。page と OOPIF で同じ判定（リダイレクトの対応付け、`expectedCdpFailures`、外部スキームへのリダイレクトの判定、閉じる
         // 途中と凍結の後の扱い）を使う。リダイレクトの対応付けの登録は、session ごとに持つ（requestId は、その session の中で対応付く）。
         // OOPIF の事象の frame は、page の root frame ではないので、main frame として扱わない。
-        const createDocumentInterception = (channel: GuardCdpChannel): DocumentInterception => {
+        // DEF-027: `mainFrameId` は、main frame の文書の要求を記録する session（page の session）で、その root frame の ID。OOPIF の session は
+        // `null`（main frame の要求を扱わないので、記録しない）。
+        const createDocumentInterception = (channel: GuardCdpChannel, mainFrameId: string | null): DocumentInterception => {
           const redirectedPredecessors = new RedirectPredecessorRegistry(ledger);
+          // DEF-026（設計書 `2026-10-05-beaksight-def-026-guard-canceled-document-design.md`）: この session で受けた、文書の要求の、
+          // ブラウザによる取り消しの証拠（同じ session の `Network.loadingFailed` の canceled で、type が Document）。一時停止した文書の要求
+          // への命令（`Fetch.continueRequest`、`Fetch.failRequest`）の結果は、すべて `settlePausedDocumentCommand` で、一時停止の通知の
+          // `networkId` と証拠を対応付けて決める。
+          // DEF-027: page の session では、main frame の文書の要求の記録も持つ（`CanceledDocumentRegistry` の DEF-027 の部分）。
+          const canceledDocuments = new CanceledDocumentRegistry();
+          const closingForCommands = (): boolean => isClosingOrInvalidatingPhase(guardState.phase) || ownerClosingPages.has(page);
+          const pausedDocumentCommands = (event: PausedDocumentEvent): PausedDocumentCommands => {
+            const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
+            const settle = (send: () => Promise<unknown>): Promise<void> =>
+              settlePausedDocumentCommand(send, canceledDocuments, networkId, closingForCommands);
+            return {
+              continueRequest: () => settle(async () => {
+                await channel.send('Fetch.continueRequest', { requestId: event.requestId });
+                // DEF-027（設計書 2.1 の3 (a)）: Request の段階の命令が成功した（Guard が許可して進めた）ことだけを記録する。命令が失敗した
+                // 場合（ブラウザが取り消したもので、DEF-026 で成功と同じに解決する場合を含む）は、ここに来ないので記録しない。
+                if (networkId !== null && !isPausedDocumentResponse(event)) {
+                  canceledDocuments.recordMainFrameContinued(networkId);
+                }
+              }),
+              failRequest: () => settle(() => channel.send('Fetch.failRequest', {
+                requestId: event.requestId,
+                errorReason: 'BlockedByClient',
+              })),
+            };
+          };
           // C18g（RC18a の指摘1・3。Task 19 の前の整理の設計書 4.2「サーバのリダイレクトは、たどる前に止める」、4.2.1）:
           // Document の応答の段階で、3xx の `Location` が外部スキームなら、リダイレクトをたどる前にリクエストを失敗させ、
           // `externalSchemeNavigations` に `EXTERNAL_SCHEME_REDIRECT_BLOCKED` で記録する。止めて防げる経路なので、違反にしない
@@ -1205,13 +1653,16 @@ export async function installPassiveRequestGuard(
           // まず消す。続けるリダイレクトの応答（3xx で `Location` を持つ）だけ、登録し直して、期限をこの時点から数える。3xx を返すまでの
           // サーバの時間を、期限に数えないためである。登録できない場合（件数の上限など）は、登録の側が違反を記録し、この応答を失敗させて
           // Context を閉じる（リクエストの段階の登録と同じ fail-closed）。
-          const handlePausedDocumentResponse = async (event: PausedDocumentEvent, phase: GuardPhase): Promise<void> => {
+          const handlePausedDocumentResponse = async (
+            event: PausedDocumentEvent,
+            phase: GuardPhase,
+            commands: PausedDocumentCommands,
+          ): Promise<void> => {
             redirectedPredecessors.forget(event.requestId);
             if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
               await failPausedDocumentForLifecycle(
                 context,
-                channel,
-                event.requestId,
+                commands,
                 ledger,
                 expectedCdpFailures,
                 page,
@@ -1226,8 +1677,7 @@ export async function installPassiveRequestGuard(
               });
               await failPausedDocumentForLifecycle(
                 context,
-                channel,
-                event.requestId,
+                commands,
                 ledger,
                 expectedCdpFailures,
                 page,
@@ -1241,10 +1691,7 @@ export async function installPassiveRequestGuard(
             } catch (error) {
               ledger.recordInvariantViolation({ code: 'EXTERNAL_SCHEME_DETECTION_FAILED', message: errorMessage(error) });
               try {
-                await channel.send('Fetch.failRequest', {
-                  requestId: event.requestId,
-                  errorReason: 'BlockedByClient',
-                });
+                await commands.failRequest();
               } catch (failError) {
                 ledger.recordInvariantViolation({
                   code: 'CDP_FAIL_REQUEST_FAILED',
@@ -1260,10 +1707,7 @@ export async function installPassiveRequestGuard(
                 && !redirectedPredecessors.remember(event.requestId, event.request, Date.now())
               ) {
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                 } catch (error) {
                   ledger.recordInvariantViolation({
                     code: 'CDP_FAIL_REQUEST_FAILED',
@@ -1274,7 +1718,7 @@ export async function installPassiveRequestGuard(
                 return;
               }
               try {
-                await channel.send('Fetch.continueRequest', { requestId: event.requestId });
+                await commands.continueRequest();
               } catch (error) {
                 ledger.recordInvariantViolation({
                   code: 'CDP_CONTINUE_REQUEST_FAILED',
@@ -1293,10 +1737,7 @@ export async function installPassiveRequestGuard(
               ? expectedCdpFailures.register(page, event.request, Date.now())
               : null;
             try {
-              await channel.send('Fetch.failRequest', {
-                requestId: event.requestId,
-                errorReason: 'BlockedByClient',
-              });
+              await commands.failRequest();
             } catch (error) {
               if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
               // 止められたか分からないので、止めた記録にはしない。
@@ -1316,20 +1757,25 @@ export async function installPassiveRequestGuard(
             });
           };
           const onRequestPaused = (event: PausedDocumentEvent): void => {
+            // DEF-027: main frame の文書の要求の一時停止を、事象を受けた順に記録する（Request の段階は記録を作り、Response の段階は応答を
+            // 受けたと記録する）。Guard の作業（下の非同期の処理）の順は、事象の順と入れ替わることがある（DEF-026-fix の報告）ため、ここで
+            // 同期に記録する。
+            if (mainFrameId !== null && event.frameId === mainFrameId) {
+              canceledDocuments.recordMainFramePaused(event, Date.now());
+            }
+            // DEF-026: この要求への命令（結果は、取り消しの証拠と対応付けて決める）。
+            const commands = pausedDocumentCommands(event);
             trackGuardTask(guardState, 'paused CDP Document request', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
               const phase = guardState.phase;
               if (isPausedDocumentResponse(event)) {
-                await handlePausedDocumentResponse(event, phase);
+                await handlePausedDocumentResponse(event, phase, commands);
                 return;
               }
               const interceptedRequest = boundedCorrelationRequest(event.request.method, event.request.url);
               if (interceptedRequest === null) {
                 expectedCdpFailures.register(page, event.request, Date.now());
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                 } catch (error) {
                   ledger.recordInvariantViolation({
                     code: 'CDP_FAIL_REQUEST_FAILED',
@@ -1350,10 +1796,7 @@ export async function installPassiveRequestGuard(
                   });
                 }
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                 } catch (error) {
                   ledger.recordInvariantViolation({
                     code: 'CDP_FAIL_REQUEST_FAILED',
@@ -1379,10 +1822,7 @@ export async function installPassiveRequestGuard(
                 });
                 let invalidationNeeded = expectedFailure === null;
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                 } catch (error) {
                   if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
                   ledger.recordInvariantViolation({
@@ -1397,8 +1837,7 @@ export async function installPassiveRequestGuard(
               if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
                 await failPausedDocumentForLifecycle(
                   context,
-                  channel,
-                  event.requestId,
+                  commands,
                   ledger,
                   expectedCdpFailures,
                   page,
@@ -1413,8 +1852,7 @@ export async function installPassiveRequestGuard(
                 });
                 await failPausedDocumentForLifecycle(
                   context,
-                  channel,
-                  event.requestId,
+                  commands,
                   ledger,
                   expectedCdpFailures,
                   page,
@@ -1424,10 +1862,7 @@ export async function installPassiveRequestGuard(
               }
               if (!redirectedPredecessors.remember(event.requestId, interceptedRequest, Date.now())) {
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                 } catch (error) {
                   ledger.recordInvariantViolation({
                     code: 'CDP_FAIL_REQUEST_FAILED',
@@ -1452,10 +1887,7 @@ export async function installPassiveRequestGuard(
                   expectedFailure = expectedCdpFailures.register(page, redirectedFrom, Date.now()) ?? undefined;
                 }
                 try {
-                  await channel.send('Fetch.failRequest', {
-                    requestId: event.requestId,
-                    errorReason: 'BlockedByClient',
-                  });
+                  await commands.failRequest();
                   recordBlockedDecision(ledger, decision, {
                     method: event.request.method,
                     url: event.request.url,
@@ -1476,7 +1908,7 @@ export async function installPassiveRequestGuard(
                 return;
               }
               try {
-                await channel.send('Fetch.continueRequest', { requestId: event.requestId });
+                await commands.continueRequest();
               } catch (error) {
                 ledger.recordInvariantViolation({
                   code: 'CDP_CONTINUE_REQUEST_FAILED',
@@ -1486,9 +1918,24 @@ export async function installPassiveRequestGuard(
               }
             });
           };
-          return Object.freeze({ onRequestPaused, clear: () => redirectedPredecessors.clear() });
+          // DEF-026: 同じ session の `Network.loadingFailed`（取り消しの証拠）を受ける。
+          const onLoadingFailed = (event: unknown): void => canceledDocuments.recordLoadingFailed(event, Date.now());
+          return Object.freeze({
+            onRequestPaused,
+            onLoadingFailed,
+            // DEF-027: 同じ session の、main frame の文書の要求が応答を受けたか、終わったか（記録のない要求の事象は、何もしない）。
+            onResponseReceived: (event: unknown): void => canceledDocuments.recordResponseReceived(event),
+            onRequestWillBeSent: (event: unknown): void => canceledDocuments.recordRequestWillBeSent(event),
+            onLoadingFinished: (event: unknown): void => canceledDocuments.recordLoadingFinished(event),
+            awaitMainFrameCancellation: (request: CorrelationRequest, waitMs: number): Promise<boolean> =>
+              canceledDocuments.awaitMainFrameCancellation(request, waitMs),
+            clear: () => {
+              redirectedPredecessors.clear();
+              canceledDocuments.clear();
+            },
+          });
         };
-        const pageInterception = createDocumentInterception(session);
+        const pageInterception = createDocumentInterception(session, rootFrameId);
         // C18i: page の子の OOPIF の session（入れ子の OOPIF の session は、その親の OOPIF の node の `children` に持つ）。
         const pageOopifSessions = new Map<string, OopifGuardNode>();
         let oopifSessionCount = 0;
@@ -1539,9 +1986,14 @@ export async function installPassiveRequestGuard(
               interception?.onRequestPaused(eventParams as PausedDocumentEvent);
               return;
             }
+            // DEF-026: この OOPIF の session の `Network.loadingFailed`（取り消しの証拠）。
+            if (method === 'Network.loadingFailed') {
+              interception?.onLoadingFailed(eventParams);
+              return;
+            }
             onTargetEvent(channel, children, method, eventParams);
           });
-          interception = createDocumentInterception(channel);
+          interception = createDocumentInterception(channel, null);
           sessions.set(sessionId, { channel, interception, children });
           oopifSessionCount += 1;
           trackGuardTask(guardState, 'OOPIF document interception attach', 'GUARD_OOPIF_ATTACH_TASK_FAILED', async () => {
@@ -1634,6 +2086,17 @@ export async function installPassiveRequestGuard(
         listenerGroup.cleanups.push(() => session.off('close', onSessionClose));
         session.on('Fetch.requestPaused', pageInterception.onRequestPaused);
         listenerGroup.cleanups.push(() => session.off('Fetch.requestPaused', pageInterception.onRequestPaused));
+        // DEF-026: page の session の `Network.loadingFailed`（一時停止した文書の要求の取り消しの証拠）。
+        session.on('Network.loadingFailed', pageInterception.onLoadingFailed);
+        listenerGroup.cleanups.push(() => session.off('Network.loadingFailed', pageInterception.onLoadingFailed));
+        // DEF-027: page の session の、main frame の文書の要求が応答を受けたか（`Network.responseReceived`、リダイレクトの
+        // `Network.requestWillBeSent`）と、読み込みを終えたか（`Network.loadingFinished`）。
+        session.on('Network.responseReceived', pageInterception.onResponseReceived);
+        listenerGroup.cleanups.push(() => session.off('Network.responseReceived', pageInterception.onResponseReceived));
+        session.on('Network.requestWillBeSent', pageInterception.onRequestWillBeSent);
+        listenerGroup.cleanups.push(() => session.off('Network.requestWillBeSent', pageInterception.onRequestWillBeSent));
+        session.on('Network.loadingFinished', pageInterception.onLoadingFinished);
+        listenerGroup.cleanups.push(() => session.off('Network.loadingFinished', pageInterception.onLoadingFinished));
         session.on('Target.attachedToTarget', onPageOopifAttached);
         listenerGroup.cleanups.push(() => session.off('Target.attachedToTarget', onPageOopifAttached));
         session.on('Target.receivedMessageFromTarget', onPageOopifMessage);
@@ -1649,7 +2112,7 @@ export async function installPassiveRequestGuard(
         // C18i: 横取りを付けた後に、OOPIF への自動の付与を始める。どちらかが失敗したら、page の準備の失敗（`CDP_SETUP_FAILED`）として
         // Context を閉じる（fail-closed）。
         await enableOopifAutoAttach(session);
-        const guard = { session, rootFrameId };
+        const guard = { session, rootFrameId, awaitMainFrameCancellation: pageInterception.awaitMainFrameCancellation };
         record.status = 'READY';
         resolveReady(guard);
       } catch (error) {
@@ -1797,6 +2260,22 @@ export async function installPassiveRequestGuard(
       initiateInvalidation(context, ledger);
     }
   };
+  /**
+   * DEF-027: `page` の Guard の page の session の証拠で、main frame の要求 `request` を、Guard が Request の段階で許可して進めた後に、
+   * 応答を1つも受けずにブラウザが取り消したと確かめられるか（`CanceledDocumentRegistry.awaitMainFrameCancellation`。設計書 2.1 の3、4、
+   * 2.2）。page の Guard の準備ができていない、method や URL が上限（`boundedCorrelationRequest`）を超える場合は、偽。証拠がまだそろって
+   * いなければ `CANCELED_DOCUMENT_EVIDENCE_WAIT_MS` まで待つ。Guard や page が閉じる途中なら、待たない。
+   */
+  const isMainFrameCancellationConfirmed = async (page: Page, request: Request): Promise<boolean> => {
+    const correlation = boundedCorrelationRequest(request.method(), request.url());
+    const pageGuard = pageGuards.get(page);
+    if (correlation === null || pageGuard?.status !== 'READY') {
+      return false;
+    }
+    const { awaitMainFrameCancellation } = await pageGuard.ready;
+    const closing = isClosingOrInvalidatingPhase(guardState.phase) || ownerClosingPages.has(page);
+    return awaitMainFrameCancellation(correlation, closing ? 0 : CANCELED_DOCUMENT_EVIDENCE_WAIT_MS);
+  };
   const onRequestFailed = (request: Request): void => {
     const completion = runGuardProtocolTask(
       guardState,
@@ -1843,7 +2322,7 @@ export async function installPassiveRequestGuard(
         }, authoritySnapshot);
         if (decision.action === 'ALLOW' && request.isNavigationRequest() && isMainFrame) {
           if (
-            message === 'net::ERR_ABORTED'
+            message === NAVIGATION_ABORTED_ERROR_TEXT
             && requestPage !== undefined
             && (
               ownerClosingPages.has(requestPage)
@@ -1858,6 +2337,39 @@ export async function installPassiveRequestGuard(
             !isFrozenPhase(guardState.phase)
             && isReadMethod(request.method())
             && isNetworkLayerFailure(message)
+          ) {
+            return;
+          }
+          // DEF-029: 許可した読み取りのナビゲーションが、凍結の前に、応答（ヘッダ）を受けた後の失敗の閉じた一覧に載る理由で失敗し、
+          // その要求の応答の HTTP の status が 4xx・5xx なら、要求はサーバに届き、サーバが失敗の status で答えた（配送は確か）ので、
+          // Guard の違反ではない。応答がない、取り出しが失敗する、status が範囲の外の場合は、これまでどおり違反とする（fail-closed）。
+          if (
+            !isFrozenPhase(guardState.phase)
+            && isReadMethod(request.method())
+            && isResponseReceivedFailure(message)
+          ) {
+            let responseStatus: number | null = null;
+            try {
+              responseStatus = (await request.response())?.status() ?? null;
+            } catch {
+              // 応答の取り出しの失敗は、応答がないものとして扱う（違反のまま）。
+            }
+            if (isHttpStatusInRange(responseStatus, ERROR_HTTP_STATUS_RANGE)) {
+              return;
+            }
+          }
+          // DEF-027（設計書 `2026-10-05-beaksight-def-027-external-cancel-design.md` 2.1、2.1.1）: 許可した読み取りのナビゲーションが、
+          // 凍結の前に `net::ERR_ABORTED` で失敗し、Guard の page の session の証拠で、その要求（page、method、URL で1対1に対応付けたもの）に
+          // ついて、(a) Guard が Request の段階で許可して進めた、(b) 取り消しの証拠がある、(c) 応答（ヘッダ）を1つも受けていない（応答が
+          // ページに渡っていないことの証拠）の3つを確かめた場合は、Guard の違反ではない（BeakSight の外の操作か、ページのスクリプトによる
+          // 取り消し）。確かめられない場合は、これまでどおり違反とする（fail-closed）。Guard が進める前に取り消された要求は、(a) がないので
+          // 違反のまま残る（設計書 2.1.1 の限界）。
+          if (
+            !isFrozenPhase(guardState.phase)
+            && isReadMethod(request.method())
+            && message === NAVIGATION_ABORTED_ERROR_TEXT
+            && requestPage !== undefined
+            && await isMainFrameCancellationConfirmed(requestPage, request)
           ) {
             return;
           }

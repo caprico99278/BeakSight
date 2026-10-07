@@ -12,6 +12,8 @@
  *   再開の設計書 4.10。RR の Minor-5）。
  * - 入出力の失敗は、`ArtifactWriteError` を投げる。
  * - HTML レポートと ChatGPT 用バンドルは、描画する側が作った中身を `writePresentation` で書く（書き出しの owner は、ここだけ）。
+ * - サイトの不調で止めたときの診断の記録（`diagnostics/`）も、Run Coordinator が組み立てた値を `writeSiteUnavailableDiagnostic` で、
+ *   スキーマで検証してから書く（サイトの不調で止めたときの診断の記録の設計書 2.3）。
  * - 中断した Run の再開のための保存（チェックポイント）の書き出しと読み込み（状態の保存だけの読み込みを含む）、ロックのファイルの作成・
  *   書き換え・削除、再開のときの後始末、終わった Run の使わない保存の片付けも、ここで行う（中断した Run の再開の設計書 4.1〜4.5、4.7.1。
  *   保存のファイルの読み書きを1か所にする）。
@@ -41,6 +43,7 @@ import {
   isPreflightTemporaryFileName,
   pageArtifactRelativePath,
   runArtifactDirectory,
+  siteUnavailableDiagnosticRelativePath,
   type CheckpointArtifactFile,
 } from '../core/artifact-layout.js';
 import type {
@@ -179,6 +182,16 @@ export interface CheckpointStateShape {
  */
 export interface CheckpointPageShape {
   readonly pageId: PageId;
+}
+
+/**
+ * サイトの不調で止めたときの診断の記録の値のうち、ArtifactWriter が知る最小の形（ファイルの名前に使う、ページの ID と実行の番号。サイトの
+ * 不調で止めたときの診断の記録の設計書 2.3）。値の全体の形は `schemas/site-unavailable-diagnostic.schema.json` が決め、その型は
+ * `src/orchestration/run-coordinator.ts` の `SiteUnavailableDiagnosticRecord`（report は orchestration を import しないので、総称で受ける）。
+ */
+export interface SiteUnavailableDiagnosticShape {
+  readonly pageId: PageId;
+  readonly executionNumber: number;
 }
 
 /**
@@ -427,11 +440,15 @@ function assertPathPageId(pageId: unknown): asserts pageId is PageId {
 }
 
 /**
- * 保存の値を、artifact の JSON の書式（`serializeArtifactJson`）の文字列にする。書く文字列を JSON として読み戻した値を、
- * スキーマ（`schema`）で検証し、合わなければ何も書かずに `ArtifactWriteError` を投げる（読み戻した値で確かめるので、書いたものは
- * 読むときにも同じ検証を通る）。
+ * 保存の値（と、サイトの不調で止めたときの診断の記録）を、artifact の JSON の書式（`serializeArtifactJson`）の文字列にする。書く文字列を
+ * JSON として読み戻した値を、スキーマ（`schema`）で検証し、合わなければ何も書かずに `ArtifactWriteError` を投げる（読み戻した値で
+ * 確かめるので、書いたものは読むときにも同じ検証を通る）。
  */
-async function checkpointJson(schema: 'checkpoint' | 'checkpoint-page', path: string, value: unknown): Promise<string> {
+async function checkpointJson(
+  schema: 'checkpoint' | 'checkpoint-page' | 'site-unavailable-diagnostic',
+  path: string,
+  value: unknown,
+): Promise<string> {
   let data: string;
   let written: unknown;
   try {
@@ -851,6 +868,36 @@ export class ArtifactWriter {
       writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.bundle);
     }
     return Object.freeze(writtenFiles);
+  }
+
+  // -------------------------------------------------------------------------------------------------------------
+  // サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）
+  // -------------------------------------------------------------------------------------------------------------
+
+  /**
+   * サイトの不調で止めたときの診断の記録（Run Coordinator の `SiteUnavailableDiagnosticRecord`）を、Run のディレクトリの
+   * `diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`（`siteUnavailableDiagnosticRelativePath`）に書き、その相対パスを
+   * 返す。`attemptNumber` は、その実行の中でそのページを監査した試行の番号（1 回目が 1。捨てた後に 1 回だけ確かめ直した試行は 2。サイトが
+   * 応答しないときに Run を止める設計書 3.5.2）。記録の中には入れない（記録の形は変えない。名前にだけ使う）。
+   * - 値を `site-unavailable-diagnostic` のスキーマで検証し、合わなければ何も書かずに `ArtifactWriteError` を投げる（呼び出し側が捨てる）。
+   * - 合えば、今の artifact の書き方（同じディレクトリの一時ファイルに書いて、名前を変える。`renameWithRetry`）で書く。`diagnostics/`
+   *   （と Run のディレクトリ）がなければ作る。同じ名前のファイルがあれば置き換える。ほかのファイルには触れない。
+   * - 監査の結果ではないので、Run Status は導き直さない。`fsync` も加えない（最後の artifact の書き出しと同じ）。
+   * Run のディレクトリが空なら `TypeError`、ページの ID か実行の番号か試行の番号がファイルの名前に使えない形なら `RangeError` を、
+   * 何も書かずに投げる。
+   */
+  async writeSiteUnavailableDiagnostic<TRecord extends SiteUnavailableDiagnosticShape>(
+    runDirectory: string,
+    record: TRecord,
+    attemptNumber: number,
+  ): Promise<string> {
+    assertRunDirectory(runDirectory, 'writeSiteUnavailableDiagnostic');
+    const pageId: unknown = isRecord(record) ? record.pageId : undefined;
+    assertPathPageId(pageId);
+    const relativePath = siteUnavailableDiagnosticRelativePath(pageId, record.executionNumber, attemptNumber);
+    const path = artifactFilePath(runDirectory, relativePath);
+    await writeFileAtomically(path, await checkpointJson('site-unavailable-diagnostic', path, record), this.#rename);
+    return relativePath;
   }
 
   // -------------------------------------------------------------------------------------------------------------

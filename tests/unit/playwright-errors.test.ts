@@ -2,7 +2,9 @@ import { errors } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import {
   BLOCKED_BY_CLIENT_FAILURE_TEXTS,
+  INVALID_INTERCEPTION_ID_FAILURE_TEXTS,
   isBlockedByClientFailure,
+  isInvalidInterceptionIdFailure,
   isPlaywrightTimeoutError,
 } from '../../src/browser/playwright-errors.js';
 
@@ -83,5 +85,46 @@ describe('isBlockedByClientFailure (L4)', () => {
     ['undefined', undefined],
   ])('does not report %s as blocked by the client (unknown reasons are counted)', (_label, text) => {
     expect(isBlockedByClientFailure(text)).toBe(false);
+  });
+});
+
+// DEF-026（設計書 `2026-10-05-beaksight-def-026-guard-canceled-document-design.md` 2章）: Guard の CDP の層の命令
+// （`Fetch.continueRequest`、`Fetch.failRequest`）が、一時停止の ID が無効なために失敗したときの文言の、完全一致の閉じた一覧。
+// page の session（Playwright の `CDPSession.send`）は命令の名前を含む形、OOPIF の session は Chromium の失敗の応答の文言そのもの。
+describe('isInvalidInterceptionIdFailure (DEF-026)', () => {
+  /** page の session の、進める命令の失敗の文言（DEF-026 の調査で、本番と同じ文言を再現した）。 */
+  const PAGE_CONTINUE_TEXT = 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.';
+  /** page の session の、止める命令の失敗の文言。 */
+  const PAGE_FAIL_TEXT = 'cdpSession.send: Protocol error (Fetch.failRequest): Invalid InterceptionId.';
+  /** OOPIF の session の失敗の文言（Chromium の失敗の応答の `message`。進める命令と止める命令で同じ）。 */
+  const OOPIF_TEXT = 'Invalid InterceptionId.';
+
+  it('lists exactly the page session texts of both commands and the OOPIF session text', () => {
+    expect([...INVALID_INTERCEPTION_ID_FAILURE_TEXTS]).toEqual([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT]);
+    expect(Object.isFrozen(INVALID_INTERCEPTION_ID_FAILURE_TEXTS)).toBe(true);
+  });
+
+  it.each([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT])('reports %s as an invalid interception id failure', (text) => {
+    expect(isInvalidInterceptionIdFailure(text)).toBe(true);
+  });
+
+  it.each([
+    ['the OOPIF text without the final period', 'Invalid InterceptionId'],
+    ['the page text without the final period', 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId'],
+    ['the page text without the cdpSession.send prefix', 'Protocol error (Fetch.continueRequest): Invalid InterceptionId.'],
+    ['the same failure of another command', 'cdpSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId.'],
+    ['the same failure of another domain', 'cdpSession.send: Protocol error (Network.continueInterceptedRequest): Invalid InterceptionId.'],
+    ['a longer text that contains the OOPIF text', 'Protocol error: Invalid InterceptionId.'],
+    ['a longer text with the same prefix', 'Invalid InterceptionId. (retry)'],
+    ['a different case', 'invalid interceptionid.'],
+    ['surrounding spaces', ' Invalid InterceptionId. '],
+    ['the failure after the target closed', 'cdpSession.send: Target page, context or browser has been closed'],
+    ['the failure after the OOPIF session was detached', 'OOPIF interception session was detached'],
+    ['another protocol failure of the same command', 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid state for continueInterceptedRequest'],
+    ['an empty text', ''],
+    ['null', null],
+    ['undefined', undefined],
+  ])('does not report %s as an invalid interception id failure (unknown failures stay violations)', (_label, text) => {
+    expect(isInvalidInterceptionIdFailure(text)).toBe(false);
   });
 });

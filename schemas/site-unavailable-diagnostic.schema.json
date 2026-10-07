@@ -1,0 +1,149 @@
+{
+  "$id": "urn:beaksight:schema:site-unavailable-diagnostic:1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "executionNumber",
+    "writtenAt",
+    "pageId",
+    "url",
+    "siteUnavailableDetail",
+    "page",
+    "navigationDiagnostics"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "site-unavailable-diagnostic-schema/1.1" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "executionNumber": { "type": "integer", "minimum": 1 },
+    "writtenAt": { "$ref": "urn:beaksight:schema:run:1.0#/properties/startedAt" },
+    "pageId": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageId" },
+    "url": { "$ref": "urn:beaksight:schema:page:1.0#/properties/pageUrl" },
+    "siteUnavailableDetail": { "type": "string", "minLength": 1 },
+    "page": { "$ref": "urn:beaksight:schema:page:1.0" },
+    "navigationDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desktop", "mobile"],
+      "properties": {
+        "desktop": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/viewportNavigationDiagnostics" }] },
+        "mobile": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/viewportNavigationDiagnostics" }] }
+      }
+    }
+  },
+  "$defs": {
+    "timeMs": { "type": "integer", "minimum": 0 },
+    "viewportNavigationDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passive", "stressWidths", "interactionCandidates"],
+      "properties": {
+        "passive": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/navigationDiagnostics" }] },
+        "stressWidths": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/stressWidthNavigationDiagnostics" } },
+        "interactionCandidates": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/interactionCandidateNavigationDiagnostics" }
+        }
+      }
+    },
+    "stressWidthNavigationDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "diagnostics"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "diagnostics": { "$ref": "#/$defs/navigationDiagnostics" }
+      }
+    },
+    "interactionCandidateNavigationDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "diagnostics"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "diagnostics": { "$ref": "#/$defs/navigationDiagnostics" }
+      }
+    },
+    "navigationDiagnostics": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "observationStartedAtMs",
+            "observationEndedAtMs",
+            "documentRequests",
+            "omittedDocumentRequestCount",
+            "omittedEventCount"
+          ],
+          "properties": {
+            "status": { "const": "OBSERVED" },
+            "observationStartedAtMs": { "$ref": "#/$defs/timeMs" },
+            "observationEndedAtMs": { "$ref": "#/$defs/timeMs" },
+            "documentRequests": { "type": "array", "maxItems": 16, "items": { "$ref": "#/$defs/documentRequest" } },
+            "omittedDocumentRequestCount": { "type": "integer", "minimum": 0 },
+            "omittedEventCount": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": { "const": "NOT_OBSERVED" },
+            "reason": { "type": "string", "maxLength": 2048 }
+          }
+        }
+      ]
+    },
+    "documentRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hops", "loadingFinishedAtMs", "loadingFailure"],
+      "properties": {
+        "hops": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/documentRequestHop" } },
+        "loadingFinishedAtMs": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/timeMs" }] },
+        "loadingFailure": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/loadingFailure" }] }
+      }
+    },
+    "documentRequestHop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "method",
+        "truncated",
+        "issuedAtMs",
+        "requestHeadersSentAtMs",
+        "responseHeadersReceivedAtMs",
+        "httpStatus",
+        "remoteIpAddress",
+        "remotePort"
+      ],
+      "properties": {
+        "url": { "type": "string", "maxLength": 2048 },
+        "method": { "type": "string", "maxLength": 32 },
+        "truncated": { "type": "boolean" },
+        "issuedAtMs": { "$ref": "#/$defs/timeMs" },
+        "requestHeadersSentAtMs": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/timeMs" }] },
+        "responseHeadersReceivedAtMs": { "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/timeMs" }] },
+        "httpStatus": { "type": ["integer", "null"], "minimum": 0 },
+        "remoteIpAddress": { "type": ["string", "null"], "minLength": 1 },
+        "remotePort": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "loadingFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failedAtMs", "errorText", "canceled"],
+      "properties": {
+        "failedAtMs": { "$ref": "#/$defs/timeMs" },
+        "errorText": { "type": "string", "maxLength": 2048 },
+        "canceled": { "type": "boolean" }
+      }
+    }
+  }
+}

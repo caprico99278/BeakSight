@@ -223,8 +223,14 @@ immutable AuditConfig
 | Resource delivery after Passive ALLOW（Run 全体のキャッシュと、送らない要求） | `src/browser/resource-delivery.ts` |
 | Run checkpoint content and resumption（再開のための保存の中身と、再開の判定） | `src/orchestration/run-checkpoint.ts` |
 | Run checkpoint session（保存、ロック、ハートビート） | `src/orchestration/run-checkpoint-session.ts` |
+| Site unavailability（サイトの不調とみなす読み込みの失敗の判定） | `src/orchestration/site-availability.ts` |
+| Navigation diagnostics（Passive のページ本体の要求の観察。診断のためだけ） | `src/browser/navigation-diagnostics.ts` |
 
 > 2026-10-01 追補: 表の最後の5行は、ユーザーの承認を得た追補設計書 `2026-10-01-beaksight-site-load-control-design.md`（第5章）と `2026-10-01-beaksight-resumable-run-design.md`（第5章）で加えた owner である。許可の判定（Passive HTTP authority）は、引き続き `request-policy.ts` だけが行い、届け方の部品は、許可された要求の届け方（ネットワーク、キャッシュから返す、送らない）を選ぶだけである。保存とロックのファイルの読み書きは、引き続き `artifact-writer.ts` だけが行う。
+
+> 2026-10-05 追補: 最後の行（Site unavailability）は、ユーザーの判断を反映した追補設計書 `2026-10-05-beaksight-site-unavailability-stop-design.md`（第2章、第4章）で加えた owner である。不調で止めた後の実行の終わり方と保存の終わり方は、引き続き `run-checkpoint.ts` だけが決める。
+
+> 2026-10-06 追補: Navigation diagnostics の行は、ユーザーの指示を反映した追補設計書 `2026-10-06-beaksight-site-unavailable-diagnostics-design.md`（第3章）で加えた owner である。観察だけで、判定も、監査の結果への記録もしない（診断のファイルにだけ書く）。
 
 新しい実装で第二ownerが必要に見えた場合は、第二ownerを追加せず停止して設計上の問題として報告してください。
 

@@ -1,7 +1,7 @@
 // R15a（Task 14〜17 の設計書 5.6.4）: ナビゲーションが失敗したときの理由（`NAVIGATION_FAILED`）の detail。
 // Run Coordinator は、この detail で再試行するかを判断する。
 import { describe, expect, it } from 'vitest';
-import { chromiumNetErrorCode, navigationFailureDetail } from '../../src/orchestration/page-auditor.js';
+import { chromiumNetErrorCode, navigationFailureDetail } from '../../src/orchestration/page-navigation.js';
 
 describe('chromiumNetErrorCode', () => {
   it.each([

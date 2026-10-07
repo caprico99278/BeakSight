@@ -1,7 +1,15 @@
 import type { Page } from 'playwright';
+import {
+  observeMainFrameLoad,
+  trackMainFrameDocument,
+  type MainFrameLoadObservation,
+  type MainFrameLoadSettlement,
+} from '../browser/main-frame-load.js';
+import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { pageFailureReason } from '../browser/page-failure.js';
 import type { Viewport } from '../config/types.js';
-import { awaitBeforeDeadline } from '../core/deadline.js';
+import type { NavigationDiagnostics } from '../core/contracts.js';
+import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   FIXED_ELEMENT_POSITIONS,
@@ -35,6 +43,7 @@ import {
   MAX_ERROR_MESSAGE_LENGTH,
   MAX_SELECTOR_DEPTH,
   MAX_SELECTOR_LENGTH,
+  SESSION_OPEN_TIMEOUT_MS,
 } from '../core/limits.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
 
@@ -169,6 +178,24 @@ export interface StressLayoutOptions {
    * 待たない呼び出し側（テストなど）は、それを明示する関数（`async () => 0`）を渡す。
    */
   readonly beforeNavigation: () => Promise<number>;
+  /**
+   * 各幅の読み込み（`page.goto`）の観測と、その読み込みの間のページ本体の要求の観察の結果を受け取る口（サイトが応答しないときに Run を
+   * 止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。読み込みを始めた幅ごとに1回、読み込みが
+   * 終わった（期限の競争の結果が出た）直後に呼ぶ。読み込みを始めなかった幅（`NOT_STARTED`）では呼ばない。
+   * 観測は `src/browser/main-frame-load.ts` の部品で作る。観察は `src/browser/navigation-diagnostics.ts` の部品で、`goto` の直前に
+   * 始め（期限は、その幅の読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方）、`goto` の直後に、結果によらず止める。
+   * 始められなくても読み込みは行い、`NOT_OBSERVED` の結果を渡す。この collector は判定をしない（判定は、受け取った Page Auditor が行う）。
+   * 省略できる。省略すると、観測を作らず、page の事象の受け口も付けず、観察も始めない（今までの振る舞いのまま）。関数でない値は、
+   * セッションを作らずに例外を投げる。
+   */
+  readonly afterNavigation?: ((observation: MainFrameLoadObservation, diagnostics: NavigationDiagnostics) => void) | undefined;
+  /**
+   * 各幅の読み込みの間のページ本体の要求の観察を始める処理（CDP の session を開く）を待つ上限（ms。診断の記録の設計書 2.2「長く待たない」。
+   * D3R の Minor-1）。既定は `SESSION_OPEN_TIMEOUT_MS`。観察の開始の期限は、今からこの時間の後と、その幅の読み込みの期限の早い方である
+   * （Passive の観察の開始と同じ）。読み込みの期限そのものは変えない。`afterNavigation` を省略した場合は使わない。正の安全な整数で
+   * なければ、セッションを作らずに例外（`RangeError`）を投げる。
+   */
+  readonly sessionOpenTimeoutMs?: number | undefined;
 }
 
 function positiveFiniteDimension(value: number, name: string): void {
@@ -1324,7 +1351,11 @@ function failedWidth(
  * ある幅の遷移や収集が失敗しても、それまでの幅の結果を保持し、失敗した幅を理由付きで記録して次の幅へ進む。
  * 期限を過ぎた後の幅は、セッションを作らずに `NOT_STARTED` として記録する。
  * 各幅の遷移の直前に `options.beforeNavigation` を呼び、待った時間の分だけ期限を延ばす（サイトへの負荷の制御の設計書 4.1、4.4）。
- * `options`（期限と間隔の待ち）は省略できない。省略した場合と、`beforeNavigation` が関数でない場合は、セッションを作らずに例外を投げる。
+ * `options.afterNavigation` を渡した場合は、各幅の遷移の前に main frame の文書の追跡を付け、ページ本体の要求の観察を始め、遷移の結果から
+ * 観測を作って、遷移の直後に止めた観察の結果とともに渡し、追跡を外す（サイトが応答しないときに Run を止める設計書 2.1。サイトの不調で
+ * 止めたときの診断の記録の設計書 2.2）。
+ * `options`（期限と間隔の待ち）は省略できない。省略した場合と、`beforeNavigation` が関数でない場合、`afterNavigation` が関数でも
+ * `undefined` でもない場合は、セッションを作らずに例外を投げる。
  * セッションの作成と close の失敗は、owner のライフサイクルの失敗として例外で返す。
  */
 export async function collectStressLayout(
@@ -1342,7 +1373,7 @@ export async function collectStressLayout(
   if (typeof options !== 'object' || options === null) {
     throw new Error('Responsive stress requires options with a deadline and a beforeNavigation function');
   }
-  const { beforeNavigation } = options;
+  const { beforeNavigation, afterNavigation } = options;
   let { deadlineAtMs } = options;
   if (!Number.isFinite(deadlineAtMs)) {
     throw new Error('Responsive stress deadline must be finite');
@@ -1350,6 +1381,10 @@ export async function collectStressLayout(
   if (typeof beforeNavigation !== 'function') {
     throw new Error('Responsive stress requires a beforeNavigation function');
   }
+  if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
+    throw new Error('Responsive stress afterNavigation must be a function when given');
+  }
+  const sessionOpenTimeoutMs = resolveTimeoutMs(options.sessionOpenTimeoutMs, SESSION_OPEN_TIMEOUT_MS);
 
   const results: StressLayoutEvidence[] = [];
   for (const width of widths) {
@@ -1365,7 +1400,29 @@ export async function collectStressLayout(
     try {
       // ページの読み込みの間隔のために待った時間は、期限を消費しない（サイトへの負荷の制御の設計書 4.4）。
       deadlineAtMs += await beforeNavigation();
-      const navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
+      // 受け口があれば、読み込みの観測と、ページ本体の要求の観察の結果を渡す（サイトが応答しないときに Run を止める設計書 2.1。診断の
+      // 記録の設計書 2.2）。追跡は読み込みの前に付け、観測を渡した後に外す。観察は読み込みの直前に始め、読み込みの直後に、結果によらず
+      // 止める（止める処理は `detach` の終わりを待たない）。観察を始める処理は、この幅の読み込みの期限と、今から `sessionOpenTimeoutMs`
+      // 後の早い方までしか待たず（設計書 2.2「長く待たない」。Passive の観察と同じ）、始められなくても読み込みは、読み込みの期限まで
+      // 今までどおり行う。判定はしない。
+      const tracker = afterNavigation === undefined ? null : trackMainFrameDocument(session.page);
+      const recorder = afterNavigation === undefined
+        ? null
+        : await startNavigationDiagnostics(session.page, { deadlineAtMs: Math.min(deadlineAtMs, Date.now() + sessionOpenTimeoutMs) });
+      let navigated: MainFrameLoadSettlement;
+      try {
+        let diagnostics: NavigationDiagnostics | null = null;
+        try {
+          navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
+        } finally {
+          diagnostics = recorder === null ? null : await recorder.finish();
+        }
+        if (tracker !== null && afterNavigation !== undefined && diagnostics !== null) {
+          afterNavigation(observeMainFrameLoad(tracker, navigated), diagnostics);
+        }
+      } finally {
+        tracker?.dispose();
+      }
       if (navigated.status === 'DEADLINE_EXCEEDED') {
         result = failedWidth(width, 'NAVIGATION', 'DEADLINE_EXCEEDED', undefined);
       } else if (navigated.status === 'REJECTED') {

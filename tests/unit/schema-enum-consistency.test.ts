@@ -7,11 +7,17 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
+import {
+  MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS,
+  MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
+} from '../../src/browser/navigation-diagnostics.js';
 import * as contracts from '../../src/core/contracts.js';
 import * as evidenceTypes from '../../src/core/evidence-types.js';
 import { createEvidenceId } from '../../src/core/ids.js';
+import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../../src/core/limits.js';
+import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 
-type SchemaName = 'audit' | 'checkpoint' | 'checkpoint-page' | 'finding' | 'page' | 'run';
+type SchemaName = 'audit' | 'checkpoint' | 'checkpoint-page' | 'finding' | 'page' | 'run' | 'site-unavailable-diagnostic';
 
 interface EnumMapping {
   readonly schema: SchemaName;
@@ -257,7 +263,7 @@ beforeAll(() => {
 
 describe('F12: schema enums and the core value arrays', () => {
   it('reads every schema that the mapping table refers to', () => {
-    expect([...schemas.keys()].sort()).toEqual(['audit', 'checkpoint', 'checkpoint-page', 'finding', 'page', 'run']);
+    expect([...schemas.keys()].sort()).toEqual(['audit', 'checkpoint', 'checkpoint-page', 'finding', 'page', 'run', 'site-unavailable-diagnostic']);
   });
 
   it('has no duplicate row in the mapping table', () => {
@@ -287,6 +293,81 @@ describe('F12: schema enums and the core value arrays', () => {
 
     expect(found.filter((key) => !mapped.has(key))).toEqual([]);
     expect([...mapped].filter((key) => !found.includes(key))).toEqual([]);
+  });
+});
+
+// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録のスキーマは、enum を持たない。ページ本体の要求の観察の結果の状態は、
+// 分岐（`oneOf`）ごとの `const` で表すので、分岐の `const` の並びが core の一覧（`NAVIGATION_DIAGNOSTICS_STATUSES`）と一致することを確かめる。
+// 上限（`maxItems`、`maxLength`）は、観察の部品（`src/browser/navigation-diagnostics.ts`）の定数と `src/core/limits.ts` の定数と一致する
+// ことを、下の対応表で確かめる。対応表にない上限がスキーマにあれば、失敗する。
+const DIAGNOSTIC_SCHEMA: SchemaName = 'site-unavailable-diagnostic';
+/** ページ本体の要求の観察の結果の分岐（`OBSERVED`、`NOT_OBSERVED` の順）。 */
+const NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER = '/$defs/navigationDiagnostics/oneOf';
+
+/** 診断の記録のスキーマの上限と、その定義元の定数の対応表。 */
+const DIAGNOSTIC_LIMIT_MAPPINGS: readonly (readonly [pointer: string, expected: number, constant: string])[] = Object.freeze([
+  // D3（設計書 2.2 の 2026-10-07 の改訂、2.3）: ビューポートごとの、幅の走査の幅ごとの観察の数の上限（設定の `stressWidths` に上限がないので、
+  // 記録の上限は `src/core/contracts.ts` の定数）と、Interaction の候補ごとの観察の数の上限（候補の数の上限 `INTERACTION_CANDIDATE_LIMITS.maxCandidates`）。
+  ['/$defs/viewportNavigationDiagnostics/properties/stressWidths/maxItems', contracts.MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS, 'MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS'],
+  ['/$defs/viewportNavigationDiagnostics/properties/interactionCandidates/maxItems', INTERACTION_CANDIDATE_LIMITS.maxCandidates, 'INTERACTION_CANDIDATE_LIMITS.maxCandidates'],
+  [`${NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER}/0/properties/documentRequests/maxItems`, MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS, 'MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS'],
+  // 文書の要求の1回分（hop）は、それぞれ1件の事象（`Network.requestWillBeSent`）から作るので、1つの要求の回の数は、事象の上限を超えない。
+  ['/$defs/documentRequest/properties/hops/maxItems', MAX_NAVIGATION_DIAGNOSTICS_EVENTS, 'MAX_NAVIGATION_DIAGNOSTICS_EVENTS'],
+  ['/$defs/documentRequestHop/properties/url/maxLength', MAX_URL_LENGTH, 'MAX_URL_LENGTH'],
+  ['/$defs/documentRequestHop/properties/method/maxLength', MAX_HTTP_METHOD_LENGTH, 'MAX_HTTP_METHOD_LENGTH'],
+  ['/$defs/loadingFailure/properties/errorText/maxLength', MAX_ERROR_MESSAGE_LENGTH, 'MAX_ERROR_MESSAGE_LENGTH'],
+  [`${NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER}/1/properties/reason/maxLength`, MAX_ERROR_MESSAGE_LENGTH, 'MAX_ERROR_MESSAGE_LENGTH'],
+] as const);
+
+/** スキーマを走査し、`maxItems` と `maxLength` のキーを持つすべての場所の JSON Pointer（値そのものを指す）を集める。 */
+function collectLimitPointers(node: unknown, pointer: string, found: string[]): void {
+  if (Array.isArray(node)) {
+    node.forEach((item, index) => collectLimitPointers(item, `${pointer}/${index}`, found));
+    return;
+  }
+  if (typeof node !== 'object' || node === null) {
+    return;
+  }
+  for (const [key, value] of Object.entries(node)) {
+    const childPointer = `${pointer}/${escapePointerToken(key)}`;
+    if (key === 'maxItems' || key === 'maxLength') {
+      found.push(childPointer);
+    } else {
+      collectLimitPointers(value, childPointer, found);
+    }
+  }
+}
+
+describe('D2: the statuses and the limits of the site-unavailable diagnostic schema, and the core and D1 constants', () => {
+  it('lists the statuses of the branches of the navigation diagnostics in the order of NAVIGATION_DIAGNOSTICS_STATUSES', () => {
+    const branches = resolvePointer(schemas.get(DIAGNOSTIC_SCHEMA), NAVIGATION_DIAGNOSTICS_BRANCHES_POINTER);
+
+    expect(Array.isArray(branches)).toBe(true);
+    expect(Object.isFrozen(contracts.NAVIGATION_DIAGNOSTICS_STATUSES)).toBe(true);
+    expect((branches as readonly unknown[]).map((branch) => resolvePointer(branch, '/properties/status/const')))
+      .toEqual([...contracts.NAVIGATION_DIAGNOSTICS_STATUSES]);
+  });
+
+  it('requires the navigation diagnostics of every viewport of VIEWPORT_PROFILES, and no other viewport', () => {
+    const schema = schemas.get(DIAGNOSTIC_SCHEMA);
+
+    expect(resolvePointer(schema, '/properties/navigationDiagnostics/required')).toEqual([...contracts.VIEWPORT_PROFILES]);
+    expect(Object.keys(resolvePointer(schema, '/properties/navigationDiagnostics/properties') as object)).toEqual([...contracts.VIEWPORT_PROFILES]);
+    expect(resolvePointer(schema, '/properties/navigationDiagnostics/additionalProperties')).toBe(false);
+  });
+
+  it.each(DIAGNOSTIC_LIMIT_MAPPINGS.map(([pointer, expected, constant]) => [`${pointer} = ${constant}`, pointer, expected] as const))(
+    'matches %s',
+    (_name, pointer, expected) => {
+      expect(resolvePointer(schemas.get(DIAGNOSTIC_SCHEMA), pointer)).toBe(expected);
+    },
+  );
+
+  it('maps every limit found in the schema (no limit outside the mapping table)', () => {
+    const found: string[] = [];
+    collectLimitPointers(schemas.get(DIAGNOSTIC_SCHEMA), '', found);
+
+    expect(found.sort()).toEqual(DIAGNOSTIC_LIMIT_MAPPINGS.map(([pointer]) => pointer).sort());
   });
 });
 

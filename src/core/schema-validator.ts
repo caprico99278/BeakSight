@@ -1,7 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { Ajv, type ErrorObject, type ValidateFunction } from 'ajv';
 
-export type ArtifactSchemaName = 'run' | 'audit' | 'page' | 'finding' | 'checkpoint' | 'checkpoint-page';
+export type ArtifactSchemaName =
+  | 'run'
+  | 'audit'
+  | 'page'
+  | 'finding'
+  | 'checkpoint'
+  | 'checkpoint-page'
+  | 'site-unavailable-diagnostic';
 
 export type ArtifactValidationResult =
   | { readonly ok: true }
@@ -14,6 +21,8 @@ const schemaIdByName: Readonly<Record<ArtifactSchemaName, string>> = {
   finding: 'urn:beaksight:schema:finding:1.0',
   checkpoint: 'urn:beaksight:schema:checkpoint:1.0',
   'checkpoint-page': 'urn:beaksight:schema:checkpoint-page:1.0',
+  // サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。
+  'site-unavailable-diagnostic': 'urn:beaksight:schema:site-unavailable-diagnostic:1.0',
 };
 
 let validatorsPromise: Promise<Readonly<Record<ArtifactSchemaName, ValidateFunction>>> | undefined;
