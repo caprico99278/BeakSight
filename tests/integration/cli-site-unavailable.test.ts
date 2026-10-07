@@ -81,13 +81,14 @@ import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import {
   RunCoordinator,
   SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-  SITE_UNAVAILABLE_RECHECK_DELAY_MS,
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
+  SITE_UNAVAILABLE_SLOWDOWN_FACTOR,
   type SiteUnavailableDiagnosticRecord,
 } from '../../src/orchestration/run-coordinator.js';
 import { SITE_UNAVAILABLE_SKIP_REASON } from '../../src/orchestration/site-availability.js';
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { formatDuration } from '../../src/presentation/format.js';
-import { CLI_TEXT, siteUnavailableRecheckText, siteUnavailableStopText } from '../../src/presentation/messages.js';
+import { CLI_TEXT, siteUnavailableRecheckText, siteUnavailableSlowdownText, siteUnavailableStopText } from '../../src/presentation/messages.js';
 import { BROWSER_DEFAULT_FAVICON_PATH } from '../helpers/chromium.js';
 import { captureCliOutput, fastRunConfig, readJson, readRunAudit } from '../helpers/run-harness.js';
 
@@ -325,26 +326,34 @@ afterAll(async () => {
   expect(leftovers.length, 'Browsers left connected after the Runs').toBe(0);
 });
 
-/** 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（中継のサーバの `/crawl/` のページ）。 */
-const configFor = (name: string): AuditConfig =>
+/**
+ * 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（中継のサーバの `/crawl/` のページ）。
+ * `minNavigationIntervalMs` を渡すと、ページの読み込みの間隔をその値にする（既定は `createTestConfig` の 0。減速（SU6）を確かめる場面で使う。
+ * 待ちは差し替えるので、実際には待たない）。
+ */
+const configFor = (name: string, minNavigationIntervalMs = 0): AuditConfig =>
   fastRunConfig(relay.origin, START_PATH, {
     target: { id: 'cli-site-unavailable' },
     output: { directory: join(workDirectory, name) },
-    crawl: { navigationTimeoutMs: UNRESPONSIVE_NAVIGATION_TIMEOUT_MS },
+    crawl: { navigationTimeoutMs: UNRESPONSIVE_NAVIGATION_TIMEOUT_MS, minNavigationIntervalMs },
     viewports: { stressWidths: [...STRESS_WIDTHS] },
   });
 
 /**
  * Run Coordinator に加える、テストの差し替え（`createRunCoordinator` で、CLI が渡すものに加えて `new RunCoordinator` に渡す）。
  * - `switchAfterPages`: そのページ数の監査が終わったとき（`onProgress`）に、中継のサーバのモードを切り替える。
- * - `onRecheckWait`: 確かめ直しの前の待ち（`SITE_UNAVAILABLE_RECHECK_DELAY_MS` の `sleep`。SU5）のときに呼ぶ。
- * 待ち（`sleep`）は、いつも差し替える（実際には待たずに、待った長さを記録する。60 秒の待ちをテストで待たないため。設定の間隔は 0 なので、
- * 間隔の待ちは起きない）。
+ * - `onRecheckWait`: 確かめ直しの前の待ち（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` のどれかの `sleep`。SU5、SU6）のときに呼ぶ（引数は、その
+ *   待ちの長さと、この実行で何回目の確かめ直しの待ちか（0 から））。
+ * 待ち（`sleep`）は、いつも差し替える（実際には待たずに、待った長さを記録する。60 秒〜8 分の待ちをテストで待たないため。設定の間隔が 0 でない
+ * 場面（減速。SU6）では、間隔の待ちも記録されるが、実際には待たない）。
  */
 interface CoordinatorHooks {
   readonly switchAfterPages?: { readonly pages: number; readonly mode: RelayMode };
-  readonly onRecheckWait?: () => void;
+  readonly onRecheckWait?: (delayMs: number, index: number) => void;
 }
+
+/** 確かめ直しの前の待ちの長さか（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` のどれか）。 */
+const isRecheckDelay = (ms: number): boolean => SITE_UNAVAILABLE_RECHECK_DELAYS_MS.includes(ms);
 
 interface CommandOutcome {
   readonly code: number;
@@ -354,6 +363,8 @@ interface CommandOutcome {
   readonly requests: readonly RelayedRequest[];
   /** Run Coordinator が待った長さ（ms。呼ばれた順。実際には待っていない）。 */
   readonly sleeps: readonly number[];
+  /** `sleeps` のうち、確かめ直しの前の待ち（間隔の待ちを除く）。 */
+  readonly recheckSleeps: readonly number[];
   /** 確かめ直しの前の待ちのたびに、その時点までに中継のサーバが受けた要求の数（待っている間に何も送らないことの確かめ）。 */
   readonly requestCountsAtRecheckWait: readonly number[];
 }
@@ -383,27 +394,54 @@ async function runCommand(config: AuditConfig, mode: RelayMode, hooks: Coordinat
       },
       sleep: async (ms) => {
         sleeps.push(ms);
-        if (ms === SITE_UNAVAILABLE_RECHECK_DELAY_MS) {
+        if (isRecheckDelay(ms)) {
           requestCountsAtRecheckWait.push(relay.requests.length);
-          hooks.onRecheckWait?.();
+          hooks.onRecheckWait?.(ms, requestCountsAtRecheckWait.length - 1);
         }
       },
     }),
   };
   const code = await runAuditCommand(config, { stdout: stdout.output, stderr: stderr.output }, dependencies);
-  return { code, stdout: stdout.text(), stderr: stderr.text(), requests: [...relay.requests], sleeps, requestCountsAtRecheckWait };
+  return {
+    code,
+    stdout: stdout.text(),
+    stderr: stderr.text(),
+    requests: [...relay.requests],
+    sleeps,
+    recheckSleeps: sleeps.filter(isRecheckDelay),
+    requestCountsAtRecheckWait,
+  };
 }
 
 /** `NORMAL` で始め、`PAGES_BEFORE_SWITCH` ページ目の後に `mode` に切り替える Run を、`config` で行う。 */
 const runSwitchedAfterPages = async (config: AuditConfig, mode: RelayMode, hooks: Omit<CoordinatorHooks, 'switchAfterPages'> = {}): Promise<CommandOutcome> =>
   await runCommand(config, 'NORMAL', { ...hooks, switchAfterPages: { pages: PAGES_BEFORE_SWITCH, mode } });
 
-/** 確かめ直しの知らせの1行（SU5。文言は `messages.ts`、待つ時間の書式は `format.ts`）。 */
-const recheckLineOf = (pageUrl: string): string => siteUnavailableRecheckText(pageUrl, formatDuration(SITE_UNAVAILABLE_RECHECK_DELAY_MS));
+/** 1 ページにつき確かめ直す回数の上限（待ちの段階の数。SU6）。 */
+const MAX_RECHECKS = SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length;
 
-/** `stdout` にある、`pages` のどれかのページの確かめ直しの知らせの行の数（出ていないことを確かめるときに使う）。 */
+/** `value` を `count` 個並べた配列。 */
+const repeated = <T>(value: T, count: number): T[] => Array.from({ length: count }, () => value);
+
+/** `attempt` 回目（1 から）の確かめ直しの知らせの1行（SU5、SU6。文言は `messages.ts`、待つ時間の書式は `format.ts`）。 */
+const recheckLineOf = (pageUrl: string, attempt: number): string =>
+  siteUnavailableRecheckText(pageUrl, formatDuration(SITE_UNAVAILABLE_RECHECK_DELAYS_MS[attempt - 1] as number), attempt, MAX_RECHECKS);
+
+/** 減速の知らせの1行（SU6。新しい間隔の書式は `format.ts`）。 */
+const slowdownLineOf = (minIntervalMs: number): string => siteUnavailableSlowdownText(formatDuration(minIntervalMs));
+
+/** 減速の知らせの行の、間隔の前の部分（どの間隔の知らせも出ていないことを確かめるときに使う）。 */
+const SLOWDOWN_LINE_PREFIX = slowdownLineOf(0).split(formatDuration(0))[0] as string;
+
+/** `stdout` にある、減速の知らせの行（どの間隔でも）の数。 */
+const slowdownLinesIn = (stdout: string): number => stdout.split('\n').filter((line) => line.startsWith(SLOWDOWN_LINE_PREFIX)).length;
+
+/** `stdout` にある、`pages` のどれかのページの、どの回の確かめ直しの知らせの行の数（出ていないことを確かめるときに使う）。 */
 const recheckLinesIn = (stdout: string, pages: readonly PageAuditResult[]): number =>
-  pages.reduce((count, page) => count + linesEqualTo(stdout, recheckLineOf(page.pageUrl)), 0);
+  pages.reduce(
+    (count, page) => count + SITE_UNAVAILABLE_RECHECK_DELAYS_MS.reduce((sum, _, index) => sum + linesEqualTo(stdout, recheckLineOf(page.pageUrl, index + 1)), 0),
+    0,
+  );
 
 // ---------------------------------------------------------------------------------------------------------------
 // 結果の読み方
@@ -461,8 +499,10 @@ async function readDiagnostic(
 
 /** 1 回目の試行の番号（診断の記録のファイルの名前。SU5）。 */
 const FIRST_ATTEMPT = 1;
-/** 確かめ直しの試行の番号（SU5）。 */
-const RECHECK_ATTEMPT = 2;
+/** `count` 回目の確かめ直しの試行の番号（1 回目の次から。SU6）。 */
+const recheckAttempt = (count: number): number => FIRST_ATTEMPT + count;
+/** 1 回目と、最大の回数の確かめ直しの、すべての試行の番号（1〜5）。 */
+const ALL_ATTEMPTS: readonly number[] = Array.from({ length: MAX_RECHECKS + 1 }, (_, index) => FIRST_ATTEMPT + index);
 
 /** 診断の記録があることを確かめて返す（D2）。 */
 function presentDiagnostic(record: SiteUnavailableDiagnosticRecord | null): SiteUnavailableDiagnosticRecord {
@@ -598,7 +638,8 @@ describe.each([
   let stoppedCheckpointPageIds: PageId[];
   let stoppedDiagnosticPaths: string[];
   let stoppedDiagnostic: SiteUnavailableDiagnosticRecord | null;
-  let stoppedRecheckDiagnostic: SiteUnavailableDiagnosticRecord | null;
+  /** 各確かめ直しの試行（2〜5）の診断の記録（SU6）。 */
+  let stoppedRecheckDiagnostics: (SiteUnavailableDiagnosticRecord | null)[];
   let resumed: CommandOutcome;
   let resumedDiagnosticPaths: string[];
   let resumedDiagnostic: SiteUnavailableDiagnosticRecord | null;
@@ -606,7 +647,7 @@ describe.each([
   beforeAll(async () => {
     const config = configFor(outputName);
     outputDirectory = config.output.directory;
-    // 1回目: k ページ目の後に、中継のサーバを `mode` にする（確かめ直し（SU5）のときも、そのまま）。
+    // 1回目: k ページ目の後に、中継のサーバを `mode` にする（各確かめ直し（SU5、SU6）のときも、そのまま）。
     stopped = await runSwitchedAfterPages(config, mode);
     runDirectory = await onlyRunDirectoryIn(outputDirectory);
     stoppedRun = await readRun(runDirectory);
@@ -615,7 +656,10 @@ describe.each([
     stoppedCheckpointPageIds = await checkpointPageIdsIn(runDirectory);
     stoppedDiagnosticPaths = await diagnosticPathsIn(runDirectory);
     stoppedDiagnostic = await readDiagnostic(runDirectory, pageAfterSwitch().pageId, 1, FIRST_ATTEMPT);
-    stoppedRecheckDiagnostic = await readDiagnostic(runDirectory, pageAfterSwitch().pageId, 1, RECHECK_ATTEMPT);
+    stoppedRecheckDiagnostics = [];
+    for (const attempt of ALL_ATTEMPTS.slice(1)) {
+      stoppedRecheckDiagnostics.push(await readDiagnostic(runDirectory, pageAfterSwitch().pageId, 1, attempt));
+    }
     // 2回目: サイトが戻った（`NORMAL`）後に、同じ設定で実行する。
     resumed = await runCommand(config, 'NORMAL');
     resumedDiagnosticPaths = await diagnosticPathsIn(runDirectory);
@@ -660,28 +704,33 @@ describe.each([
     const afterSwitch = stopped.requests.filter((request) => request.mode === mode);
     const documentGet = { method: 'GET', pathname: pathOf(pageAfterSwitch()) };
 
-    // 1 回目の試行と、確かめ直し（SU5）の 1 回ずつ。
-    expect(siteRequests(afterSwitch), JSON.stringify(stopped.requests)).toEqual([documentGet, documentGet]);
+    // 1 回目の試行と、各確かめ直し（SU5、SU6。最大 4 回）の 1 回ずつ。
+    expect(siteRequests(afterSwitch), JSON.stringify(stopped.requests)).toEqual(repeated(documentGet, MAX_RECHECKS + 1));
   });
 
-  it('waits once before the recheck and sends nothing to the site while waiting (SU5, design 3.5.2)', () => {
-    expect(stopped.sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    // 待ちの時点までの要求の次の要求が、確かめ直しの文書の GET（待っている間の要求はない）。
-    const [countAtWait] = stopped.requestCountsAtRecheckWait;
-    expect(countAtWait).toBeDefined();
-    expect(siteRequests(stopped.requests.slice(countAtWait as number)), JSON.stringify(stopped.requests)).toEqual([
-      { method: 'GET', pathname: pathOf(pageAfterSwitch()) },
-    ]);
+  it('waits in stages (60 s, 2 min, 4 min, 8 min) before each recheck and sends nothing to the site while waiting (SU6, design 3.6.2)', () => {
+    expect(stopped.sleeps).toEqual([...SITE_UNAVAILABLE_RECHECK_DELAYS_MS]);
+    // 各待ちの時点までの要求の次の要求が、その確かめ直しの文書の GET（待っている間の要求はない）。
+    const counts = stopped.requestCountsAtRecheckWait;
+    expect(counts).toHaveLength(MAX_RECHECKS);
+    for (const [index, countAtWait] of counts.entries()) {
+      expect(siteRequests(stopped.requests.slice(countAtWait, counts[index + 1])), JSON.stringify(stopped.requests)).toEqual([
+        { method: 'GET', pathname: pathOf(pageAfterSwitch()) },
+      ]);
+    }
   });
 
-  it('shows the recheck notice once with the URL of the page, before the one line of the stop by site unavailability with the second failure', () => {
+  it('shows the recheck notice once per stage (1/4 to 4/4) with the URL of the page, in order, before the one line of the stop, and no slowdown notice', () => {
     const lines = stopped.stdout.split('\n');
-    const recheckLine = recheckLineOf(pageAfterSwitch().pageUrl);
+    const recheckLines = SITE_UNAVAILABLE_RECHECK_DELAYS_MS.map((_, index) => recheckLineOf(pageAfterSwitch().pageUrl, index + 1));
 
-    expect(lines.filter((line) => line === recheckLine)).toHaveLength(1);
+    for (const recheckLine of recheckLines) {
+      expect(lines.filter((line) => line === recheckLine)).toHaveLength(1);
+    }
     expect(linesEqualTo(stopped.stdout, siteUnavailableStopText(detail))).toBe(1);
-    expect(lines.indexOf(CLI_TEXT.run.started)).toBeLessThan(lines.indexOf(recheckLine));
-    expect(lines.indexOf(recheckLine)).toBeLessThan(lines.indexOf(siteUnavailableStopText(detail)));
+    const indexes = [CLI_TEXT.run.started, ...recheckLines, siteUnavailableStopText(detail)].map((line) => lines.indexOf(line));
+    expect([...indexes].sort((left, right) => left - right)).toEqual(indexes);
+    expect(slowdownLinesIn(stopped.stdout)).toBe(0);
   });
 
   it('resumes from the k+1-th page by the same command after the site is back, and finishes the Run', async () => {
@@ -711,16 +760,14 @@ describe.each([
     expect(await comparableRunIn(runDirectory)).toEqual(uninterrupted.comparable);
   });
 
-  it('writes one diagnostic per discarded attempt of the k+1-th page in diagnostics/ in the first execution, matching its schema (D2, SU5)', async () => {
+  it('writes one diagnostic per discarded attempt (1 to 5) of the k+1-th page in diagnostics/ in the first execution, matching its schema (D2, SU5, SU6)', async () => {
     const afterSwitch = pageAfterSwitch();
 
-    expect(stoppedDiagnosticPaths).toEqual([
-      siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, FIRST_ATTEMPT),
-      siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, RECHECK_ATTEMPT),
-    ]);
+    expect(stoppedDiagnosticPaths).toEqual(ALL_ATTEMPTS.map((attempt) => siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, attempt)));
     const [execution] = stoppedRun.executions;
-    const recheck = presentDiagnostic(stoppedRecheckDiagnostic);
-    for (const diagnostic of [presentDiagnostic(stoppedDiagnostic), recheck]) {
+    const rechecks = stoppedRecheckDiagnostics.map(presentDiagnostic);
+    const diagnostics = [presentDiagnostic(stoppedDiagnostic), ...rechecks];
+    for (const diagnostic of diagnostics) {
       await expect(validateArtifact('site-unavailable-diagnostic', diagnostic)).resolves.toEqual({ ok: true });
       expect(diagnostic).toMatchObject({
         schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
@@ -737,10 +784,13 @@ describe.each([
       expect(Date.parse(diagnostic.writtenAt)).toBeGreaterThanOrEqual(Date.parse(execution?.startedAt ?? ''));
       expect(Date.parse(diagnostic.writtenAt)).toBeLessThanOrEqual(Date.parse(execution?.finishedAt ?? ''));
     }
-    // 確かめ直しの試行の記録は、別の試行の観察（1 回目より後に書いた）。
-    expect(Date.parse(recheck.writtenAt)).toBeGreaterThanOrEqual(Date.parse(presentDiagnostic(stoppedDiagnostic).writtenAt));
-    expect(documentHopOf(recheck, stoppedViewport, afterSwitch.pageUrl).issuedAtMs)
-      .toBeGreaterThan(documentHopOf(presentDiagnostic(stoppedDiagnostic), stoppedViewport, afterSwitch.pageUrl).issuedAtMs);
+    // 各確かめ直しの試行の記録は、別の試行の観察（前の試行より後に書いた）。
+    for (const [index, recheck] of rechecks.entries()) {
+      const previous = diagnostics[index] as SiteUnavailableDiagnosticRecord;
+      expect(Date.parse(recheck.writtenAt)).toBeGreaterThanOrEqual(Date.parse(previous.writtenAt));
+      expect(documentHopOf(recheck, stoppedViewport, afterSwitch.pageUrl).issuedAtMs)
+        .toBeGreaterThan(documentHopOf(previous, stoppedViewport, afterSwitch.pageUrl).issuedAtMs);
+    }
   });
 
   it('records in the observation of the stopped viewport that the document request headers were sent, and the response as the site gave it (D2)', () => {
@@ -790,27 +840,38 @@ describe.each([
 });
 
 // ---------------------------------------------------------------------------------------------------------------
-// 場面 5（SU5。設計書 3.5）: ページの監査の途中で応答しなくなり、60 秒の待ちの間にサイトが戻る。同じ起動の中で、同じページを 1 回だけ
-// 確かめ直して通り、Run を最後まで終える。
+// 場面 5（SU5、SU6。設計書 3.5、3.6）: ページの監査の途中で応答しなくなり、1 回目の確かめ直しも通らず、2 回目の確かめ直しの前の待ち
+// （2 分）の間にサイトが戻る。同じ起動の中で、同じページを確かめ直して通り、ページの読み込みの間隔を 2 倍にして、Run を最後まで終える。
 // ---------------------------------------------------------------------------------------------------------------
 
-describe('SU5: the site is back when the k+1-th page is checked once more after the wait (design 3.5)', () => {
+describe('SU6: the site is back before the second recheck of the k+1-th page: the Run passes, slows down and finishes (design 3.6)', () => {
   const OUTPUT_NAME = 'recheck-recovers';
+  /** この場面の設定の間隔（ms。減速の知らせを出すために 0 でない値にする。待ちは差し替えるので、実際には待たない）。 */
+  const BASE_INTERVAL_MS = 1_000;
 
   let outcome: CommandOutcome;
   let runDirectory: string;
   let run: RunSummary;
   let diagnosticPaths: string[];
-  let diagnostic: SiteUnavailableDiagnosticRecord | null;
+  let diagnostics: (SiteUnavailableDiagnosticRecord | null)[];
 
   beforeAll(async () => {
-    const config = configFor(OUTPUT_NAME);
-    // k ページ目の後に `HANG` にし、確かめ直しの前の待ちのときに `NORMAL` に戻す（待ちは実際には行わない）。
-    outcome = await runSwitchedAfterPages(config, 'HANG', { onRecheckWait: () => relay.setMode('NORMAL') });
+    const config = configFor(OUTPUT_NAME, BASE_INTERVAL_MS);
+    // k ページ目の後に `HANG` にし、2 回目の確かめ直しの前の待ちのときに `NORMAL` に戻す（待ちは実際には行わない）。
+    outcome = await runSwitchedAfterPages(config, 'HANG', {
+      onRecheckWait: (_delayMs, index) => {
+        if (index === 1) {
+          relay.setMode('NORMAL');
+        }
+      },
+    });
     runDirectory = await onlyRunDirectoryIn(config.output.directory);
     run = await readRun(runDirectory);
     diagnosticPaths = await diagnosticPathsIn(runDirectory);
-    diagnostic = await readDiagnostic(runDirectory, pageAfterSwitch().pageId, 1, FIRST_ATTEMPT);
+    diagnostics = [];
+    for (const attempt of ALL_ATTEMPTS.slice(0, 2)) {
+      diagnostics.push(await readDiagnostic(runDirectory, pageAfterSwitch().pageId, 1, attempt));
+    }
   }, SUITE_TIMEOUT_MS);
 
   it('finishes the Run in the one execution, with the same pages, statuses, Findings and Run Status as the uninterrupted Run', async () => {
@@ -821,44 +882,58 @@ describe('SU5: the site is back when the k+1-th page is checked once more after 
     expect(run.safety.invariantViolationCount).toBe(0);
     expect((await readState(runDirectory)).state).toBe('FINISHED');
     expect(await comparableRunIn(runDirectory)).toEqual(uninterrupted.comparable);
+    // 設定の間隔は、`run.json` の `load` に設定の値のまま残る（減速は保存しない）。
+    expect(run.load.minNavigationIntervalMs).toBe(BASE_INTERVAL_MS);
   });
 
-  it('waits once, sends nothing while waiting, and then loads the same page again before going on', () => {
+  it('waits twice (60 s, then 2 min), sends nothing while waiting, and then loads the same page again before going on', () => {
     const afterSwitch = pageAfterSwitch();
     const documentGet = { method: 'GET', pathname: pathOf(afterSwitch) };
 
-    expect(outcome.sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    // 応答しない間に届いたのは、そのページの文書の GET の 1 件だけ。
-    expect(siteRequests(outcome.requests.filter((request) => request.mode === 'HANG')), JSON.stringify(outcome.requests)).toEqual([documentGet]);
-    // 待ちの時点までの要求の次が、確かめ直しの文書の GET（`NORMAL`）。そのページは、確かめ直しで、中断しない Run と同じ回数の読み込みを受ける。
-    const [countAtWait] = outcome.requestCountsAtRecheckWait;
-    expect(countAtWait).toBeDefined();
-    expect(siteRequests(outcome.requests.slice(countAtWait as number, (countAtWait as number) + 1))).toEqual([documentGet]);
-    expect(outcome.requests[countAtWait as number]?.mode).toBe('NORMAL');
+    expect(outcome.recheckSleeps).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, 2));
+    // 応答しない間に届いたのは、そのページの文書の GET の 2 件（1 回目と、1 回目の確かめ直し）だけ。
+    expect(siteRequests(outcome.requests.filter((request) => request.mode === 'HANG')), JSON.stringify(outcome.requests)).toEqual([documentGet, documentGet]);
+    // 各待ちの時点までの要求の次が、その確かめ直しの文書の GET。2 回目の確かめ直し（`NORMAL`）で、そのページは中断しない Run と同じ回数の
+    // 読み込みを受ける。
+    const counts = outcome.requestCountsAtRecheckWait;
+    expect(counts).toHaveLength(2);
+    expect(siteRequests(outcome.requests.slice(counts[0], counts[1]))).toEqual([documentGet]);
+    expect(outcome.requests[counts[0] as number]?.mode).toBe('HANG');
+    expect(siteRequests(outcome.requests.slice(counts[1], (counts[1] as number) + 1))).toEqual([documentGet]);
+    expect(outcome.requests[counts[1] as number]?.mode).toBe('NORMAL');
     expect(getCount(outcome.requests.filter((request) => request.mode === 'NORMAL'), pathOf(afterSwitch))).toBe(DOCUMENT_GETS_PER_PAGE);
   });
 
-  it('shows the recheck notice once with the URL of the page, and no line of a stop', () => {
+  it('shows the recheck notices (1/4, 2/4) and then the slowdown notice with the doubled interval, in order, and no line of a stop', () => {
     const lines = outcome.stdout.split('\n');
-    const recheckLine = recheckLineOf(pageAfterSwitch().pageUrl);
+    const pageUrl = pageAfterSwitch().pageUrl;
+    const firstRecheckLine = recheckLineOf(pageUrl, 1);
+    const secondRecheckLine = recheckLineOf(pageUrl, 2);
+    const slowdownLine = slowdownLineOf(BASE_INTERVAL_MS * SITE_UNAVAILABLE_SLOWDOWN_FACTOR);
 
-    expect(lines.filter((line) => line === recheckLine)).toHaveLength(1);
-    expect(lines.indexOf(CLI_TEXT.run.started)).toBeLessThan(lines.indexOf(recheckLine));
-    expect(lines.indexOf(recheckLine)).toBeLessThan(lines.indexOf(CLI_TEXT.run.resultHeading));
+    expect(lines.filter((line) => line === firstRecheckLine)).toHaveLength(1);
+    expect(lines.filter((line) => line === secondRecheckLine)).toHaveLength(1);
+    expect(lines.filter((line) => line === slowdownLine)).toHaveLength(1);
+    expect(slowdownLinesIn(outcome.stdout)).toBe(1);
+    expect(recheckLinesIn(outcome.stdout, uninterrupted.pages)).toBe(2);
+    const indexes = [CLI_TEXT.run.started, firstRecheckLine, secondRecheckLine, slowdownLine, CLI_TEXT.run.resultHeading].map((line) => lines.indexOf(line));
+    expect([...indexes].sort((left, right) => left - right)).toEqual(indexes);
     expect(linesEqualTo(outcome.stdout, siteUnavailableStopText(DESKTOP_PASSIVE_TIMEOUT))).toBe(0);
     expect(linesEqualTo(outcome.stdout, siteUnavailableStopText(null))).toBe(0);
   });
 
-  it('writes the diagnostic of the discarded first attempt only, and keeps it after the Run is finished (D2, SU5)', async () => {
+  it('writes the diagnostics of the discarded attempts (1 and 2) only, and keeps them after the Run is finished (D2, SU5, SU6)', async () => {
     const afterSwitch = pageAfterSwitch();
 
-    expect(diagnosticPaths).toEqual([siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, FIRST_ATTEMPT)]);
-    const record = presentDiagnostic(diagnostic);
-    await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
-    expect(record).toMatchObject({ runId: run.runId, executionNumber: 1, pageId: afterSwitch.pageId, siteUnavailableDetail: DESKTOP_PASSIVE_TIMEOUT });
-    const hop = documentHopOf(record, 'desktop', afterSwitch.pageUrl);
-    expect(hop.requestHeadersSentAtMs).toEqual(expect.any(Number));
-    expect(hop.responseHeadersReceivedAtMs).toBeNull();
+    expect(diagnosticPaths).toEqual(ALL_ATTEMPTS.slice(0, 2).map((attempt) => siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, attempt)));
+    for (const diagnostic of diagnostics) {
+      const record = presentDiagnostic(diagnostic);
+      await expect(validateArtifact('site-unavailable-diagnostic', record)).resolves.toEqual({ ok: true });
+      expect(record).toMatchObject({ runId: run.runId, executionNumber: 1, pageId: afterSwitch.pageId, siteUnavailableDetail: DESKTOP_PASSIVE_TIMEOUT });
+      const hop = documentHopOf(record, 'desktop', afterSwitch.pageUrl);
+      expect(hop.requestHeadersSentAtMs).toEqual(expect.any(Number));
+      expect(hop.responseHeadersReceivedAtMs).toBeNull();
+    }
     // 出力の結果では、そのページは確かめ直しの結果（中断しない Run と同じ状態）。
     const page = (await readRunAudit(runDirectory)).pages.find(({ pageId }) => pageId === afterSwitch.pageId);
     expect(page?.status).toBe(afterSwitch.status);
@@ -993,10 +1068,9 @@ describe('SU3c: a Run resumed before the site is back keeps the trigger page as 
 
   it('writes the diagnostic of the trigger page in the second execution too, with the execution number 2 and the attempt number 1, and keeps all to the end (D2, SU5)', () => {
     const afterSwitch = pageAfterSwitch();
-    // 1 回目の実行: 試行 1 と確かめ直しの試行 2。2 回目の実行: 前の実行のきっかけのページなので、確かめ直さずに試行 1 だけ。
+    // 1 回目の実行: 試行 1 と確かめ直しの試行 2〜5。2 回目の実行: 前の実行のきっかけのページなので、確かめ直さずに試行 1 だけ。
     const expectedPaths = [
-      siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, FIRST_ATTEMPT),
-      siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, RECHECK_ATTEMPT),
+      ...ALL_ATTEMPTS.map((attempt) => siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 1, attempt)),
       siteUnavailableDiagnosticRelativePath(afterSwitch.pageId, 2, FIRST_ATTEMPT),
     ];
 

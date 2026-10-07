@@ -154,7 +154,7 @@ const restoreEntry = (stored: StoredCrawlUrlEntry, index: number, options: Crawl
  * - ページの ID は、URL を初めて発見したときに、Run の採番器で採番する（発見の順と ID が一致し、決定論的になる）。
  * - 深さが `maxDepth` を超える URL は、キューに入れずに `SKIPPED`（理由 `MAX_DEPTH_REACHED`）にする。
  * - 状態の遷移は、`QUEUED` → `AUDITING` → `AUDITED`・`FAILED` と、まだ終えていない URL の `SKIPPED` と、サイトの不調で捨てた URL
- *   （`detail` のある `SITE_UNAVAILABLE` の `SKIPPED`）を 1 回だけ確かめ直すための `SKIPPED` → `AUDITING`（`requeueForRecheck`）だけを
+ *   （`detail` のある `SITE_UNAVAILABLE` の `SKIPPED`）を確かめ直す（最大 4 回）ための `SKIPPED` → `AUDITING`（`requeueForRecheck`）だけを
  *   受け付ける。それ以外の遷移は、呼び出し側の誤りとして `Error` を投げる。
  * - 中断した Run の再開のために、記録を `snapshot` で取り出し、`CrawlFrontier.restore` で新しい frontier に作り直せる。
  */
@@ -260,7 +260,8 @@ export class CrawlFrontier {
 
   /**
    * サイトの不調で捨てた URL（理由のコードが `SITE_UNAVAILABLE` で、`detail` のある `SKIPPED`。止まるきっかけのページの印）を、同じ実行の
-   * 中で 1 回だけ確かめ直すために、`AUDITING` に戻す（理由は `null` にする。サイトが応答しないときに Run を止める設計書 3.5.2）。
+   * 中で確かめ直す（1 ページにつき最大 4 回。回数は Run Coordinator が数える）ために、`AUDITING` に戻す（理由は `null` にする。サイトが
+   * 応答しないときに Run を止める設計書 3.5.2、3.6.2）。
    * 待ち行列は通さない（次に監査するのは、呼び出し側が持っている、その URL の記録である）。`snapshot` と `restore` の形は変えない。
    * ほかの状態と理由（始めなかった URL の、`detail` のない `SITE_UNAVAILABLE` を含む）からは戻さず、呼び出し側の誤りとして `Error` を投げる。
    */

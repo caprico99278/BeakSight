@@ -417,3 +417,84 @@ describe('NavigationPacer (load control design 4.1)', () => {
     expect(pacer.snapshot()).toEqual({ navigationCount: 0, totalWaitMs: 0, lastNavigationStartedAtMs: null });
   });
 });
+
+// SU6（サイトが応答しないときに Run を止める設計書 3.6.2）: 最小の間隔を上げる操作。確かめ直しで通った後に、Run Coordinator が
+// 間隔を倍にして続けるために使う。下げない（今より小さい値は無視する）。記録（`snapshot`）の形は変えない。間隔の意味の owner は pacer のまま。
+describe('NavigationPacer.raiseMinimumInterval (site unavailability design 3.6.2, SU6)', () => {
+  it('waits for the raised interval from the next navigation on, counted from the last start', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(1_000);
+
+    pacer.raiseMinimumInterval(2 * INTERVAL_MS);
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(2 * INTERVAL_MS - 1_000);
+    expect(time.sleeps).toEqual([2 * INTERVAL_MS - 1_000]);
+    expect(pacer.snapshot()).toEqual({
+      navigationCount: 2,
+      totalWaitMs: 2 * INTERVAL_MS - 1_000,
+      lastNavigationStartedAtMs: START_MS + 2 * INTERVAL_MS,
+    });
+    // 上げた後の読み込みも、新しい間隔で待つ（1回だけではない）。
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(2 * INTERVAL_MS);
+    expect(time.sleeps).toEqual([2 * INTERVAL_MS - 1_000, 2 * INTERVAL_MS]);
+  });
+
+  it('ignores a value that is not larger than the current interval (never lowers the interval)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+
+    pacer.raiseMinimumInterval(INTERVAL_MS - 1_000);
+    pacer.raiseMinimumInterval(INTERVAL_MS);
+    pacer.raiseMinimumInterval(0);
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS);
+    expect(time.sleeps).toEqual([INTERVAL_MS]);
+
+    // 上げた後に、それより小さい値を渡しても、上げた間隔のまま。
+    pacer.raiseMinimumInterval(3 * INTERVAL_MS);
+    pacer.raiseMinimumInterval(2 * INTERVAL_MS);
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(3 * INTERVAL_MS);
+    expect(time.sleeps).toEqual([INTERVAL_MS, 3 * INTERVAL_MS]);
+  });
+
+  it('raises the interval of a pacer made with the interval 0 (the caller decides whether to keep 0)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time, 0);
+    await time.settle(pacer.beforeNavigation());
+
+    pacer.raiseMinimumInterval(INTERVAL_MS);
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS);
+    expect(time.sleeps).toEqual([INTERVAL_MS]);
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, '5000' as unknown as number])(
+    'rejects %s with RangeError and keeps the interval',
+    async (value) => {
+      const time = new FakeTime();
+      const pacer = pacerWith(time);
+      await time.settle(pacer.beforeNavigation());
+
+      expect(() => pacer.raiseMinimumInterval(value)).toThrow(RangeError);
+
+      await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS);
+      expect(time.sleeps).toEqual([INTERVAL_MS]);
+    },
+  );
+
+  it('does not change the shape of the snapshot (the raised interval is not recorded)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+
+    pacer.raiseMinimumInterval(2 * INTERVAL_MS);
+    const snapshot = pacer.snapshot();
+
+    expect(Object.keys(snapshot).sort()).toEqual(['lastNavigationStartedAtMs', 'navigationCount', 'totalWaitMs']);
+    expect(snapshot).toEqual({ navigationCount: 1, totalWaitMs: 0, lastNavigationStartedAtMs: START_MS });
+    expect(Object.isFrozen(snapshot)).toBe(true);
+  });
+});
