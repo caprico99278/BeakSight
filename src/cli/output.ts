@@ -48,6 +48,7 @@ import {
   runLockHeldText,
   runLockTakenOverText,
   siteUnavailableRecheckText,
+  siteUnavailableSlowdownText,
   siteUnavailableStopText,
   truncatedListText,
   unreadableCheckpointText,
@@ -190,14 +191,18 @@ export function runStartedLines(config: AuditConfig): readonly string[] {
  * 件数と、1分あたりの最大を添える）、許可 Origin の外への要求、経過時間。
  */
 /**
- * `run` の実行中の知らせの1行（Run Coordinator の `RunNotice`。サイトが応答しないときに Run を止める設計書 3.5.4）。知らせの事実
- * （種類、ページの URL、待つ時間）を、文言（`messages.ts`）と書式（`format.ts`）にかけるだけで、計算しない。
- * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページを捨てた後、待ってから同じページを 1 回だけ確かめ直す（待つ時間は `formatDuration`）。
+ * `run` の実行中の知らせの1行（Run Coordinator の `RunNotice`。サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）。知らせの事実
+ * （種類と、その値）を、文言（`messages.ts`）と書式（`format.ts`）にかけるだけで、計算しない。
+ * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページを捨てた後、待ってから同じページを確かめ直す（待つ時間は `formatDuration`。何回目かと
+ *   最大の回数は、そのまま）。
+ * - `SITE_UNAVAILABLE_SLOWDOWN`: 確かめ直しで応答が戻ったので、ページの読み込みの間隔を延ばして続ける（新しい間隔は `formatDuration`）。
  */
 export function runNoticeLines(notice: RunNotice): readonly string[] {
   switch (notice.kind) {
     case 'SITE_UNAVAILABLE_RECHECK':
-      return [siteUnavailableRecheckText(notice.url, formatDuration(notice.delayMs))];
+      return [siteUnavailableRecheckText(notice.url, formatDuration(notice.delayMs), notice.attempt, notice.maxAttempts)];
+    case 'SITE_UNAVAILABLE_SLOWDOWN':
+      return [siteUnavailableSlowdownText(formatDuration(notice.minIntervalMs))];
   }
 }
 

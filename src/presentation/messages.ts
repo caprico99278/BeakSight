@@ -639,12 +639,21 @@ export const siteUnavailableStopText = (detail: string | null): string =>
   `サイトが応答しないため、監査を止めました${detail === null ? '' : `（${detail}）`}。サイトが戻ってから、同じコマンドで続きから再開してください。`;
 
 /**
- * サイトの不調でページを捨てた後、待ってから同じページを 1 回だけ確かめ直すことを知らせる、実行中の1行（サイトが応答しないときに Run を
- * 止める設計書 3.5.4。SU5）。`url` はそのページの URL、`waitText` は待つ時間の文言（`formatDuration` の結果。例: `60秒`。値は Run Coordinator
- * の知らせの事実から、CLI が書式にかける）。どちらも、そのまま示す。
+ * サイトの不調でページを捨てた後、待ってから同じページを確かめ直すことを知らせる、実行中の1行（サイトが応答しないときに Run を止める設計書
+ * 3.5.4、3.6.2。SU5、SU6）。`url` はそのページの URL、`waitText` は待つ時間の文言（`formatDuration` の結果。例: `60秒`。値は Run Coordinator
+ * の知らせの事実から、CLI が書式にかける）、`attempt` は何回目の確かめ直しか（1 から）、`maxAttempts` は確かめ直しの最大の回数。どれも、
+ * そのまま示す。
  */
-export const siteUnavailableRecheckText = (url: string, waitText: string): string =>
-  `サイトが応答しないため、${waitText}待ってから同じページを 1 回だけ確かめ直します（${url}）。`;
+export const siteUnavailableRecheckText = (url: string, waitText: string, attempt: number, maxAttempts: number): string =>
+  `サイトが応答しないため、${waitText}待ってから同じページを確かめ直します（${String(attempt)}/${String(maxAttempts)} 回目。${url}）。`;
+
+/**
+ * 確かめ直しで応答が戻った後、ページの読み込みの間隔を延ばして続けることを知らせる、実行中の1行（サイトが応答しないときに Run を止める設計書
+ * 3.6.2。SU6）。`intervalText` は新しい間隔の文言（`formatDuration` の結果。例: `10秒`。値は Run Coordinator の知らせの事実から、CLI が
+ * 書式にかける）。そのまま示す。
+ */
+export const siteUnavailableSlowdownText = (intervalText: string): string =>
+  `確かめ直しで応答が戻ったので、ページの読み込みの間隔を ${intervalText} に延ばして続けます。`;
 
 /** CLI の1つの項目の行（例: `出力先: C:\artifacts\RUN-…`）。 */
 export const cliFieldText = (label: string, value: string): string => `${label}: ${value}`;

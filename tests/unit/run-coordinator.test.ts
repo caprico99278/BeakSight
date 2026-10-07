@@ -71,7 +71,9 @@ import {
   RunNotResumableError,
   RunResumeUnavailableError,
   SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
-  SITE_UNAVAILABLE_RECHECK_DELAY_MS,
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
+  SITE_UNAVAILABLE_SLOWDOWN_FACTOR,
+  SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR,
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunCoordinatorResumeInput,
@@ -124,7 +126,7 @@ afterAll(async () => {
 });
 /** 偽のページの監査1回で進む時間（既定）。 */
 const DEFAULT_AUDIT_DURATION_MS = 10;
-/** 待たない待ちの関数（ハーネスの既定の `sleep`。確かめ直しの前の待ち（SU5）を、実際に待たないため）。 */
+/** 待たない待ちの関数（ハーネスの既定の `sleep`。確かめ直しの前の待ち（SU5、SU6）を、実際に待たないため）。 */
 const NO_WAIT = async (_ms: number): Promise<void> => undefined;
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -518,8 +520,8 @@ interface HarnessOptions {
    */
   readonly paceNavigations?: boolean;
   /**
-   * Run Coordinator に注入する、待ちの関数（ページの読み込みの間隔の待ち（L2）と、確かめ直しの前の待ち（SU5））。省略すると、待たない
-   * 関数（`NO_WAIT`）を渡す（テストの設定の間隔は 0 なので、間隔の待ちは起きない。確かめ直しの前の 60 秒の待ちを、実際に待たないため）。
+   * Run Coordinator に注入する、待ちの関数（ページの読み込みの間隔の待ち（L2）と、確かめ直しの前の待ち（SU5、SU6））。省略すると、待たない
+   * 関数（`NO_WAIT`）を渡す（テストの設定の間隔は 0 なので、間隔の待ちは起きない。確かめ直しの前の 60 秒〜8 分の待ちを、実際に待たないため）。
    */
   readonly sleep?: (ms: number) => Promise<void>;
   /** Run Coordinator に注入する、進み具合の受け手（L7）。省略すると、渡さない。 */
@@ -4119,18 +4121,30 @@ const UNAVAILABLE_ATTEMPT: AttemptSpec = { outcome: 'TIMEOUT', detail: 'TIMEOUT'
 /** 読み込みの時間切れの理由（偽の Page Auditor が、時間切れの試行のビューポートに付ける理由）。 */
 const NAVIGATION_TIMEOUT_REASON: IncompleteReason = { code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' };
 
+/** 1 ページにつき確かめ直す回数の上限（待ちの段階の数。SU6。設計書 3.6.2）。 */
+const MAX_RECHECKS = SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length;
+
+/** `value` を `count` 個並べた配列。 */
+const repeated = <T>(value: T, count: number): T[] => Array.from({ length: count }, () => value);
+
+/** 1 回目と、最大の回数の確かめ直しのすべてで、サイトの不調の印を返す試行の並び（「不調で止まる」場面）。 */
+const ALWAYS_UNAVAILABLE_ATTEMPTS: readonly AttemptSpec[] = repeated(UNAVAILABLE_ATTEMPT, MAX_RECHECKS + 1);
+
 /**
- * `UNAVAILABILITY_SITE` のうち、`path` のページだけを `spec` にしたサイト。既定は、2 回の試行とも、サイトの不調の印を返すページ（SU5 で、
- * 捨てたページを 1 回確かめ直すようになったので、「不調で止まる」場面は、2 回とも不調のページで作る。設計書 3.5.2 の 5）。
+ * `UNAVAILABILITY_SITE` のうち、`path` のページだけを `spec` にしたサイト。既定は、1 回目と最大の回数の確かめ直しのすべてで、サイトの不調の
+ * 印を返すページ（SU6 で、捨てたページを最大 4 回確かめ直すようになったので、「不調で止まる」場面は、5 回とも不調のページで作る。
+ * 設計書 3.6.2）。
  */
-function unavailableAt(path: string, spec: FakePageSpec = { attempts: [UNAVAILABLE_ATTEMPT, UNAVAILABLE_ATTEMPT] }): FakeSite {
+function unavailableAt(path: string, spec: FakePageSpec = { attempts: ALWAYS_UNAVAILABLE_ATTEMPTS }): FakeSite {
   return { ...UNAVAILABILITY_SITE, [path]: spec };
 }
 
 /** 1 回目の試行の番号（診断の記録のファイルの名前。SU5）。 */
 const FIRST_ATTEMPT = 1;
-/** 確かめ直しの試行の番号（SU5）。 */
-const RECHECK_ATTEMPT = 2;
+/** `count` 回目の確かめ直しの試行の番号（1 回目の次から。SU6）。 */
+const recheckAttempt = (count: number): number => FIRST_ATTEMPT + count;
+/** 1 回目と、最大の回数の確かめ直しの、すべての試行の番号（1〜5）。 */
+const ALL_ATTEMPTS: readonly number[] = Array.from({ length: MAX_RECHECKS + 1 }, (_, index) => FIRST_ATTEMPT + index);
 
 /** 止まるきっかけのページの理由（`SITE_UNAVAILABLE`。`detail` は、ページの結果の不調の詳細）。Run の理由も、同じ形である。 */
 const siteUnavailableTrigger = (detail: string): IncompleteReason => ({ code: SITE_UNAVAILABLE_SKIP_REASON.code, detail });
@@ -4142,15 +4156,15 @@ const frontierStates = (checkpoint: RunCheckpoint) =>
 describe('RunCoordinator: stopping the Run on site unavailability (site unavailability design 3.2, 3.3, SU3a)', () => {
   it('skips the unavailable page with its detail without saving it, saves the state, skips the rest, and stops resumable', async () => {
     const reports: RunProgressReport[] = [];
-    // 2 回の試行とも不調（確かめ直し（SU5）でも不調で、止まる場面）。
-    const site = unavailableAt('/b.html', { attempts: [UNAVAILABLE_ATTEMPT, UNAVAILABLE_ATTEMPT], blockedPosts: 2 });
+    // 5 回の試行とも不調（最大の回数の確かめ直し（SU6）でも不調で、止まる場面）。
+    const site = unavailableAt('/b.html', { attempts: ALWAYS_UNAVAILABLE_ATTEMPTS, blockedPosts: 2 });
     const { harness, recorder } = checkpointHarness({ site, onProgress: (report) => reports.push(report) });
 
     const concluded = await concludedRun(harness);
 
     const result = concluded.result as AuditRunResult;
-    // /b.html（3ページ目）で不調を検知した後は、1 回だけ確かめ直し（SU5）、また不調なら新しいページを始めない。
-    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html']);
+    // /b.html（3ページ目）で不調を検知した後は、最大 4 回確かめ直し（SU6）、また不調なら新しいページを始めない。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', ...repeated('/b.html', MAX_RECHECKS + 1)]);
     // 不調のページは、ページの結果を捨てて（Evidence も残さない）、理由 SITE_UNAVAILABLE（detail は不調の詳細）の SKIPPED にする。
     // 残りは、理由 SITE_UNAVAILABLE（detail は null）の SKIPPED。
     expect(pageStates(result)).toEqual([
@@ -4169,7 +4183,7 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
     expect(result.run.runStatus).toBe('PARTIAL');
     expect(deriveRunStatus(result.statusInput)).toBe('PARTIAL');
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
-    // 不調のページの保存はせず、その後に状態を保存する（捨てた試行ごとに。SU5）。
+    // 不調のページの保存はせず、その後に状態を保存する（捨てた試行ごとに。SU5、SU6）。
     expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls])).toEqual([
       ['start', 0],
       ['state', 0],
@@ -4177,17 +4191,20 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
       ['state', 1],
       ['page', 2],
       ['state', 2],
-      ['state', 3],
-      ['state', 4],
+      ...ALL_ATTEMPTS.map((attempt) => ['state', 2 + attempt]),
     ]);
     const pageIds = result.pages.map(({ pageId }) => pageId);
     expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(pageIds.slice(0, 2));
     const states = recorder.states();
-    expect(states).toHaveLength(5);
-    const [, , beforeDiscard, afterFirstDiscard, afterDiscard] = states as [RunCheckpoint, RunCheckpoint, RunCheckpoint, RunCheckpoint, RunCheckpoint];
-    // 捨てた後の状態の保存（1 回目の後も、確かめ直しの後も）: 終わったページは2つ、監査を始めたページの数は2（不調のページを数えない）、
+    expect(states).toHaveLength(3 + MAX_RECHECKS + 1);
+    const beforeDiscard = states[2] as RunCheckpoint;
+    const afterDiscards = states.slice(3) as RunCheckpoint[];
+    const afterFirstDiscard = afterDiscards[0] as RunCheckpoint;
+    const afterDiscard = afterDiscards.at(-1) as RunCheckpoint;
+    // 捨てた後の状態の保存（1 回目の後も、各確かめ直しの後も）: 終わったページは2つ、監査を始めたページの数は2（不調のページを数えない）、
     // 保存の理由は空。巡回の記録では、不調のページは理由 SITE_UNAVAILABLE（detail あり）の SKIPPED（待っている間に止まっても残る）。
-    for (const state of [afterFirstDiscard, afterDiscard]) {
+    expect(afterDiscards).toHaveLength(MAX_RECHECKS + 1);
+    for (const state of afterDiscards) {
       expect(state.completedPageIds).toEqual(pageIds.slice(0, 2));
       expect(state.progress).toMatchObject({ pagesStarted: 2, reasons: [] });
       expect(frontierStates(state)).toEqual([
@@ -4208,8 +4225,8 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
       .toEqual([2, 0]);
     expect(afterDiscard.safetyLedgerSnapshots.slice(0, outsideBefore.length)).toEqual(outsideBefore);
     expect(afterDiscard.safetyLedgerSnapshots.slice(outsideBefore.length).map(({ blockedRequests }) => blockedRequests.length))
-      .toEqual([2, 0, 2, 0]);
-    expect(result.run.safety.blockedActions.requests).toBe(4);
+      .toEqual(repeated([2, 0], MAX_RECHECKS + 1).flat());
+    expect(result.run.safety.blockedActions.requests).toBe(2 * (MAX_RECHECKS + 1));
     // 進み具合は、監査を終えたページ（開始のページと /a.html）の後だけ伝える（不調のページは数えない）。
     expect(reports.map(({ pagesFinished, pagesDiscovered }) => [pagesFinished, pagesDiscovered])).toEqual([[1, 5], [2, 5]]);
     // 最後の状態の保存は STOPPED（再開できる）。終わり方は STOPPED_BY_SITE_UNAVAILABLE。保存の理由には SITE_UNAVAILABLE を入れない。
@@ -4234,10 +4251,7 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
     const harness = createHarness({
       site: unavailableAt('/b.html', {
         links: ['/from-b.html'],
-        attempts: [
-          { outcome: 'OK', siteUnavailableDetail: DESKTOP_INTERACTION_TIMEOUT },
-          { outcome: 'OK', siteUnavailableDetail: DESKTOP_INTERACTION_TIMEOUT },
-        ],
+        attempts: repeated({ outcome: 'OK', siteUnavailableDetail: DESKTOP_INTERACTION_TIMEOUT }, MAX_RECHECKS + 1),
       }),
     });
 
@@ -4273,7 +4287,7 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
       ['/c.html', 1],
       ['/d.html', 1],
     ]);
-    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
+    expect(sleeps).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, 1));
     expect(result.run.retries).toEqual([]);
     expect(pageStates(result)[2]).toEqual(['/b.html', 'AUDITED', []]);
 
@@ -4288,14 +4302,15 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
   it('drops the retry record and the Evidence of the earlier attempt when the retry returns the unavailability mark', async () => {
     const SECOND_ATTEMPT_DETAIL = 'mobile:passive:HTTP 503';
     const unavailable503: AttemptSpec = { outcome: 'OK', httpStatus: 503, siteUnavailableDetail: SECOND_ATTEMPT_DETAIL };
-    // 3 回目の監査は、確かめ直し（SU5）。また不調なので、止まる。
-    const site = unavailableAt('/b.html', { attempts: [{ outcome: 'TIMEOUT', detail: 'TIMEOUT' }, unavailable503, unavailable503] });
+    // 3 回目からの監査は、確かめ直し（SU5、SU6）。最大の回数まで不調なので、止まる。
+    const site = unavailableAt('/b.html', { attempts: [{ outcome: 'TIMEOUT', detail: 'TIMEOUT' }, ...repeated(unavailable503, MAX_RECHECKS + 1)] });
     const { harness, recorder } = checkpointHarness({ site });
 
     const result = await harness.coordinator.run();
 
-    // 1回目の試行は、不調の印のない時間切れなので、今のとおり再試行する。2回目の試行が、不調の印を返す。確かめ直し（試行 1）も不調。
-    expect(harness.world.auditCalls.filter(({ url }) => pathOf(url) === '/b.html').map(({ attempt }) => attempt?.attempt)).toEqual([1, 2, 1]);
+    // 1回目の試行は、不調の印のない時間切れなので、今のとおり再試行する。2回目の試行が、不調の印を返す。各確かめ直し（試行 1）も不調。
+    expect(harness.world.auditCalls.filter(({ url }) => pathOf(url) === '/b.html').map(({ attempt }) => attempt?.attempt))
+      .toEqual([1, 2, ...repeated(1, MAX_RECHECKS)]);
     const [, , firstAttempt, secondAttempt] = harness.world.auditOutcomes;
     const discardedIds = [...(firstAttempt?.result.evidence ?? []), ...(secondAttempt?.result.evidence ?? [])]
       .map(({ evidenceId }) => evidenceId);
@@ -4388,8 +4403,8 @@ describe('RunCoordinator: stopping the Run on site unavailability (site unavaila
     ]);
     expect(stopped.result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
     expect(stopped.result.run.crawlLimits).toEqual(NO_CRAWL_LIMITS);
-    // 捨てた後の状態の保存（1 回目と、確かめ直しの後）のどちらも、不調のページを数えない。
-    expect(stopped.recorder.states().map(({ progress }) => progress.pagesStarted)).toEqual([0, 1, 1, 1]);
+    // 捨てた後の状態の保存（1 回目と、各確かめ直しの後）のどれも、不調のページを数えない。
+    expect(stopped.recorder.states().map(({ progress }) => progress.pagesStarted)).toEqual([0, 1, ...repeated(1, MAX_RECHECKS + 1)]);
     const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
     expect(checkpoint.progress.pagesStarted).toBe(1);
 
@@ -4501,8 +4516,8 @@ describe('RunCoordinator: resuming a Run stopped by site unavailability (site un
     const concluded = await concludedRun(harness);
 
     const result = concluded.result as AuditRunResult;
-    // /c.html は、前の実行のきっかけのページではないので、1 回確かめ直してから（SU5）捨てる。
-    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html', '/c.html', '/c.html']);
+    // /c.html は、前の実行のきっかけのページではないので、最大の回数まで確かめ直してから（SU5、SU6）捨てる。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/b.html', ...repeated('/c.html', MAX_RECHECKS + 1)]);
     expect(pageStates(result)).toEqual([
       [START_PATH, 'AUDITED', []],
       ['/a.html', 'AUDITED', []],
@@ -4765,9 +4780,9 @@ const UNAVAILABLE_NAVIGATION_DIAGNOSTICS: PageAuditOutcome['navigationDiagnostic
 /** サイトの不調の印と、ページ本体の要求の観察の結果を返す試行。 */
 const UNAVAILABLE_OBSERVED_ATTEMPT: AttemptSpec = { ...UNAVAILABLE_ATTEMPT, navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS };
 
-/** `path` のページだけが、不調の印と観察の結果を返すサイト（既定は、2 回の試行とも。SU5）。 */
+/** `path` のページだけが、不調の印と観察の結果を返すサイト（既定は、5 回の試行とも。SU5、SU6）。 */
 const observedUnavailableAt = (path: string, spec: FakePageSpec = {}): FakeSite =>
-  unavailableAt(path, { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, UNAVAILABLE_OBSERVED_ATTEMPT], ...spec });
+  unavailableAt(path, { attempts: repeated(UNAVAILABLE_OBSERVED_ATTEMPT, MAX_RECHECKS + 1), ...spec });
 
 /** 書き出しの口の偽物。受けた Run のディレクトリと記録と試行の番号（SU5）を、受けた順に返す。 */
 function diagnosticWriter(write: () => Promise<void> = async () => undefined) {
@@ -4801,16 +4816,18 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
 
     const result = await harness.coordinator.run();
 
-    // 1 回目の試行と、確かめ直しの試行（SU5）の、それぞれの記録を 1 回ずつ渡す（試行の番号は 1 と 2）。
-    expect(writer).toHaveBeenCalledTimes(2);
+    // 1 回目の試行と、各確かめ直しの試行（SU5、SU6）の、それぞれの記録を 1 回ずつ渡す（試行の番号は 1〜5）。
+    expect(writer).toHaveBeenCalledTimes(MAX_RECHECKS + 1);
     const [first, second] = calls();
     const [, , firstOutcome, secondOutcome] = harness.world.auditOutcomes;
     expect(firstOutcome?.siteUnavailableDetail).toBe(DESKTOP_PASSIVE_TIMEOUT);
     expect(secondOutcome?.siteUnavailableDetail).toBe(DESKTOP_PASSIVE_TIMEOUT);
     expect(firstOutcome?.result).not.toBe(secondOutcome?.result);
     expect(first?.runDirectory).toBe(runArtifactDirectory(harness.outputDirectory, result.run.runId));
-    expect(second?.runDirectory).toBe(first?.runDirectory);
-    expect([first?.attemptNumber, second?.attemptNumber]).toEqual([FIRST_ATTEMPT, RECHECK_ATTEMPT]);
+    expect(calls().every(({ runDirectory }) => runDirectory === first?.runDirectory)).toBe(true);
+    expect(calls().map(({ attemptNumber }) => attemptNumber)).toEqual(ALL_ATTEMPTS);
+    // 各試行の記録のページの結果は、その試行の結果（呼び出しの順）。
+    expect(calls().map(({ record }) => record.page)).toEqual(harness.world.auditOutcomes.slice(2).map(({ result: page }) => page));
     expect(first?.record).toEqual({
       schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
       runId: result.run.runId,
@@ -4833,12 +4850,15 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
     // 記録は、診断の記録のスキーマに合う（偽の Page Auditor のページの結果は、ページのスキーマに合う）。
     await expect(validateArtifact('site-unavailable-diagnostic', JSON.parse(JSON.stringify(first?.record)))).resolves.toEqual({ ok: true });
     await expect(validateArtifact('site-unavailable-diagnostic', JSON.parse(JSON.stringify(second?.record)))).resolves.toEqual({ ok: true });
-    // それぞれ、捨てた後の状態の保存の後に渡す（状態の保存は、robots.txt と sitemap.xml の後、2 ページの後、捨てた試行ごとの 5 回）。
+    // それぞれ、捨てた後の状態の保存の後に渡す（状態の保存は、robots.txt と sitemap.xml の後、2 ページの後、捨てた試行ごとの 8 回）。
     const saveOrders = recorder.session.saveState.mock.invocationCallOrder;
-    expect(saveOrders).toHaveLength(5);
-    expect(writer.mock.invocationCallOrder[0]).toBeGreaterThan(saveOrders[3] ?? Number.POSITIVE_INFINITY);
-    expect(writer.mock.invocationCallOrder[0]).toBeLessThan(saveOrders[4] ?? 0);
-    expect(writer.mock.invocationCallOrder[1]).toBeGreaterThan(saveOrders[4] ?? Number.POSITIVE_INFINITY);
+    expect(saveOrders).toHaveLength(3 + MAX_RECHECKS + 1);
+    for (const [index, writeOrder] of writer.mock.invocationCallOrder.entries()) {
+      expect(writeOrder).toBeGreaterThan(saveOrders[3 + index] ?? Number.POSITIVE_INFINITY);
+      if (index < MAX_RECHECKS) {
+        expect(writeOrder).toBeLessThan(saveOrders[4 + index] ?? 0);
+      }
+    }
     // ページは、今のとおり捨てる（結果、ページの保存に入れない）。
     expect(pageStates(result)[2]).toEqual(['/b.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
     expect(recorder.pages().map(({ pageId }) => pageId)).not.toContain(result.pages[2]?.pageId);
@@ -4886,11 +4906,10 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
 
     const result = await harness.coordinator.run();
 
-    // 実行の番号は 2 のまま、試行の番号が 1 と 2（SU5）。
-    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber, record.pageId])).toEqual([
-      ['/c.html', 2, FIRST_ATTEMPT, result.pages[3]?.pageId],
-      ['/c.html', 2, RECHECK_ATTEMPT, result.pages[3]?.pageId],
-    ]);
+    // 実行の番号は 2 のまま、試行の番号が 1〜5（SU5、SU6）。
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber, record.pageId])).toEqual(
+      ALL_ATTEMPTS.map((attempt) => ['/c.html', 2, attempt, result.pages[3]?.pageId]),
+    );
     expect(pageStates(result)[3]).toEqual(['/c.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
   });
 
@@ -4936,9 +4955,9 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
   ] as const)('keeps the Run, its reasons, its end and its saves unchanged when the writer %s, for both kinds of record', async (_name, write) => {
     const stopped = await recordedRun({ site: unavailableAt('/b.html') });
     const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
-    // 捨てたページ（2 回の試行の記録。SU5）と、前の実行のきっかけのページ（1 回）。
+    // 捨てたページ（5 回の試行の記録。SU5、SU6）と、前の実行のきっかけのページ（1 回）。
     const scenarios: readonly [(options: Pick<HarnessOptions, 'writeSiteUnavailableDiagnostic'>) => ReturnType<typeof checkpointHarness>, number][] = [
-      [(options) => checkpointHarness({ site: observedUnavailableAt('/b.html'), ...options }), 2],
+      [(options) => checkpointHarness({ site: observedUnavailableAt('/b.html'), ...options }), MAX_RECHECKS + 1],
       [(options) => resumedHarness({ site: observedUnavailableAt('/b.html'), ...options }, resumeInputFrom(stopped, checkpoint)), 1],
     ];
     for (const [scenario, records] of scenarios) {
@@ -4971,10 +4990,10 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
 
     await harness.coordinator.run();
 
-    // 2 回の試行の記録（SU5）のどちらも、Browser を閉じる前に書き終える。
-    expect(finished).toHaveBeenCalledTimes(2);
+    // 5 回の試行の記録（SU5、SU6）のどれも、Browser を閉じる前に書き終える。
+    expect(finished).toHaveBeenCalledTimes(MAX_RECHECKS + 1);
     expect(harness.browserClose).toHaveBeenCalledOnce();
-    expect(finished.mock.invocationCallOrder[1]).toBeLessThan(harness.browserClose.mock.invocationCallOrder[0] ?? 0);
+    expect(finished.mock.invocationCallOrder.at(-1)).toBeLessThan(harness.browserClose.mock.invocationCallOrder[0] ?? 0);
   });
 
   it('rejects a writer that is not a function with TypeError', () => {
@@ -4985,20 +5004,32 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
   });
 });
 
+
 // ---------------------------------------------------------------------------------------------------------------
-// SU5（サイトが応答しないときに Run を止める設計書 3.5）: サイトの不調でページを捨てた後、`SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待って
-// （止める印で打ち切る）、同じページ（同じ `pageId`）を 1 回だけ監査し直す。2 回目に不調がなければ通常どおり保存して進み、2 回目も不調なら
-// 今までどおり止める。確かめ直しは、1 つの実行の中で、同じ URL につき 1 回まで。前の実行のきっかけのページ（3.2.1）は確かめ直さない。
-// 知らせは、`onProgress` とは別の口（`onNotice`）に、事実（種類、URL、待つ時間）で渡す（3.5.4）。
+// SU6（サイトが応答しないときに Run を止める設計書 3.6。SU5 の 3.5 を広げた）: サイトの不調でページを捨てるたびに、次の段階の待ち
+// （`SITE_UNAVAILABLE_RECHECK_DELAYS_MS`: 60 秒、2 分、4 分、8 分。止める印で打ち切る）で待って、同じページ（同じ `pageId`）を監査し直す。
+// 1 ページにつき最大 4 回。確かめ直しで通れば通常どおり保存して進み、Run で 1 つの pacer の最小の間隔を 2 倍（上限は設定の 8 倍。設定が 0 なら
+// 0 のまま）にして続ける。最後の確かめ直しも不調なら、今までどおり止める。前の実行のきっかけのページ（3.2.1）は確かめ直さない。
+// 知らせは、`onProgress` とは別の口（`onNotice`）に、事実（確かめ直し: 種類、URL、待つ時間、何回目か、最大の回数。減速: 種類、新しい間隔）
+// で渡す（3.6.2）。
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 待ちの記録（実際には待たない）。確かめ直しの前の待ちのときに `onRecheckWait` を呼ぶ（待っている間の事実を確かめるため）。 */
-function recordedSleep(onRecheckWait?: () => void | Promise<void>) {
+/** 確かめ直しの前の待ちの長さか（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` のどれか）。 */
+const isRecheckDelay = (ms: number): boolean => SITE_UNAVAILABLE_RECHECK_DELAYS_MS.includes(ms);
+
+/**
+ * 待ちの記録（実際には待たない）。確かめ直しの前の待ちのときに `onRecheckWait` を呼ぶ（待っている間の事実を確かめるため。引数は、その待ちの
+ * 長さと、この Run で何回目の確かめ直しの待ちか（0 から））。
+ */
+function recordedSleep(onRecheckWait?: (delayMs: number, index: number) => void | Promise<void>) {
   const sleeps: number[] = [];
+  let recheckWaits = 0;
   const sleep = vi.fn(async (ms: number): Promise<void> => {
     sleeps.push(ms);
-    if (ms === SITE_UNAVAILABLE_RECHECK_DELAY_MS) {
-      await onRecheckWait?.();
+    if (isRecheckDelay(ms)) {
+      const index = recheckWaits;
+      recheckWaits += 1;
+      await onRecheckWait?.(ms, index);
     }
   });
   return { sleeps, sleep };
@@ -5013,29 +5044,80 @@ function recordedNotices() {
   return { notices, onNotice };
 }
 
-/** `path` のページの確かめ直しの知らせ。 */
-const recheckNotice = (path: string): RunNotice =>
-  ({ kind: 'SITE_UNAVAILABLE_RECHECK', url: urlOf(path), delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS });
+/** `path` のページの、`attempt` 回目（1 から）の確かめ直しの知らせ（待つ時間は、その回の段階の待ち）。 */
+const recheckNotice = (path: string, attempt: number): RunNotice => ({
+  kind: 'SITE_UNAVAILABLE_RECHECK',
+  url: urlOf(path),
+  delayMs: SITE_UNAVAILABLE_RECHECK_DELAYS_MS[attempt - 1] as number,
+  attempt,
+  maxAttempts: MAX_RECHECKS,
+});
 
-/** 1 回目は不調で、確かめ直しで通るページ。 */
+/** 減速の知らせ（新しい最小の間隔）。 */
+const slowdownNotice = (minIntervalMs: number): RunNotice => ({ kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs });
+
+/** 1 回目は不調で、1 回目の確かめ直しで通るページ。 */
 const RECOVERING_PAGE: FakePageSpec = { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, { outcome: 'OK' }] };
+/** 1 回目と 1 回目の確かめ直しは不調で、2 回目の確かめ直しで通るページ。 */
+const RECOVERING_AT_SECOND_RECHECK: FakePageSpec = { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, UNAVAILABLE_OBSERVED_ATTEMPT, { outcome: 'OK' }] };
 
-describe('RunCoordinator: checking an unavailable page once more after the wait (site unavailability design 3.5, SU5)', () => {
-  it('fixes the wait before the recheck at 60 seconds', () => {
-    expect(SITE_UNAVAILABLE_RECHECK_DELAY_MS).toBe(60_000);
+/** 間隔のあるテストの、設定の最小の間隔（ms）。減速の上限は、この 8 倍。 */
+const SLOWDOWN_BASE_INTERVAL_MS = 5_000;
+
+/**
+ * 間隔 `intervalMs` の pacer で、1 ページ（Desktop と Mobile）の読み込みの待ち。Desktop は、前の読み込みの開始から監査の時間
+ * （`DEFAULT_AUDIT_DURATION_MS`）だけ過ぎているので、その分だけ短い。Mobile は、Desktop の開始から時計が進まないので、間隔の全体。
+ */
+const pageWaits = (intervalMs: number): number[] => [intervalMs - DEFAULT_AUDIT_DURATION_MS, intervalMs];
+
+/** 待ちの記録（注入した時計を、待った長さだけ進める。間隔の待ちも、確かめ直しの前の待ちも。L2 の pacer のテストと同じ）。 */
+function clockAdvancingSleep(current: () => Harness | null, onRecheckWait?: () => void) {
+  const sleeps: number[] = [];
+  const sleep = vi.fn(async (ms: number): Promise<void> => {
+    sleeps.push(ms);
+    if (isRecheckDelay(ms)) {
+      onRecheckWait?.();
+    }
+    const harness = current();
+    if (harness !== null) {
+      harness.world.nowMs += ms;
+    }
+  });
+  return { sleeps, sleep };
+}
+
+describe('RunCoordinator: checking an unavailable page again in stages, and slowing down after it passes (site unavailability design 3.6, SU6)', () => {
+  it('fixes the waits (60 s, 2 min, 4 min, 8 min), the slowdown factor (2) and its maximum (8 times the setting) as frozen constants', () => {
+    expect(SITE_UNAVAILABLE_RECHECK_DELAYS_MS).toEqual([60_000, 120_000, 240_000, 480_000]);
+    expect(Object.isFrozen(SITE_UNAVAILABLE_RECHECK_DELAYS_MS)).toBe(true);
+    expect(SITE_UNAVAILABLE_SLOWDOWN_FACTOR).toBe(2);
+    expect(SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR).toBe(8);
   });
 
-  it('1. discards the page, waits once, audits the same page ID again, and keeps the second attempt as an ordinary result when it is fine', async () => {
+  it('1. passes at the second recheck: waits 60 s then 2 min, audits the same page ID three times, keeps the result, and doubles the pacer interval', async () => {
     const auditCallsAtWait: number[] = [];
+    const sleepCountAtNotice: number[] = [];
     const { writer, calls } = diagnosticWriter();
     const reports: RunProgressReport[] = [];
-    const { notices, onNotice } = recordedNotices();
-    const site = unavailableAt('/b.html', { ...RECOVERING_PAGE, links: ['/from-b.html'] });
+    const notices: RunNotice[] = [];
     let harness: Harness | null = null;
-    const { sleeps, sleep } = recordedSleep(() => {
+    const { sleeps, sleep } = clockAdvancingSleep(() => harness, () => {
       auditCallsAtWait.push(harness?.world.auditCalls.length ?? -1);
     });
-    const made = checkpointHarness({ site, sleep, onNotice, writeSiteUnavailableDiagnostic: writer, onProgress: (report) => reports.push(report) });
+    const onNotice = vi.fn((notice: RunNotice): void => {
+      notices.push(notice);
+      sleepCountAtNotice.push(sleeps.length);
+    });
+    const site = unavailableAt('/b.html', { ...RECOVERING_AT_SECOND_RECHECK, links: ['/from-b.html'] });
+    const made = checkpointHarness({
+      site,
+      config: { crawl: { minNavigationIntervalMs: SLOWDOWN_BASE_INTERVAL_MS } },
+      paceNavigations: true,
+      sleep,
+      onNotice,
+      writeSiteUnavailableDiagnostic: writer,
+      onProgress: (report) => reports.push(report),
+    });
     harness = made.harness;
     const { recorder } = made;
 
@@ -5043,28 +5125,59 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
 
     const result = concluded.result as AuditRunResult;
     const pageIdOf = (path: string): PageId | undefined => result.pages.find(({ pageUrl }) => pathOf(pageUrl) === path)?.pageId;
-    // 同じ pageId で、もう 1 回監査する（どちらも試行 1。再試行ではない）。待ちは 1 回だけ（60 秒）。その間、Page Auditor を呼ばない。
+    // 同じ pageId で、3 回監査する（どれも試行 1。再試行ではない）。待ちは 2 回（60 秒、2 分）。その間、Page Auditor を呼ばない。
     expect(made.harness.world.auditCalls.map(({ url, pageId, attempt }) => [pathOf(url), pageId, attempt?.attempt])).toEqual([
       [START_PATH, pageIdOf(START_PATH), 1],
       ['/a.html', pageIdOf('/a.html'), 1],
+      ['/b.html', pageIdOf('/b.html'), 1],
       ['/b.html', pageIdOf('/b.html'), 1],
       ['/b.html', pageIdOf('/b.html'), 1],
       ['/c.html', pageIdOf('/c.html'), 1],
       ['/d.html', pageIdOf('/d.html'), 1],
       ['/from-b.html', pageIdOf('/from-b.html'), 1],
     ]);
-    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    expect(auditCallsAtWait).toEqual([3]);
+    expect(sleeps.filter(isRecheckDelay)).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, 2));
+    expect(auditCallsAtWait).toEqual([3, 4]);
     expect(result.run.retries).toEqual([]);
-    // 知らせは 1 回（事実: 種類、URL、待つ時間）。捨てた試行の診断の記録（試行 1）の後、待ちの前に渡す。
-    expect(notices).toEqual([recheckNotice('/b.html')]);
-    expect(Object.isFrozen(notices[0])).toBe(true);
-    expect(writer).toHaveBeenCalledOnce();
-    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber])).toEqual([['/b.html', 1, FIRST_ATTEMPT]]);
-    expect(calls()[0]?.record.page).toEqual(made.harness.world.auditOutcomes[2]?.result);
+    // 知らせは、確かめ直し 2 回（1/4、2/4。それぞれの段階の待ち）と、減速 1 回（設定の 2 倍）。確かめ直しの知らせは、捨てた試行の診断の
+    // 記録の後、待ちの前。減速の知らせは、通った試行の後、次のページの前。
+    expect(notices).toEqual([
+      recheckNotice('/b.html', 1),
+      recheckNotice('/b.html', 2),
+      slowdownNotice(SLOWDOWN_BASE_INTERVAL_MS * SITE_UNAVAILABLE_SLOWDOWN_FACTOR),
+    ]);
+    expect(notices.every((notice) => Object.isFrozen(notice))).toBe(true);
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), record.executionNumber, attemptNumber])).toEqual([
+      ['/b.html', 1, FIRST_ATTEMPT],
+      ['/b.html', 1, recheckAttempt(1)],
+    ]);
+    expect(calls().map(({ record }) => record.page)).toEqual([made.harness.world.auditOutcomes[2]?.result, made.harness.world.auditOutcomes[3]?.result]);
     expect(writer.mock.invocationCallOrder[0]).toBeLessThan(onNotice.mock.invocationCallOrder[0] ?? 0);
-    expect(onNotice.mock.invocationCallOrder[0]).toBeLessThan(sleep.mock.invocationCallOrder[0] ?? 0);
-    // 2 回目は通常の結果（AUDITED）として残り、その Link（/from-b.html）も拾う。Run の理由に SITE_UNAVAILABLE は残らない。
+    expect(writer.mock.invocationCallOrder[1]).toBeLessThan(onNotice.mock.invocationCallOrder[1] ?? 0);
+    // pacer の待ち（`now` と `sleep` の記録）: sitemap.xml、開始のページ、/a.html、/b.html の 1 回目は設定の間隔（5 秒）。待った後の確かめ直しは
+    // Desktop を待たず、Mobile は 5 秒。減速の後の /c.html、/d.html、/from-b.html は、10 秒の間隔。
+    const [firstDelayMs, secondDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS;
+    const base = SLOWDOWN_BASE_INTERVAL_MS;
+    const slowed = SLOWDOWN_BASE_INTERVAL_MS * SITE_UNAVAILABLE_SLOWDOWN_FACTOR;
+    expect(sleeps).toEqual([
+      base,
+      ...pageWaits(base),
+      ...pageWaits(base),
+      ...pageWaits(base),
+      firstDelayMs,
+      base,
+      secondDelayMs,
+      base,
+      ...pageWaits(slowed),
+      ...pageWaits(slowed),
+      ...pageWaits(slowed),
+    ]);
+    // 減速の知らせの後の待ちは、すべて 10 秒の間隔のもの。
+    expect(sleeps.slice(sleepCountAtNotice[2])).toEqual([...pageWaits(slowed), ...pageWaits(slowed), ...pageWaits(slowed)]);
+    // 設定の間隔（`load.minNavigationIntervalMs`）は変えない。実際の待ちは `pacingWaitMs` に表れる。
+    expect(result.run.load.minNavigationIntervalMs).toBe(SLOWDOWN_BASE_INTERVAL_MS);
+    expect(result.run.load.pacingWaitMs).toBe(sleeps.filter((ms) => !isRecheckDelay(ms)).reduce((sum, ms) => sum + ms, 0));
+    // 3 回目は通常の結果（AUDITED）として残り、その Link（/from-b.html）も拾う。Run の理由に SITE_UNAVAILABLE は残らない。
     expect(pageStates(result)).toEqual([
       [START_PATH, 'AUDITED', []],
       ['/a.html', 'AUDITED', []],
@@ -5073,13 +5186,13 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
       ['/d.html', 'AUDITED', []],
       ['/from-b.html', 'AUDITED', []],
     ]);
-    expect(result.pages[2]).toEqual(made.harness.world.auditOutcomes[3]?.result);
+    expect(result.pages[2]).toEqual(made.harness.world.auditOutcomes[4]?.result);
     expect(result.run.incompleteReasons).toEqual([]);
     expect(result.run.runStatus).toBe('COMPLETE');
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['COMPLETED']);
-    // 保存: 捨てた後に状態を保存し（待っている間に止まっても、理由 SITE_UNAVAILABLE（detail あり）の SKIPPED が残る）、確かめ直しの後は
-    // 通常どおりページと状態を保存する（ページの保存は 1 回。終わったページに 1 回だけ入る）。
-    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls]).slice(0, 10)).toEqual([
+    // 保存: 捨てるたびに状態を保存し（待っている間に止まっても、理由 SITE_UNAVAILABLE（detail あり）の SKIPPED が残る）、確かめ直しで通った
+    // 後は通常どおりページと状態を保存する（ページの保存は 1 回。終わったページに 1 回だけ入る）。
+    expect(recorder.calls.map(({ kind, auditCalls }) => [kind, auditCalls]).slice(0, 11)).toEqual([
       ['start', 0],
       ['state', 0],
       ['page', 1],
@@ -5087,17 +5200,21 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
       ['page', 2],
       ['state', 2],
       ['state', 3],
-      ['page', 4],
       ['state', 4],
       ['page', 5],
+      ['state', 5],
+      ['page', 6],
     ]);
     const states = recorder.states();
-    expect(frontierStates(states[3] as RunCheckpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
-    expect((states[3] as RunCheckpoint).progress.pagesStarted).toBe(2);
-    expect(frontierStates(states[4] as RunCheckpoint)[2]).toEqual(['/b.html', 'AUDITED', null]);
-    expect((states[4] as RunCheckpoint).progress.pagesStarted).toBe(3);
+    for (const state of [states[3], states[4]] as RunCheckpoint[]) {
+      expect(frontierStates(state)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
+      expect(state.progress.pagesStarted).toBe(2);
+      // 減速は保存しない（保存の負荷の記録の形を変えない）。
+      expect(Object.keys(state.load.pacer).sort()).toEqual(['lastNavigationStartedAtMs', 'navigationCount', 'totalWaitMs']);
+    }
+    expect(frontierStates(states[5] as RunCheckpoint)[2]).toEqual(['/b.html', 'AUDITED', null]);
+    expect((states[5] as RunCheckpoint).progress.pagesStarted).toBe(3);
     expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(result.pages.map(({ pageId }) => pageId));
-    expect(recorder.pages().find(({ pageId }) => pageId === pageIdOf('/b.html'))?.result).toEqual(result.pages[2]);
     const checkpoint = await expectFinishCheckpoint(concluded, 'FINISHED');
     expect(checkpoint.completedPageIds).toEqual(result.pages.map(({ pageId }) => pageId));
     expect(checkpoint.progress.pagesStarted).toBe(6);
@@ -5106,14 +5223,14 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     await expectValidRun(result);
   });
 
-  it('2. stops as before when the second attempt is unavailable too: the detail of the second attempt, the diagnostics of both attempts, one wait', async () => {
-    const SECOND_DETAIL = 'mobile:passive:HTTP 503';
-    const secondAttempt: AttemptSpec = { outcome: 'OK', httpStatus: 503, siteUnavailableDetail: SECOND_DETAIL, navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS };
+  it('2. stops as before when every recheck is unavailable too: waits 60 s, 2 min, 4 min and 8 min, stops after the fifth attempt with its detail, and writes five diagnostics', async () => {
+    const LAST_DETAIL = 'mobile:passive:HTTP 503';
+    const lastAttempt: AttemptSpec = { outcome: 'OK', httpStatus: 503, siteUnavailableDetail: LAST_DETAIL, navigationDiagnostics: UNAVAILABLE_NAVIGATION_DIAGNOSTICS };
     const { sleeps, sleep } = recordedSleep();
     const { notices, onNotice } = recordedNotices();
     const { writer, calls } = diagnosticWriter();
     const { harness, recorder } = checkpointHarness({
-      site: unavailableAt('/b.html', { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, secondAttempt] }),
+      site: unavailableAt('/b.html', { attempts: [...repeated(UNAVAILABLE_OBSERVED_ATTEMPT, MAX_RECHECKS), lastAttempt] }),
       sleep,
       onNotice,
       writeSiteUnavailableDiagnostic: writer,
@@ -5125,38 +5242,160 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(harness.world.auditCalls.map(({ url, attempt }) => [pathOf(url), attempt?.attempt])).toEqual([
       [START_PATH, 1],
       ['/a.html', 1],
-      ['/b.html', 1],
-      ['/b.html', 1],
+      ...repeated(['/b.html', 1], MAX_RECHECKS + 1),
     ]);
-    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    expect(notices).toEqual([recheckNotice('/b.html')]);
-    // 2 回目の不調の詳細で止める。残りも SKIPPED。
+    expect(sleeps).toEqual([...SITE_UNAVAILABLE_RECHECK_DELAYS_MS]);
+    expect(notices).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.map((_, index) => recheckNotice('/b.html', index + 1)));
+    // 5 回目（最後の確かめ直し）の不調の詳細で止める。残りも SKIPPED。
     expect(pageStates(result)).toEqual([
       [START_PATH, 'AUDITED', []],
       ['/a.html', 'AUDITED', []],
-      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(SECOND_DETAIL)]],
+      ['/b.html', 'SKIPPED', [siteUnavailableTrigger(LAST_DETAIL)]],
       ['/c.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
       ['/d.html', 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]],
     ]);
-    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SECOND_DETAIL)]);
+    expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(LAST_DETAIL)]);
     expect(result.run.runStatus).toBe('PARTIAL');
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
     const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
-    expect(frontierStates(checkpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(SECOND_DETAIL)]);
+    expect(frontierStates(checkpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(LAST_DETAIL)]);
     expect(checkpoint.progress.pagesStarted).toBe(2);
     expect(recorder.pages().map(({ pageId }) => pageId)).toEqual(result.pages.slice(0, 2).map(({ pageId }) => pageId));
-    // 診断の記録は、試行 1 と試行 2（それぞれの試行の結果と詳細）。
+    // 診断の記録は、試行 1〜5（それぞれの試行の結果と詳細）。
     expect(calls().map(({ record, attemptNumber }) => [attemptNumber, record.executionNumber, record.siteUnavailableDetail, record.page])).toEqual([
-      [FIRST_ATTEMPT, 1, DESKTOP_PASSIVE_TIMEOUT, harness.world.auditOutcomes[2]?.result],
-      [RECHECK_ATTEMPT, 1, SECOND_DETAIL, harness.world.auditOutcomes[3]?.result],
+      ...SITE_UNAVAILABLE_RECHECK_DELAYS_MS.map((_, index) => [FIRST_ATTEMPT + index, 1, DESKTOP_PASSIVE_TIMEOUT, harness.world.auditOutcomes[2 + index]?.result]),
+      [recheckAttempt(MAX_RECHECKS), 1, LAST_DETAIL, harness.world.auditOutcomes[2 + MAX_RECHECKS]?.result],
     ]);
   });
 
-  it('3. cuts the wait short and does not check again when the stop signal is set during the wait: the Run stops with the first detail', async () => {
+  it('3. doubles the interval each time a recheck passes, up to 8 times the setting: 10 s, 20 s, 40 s, then 40 s', async () => {
+    let harness: Harness | null = null;
+    const { sleeps, sleep } = clockAdvancingSleep(() => harness);
+    const { notices, onNotice } = recordedNotices();
+    // 4 つのページが、順に 1 回ずつ不調になり、どれも 1 回目の確かめ直しで通る。最後のページ（/e.html）は不調にならない。
+    const site: FakeSite = {
+      [START_PATH]: { links: ['/a.html', '/b.html', '/c.html', '/d.html', '/e.html'] },
+      '/a.html': RECOVERING_PAGE,
+      '/b.html': RECOVERING_PAGE,
+      '/c.html': RECOVERING_PAGE,
+      '/d.html': RECOVERING_PAGE,
+      '/e.html': {},
+    };
+    harness = createHarness({ site, config: { crawl: { minNavigationIntervalMs: SLOWDOWN_BASE_INTERVAL_MS } }, paceNavigations: true, sleep, onNotice });
+
+    const result = await harness.coordinator.run();
+
+    const base = SLOWDOWN_BASE_INTERVAL_MS;
+    const [firstDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS;
+    const maximum = base * SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR;
+    // 通るたびに 2 倍（10 秒、20 秒、40 秒）。4 回目は、すでに上限（40 秒）なので上げず、知らせも出さない。
+    expect(notices).toEqual([
+      recheckNotice('/a.html', 1),
+      slowdownNotice(base * SITE_UNAVAILABLE_SLOWDOWN_FACTOR),
+      recheckNotice('/b.html', 1),
+      slowdownNotice(base * SITE_UNAVAILABLE_SLOWDOWN_FACTOR ** 2),
+      recheckNotice('/c.html', 1),
+      slowdownNotice(maximum),
+      recheckNotice('/d.html', 1),
+    ]);
+    expect(base * SITE_UNAVAILABLE_SLOWDOWN_FACTOR ** 3).toBe(maximum);
+    // pacer の待ち: 各ページの 1 回目はその時点の間隔、待った後の確かめ直しは Desktop を待たず Mobile は間隔の全体。/e.html は上限の 40 秒。
+    expect(sleeps).toEqual([
+      base,
+      ...pageWaits(base),
+      ...pageWaits(base),
+      firstDelayMs,
+      base,
+      ...pageWaits(base * 2),
+      firstDelayMs,
+      base * 2,
+      ...pageWaits(base * 4),
+      firstDelayMs,
+      base * 4,
+      ...pageWaits(maximum),
+      firstDelayMs,
+      maximum,
+      ...pageWaits(maximum),
+    ]);
+    expect(result.run.load.minNavigationIntervalMs).toBe(SLOWDOWN_BASE_INTERVAL_MS);
+    expect(pageStates(result).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'AUDITED'],
+      ['/b.html', 'AUDITED'],
+      ['/c.html', 'AUDITED'],
+      ['/d.html', 'AUDITED'],
+      ['/e.html', 'AUDITED'],
+    ]);
+    expect(result.run.runStatus).toBe('COMPLETE');
+  });
+
+  it('4. keeps the interval 0 (no slowdown and no slowdown notice) when the setting is 0', async () => {
+    const { sleeps, sleep } = recordedSleep();
+    const { notices, onNotice } = recordedNotices();
+    const site: FakeSite = { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': RECOVERING_PAGE };
+    const harness = createHarness({ site, paceNavigations: true, sleep, onNotice });
+
+    const result = await harness.coordinator.run();
+
+    expect(harness.config.crawl.minNavigationIntervalMs).toBe(0);
+    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAYS_MS[0], SITE_UNAVAILABLE_RECHECK_DELAYS_MS[0]]);
+    expect(notices).toEqual([recheckNotice('/b.html', 1), recheckNotice('/d.html', 1)]);
+    expect(result.run.load.minNavigationIntervalMs).toBe(0);
+    expect(result.run.load.pacingWaitMs).toBe(0);
+    expect(result.run.runStatus).toBe('COMPLETE');
+  });
+
+  it('5. does not keep the slowed interval across executions: after a stop by the stop signal (Ctrl+C), the resumed execution starts from the setting again', async () => {
+    let harness: Harness | null = null;
+    const { sleeps, sleep } = clockAdvancingSleep(() => harness);
+    const { notices, onNotice } = recordedNotices();
     const controller = new AbortController();
-    // 待ちは決して終わらない（止める印で打ち切られることを確かめる）。
+    const config = { crawl: { minNavigationIntervalMs: SLOWDOWN_BASE_INTERVAL_MS } };
+    // /a.html は確かめ直しで通る（減速）。/b.html の監査の途中で止める印（Ctrl+C）を付け、/b.html を終えてから止める。
+    const site: FakeSite = { ...UNAVAILABILITY_SITE, '/a.html': RECOVERING_PAGE, '/b.html': { duringAudit: () => controller.abort() } };
+    const stoppedMade = checkpointHarness({ site, config, paceNavigations: true, sleep, onNotice, stopSignal: controller.signal });
+    harness = stoppedMade.harness;
+    const stoppedConcluded = await concludedRun(stoppedMade.harness);
+    const stopped = { harness: stoppedMade.harness, recorder: stoppedMade.recorder, result: stoppedConcluded.result as AuditRunResult };
+    const checkpoint = await expectFinishCheckpoint(stoppedConcluded, 'STOPPED');
+    const slowed = SLOWDOWN_BASE_INTERVAL_MS * SITE_UNAVAILABLE_SLOWDOWN_FACTOR;
+    expect(notices).toEqual([recheckNotice('/a.html', 1), slowdownNotice(slowed)]);
+    expect(pageStates(stopped.result).map(([path, status]) => [path, status])).toEqual([
+      [START_PATH, 'AUDITED'],
+      ['/a.html', 'AUDITED'],
+      ['/b.html', 'AUDITED'],
+      ['/c.html', 'SKIPPED'],
+      ['/d.html', 'SKIPPED'],
+    ]);
+    expect(stopped.result.run.incompleteReasons).toEqual([RUN_INTERRUPTED_SKIP]);
+    expect(checkpoint.executions.at(-1)?.endReason).toBe('STOPPED_BY_SIGNAL');
+    // 減速の後の /b.html の読み込みは、10 秒の間隔。減速の値は保存に入れない（保存の負荷の記録の形を変えない）。
+    expect(sleeps.slice(-2)).toEqual(pageWaits(slowed));
+    expect(Object.keys(checkpoint.load.pacer).sort()).toEqual(['lastNavigationStartedAtMs', 'navigationCount', 'totalWaitMs']);
+    expect(stopped.result.run.load.minNavigationIntervalMs).toBe(SLOWDOWN_BASE_INTERVAL_MS);
+    sleeps.length = 0;
+
+    // 同じコマンドでの再開（同じ設定。止める印はない）。
+    const resumed = resumedHarness({ site: UNAVAILABILITY_SITE, config, paceNavigations: true, sleep }, resumeInputFrom(stopped, checkpoint));
+    harness = resumed.harness;
+    // 時計は、止めた実行から続ける（再開の実行の開始は、前の回の最後の読み込みの開始より後）。
+    resumed.harness.world.nowMs = stopped.harness.world.nowMs;
+    const result = await resumed.harness.coordinator.run();
+
+    // 再開した実行の読み込みの間隔は、設定の値（5 秒。減速した 10 秒ではない）。再開の直後の最初の読み込みも、この実行の開始（前の回の最後の
+    // 読み込みの開始より後）から、設定の間隔以上空ける。
+    expect(resumed.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual(['/c.html', '/d.html']);
+    expect(sleeps).toEqual([...pageWaits(SLOWDOWN_BASE_INTERVAL_MS), ...pageWaits(SLOWDOWN_BASE_INTERVAL_MS)]);
+    expect(result.run.load.minNavigationIntervalMs).toBe(SLOWDOWN_BASE_INTERVAL_MS);
+    expect(result.run.runStatus).toBe('COMPLETE');
+  });
+
+  it('6. cuts the wait short and does not check again when the stop signal is set during a wait: the Run stops with the detail of the last attempt', async () => {
+    const controller = new AbortController();
+    const [, secondDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS;
+    // 2 回目の待ちは決して終わらない（止める印で打ち切られることを確かめる）。
     const sleep = vi.fn((ms: number): Promise<void> => {
-      if (ms === SITE_UNAVAILABLE_RECHECK_DELAY_MS) {
+      if (ms === secondDelayMs) {
         queueMicrotask(() => controller.abort());
         return new Promise<void>(() => undefined);
       }
@@ -5165,7 +5404,7 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     const { notices, onNotice } = recordedNotices();
     const { writer, calls } = diagnosticWriter();
     const { harness, recorder } = checkpointHarness({
-      site: unavailableAt('/b.html', RECOVERING_PAGE),
+      site: unavailableAt('/b.html', RECOVERING_AT_SECOND_RECHECK),
       sleep,
       onNotice,
       stopSignal: controller.signal,
@@ -5175,10 +5414,10 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     const concluded = await concludedRun(harness);
 
     const result = concluded.result as AuditRunResult;
-    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
-    expect(sleep).toHaveBeenCalledWith(SITE_UNAVAILABLE_RECHECK_DELAY_MS);
-    expect(notices).toEqual([recheckNotice('/b.html')]);
-    // 残りは、止める印（RUN_INTERRUPTED）ではなく、サイトの不調の SKIPPED（確かめの順）。1 回目の不調の詳細で止める。
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html']);
+    expect(sleep.mock.calls.map(([ms]) => ms)).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, 2));
+    expect(notices).toEqual([recheckNotice('/b.html', 1), recheckNotice('/b.html', 2)]);
+    // 残りは、止める印（RUN_INTERRUPTED）ではなく、サイトの不調の SKIPPED（確かめの順）。最後の試行（2 回目）の不調の詳細で止める。
     expect(pageStates(result)).toEqual([
       [START_PATH, 'AUDITED', []],
       ['/a.html', 'AUDITED', []],
@@ -5188,13 +5427,13 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     ]);
     expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
-    expect(calls().map(({ attemptNumber }) => attemptNumber)).toEqual([FIRST_ATTEMPT]);
+    expect(calls().map(({ attemptNumber }) => attemptNumber)).toEqual([FIRST_ATTEMPT, recheckAttempt(1)]);
     const checkpoint = await expectFinishCheckpoint(concluded, 'STOPPED');
     expect(frontierStates(checkpoint)[2]).toEqual(['/b.html', 'SKIPPED', siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
     expect(recorder.states().at(-1)?.progress.pagesStarted).toBe(2);
   });
 
-  it('3a. does not wait at all when the stop signal is already set when the page is discarded', async () => {
+  it('6a. does not wait at all when the stop signal is already set when the page is discarded', async () => {
     const controller = new AbortController();
     const { sleeps, sleep } = recordedSleep();
     const { notices, onNotice } = recordedNotices();
@@ -5208,25 +5447,33 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
   });
 
-  it('4. does not check again when the runtime limit is reached after the wait (the wait counts toward the limit): the Run stops with the first detail', async () => {
+  it.each([
+    ['the first', 0],
+    ['the second', 1],
+  ] as const)('7. does not check again when the runtime limit is reached after %s wait (the waits count toward the limit): the Run stops with the detail of the last attempt', async (_name, waitIndex) => {
     const MAX_RUNTIME_MS = 1_500;
     let harness: Harness | null = null;
-    // 待ちで、注入した時計を上限の先まで進める。
-    const { sleeps, sleep } = recordedSleep(() => {
-      if (harness !== null) {
+    // その待ちで、注入した時計を上限の先まで進める。
+    const { sleeps, sleep } = recordedSleep((_ms, index) => {
+      if (harness !== null && index === waitIndex) {
         harness.world.nowMs += MAX_RUNTIME_MS;
       }
     });
     const { notices, onNotice } = recordedNotices();
-    const made = checkpointHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), config: { crawl: { maxRuntimeMs: MAX_RUNTIME_MS } }, sleep, onNotice });
+    const made = checkpointHarness({
+      site: unavailableAt('/b.html', RECOVERING_AT_SECOND_RECHECK),
+      config: { crawl: { maxRuntimeMs: MAX_RUNTIME_MS } },
+      sleep,
+      onNotice,
+    });
     harness = made.harness;
 
     const concluded = await concludedRun(made.harness);
 
     const result = concluded.result as AuditRunResult;
-    expect(made.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html']);
-    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    expect(notices).toEqual([recheckNotice('/b.html')]);
+    expect(made.harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', ...repeated('/b.html', waitIndex + 1)]);
+    expect(sleeps).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, waitIndex + 1));
+    expect(notices).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, waitIndex + 1).map((_, index) => recheckNotice('/b.html', index + 1)));
     expect(pageStates(result)).toEqual([
       [START_PATH, 'AUDITED', []],
       ['/a.html', 'AUDITED', []],
@@ -5239,7 +5486,7 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     await expectFinishCheckpoint(concluded, 'STOPPED');
   });
 
-  it('4a. does not wait at all when the runtime limit is already reached when the page is discarded', async () => {
+  it('7a. does not wait at all when the runtime limit is already reached when the page is discarded', async () => {
     const { sleeps, sleep } = recordedSleep();
     const { notices, onNotice } = recordedNotices();
     const site = unavailableAt('/b.html', { ...RECOVERING_PAGE, durationMs: 2_000 });
@@ -5253,12 +5500,13 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
   });
 
-  it('5. does not check again when the page also recorded a violation: the violation stops the Run as before', async () => {
+  it('8. does not check again nor slow down when the page also recorded a violation: the violation stops the Run as before', async () => {
     const { sleeps, sleep } = recordedSleep();
     const { notices, onNotice } = recordedNotices();
     const { writer } = diagnosticWriter();
     const harness = createHarness({
       site: unavailableAt('/b.html', { ...RECOVERING_PAGE, violations: 1 }),
+      config: { crawl: { minNavigationIntervalMs: SLOWDOWN_BASE_INTERVAL_MS } },
       sleep,
       onNotice,
       writeSiteUnavailableDiagnostic: writer,
@@ -5275,7 +5523,7 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(result.run.incompleteReasons).toEqual([SAFETY_VIOLATION_ABORT_SKIP]);
   });
 
-  it('6. does not check the trigger page of the previous execution again: it is saved as an ordinary result and the Run stops (3.2.1)', async () => {
+  it('9. does not check the trigger page of the previous execution again: it is saved as an ordinary result and the Run stops (3.2.1)', async () => {
     const stopped = await recordedRun({ site: unavailableAt('/b.html') });
     const checkpoint = finishCheckpointOf(stopped.harness.coordinator.checkpointConclusion());
     const { sleeps, sleep } = recordedSleep();
@@ -5298,19 +5546,24 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(calls().map(({ record, attemptNumber }) => [record.executionNumber, attemptNumber])).toEqual([[2, FIRST_ATTEMPT]]);
   });
 
-  it('7. checks another page once more when it becomes unavailable after a page that passed the recheck', async () => {
+  it('10. starts the stages again from the first wait for another page that becomes unavailable after a page that passed the recheck', async () => {
     const { sleeps, sleep } = recordedSleep();
     const { notices, onNotice } = recordedNotices();
     const { writer, calls } = diagnosticWriter();
-    const site: FakeSite = { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': RECOVERING_PAGE };
+    const site: FakeSite = { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': RECOVERING_AT_SECOND_RECHECK };
     const harness = createHarness({ site, sleep, onNotice, writeSiteUnavailableDiagnostic: writer });
 
     const result = await harness.coordinator.run();
 
-    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', '/d.html', '/d.html']);
-    expect(sleeps).toEqual([SITE_UNAVAILABLE_RECHECK_DELAY_MS, SITE_UNAVAILABLE_RECHECK_DELAY_MS]);
-    expect(notices).toEqual([recheckNotice('/b.html'), recheckNotice('/d.html')]);
-    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([['/b.html', FIRST_ATTEMPT], ['/d.html', FIRST_ATTEMPT]]);
+    const [firstDelayMs, secondDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS;
+    expect(harness.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', '/d.html', '/d.html', '/d.html']);
+    expect(sleeps).toEqual([firstDelayMs, firstDelayMs, secondDelayMs]);
+    expect(notices).toEqual([recheckNotice('/b.html', 1), recheckNotice('/d.html', 1), recheckNotice('/d.html', 2)]);
+    expect(calls().map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([
+      ['/b.html', FIRST_ATTEMPT],
+      ['/d.html', FIRST_ATTEMPT],
+      ['/d.html', recheckAttempt(1)],
+    ]);
     expect(pageStates(result).map(([path, status]) => [path, status])).toEqual([
       [START_PATH, 'AUDITED'],
       ['/a.html', 'AUDITED'],
@@ -5321,19 +5574,18 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     expect(result.run.incompleteReasons).toEqual([]);
     expect(result.run.runStatus).toBe('COMPLETE');
 
-    // 対照: 後のページが 2 回とも不調なら、そのページで止まる（試行 1 と 2 の記録）。
+    // 対照: 後のページが 5 回とも不調なら、そのページで止まる（試行 1〜5 の記録）。
     const stopping = createHarness({
-      site: { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': { attempts: [UNAVAILABLE_OBSERVED_ATTEMPT, UNAVAILABLE_OBSERVED_ATTEMPT] } },
+      site: { ...UNAVAILABILITY_SITE, '/b.html': RECOVERING_PAGE, '/d.html': { attempts: repeated(UNAVAILABLE_OBSERVED_ATTEMPT, MAX_RECHECKS + 1) } },
       writeSiteUnavailableDiagnostic: writer,
     });
     const stoppedResult = await stopping.coordinator.run();
-    expect(stopping.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', '/d.html', '/d.html']);
+    expect(stopping.world.auditCalls.map(({ url }) => pathOf(url))).toEqual([START_PATH, '/a.html', '/b.html', '/b.html', '/c.html', ...repeated('/d.html', MAX_RECHECKS + 1)]);
     expect(pageStates(stoppedResult)[4]).toEqual(['/d.html', 'SKIPPED', [siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]]);
     expect(stoppedResult.run.incompleteReasons).toEqual([siteUnavailableTrigger(DESKTOP_PASSIVE_TIMEOUT)]);
-    expect(calls().slice(2).map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([
+    expect(calls().slice(3).map(({ record, attemptNumber }) => [pathOf(record.url), attemptNumber])).toEqual([
       ['/b.html', FIRST_ATTEMPT],
-      ['/d.html', FIRST_ATTEMPT],
-      ['/d.html', RECHECK_ATTEMPT],
+      ...ALL_ATTEMPTS.map((attempt) => ['/d.html', attempt]),
     ]);
   });
 
@@ -5355,19 +5607,22 @@ describe('RunCoordinator: checking an unavailable page once more after the wait 
     ]);
   });
 
-  it('keeps the Run going, the same as without a receiver, when the notice receiver throws or returns a rejected promise', async () => {
+  it('keeps the Run going, the same as without a receiver, when the notice receiver throws or returns a rejected promise (for both kinds of notice)', async () => {
     const { sleep } = recordedSleep();
-    const expected = await createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), sleep }).coordinator.run();
+    const config = { crawl: { minNavigationIntervalMs: SLOWDOWN_BASE_INTERVAL_MS } };
+    const expected = await createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), config, sleep }).coordinator.run();
     for (const onNotice of [
       (): void => {
         throw new Error('notice failed');
       },
       (): Promise<void> => Promise.reject(new Error('notice rejected')),
     ] as const) {
-      const harness = createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), sleep, onNotice: onNotice as RunCoordinatorDependencies['onNotice'] });
+      const spy = vi.fn(onNotice as (notice: RunNotice) => void);
+      const harness = createHarness({ site: unavailableAt('/b.html', RECOVERING_PAGE), config, sleep, onNotice: spy });
 
       const result = await harness.coordinator.run();
 
+      expect(spy.mock.calls.map(([notice]) => notice.kind)).toEqual(['SITE_UNAVAILABLE_RECHECK', 'SITE_UNAVAILABLE_SLOWDOWN']);
       expect(result.run.runStatus).toBe('COMPLETE');
       expect(result.statusInput.unhandledFailures).toBe(0);
       expect(pageStates(result)).toEqual(pageStates(expected));
