@@ -133,6 +133,7 @@
             "STOPPED_BY_RUNTIME_LIMIT",
             "STOPPED_BY_SIGNAL",
             "STOPPED_BY_SAFETY_VIOLATION",
+            "STOPPED_BY_SITE_UNAVAILABLE",
             "INTERRUPTED_ABNORMALLY",
             null
           ]

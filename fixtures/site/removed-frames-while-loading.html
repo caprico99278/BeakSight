@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Removed Frames While Loading</title></head>
+  <body>
+    <h1>Fixture Removed Frames While Loading</h1>
+    <script>
+      // DEF-026: 読み込みの途中で iframe を作り、すぐに消すページ。ブラウザは、消した iframe の文書の要求を取り消すので、Guard の CDP の層が
+      // 一時停止した要求への命令（`Fetch.continueRequest` など）が、一時停止の ID が無効なために失敗する競合を起こす。
+      // DEF-026 の調査で毎回競合が起きた条件（iframe を数十個作り、0〜9ms 後に消す）を、クエリで指定する。
+      // - `count`: 作る iframe の数（1〜60）。
+      // - `spread`: i 番目の iframe を、作ってから `i % spread` ms 後に消す（1〜60）。
+      // - `token`: iframe の文書のパスに入れる印（英数字と `-`）。サーバは、受けた要求のパスだけを記録するので、iframe ごとに違うパス
+      //   （`/removed-frame/<token>/<i>`）にして、どの iframe の要求がサーバに届いたかを数える。パスにファイルはない（サーバは 404 を返す）。
+      // - `target`: iframe の文書の Origin（省略すると、このページの Origin）。`127.0.0.1` か `localhost` の `http:` の Origin だけを使う
+      //   （許可 Origin の外の確かめも、ローカルの fixture のサーバの別のポートで行う）。インターネット上のサイトは使わない。
+      const query = new URLSearchParams(location.search);
+      const boundedInteger = (value, max) => {
+        const parsed = Number(value);
+        return Number.isInteger(parsed) && parsed >= 1 && parsed <= max ? parsed : null;
+      };
+      const count = boundedInteger(query.get('count'), 60);
+      const spread = boundedInteger(query.get('spread'), 60);
+      const token = query.get('token');
+      let target = location.origin;
+      if (query.get('target') !== null) {
+        const parsed = new URL(query.get('target'));
+        target = parsed.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(parsed.hostname) ? parsed.origin : null;
+      }
+      if (count !== null && spread !== null && token !== null && /^[A-Za-z0-9-]+$/.test(token) && target !== null) {
+        for (let index = 0; index < count; index += 1) {
+          const frame = document.createElement('iframe');
+          frame.src = `${target}/removed-frame/${token}/${index}`;
+          document.body.append(frame);
+          setTimeout(() => frame.remove(), index % spread);
+        }
+      }
+    </script>
+  </body>
+</html>

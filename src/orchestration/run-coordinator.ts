@@ -1,6 +1,7 @@
 import type { Browser } from 'playwright';
 import { evaluateCrossPageRules } from '../audit/cross-page-rules.js';
 import type { BrowserContextFactory, SafetyLedgerFactory } from '../browser/context-factory.js';
+import type { MainFrameLoadObservation } from '../browser/main-frame-load.js';
 import { ResourceCache } from '../browser/resource-delivery.js';
 import type { AuditConfig } from '../config/types.js';
 import { createRunArtifactDirectory, type RunArtifactDirectoryCreation } from '../core/artifact-layout.js';
@@ -17,6 +18,7 @@ import type {
   RunCheckpointState,
   RunEnvironment,
   RunExecution,
+  RunExecutionEndReason,
   RunId,
   RunLoad,
   RunProgressReport,
@@ -51,11 +53,11 @@ import {
 } from './environment.js';
 import { IdAllocator } from './id-allocator.js';
 import {
-  navigationFailureDetail,
   PageAuditor,
   SAFETY_VIOLATION_ABORT_REASON,
   type PageAuditorDependencies,
 } from './page-auditor.js';
+import { navigationFailureDetail } from './page-navigation.js';
 import {
   resolvePassiveSessionDeadlines,
   type PassiveSessionDeadlineOptions,
@@ -93,6 +95,12 @@ import {
   viewportEvidenceOfType,
 } from './run-aggregation.js';
 import { createRunIdFromTime } from './run-id.js';
+import {
+  SITE_UNAVAILABLE_SKIP_REASON,
+  siteUnavailabilityOf,
+  siteUnavailableDetail,
+  type SiteUnavailabilityStage,
+} from './site-availability.js';
 import { skippedPageResult } from './skipped-page.js';
 
 /** Run Coordinator が使う、1ページを監査するもの（`PageAuditor` の入口）。テストでは偽のものを渡せる。 */
@@ -135,6 +143,66 @@ export interface RunCoordinatorResumeInput {
   readonly checkpoint: RunCheckpoint;
   /** 終わったページの保存（`checkpoint.completedPageIds` の順）。 */
   readonly pages: readonly RunCheckpointPage[];
+}
+
+/**
+ * サイトの不調で止めたときの診断の記録の `schemaVersion`（`schemas/site-unavailable-diagnostic.schema.json`。サイトの不調で止めたときの
+ * 診断の記録の設計書 2.3）。1.1（2026-10-07 の改訂）: ビューポートごとの観察の結果に、幅の走査の幅ごとと Interaction の候補ごとの観察を
+ * 加えた（1.0 の形は、Passive の観察の結果そのものだった）。
+ */
+export const SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION = 'site-unavailable-diagnostic-schema/1.1';
+
+/**
+ * サイトの不調でページを捨てた後、同じページを 1 回だけ確かめ直すまでに待つ時間（ms。サイトが応答しないときに Run を止める設計書 3.5.2）。
+ * 設定の項目にしない: 設定の項目を増やすと、保存した設定と今の設定の比較が合わなくなり、今の途中の Run を続きから再開できなくなるため
+ * （設定が違う Run は再開しない。中断した Run の再開の設計書 4.7）。待っている間は、サイトへ何も送らない。待ちは、止める印（Ctrl+C）で
+ * 打ち切る。待った時間は、実行時間の上限に含める。
+ */
+export const SITE_UNAVAILABLE_RECHECK_DELAY_MS = 60_000;
+
+/** サイトの不調で捨てた、1 回目の試行の番号（診断の記録のファイルの名前に使う。設計書 3.5.2）。 */
+const SITE_UNAVAILABLE_FIRST_ATTEMPT = 1;
+/** 待った後の確かめ直しの試行の番号（1 回目の次。1 つの実行の中で、同じ URL につき 1 回まで）。 */
+const SITE_UNAVAILABLE_RECHECK_ATTEMPT = SITE_UNAVAILABLE_FIRST_ATTEMPT + 1;
+
+/**
+ * Run Coordinator の、実行中の知らせ（サイトが応答しないときに Run を止める設計書 3.5.4）。進み具合（`RunProgressReport`）とは別の口
+ * （`RunCoordinatorDependencies.onNotice`）に渡す、事実だけの値である（文言は、CLI が `messages.ts` で作る）。凍結する。
+ * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページ（`url`）を捨てた後、`delayMs` だけ待ってから、同じページを 1 回だけ確かめ直す。
+ */
+export interface RunNotice {
+  readonly kind: 'SITE_UNAVAILABLE_RECHECK';
+  /** そのページの URL（巡回の記録の、正規化した URL）。 */
+  readonly url: string;
+  /** 待つ時間（ms。`SITE_UNAVAILABLE_RECHECK_DELAY_MS`）。 */
+  readonly delayMs: number;
+}
+
+/**
+ * サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。Run Coordinator が組み立て、注入された書き出しの口
+ * （`RunCoordinatorDependencies.writeSiteUnavailableDiagnostic`）に渡す。形は `schemas/site-unavailable-diagnostic.schema.json` が決め、
+ * 書き出しは `ArtifactWriter.writeSiteUnavailableDiagnostic` が、そのスキーマで検証してから行う。監査の結果（`run.json`、`audit.json`、
+ * ページの結果）とは別の、付けたしの情報である。
+ */
+export interface SiteUnavailableDiagnosticRecord {
+  readonly schemaVersion: typeof SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION;
+  readonly runId: RunId;
+  /** 記録を書いた実行の番号（1から。再開した実行は、前の回の実行の数 + 1。`run.json` の `executions` の何件目か）。 */
+  readonly executionNumber: number;
+  /** 書いた時刻（ISO 8601。注入した時計で、記録を組み立てた時点に読む）。 */
+  readonly writtenAt: string;
+  readonly pageId: PageId;
+  /** ページの URL（クロールのキューの、正規化した URL。ページの結果の `pageUrl` と同じ値）。 */
+  readonly url: NormalizedHttpUrlEvidence;
+  /** そのページで最初に検知したサイトの不調の詳細（`PageAuditOutcome.siteUnavailableDetail`。例: `desktop:passive:TIMEOUT`）。 */
+  readonly siteUnavailableDetail: string;
+  /** そのページの最終の試行の監査の結果（ページのスキーマのまま。捨てたページでは、捨てた試行の Evidence を含む）。 */
+  readonly page: PageAuditResult;
+  /**
+   * その試行の、各ビューポートの、ページ本体の要求の観察の結果（`PageAuditOutcome.navigationDiagnostics`。Passive と、幅の走査の幅ごと、
+   * Interaction の候補ごと）。Page Auditor の値をそのまま写す。
+   */
+  readonly navigationDiagnostics: PageAuditOutcome['navigationDiagnostics'];
 }
 
 /** `RunCoordinator` に注入するもの（Task 14〜17 の設計書 5.6.1）。 */
@@ -184,17 +252,26 @@ export interface RunCoordinatorDependencies {
   readonly sleep?: ((ms: number) => Promise<void>) | undefined;
   /**
    * 実行中の進み具合の受け手（サイトへの負荷の制御の設計書 4.8）。省略すると、何もしない。ページの監査が1つ終わるたびに（`markFinished`
-   * と Link からの発見の後、次のページを始める前に）、その時点の進み具合の事実（`RunProgressReport`）を渡す。受け手は待たない。
+   * と Link からの発見の後、次のページを始める前に）、その時点の進み具合の事実（`RunProgressReport`）を渡す。サイトの不調のため捨てた
+   * ページ（サイトが応答しないときに Run を止める設計書 3.2）は、監査を終えたページに数えず、渡さない。受け手は待たない。
    * 受け手の例外（と、受け手が返した Promise の reject）は、握りつぶす。Run を止めず、Run の理由にもしない（表示の失敗で監査を止めない
    * ため）。関数でない値は、コンストラクタが `TypeError` を投げる。
    */
   readonly onProgress?: ((report: RunProgressReport) => void) | undefined;
+  /**
+   * 実行中の知らせの受け手（サイトが応答しないときに Run を止める設計書 3.5.4）。省略すると、何もしない。進み具合とは別の口である。
+   * サイトの不調でページを捨てた後、確かめ直しのために待つ前に（捨てた試行の診断の記録を渡した後に）、知らせ（`RunNotice`）を渡す。
+   * 受け手は待たない。受け手の例外（と、受け手が返した Promise の reject）は、握りつぶす。Run を止めず、Run の理由にもしない（表示の
+   * 失敗で監査を止めないため）。関数でない値は、コンストラクタが `TypeError` を投げる。
+   */
+  readonly onNotice?: ((notice: RunNotice) => void) | undefined;
   /**
    * 再開のための保存のセッション（中断した Run の再開の設計書 4.3、4.3.1）。省略すると、保存しない（今のまま）。作るのは CLI か
    * テストである。渡すと、Run Coordinator は、次の時期に保存を頼む。
    * - Run のディレクトリを排他的に作った直後（PREFLIGHT の前）に、`start(runDirectory, { mode: 'NEW_RUN' })` で始める。
    * - robots.txt と sitemap.xml の取得の後に、状態の保存（`saveState`）を1回行う。
    * - 各ページの `markFinished` と Link からの発見の後に、そのページの保存（`savePage`）と、状態の保存（`saveState`）を、この順に行う。
+   * - サイトの不調のため捨てたページ（サイトが応答しないときに Run を止める設計書 3.2）は、ページの保存をせず、状態の保存だけを行う。
    * 保存の状態は `IN_PROGRESS` のままにする（最後の状態は、CLI が最後の出力を書き終えた後に、セッションの `finish` で書く）。
    * CLI が行う保存の終わり方（`finish` に渡す最後の状態の保存、または `abandon`）は、`run()` の後に `checkpointConclusion()` で返す
    * （設計書 4.3.2。R4b2）。
@@ -213,17 +290,34 @@ export interface RunCoordinatorDependencies {
   /**
    * 止める印（中断した Run の再開の設計書 4.6.1。R4b2）。省略すると、止めない（今のまま）。CLI は、1回目のシグナル（Ctrl+C など）で、
    * この印の `AbortController` の `abort()` を呼ぶ（R5）。Run Coordinator は、次のページを始める前にだけ、印を確かめる（違反、保存の
-   * 失敗、ページ数、実行時間の後）。印が付いていれば、その URL から後を、理由 `RUN_INTERRUPTED`（`detail` は `null`）の SKIPPED にする。
+   * 失敗、サイトの不調、ページ数、実行時間の後）。印が付いていれば、その URL から後を、理由 `RUN_INTERRUPTED`（`detail` は `null`）の SKIPPED にする。
    * 今のページ（ビューポート、幅の走査、Interaction の候補、再試行）は最後まで行う。robots.txt と sitemap.xml の取得も止めない。
    * `AbortSignal` でない値は、コンストラクタが `TypeError` を投げる。
    */
   readonly stopSignal?: AbortSignal | undefined;
+  /**
+   * サイトの不調で止めたときの診断の記録の書き出しの口（サイトの不調で止めたときの診断の記録の設計書 2.3）。省略すると、何もしない（今のまま）。
+   * CLI は、`ArtifactWriter.writeSiteUnavailableDiagnostic` を渡す。Run Coordinator は、次の場合に、Run のディレクトリと記録と、その実行の中で
+   * そのページを監査した試行の番号（1 回目が 1。捨てた後に 1 回だけ確かめ直した試行は 2。同 3.5.2。ファイルの名前に使う）を渡して1回呼ぶ。
+   * - サイトの不調でページを捨てた場合（サイトが応答しないときに Run を止める設計書 3.2）。捨てた試行ごとに、捨てた後の状態の保存の後に呼ぶ
+   *   （確かめ直しのために待つ前）。
+   * - 前の実行のきっかけのページが、また不調で、普通の結果として保存した場合（同 3.2.1）。ページの保存と状態の保存の後に呼ぶ。
+   * 違反でページを捨てなかった場合（違反の優先）と、robots.txt と sitemap.xml の段階で止めた場合は、呼ばない。
+   * 書き終わる（返した Promise が決まる）まで待ってから、次の処理（確かめ直しの待ち、次のページの前の確かめ、Browser を閉じる処理）に進む。
+   * 口の例外と、返した Promise の reject は、握りつぶす（Run の理由、未処理の失敗の件数、標準エラーには何も残さない。診断は付けたしの
+   * 情報のため）。関数でない値は、コンストラクタが `TypeError` を投げる。
+   */
+  readonly writeSiteUnavailableDiagnostic?:
+    | ((runDirectory: string, record: SiteUnavailableDiagnosticRecord, attemptNumber: number) => Promise<void>)
+    | undefined;
 }
 
 /**
  * 再試行の対象の、Desktop の `NAVIGATION_FAILED` の理由の `detail` の一覧（Task 14〜17 の設計書 5.2、5.6.4）。
  * 一時的なナビゲーションの失敗（期限切れと、接続の一時的な失敗）だけである。detail の形は、`navigationFailureDetail` だけが作る。
  * 4xx・5xx の応答（ナビゲーションは `OK`）、安全のための遮断（`BLOCKED_EXTERNAL_REDIRECT`）、そのほかのエラーは、再試行しない。
+ * 一覧に入る失敗でも、試行の結果にサイトの不調の印がある場合は、再試行しない（サイトが応答しないときに Run を止める設計書 3.3。
+ * `#auditWithRetry`）。
  */
 export const RETRYABLE_NAVIGATION_FAILURE_DETAILS: readonly string[] = Object.freeze([
   navigationFailureDetail({ navigationOutcome: 'TIMEOUT', failureDetail: null }),
@@ -439,9 +533,12 @@ type RunCheckpointContentValues = Omit<RunCheckpointInput, 'state' | 'savedAt' |
 interface RunCrawlRecord {
   readonly frontier: CrawlFrontier;
   readonly allocator: IdAllocator;
-  /** 監査を始めたページの数。 */
+  /** 監査を始めたページの数（サイトの不調のため捨てたページは数えない。サイトが応答しないときに Run を止める設計書 3.2）。 */
   readonly pagesStarted: number;
-  /** ページの外で作った Safety Ledger の snapshot（再開した Run では、前の回までの分を含む）。 */
+  /**
+   * ページの外で作った Safety Ledger の snapshot（再開した Run では、前の回までの分を含む）。サイトの不調のため捨てたページの Ledger の
+   * snapshot も、ここに入る（サイトが応答しないときに Run を止める設計書 3.2）。
+   */
   readonly outsidePageSnapshots: readonly SafetyLedgerSnapshot[];
   /** 監査を終え、ページの保存を書いたページの ID（終わった順）。 */
   readonly completedPageIds: readonly PageId[];
@@ -476,6 +573,20 @@ interface RunSessionStatus {
 /** robots.txt と sitemap.xml の取得の結果のうち、Run Coordinator が使うもの（再開のときは、保存の Evidence から作り直す）。 */
 type RunSiteMetadata = Pick<SiteMetadataResult, 'records' | 'sitemap'>;
 
+/**
+ * 1つの URL の監査の結果（`#auditWithRetry`）。最終の試行のページの結果と、その試行のサイトの不調の印（不調を検知しなければ `null`。
+ * サイトが応答しないときに Run を止める設計書 3.2、3.3）と、その試行のページ本体の要求の観察の結果（診断の記録に使う。サイトの不調で
+ * 止めたときの診断の記録の設計書 2.2、2.3）。
+ */
+type RunPageAudit = Pick<PageAuditOutcome, 'result' | 'siteUnavailableDetail' | 'navigationDiagnostics'>;
+
+/** 診断の記録に入れる、この実行の値（`#crawl` に渡す。サイトの不調で止めたときの診断の記録の設計書 2.3）。 */
+interface RunDiagnosticIdentity {
+  readonly runId: RunId;
+  /** この実行の番号（1から。再開した実行は、前の回の実行の数 + 1）。 */
+  readonly executionNumber: number;
+}
+
 /** 1回の `run()` の途中の状態。 */
 interface RunProgress {
   readonly reasons: IncompleteReason[];
@@ -497,7 +608,8 @@ interface RunProgress {
   /**
    * 違反を検出したか（Task 19 の前の整理の設計書 4.5。C18f）。一度真になったら、戻さない（Ledger の違反は減らないため）。
    * `#detectSafetyViolation` だけが変える（監査を始める前の確かめと、各保存の前（robots.txt と sitemap.xml の取得の後の保存と、各ページの
-   * 保存）。中断した Run の再開の設計書 4.2）。
+   * 保存）。中断した Run の再開の設計書 4.2。サイトの不調の印のあるページの後の確かめ（ページを捨てるかを決める前。サイトが応答しないときに
+   * Run を止める設計書 3.2））。
    */
   safetyViolationDetected: boolean;
   /**
@@ -527,6 +639,15 @@ interface RunProgress {
    * 残らない場合も、事実として `crawlLimits.maxRuntimeReached` に記録する（その場合は、Run の理由は付けない。R15 の Minor-4）。
    */
   maxRuntimeExceeded: boolean;
+  /**
+   * この実行で最初に検知したサイトの不調の詳細（ページの結果の `siteUnavailableDetail`。サイトが応答しないときに Run を止める設計書 3.2、
+   * 3.2.1）。検知していなければ `null`。`#crawl` だけが、不調のページを捨てるときと、前の実行のきっかけのページを普通の結果として保存する
+   * ときと、robots.txt と sitemap.xml の取得で不調を検知したとき（詳細は `site-metadata:<判定の詳細>`。設計書 3.1）に、入れる（そのページや
+   * 取得までに違反も検出していた場合は入れない。今のとおり違反で止めるため。違反の優先）。
+   * `null` でなければ、次のページを始めず（止める理由の確かめ）、`#finalize` が Run の理由 `SITE_UNAVAILABLE`（`detail` はこの値）を1件
+   * 加える。保存しない（この実行だけの値。再開した実行で不調を検知しなければ、Run の理由は残らない）。
+   */
+  siteUnavailableDetail: string | null;
   unhandledFailures: number;
   executionComplete: boolean;
   preflightFailed: boolean;
@@ -557,9 +678,11 @@ export class RunCoordinator {
   readonly #deadlines: ResolvedPassiveSessionDeadlines;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #onProgress: ((report: RunProgressReport) => void) | undefined;
+  readonly #onNotice: ((notice: RunNotice) => void) | undefined;
   readonly #checkpointSession: RunCoordinatorCheckpointSession | undefined;
   readonly #resumeFrom: RunCoordinatorResumeInput | undefined;
   readonly #stopSignal: AbortSignal | undefined;
+  readonly #diagnosticWriter: RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'];
   /** 最後に終わった `run()` の後の保存の終わり方（`run()` が終わるまでは `null`）。 */
   #checkpointConclusion: RunCoordinatorCheckpointConclusion | null = null;
 
@@ -592,6 +715,8 @@ export class RunCoordinator {
       ['readToolVersion', dependencies.readToolVersion],
       ['sleep', dependencies.sleep],
       ['onProgress', dependencies.onProgress],
+      ['onNotice', dependencies.onNotice],
+      ['writeSiteUnavailableDiagnostic', dependencies.writeSiteUnavailableDiagnostic],
     ] as const) {
       if (value !== undefined && typeof value !== 'function') {
         throw new TypeError(`RunCoordinator ${name} must be a function when given`);
@@ -637,9 +762,11 @@ export class RunCoordinator {
     this.#readToolVersion = dependencies.readToolVersion ?? readToolVersionDefault;
     this.#sleep = dependencies.sleep ?? wait;
     this.#onProgress = dependencies.onProgress;
+    this.#onNotice = dependencies.onNotice;
     this.#checkpointSession = dependencies.checkpointSession;
     this.#resumeFrom = dependencies.resumeFrom;
     this.#stopSignal = dependencies.stopSignal;
+    this.#diagnosticWriter = dependencies.writeSiteUnavailableDiagnostic;
     // 期限の値の検証は、期限の部品と同じもので行う（正の安全な整数でなければ `RangeError`）。
     this.#browserCloseTimeoutMs = resolveTimeoutMs(dependencies.browserCloseTimeoutMs, BROWSER_CLOSE_TIMEOUT_MS);
     // 作成・終了の期限は、ここで検証し、既定値で埋めたものを下へ渡す（RP18 の指摘2）。
@@ -659,11 +786,17 @@ export class RunCoordinator {
    *    で、違反が記録された場合は `ABORTED_BY_SAFETY` である（設計書 5.6.7）。
    * 3. 環境の事実を集める。User-Agent を読んだ page と Context の閉じる処理の失敗（期限切れを含む）は、Run の理由に加える。
    * 4. 採番器を作り、開始の URL のページの ID を採番する。
-   * 5. robots.txt と sitemap.xml を取得する。Evidence は、開始の URL のページに置く（設計書 5.6.2）。
+   * 5. robots.txt と sitemap.xml を取得する。Evidence は、開始の URL のページに置く（設計書 5.6.2）。取得の観測でサイトの不調を検知したら、
+   *    sitemap.xml を読み込まず、ページの監査を始めずに、残りの URL を理由 `SITE_UNAVAILABLE` の SKIPPED にする。取得の結果は、前の実行が
+   *    この段階で止まっていなければ残さない（再開のときに取得し直す。`#crawl`。サイトが応答しないときに Run を止める設計書 3.1、3.2.1）。
    * 6. BFS でクロールする（5.6.3）。一時的なナビゲーションの失敗は、1回だけ再試行する（5.6.4）。安全の不変条件の違反を検出した後は、
    *    新しいページを始めず、残りの URL を理由 `SAFETY_VIOLATION_ABORT` の SKIPPED にする。Page Auditor にも、次のビューポート、
    *    幅の走査の次の幅、Interaction の次の候補を始めないよう、違反の確かめを渡す（Task 19 の前の整理の設計書 4.5）。
    *    保存のセッションがあれば、robots.txt と sitemap.xml の後と、各ページの後に、保存を頼む（`#crawl`。中断した Run の再開の設計書 4.3）。
+   *    ページの結果にサイトの不調の印があれば、再試行せず、そのページを捨てて（再開で監査し直す）、新しいページを始めずに、残りの URL を
+   *    理由 `SITE_UNAVAILABLE` の SKIPPED にする（`#crawl`。サイトが応答しないときに Run を止める設計書 3.2、3.2.1、3.3）。
+   *    書き出しの口（`writeSiteUnavailableDiagnostic`）が注入されていれば、そのページの診断の記録を渡す（サイトの不調で止めたときの
+   *    診断の記録の設計書 2.3。口の失敗は、Run を変えない）。
    * 7. Browser を閉じる（閉じる処理の失敗は、Run の理由に加える）。
    * 8. Cross-page rule を評価する。評価の失敗は、Run の理由に加える。
    * 9. すべてのページと Finding を、スキーマで確かめる。
@@ -806,6 +939,7 @@ export class RunCoordinator {
       navigationPacer,
       loadMeter,
       maxRuntimeExceeded: false,
+      siteUnavailableDetail: null,
       executionComplete: false,
       preflightFailed: false,
       guardEnabled: false,
@@ -911,7 +1045,10 @@ export class RunCoordinator {
             startedAt: runStartedAt,
             executions: executionsEndingWith(previousExecutions, execution),
           };
-        crawl = await this.#crawl(factory, runDirectory, startedAtMs, progress, checkpoint, saved ?? null);
+        // 診断の記録の実行の番号は、前の回までの実行の数 + 1（`run.json` の実行の記録の、この実行の位置。サイトの不調で止めたときの
+        // 診断の記録の設計書 2.3）。
+        const diagnosticIdentity: RunDiagnosticIdentity = { runId, executionNumber: previousExecutions.length + 1 };
+        crawl = await this.#crawl(factory, runDirectory, startedAtMs, progress, checkpoint, saved ?? null, diagnosticIdentity);
         crawlEndContent = crawl.crawlEndContent;
       } else {
         // 巡回を始めなかった（PREFLIGHT の失敗など）。
@@ -994,9 +1131,25 @@ export class RunCoordinator {
    * Evidence（`progress` の値。`restoredCrawlProgress`）を使い、監査を始めたページの数と、保存の続き（終わったページの ID、ページの外の
    * Ledger の snapshot）を、保存から作り直して、続きから巡回する（中断した Run の再開の設計書 4.1、4.2、4.10 の DEF-022）。
    * 止める印が付いていれば、次のページを始めず、残りの URL を理由 `RUN_INTERRUPTED` の SKIPPED にする（設計書 4.6.1）。
+   * ページの結果にサイトの不調の印があれば（サイトが応答しないときに Run を止める設計書 3.2、3.2.1）、そのページの Ledger に違反がない限り、
+   * この実行の不調の詳細（`progress.siteUnavailableDetail`）を残して、次のページを始めず、残りの URL を理由 `SITE_UNAVAILABLE`（`detail` は
+   * `null`）の SKIPPED にする。不調のページは、前の実行のきっかけのページ（`saved` の巡回の記録で、理由 `SITE_UNAVAILABLE` の `detail` のある
+   * SKIPPED）でなければ捨てて、理由 `SITE_UNAVAILABLE`（`detail` は不調の詳細）の SKIPPED にし、状態だけを保存する。前の実行のきっかけの
+   * ページなら、普通の結果として保存する。
+   * robots.txt と sitemap.xml の取得の観測でサイトの不調を検知したら（設計書 3.1、3.2.1 の最後の項目）、包んだ間隔の待ちで sitemap.xml を
+   * 読み込ませない。Run の初めからの Ledger に違反がなければ、この実行の不調の詳細を残し、ページの監査を始めずに、開始の URL を含む残りの
+   * URL を理由 `SITE_UNAVAILABLE`（`detail` は `null`）の SKIPPED にする。取得の結果は、前の実行がこの段階で止まっていなければ残さず（取得の
+   * 後の状態の保存の `siteMetadata` は `null` になり、再開のときに取得し直す）、止まっていれば残す（保存し、次の再開では取得し直さない）。
    * 保存のセッションがあれば、巡回の終わり（残りの URL を SKIPPED にした後。例外で止まった経路でも、SKIPPED にした後）の値を、最後の
    * 状態の保存の中身として写して返す（設計書 4.3.2。R4b2）。この後の Browser を閉じる処理と `#finalize` で加わる理由、件数、Finding の
    * ID の採番は、中身に入らない。
+   * 不調のページを捨てた場合と、前の実行のきっかけのページを普通の結果として保存した場合は、そのページの保存の後に、診断の記録を書き出しの
+   * 口に渡す（`#passSiteUnavailableDiagnostic`。`diagnosticIdentity` は、記録の Run の ID と実行の番号。サイトの不調で止めたときの診断の
+   * 記録の設計書 2.3）。
+   * 不調のページを捨てた後、その実行でそのページをまだ確かめ直していなければ、知らせてから `SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待ち
+   * （止める印で打ち切る）、待った後に止める印がなく、実行時間の上限にも達していなければ、同じページ（同じ `pageId`）を 1 回だけ監査し直す
+   * （サイトが応答しないときに Run を止める設計書 3.5.2。`#waitBeforeRecheck`）。2 回目に不調がなければ通常どおり保存して進み、2 回目も
+   * 不調なら今までどおり止める（不調の詳細は 2 回目のもの）。前の実行のきっかけのページは、確かめ直さない。
    */
   async #crawl(
     factory: BrowserContextFactory,
@@ -1005,6 +1158,7 @@ export class RunCoordinator {
     progress: RunProgress,
     checkpoint: RunCheckpointContext | null,
     saved: RunCheckpoint | null,
+    diagnosticIdentity: RunDiagnosticIdentity,
   ): Promise<RunCrawlOutcome> {
     const config = this.#config;
     const runtimeLimitReached = (): boolean => this.#now() - startedAtMs >= config.crawl.maxRuntimeMs;
@@ -1022,6 +1176,12 @@ export class RunCoordinator {
     const pageLedgers = new Set<SafetyLedger>();
     const outsidePageSnapshots = (): SafetyLedgerSnapshot[] =>
       outsidePageLedgerSnapshots(savedOutsidePageSnapshots, progress.safetyLedgers, pageLedgers);
+    // 前の実行で止まるきっかけになったページの URL（サイトが応答しないときに Run を止める設計書 3.2.1）。実行の初めに1回だけ、再開の入力の
+    // 保存の巡回の記録から読み取る（`restoredCrawlProgress` で待ち行列に戻した後の巡回の記録ではなく、保存の値を見る）。新しい Run では空。
+    const previousTriggerUrls = siteUnavailableTriggerUrlsOf(saved);
+    // 前の実行が、robots.txt と sitemap.xml の段階で、サイトの不調で止まったか（設計書 3.2.1 の最後の項目）。実行の初めに1回だけ、再開の入力の
+    // 保存から決める。新しい Run では偽。
+    const previousStoppedAtSiteMetadata = stoppedAtSiteMetadataBefore(saved);
     try {
       // 開始の URL（再開のときは、PREFLIGHT の前に作った値。`restoredCrawlProgress`）。
       const startUrl = progress.startUrl ?? normalizedStartUrl(config);
@@ -1047,7 +1207,8 @@ export class RunCoordinator {
       // （sitemap がないものとして、Cross-page rule は sitemap の判定をしない）。
       // 再開のときは、取得し直さない。保存に Evidence があれば、PREFLIGHT の前に、そこから作り直してある（`restoredCrawlProgress`。閉じる処理の
       // 失敗などの理由は、保存の理由にある）。前の回が、違反のため取得を始めなかった場合は、そのことが保存の理由にあるので、理由も加えない
-      // （中断しなかった場合と同じ理由にする）。どちらでもない保存のときだけ、今の決まりのとおり取得する。
+      // （中断しなかった場合と同じ理由にする）。どちらでもない保存のときだけ、今の決まりのとおり取得する（取得でサイトの不調を検知し、
+      // 取得の結果を残さずに止まった保存も、ここで取得し直す。サイトが応答しないときに Run を止める設計書 3.1）。
       if (saved !== null && saved.siteMetadata !== null) {
         // 保存の Evidence から作り直してある。
       } else if (saved !== null && saved.progress.reasons.some(isSiteMetadataSafetyAbortReason)) {
@@ -1055,6 +1216,9 @@ export class RunCoordinator {
       } else if (this.#safetyViolationRecorded(progress, 0)) {
         progress.reasons.push(SITE_METADATA_SAFETY_ABORT_REASON);
       } else {
+        // 各ファイルの読み込みの観測で、サイトの不調を判定し、最初の不調を残す。不調を残した後は、次のファイル（sitemap.xml）の前の待ちが、
+        // 待たずに例外を投げ、読み込ませない（サイトが応答しないときに Run を止める設計書 3.1）。
+        const hooks = siteMetadataNavigationHooks(progress.navigationPacer);
         const metadata = await this.#collectSiteMetadata({
           contextFactory: factory,
           origin: new URL(startUrl).origin,
@@ -1063,11 +1227,24 @@ export class RunCoordinator {
           allocator,
           clock: this.#clock,
           deadlines: this.#deadlines,
-          // 各ファイルの読み込みの前に、Run で1つの pacer で間隔を守る（サイトへの負荷の制御の設計書 4.1）。
-          beforeNavigation: () => progress.navigationPacer.beforeNavigation(),
+          // 各ファイルの読み込みの前に、Run で1つの pacer で間隔を守る（サイトへの負荷の制御の設計書 4.1）。不調を残した後は、待たない。
+          beforeNavigation: hooks.beforeNavigation,
+          afterNavigation: hooks.afterNavigation,
         });
         // metadata の取得の Ledger は、Context の factory が作ったもので、すでに登録にある（`ledgerSnapshot` は集計に使わない）。
-        progress.metadata = metadata;
+        // サイトの不調を検知し、Run の初めからの Ledger に違反がなければ、この実行の不調の詳細を残す（次のページを始めない。設計書 3.2）。
+        // 違反があれば、今のとおり違反で止める（不調の詳細を残さない。違反の優先）。不調の詳細を残した場合、取得の結果は、前の実行がこの
+        // 段階で止まっていなければ残さず（保存の `siteMetadata` を `null` にし、再開のときに取得し直す）、止まっていれば今のとおり残す
+        // （保存し、次の再開では取得し直さない。同じ段階で止まり続けないため。設計書 3.2.1 の最後の項目）。
+        const unavailableDetail = hooks.unavailableDetail();
+        if (unavailableDetail !== null && !this.#detectSafetyViolation(progress, 0)) {
+          progress.siteUnavailableDetail ??= unavailableDetail;
+          if (previousStoppedAtSiteMetadata) {
+            progress.metadata = metadata;
+          }
+        } else {
+          progress.metadata = metadata;
+        }
         for (const { step, error } of metadata.closeFailures) {
           progress.reasons.push(unhandledFailureReason(
             step === 'page' ? RUN_FAILURE_LABELS.metadataPageClose : RUN_FAILURE_LABELS.metadataContextClose,
@@ -1116,23 +1293,41 @@ export class RunCoordinator {
         // （それより前の Ledger は、ページを始める前に調べた）。
         safetyViolationRecorded: () => this.#safetyViolationRecorded(progress, progress.pageLedgerStart),
       });
-      // 新しいページを始めない理由（保存の失敗、ページ数の上限、実行時間の上限、止める印）。決まった後の URL は、すべてこの理由の SKIPPED に
-      // する。
+      // 新しいページを始めない理由（保存の失敗、サイトの不調、ページ数の上限、実行時間の上限、止める印）。決まった後の URL は、すべてこの
+      // 理由の SKIPPED にする。
       let stopReason: IncompleteReason | null = null;
       // 監査を終えたページの数（進み具合の事実。サイトへの負荷の制御の設計書 4.8）。再開のときは、再開の前に終わったページを含める。
       let pagesFinished = saved?.completedPageIds.length ?? 0;
-      for (let entry = frontier.next(); entry !== undefined; entry = frontier.next()) {
+      // 1 回だけ確かめ直す（サイトが応答しないときに Run を止める設計書 3.5.2）。不調で捨てたページを、待った後にもう 1 回監査するときは、
+      // 待ち行列を通さずに、その記録（`recheckEntry`）を次に監査する。確かめ直したページの URL は、1 つの実行の中で同じ URL につき 1 回まで
+      // にするために持つ（確かめ直しの試行でまた不調なら、今までどおり止める）。
+      let recheckEntry: CrawlUrlEntry | null = null;
+      const recheckedUrls = new Set<string>();
+      const nextEntry = (): CrawlUrlEntry | undefined => {
+        if (recheckEntry === null) {
+          return frontier.next();
+        }
+        const entry = recheckEntry;
+        recheckEntry = null;
+        return entry;
+      };
+      for (let entry = nextEntry(); entry !== undefined; entry = nextEntry()) {
+        // この記録が、待った後の確かめ直しか（`requeueForRecheck` で `AUDITING` に戻してある）。
+        const rechecking = recheckedUrls.has(entry.url);
         // 違反を検出した後は、新しいページを始めない（Task 19 の前の整理の設計書 4.5）。ページを始める前に、Run の間に作ったすべての
         // Ledger を調べる。違反の後の URL は、保存の失敗と上限より先に、理由 `SAFETY_VIOLATION_ABORT` の SKIPPED にする。
         if (stopReason === null && this.#safetyViolationRecorded(progress, 0)) {
           frontier.markSkipped(entry.url, SAFETY_VIOLATION_ABORT_REASON);
           continue;
         }
-        // 次のページを始める前に、毎回、保存の失敗（中断した Run の再開の設計書 4.3）、ページ数、実行時間、止める印（設計書 4.6.1）の順に
-        // 確かめる（同時に当てはまる場合は、前のものの理由にする）。止める印は、ここでだけ確かめる（今のページは、再試行を含めて最後まで行う）。
+        // 次のページを始める前に、毎回、保存の失敗（中断した Run の再開の設計書 4.3）、サイトの不調（この実行で不調を検知した。サイトが
+        // 応答しないときに Run を止める設計書 3.2）、ページ数、実行時間、止める印（中断した Run の再開の設計書 4.6.1）の順に確かめる（同時に
+        // 当てはまる場合は、前のものの理由にする）。止める印は、ここでだけ確かめる（今のページは、再試行を含めて最後まで行う）。
         if (stopReason === null) {
           if (checkpointFailed) {
             stopReason = CHECKPOINT_WRITE_FAILED_SKIP_REASON;
+          } else if (progress.siteUnavailableDetail !== null) {
+            stopReason = SITE_UNAVAILABLE_SKIP_REASON;
           } else if (pagesStarted >= config.crawl.maxPages) {
             stopReason = crawlLimitReason('MAX_PAGES_REACHED');
           } else if (runtimeLimitReached()) {
@@ -1147,8 +1342,62 @@ export class RunCoordinator {
         }
         pagesStarted += 1;
         progress.pageLedgerStart = progress.safetyLedgers.length;
-        frontier.markAuditing(entry.url);
-        const result = await this.#auditWithRetry(auditor, entry, progress);
+        // 確かめ直しの記録は、捨てたときに `AUDITING` に戻してある（`requeueForRecheck`）。
+        if (!rechecking) {
+          frontier.markAuditing(entry.url);
+        }
+        const { result, siteUnavailableDetail, navigationDiagnostics } = await this.#auditWithRetry(auditor, entry, progress);
+        // 診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。不調で止めたページ（捨てたページと、普通の結果として保存した
+        // 前の実行のきっかけのページ）だけに、そのページの保存の後に渡す。違反でページを捨てなかった場合は、渡さない。試行の番号は、
+        // 確かめ直しなら 2、それ以外は 1（ファイルの名前に使う。設計書 3.5.2）。
+        let diagnosticDetail: string | null = null;
+        const passDiagnostic = (detail: string): Promise<void> => this.#passSiteUnavailableDiagnostic(
+          runDirectory,
+          () => this.#siteUnavailableDiagnostic({
+            identity: diagnosticIdentity,
+            entry,
+            siteUnavailableDetail: detail,
+            page: result,
+            navigationDiagnostics,
+          }),
+          rechecking ? SITE_UNAVAILABLE_RECHECK_ATTEMPT : SITE_UNAVAILABLE_FIRST_ATTEMPT,
+        );
+        // サイトの不調の印（サイトが応答しないときに Run を止める設計書 3.2、3.2.1）。まず、そのページの Ledger の違反を確かめる。違反が
+        // あれば、ページを捨てずに、今のとおり普通の結果として保存し、違反で止める（違反の Evidence をページに残すため。違反の優先）。
+        // 違反がなければ、この実行の不調の詳細を残し（次のページを始めない）、前の実行のきっかけのページでなければ、ページを捨てる。前の実行の
+        // きっかけのページなら、捨てずに、普通の結果として保存する（同じページで止まり続けないため。設計書 3.2.1）。
+        if (siteUnavailableDetail !== null && !this.#detectSafetyViolation(progress, progress.pageLedgerStart)) {
+          progress.siteUnavailableDetail ??= siteUnavailableDetail;
+          diagnosticDetail = siteUnavailableDetail;
+          if (!previousTriggerUrls.has(entry.url)) {
+            // ページを捨てる。巡回の記録で、理由 `SITE_UNAVAILABLE`（`detail` は不調の詳細。止まるきっかけのページの印）の SKIPPED にする
+            // （再開のときに、待ち行列に戻す）。結果、ページの保存、終わったページの ID、Link、進み具合には入れない。監査を始めたページの数
+            // からも外す（再開で監査し直すときに、二重に数えないため）。そのページの Ledger は `pageLedgers` に入れないので、ページの外の
+            // Ledger の snapshot として、状態の保存と Run の Safety の集計に入る。そのページの再試行の記録と、再試行の前の試行の Evidence は
+            // 消す（ページの結果がないので、記録の `evidenceIds` の行き先がなくなるため）。
+            pagesStarted -= 1;
+            frontier.markSkipped(entry.url, siteUnavailableReason(siteUnavailableDetail));
+            removeRetryRecordsOf(progress.retries, entry.url);
+            progress.retryEvidence.delete(entry.url);
+            // 捨てた後に、状態を保存する（理由と `detail` のある SKIPPED を、この後に途中で止まった場合（確かめ直しのために待っている間を
+            // 含む）にも残すため）。
+            if (checkpoint !== null && !checkpointFailed) {
+              await saveState(checkpoint);
+            }
+            await passDiagnostic(siteUnavailableDetail);
+            // 1 回だけ確かめ直す（設計書 3.5.2）。この実行でまだ確かめ直していないページで、状態を保存できていれば（保存に失敗した後は、
+            // 新しいページを始めないので、待たず、確かめ直さない）、知らせてから待ち、待った後に止める印がなく、実行時間の上限にも達して
+            // いなければ、この実行の不調の詳細を消し（このページを始める前は `null` だった。上の `??=` で入れた値）、巡回の記録をこの
+            // ページの `AUDITING` に戻して、同じ記録（同じ `pageId`）を次に監査する。待っている間は、サイトへ何も送らない。
+            if (!rechecking && !checkpointFailed && await this.#waitBeforeRecheck(entry.url, runtimeLimitReached)) {
+              recheckedUrls.add(entry.url);
+              progress.siteUnavailableDetail = null;
+              frontier.requeueForRecheck(entry.url);
+              recheckEntry = entry;
+            }
+            continue;
+          }
+        }
         progress.results.set(entry.url, result);
         frontier.markFinished(entry.url, result.status);
         // Link は、Desktop の `link` の Evidence から取り、`INTERNAL_NAVIGABLE` のものだけをキューに入れる（ARCH03）。
@@ -1176,6 +1425,10 @@ export class RunCoordinator {
           if (!checkpointFailed) {
             await saveState(checkpoint);
           }
+        }
+        // 前の実行のきっかけのページを、また不調で、普通の結果として保存した（設計書 3.2.1）。保存の後に、診断の記録を渡す。
+        if (diagnosticDetail !== null) {
+          await passDiagnostic(diagnosticDetail);
         }
         pagesFinished += 1;
         this.#reportProgress(progress, { pagesFinished, pagesDiscovered: frontier.discoveredCount, startedAtMs });
@@ -1327,14 +1580,121 @@ export class RunCoordinator {
   }
 
   /**
+   * 診断の記録を組み立て（`build`）、注入された書き出しの口に、Run のディレクトリと合わせて渡す（サイトの不調で止めたときの診断の記録の
+   * 設計書 2.3）。口がなければ、何もしない（記録も組み立てない）。口が書き終わる（返した Promise が決まる）まで待つ（次のページの前の
+   * 確かめと、Browser を閉じる処理の前に終える）。
+   * 記録の組み立ての例外（注入した時計が不正な時刻を返した場合など）、口の例外、口が返した Promise の reject は、握りつぶす（Run を止めず、
+   * Run の理由、未処理の失敗の件数、標準エラーにも残さない。診断は付けたしの情報で、口の有無で Run を変えないため）。
+   */
+  async #passSiteUnavailableDiagnostic(
+    runDirectory: string,
+    build: () => SiteUnavailableDiagnosticRecord,
+    attemptNumber: number,
+  ): Promise<void> {
+    const write = this.#diagnosticWriter;
+    if (write === undefined) {
+      return;
+    }
+    try {
+      await write(runDirectory, build(), attemptNumber);
+    } catch {
+      // 診断の記録の失敗で、監査を変えない（設計書 2.3）。
+    }
+  }
+
+  /**
+   * 知らせ（`RunNotice`）を、注入された受け手に渡す（サイトが応答しないときに Run を止める設計書 3.5.4）。受け手がなければ、何もしない。
+   * 受け手の例外と、受け手が返した Promise の reject は、握りつぶす（`#reportProgress` と同じ。表示の失敗で監査を止めないため）。
+   */
+  #notify(notice: RunNotice): void {
+    const onNotice = this.#onNotice;
+    if (onNotice === undefined) {
+      return;
+    }
+    try {
+      const returned: unknown = onNotice(notice);
+      if (returned instanceof Promise) {
+        returned.catch(() => undefined);
+      }
+    } catch {
+      // 表示の失敗で、監査を止めない（Run の理由にもしない）。
+    }
+  }
+
+  /**
+   * サイトの不調で捨てたページ（`url`）を確かめ直す前の待ち（サイトが応答しないときに Run を止める設計書 3.5.2）。確かめ直してよければ真を
+   * 返す。
+   * - 待つ前に、止める印が付いているか、実行時間の上限に達していれば、待たず（知らせも出さず）に偽を返す（待っても確かめ直せないため）。
+   * - 知らせ（`SITE_UNAVAILABLE_RECHECK`）を渡してから、`SITE_UNAVAILABLE_RECHECK_DELAY_MS` だけ待つ（注入した `sleep`。止める印で打ち切る）。
+   *   待っている間は、サイトへ何も送らない（Page Auditor も、pacer の待ちも呼ばない）。
+   * - 待った後、止める印が付いているか、実行時間の上限に達していれば（待った時間は上限に含める）、偽を返す。
+   */
+  async #waitBeforeRecheck(url: NormalizedHttpUrlEvidence, runtimeLimitReached: () => boolean): Promise<boolean> {
+    if (this.#stopRequested() || runtimeLimitReached()) {
+      return false;
+    }
+    this.#notify(Object.freeze({ kind: 'SITE_UNAVAILABLE_RECHECK', url, delayMs: SITE_UNAVAILABLE_RECHECK_DELAY_MS }));
+    await this.#sleepUnlessStopped(SITE_UNAVAILABLE_RECHECK_DELAY_MS);
+    return !this.#stopRequested() && !runtimeLimitReached();
+  }
+
+  /** 止める印（`stopSignal`）が付いているか（印がなければ偽）。待ちの前後で読み直す（型の絞り込みを待ちの後に持ち越さないため）。 */
+  #stopRequested(): boolean {
+    return this.#stopSignal?.aborted === true;
+  }
+
+  /**
+   * `ms` だけ待つ（注入した `sleep`）。止める印が付いたら、待ちを打ち切って返る（`sleep` の終わりは待たない。止める印の受け手は、
+   * 終わったら外す）。止める印がなければ、`sleep` の終わりまで待つ。`sleep` の失敗（reject）は、そのまま投げる。
+   */
+  async #sleepUnlessStopped(ms: number): Promise<void> {
+    const signal = this.#stopSignal;
+    if (signal === undefined) {
+      await this.#sleep(ms);
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => resolve();
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.#sleep(ms).then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort)).catch(() => undefined);
+    });
+  }
+
+  /**
+   * 診断の記録を組み立てる（サイトの不調で止めたときの診断の記録の設計書 2.3）。書いた時刻は、注入した時計で、ここで読む。ページの結果と
+   * 観察の結果は、そのページの最終の試行のもの（`#auditWithRetry` の結果）を、そのまま入れる。記録の最上位は凍結する（中身は、Page Auditor が
+   * 凍結した値）。
+   */
+  #siteUnavailableDiagnostic(input: {
+    readonly identity: RunDiagnosticIdentity;
+    readonly entry: Pick<CrawlUrlEntry, 'url' | 'pageId'>;
+    readonly siteUnavailableDetail: string;
+    readonly page: PageAuditResult;
+    readonly navigationDiagnostics: PageAuditOutcome['navigationDiagnostics'];
+  }): SiteUnavailableDiagnosticRecord {
+    return Object.freeze({
+      schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+      runId: input.identity.runId,
+      executionNumber: input.identity.executionNumber,
+      writtenAt: this.#clock().toISOString(),
+      pageId: input.entry.pageId,
+      url: input.entry.url,
+      siteUnavailableDetail: input.siteUnavailableDetail,
+      page: input.page,
+      navigationDiagnostics: input.navigationDiagnostics,
+    });
+  }
+
+  /**
    * この Run で作った Ledger（登録の `fromIndex` 番目から後）に、安全の不変条件の違反が1件でも記録されたかを調べ、記録されていれば
    * `progress.safetyViolationDetected` を立てて、その値を返す（Task 19 の前の整理の設計書 4.5。C18f）。違反の検出は、ここだけで行う
    * （Run Coordinator が、Ledger の登録を調べる方法）。止めたことは記録しない（それは `#safetyViolationRecorded` が行う）。
    * - 再開した Run の、保存した Safety Ledger の snapshot（前の回までの Ledger）は、登録の先頭（この実行の Ledger より前）にあるものと
    *   して扱い、Run の初めから調べる場合（`fromIndex` が 0）に調べる（中断した Run の再開の設計書 4.2。保存のフラグが偽で、保存した
-   *   snapshot に違反がある場合の守り。R4a2b）。ページの中の確かめと、ページの保存の前の確かめ（`fromIndex` は今のページの初め）では
-   *   調べない（ページを始める前に調べた）。robots.txt と sitemap.xml の取得の後の保存の前の確かめは、Run の初めから（`fromIndex` が 0）
-   *   調べる（この実行の PREFLIGHT、環境の記録、取得の Ledger と、保存した snapshot。R5-fix-round-1）。
+   *   snapshot に違反がある場合の守り。R4a2b）。ページの中の確かめと、ページの保存の前の確かめと、サイトの不調の印のあるページを捨てるかを
+   *   決める前の確かめ（`fromIndex` は今のページの初め）では調べない（ページを始める前に調べた）。robots.txt と sitemap.xml の取得の後の保存の前の確かめは、Run の初めから（`fromIndex` が 0）
+   *   調べる（この実行の PREFLIGHT、環境の記録、取得の Ledger と、保存した snapshot。R5-fix-round-1）。取得でサイトの不調を検知した場合の、
+   *   不調の詳細を残すかを決める前の確かめも、Run の初めから調べる（サイトが応答しないときに Run を止める設計書 3.1。SU3b）。
    * - 一度検出したら、それ以後は、調べずに真を返す（Ledger の違反は減らないため）。
    * 違反の種類は問わない。件数は、Ledger の snapshot の `invariantViolationCount` で読む（Run の Safety の集計と同じ値）。
    */
@@ -1364,8 +1724,11 @@ export class RunCoordinator {
    * （設計書 5.6.4）。Page Auditor には、試行の番号と再試行の判断を渡す（再試行の前の試行のスクリーンショットは、
    * `pages/<pageId>/retry-<n>/<ビューポート>/` に置かれる。DEF-007）。最初の試行は `retries` に記録し、その Evidence は、最終のページの `evidence` に残すために取っておく。
    * 最初の試行の Finding は残さない。その試行の Ledger は登録にあるので、Safety の集計に入る。
+   * 試行の結果にサイトの不調の印（`siteUnavailableDetail`）があれば、再試行しない（再試行の判断を呼ばずに終える。サイトが応答しないときに
+   * Run を止める設計書 3.3。最初の1回で止める）。最終の試行のページの結果と、その試行の不調の印と、その試行のページ本体の要求の観察の結果
+   * （診断の記録に使う。サイトの不調で止めたときの診断の記録の設計書 2.3）を返す。
    */
-  async #auditWithRetry(auditor: RunPageAuditor, entry: CrawlUrlEntry, progress: RunProgress): Promise<PageAuditResult> {
+  async #auditWithRetry(auditor: RunPageAuditor, entry: CrawlUrlEntry, progress: RunProgress): Promise<RunPageAudit> {
     let outcome: PageAuditOutcome | undefined;
     const earlierEvidence: EvidenceRecord[] = [];
     for (let attempt = 1; attempt <= MAX_NAVIGATION_ATTEMPTS; attempt += 1) {
@@ -1380,6 +1743,10 @@ export class RunCoordinator {
         attempt,
         precedesRetry: (desktop) => retryAfter(desktop) !== null,
       });
+      // サイトの不調の印があれば、再試行しない（設計書 3.3）。再試行の判断（`retryAfter`）より先に確かめ、判断を呼ばない。
+      if (outcome.siteUnavailableDetail !== null) {
+        break;
+      }
       const retryable = retryAfter(outcome.result.viewports.desktop);
       if (retryable === null) {
         break;
@@ -1398,7 +1765,7 @@ export class RunCoordinator {
     if (outcome === undefined) {
       throw new Error('page audit did not run');
     }
-    return outcome.result;
+    return outcome;
   }
 
   /**
@@ -1483,10 +1850,15 @@ export class RunCoordinator {
     // SKIPPED のページから導く。再開で URL を待ち行列に戻すと、理由も消える）。クロールの上限ではないので、`crawlLimitReached` には含めない。
     // Run Status は、SKIPPED のページから `deriveRunStatus` が `PARTIAL` と導く（この理由では決めない）。
     const interruptedReasons = skipCodes.has(RUN_INTERRUPTED_SKIP_REASON.code) ? [RUN_INTERRUPTED_SKIP_REASON] : [];
+    // この実行でサイトの不調を検知したら、Run の理由に1件だけ残す（サイトが応答しないときに Run を止める設計書 3.2。`detail` は、最初に
+    // 検知した不調の詳細）。この実行の事実（`progress.siteUnavailableDetail`）から最後の処理で作り、保存の理由（`progress.reasons`）には
+    // 入れない（再開した実行で不調を検知しなければ、残らない）。Run Status は、SKIPPED のページなどから `deriveRunStatus` が導く（この理由
+    // では決めない）。
+    const siteUnavailableReasons = progress.siteUnavailableDetail === null ? [] : [siteUnavailableReason(progress.siteUnavailableDetail)];
     // 違反を検出したため、監査を始めなかったものがあれば、止めたことを Run の理由に1件だけ残す（Task 19 の前の整理の設計書 4.5）。
     // Run Status は、違反の件数から `deriveRunStatus` が `ABORTED_BY_SAFETY` と導く（この理由では決めない）。
     const safetyAbortReasons = progress.stoppedBySafetyViolation ? [SAFETY_VIOLATION_ABORT_REASON] : [];
-    const reasons = [...limitReasons, ...interruptedReasons, ...safetyAbortReasons, ...progress.reasons];
+    const reasons = [...limitReasons, ...interruptedReasons, ...siteUnavailableReasons, ...safetyAbortReasons, ...progress.reasons];
 
     // Safety の集計（設計書 5.6.5）。この Run で作ったすべての Ledger の、Browser を閉じた後の snapshot からだけ集計する。再開した Run では、
     // 保存した snapshot（前の回までの Ledger）と、この実行の Ledger の snapshot を、この順に渡す（Ledger を作った順と同じ。
@@ -1575,6 +1947,95 @@ function crawlLimitReason(code: CrawlLimitReasonCode): IncompleteReason {
 /** 再開のための保存を書けなかったことを表す Run の理由（中断した Run の再開の設計書 4.3）。結果は凍結する。 */
 function checkpointWriteFailedReason(detail: string): IncompleteReason {
   return Object.freeze({ code: CHECKPOINT_WRITE_FAILED_SKIP_REASON.code, detail });
+}
+
+/**
+ * サイトの不調を検知した理由（サイトが応答しないときに Run を止める設計書 3.2）。止まるきっかけのページ（捨てたページ）の SKIPPED の理由と、
+ * Run の理由に使う（どちらも同じ形）。`detail` は、ページの結果の不調の詳細（`PageAuditOutcome.siteUnavailableDetail`）。コードは、
+ * `SITE_UNAVAILABLE_SKIP_REASON`（owner は `site-availability.ts`）のものを使う。結果は凍結する。
+ */
+function siteUnavailableReason(detail: string): IncompleteReason {
+  return Object.freeze({ code: SITE_UNAVAILABLE_SKIP_REASON.code, detail });
+}
+
+/**
+ * 前の実行で止まるきっかけになったページの URL の集まり（サイトが応答しないときに Run を止める設計書 3.2.1）。再開の入力の保存の巡回の
+ * 記録で、理由 `SITE_UNAVAILABLE` の、`detail` のある SKIPPED の URL である（始めなかったページの `detail` は `null`）。新しい Run（保存なし）
+ * では空。
+ */
+function siteUnavailableTriggerUrlsOf(saved: RunCheckpoint | null): ReadonlySet<string> {
+  return new Set((saved?.frontier.entries ?? [])
+    .filter(({ state, skipReason }) => state === 'SKIPPED'
+      && skipReason?.code === SITE_UNAVAILABLE_SKIP_REASON.code
+      && skipReason.detail !== null)
+    .map(({ url }) => url));
+}
+
+/** robots.txt と sitemap.xml の取得の段階（サイトの不調の詳細の `<段階>`。サイトが応答しないときに Run を止める設計書 3.1）。 */
+const SITE_METADATA_STAGE: Extract<SiteUnavailabilityStage, 'site-metadata'> = 'site-metadata';
+
+/** サイトの不調で止めた実行の終わり方（`decideRunExecutionEndReason` が決める値の1つ。ここでは、前の実行の記録を読むだけに使う）。 */
+const SITE_UNAVAILABLE_END_REASON: Extract<RunExecutionEndReason, 'STOPPED_BY_SITE_UNAVAILABLE'> = 'STOPPED_BY_SITE_UNAVAILABLE';
+
+/**
+ * 前の実行が、robots.txt と sitemap.xml の段階で、サイトの不調で止まったか（サイトが応答しないときに Run を止める設計書 3.2.1 の最後の項目）。
+ * 再開の入力の保存で、取得の結果がなく（`siteMetadata` が `null`）、実行の記録の最後の終わり方が `STOPPED_BY_SITE_UNAVAILABLE` のとき真。
+ * 新しい Run（保存なし）では偽。
+ */
+function stoppedAtSiteMetadataBefore(saved: RunCheckpoint | null): boolean {
+  return saved !== null && saved.siteMetadata === null && saved.executions.at(-1)?.endReason === SITE_UNAVAILABLE_END_REASON;
+}
+
+/**
+ * サイトの不調を検知したため、robots.txt と sitemap.xml の次のファイルを読み込まなかった（サイトが応答しないときに Run を止める設計書 3.1）。
+ * `siteMetadataNavigationHooks` の包んだ間隔の待ちが投げる。`collectSiteMetadata` は、そのファイルを読み込まずに `FAILED` にする。
+ */
+class SiteMetadataNavigationSkippedError extends Error {
+  constructor(unavailableDetail: string) {
+    super(`site metadata navigation was not started after the site unavailability: ${unavailableDetail}`);
+    this.name = 'SiteMetadataNavigationSkippedError';
+  }
+}
+
+/**
+ * robots.txt と sitemap.xml の取得（`collectSiteMetadata`）に渡す、包んだ間隔の待ちと、読み込みの観測の受け口（サイトが応答しないときに Run を
+ * 止める設計書 3.1）。
+ * - 受け口（`afterNavigation`）: 観測を `siteUnavailabilityOf` で判定し、最初の不調の詳細（`siteUnavailableDetail(null, 'site-metadata', <判定>)`。
+ *   例: `site-metadata:TIMEOUT`）だけを残す。
+ * - 包んだ間隔の待ち（`beforeNavigation`）: 不調を残していれば、待たずに `SiteMetadataNavigationSkippedError` を投げる（次のファイルを
+ *   読み込ませない）。残していなければ、Run で1つの pacer の待ちを呼ぶ（サイトへの負荷の制御の設計書 4.1）。
+ * - `unavailableDetail()`: 残した不調の詳細。不調を検知していなければ `null`。
+ */
+function siteMetadataNavigationHooks(pacer: NavigationPacer): {
+  readonly beforeNavigation: () => Promise<number>;
+  readonly afterNavigation: (observation: MainFrameLoadObservation) => void;
+  readonly unavailableDetail: () => string | null;
+} {
+  let detail: string | null = null;
+  return {
+    beforeNavigation: async () => {
+      if (detail !== null) {
+        throw new SiteMetadataNavigationSkippedError(detail);
+      }
+      return pacer.beforeNavigation();
+    },
+    afterNavigation: (observation) => {
+      if (detail !== null) {
+        return;
+      }
+      const unavailability = siteUnavailabilityOf(observation);
+      if (unavailability !== null) {
+        detail = siteUnavailableDetail(null, SITE_METADATA_STAGE, unavailability);
+      }
+    },
+    unavailableDetail: () => detail,
+  };
+}
+
+/** 再試行の記録の一覧（`RunProgress.retries`）から、`url` の記録を取り除く（一覧そのものを変える。ほかの記録の順は変えない）。 */
+function removeRetryRecordsOf(retries: RunRetryRecord[], url: string): void {
+  const kept = retries.filter((record) => record.url !== url);
+  retries.splice(0, retries.length, ...kept);
 }
 
 /**

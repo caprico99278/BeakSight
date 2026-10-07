@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  RESOURCE_CACHE_FULL_RANGE_REQUEST,
+  RESOURCE_CACHE_FULL_RANGE_STATUS,
   RESOURCE_CACHE_LIMITS,
   RESOURCE_CACHE_RESOURCE_TYPES,
   RESOURCE_CACHE_STORABLE_STATUS,
@@ -77,7 +79,7 @@ describe('ResourceCache の入れる条件', () => {
     expect(cache.store(storableFact({ resourceType }))).toBe(true);
   });
 
-  it.each(['document', 'xhr', 'fetch', 'media', 'websocket', 'manifest', 'other', 'Stylesheet', ''])(
+  it.each(['document', 'xhr', 'fetch', 'websocket', 'manifest', 'other', 'Stylesheet', 'Media', ''])(
     '要求の種類 %s は入れない',
     (resourceType) => {
       const cache = new ResourceCache();
@@ -307,7 +309,7 @@ describe('ResourceCache.mayStore（本文を読む前の見込み）', () => {
     expect(cache.stats()).toEqual({ entryCount: 0, totalBytes: 0 });
   });
 
-  it.each(['document', 'xhr', 'fetch', 'media', 'other'])('要求の種類 %s は、見込みなし', (resourceType) => {
+  it.each(['document', 'xhr', 'fetch', 'other', 'Media'])('要求の種類 %s は、見込みなし', (resourceType) => {
     expect(new ResourceCache().mayStore(responseFact({ resourceType }))).toBe(false);
   });
 
@@ -367,6 +369,247 @@ describe('ResourceCache.mayStore（本文を読む前の見込み）', () => {
   });
 });
 
+// DEF-031（サイトへの負荷の制御の設計書 4.10.3）: キャッシュの種類に media（動画と音声）を加え、1件の上限を 16 MiB にする。
+// media は、status 200 で Range のない応答に加えて、`Range: bytes=0-` の要求に、ファイルの全体（`Content-Range: bytes 0-<N-1>/<N>`、
+// 本文の長さが N）を 206 で返した応答も入れる。入れるときは status を 200 にし、`Content-Range` を除く。
+describe('ResourceCache の media（DEF-031）', () => {
+  const MEBIBYTE = 1024 * 1024;
+  const VIDEO_URL = `${OTHER_ORIGIN}/videos/hero.mp4`;
+  /** 動画の本文の長さ（N）。 */
+  const VIDEO_BYTES = 10;
+  const FULL_CONTENT_RANGE = `bytes 0-${VIDEO_BYTES - 1}/${VIDEO_BYTES}`;
+
+  /** `Range: bytes=0-` の要求に、ファイルの全体を 206 で返した、入れる条件をすべて満たす動画の応答の事実。 */
+  const fullRangeVideoFact = (overrides: Partial<ResourceCacheStoreFact> = {}): ResourceCacheStoreFact => storableFact({
+    resourceType: 'media',
+    url: VIDEO_URL,
+    requestHeaders: { accept: '*/*', range: RESOURCE_CACHE_FULL_RANGE_REQUEST },
+    status: RESOURCE_CACHE_FULL_RANGE_STATUS,
+    responseHeaders: {
+      'content-type': 'video/mp4',
+      'accept-ranges': 'bytes',
+      'content-range': FULL_CONTENT_RANGE,
+      'content-length': String(VIDEO_BYTES),
+    },
+    body: bytes(VIDEO_BYTES, 5),
+    ...overrides,
+  });
+
+  /** 本文を除いた事実（`mayStore` に渡す）。 */
+  const withoutBody = (fact: ResourceCacheStoreFact): ResourceCacheResponseFact => {
+    const { body: _body, ...rest } = fact;
+    return rest;
+  };
+
+  it('キャッシュの種類は stylesheet・script・image・font・media の閉じた一覧である', () => {
+    expect([...RESOURCE_CACHE_RESOURCE_TYPES]).toEqual(['stylesheet', 'script', 'image', 'font', 'media']);
+  });
+
+  it('1件の上限は 16 MiB、合計の上限は 256 MiB', () => {
+    expect(RESOURCE_CACHE_LIMITS).toEqual({ maxEntryBytes: 16 * MEBIBYTE, maxTotalBytes: 256 * MEBIBYTE });
+  });
+
+  it('ファイルの全体を求める Range は bytes=0-、それに全体を返した範囲の応答の status は 206', () => {
+    expect(RESOURCE_CACHE_FULL_RANGE_REQUEST).toBe('bytes=0-');
+    expect(RESOURCE_CACHE_FULL_RANGE_STATUS).toBe(206);
+  });
+
+  it('status 200 で Range のない media の応答は入れる（ほかの種類と同じ）', () => {
+    const cache = new ResourceCache();
+    const body = bytes(VIDEO_BYTES, 3);
+
+    expect(cache.store(storableFact({ resourceType: 'media', url: VIDEO_URL, body }))).toBe(true);
+    expect(cache.lookup(VIDEO_URL)?.status).toBe(RESOURCE_CACHE_STORABLE_STATUS);
+    expect(cache.lookup(VIDEO_URL)?.body).toEqual(body);
+  });
+
+  it('`bytes=0-` の要求に、全体の Content-Range で、本文の長さが N の 206 は入れ、status を 200 にし、Content-Range を除く', () => {
+    const cache = new ResourceCache();
+    const fact = fullRangeVideoFact();
+
+    expect(cache.mayStore(withoutBody(fact))).toBe(true);
+    expect(cache.store(fact)).toBe(true);
+
+    const resource = cache.lookup(VIDEO_URL);
+    expect(resource?.status).toBe(RESOURCE_CACHE_STORABLE_STATUS);
+    expect(resource?.headers).toEqual({ 'content-type': 'video/mp4', 'accept-ranges': 'bytes' });
+    expect(resource?.body).toEqual(fact.body);
+    expect(cache.stats()).toEqual({ entryCount: 1, totalBytes: VIDEO_BYTES });
+  });
+
+  it.each([
+    { range: ' bytes=0- ', contentRange: FULL_CONTENT_RANGE },
+    { range: 'BYTES=0-', contentRange: FULL_CONTENT_RANGE },
+    { range: 'Bytes=0-', contentRange: ` ${FULL_CONTENT_RANGE} ` },
+  ])('Range は前後の空白を除き、大文字小文字を区別せずに比べる: %o', ({ range, contentRange }) => {
+    const cache = new ResourceCache();
+    const fact = fullRangeVideoFact({
+      requestHeaders: { Range: range },
+      responseHeaders: { 'Content-Type': 'video/mp4', 'Content-Range': contentRange },
+    });
+
+    expect(cache.mayStore(withoutBody(fact))).toBe(true);
+    expect(cache.store(fact)).toBe(true);
+    expect(cache.lookup(VIDEO_URL)?.status).toBe(RESOURCE_CACHE_STORABLE_STATUS);
+    expect(cache.lookup(VIDEO_URL)?.headers).toEqual({ 'content-type': 'video/mp4' });
+  });
+
+  it.each([
+    {
+      name: 'ファイルの一部（bytes 0-99/1000）',
+      fact: { responseHeaders: { 'content-range': 'bytes 0-99/1000' }, body: bytes(100) },
+    },
+    {
+      name: '要求の Range が bytes=100-',
+      fact: { requestHeaders: { range: 'bytes=100-' }, responseHeaders: { 'content-range': 'bytes 100-999/1000' }, body: bytes(900) },
+    },
+    {
+      name: '要求の Range が bytes=0-9（終わりの指定がある）',
+      fact: { requestHeaders: { range: 'bytes=0-9' } },
+    },
+    {
+      name: '要求の Range が複数の範囲',
+      fact: { requestHeaders: { range: 'bytes=0-,100-' } },
+    },
+    {
+      name: '要求に Range がない',
+      fact: { requestHeaders: { accept: '*/*' } },
+    },
+    {
+      name: '応答に Content-Range がない',
+      fact: { responseHeaders: { 'content-type': 'video/mp4' } },
+    },
+    {
+      name: '応答の Content-Range の全体の長さが分からない（*）',
+      fact: { responseHeaders: { 'content-range': `bytes 0-${VIDEO_BYTES - 1}/*` } },
+    },
+    {
+      name: '応答の Content-Range の終わりが N-1 でない',
+      fact: { responseHeaders: { 'content-range': `bytes 0-${VIDEO_BYTES}/${VIDEO_BYTES}` } },
+    },
+    {
+      name: '応答の Content-Range の単位が bytes でない',
+      fact: { responseHeaders: { 'content-range': `items 0-${VIDEO_BYTES - 1}/${VIDEO_BYTES}` } },
+    },
+  ])('全体でない 206 の media は入れない: $name', ({ fact }) => {
+    const cache = new ResourceCache();
+    const partial = fullRangeVideoFact(fact);
+
+    expect(cache.mayStore(withoutBody(partial))).toBe(false);
+    expect(cache.store(partial)).toBe(false);
+    expect(cache.stats().entryCount).toBe(0);
+  });
+
+  it('本文の長さが Content-Range の N と違う 206 は入れない（本文を読む前の見込みはある）', () => {
+    const cache = new ResourceCache();
+    const shorter = fullRangeVideoFact({ body: bytes(VIDEO_BYTES - 1) });
+    const longer = fullRangeVideoFact({ body: bytes(VIDEO_BYTES + 1) });
+
+    expect(cache.mayStore(withoutBody(shorter))).toBe(true);
+    expect(cache.store(shorter)).toBe(false);
+    expect(cache.store(longer)).toBe(false);
+    expect(cache.stats().entryCount).toBe(0);
+  });
+
+  it.each(RESOURCE_CACHE_RESOURCE_TYPES.filter((resourceType) => resourceType !== 'media'))(
+    'media 以外の種類（%s）の 206 は、全体でも入れない',
+    (resourceType) => {
+      const cache = new ResourceCache();
+      const fact = fullRangeVideoFact({ resourceType });
+
+      expect(cache.mayStore(withoutBody(fact))).toBe(false);
+      expect(cache.store(fact)).toBe(false);
+    },
+  );
+
+  // PCR-DR の Minor-4（設計書 4.10.3 の 2026-10-06 の追補）: サーバが Range を無視して、`Range: bytes=0-` の要求に全体を 200 で返した
+  // media の応答は、全体なので、そのまま 200 として入れる。
+  it.each([
+    RESOURCE_CACHE_FULL_RANGE_REQUEST,
+    ` ${RESOURCE_CACHE_FULL_RANGE_REQUEST.toUpperCase()} `,
+  ])('`Range: %s` の要求に status 200 で全体を返した media の応答は、そのまま 200 として入れる', (range) => {
+    const cache = new ResourceCache();
+    const body = bytes(VIDEO_BYTES, 4);
+    const fact = fullRangeVideoFact({
+      status: RESOURCE_CACHE_STORABLE_STATUS,
+      requestHeaders: { accept: '*/*', Range: range },
+      responseHeaders: { 'content-type': 'video/mp4', 'accept-ranges': 'bytes', 'content-length': String(VIDEO_BYTES) },
+      body,
+    });
+
+    expect(cache.mayStore(withoutBody(fact))).toBe(true);
+    expect(cache.store(fact)).toBe(true);
+    const resource = cache.lookup(VIDEO_URL);
+    expect(resource?.status).toBe(RESOURCE_CACHE_STORABLE_STATUS);
+    expect(resource?.headers).toEqual({ 'content-type': 'video/mp4', 'accept-ranges': 'bytes' });
+    expect(resource?.body).toEqual(body);
+  });
+
+  it.each([
+    { name: 'media で、要求の Range が bytes=100-', resourceType: 'media', range: 'bytes=100-' },
+    { name: 'media で、要求の Range が bytes=0-9', resourceType: 'media', range: 'bytes=0-9' },
+    { name: 'media で、要求の Range が複数の範囲', resourceType: 'media', range: 'bytes=0-,100-' },
+    ...RESOURCE_CACHE_RESOURCE_TYPES.filter((resourceType) => resourceType !== 'media').map((resourceType) => ({
+      name: `${resourceType} で、要求の Range が bytes=0-`,
+      resourceType,
+      range: RESOURCE_CACHE_FULL_RANGE_REQUEST,
+    })),
+  ])('status 200 でも、ほかの Range のある要求の応答は入れない: $name', ({ resourceType, range }) => {
+    const cache = new ResourceCache();
+    const fact = fullRangeVideoFact({
+      resourceType,
+      status: RESOURCE_CACHE_STORABLE_STATUS,
+      requestHeaders: { range },
+      responseHeaders: { 'content-type': 'video/mp4' },
+    });
+
+    expect(cache.mayStore(withoutBody(fact))).toBe(false);
+    expect(cache.store(fact)).toBe(false);
+    expect(cache.stats().entryCount).toBe(0);
+  });
+
+  it('no-store の 206 は、全体でも入れない', () => {
+    const cache = new ResourceCache();
+    const fact = fullRangeVideoFact({
+      responseHeaders: { 'content-type': 'video/mp4', 'content-range': FULL_CONTENT_RANGE, 'cache-control': 'no-store' },
+    });
+
+    expect(cache.mayStore(withoutBody(fact))).toBe(false);
+    expect(cache.store(fact)).toBe(false);
+  });
+
+  it('GET 以外と、キャッシュから返した 206 は入れない', () => {
+    const cache = new ResourceCache();
+
+    expect(cache.store(fullRangeVideoFact({ method: 'HEAD' }))).toBe(false);
+    expect(cache.store(fullRangeVideoFact({ servedFromRunCache: true }))).toBe(false);
+    expect(cache.stats().entryCount).toBe(0);
+  });
+
+  it('206 の Content-Range の N が1件の上限を超えれば、本文を読む前に見込みなし。ちょうど上限なら見込みあり', () => {
+    const small = new ResourceCache({ limits: SMALL_LIMITS });
+    const fullRangeOf = (totalBytes: number): ResourceCacheResponseFact => withoutBody(fullRangeVideoFact({
+      responseHeaders: { 'content-type': 'video/mp4', 'content-range': `bytes 0-${totalBytes - 1}/${totalBytes}` },
+    }));
+
+    expect(small.mayStore(fullRangeOf(SMALL_LIMITS.maxEntryBytes + 1))).toBe(false);
+    expect(small.mayStore(fullRangeOf(SMALL_LIMITS.maxEntryBytes))).toBe(true);
+    expect(small.store(fullRangeVideoFact({
+      responseHeaders: { 'content-range': `bytes 0-${SMALL_LIMITS.maxEntryBytes - 1}/${SMALL_LIMITS.maxEntryBytes}` },
+      body: bytes(SMALL_LIMITS.maxEntryBytes),
+    }))).toBe(true);
+  });
+
+  it('全体でない 206 は、同じ URL のすでにある項目を変えない', () => {
+    const cache = new ResourceCache();
+    const original = fullRangeVideoFact();
+    expect(cache.store(original)).toBe(true);
+
+    expect(cache.store(fullRangeVideoFact({ responseHeaders: { 'content-range': 'bytes 0-4/10' }, body: bytes(5, 9) }))).toBe(false);
+    expect(cache.lookup(VIDEO_URL)?.body).toEqual(original.body);
+  });
+});
+
 describe('decideResourceDelivery', () => {
   const allowedOrigins: ReadonlySet<string> = new Set([ALLOWED_ORIGIN]);
   const allowedImageUrl = `${ALLOWED_ORIGIN}/images/hero.png`;
@@ -399,17 +642,50 @@ describe('decideResourceDelivery', () => {
     expect([...RESOURCE_DELIVERY_ROLES]).toEqual(['PRIMARY', 'REVISIT']);
   });
 
+  // DEF-031（サイトへの負荷の制御の設計書 4.10.3）: PRIMARY（Passive の読み込み）も、キャッシュにあればキャッシュから返す。
+  // ナビゲーションの要求は NETWORK。キャッシュにない要求は、許可 Origin の外でも NETWORK（PRIMARY では WITHHOLD を選ばない）。
   it.each([
-    request(),
-    request({ url: OTHER_SCRIPT_URL, resourceType: 'script' }),
-    request({ url: otherImageUrl }),
+    request({ isNavigationRequest: true }),
     request({ isNavigationRequest: true, resourceType: 'document' }),
-    request({ url: 'not a url' }),
-  ])('PRIMARY の役割では、キャッシュや Origin によらず常に NETWORK: %o', (facts) => {
+    request({ isNavigationRequest: true, url: OTHER_SCRIPT_URL, resourceType: 'script' }),
+  ])('PRIMARY の役割でも、ナビゲーションの要求は、キャッシュにあっても NETWORK: %o', (facts) => {
     expect(decide('PRIMARY', facts)).toEqual({ kind: 'NETWORK' });
   });
 
-  it('PRIMARY の役割では、キャッシュを引かない（LRU の順を変えない）', () => {
+  it('PRIMARY の役割で、GET・キャッシュの種類・キャッシュにある要求は、許可 Origin の中でも外でも FROM_RUN_CACHE で、キャッシュの内容を持つ', () => {
+    const cache = filledCache();
+
+    expect(decide('PRIMARY', request(), cache)).toEqual({ kind: 'FROM_RUN_CACHE', resource: cache.lookup(allowedImageUrl) });
+    expect(decide('PRIMARY', request({ method: 'get' }), cache))
+      .toEqual({ kind: 'FROM_RUN_CACHE', resource: cache.lookup(allowedImageUrl) });
+    expect(decide('PRIMARY', request({ url: OTHER_SCRIPT_URL, resourceType: 'script' }), cache))
+      .toEqual({ kind: 'FROM_RUN_CACHE', resource: cache.lookup(OTHER_SCRIPT_URL) });
+  });
+
+  it.each([
+    request({ url: otherImageUrl }),
+    request({ url: `${OTHER_ORIGIN}/collect`, resourceType: 'fetch' }),
+    request({ url: `${ALLOWED_ORIGIN}/images/other.png` }),
+    request({ url: `${ALLOWED_ORIGIN}/api/items`, resourceType: 'xhr' }),
+    request({ url: 'not a url' }),
+    request({ url: '' }),
+  ])('PRIMARY の役割で、キャッシュにない要求は、許可 Origin の外でも NETWORK（WITHHOLD を選ばない）: %o', (facts) => {
+    expect(decide('PRIMARY', facts)).toEqual({ kind: 'NETWORK' });
+  });
+
+  it('PRIMARY の役割で、GET 以外と、キャッシュの種類でない要求は、同じ URL がキャッシュにあっても NETWORK', () => {
+    expect(decide('PRIMARY', request({ method: 'HEAD' }))).toEqual({ kind: 'NETWORK' });
+    expect(decide('PRIMARY', request({ method: 'HEAD', url: OTHER_SCRIPT_URL, resourceType: 'script' }))).toEqual({ kind: 'NETWORK' });
+    expect(decide('PRIMARY', request({ resourceType: 'fetch' }))).toEqual({ kind: 'NETWORK' });
+    expect(decide('PRIMARY', request({ url: OTHER_SCRIPT_URL, resourceType: 'xhr' }))).toEqual({ kind: 'NETWORK' });
+  });
+
+  it('PRIMARY の役割で、不正な許可 Origin でも例外を投げず、キャッシュになければ NETWORK にする', () => {
+    expect(decide('PRIMARY', request(), new ResourceCache(), new Set(['not a URL', 'mailto:help@example.com'])))
+      .toEqual({ kind: 'NETWORK' });
+  });
+
+  it('PRIMARY の役割でキャッシュから返すと、その項目は最も新しく使われたものになる', () => {
     const limits: ResourceCacheLimits = Object.freeze({ maxEntryBytes: 4, maxTotalBytes: 8 });
     const cache = new ResourceCache({ limits });
     const urlA = `${ALLOWED_ORIGIN}/a.png`;
@@ -418,10 +694,19 @@ describe('decideResourceDelivery', () => {
     cache.store(storableFact({ url: urlA, resourceType: 'image', body: bytes(limits.maxEntryBytes) }));
     cache.store(storableFact({ url: urlB, resourceType: 'image', body: bytes(limits.maxEntryBytes) }));
 
-    decide('PRIMARY', request({ url: urlA }), cache);
+    expect(decide('PRIMARY', request({ url: urlA }), cache).kind).toBe('FROM_RUN_CACHE');
     cache.store(storableFact({ url: urlC, resourceType: 'image', body: bytes(limits.maxEntryBytes) }));
 
-    expect(cachedUrls(cache, [urlA, urlB, urlC])).toEqual([urlB, urlC]);
+    expect(cachedUrls(cache, [urlA, urlB, urlC])).toEqual([urlA, urlC]);
+  });
+
+  it.each(['PRIMARY', 'REVISIT'] as const)('%s の役割で、キャッシュにある動画（media）は FROM_RUN_CACHE', (role) => {
+    const cache = new ResourceCache();
+    const videoUrl = `${OTHER_ORIGIN}/movie.mp4`;
+    cache.store(storableFact({ url: videoUrl, resourceType: 'media', responseHeaders: { 'content-type': 'video/mp4' } }));
+
+    expect(decide(role, request({ url: videoUrl, resourceType: 'media' }), cache))
+      .toEqual({ kind: 'FROM_RUN_CACHE', resource: cache.lookup(videoUrl) });
   });
 
   it.each([

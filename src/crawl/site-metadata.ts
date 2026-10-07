@@ -1,5 +1,11 @@
-import type { BrowserContext, Page, Response } from 'playwright';
+import type { BrowserContext, Page } from 'playwright';
 import type { BrowserContextFactory } from '../browser/context-factory.js';
+import {
+  observeMainFrameLoad,
+  trackMainFrameDocument,
+  type MainFrameLoadObservation,
+  type MainFrameLoadSettlement,
+} from '../browser/main-frame-load.js';
 import { isPlaywrightTimeoutError } from '../browser/playwright-errors.js';
 import type { AuditConfig } from '../config/types.js';
 import type { EvidenceRecordFor, PageId } from '../core/contracts.js';
@@ -90,6 +96,15 @@ export interface SiteMetadataOptions {
    * 待たない呼び出し側（テストなど）は、それを明示する関数（`async () => 0`）を渡す。関数でない値と、渡さなかった場合は `TypeError`。
    */
   readonly beforeNavigation: () => Promise<number>;
+  /**
+   * 各ファイルの読み込み（`page.goto`）の観測を受け取る口（サイトが応答しないときに Run を止める設計書 2.1。幅の走査の
+   * `StressLayoutOptions.afterNavigation` と同じ名前と形）。読み込みを始めたファイルごとに1回、読み込みが終わった（応答か例外が出た）
+   * 直後に呼ぶ。読み込みを始めなかったファイル（間隔の待ちが失敗した、Context や page を開けなかった、前の page を閉じる処理が期限を
+   * 過ぎた）では呼ばない。観測は `src/browser/main-frame-load.ts` の部品で作る。この部品は判定をしない（判定は、受け取った Run Coordinator
+   * が行う）。省略できる。省略しても、取得の結果は同じである。関数でない値は、Context を作らずに `TypeError` を投げる。受け口が投げた例外は、
+   * そのまま reject する（呼び出し側の誤り）。
+   */
+  readonly afterNavigation?: ((observation: MainFrameLoadObservation) => void) | undefined;
 }
 
 /**
@@ -136,6 +151,11 @@ const NOT_FOUND_HTTP_STATUSES: ReadonlySet<number> = new Set([404, 410]);
 const MIN_SUCCESS_HTTP_STATUS = 200;
 const MAX_SUCCESS_HTTP_STATUS = 299;
 
+/**
+ * `page.goto` の終わり方（応答は `FULFILLED`、例外は `REJECTED`）。Playwright の期限だけで待つので、期限の競争の `DEADLINE_EXCEEDED` はない。
+ */
+type GotoSettlement = Exclude<MainFrameLoadSettlement, { readonly status: 'DEADLINE_EXCEEDED' }>;
+
 /** 1つのファイルの取得の結果（Evidence の payload の共通の項目と、sitemap の場合の切り詰める前の本文）。 */
 interface FetchOutcome {
   readonly outcome: SiteMetadataOutcome;
@@ -174,6 +194,11 @@ type OpenedPage =
  *
  * - `outcome`: 2xx は `OK`、404 と 410 は `NOT_FOUND`、それ以外の応答と、応答を得られなかった場合は `FAILED`。
  *   本文（`text`）は `OK` の場合だけ残し、上限で切り詰めた場合は `textTruncated` を真にする。
+ * - 読み込みが例外で終わっても、main frame の最後の文書の応答の status（読み込みの観測の `httpStatus`）が 2xx でなければ、その status の
+ *   応答として扱う（DEF-029 の設計書 2.3。例: 本文が空の 404 は `NOT_FOUND`、本文が空の 503 は `FAILED` で `httpStatus` は 503。どちらも
+ *   `failures` には入らない）。status がない、または 2xx の場合は、応答を得られなかった `FAILED`（`httpStatus` は `null`）のまま。
+ * - 各ファイルの読み込みの観測（`observeMainFrameLoad`）を、受け口（`afterNavigation`）があれば渡す（サイトが応答しないときに Run を止める
+ *   設計書 2.1）。判定はしない。
  * - sitemap の URL は、切り詰める前の本文の `<loc>` から取り出し（`extractSitemapLocations`）、`normalizeUrl` で正規化する。
  *   許可 Origin の外の URL も残す。正規化できないものは `sitemapUrls` に入れず、件数を `unnormalizableSitemapUrlCount` で返す。
  * - sitemap の index（`<sitemapindex>`）の入れ子の sitemap は、たどらない（制約）。入れ子の sitemap の URL はページの URL ではないので、
@@ -195,12 +220,13 @@ type OpenedPage =
  * 例外を投げる（reject する）のは、引数が不正な場合だけで、そのときは Context を作らない。
  * - Origin が Origin の直列化でない、または取得する URL が許可 Origin の中（`classifyUrl` の `INTERNAL_NAVIGABLE`）でない: `RangeError`
  * - 上限が0以上の安全な整数でない、期限（`crawl.navigationTimeoutMs` と、注入した作成・終了の期限）が正の安全な整数でない: `RangeError`
- * - factory、採番器、時計、pageId、設定の形、`beforeNavigation`（関数でない、または渡さなかった）が不正: `TypeError`
- * 取得の失敗（Context を作れない場合を含む）は、`FAILED` の Evidence として返す。
+ * - factory、採番器、時計、pageId、設定の形、`beforeNavigation`（関数でない、または渡さなかった）、`afterNavigation`（関数でも `undefined`
+ *   でもない）が不正: `TypeError`
+ * 取得の失敗（Context を作れない場合を含む）は、`FAILED` の Evidence として返す。受け口（`afterNavigation`）が投げた例外は、そのまま reject する。
  */
 export async function collectSiteMetadata(options: SiteMetadataOptions): Promise<SiteMetadataResult> {
   const validated = validateOptions(options);
-  const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation } = validated;
+  const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation, afterNavigation } = validated;
   const evidenceContext: EvidenceRecordContext = { allocator: options.allocator, clock: options.clock };
 
   const session = await openContext(contextFactory, options.config.viewports.primaryDesktop, deadlines);
@@ -249,7 +275,7 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
               abandonedFailure = opened.failure;
             }
           } else {
-            fetched = await fetchMetadata(opened.page, url, timeoutMs, beforeNavigation);
+            fetched = await fetchMetadata(opened.page, url, timeoutMs, { beforeNavigation, afterNavigation });
           }
         }
       }
@@ -311,6 +337,7 @@ interface ValidatedOptions {
   readonly targets: readonly { readonly kind: SiteMetadataKind; readonly url: string }[];
   readonly deadlines: ResolvedPassiveSessionDeadlines;
   readonly beforeNavigation: () => Promise<number>;
+  readonly afterNavigation: SiteMetadataOptions['afterNavigation'];
 }
 
 function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
@@ -333,6 +360,10 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
   const { beforeNavigation } = options;
   if (typeof beforeNavigation !== 'function') {
     throw new TypeError('site metadata requires a beforeNavigation function');
+  }
+  const { afterNavigation } = options;
+  if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
+    throw new TypeError('site metadata afterNavigation must be a function when given');
   }
   if (!isRecord(config) || !isRecord(config.site) || !isRecord(config.crawl) || !isRecord(config.viewports)) {
     throw new TypeError('site metadata requires the audit config');
@@ -357,6 +388,7 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
     targets: metadataTargets(origin, allowedOrigins),
     deadlines: resolvePassiveSessionDeadlines(options.deadlines),
     beforeNavigation,
+    afterNavigation,
   };
 }
 
@@ -448,23 +480,43 @@ function openDeadlineFailureOf(error: PassiveSessionOpenDeadlineError): Omit<Sit
 /**
  * 1つのファイルを、`page.goto`（GET のナビゲーション）で取得する。ナビゲーションと本文の読み取りを合わせて `timeoutMs` までに終える。
  * 読み込みの直前に、ページの読み込みの間隔の待ち（`beforeNavigation`）を呼ぶ。期限は、待った後の時刻から数える（サイトへの負荷の
- * 制御の設計書 4.1、4.4）。待ちが失敗した場合は、読み込まずに `FAILED` を返す。例外は投げない。
+ * 制御の設計書 4.1、4.4）。待ちが失敗した場合は、読み込まずに `FAILED` を返す（受け口は呼ばない）。
+ * 読み込みの前に main frame の最後の文書の追跡（`trackMainFrameDocument`）を付け、`page.goto` の終わり方（応答は `FULFILLED`、例外は
+ * `REJECTED`）から観測（`observeMainFrameLoad`）を作り、受け口（`afterNavigation`）があれば渡し、追跡を外す（サイトが応答しないときに
+ * Run を止める設計書 2.1）。判定はしない。
+ * 読み込みが例外で終わった場合は、観測の status が 2xx でなければ、その status の応答として扱う（DEF-029 の設計書 2.3。`outcomeOf`）。
+ * それ以外の例外は、応答を得られなかった `FAILED` にする。例外は投げない（受け口が投げた例外を除く）。
  */
 async function fetchMetadata(
   page: Page,
   url: string,
   timeoutMs: number,
-  beforeNavigation: () => Promise<number>,
+  hooks: Pick<ValidatedOptions, 'beforeNavigation' | 'afterNavigation'>,
 ): Promise<FetchOutcome> {
-  let deadlineAtMs: number;
-  let response: Response | null;
   try {
-    await beforeNavigation();
-    deadlineAtMs = Date.now() + timeoutMs;
-    response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    await hooks.beforeNavigation();
   } catch (error) {
     return { outcome: 'FAILED', httpStatus: null, body: null, failure: failureOf(error) };
   }
+  const deadlineAtMs = Date.now() + timeoutMs;
+  const tracker = trackMainFrameDocument(page);
+  let navigated: GotoSettlement;
+  let observation: MainFrameLoadObservation;
+  try {
+    try {
+      navigated = { status: 'FULFILLED', value: await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }) };
+    } catch (error) {
+      navigated = { status: 'REJECTED', reason: error };
+    }
+    observation = observeMainFrameLoad(tracker, navigated);
+    hooks.afterNavigation?.(observation);
+  } finally {
+    tracker.dispose();
+  }
+  if (navigated.status === 'REJECTED') {
+    return rejectedNavigationOutcome(navigated.reason, observation);
+  }
+  const response = navigated.value;
   if (response === null) {
     return {
       outcome: 'FAILED',
@@ -492,6 +544,22 @@ async function fetchMetadata(
         failure: { timedOut: true, detail: 'reading the response body exceeded the navigation timeout' },
       };
   }
+}
+
+/**
+ * 例外で終わった読み込みの結果（DEF-029 の設計書 2.3）。観測の status（main frame の最後の文書の応答の status）が `null` でなく、2xx でなければ、
+ * その status の応答として扱う（`outcome` は `outcomeOf`、本文と失敗の詳細は `null`）。そうでなければ、応答を得られなかった `FAILED`
+ * （`httpStatus` は `null`、失敗の詳細は例外から作る）。
+ */
+function rejectedNavigationOutcome(reason: unknown, observation: MainFrameLoadObservation): FetchOutcome {
+  const { httpStatus } = observation;
+  if (httpStatus !== null) {
+    const outcome = outcomeOf(httpStatus);
+    if (outcome !== 'OK') {
+      return { outcome, httpStatus, body: null, failure: null };
+    }
+  }
+  return { outcome: 'FAILED', httpStatus: null, body: null, failure: failureOf(reason) };
 }
 
 function outcomeOf(httpStatus: number): SiteMetadataOutcome {

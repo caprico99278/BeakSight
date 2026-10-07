@@ -1,8 +1,15 @@
 import type { Page } from 'playwright';
 import type { InteractionGuardedSession } from '../browser/context-factory.js';
+import {
+  observeMainFrameLoad,
+  trackMainFrameDocument,
+  type MainFrameLoadObservation,
+  type MainFrameLoadSettlement,
+} from '../browser/main-frame-load.js';
+import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { isPlaywrightTimeoutError } from '../browser/playwright-errors.js';
 import type { Viewport } from '../config/types.js';
-import type { InteractionStatus } from '../core/contracts.js';
+import type { InteractionStatus, NavigationDiagnostics } from '../core/contracts.js';
 import { awaitBeforeDeadline, wait, yieldMacrotask } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
@@ -91,6 +98,17 @@ export interface InteractionAuditInput {
    * 呼ばれる。口の例外は封じ込める。省略すると、遅れた失敗は捨てる。遅れて届いた session は、この口を使わずに `close()` で閉じる。
    */
   readonly releaseLateSessionFailure?: ((error: unknown) => void) | undefined;
+  /**
+   * 候補の対象のページの読み込み（`page.goto`）の観測と、その読み込みの間のページ本体の要求の観察の結果を受け取る口（サイトが応答しない
+   * ときに Run を止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。読み込みを始めた場合に1回、
+   * 読み込みが終わった（応答か例外が返った）直後に呼ぶ。読み込みを始めなかった場合（読み込みの予算が 0）は呼ばない。
+   * 観測は `src/browser/main-frame-load.ts` の部品で作る。観察は `src/browser/navigation-diagnostics.ts` の部品で、`goto` の直前に
+   * 始め（期限は、読み込みの期限。始める処理は読み込みの予算を消費する）、`goto` の直後に、結果によらず止める。始められなくても読み込みは
+   * 行い、`NOT_OBSERVED` の結果を渡す。Interaction は判定をしない（判定は、受け取った Page Auditor が行う）。
+   * 結果と例外の扱いは、受け口の有無で変わらない。省略できる。省略すると、観測を作らず、page の事象の受け口も付けず、観察も始めない。
+   * 関数でない値は、session を開かずに例外を投げる。
+   */
+  readonly afterTargetLoad?: ((observation: MainFrameLoadObservation, diagnostics: NavigationDiagnostics) => void) | undefined;
 }
 
 /** Interaction の Evidence（`InteractionEvidence`）と、その Interaction の Context の Safety Ledger の記録。 */
@@ -1145,27 +1163,61 @@ async function observePreparedStability(
  * 隔離された Context で対象のページを読み込み、初期描画を待つ（設計書 2026-09-23 4.4.1、R6 の I-2）。どちらも読み込みの期限
  * （`navigationDeadlineAtMs`）で待つ。期限を過ぎた場合は、読み込みの期限切れと分かる理由の NOT_VERIFIABLE を返し、終えた場合は null を返す。
  * 読み込みのほかの失敗は、そのまま投げる（`auditInteraction` が EXECUTION_FAILED にする）。
+ * `afterTargetLoad` を渡した場合は、読み込みの前に main frame の文書の追跡を付け、ページ本体の要求の観察を始め、読み込みの結果（応答は
+ * `FULFILLED`、例外は `REJECTED`）から観測を作って、読み込みの直後に止めた観察の結果とともに渡し、追跡を外す（サイトが応答しないときに
+ * Run を止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2）。読み込みを始めなかった場合は、観察も始めず、呼ばない。
+ * 観察を始める処理は、読み込みの期限（`navigationDeadlineAtMs`）を消費するが、読み込みの期限と、今から `sessionOpenTimeoutMs` 後の
+ * 早い方までしか待たない（設計書 2.2「長く待たない」。session の作成と Passive の観察の開始と同じ。D3R の Minor-1）。読み込みの期限は
+ * 変えない。
  */
 async function loadInteractionTarget(
   session: InteractionAuditSession,
   targetUrl: string,
   candidate: InteractionCandidate,
   navigationDeadlineAtMs: number,
+  sessionOpenTimeoutMs: number,
+  afterTargetLoad: InteractionAuditInput['afterTargetLoad'],
 ): Promise<ClassifiedWorkOutcome | null> {
   const navigationBudgetMs = Math.max(0, navigationDeadlineAtMs - Date.now());
   if (navigationBudgetMs === 0) {
     return notVerifiable('INITIAL_LOAD_BEFORE_LOAD', emptyEvidence(candidate));
   }
-  try {
-    await session.page.goto(targetUrl, {
-      waitUntil: 'load',
-      timeout: navigationBudgetMs,
+  const tracker = afterTargetLoad === undefined ? null : trackMainFrameDocument(session.page);
+  const recorder = afterTargetLoad === undefined
+    ? null
+    : await startNavigationDiagnostics(session.page, {
+      deadlineAtMs: Math.min(navigationDeadlineAtMs, Date.now() + sessionOpenTimeoutMs),
     });
-  } catch (error) {
-    if (isPlaywrightTimeoutError(error)) {
+  // 観察を始める処理が使った時間の分だけ、読み込みの予算を減らす（読み込みの期限は変えない）。予算は 0 にしない（Playwright の `timeout: 0`
+  // は期限なしのため）。観察を始めない場合（受け口なし）の予算は、今までどおりである。
+  const remainingBudgetMs = recorder === null ? navigationBudgetMs : Math.max(1, navigationDeadlineAtMs - Date.now());
+  let loaded: MainFrameLoadSettlement;
+  try {
+    let diagnostics: NavigationDiagnostics | null = null;
+    try {
+      loaded = Object.freeze({
+        status: 'FULFILLED',
+        value: await session.page.goto(targetUrl, {
+          waitUntil: 'load',
+          timeout: remainingBudgetMs,
+        }),
+      });
+    } catch (error) {
+      loaded = Object.freeze({ status: 'REJECTED', reason: error });
+    } finally {
+      diagnostics = recorder === null ? null : await recorder.finish();
+    }
+    if (tracker !== null && afterTargetLoad !== undefined && diagnostics !== null) {
+      afterTargetLoad(observeMainFrameLoad(tracker, loaded), diagnostics);
+    }
+  } finally {
+    tracker?.dispose();
+  }
+  if (loaded.status === 'REJECTED') {
+    if (isPlaywrightTimeoutError(loaded.reason)) {
       return notVerifiable('INITIAL_LOAD_DURING_LOAD', emptyEvidence(candidate));
     }
-    throw error;
+    throw loaded.reason;
   }
   if (Date.now() >= navigationDeadlineAtMs) {
     return notVerifiable('INITIAL_LOAD_AFTER_LOAD', emptyEvidence(candidate));
@@ -1181,8 +1233,16 @@ async function executeInteraction(
   input: InteractionAuditInput,
   candidate: InteractionCandidate,
   navigationDeadlineAtMs: number,
+  sessionOpenTimeoutMs: number,
 ): Promise<ClassifiedWorkOutcome> {
-  const loadFailure = await loadInteractionTarget(session, input.targetUrl, candidate, navigationDeadlineAtMs);
+  const loadFailure = await loadInteractionTarget(
+    session,
+    input.targetUrl,
+    candidate,
+    navigationDeadlineAtMs,
+    sessionOpenTimeoutMs,
+    input.afterTargetLoad,
+  );
   if (loadFailure !== null) {
     return loadFailure;
   }
@@ -1538,6 +1598,9 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   if (releaseLateSessionFailure !== undefined && typeof releaseLateSessionFailure !== 'function') {
     throw new Error('The receiver of late interaction session failures must be a function');
   }
+  if (input.afterTargetLoad !== undefined && typeof input.afterTargetLoad !== 'function') {
+    throw new Error('The receiver of the interaction target load observation must be a function');
+  }
   if (!Number.isFinite(input.deadlineAtMs)) {
     throw new Error('Interaction deadline must be finite');
   }
@@ -1574,7 +1637,7 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   const session = opened.value;
   let classifiedWork: ClassifiedWorkOutcome;
   try {
-    classifiedWork = await executeInteraction(session, input, candidate, navigationDeadlineAtMs);
+    classifiedWork = await executeInteraction(session, input, candidate, navigationDeadlineAtMs, sessionOpenTimeoutMs);
   } catch (error) {
     classifiedWork = outcome('EXECUTION_FAILED', 'EXECUTION_FAILED', interactionFailureDetail(error), emptyEvidence(candidate));
   }

@@ -156,6 +156,19 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
    */
   'RUN_INTERRUPTED',
+  /**
+   * サイトの不調（判定は `siteUnavailabilityOf`、`src/orchestration/site-availability.ts`）を検知したため、その後の監査を始めなかった
+   * （サイトが応答しないときに Run を止める設計書 3.2）。
+   * - 始めなかったページと、不調を検知したページ（`SKIPPED`）の理由。始めなかったページの `detail` は `null`。不調を検知したページ
+   *   （止まるきっかけのページ）の `detail` は、最初に検知した失敗（Run の理由と同じ形。設計書 3.2 の 2026-10-05 改訂）。
+   * - 再開のときは、この理由の SKIPPED の URL を、待ち行列に戻す（`RESUME_REQUEUE_SKIP_REASON_CODES`、`src/orchestration/run-checkpoint.ts`）。
+   * - Run の理由にも1件残す（`detail` は、最初に検知した失敗。例: `desktop:passive:TIMEOUT`、`mobile:passive:HTTP 503`）。
+   * - ビューポートの理由としても使う（設計書 3.1）。不調を検知したビューポートは `FAILED` で、`detail` は `<段階>:<判定の詳細>`
+   *   （例: `passive:TIMEOUT`、`passive:HTTP 503`。組み立ては `siteUnavailableStageDetail`）。読み込みが失敗した場合の
+   *   `NAVIGATION_FAILED` の理由も残す。不調を検知した後に始めなかったビューポートは `SKIPPED` で、`detail` は `null`。
+   * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
+   */
+  'SITE_UNAVAILABLE',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -337,10 +350,159 @@ export interface PageSafetySummary {
   readonly recordTruncated: boolean;
 }
 
+/**
+ * ページ本体の要求の観察の結果の状態の閉じた一覧（サイトの不調で止めたときの診断の記録の設計書 2.1）。
+ * - `OBSERVED`: 観察した（記録した文書の要求が0件の場合を含む）。
+ * - `NOT_OBSERVED`: 観察を始められなかった（CDP の session を開けない、`Network.enable` が失敗した、始める処理が期限までに終わらない）。
+ */
+export const NAVIGATION_DIAGNOSTICS_STATUSES = Object.freeze(['OBSERVED', 'NOT_OBSERVED'] as const);
+export type NavigationDiagnosticsStatus = (typeof NAVIGATION_DIAGNOSTICS_STATUSES)[number];
+
+/**
+ * 1回の読み込み（Passive のビューポートの読み込み、幅の走査の1つの幅、Interaction の1つの候補）の間の、ページ本体の要求の観察の結果
+ * （サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）。
+ * 作るのは `startNavigationDiagnostics`（`src/browser/navigation-diagnostics.ts`）だけである。判定はしない（サイトの不調の判定は
+ * `src/orchestration/site-availability.ts`）。要求と応答の header の中身と、本文は持たない。
+ * 時刻は、すべて `Date.now()` と同じ基準の ms（UNIX エポックからのミリ秒）である。
+ */
+export type NavigationDiagnostics = ObservedNavigationDiagnostics | NotObservedNavigationDiagnostics;
+
+/** 観察した結果。 */
+export interface ObservedNavigationDiagnostics {
+  readonly status: Extract<NavigationDiagnosticsStatus, 'OBSERVED'>;
+  /** 観察を始めた時刻（`Network.enable` が終わった時刻）。 */
+  readonly observationStartedAtMs: number;
+  /** 観察を終えた時刻（読み込みの後に、観察を止めた時刻）。 */
+  readonly observationEndedAtMs: number;
+  /** main frame の文書の要求（発行の順）。上限は `MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS`。 */
+  readonly documentRequests: readonly NavigationDocumentRequestDiagnostics[];
+  /** 上限を超えたため（文書の要求の上限か、事象の上限に達した後）、記録しなかった文書の要求の数。 */
+  readonly omittedDocumentRequestCount: number;
+  /** 記録した文書の要求の事象のうち、事象の上限（`MAX_NAVIGATION_DIAGNOSTICS_EVENTS`）を超えたため、記録しなかった事象の数。 */
+  readonly omittedEventCount: number;
+}
+
+/** 観察を始められなかった結果。 */
+export interface NotObservedNavigationDiagnostics {
+  readonly status: Extract<NavigationDiagnosticsStatus, 'NOT_OBSERVED'>;
+  /** 始められなかった理由（上限 `MAX_ERROR_MESSAGE_LENGTH` 付きのメッセージ）。 */
+  readonly reason: string;
+}
+
+/**
+ * main frame の文書の要求1つ（CDP の同じ要求の ID）。リダイレクトは、同じ要求の続き（`hops` の次の要素）として記録する。
+ * 読み込みの終わり（`Network.loadingFinished`）と失敗（`Network.loadingFailed`）は、要求の全体（最後の `hops`）に対するものである。
+ */
+export interface NavigationDocumentRequestDiagnostics {
+  /** 最初の要求と、リダイレクトでたどった要求（発行の順）。少なくとも1つある。 */
+  readonly hops: readonly NavigationDocumentRequestHop[];
+  /** 読み込みが終わった時刻（`Network.loadingFinished` を受けた時刻）。受けていなければ `null`。 */
+  readonly loadingFinishedAtMs: number | null;
+  /** 読み込みの失敗（`Network.loadingFailed`）。受けていなければ `null`。 */
+  readonly loadingFailure: NavigationDocumentLoadingFailure | null;
+}
+
+/** 文書の要求の1回分（最初の要求か、リダイレクトでたどった要求）。 */
+export interface NavigationDocumentRequestHop {
+  /** 要求の URL（上限 `MAX_URL_LENGTH`）。 */
+  readonly url: string;
+  /** 要求の method（上限 `MAX_HTTP_METHOD_LENGTH`）。 */
+  readonly method: string;
+  /** `url` か `method` を上限で切り詰めたか。 */
+  readonly truncated: boolean;
+  /** ページが要求を発行した時刻（`Network.requestWillBeSent` の `wallTime`。なければ、受けた時刻）。 */
+  readonly issuedAtMs: number;
+  /**
+   * 要求のヘッダをネットワークへ送った時刻（`Network.requestWillBeSentExtraInfo` を受けた時刻）。受けていなければ `null`
+   * （要求がネットワークへ送られていない。キャッシュや内部のリダイレクトのように、ネットワークに出ない要求も `null`）。
+   */
+  readonly requestHeadersSentAtMs: number | null;
+  /**
+   * 応答のヘッダを受けた時刻（`Network.responseReceivedExtraInfo`、`Network.responseReceived`、リダイレクトの応答の、最初に受けたもの）。
+   * 受けていなければ `null`。
+   */
+  readonly responseHeadersReceivedAtMs: number | null;
+  /** 応答の HTTP の status。応答を受けていなければ `null`。 */
+  readonly httpStatus: number | null;
+  /** 応答の接続先の IP アドレス（`remoteIPAddress`）。応答を受けていない場合と、IP アドレスでない場合は `null`。 */
+  readonly remoteIpAddress: string | null;
+  /** 応答の接続先の port（`remotePort`）。応答を受けていない場合と、0以上の安全な整数でない場合は `null`。 */
+  readonly remotePort: number | null;
+}
+
+/** 文書の要求の読み込みの失敗（`Network.loadingFailed`）。 */
+export interface NavigationDocumentLoadingFailure {
+  /** 失敗を受けた時刻。 */
+  readonly failedAtMs: number;
+  /** 失敗の理由（例: `net::ERR_ABORTED`。上限 `MAX_ERROR_MESSAGE_LENGTH`）。 */
+  readonly errorText: string;
+  /** ブラウザが取り消したか（`canceled`）。 */
+  readonly canceled: boolean;
+}
+
 /** `PageAuditor.audit(url, pageId)` の戻り値（Task 14〜17 の設計書 4.5.1）。 */
 export interface PageAuditOutcome {
   readonly result: PageAuditResult;
   readonly safety: PageSafetySummary;
+  /**
+   * そのページで最初に検知したサイトの不調（判定は `siteUnavailabilityOf`、`src/orchestration/site-availability.ts`）の詳細
+   * （サイトが応答しないときに Run を止める設計書 3.1、3.2）。形は `<ビューポート>:<段階>:<判定の詳細>`（例: `desktop:passive:TIMEOUT`、
+   * `mobile:passive:HTTP 503`。組み立ては `siteUnavailableDetail`）。不調を検知しなければ `null`。
+   * Run Coordinator は、これを、Run の理由と、止まるきっかけのページの理由（`SITE_UNAVAILABLE`）の `detail` に使う。
+   * Page の結果（`PageAuditResult`）の JSON には含めない。
+   */
+  readonly siteUnavailableDetail: string | null;
+  /**
+   * 各ビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の要求の観察の結果（サイトの不調で止めた
+   * ときの診断の記録の設計書 2.1、2.2。2026-10-07 の改訂）。始めなかったビューポート（SKIPPED のビューポート）は `null`。
+   * ページの結果（`PageAuditResult`）と Evidence には含めない（診断の記録だけに使う）。
+   */
+  readonly navigationDiagnostics: Readonly<Record<ViewportProfile, ViewportNavigationDiagnostics | null>>;
+}
+
+/**
+ * 1つのビューポートの診断の記録に持つ、幅の走査の幅ごとの観察の結果の最大の数（サイトの不調で止めたときの診断の記録の設計書 2.3）。
+ * 設定の `viewports.stressWidths` の数に上限はないので、記録の数だけをここで止める（Page Auditor は、この数までの幅の観察を記録し、
+ * 超えた幅の観察は記録しない）。診断の記録のスキーマ（`schemas/site-unavailable-diagnostic.schema.json`）の `stressWidths` の
+ * `maxItems` と一致する。
+ * 値の根拠: 既定の幅は 5 つで、幅はそれぞれページの読み込み直しなので、ふつうの設定は 10 幅に満たない。320px から 1920px まで 25px
+ * おきに調べる密な走査（65 幅）に近い数まで余裕を取った（設計者の決定）。
+ */
+export const MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS = 64;
+
+/**
+ * 1つのビューポートの、ページ本体の要求の観察の結果（サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。
+ * Passive の読み込みに加えて、幅の走査の幅ごと（幅の値つき。読み込みを始めた幅だけ、読み込んだ順）と、Interaction の候補ごと
+ * （候補の順の番号つき。読み込みを始めた候補だけ、監査した順）の観察を持つ。幅の走査と Interaction は Desktop だけで行うので、
+ * Mobile では、どちらも空である。
+ */
+export interface ViewportNavigationDiagnostics {
+  /**
+   * Passive の読み込みの間の観察の結果。Passive の読み込みを始めなかった（Context と page を作れなかった）ビューポートは `null`
+   * （そのビューポートでは、幅の走査と Interaction も行わないので、下の2つは空）。
+   */
+  readonly passive: NavigationDiagnostics | null;
+  /** 幅の走査の、読み込みを始めた幅ごとの観察の結果（読み込んだ順。上限は `MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS`）。 */
+  readonly stressWidths: readonly StressWidthNavigationDiagnostics[];
+  /**
+   * Interaction の、対象のページの読み込みを始めた候補ごとの観察の結果（監査した順。上限は、候補の数の上限
+   * `INTERACTION_CANDIDATE_LIMITS.maxCandidates`、`src/safety/interaction-policy.ts`）。
+   */
+  readonly interactionCandidates: readonly InteractionCandidateNavigationDiagnostics[];
+}
+
+/** 幅の走査の1つの幅の読み込みの観察の結果。 */
+export interface StressWidthNavigationDiagnostics {
+  /** 幅（CSS ピクセル。設定の `viewports.stressWidths` の値）。 */
+  readonly width: number;
+  readonly diagnostics: NavigationDiagnostics;
+}
+
+/** Interaction の1つの候補の、対象のページの読み込みの観察の結果。 */
+export interface InteractionCandidateNavigationDiagnostics {
+  /** 候補の順の番号（候補の発見の順。0 から）。 */
+  readonly index: number;
+  readonly diagnostics: NavigationDiagnostics;
 }
 
 /** 実行の環境の事実（設計書 18.1、Task 14〜17 の設計書 5.5）。ビューポート・locale・timezone・headed は `effectiveConfig` にある。 */
@@ -577,7 +739,7 @@ export interface RunRetryRecord {
   readonly navigationOutcome: NavigationOutcomeKind;
   /**
    * その試行の、Desktop の `NAVIGATION_FAILED` の理由の `detail`（`TIMEOUT`、`BLOCKED_EXTERNAL_REDIRECT`、
-   * `FAILED:<Chromium のエラーのコード>`、`FAILED`。作るのは `navigationFailureDetail`、`src/orchestration/page-auditor.ts`）。
+   * `FAILED:<Chromium のエラーのコード>`、`FAILED`。作るのは `navigationFailureDetail`、`src/orchestration/page-navigation.ts`）。
    * 理由がない場合は `null`。
    */
   readonly detail: string | null;
@@ -615,6 +777,7 @@ export interface AuditRunResult {
  * （`schemas/checkpoint.schema.json` の `state`）の enum と一致させるため、ここに置く（共通部品台帳 2.2。R2 の Blocker B2）。
  * - `IN_PROGRESS`: Run の途中（プロセスが途中で終わった場合も、この状態のまま残る）。
  * - `STOPPED`: 止める印か、1回の実行の時間の上限で、今のページを終えてから止まり、最後の処理を行った（再開できることがある）。
+ *   サイトの不調を検知して止まった場合も、この状態にする（サイトが応答しないときに Run を止める設計書 3.2）。
  * - `FINISHED`: 最後の処理まで行い、Run を終えた（再開の対象にしない）。
  */
 export const RUN_CHECKPOINT_STATES = Object.freeze(['IN_PROGRESS', 'STOPPED', 'FINISHED'] as const);
@@ -628,6 +791,8 @@ export type RunCheckpointState = (typeof RUN_CHECKPOINT_STATES)[number];
  * - `STOPPED_BY_RUNTIME_LIMIT`: 1回の実行の時間の上限で止まった。
  * - `STOPPED_BY_SIGNAL`: 止める印（Ctrl+C など）で止まった。
  * - `STOPPED_BY_SAFETY_VIOLATION`: 安全の不変条件の違反で止まった。
+ * - `STOPPED_BY_SITE_UNAVAILABLE`: サイトの不調（時間切れ、ネットワークの層の失敗、429・502・503・504 の応答。判定は
+ *   `src/orchestration/site-availability.ts`）を検知して止まった（サイトが応答しないときに Run を止める設計書 3.2）。再開できる。
  * - `INTERRUPTED_ABNORMALLY`: プロセスが途中で終わった（終わりの時刻は、最後の保存の時刻とする）。
  */
 export const RUN_EXECUTION_END_REASONS = Object.freeze([
@@ -635,6 +800,7 @@ export const RUN_EXECUTION_END_REASONS = Object.freeze([
   'STOPPED_BY_RUNTIME_LIMIT',
   'STOPPED_BY_SIGNAL',
   'STOPPED_BY_SAFETY_VIOLATION',
+  'STOPPED_BY_SITE_UNAVAILABLE',
   'INTERRUPTED_ABNORMALLY',
 ] as const);
 export type RunExecutionEndReason = (typeof RUN_EXECUTION_END_REASONS)[number];

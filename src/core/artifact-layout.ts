@@ -15,6 +15,10 @@
  *   - `checkpoint/`: `state.json`、`state.prev.json`、`run.lock`
  *   - `checkpoint/pages/<pageId>.json`: ページの保存
  *   保存のファイルを読み書きし、消すのは `ArtifactWriter` である。ここは、名前とパスだけを持つ。
+ * - サイトの不調で止めたときの診断の記録の配置（サイトの不調で止めたときの診断の記録の設計書 2.3）:
+ *   - `diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`: そのページのその試行の監査の結果と、ページ本体の要求の観察の
+ *     結果（試行の番号は、捨てた後に 1 回だけ確かめ直す決まり（サイトが応答しないときに Run を止める設計書 3.5.2）による。1 回目が 1）
+ *   `checkpoint/` の外に置く（Run の終わりの片付けで消さない）。書くのは `ArtifactWriter` である。
  * - PREFLIGHT が Run のディレクトリの直下に作る一時ファイルの名前（接頭辞と接尾辞）も、ここに置く（PREFLIGHT が作り、再開のときの
  *   後始末で `ArtifactWriter` が消す。report の層は orchestration を import しないため）。
  * - Run のディレクトリを排他的に作る処理（`createRunArtifactDirectory`。DEF-009）と、Run のディレクトリの一覧の読み取り
@@ -73,6 +77,22 @@ export const CHECKPOINT_PAGES_ARTIFACT_DIRECTORY = `${CHECKPOINT_ARTIFACT_DIRECT
 /** ページの保存のファイルの名前の接尾辞（`<pageId>.json`）。 */
 const CHECKPOINT_PAGE_FILE_SUFFIX = '.json';
 
+/**
+ * サイトの不調で止めたときの診断の記録を置く、Run のディレクトリの直下のディレクトリの名前（サイトの不調で止めたときの診断の記録の
+ * 設計書 2.3）。`checkpoint/` の外なので、Run の終わりの片付け（`checkpoint/` の中だけを消す）で消えない。
+ */
+export const DIAGNOSTICS_ARTIFACT_DIRECTORY = 'diagnostics';
+
+/**
+ * 診断の記録のファイルの名前の接頭辞（`<接頭辞><pageId><区切り><実行の番号><区切り><試行の番号><接尾辞>`。
+ * `site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`）。
+ */
+const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_PREFIX = 'site-unavailable-';
+/** 診断の記録のファイルの名前の、ページの ID と実行の番号と試行の番号の区切り。 */
+const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SEPARATOR = '-';
+/** 診断の記録のファイルの名前の接尾辞。 */
+const SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SUFFIX = '.json';
+
 /** PREFLIGHT が出力先を確かめるために、Run のディレクトリの直下に作って消す一時ファイルの名前の接頭辞（`<接頭辞><UUID><接尾辞>`）。 */
 export const PREFLIGHT_TEMPORARY_FILE_PREFIX = '.beaksight-preflight-';
 /** PREFLIGHT の一時ファイルの名前の接尾辞。 */
@@ -94,6 +114,26 @@ export const checkpointArtifactRelativePath = (file: CheckpointArtifactFile): st
 /** ページの保存の、Run のディレクトリからの相対パス（区切りは `/`。例: `checkpoint/pages/PAGE-000001.json`）。 */
 export const checkpointPageArtifactRelativePath = (pageId: PageId): string =>
   `${CHECKPOINT_PAGES_ARTIFACT_DIRECTORY}/${pageId}${CHECKPOINT_PAGE_FILE_SUFFIX}`;
+
+/**
+ * サイトの不調で止めたときの診断の記録の、Run のディレクトリからの相対パス（区切りは `/`。例:
+ * `diagnostics/site-unavailable-PAGE-000003-1-1.json`。サイトの不調で止めたときの診断の記録の設計書 2.3）。`executionNumber` は、その記録を
+ * 書いた実行の番号（1から。再開した実行は、前の回の実行の数 + 1）。`attemptNumber` は、その実行の中でそのページを監査した試行の番号
+ * （1から。捨てた後に 1 回だけ確かめ直した試行は 2。サイトが応答しないときに Run を止める設計書 3.5.2）。ページと実行と試行ごとに1つで、
+ * 同じページが別の実行や試行でまた止まっても、前の記録を置き換えない。
+ * `executionNumber` か `attemptNumber` が正の安全な整数でない場合は、`RangeError` を投げる。
+ */
+export function siteUnavailableDiagnosticRelativePath(pageId: PageId, executionNumber: number, attemptNumber: number): string {
+  if (!isPositiveSafeInteger(executionNumber)) {
+    throw new RangeError(`execution number must be a positive safe integer: ${String(executionNumber)}`);
+  }
+  if (!isPositiveSafeInteger(attemptNumber)) {
+    throw new RangeError(`attempt number must be a positive safe integer: ${String(attemptNumber)}`);
+  }
+  const fileName = [SITE_UNAVAILABLE_DIAGNOSTIC_FILE_PREFIX + pageId, executionNumber, attemptNumber]
+    .join(SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SEPARATOR) + SITE_UNAVAILABLE_DIAGNOSTIC_FILE_SUFFIX;
+  return `${DIAGNOSTICS_ARTIFACT_DIRECTORY}/${fileName}`;
+}
 
 /**
  * `checkpoint/pages/` の中のファイルの名前が、ページの保存の名前（`<pageId>.json`。ページの ID は `isPageId` の形）なら、その

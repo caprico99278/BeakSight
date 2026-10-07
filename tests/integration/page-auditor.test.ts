@@ -347,7 +347,11 @@ describe('PageAuditor Desktop and Mobile independence (Task 14 Step 3)', () => {
 });
 
 describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
-  it('marks both viewports FAILED on a navigation timeout and still records the network Evidence', async () => {
+  // SU2a（サイトが応答しないときに Run を止める設計書 3.1）: `/__slow` は、遅らせる間、ヘッダを返さない。応答のない時間切れはサイトの
+  // 不調なので、Desktop は理由 `SITE_UNAVAILABLE` を加えた FAILED にし、Mobile は始めない（SKIPPED）。両方のビューポートが FAILED に
+  // なり、両方に network などの Evidence が残る、という元の確かめは、応答を受けた後の時間切れ（不調ではない）で、
+  // `tests/integration/page-auditor-site-unavailability.test.ts` に残した。
+  it('marks Desktop FAILED with SITE_UNAVAILABLE on a navigation timeout without a response, records its network Evidence, and skips Mobile', async () => {
     const server = await startServer({ slowResponseDelayMs: SLOW_RESPONSE_DELAY_MS });
     const { outcome, remainingContextCount } = await auditFixture(server, '/__slow', {
       overrides: { ...NO_STRESS_SWEEP, crawl: { navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS } },
@@ -355,22 +359,30 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     const { result } = outcome;
 
     expect(result.status).toBe('FAILED');
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(result.viewports[viewport]).toMatchObject({
-        status: 'FAILED',
-        navigationOutcome: 'TIMEOUT',
-        httpStatus: null,
-        incompleteReasons: [{ code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' }],
-      });
-      const [network] = evidenceOf(outcome, 'network', viewport);
-      expect(network?.payload.requests.some((request) => request.url === `${server.origin}/__slow`)).toBe(true);
-      expect(evidenceOf(outcome, 'console', viewport)).toHaveLength(1);
-      expect(evidenceOf(outcome, 'safety', viewport)).toHaveLength(1);
-      // ナビゲーションが失敗したので、以降の収集はしない。
-      for (const type of ['scroll', 'dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
-        expect(evidenceOf(outcome, type, viewport), `${viewport} ${type}`).toHaveLength(0);
-      }
+    expect(result.viewports.desktop).toMatchObject({
+      status: 'FAILED',
+      navigationOutcome: 'TIMEOUT',
+      httpStatus: null,
+      incompleteReasons: [
+        { code: 'NAVIGATION_FAILED', detail: 'TIMEOUT' },
+        { code: 'SITE_UNAVAILABLE', detail: 'passive:TIMEOUT' },
+      ],
+    });
+    const [network] = evidenceOf(outcome, 'network', 'desktop');
+    expect(network?.payload.requests.some((request) => request.url === `${server.origin}/__slow`)).toBe(true);
+    expect(evidenceOf(outcome, 'console', 'desktop')).toHaveLength(1);
+    expect(evidenceOf(outcome, 'safety', 'desktop')).toHaveLength(1);
+    // ナビゲーションが失敗したので、以降の収集はしない。
+    for (const type of ['scroll', 'dom', 'layout', 'color', 'accessibility', 'performance', 'screenshot', 'link'] as const) {
+      expect(evidenceOf(outcome, type, 'desktop'), `desktop ${type}`).toHaveLength(0);
     }
+    // Mobile は始めない（理由 `SITE_UNAVAILABLE`、`detail` は `null` の SKIPPED。Evidence はない）。
+    expect(result.viewports.mobile).toMatchObject({
+      status: 'SKIPPED',
+      navigationOutcome: null,
+      incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: null }],
+    });
+    expect(evidenceTypesOf(outcome, 'mobile')).toEqual([]);
     expect(remainingContextCount).toBe(0);
     await expect(validateArtifact('page', JSON.parse(JSON.stringify(result)) as unknown)).resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
@@ -404,6 +416,7 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
   }, AUDIT_TEST_TIMEOUT_MS);
 
   // R15a（設計書 5.6.4）: そのほかの失敗の detail は `FAILED:<Chromium のエラーのコード>`。Run Coordinator は、これで再試行を判断する。
+  // SU2a（サイトが応答しないときに Run を止める設計書 3.1）: 接続の拒否はサイトの不調なので、Mobile は始めない（SKIPPED）。
   it('writes FAILED:<Chromium error code> as the detail when nothing listens on the port', async () => {
     // 起動して閉じたサーバの 127.0.0.1 のポートには、何も待ち受けていない。
     const closed = await startServer();
@@ -412,17 +425,21 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     const { result } = outcome;
 
     expect(result.status).toBe('FAILED');
-    for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(result.viewports[viewport]).toMatchObject({
-        status: 'FAILED',
-        navigationOutcome: 'FAILED',
-        httpStatus: null,
-      });
-      // ナビゲーションの失敗の理由は、最初に記録する。ほかの理由（閉じる処理の失敗など）は、この変更の対象ではないので確かめない。
-      expect(result.viewports[viewport].incompleteReasons[0])
-        .toEqual({ code: 'NAVIGATION_FAILED', detail: 'FAILED:net::ERR_CONNECTION_REFUSED' });
-      expect(evidenceOf(outcome, 'network', viewport)).toHaveLength(1);
-    }
+    expect(result.viewports.desktop).toMatchObject({
+      status: 'FAILED',
+      navigationOutcome: 'FAILED',
+      httpStatus: null,
+    });
+    // ナビゲーションの失敗の理由は、最初に記録する。ほかの理由（閉じる処理の失敗など）は、この変更の対象ではないので確かめない。
+    expect(result.viewports.desktop.incompleteReasons[0])
+      .toEqual({ code: 'NAVIGATION_FAILED', detail: 'FAILED:net::ERR_CONNECTION_REFUSED' });
+    expect(evidenceOf(outcome, 'network', 'desktop')).toHaveLength(1);
+    expect(result.viewports.mobile).toMatchObject({
+      status: 'SKIPPED',
+      navigationOutcome: null,
+      httpStatus: null,
+      incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: null }],
+    });
     expect(result.incompleteReasons[0]).toEqual({ code: 'NAVIGATION_FAILED', detail: 'FAILED:net::ERR_CONNECTION_REFUSED' });
     // DEF-004: 許可した GET のネットワークの層の失敗は、Guard の違反にならない。閉じる処理の失敗の理由も加わらない。
     expect(outcome.safety.invariantViolationCount).toBe(0);
