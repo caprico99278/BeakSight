@@ -15,6 +15,7 @@ import type { AuditConfig } from '../../src/config/types.js';
 import {
   FINDING_CATEGORIES,
   INCOMPLETE_REASON_CODES,
+  NAVIGATION_DIAGNOSTICS_STATUSES,
   OBSERVATION_STATUSES,
   PAGE_AUDIT_STAGES,
   PARTIAL_FAILURE_REASONS,
@@ -27,7 +28,15 @@ import {
   type FindingCategory,
   type IncompleteReason,
   type IncompleteReasonCode,
+  type InteractionCandidateNavigationDiagnostics,
+  type NavigationDiagnostics,
+  type NavigationDiagnosticsStatus,
+  type NavigationDocumentLoadingFailure,
+  type NavigationDocumentRequestDiagnostics,
+  type NavigationDocumentRequestHop,
+  type NotObservedNavigationDiagnostics,
   type ObservationStatus,
+  type ObservedNavigationDiagnostics,
   type PageAuditOutcome,
   type PageAuditResult,
   type PageAuditStage,
@@ -38,7 +47,9 @@ import {
   type RunSummary,
   type SafetyBlockedActionCounts,
   type SafetyInvariantViolationSummary,
+  type StressWidthNavigationDiagnostics,
   type ViewportAuditResult,
+  type ViewportNavigationDiagnostics,
   type ViewportProfile,
 } from '../../src/core/contracts.js';
 import {
@@ -417,6 +428,8 @@ describe('C8: incomplete reason codes', () => {
     'CHECKPOINT_WRITE_FAILED',
     // R4b1（中断した Run の再開の設計書 4.6.1）: 止める印（Ctrl+C など）を受けたため、その後の監査を始めなかった。
     'RUN_INTERRUPTED',
+    // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調を検知したため、その後の監査を始めなかった。
+    'SITE_UNAVAILABLE',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -1013,6 +1026,77 @@ describe('P14a: page audit contracts', () => {
     expectTypeOf<PageSafetySummary['recordTruncated']>().toEqualTypeOf<boolean>();
     expectTypeOf<PageSafetySummary['invariantViolations']>().toEqualTypeOf<readonly SafetyInvariantViolationSummary[]>();
     expectTypeOf<PageAuditResult>().not.toHaveProperty('safety');
+  });
+
+  // SU2a（サイトが応答しないときに Run を止める設計書 3.1、3.2）: ページの結果は、最初に検知したサイトの不調の詳細
+  // （`<ビューポート>:<段階>:<判定の詳細>`）を、Page の結果（`PageAuditResult`）の外に持つ。不調がなければ `null`。
+  it('carries the detail of the first site unavailability outside the page result (site unavailability design 3.1, 3.2)', () => {
+    expectTypeOf<PageAuditOutcome['siteUnavailableDetail']>().toEqualTypeOf<string | null>();
+    expectTypeOf<keyof PageAuditOutcome>()
+      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'navigationDiagnostics'>();
+    expectTypeOf<PageAuditResult>().not.toHaveProperty('siteUnavailableDetail');
+  });
+
+  // D1（サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）: ページの結果は、各ビューポートの読み込みの観察（main frame の
+  // 文書の要求の事象）を、Page の結果（`PageAuditResult`）の外に持つ。始めなかったビューポートは `null`。記録は、要求ごとの時刻、status、
+  // 接続先の IP と port、終わりか失敗だけで、header の中身と本文の項目を持たない。
+  // D3（設計書 2.2 の 2026-10-07 の改訂）: ビューポートごとに、Passive の読み込みの観察（始めなければ `null`）に加えて、幅の走査の幅ごと
+  // （幅の値つき）と、Interaction の候補ごと（候補の順の番号つき）の観察を配列で持つ。
+  it('carries the navigation diagnostics of each viewport outside the page result (site unavailable diagnostics design 2.1, 2.2)', () => {
+    expectTypeOf<PageAuditOutcome['navigationDiagnostics']>()
+      .toEqualTypeOf<Readonly<Record<ViewportProfile, ViewportNavigationDiagnostics | null>>>();
+    expectTypeOf<ViewportNavigationDiagnostics>().toEqualTypeOf<{
+      readonly passive: NavigationDiagnostics | null;
+      readonly stressWidths: readonly StressWidthNavigationDiagnostics[];
+      readonly interactionCandidates: readonly InteractionCandidateNavigationDiagnostics[];
+    }>();
+    expectTypeOf<StressWidthNavigationDiagnostics>().toEqualTypeOf<{
+      readonly width: number;
+      readonly diagnostics: NavigationDiagnostics;
+    }>();
+    expectTypeOf<InteractionCandidateNavigationDiagnostics>().toEqualTypeOf<{
+      readonly index: number;
+      readonly diagnostics: NavigationDiagnostics;
+    }>();
+    expectTypeOf<PageAuditResult>().not.toHaveProperty('navigationDiagnostics');
+    expect(NAVIGATION_DIAGNOSTICS_STATUSES).toEqual(['OBSERVED', 'NOT_OBSERVED']);
+    expect(Object.isFrozen(NAVIGATION_DIAGNOSTICS_STATUSES)).toBe(true);
+    expectTypeOf<NavigationDiagnosticsStatus>().toEqualTypeOf<ValueOf<typeof NAVIGATION_DIAGNOSTICS_STATUSES>>();
+    expectTypeOf<NavigationDiagnostics>().toEqualTypeOf<ObservedNavigationDiagnostics | NotObservedNavigationDiagnostics>();
+    expectTypeOf<NavigationDiagnostics['status']>().toEqualTypeOf<NavigationDiagnosticsStatus>();
+    expectTypeOf<NotObservedNavigationDiagnostics>().toEqualTypeOf<{
+      readonly status: 'NOT_OBSERVED';
+      readonly reason: string;
+    }>();
+    expectTypeOf<ObservedNavigationDiagnostics>().toEqualTypeOf<{
+      readonly status: 'OBSERVED';
+      readonly observationStartedAtMs: number;
+      readonly observationEndedAtMs: number;
+      readonly documentRequests: readonly NavigationDocumentRequestDiagnostics[];
+      readonly omittedDocumentRequestCount: number;
+      readonly omittedEventCount: number;
+    }>();
+    expectTypeOf<NavigationDocumentRequestDiagnostics>().toEqualTypeOf<{
+      readonly hops: readonly NavigationDocumentRequestHop[];
+      readonly loadingFinishedAtMs: number | null;
+      readonly loadingFailure: NavigationDocumentLoadingFailure | null;
+    }>();
+    expectTypeOf<NavigationDocumentRequestHop>().toEqualTypeOf<{
+      readonly url: string;
+      readonly method: string;
+      readonly truncated: boolean;
+      readonly issuedAtMs: number;
+      readonly requestHeadersSentAtMs: number | null;
+      readonly responseHeadersReceivedAtMs: number | null;
+      readonly httpStatus: number | null;
+      readonly remoteIpAddress: string | null;
+      readonly remotePort: number | null;
+    }>();
+    expectTypeOf<NavigationDocumentLoadingFailure>().toEqualTypeOf<{
+      readonly failedAtMs: number;
+      readonly errorText: string;
+      readonly canceled: boolean;
+    }>();
   });
 
   // P18b（CC-015）: 不変条件の違反の型は、core のこの1つだけ。形は `code` と `message` の文字列で、JSON の形を変えない。

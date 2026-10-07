@@ -1,5 +1,9 @@
+import { EventEmitter } from 'node:events';
 import type { Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
+import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
+import { NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE } from '../../src/browser/navigation-diagnostics.js';
+import type { NavigationDiagnostics } from '../../src/core/contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import {
   VISUALLY_HIDDEN_MAX_DIMENSION_PX,
@@ -527,6 +531,300 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
       deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
       beforeNavigation: 'wait' as unknown as () => Promise<number>,
     })).rejects.toThrow('beforeNavigation');
+    expect(creations).toBe(0);
+  });
+});
+
+// SU2b（サイトが応答しないときに Run を止める設計書 2.1）: 幅の走査は、各幅の読み込み（`page.goto`）の観測を、注入された受け口
+// （`afterNavigation`）に渡す。観測は `src/browser/main-frame-load.ts` の部品で作り、collector は判定をしない。偽の page は、
+// 本物の page と同じく、要求と応答の事象を出す（main frame の文書の要求を追う部品が、事象の受け口を付けて外すことも確かめる）。
+
+/** 偽の page の読み込みの振る舞い。 */
+type FakeLoad =
+  /** main frame の文書の要求を出し、`status` の応答を返して、読み込みを終える。 */
+  | { readonly kind: 'ANSWER'; readonly status: number }
+  /** main frame の文書の要求を出すが、応答を返さず、読み込みも終わらない（応答のない時間切れ）。 */
+  | { readonly kind: 'NO_RESPONSE' }
+  /** main frame の文書の要求を出し、応答を返さずに、`message` の例外で読み込みが失敗する。 */
+  | { readonly kind: 'REJECT'; readonly message: string };
+
+const FAKE_STATUS_OK = 200;
+const FAKE_STATUS_SERVICE_UNAVAILABLE = 503;
+/**
+ * 偽の page の Context が、CDP の session を開く求めを断るときのメッセージ（D3。診断の記録の設計書 2.2）。偽の page には CDP の session が
+ * ないので、ページ本体の要求の観察は始められず、受け口には `NOT_OBSERVED`（理由はこのメッセージ）が渡る。
+ */
+const FAKE_NO_CDP_SESSION_MESSAGE = 'the fake page has no CDP session';
+
+/**
+ * 偽の page の Context が、CDP の session を開く求め（ページ本体の要求の観察の開始）にどう振る舞うか。
+ * `REFUSED` は `FAKE_NO_CDP_SESSION_MESSAGE` で断る。`NEVER_OPENS` は、いつまでも開かない（観察の開始の期限の確かめに使う）。
+ */
+type FakeCdpSession = 'REFUSED' | 'NEVER_OPENS';
+
+/**
+ * 事象の受け口の数を記録する、偽の page を持つセッションの factory。n 番目の幅の読み込みは `loads[n - 1]` のとおりに振る舞う。
+ * 偽の page の Context は、CDP の session を開く求め（ページ本体の要求の観察の開始。D3）に `cdp:<n>` を記録し、`cdpSession` の
+ * とおりに振る舞う（既定は断る）。
+ */
+function eventEmittingSessionFactory(
+  loads: readonly FakeLoad[],
+  events: string[],
+  cdpSession: FakeCdpSession = 'REFUSED',
+): PassiveStressSessionFactory {
+  let serial = 0;
+  return async (viewport): Promise<PassiveStressSession> => {
+    const load = loads[serial];
+    serial += 1;
+    const id = serial;
+    if (load === undefined) {
+      throw new Error(`no fake load for the session ${id}`);
+    }
+    const mainFrame = Object.freeze({});
+    const emitter = new EventEmitter();
+    const listeners = (): string => `request=${emitter.listenerCount('request')},response=${emitter.listenerCount('response')}`;
+    const context = {
+      newCDPSession: async (): Promise<never> => {
+        events.push(`cdp:${id}`);
+        if (cdpSession === 'NEVER_OPENS') {
+          return neverSettles();
+        }
+        throw new Error(FAKE_NO_CDP_SESSION_MESSAGE);
+      },
+    };
+    const page = Object.assign(emitter, {
+      mainFrame: () => mainFrame,
+      isClosed: () => false,
+      context: () => context,
+      evaluate: async () => rawLayout(viewport.width, viewport.height),
+      goto: async (url: string) => {
+        events.push(`goto:${id}:${url}:${listeners()}`);
+        const request = { isNavigationRequest: () => true, frame: () => mainFrame };
+        emitter.emit('request', request);
+        switch (load.kind) {
+          case 'ANSWER': {
+            const response = { request: () => request, status: () => load.status };
+            emitter.emit('response', response);
+            return response;
+          }
+          case 'NO_RESPONSE':
+            return neverSettles();
+          case 'REJECT':
+            throw new Error(load.message);
+        }
+      },
+    });
+    return {
+      page: page as unknown as Page,
+      close: async () => { events.push(`close:${id}:${listeners()}`); },
+    };
+  };
+}
+
+/** 偽の page（CDP の session がない）での、ページ本体の要求の観察の結果（D3）。 */
+const NOT_OBSERVED_IN_FAKE_PAGE: NavigationDiagnostics = Object.freeze({ status: 'NOT_OBSERVED', reason: FAKE_NO_CDP_SESSION_MESSAGE });
+
+describe('responsive layout stress main frame load observation (site unavailability design 2.1)', () => {
+  // D3（診断の記録の設計書 2.2 の 2026-10-07 の改訂）: 受け口には、観測に加えて、各幅の読み込みの間のページ本体の要求の観察の結果を渡す。
+  // 観察は、各幅の `goto` の直前に始め（偽の page では CDP の session を開けないので `NOT_OBSERVED`）、`goto` の直後に、結果によらず止める。
+  it('passes the observation of the load of each width to afterNavigation (200, 503 and a failure), tracking only during the load', async () => {
+    const events: string[] = [];
+    const observations: MainFrameLoadObservation[] = [];
+    const diagnostics: NavigationDiagnostics[] = [];
+    const failureMessage = 'page.goto: net::ERR_CONNECTION_REFUSED at https://fixture.test/page';
+
+    const result = await collectStressLayout(
+      eventEmittingSessionFactory([
+        { kind: 'ANSWER', status: FAKE_STATUS_OK },
+        { kind: 'ANSWER', status: FAKE_STATUS_SERVICE_UNAVAILABLE },
+        { kind: 'REJECT', message: failureMessage },
+      ], events),
+      'https://fixture.test/page',
+      [390, 320, 768],
+      {
+        ...unpacedStressOptions([390, 320, 768]),
+        afterNavigation: (observation, navigationDiagnostics) => {
+          observations.push(observation);
+          diagnostics.push(navigationDiagnostics);
+        },
+      },
+    );
+
+    expect(observations).toEqual([
+      { navigationOutcome: 'OK', httpStatus: FAKE_STATUS_OK, failureDetail: null },
+      { navigationOutcome: 'OK', httpStatus: FAKE_STATUS_SERVICE_UNAVAILABLE, failureDetail: null },
+      { navigationOutcome: 'FAILED', httpStatus: null, failureDetail: failureMessage },
+    ]);
+    expect(observations.every((observation) => Object.isFrozen(observation))).toBe(true);
+    // D3: 各幅の読み込み（応答した幅も、失敗した幅も）の観察の結果が渡る。偽の page では観察を始められない。
+    expect(diagnostics).toEqual([NOT_OBSERVED_IN_FAKE_PAGE, NOT_OBSERVED_IN_FAKE_PAGE, NOT_OBSERVED_IN_FAKE_PAGE]);
+    expect(diagnostics.every((entry) => Object.isFrozen(entry))).toBe(true);
+    // 観測を渡しても、幅の結果は今までどおりである（collector は判定をしない）。
+    expect(result.map((entry) => [entry.width, entry.status])).toEqual([[390, 'COMPLETE'], [320, 'COMPLETE'], [768, 'FAILED']]);
+    expect(result[2]).toMatchObject({ stage: 'NAVIGATION', reason: 'NAVIGATION_FAILED', message: failureMessage });
+    // 事象の受け口は、読み込みの前に付け、セッションを閉じる前に外す。観察（CDP の session を開く求め）は、各幅の読み込みの前に始める。
+    expect(events).toEqual([
+      'cdp:1',
+      'goto:1:https://fixture.test/page:request=1,response=1',
+      'close:1:request=0,response=0',
+      'cdp:2',
+      'goto:2:https://fixture.test/page:request=1,response=1',
+      'close:2:request=0,response=0',
+      'cdp:3',
+      'goto:3:https://fixture.test/page:request=1,response=1',
+      'close:3:request=0,response=0',
+    ]);
+  });
+
+  it('passes a TIMEOUT without an HTTP status when the load of a width gets no response before the stress deadline', async () => {
+    const events: string[] = [];
+    const observations: MainFrameLoadObservation[] = [];
+    const diagnostics: NavigationDiagnostics[] = [];
+
+    const result = await collectStressLayout(
+      eventEmittingSessionFactory([{ kind: 'NO_RESPONSE' }], events),
+      'https://fixture.test/page',
+      [320],
+      {
+        deadlineAtMs: Date.now() + 50,
+        beforeNavigation: NO_PACING_WAIT,
+        afterNavigation: (observation, navigationDiagnostics) => {
+          observations.push(observation);
+          diagnostics.push(navigationDiagnostics);
+        },
+      },
+    );
+
+    expect(observations).toEqual([{ navigationOutcome: 'TIMEOUT', httpStatus: null, failureDetail: null }]);
+    // D3: 期限切れの幅でも、観察の結果（偽の page では `NOT_OBSERVED`）が渡る。
+    expect(diagnostics).toEqual([NOT_OBSERVED_IN_FAKE_PAGE]);
+    expect(result[0]).toMatchObject({ width: 320, status: 'FAILED', stage: 'NAVIGATION', reason: 'DEADLINE_EXCEEDED' });
+    expect(events).toEqual([
+      'cdp:1',
+      'goto:1:https://fixture.test/page:request=1,response=1',
+      'close:1:request=0,response=0',
+    ]);
+  });
+
+  // D3R の Minor-1（診断の記録の設計書 2.2「長く待たない」）: 観察の開始は、幅の読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方
+  // までしか待たない（Passive の観察と同じ）。読み込みの期限は変えない（観察を始められなくても、読み込みは期限まで行う）。
+  describe('the deadline of the start of the navigation diagnostics (D3R Minor-1)', () => {
+    /** 注入する、観察の開始を待つ上限（ms）。 */
+    const SHORT_SESSION_OPEN_TIMEOUT_MS = 50;
+    /** 幅の読み込みの期限（ms）。観察の開始がこの期限まで待ってしまう場合に、それと分かるよう、戻るまでの上限より十分に長くする。 */
+    const LONG_STRESS_DEADLINE_MS = 3_000;
+    /** 観察の開始の期限を過ぎてから戻るまでの余裕を含めた、戻るまでの上限（ms）。 */
+    const RETURN_LIMIT_MS = 1_000;
+
+    it('gives up starting the observation sessionOpenTimeoutMs after now, and loads the width as without it', async () => {
+      const events: string[] = [];
+      const observations: MainFrameLoadObservation[] = [];
+      const diagnostics: NavigationDiagnostics[] = [];
+      const startedAtMs = Date.now();
+
+      const result = await collectStressLayout(
+        eventEmittingSessionFactory([{ kind: 'ANSWER', status: FAKE_STATUS_OK }], events, 'NEVER_OPENS'),
+        'https://fixture.test/page',
+        [320],
+        {
+          deadlineAtMs: startedAtMs + LONG_STRESS_DEADLINE_MS,
+          beforeNavigation: NO_PACING_WAIT,
+          sessionOpenTimeoutMs: SHORT_SESSION_OPEN_TIMEOUT_MS,
+          afterNavigation: (observation, navigationDiagnostics) => {
+            observations.push(observation);
+            diagnostics.push(navigationDiagnostics);
+          },
+        },
+      );
+      const elapsedMs = Date.now() - startedAtMs;
+
+      expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS);
+      expect(elapsedMs).toBeLessThan(RETURN_LIMIT_MS);
+      expect(diagnostics).toEqual([{ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE }]);
+      // 読み込みと、幅の結果は、観察を始められなくても今までどおりである。
+      expect(observations).toEqual([{ navigationOutcome: 'OK', httpStatus: FAKE_STATUS_OK, failureDetail: null }]);
+      expect(result.map((entry) => [entry.width, entry.status])).toEqual([[320, 'COMPLETE']]);
+      expect(events).toEqual([
+        'cdp:1',
+        'goto:1:https://fixture.test/page:request=1,response=1',
+        'close:1:request=0,response=0',
+      ]);
+    });
+
+    it('rejects a sessionOpenTimeoutMs that is not a positive integer before creating a session', async () => {
+      let creations = 0;
+      const factory: PassiveStressSessionFactory = async () => {
+        creations += 1;
+        throw new Error('must not create');
+      };
+
+      await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
+        ...unpacedStressOptions([320]),
+        sessionOpenTimeoutMs: 0,
+        afterNavigation: () => undefined,
+      })).rejects.toThrow(RangeError);
+      expect(creations).toBe(0);
+    });
+  });
+
+  it('does not call afterNavigation for widths that could not start before the stress deadline', async () => {
+    let creations = 0;
+    let calls = 0;
+    const factory: PassiveStressSessionFactory = async () => {
+      creations += 1;
+      throw new Error('must not create');
+    };
+
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390], {
+      deadlineAtMs: Date.now() - 1,
+      beforeNavigation: NO_PACING_WAIT,
+      afterNavigation: () => {
+        calls += 1;
+      },
+    });
+
+    expect(result.map((entry) => entry.status === 'FAILED' ? entry.stage : entry.status)).toEqual(['NOT_STARTED', 'NOT_STARTED']);
+    expect(creations).toBe(0);
+    expect(calls).toBe(0);
+  });
+
+  it('works as before without afterNavigation, without listening to the events of the page nor observing its requests', async () => {
+    // 受け口を省略した呼び出し（既存の呼び出し）の振る舞いは変えない。事象の受け口も付けず、ページ本体の要求の観察（CDP の session）も
+    // 始めない（D3。事象の受け口も Context も持たない偽の page でも動く）。
+    const events: string[] = [];
+    const factory = sessionFactory(events);
+    const listening: PassiveStressSessionFactory = async (viewport) => {
+      const session = await factory(viewport);
+      return {
+        ...session,
+        page: Object.assign(session.page, {
+          on: () => {
+            throw new Error('must not listen to the page events');
+          },
+          context: () => {
+            throw new Error('must not open a CDP session');
+          },
+        }),
+      };
+    };
+
+    const result = await collectStressLayout(listening, 'https://fixture.test/page', [390, 320], unpacedStressOptions([390, 320]));
+
+    expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
+    expect(events.filter((event) => event.startsWith('goto:'))).toHaveLength(2);
+  });
+
+  it('rejects an afterNavigation that is not a function before creating a session', async () => {
+    let creations = 0;
+    const factory: PassiveStressSessionFactory = async () => {
+      creations += 1;
+      throw new Error('must not create');
+    };
+
+    await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
+      ...unpacedStressOptions([320]),
+      afterNavigation: 'observe' as unknown as (observation: MainFrameLoadObservation) => void,
+    })).rejects.toThrow('afterNavigation');
     expect(creations).toBe(0);
   });
 });

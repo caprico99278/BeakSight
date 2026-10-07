@@ -60,6 +60,7 @@
               "STOPPED_BY_RUNTIME_LIMIT",
               "STOPPED_BY_SIGNAL",
               "STOPPED_BY_SAFETY_VIOLATION",
+              "STOPPED_BY_SITE_UNAVAILABLE",
               "INTERRUPTED_ABNORMALLY"
             ]
           }
@@ -333,7 +334,8 @@
             "PAGE_CRASHED",
             "SAFETY_VIOLATION_ABORT",
             "CHECKPOINT_WRITE_FAILED",
-            "RUN_INTERRUPTED"
+            "RUN_INTERRUPTED",
+            "SITE_UNAVAILABLE"
           ]
         },
         "detail": { "type": ["string", "null"] }

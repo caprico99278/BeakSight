@@ -492,3 +492,52 @@
 - 振る舞いの違い: なし（どちらも、保存の実効の設定の `maxDepth`・`allowedQueryParameters` と、`RESUME_REQUEUE_SKIP_REASON_CODES` を使う）。
 - 方針: 保存から採番器と巡回の記録を作り直す関数を `run-checkpoint.ts` に置き、Run Coordinator と整合の確かめの両方がそれを使う。
 - 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-041 閉じたポートの origin を作るテストの補助が2つのテストにある（2026-10-05 SU1b の報告で登録）
+
+- 場所: `tests/integration/page-navigation.test.ts` と `tests/integration/passive-session-close.test.ts` の `unusedLoopbackOrigin`。SU1b の `tests/integration/main-frame-load.test.ts` は、3つ目を作らず、テストのサーバを起動してすぐ閉じる形で、閉じたポートを作った。
+- 振る舞いの違い: 未確認（同じ目的の補助）。
+- 方針: `tests/helpers/` に1つ置き、3つのテストがそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-042 safety が、HTTP の status の範囲を audit から import している（2026-10-05 DEF-029 の報告で登録）
+
+- 場所: `src/safety/passive-request-guard.ts` が、`src/audit/rule-helpers.ts` の `ERROR_HTTP_STATUS_RANGE` と `isHttpStatusInRange` を import する（DEF-029。safety から audit への import は、これが初めて）。
+- 問題: HTTP の status の範囲は、Rule だけの概念ではなく、safety と audit の両方が使う。下の層（safety）が上の層（audit）に頼る形になっている。循環はない。
+- 方針: status の範囲の定数と判定を `src/core/` に移し、audit と safety の両方がそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-043 接続を記録して閉じるときに切る、テストの中の 127.0.0.1 のサーバが、3つのテストにある（2026-10-05 SU2a の報告で登録）
+
+- 場所: `tests/integration/main-frame-load.test.ts`、`tests/integration/page-navigation.test.ts`、`tests/integration/page-auditor-site-unavailability.test.ts`（DEF-029、DEF-027 の新しいテストにも、似た形があるかもしれない）。
+- 振る舞いの違い: 未確認（同じ目的の補助）。
+- 方針: `tests/helpers/` に1つ置く（応答しない、ヘッダの後に止める、503 などの場面を選べる形）。CC-041 と合わせて行う。
+- 追記（2026-10-06 PC1 の報告）: `tests/integration/resource-delivery.test.ts` の、Range に 206 で答えるサーバ。`tests/component/context-factory.test.ts` の `startBodyServer`、`tests/integration/load-meter.test.ts` の `startCacheableServer` も似た形。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-044 Guard のテストの偽の Context と session が、2つのテストにある（2026-10-05 DEF-027-fix の報告で登録）
+
+- 場所: `tests/integration/passive-request-guard.test.ts` の `createGuardHarness`（export されていない）と、`tests/integration/guard-external-cancel.test.ts` の偽の Context と session。
+- 振る舞いの違い: 未確認（同じ目的の補助）。
+- 方針: `tests/helpers/` に1つ置き、両方のテストがそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-045 `page.goto` の結果を読み込みの終わり方（`MainFrameLoadSettlement`）に変える数行が、3か所にある（2026-10-05 SU3b の報告で登録）
+
+- 場所: `src/orchestration/page-navigation.ts` の `settleNavigation`（公開していない）、`src/interaction/isolated-auditor.ts` の `loadInteractionTarget` の中、`src/crawl/site-metadata.ts` の `fetchMetadata` の中。
+- 振る舞いの違い: なし（応答は `FULFILLED`、例外は `REJECTED`）。
+- 方針: `src/browser/main-frame-load.ts` に、`goto` を包んで観測まで作る補助を1つ置き、3か所がそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-046 ms と秒の倍率の定数が3か所にある（2026-10-06 D1 の報告で登録）
+
+- 場所: `src/orchestration/run-checkpoint.ts`、`src/presentation/format.ts`、`src/browser/navigation-diagnostics.ts` の `MILLISECONDS_PER_SECOND`。
+- 振る舞いの違い: なし（どれも 1000）。
+- 方針: `src/core/` に1つ置き、3か所がそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-047 「読み込みの期限と、今から timeout 後の早い方」の計算が 3 か所にある（2026-10-07 D3-fix-round-1 の報告で登録）
+
+- 場所: `src/orchestration/passive-session-open.ts`（`passiveSessionOpenDeadlineAtMs`）、`src/interaction/isolated-auditor.ts`（session の作成と観察の開始）、`src/evidence/layout-collector.ts`（観察の開始）。
+- 方針: `src/core/deadline.ts` に小さな補助を置き、3 か所がそれを使う（evidence と interaction は orchestration を import できないため）。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。

@@ -70,7 +70,7 @@
 2. **読み込み直しでは、取ったことのあるものを取り直さない。** 主の読み込み（Passive の Desktop と Mobile）で取った画像、スタイルシート、スクリプト、フォントを、Run 全体のキャッシュに入れる。読み込み直しの Context（幅の走査と Interaction）では、キャッシュにあるものはキャッシュから返し、ネットワークに送らない。
 3. **読み込み直しの Context からは、外部のサービスに要求を送らない。** 幅の走査と Interaction の Context では、許可 Origin の外への要求（文書の読み込みを除く）は、キャッシュになければ送らない。
 4. **1つのページの読み込み直しの回数に上限を置く。** Interaction で監査する候補の数に、1ページあたりの上限（`crawl.maxInteractionsPerPage`）を置く。上限を超えた候補は監査せず、理由付きで PARTIAL にする。
-5. **主の読み込みは、ふつうのブラウザと同じにする。** Passive の Desktop と Mobile の読み込みは、利用者が初めてページを開いたときと同じく、すべてネットワークから取る（performance と network の Evidence を正しく集めるため）。1回の読み込みの中の要求は遅らせない。
+5. **主の読み込みは、ふつうのブラウザと同じにする。** Passive の Desktop と Mobile の読み込みは、利用者が初めてページを開いたときと同じく、すべてネットワークから取る（performance と network の Evidence を正しく集めるため）。1回の読み込みの中の要求は遅らせない。 （2026-10-06 改訂: 4.10 を見よ）: Passive も Run 全体のキャッシュを使い、画像・動画・スクリプト・フォントは同じ起動の中で最初の1回だけ取る（DEF-031。ユーザーの判断）。文書は毎回取る。
 6. **待ち時間は、期限を消費しない。** 間隔のために待った時間で、ページの監査が期限切れにならないようにする（4.4）。実行時間の上限（`crawl.maxRuntimeMs`）には、待ち時間も含める。
 7. **実績を記録する。** 読み込みの回数、待った時間の合計、許可 Origin とそれ以外への要求の数と1分あたりの最大、キャッシュから返した数、送らなかった数を、`run.json` に記録し、レポートと CLI に示す。
 
@@ -89,7 +89,7 @@
 | --- | --- | --- |
 | ページの読み込みの間隔 | 待ちなし | 5秒以上（1分に12回まで） |
 | 1ページの読み込みの回数 | 2 + 3 + 候補の数（最大100） | 最大25（Passive 2、幅の走査 3、Interaction 20） |
-| ページ全体を取る読み込み | 上と同じ（すべて） | 2（Passive の Desktop と Mobile） |
+| ページ全体を取る読み込み | 上と同じ（すべて） | 2（Passive の Desktop と Mobile）。2026-10-06 改訂（4.10）: Passive も、キャッシュにあるものはキャッシュから返す |
 | 読み込み直し（幅の走査、Interaction）で取るもの | ページ全体（画像なども、外部のサービスも） | 文書と、キャッシュにないもの（許可 Origin の中だけ） |
 | 1ページの監査の時間 | 約40秒 | 候補が20件なら、少なくとも約125秒 |
 | 1時間に監査できるページ | 約90（推定） | 候補が20件のページばかりなら、約29以下（推定） |
@@ -236,9 +236,9 @@ export function createNavigationPacer(options: {
 - Run Coordinator が Run の初めに1つだけ作り、`BrowserContextFactory` に渡す。Run の終わりに捨てる（ファイルには書かない。再開のときは空から始める）。
 - 入れるもの（すべての Context の `response` の事象を、factory が渡す。観察だけ）:
   - 要求の method が GET。
-  - 要求の種類（`request.resourceType()`）が `stylesheet`、`script`、`image`、`font` のどれか。文書（`document`）、XHR、fetch、media などは入れない。
+  - 要求の種類（`request.resourceType()`）が `stylesheet`、`script`、`image`、`font` のどれか。文書（`document`）、XHR、fetch、media などは入れない。 （2026-10-06 改訂: 4.10 を見よ）: `media` を加えた（`bytes=0-` に全体を返した 206 も、200 として入れる）。
   - 応答の status が 200。要求に `Range` の header がない。応答の `cache-control` に `no-store` がない。
-  - 本文（`response.body()`）が 5MB 以下。
+  - 本文（`response.body()`）が 5MB 以下。 （2026-10-06 改訂: 4.10 を見よ）: 1件の上限を 16 MiB にした。
   - キャッシュから返した応答（4.7）は、入れ直さない。
 - 持つもの: URL（完全一致の鍵）、status、header（`content-encoding`、`content-length`、`transfer-encoding`、`set-cookie` を除く。本文は展開済みのため）、本文。
 - 上限: 合計 256MB。超えたら、最も前に使われたものから捨てる（LRU）。上限の値はコードの定数とする。
@@ -251,7 +251,7 @@ export function createNavigationPacer(options: {
 
 | 役割 | 使う Context | 届け方 |
 | --- | --- | --- |
-| 主（`PRIMARY`） | Passive の Desktop と Mobile、robots.txt と sitemap.xml | 今のまま（すべてネットワーク）。キャッシュに入れるだけ |
+| 主（`PRIMARY`） | Passive の Desktop と Mobile、robots.txt と sitemap.xml | 2026-10-06 改訂（4.10）: 文書でない GET で、キャッシュにあればキャッシュから返す。なければネットワーク（`WITHHOLD` は選ばない）。応答はキャッシュに入れる |
 | 読み込み直し（`REVISIT`） | 幅の走査、Interaction | 下の表のとおり |
 
 - 判断の種類の名前は `NETWORK`、`FROM_RUN_CACHE`、`WITHHOLD` とする。`request-policy.ts` の ALLOW の `delivery`（リダイレクトの確かめ方）と混同しないよう、型の名前には `ResourceDelivery` を付ける。
@@ -313,6 +313,47 @@ export function createNavigationPacer(options: {
   - 起動の引数で止める方法は見つからなかった（Chromium 151。調べた候補は DEF-024 の報告）。CDP の `Network.setBlockedURLs` で止める案は、安全の境界のコードを変える割に、得られるのはまれなすり抜けを防ぐことだけなので、採らない。
   - 設計者の判断: 残る制約として受け入れ、README に書く。fixture の全体の監査のテストは、ブラウザ自身の `/favicon.ico` の GET だけを、「fixture のサイトの外」の確かめから除く（GET と HEAD だけであることの確かめは残す。`tests/integration/site-metadata.test.ts` と同じ扱い）。
 
+### 4.10 Passive の読み込みでも Run 全体のキャッシュを使う（DEF-031。2026-10-06）
+
+#### 4.10.1 起きたこと
+
+- Task 21 の3回目の Run（2026-10-06）で、Passive の読み込み（`PRIMARY`）が、ページごと・ビューポートごとに、同じ画像・動画・スクリプト・フォントをネットワークから取り直していた。保存の31ページ分で約 1.5 GB。同じ URL を1回だけ取れば約 264 MB（約1/6）。大半は、対象のサイトが画像と動画を置く外部のストレージ（許可 Origin の外）からの約 1.1 GB で、運営者の転送量の上限や課金にかかわるおそれがある。
+- ふつうの利用者は、同じ画像などをブラウザのキャッシュで使い回すので、同じページを見て回っても、この数分の1しか取らない。
+
+#### 4.10.2 ユーザーの判断（2026-10-06）
+
+- 「Run の中で使い回す」: 画像、動画、スクリプト、フォントは、Run の中で最初の1回だけ取る（ふつうの利用者がサイトを見て回るのと同じ）。2ページ目以降の読み込みの速さの測定は、キャッシュがある状態の値になる。
+
+#### 4.10.3 決めたこと
+
+- **Passive（`PRIMARY`）も、届け方の部品に尋ねる**: factory は、`PRIMARY` の Context の Guard にも、届け方の部品を渡す（役割は `PRIMARY`）。`decideResourceDelivery` は、`PRIMARY` では次のように決める。
+  - ナビゲーションの要求（文書）: `NETWORK`（今のまま。サイトの今の状態を見る）。
+  - GET で、キャッシュの種類で、キャッシュにある: `FROM_RUN_CACHE`。
+  - それ以外: `NETWORK`。`PRIMARY` では `WITHHOLD` を選ばない（許可 Origin の外への、キャッシュにない要求も、ふつうの利用者の初めての読み込みと同じく送る）。
+  - `REVISIT` の決め方は変えない。
+- **動画と音声もキャッシュに入れる**: キャッシュの種類に `media` を加える。入れる条件は、今の条件（GET、`no-store` でない、本文が1件の上限以下、キャッシュから返したものでない）に加えて、次のどちらか。
+  - status が 200 で、要求に `Range` がない（今の条件と同じ）。
+  - status が 206 で、要求の `Range` がちょうど `bytes=0-`、応答の `Content-Range` が `bytes 0-(N-1)/N` で、本文の長さが N（ファイルの全体を受けた）。この場合は、status を 200 にし、`Content-Range` を除いて入れる。
+  - それ以外の 206（ファイルの一部）は入れない。`media` 以外の種類の 206 も入れない（今のまま）。
+- **動画をキャッシュから返すときは、全体を 200 で返す**: 要求に `Range` があっても、ファイルの全体を 200 で返す（HTTP では、サーバが `Range` を無視して全体を返してよい）。ブラウザは再生できる（途中への移動はできなくなるが、監査では使わない）。
+- **1件の上限を 5 MiB から 16 MiB にする**（8.4 MB の動画を入れるため）。合計の上限 256 MiB は変えない（LRU で、よく使うものが残る）。
+- **読み込みが成功して終わった応答だけを入れる**（2026-10-06 追補。独立レビュー PCR-DR の Important-1）: 本文が途中で切れた応答（`net::ERR_CONTENT_LENGTH_MISMATCH` など）も、Playwright の `response.body()` は途中までの本文で解決する。それを入れると、2ページ目以降の Passive に壊れた応答を返す。そのため、キャッシュに入れるのは、要求が成功して終わった（Playwright の `requestfinished`。`requestfailed` でない）応答だけにする（今の `REVISIT` にもかかわる、前からの隙間）。
+- **`media` で、`Range: bytes=0-` に 200 で全体を返した応答も入れる**（同じレビューの Minor-4）: サーバが Range を無視して全体を返した場合である。全体なので、そのまま 200 として入れる。
+- **Guard は変えない**: 届け方の部品に尋ねる場所、キャッシュから返す処理（`route.fulfill`）、`expectedRouteFailures` の登録は、`REVISIT` のために作った今の処理をそのまま使う。
+
+#### 4.10.4 安全の性質
+
+- `PRIMARY` で部品が選べるのは「今のままネットワーク」と「キャッシュから返す」の2つだけで、後者はネットワークに何も送らない。したがって、Passive の Context でネットワークに送る要求は、今の要求の部分集合になる。許可の判定、凍結、閉じる段階、違反の判定は変わらない（Guard のコードを変えない）。
+
+#### 4.10.5 代償と制約（README に書く）
+
+- 2ページ目以降（同じ起動の中）の Passive の読み込みの速さ（performance の Evidence）は、キャッシュがある状態の値になる。キャッシュは起動ごとに空から始まるので、起動の最初のページは、キャッシュがない状態の値になる。
+- 1つのページのデスクトップとモバイルも、キャッシュを共有する（モバイルは、デスクトップで取った画像などを使う）。
+- キャッシュから返した動画は、途中への移動ができない（200 で全体を返すため）。
+- キャッシュは URL だけで見分け、有効期限（`max-age`）を考えない（今の制約と同じ。1回の起動の間、同じ URL は同じ内容とみなす）。
+- キャッシュから返した応答は、network の Evidence で、ネットワークからの応答と見分けにくい（status、header（元の `date` を含む）、大きさの値が入る。違いは `timing` の `requestStart` などが -1 になることくらい）。Finding の判定は status と失敗だけを使うので、Finding は変わらない。Evidence の大きさを、転送量の根拠として読まない（2026-10-06 追補。同じレビューの Minor-1）。
+- Task 21 の3回目の Run は、31ページを今の決まり（キャッシュなし）で監査した。続きから再開すると、32ページ目以降は新しい決まりになる。1つの Run の中で、読み込みの速さの測定の意味が混ざることを、Task 21 の記録に残す。
+
 ## 5. SSOTと安全性への影響
 
 | 項目 | owner | この設計での扱い |
@@ -356,7 +397,7 @@ export function createNavigationPacer(options: {
 - キャッシュと届け方（単体と結合）:
   - 単体: 入れる条件（種類、status、`Range`、`no-store`、大きさ）、LRU の上限、header の除外。届け方の表の3つの場合。
   - 結合（fixture のサーバが受け取った要求を数える）: 主の読み込みで取った画像やスクリプトを、幅の走査と Interaction の Context では、サーバが再び受け取らない。許可 Origin の外（fixture の2つ目の Origin）の画像やスクリプトは、読み込み直しの Context からはサーバに届かない。文書の要求は、すべての読み込みで届く。
-  - 安全（結合）: 凍結の後の要求は、キャッシュにあっても、今のまま止められ、Safety の記録に残る。GET 以外の要求は、届け方の部品に渡らない。主の Context では、キャッシュから返さない（performance の Evidence が変わらない）。
+  - 安全（結合）: 凍結の後の要求は、キャッシュにあっても、今のまま止められ、Safety の記録に残る。GET 以外の要求は、届け方の部品に渡らない。主の Context では、キャッシュから返さない（performance の Evidence が変わらない）。 （2026-10-06 改訂: 4.10 を見よ）
   - Guard の既存のテストと、Safety Gate（S01〜S10）が、変更の後も PASS する。
 - 負荷の記録（結合）: fixture のページで、許可 Origin とそれ以外の要求の数が、サーバの受け取った数と一致する（または、ブラウザのキャッシュの分だけ多い）。キャッシュから返した数と、送らなかった数が正しい。`run.json` の `load` がスキーマに合う。状態の取り出しと作り直しで、同じ記録になる。
 - 表示（単体）: HTML、CLI、`summary.json` に、表示用モデルの同じ値が出る。UI Gate が PASS する。
@@ -416,3 +457,6 @@ export function createNavigationPacer(options: {
 | 2026-10-01 | RL の報告 | 4.5 に、数えない要求と間隔の対象外の読み込みの制約を加えた。Owner Matrix（実装タスク指示 第5章）、上位の設計書 24.1、共通部品台帳を更新した（Important-1） | なし |
 | 2026-10-02 | DEF-023（再開の機能の独立レビュー RR2 の指摘2） | 4.9 を加えた（ページの先読みを、CLI の Chromium の起動の引数で止める。確かめを結合テストとして残す） | CLI の Chromium の起動、README |
 | 2026-10-03 | DEF-024（Task 21 の前の全体の検証） | 4.9 に、ページのアイコンの扱い（既定の `/favicon.ico` は Playwright が止めるが、まれに届く。残る制約として受け入れる）を加えた | README、`fixture-full-crawl.test.ts` |
+| 2026-10-06 | DEF-031（Task 21 の3回目の Run で、Passive が同じ画像・動画を取り直し、外部のストレージから約 1.1 GB 取った）とユーザーの判断「Run の中で使い回す」 | 4.10 を加えた（Passive も Run 全体のキャッシュを使う。`media` を入れる。1件の上限 16 MiB。Guard は変えない） | `resource-delivery.ts`、`context-factory.ts`、README、Task 21 |
+| 2026-10-06 | PC1 の実装者の発見（4.10 と食い違う古い記述） | 3.1 の5、3.3 の表、4.6、4.7 の表、7章に、4.10 の改訂の注を加えた | なし（記述） |
+| 2026-10-06 | 独立レビュー PCR-DR（Important 1、Minor 4） | 4.10.3 に「読み込みが成功して終わった応答だけを入れる」と「`media` の `bytes=0-` に 200 で全体を返した応答も入れる」を加えた。4.10.5 に、キャッシュから返した応答の Evidence の見え方を加えた | `context-factory.ts`、`resource-delivery.ts`、README |

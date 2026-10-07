@@ -227,9 +227,16 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         tone: 'shield',
         description: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
       },
+      // SU1（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で止まった。core の一覧の並び（違反で止まった後）に合わせる。
+      STOPPED_BY_SITE_UNAVAILABLE: {
+        label: 'サイトの不調で停止',
+        order: 5,
+        tone: 'caution',
+        description: 'サイトが応答しない（時間切れ、接続の失敗、503 などの応答）ため、残りのページを監査せずに止めました。',
+      },
       INTERRUPTED_ABNORMALLY: {
         label: '途中で終了',
-        order: 5,
+        order: 6,
         tone: 'critical',
         description:
           'プロセスが途中で終わりました（強制終了、停電、端末の再起動、2回目の Ctrl+C など）。終わりの時刻は、最後に保存した時刻です。',

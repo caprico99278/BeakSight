@@ -1,4 +1,4 @@
-import type { Browser, BrowserContext, Page, Request, Response } from 'playwright';
+import type { Browser, BrowserContext, Page, Request } from 'playwright';
 import type { AuditConfig, Viewport } from '../config/types.js';
 import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import type { LoadMeter } from '../crawl/load-meter.js';
@@ -36,8 +36,9 @@ export interface BrowserContextFactoryOptions {
   readonly loadMeter?: LoadMeter | undefined;
   /**
    * Run 全体のリソースのキャッシュ（Run で1つ。Run Coordinator が作る。設計書 4.6）。渡すと、factory が作るすべての Context
-   * （役割によらない）の応答の事実を、キャッシュに渡す（入れるかどうかは、キャッシュが決める）。また、読み込み直しの Context
-   * （役割 `REVISIT`）の Guard に、届け方の部品を渡す（設計書 4.7）。省略すると、応答を受け取らず、届け方も変えない（今のまま）。
+   * （役割によらない）の、要求が成功して終わった（`requestfinished`）応答の事実を、キャッシュに渡す（入れるかどうかは、キャッシュが
+   * 決める。失敗した要求の応答は渡さない。設計書 4.10.3）。また、すべての Context の Guard に、その Context の役割の届け方の部品を
+   * 渡す（設計書 4.7。`PRIMARY` にも渡すのは DEF-031 から。設計書 4.10.3）。省略すると、応答を受け取らず、届け方も変えない（今のまま）。
    */
   readonly resourceCache?: ResourceCache | undefined;
 }
@@ -141,11 +142,13 @@ export class BrowserContextFactory {
 
   /**
    * Guard の付いた Passive Context を作る。`role` は Context の役割（サイトへの負荷の制御の設計書 4.7。既定は `PRIMARY`）。
-   * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml、PREFLIGHT、環境の記録。すべてネットワークから取る。
-   * - `REVISIT`: 幅の走査と Interaction。Run 全体のキャッシュがあれば、Guard に届け方の部品を渡す（キャッシュにあるものはキャッシュから
-   *   返し、許可 Origin の外へは、キャッシュになければ送らない）。キャッシュがなければ、`PRIMARY` と同じ（今のまま）。
-   * Run 全体のキャッシュがあれば、役割によらず、応答の事実をキャッシュに渡す。役割が閉じた一覧（`RESOURCE_DELIVERY_ROLES`）に
-   * なければ、何も作らずに `TypeError` を投げる。
+   * Run 全体のキャッシュがあれば、役割によらず、Guard に、その役割の届け方の部品を渡し、応答の事実をキャッシュに渡す。届け方は、
+   * 役割ごとに `decideResourceDelivery` が決める。
+   * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml、PREFLIGHT、環境の記録。キャッシュにあるものはキャッシュから
+   *   返し、キャッシュにないものは、許可 Origin の外でもネットワークから取る（DEF-031。設計書 4.10.3）。
+   * - `REVISIT`: 幅の走査と Interaction。キャッシュにあるものはキャッシュから返し、許可 Origin の外へは、キャッシュになければ送らない。
+   * キャッシュがなければ、どちらの役割でも、Guard に届け方の部品を渡さない（すべてネットワーク。今のまま）。役割が閉じた一覧
+   * （`RESOURCE_DELIVERY_ROLES`）になければ、何も作らずに `TypeError` を投げる。
    */
   async createPassiveContext(viewport: Viewport, role: ResourceDeliveryRole = 'PRIMARY'): Promise<BrowserContext> {
     if (!isResourceDeliveryRole(role)) {
@@ -169,14 +172,14 @@ export class BrowserContextFactory {
     });
     // 要求の終わりの事象は、Guard の取り付けより前（最初の要求より前）に、meter に渡し始める（サイトへの負荷の制御の設計書 4.5）。
     this.#observeRequestEnds(context);
-    // 応答の事実も、同じく最初の要求より前から、Run 全体のキャッシュに渡し始める（設計書 4.6）。
+    // 成功して終わった要求の応答の事実も、同じく最初の要求より前から、Run 全体のキャッシュに渡し始める（設計書 4.6、4.10.3）。
     this.#observeResponses(context);
 
     // Context と Ledger の対応は、構築に失敗しても消さない（`getSafetyLedger` で後から取り出せるようにする。設計書 4.3）。
     this.#contextLedgers.set(context, ledger);
     this.#activeContexts.add(context);
-    // 届け方の部品は、読み込み直しの Context（`REVISIT`）で、Run 全体のキャッシュがある場合だけ渡す（設計書 4.7）。
-    const resourceDelivery = role === 'REVISIT' ? this.#createResourceDelivery() : undefined;
+    // 届け方の部品は、Run 全体のキャッシュがある場合に、役割によらず渡す（設計書 4.7、4.10.3）。
+    const resourceDelivery = this.#createResourceDelivery(role);
     const guardOptions: PassiveRequestGuardOptions = Object.freeze(resourceDelivery === undefined ? {} : { resourceDelivery });
     try {
       await installPassiveRequestGuard(context, ledger, this.#allowedOrigins, guardOptions);
@@ -303,12 +306,19 @@ export class BrowserContextFactory {
   }
 
   /**
-   * `context` の応答の事象（`response`）で、要求と応答の事実を Run 全体のキャッシュに渡す（サイトへの負荷の制御の設計書 4.6）。
-   * 観察だけで、Guard の判定には関わらず、入れるかどうかもキャッシュが決める。キャッシュがなければ、何もしない。
+   * `context` の、要求が成功して終わった事象（`requestfinished`）で、要求と応答の事実を Run 全体のキャッシュに渡す（サイトへの負荷の
+   * 制御の設計書 4.6）。観察だけで、Guard の判定には関わらず、入れるかどうかもキャッシュが決める。キャッシュがなければ、何もしない。
+   * - 失敗した要求（`requestfailed`）の応答は、渡さない（設計書 4.10.3 の 2026-10-06 の追補。PCR-DR の Important-1）。本文の途中で
+   *   切れた応答（`net::ERR_CONTENT_LENGTH_MISMATCH` など）でも、Playwright の `response.body()` は途中までの本文で解決するので、
+   *   応答の事象（`response`）で入れると、壊れた本文をキャッシュから返してしまうためである。読み込みの途中で Context を閉じた要求も、
+   *   成功して終わらないので渡さない。
    * - 本文を除いた事実で、キャッシュに入れる見込みがあるか（`ResourceCache.mayStore`）を先に尋ね、見込みがある場合だけ、本文を
    *   `response.body()`（非同期）で取る（不要な読み込みを避ける。L5b-fix-round-1）。文書、XHR、fetch、リダイレクトの応答、
    *   キャッシュから返した要求（印の付いた要求）、`content-length` でそのキャッシュの1件の上限を超えると分かる応答は、本文を取らない。
-   * - 本文を取れなかった場合（閉じた Context など）は、入れない。例外は外に出さず、未処理の拒否にもしない。
+   * - 応答は、待たずに返す `request.existingResponse()` で取り、本文の取得（`response.body()`）は、事象を受けた同じ処理の中で
+   *   （`await` の前に）始める。`await request.response()` の後に始めると、読み込みの直後に page を閉じた場合に、閉じる処理が先に
+   *   Playwright に届き、本文を取れなくなる（成功した応答がキャッシュに入らない）ためである（PC-D-fix-round-1 の実験で確かめた）。
+   * - 応答や本文を取れなかった場合（閉じた Context など）は、入れない。例外は外に出さず、未処理の拒否にもしない。
    * Playwright は、閉じた Context の事象を出さないので、閉じた後に listener を外す必要はない。
    */
   #observeResponses(context: BrowserContext): void {
@@ -317,9 +327,13 @@ export class BrowserContextFactory {
       return;
     }
     const servedFromRunCache = this.#servedFromRunCache;
-    const store = async (response: Response): Promise<void> => {
+    const store = async (request: Request): Promise<void> => {
       try {
-        const request = response.request();
+        // 要求が成功して終わった時点では、応答を受けている（受けていなければ、入れない）。
+        const response = request.existingResponse();
+        if (response === null) {
+          return;
+        }
         const fact: ResourceCacheResponseFact = {
           method: request.method(),
           resourceType: request.resourceType(),
@@ -335,20 +349,21 @@ export class BrowserContextFactory {
         const body = await response.body();
         cache.store({ ...fact, body, servedFromRunCache: servedFromRunCache.has(request) });
       } catch {
-        // 本文を取れなかった応答は、入れない（観察の失敗は、監査の失敗ではない）。
+        // 応答や本文を取れなかった要求は、入れない（観察の失敗は、監査の失敗ではない）。
       }
     };
-    context.on('response', (response: Response): void => {
-      void store(response);
+    context.on('requestfinished', (request: Request): void => {
+      void store(request);
     });
   }
 
   /**
-   * 読み込み直しの Context（`REVISIT`）の Guard に渡す、届け方の部品を作る（サイトへの負荷の制御の設計書 4.7）。Run 全体のキャッシュが
-   * なければ作らない（`undefined`。Guard は今のまま）。判断は `decideResourceDelivery` だけが行い、許可 Origin は Guard に渡すものと
-   * 同じ値を使う。どの口も例外を投げない（meter の例外も、ここで封じ込める）。
+   * 役割 `role` の Context の Guard に渡す、届け方の部品を作る（サイトへの負荷の制御の設計書 4.7、4.10.3）。Run 全体のキャッシュが
+   * なければ作らない（`undefined`。Guard は今のまま）。判断は `decideResourceDelivery` だけが `role` で行い、許可 Origin は Guard に
+   * 渡すものと同じ値を使う。キャッシュから返した要求の印と、負荷の記録は、役割によらず同じに扱う。どの口も例外を投げない
+   * （meter の例外も、ここで封じ込める）。
    */
-  #createResourceDelivery(): GuardResourceDelivery | undefined {
+  #createResourceDelivery(role: ResourceDeliveryRole): GuardResourceDelivery | undefined {
     const cache = this.#resourceCache;
     if (cache === null) {
       return undefined;
@@ -358,7 +373,7 @@ export class BrowserContextFactory {
     const loadMeter = this.#loadMeter;
     return Object.freeze({
       decide: (request: ResourceDeliveryRequestFacts) =>
-        decideResourceDelivery({ role: 'REVISIT', cache, allowedOrigins, request }),
+        decideResourceDelivery({ role, cache, allowedOrigins, request }),
       beforeServeFromRunCache: (request: Request): void => {
         servedFromRunCache.add(request);
         try {

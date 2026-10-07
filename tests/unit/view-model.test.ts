@@ -2,6 +2,7 @@
 // 表示用モデルは、数え、並べ、対応づけるだけで、判定しない。Finding の件数と一覧の出どころは `AuditRunResult.findings` だけである。
 import { describe, expect, it, vi } from 'vitest';
 import {
+  RUN_EXECUTION_END_REASONS,
   SEVERITIES,
   VIEWPORT_PROFILES,
   type AuditRunResult,
@@ -9,6 +10,8 @@ import {
   type EvidenceRecord,
   type FindingId,
   type PageId,
+  type RunExecution,
+  type RunExecutionEndReason,
   type RunSummary,
 } from '../../src/core/contracts.js';
 import type { InteractionEvidence } from '../../src/core/evidence-types.js';
@@ -237,6 +240,53 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
     expect(result.run.executions).toHaveLength(1);
     const model = buildReportViewModel(result);
     expect(model.summary.executions).toEqual({ count: 1, resumeCount: 0, items: [...result.run.executions] });
+  });
+});
+
+// SU4（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で止めたこと（CLI の結果の1行）を出すかは、実行の記録の最後の
+// 実行の終わり方が `STOPPED_BY_SITE_UNAVAILABLE` かで決める（Run の理由ではなく、終わり方で決める）。決めるのは表示用モデルの
+// 組み立ての1か所だけである。`detail` は、Run の理由のうち、コード `SITE_UNAVAILABLE` の最初のものの `detail`（なければ `null`）。
+describe('buildReportViewModel: the stop by site unavailability (site unavailability stop design 3.4)', () => {
+  /** `day` 日目の、終わり方が `endReason` の実行の記録。 */
+  const execution = (endReason: RunExecutionEndReason, day: number): RunExecution => ({
+    startedAt: `2026-10-0${day}T00:00:00.000Z`,
+    finishedAt: `2026-10-0${day}T00:10:00.000Z`,
+    endReason,
+  });
+
+  it('has the detail of the first SITE_UNAVAILABLE Run reason when the last execution stopped by site unavailability', () => {
+    const model = buildReportViewModel(auditRun({
+      executions: [execution('STOPPED_BY_RUNTIME_LIMIT', 1), execution('STOPPED_BY_SITE_UNAVAILABLE', 2)],
+      incompleteReasons: [
+        { code: 'MAX_PAGES_REACHED', detail: null },
+        { code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' },
+        { code: 'SITE_UNAVAILABLE', detail: 'mobile:passive:HTTP 503' },
+      ],
+    }));
+    expect(model.summary.siteUnavailableStop).toEqual({ detail: 'desktop:passive:TIMEOUT' });
+    expect(Object.isFrozen(model.summary.siteUnavailableStop)).toBe(true);
+  });
+
+  it('has a null detail when the last execution stopped by site unavailability but the Run has no SITE_UNAVAILABLE reason', () => {
+    const model = buildReportViewModel(auditRun({ executions: [execution('STOPPED_BY_SITE_UNAVAILABLE', 1)] }));
+    expect(model.summary.incompleteReasons.map(({ code }) => code)).toEqual(['MAX_PAGES_REACHED']);
+    expect(model.summary.siteUnavailableStop).toEqual({ detail: null });
+  });
+
+  it('is null when the last execution ended in any other way, even after an execution that stopped by site unavailability', () => {
+    const otherEndReasons = RUN_EXECUTION_END_REASONS.filter((endReason) => endReason !== 'STOPPED_BY_SITE_UNAVAILABLE');
+    expect(otherEndReasons).toHaveLength(RUN_EXECUTION_END_REASONS.length - 1);
+    for (const endReason of otherEndReasons) {
+      const model = buildReportViewModel(auditRun({
+        executions: [execution('STOPPED_BY_SITE_UNAVAILABLE', 1), execution(endReason, 2)],
+        incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' }],
+      }));
+      expect(model.summary.siteUnavailableStop, endReason).toBeNull();
+    }
+  });
+
+  it('is null for a Run that was not interrupted', () => {
+    expect(buildReportViewModel(auditRun()).summary.siteUnavailableStop).toBeNull();
   });
 });
 
