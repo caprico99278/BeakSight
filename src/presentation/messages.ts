@@ -86,6 +86,7 @@ export const INCOMPLETE_REASON_DESCRIPTIONS = deepFreeze({
   SAFETY_VIOLATION_ABORT: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
   CHECKPOINT_WRITE_FAILED: '再開のための途中の保存を書けなかったため、それより後の監査を始めませんでした。',
   RUN_INTERRUPTED: '止める指示（Ctrl+C など）を受けたため、それより後の監査を始めませんでした。',
+  SITE_UNAVAILABLE: 'サイトが応答しないため、それより後の監査を始めませんでした。',
 } as const satisfies Record<IncompleteReasonCode, string>);
 
 /** 未完了の理由のコードの、日本語の説明。 */
@@ -628,6 +629,31 @@ export const checkpointStoreFailedText = (runId: string): string => `再開の�
 /** 終わった Run の、使わない再開のための保存（ページの保存、`state.prev.json`）を消せなかった（警告。終了コードは変えない）。 */
 export const finishedCheckpointCleanupFailedText = (path: string): string =>
   `終わった Run の再開のための保存の一部を消せませんでした（${path}）。手で消しても問題ありません。`;
+
+/**
+ * サイトの不調で止めた Run の、結果の1行（サイトが応答しないときに Run を止める設計書 3.4。SU4）。`detail` は、最初に検知した失敗の
+ * 技術的な詳細（Run の理由 `SITE_UNAVAILABLE` の `detail`。例: `desktop:passive:TIMEOUT`）で、括弧の中にそのまま示す。`null` なら、
+ * 括弧を出さない。出すかどうかは、表示用モデル（`RunSummaryView.siteUnavailableStop`）が決める。
+ */
+export const siteUnavailableStopText = (detail: string | null): string =>
+  `サイトが応答しないため、監査を止めました${detail === null ? '' : `（${detail}）`}。サイトが戻ってから、同じコマンドで続きから再開してください。`;
+
+/**
+ * サイトの不調でページを捨てた後、待ってから同じページを確かめ直すことを知らせる、実行中の1行（サイトが応答しないときに Run を止める設計書
+ * 3.5.4、3.6.2。SU5、SU6）。`url` はそのページの URL、`waitText` は待つ時間の文言（`formatDuration` の結果。例: `60秒`。値は Run Coordinator
+ * の知らせの事実から、CLI が書式にかける）、`attempt` は何回目の確かめ直しか（1 から）、`maxAttempts` は確かめ直しの最大の回数。どれも、
+ * そのまま示す。
+ */
+export const siteUnavailableRecheckText = (url: string, waitText: string, attempt: number, maxAttempts: number): string =>
+  `サイトが応答しないため、${waitText}待ってから同じページを確かめ直します（${String(attempt)}/${String(maxAttempts)} 回目。${url}）。`;
+
+/**
+ * 確かめ直しで応答が戻った後、ページの読み込みの間隔を延ばして続けることを知らせる、実行中の1行（サイトが応答しないときに Run を止める設計書
+ * 3.6.2。SU6）。`intervalText` は新しい間隔の文言（`formatDuration` の結果。例: `10秒`。値は Run Coordinator の知らせの事実から、CLI が
+ * 書式にかける）。そのまま示す。
+ */
+export const siteUnavailableSlowdownText = (intervalText: string): string =>
+  `確かめ直しで応答が戻ったので、ページの読み込みの間隔を ${intervalText} に延ばして続けます。`;
 
 /** CLI の1つの項目の行（例: `出力先: C:\artifacts\RUN-…`）。 */
 export const cliFieldText = (label: string, value: string): string => `${label}: ${value}`;

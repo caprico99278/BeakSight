@@ -31,6 +31,7 @@ import {
   finishedCheckpointCleanupFailedLines,
   joinLines,
   resumingRunLines,
+  runNoticeLines,
   runProgressLines,
   runSummaryLines,
   unreadableCheckpointLines,
@@ -46,17 +47,21 @@ import {
   checkpointPageArtifactRelativePath,
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
-import type { RunLoad, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
+import type { AuditRunResult, RunExecutionEndReason, RunLoad, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
 import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
-import type { RunCoordinatorCheckpointConclusion } from '../../src/orchestration/run-coordinator.js';
+import {
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
+  type RunCoordinatorCheckpointConclusion,
+  type RunNotice,
+} from '../../src/orchestration/run-coordinator.js';
 import {
   RUN_STATUS_CATALOG,
   SEVERITY_GROUP_CATALOG,
   SEVERITY_GROUPS,
   sortByDisplayOrder,
 } from '../../src/presentation/catalog.js';
-import { formatCount, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../../src/presentation/format.js';
+import { formatCount, formatDuration, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../../src/presentation/format.js';
 import {
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
@@ -74,6 +79,9 @@ import {
   listText,
   progressItemsText,
   resumingRunText,
+  siteUnavailableRecheckText,
+  siteUnavailableSlowdownText,
+  siteUnavailableStopText,
   unreadableCheckpointText,
 } from '../../src/presentation/messages.js';
 import { ArtifactWriter } from '../../src/report/artifact-writer.js';
@@ -1208,6 +1216,80 @@ describe('CLI run: the executions line of the result', () => {
   });
 });
 
+// SU4（サイトが応答しないときに Run を止める設計書 3.4）: 最後の実行がサイトの不調で止まった Run では、`run` の結果の行に、止めたことと
+// 再開のしかたの1行を加える。置く位置は、実行の記録の行の次、未完了の理由の行の前。出すかどうかと詳細は、表示用モデルの
+// `summary.siteUnavailableStop` から取る（CLI の側で判断し直さない）。文言は `messages.ts` の `siteUnavailableStopText`。
+describe('CLI run: the line of the stop by site unavailability', () => {
+  const DETAIL = 'desktop:passive:TIMEOUT';
+  /**
+   * 最後の実行の終わり方が `endReason` で、Run の理由に `SITE_UNAVAILABLE`（`detail` は `detail`。`null` なら理由を加えない）を加えた Run。
+   * 見本の Run には、ほかの未完了の理由がある（未完了の理由の行が出る）。
+   */
+  const stoppedRun = (endReason: RunExecutionEndReason, detail: string | null): AuditRunResult => {
+    const result = edgeCaseAuditRun();
+    return {
+      ...result,
+      run: {
+        ...result.run,
+        executions: [
+          { startedAt: '2026-10-04T00:00:00.000Z', finishedAt: '2026-10-04T00:10:00.000Z', endReason: 'STOPPED_BY_SITE_UNAVAILABLE' },
+          { startedAt: '2026-10-05T00:00:00.000Z', finishedAt: '2026-10-05T00:10:00.000Z', endReason },
+        ],
+        incompleteReasons: [...result.run.incompleteReasons, ...(detail === null ? [] : [{ code: 'SITE_UNAVAILABLE' as const, detail }])],
+      },
+    };
+  };
+  const indexOfLineStartingWith = (lines: readonly string[], label: string): number =>
+    lines.findIndex((line) => line.startsWith(`${label}: `));
+
+  it('shows one line with the detail right after the executions line, before the incomplete reasons', () => {
+    const { summary } = buildReportViewModel(stoppedRun('STOPPED_BY_SITE_UNAVAILABLE', DETAIL));
+    const lines = runSummaryLines(summary, join('artifacts', 'RUN-20260924000000'));
+    const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
+    const reasonsIndex = indexOfLineStartingWith(lines, RUN_SUMMARY_TEXT.reasonsHeading);
+
+    expect(executionsIndex).toBeGreaterThanOrEqual(0);
+    expect(lines[executionsIndex + 1]).toBe(siteUnavailableStopText(DETAIL));
+    expect(reasonsIndex).toBe(executionsIndex + 2);
+    expect(lines.filter((line) => line === siteUnavailableStopText(DETAIL))).toHaveLength(1);
+    // 文言の確かめ（詳細は、技術的な詳細のまま括弧の中に示す）。
+    expect(lines).toContain(
+      'サイトが応答しないため、監査を止めました（desktop:passive:TIMEOUT）。サイトが戻ってから、同じコマンドで続きから再開してください。',
+    );
+  });
+
+  it('shows the line without the parentheses when the Run has no SITE_UNAVAILABLE reason', () => {
+    const { summary } = buildReportViewModel(stoppedRun('STOPPED_BY_SITE_UNAVAILABLE', null));
+    const lines = runSummaryLines(summary, 'out');
+    const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
+
+    expect(lines[executionsIndex + 1]).toBe(siteUnavailableStopText(null));
+    expect(lines).toContain('サイトが応答しないため、監査を止めました。サイトが戻ってから、同じコマンドで続きから再開してください。');
+  });
+
+  it('does not show the line when the last execution ended in another way, even after a stop by site unavailability', () => {
+    for (const endReason of ['COMPLETED', 'STOPPED_BY_SIGNAL', 'STOPPED_BY_SAFETY_VIOLATION'] as const) {
+      const { summary } = buildReportViewModel(stoppedRun(endReason, DETAIL));
+      const lines = runSummaryLines(summary, 'out');
+      const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
+
+      expect(lines, endReason).not.toContain(siteUnavailableStopText(DETAIL));
+      expect(lines, endReason).not.toContain(siteUnavailableStopText(null));
+      // 実行の記録の行の次は、未完了の理由の行（間に行がない）。
+      expect(indexOfLineStartingWith(lines, RUN_SUMMARY_TEXT.reasonsHeading), endReason).toBe(executionsIndex + 1);
+    }
+  });
+
+  it('follows the view model as it is (does not decide again from the executions or the reasons)', () => {
+    const stopped = buildReportViewModel(stoppedRun('STOPPED_BY_SITE_UNAVAILABLE', DETAIL)).summary;
+    const completed = buildReportViewModel(stoppedRun('COMPLETED', DETAIL)).summary;
+
+    expect(runSummaryLines({ ...stopped, siteUnavailableStop: null }, 'out')).not.toContain(siteUnavailableStopText(DETAIL));
+    expect(runSummaryLines({ ...completed, siteUnavailableStop: { detail: 'mobile:stress-layout:HTTP 503' } }, 'out'))
+      .toContain(siteUnavailableStopText('mobile:stress-layout:HTTP 503'));
+  });
+});
+
 // L7（サイトへの負荷の制御の設計書 4.8）: `run` の実行中に、ページの監査が1つ終わるたびに、Run Coordinator から受け取った進み具合の
 // 事実を、1行で標準出力に示す。文言は `messages.ts`、書式は `format.ts` のもの。表示の側で計算しない（直近の1分の件数も、事実のまま）。
 describe('CLI run: the progress line during the Run', () => {
@@ -1278,6 +1360,36 @@ describe('CLI run: the progress line during the Run', () => {
     expect(lines.indexOf(CLI_TEXT.run.started)).toBeLessThan(lines.indexOf(first ?? ''));
     expect(lines.indexOf(first ?? '')).toBeLessThan(lines.indexOf(last ?? ''));
     expect(lines.indexOf(last ?? '')).toBeLessThan(lines.indexOf(CLI_TEXT.run.resultHeading));
+  });
+});
+
+// SU5、SU6（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）: Run Coordinator の知らせ（`RunNotice`。事実だけ）を、1行の文言に
+// する。文言は `messages.ts` の `siteUnavailableRecheckText` と `siteUnavailableSlowdownText`、時間の書式は `format.ts` の `formatDuration`
+// （例: `60秒`）。表示の側で計算しない。
+describe('CLI run: the notice lines of the site unavailability recheck and slowdown', () => {
+  it('shows the recheck notice with the wait, the attempt of the maximum and the URL from the notice, in one line', () => {
+    const [firstDelayMs, secondDelayMs] = SITE_UNAVAILABLE_RECHECK_DELAYS_MS as readonly [number, number, ...number[]];
+    const maxAttempts = SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length;
+    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'http://127.0.0.1:4173/a.html', delayMs: firstDelayMs, attempt: 1, maxAttempts };
+
+    expect(runNoticeLines(notice)).toEqual([siteUnavailableRecheckText(notice.url, formatDuration(firstDelayMs), 1, maxAttempts)]);
+    expect(runNoticeLines(notice)).toEqual([
+      'サイトが応答しないため、60秒待ってから同じページを確かめ直します（1/4 回目。http://127.0.0.1:4173/a.html）。',
+    ]);
+    expect(runNoticeLines({ ...notice, delayMs: secondDelayMs, attempt: 2 })).toEqual([
+      'サイトが応答しないため、120秒待ってから同じページを確かめ直します（2/4 回目。http://127.0.0.1:4173/a.html）。',
+    ]);
+    // 待つ時間と回数は、知らせの事実のまま書式にかける（定数ではない）。
+    expect(runNoticeLines({ ...notice, delayMs: 1_500, attempt: 3, maxAttempts: 7 }))
+      .toEqual([siteUnavailableRecheckText(notice.url, formatDuration(1_500), 3, 7)]);
+  });
+
+  it('shows the slowdown notice with the new interval from the notice, in one line', () => {
+    const notice: RunNotice = { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 };
+
+    expect(runNoticeLines(notice)).toEqual([siteUnavailableSlowdownText(formatDuration(10_000))]);
+    expect(runNoticeLines(notice)).toEqual(['確かめ直しで応答が戻ったので、ページの読み込みの間隔を 10秒 に延ばして続けます。']);
+    expect(runNoticeLines({ ...notice, minIntervalMs: 40_000 })).toEqual([siteUnavailableSlowdownText(formatDuration(40_000))]);
   });
 });
 

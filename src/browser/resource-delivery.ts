@@ -1,6 +1,7 @@
 /**
  * Run 全体のリソースのキャッシュ（`ResourceCache`。設計書 4.6）と、許可された要求の届け方の判断
- * （`decideResourceDelivery`。設計書 4.7）。この意味の owner は、このファイルだけである。
+ * （`decideResourceDelivery`。設計書 4.7）。この意味の owner は、このファイルだけである。DEF-031（設計書 4.10）で、Passive の
+ * 読み込み（`PRIMARY`）もキャッシュを使い、動画と音声（`media`）もキャッシュに入れるようにした。
  * 設計書: `doc/design/2026-10-01-beaksight-site-load-control-design.md`。
  * - Playwright に依存しない。要求と応答の事実を受け取り、判断を返すだけにする。Route の操作（`route.fulfill`、
  *   `route.abort`）と、事象の受け渡しは、呼び出し側（Guard と Context の factory）が行う。
@@ -13,12 +14,22 @@ import { isPositiveSafeInteger } from '../core/guards.js';
 import { hasAllowedOrigin } from '../safety/request-policy.js';
 
 // ---------------------------------------------------------------------------------------------------------------
-// キャッシュの条件と上限（設計書 4.6）
+// キャッシュの条件と上限（設計書 4.6、4.10.3）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** キャッシュに入れる要求の種類（Playwright の `Request.resourceType()` の値。閉じた一覧）。 */
-export const RESOURCE_CACHE_RESOURCE_TYPES = Object.freeze(['stylesheet', 'script', 'image', 'font'] as const);
+/**
+ * キャッシュに入れる要求の種類（Playwright の `Request.resourceType()` の値。閉じた一覧）。
+ * `media`（動画と音声）は、DEF-031 で加えた（設計書 4.10.3。Passive の読み込みが、同じ動画をページごとに取り直さないため）。
+ */
+export const RESOURCE_CACHE_RESOURCE_TYPES = Object.freeze(['stylesheet', 'script', 'image', 'font', 'media'] as const);
 export type ResourceCacheResourceType = (typeof RESOURCE_CACHE_RESOURCE_TYPES)[number];
+
+/**
+ * 要求にファイルの全体を求める `Range` があっても、ファイルの全体を受けた応答を入れる種類（設計書 4.10.3。ブラウザは、動画と音声を
+ * 範囲を指定して取る）。全体を範囲の応答（206）で受けた場合と、サーバが `Range` を無視して全体を 200 で返した場合（PCR-DR の
+ * Minor-4）の両方を入れる。
+ */
+const FULL_RANGE_STORABLE_RESOURCE_TYPE: ResourceCacheResourceType = 'media';
 
 const BYTES_PER_MEBIBYTE = 1024 * 1024;
 
@@ -30,19 +41,38 @@ export interface ResourceCacheLimits {
   readonly maxTotalBytes: number;
 }
 
-/** 既定の上限（1件 5MB、合計 256MB）。利用者が選ぶ必要がないので、設定にはしない（設計書 3.2）。 */
+/**
+ * 既定の上限（1件 16 MiB、合計 256 MiB）。利用者が選ぶ必要がないので、設定にはしない（設計書 3.2）。
+ * - 1件の上限は、DEF-031 で 5 MiB から 16 MiB にした（設計書 4.10.3）。Task 21 の Run で、Passive の読み込みが、約 8.4 MB の
+ *   動画をページごとに取り直していたため、その大きさの動画を入れられる値にした。上限ちょうどの項目でも、合計の上限に 16 件入る。
+ * - 合計の上限は変えない（超えたら LRU で捨てるので、よく使うものが残る）。
+ */
 export const RESOURCE_CACHE_LIMITS: ResourceCacheLimits = Object.freeze({
-  maxEntryBytes: 5 * BYTES_PER_MEBIBYTE,
+  maxEntryBytes: 16 * BYTES_PER_MEBIBYTE,
   maxTotalBytes: 256 * BYTES_PER_MEBIBYTE,
 });
 
-/** キャッシュに入れる応答の status。 */
+/** キャッシュに入れる応答の status（範囲の応答を入れるときも、この status にして持つ）。 */
 export const RESOURCE_CACHE_STORABLE_STATUS = 200;
+/** ファイルの全体を返した範囲の応答として、キャッシュに入れる応答の status（206 Partial Content。`media` だけ。設計書 4.10.3）。 */
+export const RESOURCE_CACHE_FULL_RANGE_STATUS = 206;
+/**
+ * ファイルの全体を求める `Range` の値（設計書 4.10.3）。`media` の要求の `Range` が、前後の空白を除き、大文字小文字を区別せずに、
+ * これとちょうど同じ場合だけ、全体を返した 206 の応答と、`Range` を無視して全体を返した 200 の応答を入れる。
+ */
+export const RESOURCE_CACHE_FULL_RANGE_REQUEST = 'bytes=0-';
+/**
+ * ファイルの全体を返した `Content-Range` の形（`bytes 0-<N-1>/<N>`。前後の空白を除いて比べる。単位は大文字小文字を区別しない）。
+ * 1つ目の組が終わりの位置（N-1）、2つ目の組が全体の長さ（N）。
+ */
+const FULL_CONTENT_RANGE_PATTERN = /^bytes 0-(\d+)\/(\d+)$/iu;
 
 /** キャッシュに入れる（キャッシュから返す）要求の method。大文字小文字を区別せずに比べる。 */
 const CACHEABLE_METHOD = 'GET';
-/** これがある要求は入れない（部分の応答のため）。名前は小文字。 */
+/** これがある要求は、ファイルの全体を求める `media` の要求でなければ入れない（部分の応答のため）。名前は小文字。 */
 const RANGE_HEADER_NAME = 'range';
+/** 範囲の応答の位置と全体の長さを示す header（小文字）。範囲の応答を 200 として入れるときは、持たない。 */
+const CONTENT_RANGE_HEADER_NAME = 'content-range';
 const CACHE_CONTROL_HEADER_NAME = 'cache-control';
 /** `cache-control` にこの指示があれば入れない。 */
 const NO_STORE_DIRECTIVE = 'no-store';
@@ -62,6 +92,11 @@ const EXCLUDED_RESPONSE_HEADER_NAMES: ReadonlySet<string> = new Set([
   'transfer-encoding',
   'set-cookie',
 ]);
+/** ファイルの全体を返した範囲の応答（206）を、200 として入れるときに持たない header（小文字）。 */
+const EXCLUDED_FULL_RANGE_RESPONSE_HEADER_NAMES: ReadonlySet<string> = new Set([
+  ...EXCLUDED_RESPONSE_HEADER_NAMES,
+  CONTENT_RANGE_HEADER_NAME,
+]);
 /** 小文字にそろえて同じ名前になった header の値をつなぐ区切り（HTTP の、同じ名前の header を1つにまとめる規則）。 */
 const HEADER_VALUE_SEPARATOR = ', ';
 
@@ -79,7 +114,10 @@ export interface CachedResource {
   readonly body: Uint8Array;
 }
 
-/** キャッシュに入れるかを決める、要求と応答の事実（Context の factory が `response` の事象から作る）。 */
+/**
+ * キャッシュに入れるかを決める、要求と応答の事実（Context の factory が、要求が成功して終わった `requestfinished` の事象から作る。
+ * 失敗した要求（本文の途中の切断など）の応答は渡さない。設計書 4.10.3 の 2026-10-06 の追補）。
+ */
 export interface ResourceCacheStoreFact {
   readonly method: string;
   /** Playwright の `Request.resourceType()` の値。 */
@@ -134,12 +172,15 @@ const hasNoStoreDirective = (headers: Readonly<Record<string, string>>): boolean
   headerValues(headers, CACHE_CONTROL_HEADER_NAME).some((value) =>
     value.split(CACHE_CONTROL_DIRECTIVE_SEPARATOR).some((directive) => cacheControlDirectiveName(directive) === NO_STORE_DIRECTIVE));
 
-/** 持つ header（名前を小文字にそろえ、持たない header を除く）。凍結して返す。 */
-const storedResponseHeaders = (headers: Readonly<Record<string, string>>): Readonly<Record<string, string>> => {
+/** 持つ header（名前を小文字にそろえ、`excludedNames`（小文字）の header を除く）。凍結して返す。 */
+const storedResponseHeaders = (
+  headers: Readonly<Record<string, string>>,
+  excludedNames: ReadonlySet<string>,
+): Readonly<Record<string, string>> => {
   const values = new Map<string, string>();
   for (const [name, value] of Object.entries(headers)) {
     const lowerName = name.toLowerCase();
-    if (EXCLUDED_RESPONSE_HEADER_NAMES.has(lowerName)) {
+    if (excludedNames.has(lowerName)) {
       continue;
     }
     const existing = values.get(lowerName);
@@ -147,6 +188,57 @@ const storedResponseHeaders = (headers: Readonly<Record<string, string>>): Reado
   }
   return Object.freeze(Object.fromEntries(values));
 };
+
+/**
+ * 応答が、ファイルの全体を持つか（入れる条件のうち、status と `Range` に関わるもの。設計書 4.6、4.10.3）。
+ * - `WHOLE`: status が 200 で、要求に `Range` がない（種類によらない）。または、status が 200 で、種類が `media`、要求の `Range` が
+ *   ちょうど `bytes=0-`（サーバが `Range` を無視して全体を返した。全体なので、そのまま 200 として入れる。PCR-DR の Minor-4）。
+ * - `FULL_RANGE`: status が 206 で、種類が `media`、要求の `Range` がちょうど `bytes=0-`、応答の `Content-Range` が
+ *   `bytes 0-<N-1>/<N>`（N は正の整数）。`totalBytes` は N（本文の長さが N のときだけ入れる）。
+ * どちらでもない応答（ファイルの一部、`media` 以外の 206、`Range` のあるほかの要求など）は、入れない（`null`）。
+ */
+type WholeContent =
+  | { readonly kind: 'WHOLE' }
+  | { readonly kind: 'FULL_RANGE'; readonly totalBytes: number };
+
+const WHOLE_CONTENT: WholeContent = Object.freeze({ kind: 'WHOLE' });
+
+/** 名前が `lowerName` の header が1つだけあれば、その値。なければ、または2つ以上あれば `undefined`。 */
+const singleHeaderValue = (headers: Readonly<Record<string, string>>, lowerName: string): string | undefined => {
+  const values = headerValues(headers, lowerName);
+  return values.length === 1 ? values[0] : undefined;
+};
+
+/** 要求の `Range` が、ファイルの全体を求める値（`RESOURCE_CACHE_FULL_RANGE_REQUEST`）とちょうど同じか。 */
+const requestsWholeFile = (requestHeaders: Readonly<Record<string, string>>): boolean =>
+  singleHeaderValue(requestHeaders, RANGE_HEADER_NAME)?.trim().toLowerCase() === RESOURCE_CACHE_FULL_RANGE_REQUEST;
+
+/** 応答の `Content-Range` が、ファイルの全体（`bytes 0-<N-1>/<N>`。N は正の整数）を示すなら N。そうでなければ `null`。 */
+function wholeFileContentRangeBytes(responseHeaders: Readonly<Record<string, string>>): number | null {
+  const value = singleHeaderValue(responseHeaders, CONTENT_RANGE_HEADER_NAME);
+  const match = value === undefined ? null : FULL_CONTENT_RANGE_PATTERN.exec(value.trim());
+  if (match === null) {
+    return null;
+  }
+  const lastBytePosition = Number(match[1]);
+  const totalBytes = Number(match[2]);
+  return isPositiveSafeInteger(totalBytes) && lastBytePosition === totalBytes - 1 ? totalBytes : null;
+}
+
+/** 種類が `media` で、要求の `Range` がファイルの全体を求める値か（範囲の要求でも、全体を受けた応答を入れる要求）。 */
+const requestsWholeMediaFile = (fact: ResourceCacheResponseFact): boolean =>
+  fact.resourceType === FULL_RANGE_STORABLE_RESOURCE_TYPE && requestsWholeFile(fact.requestHeaders);
+
+function wholeContentOf(fact: ResourceCacheResponseFact): WholeContent | null {
+  if (fact.status === RESOURCE_CACHE_STORABLE_STATUS) {
+    return headerValues(fact.requestHeaders, RANGE_HEADER_NAME).length === 0 || requestsWholeMediaFile(fact) ? WHOLE_CONTENT : null;
+  }
+  if (fact.status !== RESOURCE_CACHE_FULL_RANGE_STATUS || !requestsWholeMediaFile(fact)) {
+    return null;
+  }
+  const totalBytes = wholeFileContentRangeBytes(fact.responseHeaders);
+  return totalBytes === null ? null : Object.freeze({ kind: 'FULL_RANGE', totalBytes });
+}
 
 function validatedLimits(limits: ResourceCacheLimits): ResourceCacheLimits {
   if (!isPositiveSafeInteger(limits.maxEntryBytes) || !isPositiveSafeInteger(limits.maxTotalBytes)) {
@@ -179,16 +271,26 @@ export class ResourceCache {
   /**
    * 入れる条件をすべて満たす応答を入れ、入れたかを返す。同じ URL があれば新しい内容で置き換える。
    * 条件を満たさない応答は、同じ URL のすでにある項目を変えない。
+   * ファイルの全体を返した範囲の応答（206。`media` だけ）は、本文の長さが `Content-Range` の全体の長さと同じときだけ入れ、
+   * status を 200 にし、`Content-Range` を除いて持つ（キャッシュから返すときは、全体を 200 で返す。設計書 4.10.3）。
    */
   store(fact: ResourceCacheStoreFact): boolean {
-    if (!this.#isStorable(fact)) {
+    const content = this.#storableContent(fact);
+    if (
+      content === null
+      || fact.body.byteLength > this.#limits.maxEntryBytes
+      || (content.kind === 'FULL_RANGE' && fact.body.byteLength !== content.totalBytes)
+    ) {
       return false;
     }
     this.#remove(fact.url);
     this.#entries.set(fact.url, Object.freeze({
       url: fact.url,
-      status: fact.status,
-      headers: storedResponseHeaders(fact.responseHeaders),
+      status: RESOURCE_CACHE_STORABLE_STATUS,
+      headers: storedResponseHeaders(
+        fact.responseHeaders,
+        content.kind === 'FULL_RANGE' ? EXCLUDED_FULL_RANGE_RESPONSE_HEADER_NAMES : EXCLUDED_RESPONSE_HEADER_NAMES,
+      ),
       body: fact.body,
     }));
     this.#totalBytes += fact.body.byteLength;
@@ -212,20 +314,33 @@ export class ResourceCache {
 
   /**
    * 本文を読む前に、入れる見込みがあるかを答える（L5b-fix-round-1。キャッシュは変えない）。条件は、入れる条件（`store`）の、
-   * 本文の大きさ以外のすべてである。応答の `content-length` が、このキャッシュの1件の上限を超えると分かる場合も、見込みなしにする
-   * （分からない場合は見込みあり。本文を読んでから、`store` が本文の大きさで決める）。`store` も、この判断を使う。
+   * 本文の大きさと長さ以外のすべてである。応答の `content-length` や、ファイルの全体を返した範囲の応答の `Content-Range` の全体の
+   * 長さが、このキャッシュの1件の上限を超えると分かる場合も、見込みなしにする（分からない場合は見込みあり。本文を読んでから、
+   * `store` が本文の大きさで決める）。`store` も、この判断を使う。
    */
   mayStore(fact: ResourceCacheResponseFact): boolean {
-    return !fact.servedFromRunCache
-      && isCacheableRequest(fact.method, fact.resourceType)
-      && fact.status === RESOURCE_CACHE_STORABLE_STATUS
-      && headerValues(fact.requestHeaders, RANGE_HEADER_NAME).length === 0
-      && !hasNoStoreDirective(fact.responseHeaders)
-      && !this.#contentLengthExceedsEntryLimit(fact.responseHeaders);
+    return this.#storableContent(fact) !== null;
   }
 
-  #isStorable(fact: ResourceCacheStoreFact): boolean {
-    return this.mayStore(fact) && fact.body.byteLength <= this.#limits.maxEntryBytes;
+  /**
+   * 入れる条件のうち、本文によらないもの（設計書 4.6、4.10.3）をすべて満たす応答が、ファイルの全体を持つ形。満たさなければ `null`。
+   * GET で、キャッシュの種類で、キャッシュから返した応答でなく、`no-store` がなく、`content-length` が1件の上限を超えず、
+   * ファイルの全体を持つ（`wholeContentOf`）。範囲の応答では、`Content-Range` の全体の長さも、1件の上限を超えない。
+   */
+  #storableContent(fact: ResourceCacheResponseFact): WholeContent | null {
+    if (
+      fact.servedFromRunCache
+      || !isCacheableRequest(fact.method, fact.resourceType)
+      || hasNoStoreDirective(fact.responseHeaders)
+      || this.#contentLengthExceedsEntryLimit(fact.responseHeaders)
+    ) {
+      return null;
+    }
+    const content = wholeContentOf(fact);
+    if (content?.kind === 'FULL_RANGE' && content.totalBytes > this.#limits.maxEntryBytes) {
+      return null;
+    }
+    return content;
   }
 
   /** 応答の `content-length`（10進の整数として読める値）のどれかが、このキャッシュの1件の上限を超えるか。 */
@@ -261,7 +376,8 @@ export class ResourceCache {
 
 /**
  * Context の役割（閉じた一覧）。
- * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml。すべてネットワークから取る（キャッシュに入れるだけ）。
+ * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml。キャッシュにあるものはキャッシュから返し、キャッシュに
+ *   ないものは、許可 Origin の外でもネットワークから取る（DEF-031。設計書 4.10.3。ふつうの利用者がサイトを見て回るのと同じ）。
  * - `REVISIT`: 幅の走査、Interaction。キャッシュにあるものはキャッシュから返し、許可 Origin の外へは送らない。
  */
 export const RESOURCE_DELIVERY_ROLES = Object.freeze(['PRIMARY', 'REVISIT'] as const);
@@ -300,14 +416,15 @@ const WITHHOLD_DECISION: ResourceDeliveryDecision = Object.freeze({ kind: 'WITHH
 
 /**
  * Guard が許可した要求の届け方を決める。例外を投げない（解析できない URL は、許可 Origin の外として扱う）。
- * - `PRIMARY` の役割では、常に `NETWORK`（キャッシュを引かない）。
- * - `REVISIT` の役割では、ナビゲーションの要求は `NETWORK`。GET で、キャッシュの種類で、キャッシュにあれば `FROM_RUN_CACHE`。
- *   許可 Origin の外で、キャッシュになければ `WITHHOLD`。それ以外は `NETWORK`。
+ * - どの役割でも、ナビゲーションの要求（文書）は `NETWORK`（サイトの今の状態を見るため）。
+ * - どの役割でも、GET で、キャッシュの種類で、キャッシュにあれば `FROM_RUN_CACHE`（`PRIMARY` は DEF-031 から。設計書 4.10.3）。
+ *   動画も、要求に `Range` があっても、キャッシュにある全体を返す（入力に `Range` は含めない）。
+ * - それ以外は、`REVISIT` の役割では、許可 Origin の外なら `WITHHOLD`、中なら `NETWORK`。`PRIMARY` の役割では、許可 Origin の
+ *   外でも `NETWORK`（`PRIMARY` では `WITHHOLD` を選ばない。ふつうの利用者の初めての読み込みと同じく送る）。
  */
 export function decideResourceDelivery(input: ResourceDeliveryInput): ResourceDeliveryDecision {
   const { role, cache, allowedOrigins, request } = input;
-  // 役割が `REVISIT` でなければ、今のまま（ネットワーク）にする。
-  if (role !== 'REVISIT' || request.isNavigationRequest) {
+  if (request.isNavigationRequest) {
     return NETWORK_DECISION;
   }
   if (isCacheableRequest(request.method, request.resourceType)) {
@@ -316,5 +433,6 @@ export function decideResourceDelivery(input: ResourceDeliveryInput): ResourceDe
       return Object.freeze({ kind: 'FROM_RUN_CACHE', resource });
     }
   }
-  return hasAllowedOrigin(request.url, allowedOrigins) ? NETWORK_DECISION : WITHHOLD_DECISION;
+  // 送らないことを選ぶのは、読み込み直しの Context（`REVISIT`）で、許可 Origin の外の要求だけである。
+  return role === 'REVISIT' && !hasAllowedOrigin(request.url, allowedOrigins) ? WITHHOLD_DECISION : NETWORK_DECISION;
 }

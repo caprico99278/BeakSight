@@ -12,6 +12,7 @@ import {
   checkpointPageArtifactRelativePath,
   pageArtifactRelativePath,
   runArtifactDirectory,
+  siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
@@ -35,6 +36,10 @@ import {
   type RunLockHost,
 } from '../../src/orchestration/run-checkpoint.js';
 import {
+  SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+  type SiteUnavailableDiagnosticRecord,
+} from '../../src/orchestration/run-coordinator.js';
+import {
   ArtifactWriteError,
   ArtifactWriter,
   RENAME_MAX_ATTEMPTS,
@@ -45,6 +50,7 @@ import {
 } from '../../src/report/artifact-writer.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
+  FIXTURE_OBSERVED_AT,
   FIXTURE_ORIGIN,
   FIXTURE_RUN_ID as RUN_ID,
   PAGE_1,
@@ -809,6 +815,161 @@ describe('ArtifactWriter: writing the checkpoint (resumable run design 4.1〜4.3
 
     expect(failure).toBeInstanceOf(ArtifactWriteError);
     expect((failure as ArtifactWriteError).path).toBe(checkpointPageFile(runDirectory, PAGE_1));
+    expect((await listTree(runDirectory)).filter((path) => path.includes('.tmp'))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録の書き出し（`diagnostics/site-unavailable-<pageId>-<実行の番号>.json`）。
+// スキーマで検証してから、一時ファイルと名前の変更で書く。検証に失敗したら、何も書かずに例外を投げる。
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 見本の診断の記録（そのページの最終の試行の結果と、Desktop の観察の結果。Desktop の文書の要求は、ヘッダを送り、応答がない）。
+ * Mobile は、Passive の読み込みを始めなかった（`null`）。
+ */
+function sampleDiagnostic(pageId: typeof PAGE_1 | typeof PAGE_2, executionNumber: number): SiteUnavailableDiagnosticRecord {
+  const result = page(pageId, pageId === PAGE_1 ? '/' : '/second.html', 'FAILED', [dom(6, pageId, 'desktop', '止まったページ')]);
+  const observedAtMs = Date.parse(FIXTURE_OBSERVED_AT);
+  return {
+    schemaVersion: SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
+    runId: RUN_ID,
+    executionNumber,
+    writtenAt: FIXTURE_OBSERVED_AT,
+    pageId,
+    url: result.pageUrl,
+    siteUnavailableDetail: 'desktop:passive:TIMEOUT',
+    page: result,
+    navigationDiagnostics: {
+      // D3 の形: Passive の観察に加えて、幅の走査の幅ごとと Interaction の候補ごとの観察（この見本では、どちらもない）。
+      desktop: {
+        passive: {
+          status: 'OBSERVED',
+          observationStartedAtMs: observedAtMs,
+          observationEndedAtMs: observedAtMs + 3_000,
+          documentRequests: [{
+            hops: [{
+              url: result.pageUrl,
+              method: 'GET',
+              truncated: false,
+              issuedAtMs: observedAtMs + 1,
+              requestHeadersSentAtMs: observedAtMs + 2,
+              responseHeadersReceivedAtMs: null,
+              httpStatus: null,
+              remoteIpAddress: null,
+              remotePort: null,
+            }],
+            loadingFinishedAtMs: null,
+            loadingFailure: null,
+          }],
+          omittedDocumentRequestCount: 0,
+          omittedEventCount: 0,
+        },
+        stressWidths: [],
+        interactionCandidates: [],
+      },
+      mobile: null,
+    },
+  };
+}
+
+/** 1 回目の試行（SU5。確かめ直す前の、捨てた試行）。 */
+const FIRST_ATTEMPT = 1;
+/** 確かめ直しの試行（SU5）。 */
+const RECHECK_ATTEMPT = 2;
+
+const diagnosticFile = (runDirectory: string, pageId: PageId, executionNumber: number, attemptNumber: number): string =>
+  artifactFilePath(runDirectory, siteUnavailableDiagnosticRelativePath(pageId, executionNumber, attemptNumber));
+
+// SU5（サイトが応答しないときに Run を止める設計書 3.5.2）: 同じ実行で同じページを 1 回確かめ直すので、ファイルの名前に試行の番号を加える
+// （`diagnostics/site-unavailable-<pageId>-<実行の番号>-<試行の番号>.json`）。試行の番号は、記録の中ではなく、引数で受ける（記録の形は変えない）。
+describe('ArtifactWriter: writing the site-unavailable diagnostic (site-unavailable diagnostics design 2.3)', () => {
+  it('writes the diagnostic to diagnostics/site-unavailable-<pageId>-<execution>-<attempt>.json in the artifact JSON format, and returns its path', async () => {
+    const { runDirectory } = await runDirectoryInWork();
+    const value = sampleDiagnostic(PAGE_2, 2);
+
+    const written = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, value, RECHECK_ATTEMPT);
+
+    expect(written).toBe('diagnostics/site-unavailable-PAGE-000002-2-2.json');
+    expect(written).toBe(siteUnavailableDiagnosticRelativePath(PAGE_2, 2, RECHECK_ATTEMPT));
+    expect(await readFile(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT), 'utf8')).toBe(`${JSON.stringify(value, null, 2)}\n`);
+    await expect(validateArtifact('site-unavailable-diagnostic', await readJson(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT))))
+      .resolves.toEqual({ ok: true });
+    // `diagnostics/`（と Run のディレクトリ）がなければ作る。一時ファイルは残らない。試行の番号は、記録の中に書かない。
+    expect(await listTree(runDirectory)).toEqual(['diagnostics/', 'diagnostics/site-unavailable-PAGE-000002-2-2.json']);
+    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT))).toEqual(value);
+  });
+
+  it('keeps the diagnostics of other pages, executions and attempts, and the other outputs of the run directory', async () => {
+    const { root, runDirectory } = await runDirectoryInWork();
+    const writer = new ArtifactWriter();
+    await writer.writeRun(auditRun(), { outputDirectory: root });
+    const outputs = await listTree(runDirectory);
+
+    for (const [pageId, executionNumber, attemptNumber] of [
+      [PAGE_2, 1, FIRST_ATTEMPT],
+      [PAGE_2, 1, RECHECK_ATTEMPT],
+      [PAGE_2, 2, FIRST_ATTEMPT],
+      [PAGE_1, 2, FIRST_ATTEMPT],
+    ] as const) {
+      await writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(pageId, executionNumber), attemptNumber);
+    }
+
+    expect(await listTree(runDirectory)).toEqual([
+      ...outputs,
+      'diagnostics/',
+      'diagnostics/site-unavailable-PAGE-000001-2-1.json',
+      'diagnostics/site-unavailable-PAGE-000002-1-1.json',
+      'diagnostics/site-unavailable-PAGE-000002-1-2.json',
+      'diagnostics/site-unavailable-PAGE-000002-2-1.json',
+    ].sort());
+    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
+    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, RECHECK_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
+    expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 2, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 2));
+  });
+
+  it('does not write a diagnostic that does not match its schema (for example with request headers), and throws an ArtifactWriteError', async () => {
+    const { runDirectory } = await runDirectoryInWork();
+    const sample = sampleDiagnostic(PAGE_1, 1);
+    const withHeaders = { ...sample, requestHeaders: { cookie: 'session=1' } } as unknown as SiteUnavailableDiagnosticRecord;
+    const withInvalidPage = { ...sample, page: { ...sample.page, unexpectedField: true } } as unknown as SiteUnavailableDiagnosticRecord;
+
+    for (const invalid of [withHeaders, withInvalidPage]) {
+      const failure = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, invalid, FIRST_ATTEMPT).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ArtifactWriteError);
+      expect((failure as ArtifactWriteError).message).toContain('site-unavailable-diagnostic');
+      expect((failure as ArtifactWriteError).path).toBe(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT));
+    }
+    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('refuses a page ID, an execution number or an attempt number that cannot be in the file name, and an empty run directory, before writing anything', async () => {
+    const { runDirectory } = await runDirectoryInWork();
+    const writer = new ArtifactWriter();
+    for (const pageId of ['../escape', 'PAGE-1', 'notes']) {
+      const unsafe = { ...sampleDiagnostic(PAGE_1, 1), pageId: pageId as PageId };
+      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, unsafe, FIRST_ATTEMPT), pageId).rejects.toBeInstanceOf(RangeError);
+    }
+    for (const number of [0, -1, 1.5]) {
+      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, number), FIRST_ATTEMPT), `execution ${String(number)}`)
+        .rejects.toBeInstanceOf(RangeError);
+      await expect(writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, 1), number), `attempt ${String(number)}`)
+        .rejects.toBeInstanceOf(RangeError);
+    }
+    await expect(writer.writeSiteUnavailableDiagnostic('', sampleDiagnostic(PAGE_1, 1), FIRST_ATTEMPT)).rejects.toBeInstanceOf(TypeError);
+    await expect(readdir(runDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('throws an ArtifactWriteError and removes the temporary file when the diagnostic cannot be renamed into place', async () => {
+    const { runDirectory } = await runDirectoryInWork();
+    await mkdir(join(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT), 'blocker'), { recursive: true });
+
+    const failure = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_1, 1), FIRST_ATTEMPT)
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ArtifactWriteError);
+    expect((failure as ArtifactWriteError).path).toBe(diagnosticFile(runDirectory, PAGE_1, 1, FIRST_ATTEMPT));
     expect((await listTree(runDirectory)).filter((path) => path.includes('.tmp'))).toEqual([]);
   });
 });
@@ -1668,6 +1829,14 @@ const RETRIED_WRITES: Readonly<Record<string, RetriedWrite>> = {
     expectWritten: async (runDirectory) => {
       expect(await readJson(checkpointFile(runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
       expect(await readJson(checkpointFile(runDirectory, 'previousState'))).toEqual(sampleCheckpoint(1));
+    },
+  },
+  // D2（サイトの不調で止めたときの診断の記録の設計書 2.3）: 診断の記録も、今のファイルの書き方（`renameWithRetry`）で書く。
+  'the site-unavailable diagnostic': {
+    target: basename(siteUnavailableDiagnosticRelativePath(PAGE_2, 1, FIRST_ATTEMPT)),
+    write: async (writer, _root, runDirectory) => writer.writeSiteUnavailableDiagnostic(runDirectory, sampleDiagnostic(PAGE_2, 1), FIRST_ATTEMPT),
+    expectWritten: async (runDirectory) => {
+      expect(await readJson(diagnosticFile(runDirectory, PAGE_2, 1, FIRST_ATTEMPT))).toEqual(sampleDiagnostic(PAGE_2, 1));
     },
   },
   'the run lock': {

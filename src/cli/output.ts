@@ -21,9 +21,9 @@ import {
   severitiesInGroup,
   sortByDisplayOrder,
 } from '../presentation/catalog.js';
-import { formatCount, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../presentation/format.js';
+import { formatCount, formatDuration, formatElapsedTime, formatRequestsWithPeak, formatTimes } from '../presentation/format.js';
 import type { RunVersionDifference, RunVersionField } from '../orchestration/run-checkpoint.js';
-import type { RunResumeUnavailableReason } from '../orchestration/run-coordinator.js';
+import type { RunNotice, RunResumeUnavailableReason } from '../orchestration/run-coordinator.js';
 import {
   CLI_COMMAND_DESCRIPTIONS,
   CLI_OPTION_DESCRIPTIONS,
@@ -47,6 +47,9 @@ import {
   resumingRunText,
   runLockHeldText,
   runLockTakenOverText,
+  siteUnavailableRecheckText,
+  siteUnavailableSlowdownText,
+  siteUnavailableStopText,
   truncatedListText,
   unreadableCheckpointText,
   versionDifferenceText,
@@ -187,6 +190,22 @@ export function runStartedLines(config: AuditConfig): readonly string[] {
  * 項目の順: 監査を終えたページ（発見したページと、ページ数の上限を添える）、ページの読み込みの回数、許可 Origin への要求（直近の1分の
  * 件数と、1分あたりの最大を添える）、許可 Origin の外への要求、経過時間。
  */
+/**
+ * `run` の実行中の知らせの1行（Run Coordinator の `RunNotice`。サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）。知らせの事実
+ * （種類と、その値）を、文言（`messages.ts`）と書式（`format.ts`）にかけるだけで、計算しない。
+ * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページを捨てた後、待ってから同じページを確かめ直す（待つ時間は `formatDuration`。何回目かと
+ *   最大の回数は、そのまま）。
+ * - `SITE_UNAVAILABLE_SLOWDOWN`: 確かめ直しで応答が戻ったので、ページの読み込みの間隔を延ばして続ける（新しい間隔は `formatDuration`）。
+ */
+export function runNoticeLines(notice: RunNotice): readonly string[] {
+  switch (notice.kind) {
+    case 'SITE_UNAVAILABLE_RECHECK':
+      return [siteUnavailableRecheckText(notice.url, formatDuration(notice.delayMs), notice.attempt, notice.maxAttempts)];
+    case 'SITE_UNAVAILABLE_SLOWDOWN':
+      return [siteUnavailableSlowdownText(formatDuration(notice.minIntervalMs))];
+  }
+}
+
 export function runProgressLines(report: RunProgressReport): readonly string[] {
   const text = CLI_TEXT.progress;
   return [
@@ -223,6 +242,8 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
  *   HTML レポートと共通の `formatRequestsWithPeak` で示す（L7）
  * - 実行の記録（実行の回数と再開の回数。例: `実行: 3回、再開 2回`。中断した Run の再開の設計書 4.8 の「表示」。R6）。負荷の行の後、
  *   未完了の理由の行の前に置く（HTML レポートの要約の小節の順と同じ）。実行が1回でも示す。回数は、表示用モデルの値を `formatTimes` で示す
+ * - サイトの不調で止めた場合は、止めたことと再開のしかたの1行（サイトが応答しないときに Run を止める設計書 3.4）。実行の記録の行の次、
+ *   未完了の理由の行の前に置く。出すかどうかと詳細は、表示用モデルの `siteUnavailableStop` のまま（ここで判断し直さない）
  * - 未完了の理由がある場合は、その件数
  */
 export function runSummaryLines(summary: RunSummaryView, runDirectory: string): readonly string[] {
@@ -265,6 +286,7 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
       CLI_TEXT.run.executions,
       listText([formatTimes(executions.count), cliCountText(CLI_TEXT.run.resumes, formatTimes(executions.resumeCount))]),
     ),
+    ...(summary.siteUnavailableStop === null ? [] : [siteUnavailableStopText(summary.siteUnavailableStop.detail)]),
     ...(summary.incompleteReasons.length > 0
       ? [cliFieldText(RUN_SUMMARY_TEXT.reasonsHeading, formatCount(summary.incompleteReasons.length))]
       : []),

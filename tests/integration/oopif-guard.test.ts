@@ -278,8 +278,9 @@ describe('C18i: the existing judgments still stop the OOPIF (navigation outside 
  * OOPIF の session の命令（親の session の `Target.sendMessageToTarget`）に、偽の失敗を注入する page の session（C18i の fail-closed）。
  * - `SEND`: OOPIF の session に命令を送れない（`Target.sendMessageToTarget` が失敗する）。
  * - `FETCH_ENABLE`: OOPIF の session の `Fetch.enable` が、ブラウザから失敗の応答を受ける（命令の名前を、ない名前に変えて送る）。
+ * - `NETWORK_ENABLE`: OOPIF の session の `Network.enable`（DEF-026。取り消しの証拠を受けるため）が、同じく失敗の応答を受ける。
  */
-function sessionFailingOopifAttach(real: CDPSession, failure: 'SEND' | 'FETCH_ENABLE'): CDPSession {
+function sessionFailingOopifAttach(real: CDPSession, failure: 'SEND' | 'FETCH_ENABLE' | 'NETWORK_ENABLE'): CDPSession {
   return new Proxy(real, {
     get(target, property, receiver): unknown {
       if (property === 'send') {
@@ -292,10 +293,11 @@ function sessionFailingOopifAttach(real: CDPSession, failure: 'SEND' | 'FETCH_EN
             throw new Error('injected: the OOPIF session cannot receive commands');
           }
           const command = JSON.parse(params.message) as { readonly method: string };
-          if (command.method !== 'Fetch.enable') {
+          const failingMethod = failure === 'FETCH_ENABLE' ? 'Fetch.enable' : 'Network.enable';
+          if (command.method !== failingMethod) {
             return send(method, params);
           }
-          return send(method, { ...params, message: JSON.stringify({ ...command, method: 'Fetch.enableInjectedFailure' }) });
+          return send(method, { ...params, message: JSON.stringify({ ...command, method: `${failingMethod}InjectedFailure` }) });
         };
       }
       const value: unknown = Reflect.get(target, property, receiver);
@@ -320,6 +322,25 @@ describe('C18i fail-closed: when the Guard cannot attach its interception to an 
       },
     });
     // OOPIF は、横取りを付けられなかったので、進めない（自分の移動を始めない）。
+    expect(window.count(null, EXTERNAL_SCHEME_REDIRECT_PATH)).toBe(0);
+    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  });
+
+  // DEF-026: OOPIF の session でも、取り消しの証拠を受けるために Network の domain を有効にする。失敗したら、横取りの取り付けの失敗と同じく扱う。
+  it('NETWORK_ENABLE failure (DEF-026): OOPIF_GUARD_ATTACH_FAILED is recorded, the Context closes, and the OOPIF never navigates', async () => {
+    const window = openServerWindow(server);
+    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
+      await page.goto(`${server.origin}${crossSiteFramePath(selfNavigatingFramePath('custom'))}`).catch(() => undefined);
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+
+      expect(ledger.snapshot().invariantViolations.map(({ code }) => code)).toContain('OOPIF_GUARD_ATTACH_FAILED');
+      expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
+    }, {
+      prepare: (context) => {
+        const original = context.newCDPSession.bind(context);
+        vi.spyOn(context, 'newCDPSession').mockImplementation(async (target) => sessionFailingOopifAttach(await original(target), 'NETWORK_ENABLE'));
+      },
+    });
     expect(window.count(null, EXTERNAL_SCHEME_REDIRECT_PATH)).toBe(0);
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   });

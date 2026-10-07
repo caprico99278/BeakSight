@@ -12,14 +12,20 @@ import { chromium, type Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { CHROMIUM_PRELOADING_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
+import { runNoticeLines } from '../../src/cli/output.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
 import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import type { PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
-import type { RunCoordinatorCheckpointConclusion, RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
+import {
+  SITE_UNAVAILABLE_RECHECK_DELAYS_MS,
+  type RunCoordinatorCheckpointConclusion,
+  type RunCoordinatorDependencies,
+  type RunNotice,
+} from '../../src/orchestration/run-coordinator.js';
 import { RUN_STATUS_CATALOG } from '../../src/presentation/catalog.js';
-import { labelWithCodeText } from '../../src/presentation/messages.js';
+import { CLI_TEXT, labelWithCodeText } from '../../src/presentation/messages.js';
 import { auditRun } from '../helpers/audit-run-fixture.js';
 import { captureCliOutput } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -148,6 +154,48 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 
     expect(code).toBe(EXIT_CODES.COMPLETE);
     expect(coordinatorDependencies[0]?.stopSignal).toBe(controller.signal);
+  });
+
+  // SU5、SU6（サイトが応答しないときに Run を止める設計書 3.5.4、3.6.2）: Run Coordinator の知らせの口（`onNotice`）を渡し、受けた知らせ
+  // （確かめ直しと減速）を、進み具合の行と同じく標準出力に1行で書く（開始の行の後、結果の前）。文言は `runNoticeLines`。
+  it('hands a notice receiver to the Run Coordinator, and writes each notice to stdout as one line between the start and the result', async () => {
+    const outputDirectory = join(workDirectory, 'notice');
+    const config = createTestConfig('http://127.0.0.1:9', '/', { output: { directory: outputDirectory } });
+    const stdout = captureCliOutput();
+    const stderr = captureCliOutput();
+    const notice: RunNotice = {
+      kind: 'SITE_UNAVAILABLE_RECHECK',
+      url: 'http://127.0.0.1:9/a.html',
+      delayMs: SITE_UNAVAILABLE_RECHECK_DELAYS_MS[0] as number,
+      attempt: 1,
+      maxAttempts: SITE_UNAVAILABLE_RECHECK_DELAYS_MS.length,
+    };
+    const second: RunNotice = { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 };
+
+    const code = await runAuditCommand(config, { stdout: stdout.output, stderr: stderr.output }, {
+      launchBrowser: failingLaunch,
+      clock: () => new Date('2026-09-25T00:00:02.000Z'),
+      now: () => 0,
+      createRunCoordinator: (dependencies) => ({
+        run: async () => {
+          dependencies.onNotice?.(notice);
+          dependencies.onNotice?.(second);
+          return auditRun();
+        },
+        checkpointConclusion: (): RunCoordinatorCheckpointConclusion => ({ action: 'NONE' }),
+      }),
+    });
+
+    expect(code).toBe(EXIT_CODES.COMPLETE);
+    expect(stderr.text()).toBe('');
+    const lines = stdout.text().split('\n');
+    const first = runNoticeLines(notice)[0] ?? '';
+    const last = runNoticeLines(second)[0] ?? '';
+    expect(lines.filter((line) => line === first)).toHaveLength(1);
+    expect(lines.filter((line) => line === last)).toHaveLength(1);
+    expect(lines.indexOf(CLI_TEXT.run.started)).toBeLessThan(lines.indexOf(first));
+    expect(lines.indexOf(first)).toBeLessThan(lines.indexOf(last));
+    expect(lines.indexOf(last)).toBeLessThan(lines.indexOf(CLI_TEXT.run.resultHeading));
   });
 });
 

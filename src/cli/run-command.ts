@@ -47,6 +47,7 @@ import {
   type RunCoordinatorCheckpointConclusion,
   type RunCoordinatorDependencies,
   type RunCoordinatorResumeInput,
+  type RunNotice,
 } from '../orchestration/run-coordinator.js';
 import { ArtifactWriteError, ArtifactWriter } from '../report/artifact-writer.js';
 import { createChatGptBundle, type ReadArtifactFile } from '../report/chatgpt-bundle.js';
@@ -65,6 +66,7 @@ import {
   joinLines,
   resumingRunLines,
   runDirectoryUnavailableLines,
+  runNoticeLines,
   runProgressLines,
   runResumeUnavailableLines,
   runStartedLines,
@@ -183,11 +185,18 @@ export async function runAuditCommand(
   }
   await streams.stdout.write(joinLines(runStartedLines(config)));
 
-  // 進み具合の行の書き込み。書き込みは、受け手が呼ばれた順に始まる（出力先は、書いた順に出す）。
+  // 進み具合の行と知らせの行の書き込み。書き込みは、受け手が呼ばれた順に始まる（出力先は、書いた順に出す）。
   let progressWritten: Promise<unknown> = Promise.resolve();
-  const onProgress = (report: RunProgressReport): void => {
-    const written = streams.stdout.write(joinLines(runProgressLines(report)));
+  const writeLines = (lines: readonly string[]): void => {
+    const written = streams.stdout.write(joinLines(lines));
     progressWritten = progressWritten.then(() => written);
+  };
+  const onProgress = (report: RunProgressReport): void => {
+    writeLines(runProgressLines(report));
+  };
+  // 知らせ（確かめ直しなど。サイトが応答しないときに Run を止める設計書 3.5.4）も、進み具合の行と同じ出し方で標準出力に書く。
+  const onNotice = (notice: RunNotice): void => {
+    writeLines(runNoticeLines(notice));
   };
 
   // 3. 保存のセッションと Run Coordinator。
@@ -203,9 +212,15 @@ export async function runAuditCommand(
     now: dependencies.now,
     outputDirectory,
     onProgress,
+    onNotice,
     checkpointSession: session,
     ...(resumeFrom === undefined ? {} : { resumeFrom }),
     ...(dependencies.stopSignal === undefined ? {} : { stopSignal: dependencies.stopSignal }),
+    // サイトの不調で止めたときの診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。Run Coordinator が渡す Run のディレクトリに、
+    // `ArtifactWriter` が書く（ARCH08。試行の番号は、ファイルの名前に使う）。失敗は Run Coordinator が握りつぶす。
+    writeSiteUnavailableDiagnostic: async (runDirectory, record, attemptNumber) => {
+      await writer.writeSiteUnavailableDiagnostic(runDirectory, record, attemptNumber);
+    },
   });
 
   // 4. Run の後。

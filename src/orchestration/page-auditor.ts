@@ -3,12 +3,15 @@ import type { BrowserContext, Page } from 'playwright';
 import { RuleEngine } from '../audit/rule-engine.js';
 import { ContextConstructionError, type BrowserContextFactory } from '../browser/context-factory.js';
 import { controlledScroll } from '../browser/controlled-scroll.js';
+import type { MainFrameLoadObservation } from '../browser/main-frame-load.js';
+import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { pageFailureReason } from '../browser/page-failure.js';
 import { waitForPageSettled } from '../browser/page-settling.js';
 import type { AuditConfig, Viewport } from '../config/types.js';
 import { viewportSizeFor } from '../config/viewport-size.js';
 import { artifactFilePath, screenshotRelativePath } from '../core/artifact-layout.js';
 import {
+  MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS,
   VIEWPORT_PROFILES,
   type EvidencePayloadByType,
   type EvidenceRecord,
@@ -16,13 +19,17 @@ import {
   type Finding,
   type IncompleteReason,
   type IncompleteReasonCode,
+  type InteractionCandidateNavigationDiagnostics,
+  type NavigationDiagnostics,
   type PageAuditOutcome,
   type PageAuditResult,
   type PageAuditStage,
   type PageId,
   type PartialFailureReason,
+  type StressWidthNavigationDiagnostics,
   type ViewportAuditResult,
   type ViewportAuditStatus,
+  type ViewportNavigationDiagnostics,
   type ViewportProfile,
 } from '../core/contracts.js';
 import { awaitBeforeDeadline } from '../core/deadline.js';
@@ -72,7 +79,7 @@ import {
 } from '../safety/safety-ledger.js';
 import { createEvidenceRecord } from './evidence-builder.js';
 import type { IdAllocator } from './id-allocator.js';
-import { navigatePage, type PageNavigationResult } from './page-navigation.js';
+import { navigatePage, navigationFailureDetail, type PageNavigationResult } from './page-navigation.js';
 import {
   closePassivePageAndContext,
   PassiveContextCloseDeadlineError,
@@ -87,6 +94,14 @@ import {
   type PassiveSessionDeadlineOptions,
   type ResolvedPassiveSessionDeadlines,
 } from './passive-session-open.js';
+import {
+  SITE_UNAVAILABLE_SKIP_REASON,
+  siteUnavailabilityOf,
+  siteUnavailableDetail,
+  siteUnavailableStageDetail,
+  type SiteUnavailability,
+  type SiteUnavailabilityStage,
+} from './site-availability.js';
 import { skippedPageResult } from './skipped-page.js';
 import { stageDeadline } from './stage-deadline.js';
 import { createStressSessionFactory, type StressSessionFactory } from './stress-session.js';
@@ -180,11 +195,36 @@ const SAFETY_VIOLATION_ABORT_CODE: Extract<IncompleteReasonCode, 'SAFETY_VIOLATI
  */
 export const SAFETY_VIOLATION_ABORT_REASON: IncompleteReason = Object.freeze({ code: SAFETY_VIOLATION_ABORT_CODE, detail: null });
 
+/**
+ * サイトの不調を検知したことを表す理由のコード（サイトが応答しないときに Run を止める設計書 3.1）。始めなかったビューポートの理由
+ * （`SITE_UNAVAILABLE_SKIP_REASON`。owner は `site-availability.ts`）のコードを使う。不調を検知したビューポートの理由と、幅の走査と
+ * Interaction の段階を途中で止めた理由の `detail` にも、同じ文字列を使う。
+ */
+const SITE_UNAVAILABLE_CODE = SITE_UNAVAILABLE_SKIP_REASON.code;
+
+/** Passive の各ビューポートの読み込みの段階の名前（不調を検知した段階。`SITE_UNAVAILABILITY_STAGES` の1つ）。 */
+const PASSIVE_STAGE: Extract<SiteUnavailabilityStage, 'passive'> = 'passive';
+/** 幅の走査の各幅の読み込みの段階の名前（不調を検知した段階。`SITE_UNAVAILABILITY_STAGES` の1つ）。 */
+const STRESS_LAYOUT_STAGE: Extract<SiteUnavailabilityStage, 'stress-layout'> = 'stress-layout';
+/** Interaction の各候補の読み込みの段階の名前（不調を検知した段階。`SITE_UNAVAILABILITY_STAGES` の1つ）。 */
+const INTERACTION_STAGE: Extract<SiteUnavailabilityStage, 'interaction'> = 'interaction';
+
 /** 違反を検出したため、幅の走査の次の幅のセッションを作らなかったことを、段階の例外として伝える（C18f）。 */
 class SafetyViolationAbortError extends Error {
   constructor() {
     super('a safety invariant violation was recorded; the next stress sweep session was not started');
     this.name = 'SafetyViolationAbortError';
+  }
+}
+
+/**
+ * サイトの不調を検知したため、幅の走査の次の幅のセッションを作らなかったことを、段階の例外として伝える（サイトが応答しないときに Run を
+ * 止める設計書 3.1。`SafetyViolationAbortError` と同じ形）。
+ */
+class SiteUnavailableAbortError extends Error {
+  constructor() {
+    super('site unavailability was detected; the next stress sweep session was not started');
+    this.name = 'SiteUnavailableAbortError';
   }
 }
 
@@ -201,6 +241,7 @@ export interface PageAuditAttempt {
    * ビューポートのスクリーンショットを `pages/<pageId>/retry-<attempt>/<ビューポート>/` に置く。
    * Desktop のスクリーンショットは、いつもの場所に置く。再試行の判断は Desktop のナビゲーションの失敗だけで決まり、ナビゲーションが
    * 失敗したビューポートは、スクリーンショットを撮らないためである。
+   * Desktop でサイトの不調を検知した場合は、呼ばない（次のビューポートを始めないため。サイトが応答しないときに Run を止める設計書 3.1）。
    */
   readonly precedesRetry: (desktop: ViewportAuditResult) => boolean;
 }
@@ -225,6 +266,10 @@ const INTERACTION_STOP_REASONS = Object.freeze({
   safety: SAFETY_VIOLATION_ABORT_CODE,
   /** 監査を始めた候補の数が、設定の上限（`crawl.maxInteractionsPerPage`）に達した（サイトへの負荷の制御の設計書 4.3）。 */
   limit: 'limit',
+  /**
+   * このビューポートで、サイトの不調を検知した（幅の走査か、前の候補の読み込み。サイトが応答しないときに Run を止める設計書 3.1）。
+   */
+  siteUnavailable: SITE_UNAVAILABLE_CODE,
 } as const);
 type InteractionStopReason = (typeof INTERACTION_STOP_REASONS)[keyof typeof INTERACTION_STOP_REASONS];
 
@@ -246,6 +291,68 @@ interface ViewportAuditOutcome {
   readonly findings: readonly Finding[];
   /** このビューポートの Safety の記録。Ledger の snapshot は、Context を閉じた後に取って集計する。 */
   readonly safety: ViewportSafetySources;
+  /** このビューポートで検知したサイトの不調（段階と判定の結果）。検知しなかった場合と、始めなかったビューポートは `null`（設計書 3.1）。 */
+  readonly siteUnavailability: DetectedSiteUnavailability | null;
+  /**
+   * このビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の要求の観察の結果（サイトの不調で
+   * 止めたときの診断の記録の設計書 2.1、2.2）。始めなかったビューポート（SKIPPED）は `null`。Passive の Context と page を作れなかった
+   * ビューポートは、`passive` が `null` で、幅と候補は空。
+   */
+  readonly navigationDiagnostics: ViewportNavigationDiagnostics | null;
+}
+
+/**
+ * 1つのビューポートの、幅の走査の幅ごとと Interaction の候補ごとの、ページ本体の要求の観察の結果の集め先（診断の記録の設計書 2.2 の
+ * 2026-10-07 の改訂）。読み込みを始めた幅と候補の受け口（`afterNavigation`、`afterTargetLoad`）が、読み込んだ順に加える。
+ * 幅は、記録の上限（`MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS`）まで加え、超えた幅の観察は加えない（候補は、候補の数の上限が、記録の
+ * 上限と同じなので、常に加える）。
+ */
+interface ViewportNavigationDiagnosticsSink {
+  readonly stressWidths: StressWidthNavigationDiagnostics[];
+  readonly interactionCandidates: InteractionCandidateNavigationDiagnostics[];
+}
+
+/** 検知したサイトの不調（サイトが応答しないときに Run を止める設計書 3.1）。`detail` の組み立ては `site-availability.ts` が行う。 */
+interface DetectedSiteUnavailability {
+  /** 不調を検知した段階。 */
+  readonly stage: SiteUnavailabilityStage;
+  /** 判定の結果（`siteUnavailabilityOf` が返したもの）。 */
+  readonly unavailability: SiteUnavailability;
+}
+
+/**
+ * 1つのビューポートで、最初に検知したサイトの不調を1つだけ持つ（サイトが応答しないときに Run を止める設計書 3.1）。
+ * Passive、幅の走査、Interaction の読み込みの観測を受け取り、`siteUnavailabilityOf` で判定する（判定は site-availability.ts だけが持つ）。
+ * 最初に検知したときだけ、ビューポートの理由 `SITE_UNAVAILABLE`（`detail` は `<段階>:<判定の詳細>`）を1件加える。後で検知した不調は
+ * 記録しない（同じビューポートの理由は1件だけである）。
+ */
+class ViewportSiteUnavailability {
+  readonly #reasons: IncompleteReason[];
+  #detected: DetectedSiteUnavailability | null = null;
+
+  constructor(reasons: IncompleteReason[]) {
+    this.#reasons = reasons;
+  }
+
+  /** 最初に検知した不調。検知していなければ `null`。 */
+  get detected(): DetectedSiteUnavailability | null {
+    return this.#detected;
+  }
+
+  /**
+   * `stage` の読み込みの観測を判定する。不調で、まだ検知していなければ、記録して理由を加える。この観測が不調なら真を返す。
+   */
+  observe(stage: SiteUnavailabilityStage, observation: MainFrameLoadObservation): boolean {
+    const unavailability = siteUnavailabilityOf(observation);
+    if (unavailability === null) {
+      return false;
+    }
+    if (this.#detected === null) {
+      this.#detected = Object.freeze({ stage, unavailability });
+      this.#reasons.push(Object.freeze({ code: SITE_UNAVAILABLE_CODE, detail: siteUnavailableStageDetail(stage, unavailability) }));
+    }
+    return true;
+  }
 }
 
 /**
@@ -340,6 +447,12 @@ export class PageAuditor {
    * 各ビューポートの Context は、途中で例外が起きても、必ず閉じてから返る（例外は呼び出し側に返す）。
    * Context と page の作成と終了は、期限付きで待つ（DEF-008）。作成の期限切れはビューポートの失敗（`DEADLINE_EXCEEDED`）、終了の
    * 期限切れは閉じる処理の失敗（`UNHANDLED_FAILURE`）として記録し、止まり続けない。遅れて届いた Context は、部品が閉じる。
+   * ビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）でサイトの不調を検知したら、同じページの次のビューポートを
+   * 始めず、理由 `SITE_UNAVAILABLE`（`detail` は `null`）の `SKIPPED` にする。結果の `siteUnavailableDetail` は、最初に検知した不調の
+   * 詳細（`<ビューポート>:<段階>:<判定の詳細>`）である（サイトが応答しないときに Run を止める設計書 3.1）。
+   * 結果の `navigationDiagnostics` は、各ビューポートの読み込み（Passive と、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の
+   * 要求の観察の結果である（始めなかったビューポートは `null`。サイトの不調で止めたときの診断の記録の設計書 2.2）。ページの結果と
+   * Evidence には入れない。
    */
   async audit(url: NormalizedHttpUrlEvidence, pageId: PageId, attempt?: PageAuditAttempt): Promise<PageAuditOutcome> {
     if (attempt !== undefined && (!isPositiveSafeInteger(attempt.attempt) || typeof attempt.precedesRetry !== 'function')) {
@@ -348,22 +461,37 @@ export class PageAuditor {
     const outcomes: ViewportAuditOutcome[] = [];
     // 再試行の前の試行なら、その試行の番号（スクリーンショットを `retry-<番号>` に置く）。Desktop の監査を終えた後に決める（DEF-007）。
     let screenshotRetryAttempt: number | null = null;
+    // 最初に検知したサイトの不調の詳細（設計書 3.1）。検知しなければ `null`。
+    let firstSiteUnavailableDetail: string | null = null;
     for (const profile of VIEWPORT_PROFILES) {
       // 違反を検出した後は、同じページの次のビューポートを始めない（Task 19 の前の整理の設計書 4.5）。最初のビューポートの前には
       // 確かめない（ページを始めるかは、Run Coordinator が決める）。
       if (outcomes.length > 0 && this.#safetyViolationRecorded()) {
-        outcomes.push(safetyAbortedViewportOutcome(url, pageId, profile));
+        outcomes.push(skippedViewportOutcome(url, pageId, profile, SAFETY_VIOLATION_ABORT_REASON));
+        continue;
+      }
+      // 前のビューポートでサイトの不調を検知した後は、次のビューポートを始めない（設計書 3.1）。違反の確かめの後に確かめる（違反と
+      // 両方なら、違反の SKIPPED を優先する）。始めないので、ページの読み込みの間隔の待ちも呼ばない。
+      if (firstSiteUnavailableDetail !== null) {
+        outcomes.push(skippedViewportOutcome(url, pageId, profile, SITE_UNAVAILABLE_SKIP_REASON));
         continue;
       }
       const outcome = await this.#auditViewport(url, pageId, profile, screenshotRetryAttempt);
       outcomes.push(outcome);
-      if (profile === 'desktop' && attempt !== undefined && attempt.precedesRetry(outcome.result)) {
+      if (outcome.siteUnavailability !== null) {
+        // 不調を検知したので、次のビューポートを始めない。そのため、Desktop でも、再試行の判断（`precedesRetry`）を呼ばない。
+        const { stage, unavailability } = outcome.siteUnavailability;
+        firstSiteUnavailableDetail = siteUnavailableDetail(profile, stage, unavailability);
+      } else if (profile === 'desktop' && attempt !== undefined && attempt.precedesRetry(outcome.result)) {
         screenshotRetryAttempt = attempt.attempt;
       }
     }
     const viewports = Object.fromEntries(
       VIEWPORT_PROFILES.map((profile, index) => [profile, (outcomes[index] as ViewportAuditOutcome).result]),
     ) as Record<ViewportProfile, ViewportAuditResult>;
+    const navigationDiagnostics = Object.fromEntries(
+      VIEWPORT_PROFILES.map((profile, index) => [profile, (outcomes[index] as ViewportAuditOutcome).navigationDiagnostics]),
+    ) as Record<ViewportProfile, ViewportNavigationDiagnostics | null>;
     const result: PageAuditResult = {
       schemaVersion: 'page-schema/1.0',
       pageId,
@@ -380,7 +508,7 @@ export class PageAuditor {
       ...sources.interactionSnapshots,
       ...sources.stressLedgers.map((ledger) => ledger.snapshot()),
     ]));
-    return deepFreeze({ result, safety });
+    return deepFreeze({ result, safety, siteUnavailableDetail: firstSiteUnavailableDetail, navigationDiagnostics });
   }
 
   /** 1つのビューポートの監査（設計書 4.5.2 の 1〜8）。 */
@@ -411,6 +539,12 @@ export class PageAuditor {
     const safety: ViewportSafetySources = { passiveLedgers: [], interactionSnapshots: [], stressLedgers: [] };
     let findings: readonly Finding[] = [];
     let navigation: PageNavigationResult | null = null;
+    // Passive の読み込みの間の、ページ本体の要求の観察の結果（診断の記録の設計書 2.2）。読み込みを始めなければ `null` のまま。
+    let passiveDiagnostics: NavigationDiagnostics | null = null;
+    // 幅の走査の幅ごとと、Interaction の候補ごとの観察の結果の集め先（診断の記録の設計書 2.2 の 2026-10-07 の改訂）。
+    const navigationDiagnostics: ViewportNavigationDiagnosticsSink = { stressWidths: [], interactionCandidates: [] };
+    // このビューポートで最初に検知したサイトの不調（Passive、幅の走査、Interaction のどこで検知しても1つだけ。設計書 3.1）。
+    const siteUnavailability = new ViewportSiteUnavailability(reasons);
     let failed = false;
     let stages: StageRunner | undefined;
     let context: BrowserContext | undefined;
@@ -480,20 +614,42 @@ export class PageAuditor {
         consoleHandle = ConsoleCollector.attach(activePage);
 
         // 3. ナビゲーションする。
+        // 直前に、ページ本体の要求の観察を始め（Guard とは別の CDP の session で `Network.enable` だけを行う）、直後に、読み込みの結果に
+        // よらず止める（サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）。観察を始める処理は、Context と page の作成と同じ期限
+        // （今から `sessionOpenTimeoutMs` 後と、ページの期限の早い方）までしか待たず、始められなくても読み込みは止めない（観察できなかった
+        // ことを結果に残す）。観察の結果は、監査の結果（ビューポートの状態、理由、Evidence、Finding）を変えない。
+        const diagnostics = await startNavigationDiagnostics(activePage, {
+          deadlineAtMs: passiveSessionOpenDeadlineAtMs({
+            timeoutMs: this.#deadlines.sessionOpenTimeoutMs,
+            notAfterMs: deadlines.pageAtMs,
+          }),
+        });
         const navigationStartedAtMs = this.#now();
         const navigationDeadlineAtMs = stageDeadline(deadlines.pageAtMs, navigationStartedAtMs, config.crawl.navigationTimeoutMs);
         // ナビゲーションは、期限（`timeoutMs`）を受け取り、例外を投げずに結果を返す。crash の段階を記すためだけに、処理中の段階にする。
         const passiveContext = context;
-        navigation = await runner.during('navigation', () => navigatePage(activePage, url, {
-          timeoutMs: Math.max(1, Math.ceil(navigationDeadlineAtMs - navigationStartedAtMs)),
-          ledger: factory.getSafetyLedger(passiveContext),
-          allowedQueryParameters,
-        }));
+        try {
+          navigation = await runner.during('navigation', () => navigatePage(activePage, url, {
+            timeoutMs: Math.max(1, Math.ceil(navigationDeadlineAtMs - navigationStartedAtMs)),
+            ledger: factory.getSafetyLedger(passiveContext),
+            allowedQueryParameters,
+          }));
+        } finally {
+          passiveDiagnostics = await diagnostics.finish();
+        }
 
         if (navigation.navigationOutcome !== 'OK') {
           failed = true;
           reasons.push(Object.freeze({ code: 'NAVIGATION_FAILED', detail: navigationFailureDetail(navigation) }));
-        } else {
+        }
+        // 読み込みの観測で、サイトの不調を判定する（サイトが応答しないときに Run を止める設計書 3.1）。不調なら、読み込みが `OK`
+        // （503 など）でも FAILED にし、理由 `SITE_UNAVAILABLE`（`<段階>:<判定の詳細>`）を加える。読み込みの失敗の理由は、そのまま残す。
+        if (siteUnavailability.observe(PASSIVE_STAGE, navigation.loadObservation)) {
+          failed = true;
+        }
+        // 読み込みが失敗した場合と、不調を検知した場合は、収集（4. と 5.）をしない（不調では、scroll などでページの部品の読み込みが
+        // さらに起きるのを避ける。設計書 3.1）。
+        if (navigation.navigationOutcome === 'OK' && siteUnavailability.detected === null) {
           // 4. DOM の準備を待ち、controlled scroll を行う。
           const settling = await attempt('settling', () => waitForPageSettled(activePage, {
             deadlineAtMs: this.#stageDeadline(deadlines.collectorAtMs, config.crawl.resourceSettlingTimeoutMs),
@@ -528,6 +684,8 @@ export class PageAuditor {
             screenshotRetryAttempt,
             reasons,
             safety,
+            siteUnavailability,
+            navigationDiagnostics,
             record,
             attempt,
             stages: runner,
@@ -588,12 +746,18 @@ export class PageAuditor {
       evidence,
       findings,
       safety,
+      siteUnavailability: siteUnavailability.detected,
+      navigationDiagnostics: {
+        passive: passiveDiagnostics,
+        stressWidths: navigationDiagnostics.stressWidths,
+        interactionCandidates: navigationDiagnostics.interactionCandidates,
+      },
     };
   }
 
   /** 設計書 4.5.2 の 5。設定で無効な段階は実行しない（4.5.5）。 */
   async #collect(state: CollectionState): Promise<void> {
-    const { url, pageId, profile, page, viewportSize, deadlines, reasons, safety, record, attempt } = state;
+    const { url, pageId, profile, page, viewportSize, deadlines, reasons, safety, siteUnavailability, record, attempt } = state;
     const config = this.#config;
     const collectors = this.#collectors;
     const deadlineAtMs = (): number => this.#stageDeadline(deadlines.collectorAtMs, null);
@@ -621,10 +785,22 @@ export class PageAuditor {
         // 余裕の分だけ前の `collectorAtMs`）を、それまでに走査の中で待った時間の分だけ延ばしたものである（幅の走査が自分の期限を
         // 延ばすのと同じ量。負荷の制御の設計書 4.4）。上限は幅ごとに変わるので、幅ごとにセッションの factory を作る。期限の注入
         // （R15r-4）も、そのまま渡す。作ったセッションの Ledger は、作成の途中で失敗した場合も含めて、作った順に残す。
+        // サイトの不調を検知した後も、次の幅を始めない（サイトが応答しないときに Run を止める設計書 3.1）。違反の確かめの次に確かめ、
+        // 不調を記録していれば、セッションを作らずに段階を止める（理由は `stress-layout:SITE_UNAVAILABLE`）。
+        // 読み込みの観察の結果（診断の記録の設計書 2.2）に付ける幅の値。走査は、幅ごとにセッションを作ってから、その幅を読み込むので、
+        // セッションを作るときの幅が、次に受け口に渡る観察の幅である。
+        // この対応付けは、collector（`collectStressLayout`）が、幅ごとに `createSession → beforeNavigation → 観察の開始 → goto →
+        // afterNavigation` を直列に行う（次の幅のセッションを、前の幅の受け口を呼ぶ前に作らない）ことを前提にしている（D3R の Minor-2）。
+        // 幅を並行に読み込む形に変えるときは、幅の値を受け口の引数で渡す形に改める。
+        let loadingStressWidth: number | null = null;
         const createSession: StressSessionFactory['createSession'] = async (viewport) => {
           if (this.#safetyViolationRecorded()) {
             throw new SafetyViolationAbortError();
           }
+          if (siteUnavailability.detected !== null) {
+            throw new SiteUnavailableAbortError();
+          }
+          loadingStressWidth = viewport.width;
           // 幅の走査の Context は、ページの読み込み直しなので、役割は `REVISIT` である（負荷の制御の設計書 4.7）。
           const sessions = createStressSessionFactory(this.#factory, {
             deadlines: this.#deadlines,
@@ -644,11 +820,21 @@ export class PageAuditor {
         // 幅のセッションの中で違反が起き、Guard がその Context を閉じた場合、段階は、そのセッションの後始末の失敗（Guard が無効にした
         // Context の page は閉じられない）で止まる。その場合も、違反で止まったことが分かる `stress-layout:SAFETY_VIOLATION_ABORT` にする
         // （C18i、RC18b の N2。違反の検出は、注入された確かめ（Run Coordinator が持つ）だけで行う）。
+        // 各幅の読み込みの観測は、受け口で受け取り、サイトの不調を判定して記録する（サイトが応答しないときに Run を止める設計書 2.1、3.1）。
+        // 読み込みの間のページ本体の要求の観察の結果は、幅の値を付けて、診断の記録のために集める（記録の上限まで。判定も、監査の結果も
+        // 変えない。診断の記録の設計書 2.2）。
         const swept = await attempt(
           'stress-layout',
           () => collectors.collectStressLayout(createSession, url, stressSweepWidths(config), {
             deadlineAtMs: deadlineAtMs(),
             beforeNavigation: () => this.#pacer.beforeNavigation(),
+            afterNavigation: (observation, diagnostics) => {
+              siteUnavailability.observe(STRESS_LAYOUT_STAGE, observation);
+              const { stressWidths } = state.navigationDiagnostics;
+              if (loadingStressWidth !== null && stressWidths.length < MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS) {
+                stressWidths.push({ width: loadingStressWidth, diagnostics });
+              }
+            },
           }),
           null,
           (error) => (this.#safetyViolationRecorded() ? SAFETY_VIOLATION_ABORT_CODE : stressSweepFailureReason(error)),
@@ -751,12 +937,14 @@ export class PageAuditor {
   /**
    * Interaction の段階（設計書 4.3.1、4.5.7、4.5.8）。Passive の page で候補を見つけ、除外されるものも含めて、
    * 見つけた順に `auditInteraction` に渡す（呼び出しの前に取り除かない）。渡すのは、1ページの上限（`crawl.maxInteractionsPerPage`）
-   * までで、残りは理由 `interaction:limit:remaining=<件数>` で記録する（サイトへの負荷の制御の設計書 4.3）。
+   * までで、残りは理由 `interaction:limit:remaining=<件数>` で記録する（サイトへの負荷の制御の設計書 4.3）。このビューポートでサイトの
+   * 不調を検知した後は、残りの候補を始めず、理由 `interaction:SITE_UNAVAILABLE:remaining=<件数>` で記録する（サイトが応答しないときに
+   * Run を止める設計書 3.1）。
    * 各候補の結果は、Evidence の部分を `interaction` の Evidence に記録し、Safety の snapshot は、INTERACTION の safety の
    * Evidence と違反の集計に使う。候補の結果の状態（NOT_VERIFIABLE など）では、ビューポートの状態を変えない。
    */
   async #auditInteractions(state: CollectionState): Promise<void> {
-    const { url, page, viewportSize, reasons, safety, record, attempt, stages } = state;
+    const { url, page, viewportSize, reasons, safety, siteUnavailability, record, attempt, stages } = state;
 
     // 候補の発見は Passive の page で行うので、Passive の段階と同じく、crash と競わせ、ページの期限まで待つ（4.5.7、R14r の Minor-1）。
     const discovery = await attempt('interaction-discovery', () => this.#collectors.discoverInteractionCandidates(page));
@@ -784,8 +972,14 @@ export class PageAuditor {
         reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.safety, candidates.length - index));
         return;
       }
+      // このビューポートでサイトの不調を検知した後は（幅の走査か、前の候補の読み込み）、次の候補を始めない（サイトが応答しないときに
+      // Run を止める設計書 3.1）。幅の走査で検知した場合は、候補を1つも始めない。
+      if (siteUnavailability.detected !== null) {
+        reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.siteUnavailable, candidates.length - index));
+        return;
+      }
       // 監査を始めた候補の数（失敗した候補も数える）が、1ページの上限に達したら、残りの候補を始めない（サイトへの負荷の制御の設計書
-      // 4.3）。確かめる順は、違反、上限、予算である。残りの候補は読み込まないので、ページの読み込みの間隔の待ちも呼ばない。
+      // 4.3）。確かめる順は、違反、サイトの不調、上限、予算である。残りの候補は読み込まないので、ページの読み込みの間隔の待ちも呼ばない。
       if (index >= this.#config.crawl.maxInteractionsPerPage) {
         reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.limit, candidates.length - index));
         return;
@@ -806,7 +1000,7 @@ export class PageAuditor {
       // 候補の監査は、候補ごとの期限（`deadlineAtMs`）を受け取って自分で守る。
       const audited = await attempt(
         'interaction',
-        () => this.#auditInteractionCandidate(url, candidate, viewportSize, deadlineAtMs, { reasons, safety }),
+        () => this.#auditInteractionCandidate(url, candidate, index, viewportSize, deadlineAtMs, state),
         null,
       );
       if (!audited.ok) {
@@ -829,13 +1023,17 @@ export class PageAuditor {
    * session を作る処理が `ContextConstructionError` を投げた場合は、Guard がまだ Context を閉じていなければ閉じてから、投げ直す。
    * エラーが持つ Ledger は、閉じた後の snapshot を INTERACTION の Safety の記録に加える（Guard が Context を閉じていた場合も含む）。
    * 閉じる処理の失敗は、場面 `interaction-context-close` の理由として記録する（設計書 4.3、4.5.5、R14 の I2、R14r の Important-1・Minor-3）。
+   * 候補の対象のページの読み込みの観測は、受け口で受け取り、サイトの不調を判定して記録する（サイトが応答しないときに Run を止める
+   * 設計書 2.1、3.1）。読み込みの間のページ本体の要求の観察の結果は、候補の順の番号（`index`。候補の発見の順で 0 から）を付けて、診断の
+   * 記録のために集める（判定も、監査の結果も変えない。診断の記録の設計書 2.2）。
    */
   async #auditInteractionCandidate(
     url: NormalizedHttpUrlEvidence,
     candidate: InteractionCandidate,
+    index: number,
     viewportSize: Viewport,
     deadlineAtMs: number,
-    sink: Pick<CollectionState, 'reasons' | 'safety'>,
+    sink: Pick<CollectionState, 'reasons' | 'safety' | 'siteUnavailability' | 'navigationDiagnostics'>,
   ): Promise<InteractionCandidateOutcome> {
     const factory = this.#factory;
     const deadlines = this.#deadlines;
@@ -854,6 +1052,10 @@ export class PageAuditor {
         freezeActivationTimeoutMs: deadlines.contextCloseTimeoutMs,
         // 作成の期限を過ぎた後に届いた `ContextConstructionError` の Context は、Passive と同じ部品で閉じる（設計書 4.2）。
         releaseLateSessionFailure: (error) => releaseLatePassiveContextFailure(factory, error, deadlines),
+        afterTargetLoad: (observation, diagnostics) => {
+          sink.siteUnavailability.observe(INTERACTION_STAGE, observation);
+          sink.navigationDiagnostics.interactionCandidates.push({ index, diagnostics });
+        },
       });
       return { kind: 'AUDITED', result };
     } catch (error) {
@@ -936,6 +1138,10 @@ interface CollectionState {
   readonly screenshotRetryAttempt: number | null;
   readonly reasons: IncompleteReason[];
   readonly safety: ViewportSafetySources;
+  /** このビューポートで最初に検知したサイトの不調。幅の走査と Interaction の読み込みの観測も、ここで判定して記録する（設計書 3.1）。 */
+  readonly siteUnavailability: ViewportSiteUnavailability;
+  /** 幅の走査の幅ごとと、Interaction の候補ごとの、ページ本体の要求の観察の結果の集め先（診断の記録の設計書 2.2）。 */
+  readonly navigationDiagnostics: ViewportNavigationDiagnosticsSink;
   readonly record: <TType extends EvidenceType>(type: TType, payload: EvidencePayloadByType[TType]) => EvidenceRecord;
   /**
    * 段階を実行する。`abandonAtMs` は、見放す時刻（省略するとページの期限。`null` なら見放さない）。
@@ -981,12 +1187,16 @@ function includesCloseDeadline(error: unknown): boolean {
 /**
  * 幅の走査の段階の例外から、理由を決める（RP18r の Minor-2、C18f）。
  * - 違反を検出したため、次の幅のセッションを作らなかった: `SAFETY_VIOLATION_ABORT`
+ * - サイトの不調を検知したため、次の幅のセッションを作らなかった: `SITE_UNAVAILABLE`（サイトが応答しないときに Run を止める設計書 3.1）
  * - セッションを閉じる処理の期限切れを含む: `CLOSE_DEADLINE_EXCEEDED`
  * - そのほか: `null`（既定の `pageFailureReason(page)`）
  */
 const stressSweepFailureReason: StageFailureReason = (error) => {
   if (error instanceof SafetyViolationAbortError) {
     return SAFETY_VIOLATION_ABORT_CODE;
+  }
+  if (error instanceof SiteUnavailableAbortError) {
+    return SITE_UNAVAILABLE_CODE;
   }
   return includesCloseDeadline(error) ? CLOSE_DEADLINE_EXCEEDED_REASON : null;
 };
@@ -1152,45 +1362,6 @@ async function snapshotCollector<TEvidence>(
   }
 }
 
-/** Chromium のネットワークのエラーのコード（例: `net::ERR_CONNECTION_REFUSED`）の形。 */
-const CHROMIUM_NET_ERROR_CODE_PATTERN = /\bnet::ERR_[A-Z0-9]+(?:_[A-Z0-9]+)*/u;
-
-/** `FAILED` の detail の、結果の種類とエラーのコードの区切り（`FAILED:<Chromium のエラーのコード>`）。 */
-const NAVIGATION_FAILURE_DETAIL_SEPARATOR = ':';
-
-/**
- * ナビゲーションの失敗の詳細（`navigatePage` の `failureDetail`）から、Chromium のネットワークのエラーのコードを取り出す
- * （Task 14〜17 の設計書 5.6.4）。最初に現れたコードを返す。コードがない場合は `null`。取り出す処理は、ここだけで行う。
- */
-export function chromiumNetErrorCode(failureDetail: string | null): string | null {
-  if (typeof failureDetail !== 'string') {
-    return null;
-  }
-  return CHROMIUM_NET_ERROR_CODE_PATTERN.exec(failureDetail)?.[0] ?? null;
-}
-
-/**
- * ナビゲーションが失敗したときの理由（`NAVIGATION_FAILED`）の `detail`（Task 14〜17 の設計書 4.5.4、5.6.4）。
- * - 期限切れ: `TIMEOUT`
- * - 外部へのリダイレクトの遮断: `BLOCKED_EXTERNAL_REDIRECT`
- * - そのほかの失敗: `FAILED:<Chromium のエラーのコード>`（例: `FAILED:net::ERR_CONNECTION_RESET`）。コードがない場合は `FAILED`。
- *
- * Run Coordinator は、この detail で再試行するかを判断する。`OK` は失敗ではないので `RangeError` を投げる。
- */
-export function navigationFailureDetail(
-  navigation: Pick<PageNavigationResult, 'navigationOutcome' | 'failureDetail'>,
-): string {
-  const { navigationOutcome } = navigation;
-  if (navigationOutcome === 'OK') {
-    throw new RangeError('navigation failure detail needs a failed navigation outcome');
-  }
-  if (navigationOutcome !== 'FAILED') {
-    return navigationOutcome;
-  }
-  const code = chromiumNetErrorCode(navigation.failureDetail);
-  return code === null ? navigationOutcome : `${navigationOutcome}${NAVIGATION_FAILURE_DETAIL_SEPARATOR}${code}`;
-}
-
 /** 幅の走査で調べる幅。設定の `stressWidths` から、主要な2つのビューポートの幅を除く（設計書 4.5.6）。 */
 function stressSweepWidths(config: AuditConfig): readonly number[] {
   const primaryWidths = new Set(VIEWPORT_PROFILES.map((profile) => viewportSizeFor(config, profile).width));
@@ -1237,20 +1408,24 @@ function screenshotCapturePaths(
 }
 
 /**
- * 違反を検出したため、始めなかったビューポートの結果（Task 19 の前の整理の設計書 4.5。C18f）。状態は `SKIPPED`、理由は
- * `SAFETY_VIOLATION_ABORT` で、Evidence、Finding、Safety の記録はない。ビューポートの結果の形は、監査しなかった URL の結果
- * （`skippedPageResult`）と同じものを使う。
+ * 始めなかったビューポートの結果。違反を検出した後（理由 `SAFETY_VIOLATION_ABORT`。Task 19 の前の整理の設計書 4.5。C18f）と、
+ * サイトの不調を検知した後（理由 `SITE_UNAVAILABLE`。サイトが応答しないときに Run を止める設計書 3.1）に使う。どちらも `detail` は
+ * `null`。状態は `SKIPPED` で、Evidence、Finding、Safety の記録と、ページ本体の要求の観察の結果（診断の記録の設計書 2.2）はない。
+ * ビューポートの結果の形は、監査しなかった URL の結果（`skippedPageResult`）と同じものを使う。
  */
-function safetyAbortedViewportOutcome(
+function skippedViewportOutcome(
   url: NormalizedHttpUrlEvidence,
   pageId: PageId,
   profile: ViewportProfile,
+  reason: IncompleteReason,
 ): ViewportAuditOutcome {
   return {
-    result: skippedPageResult(url, pageId, SAFETY_VIOLATION_ABORT_REASON).viewports[profile],
+    result: skippedPageResult(url, pageId, reason).viewports[profile],
     evidence: [],
     findings: [],
     safety: { passiveLedgers: [], interactionSnapshots: [], stressLedgers: [] },
+    siteUnavailability: null,
+    navigationDiagnostics: null,
   };
 }
 

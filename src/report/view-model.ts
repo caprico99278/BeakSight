@@ -128,6 +128,17 @@ export interface RunExecutionsView {
   readonly items: readonly [RunExecution, ...RunExecution[]];
 }
 
+/**
+ * サイトの不調で止めたこと（サイトが応答しないときに Run を止める設計書 3.4。SU4）。CLI の結果の、止めたことと再開のしかたの1行が使う。
+ */
+export interface SiteUnavailableStopView {
+  /**
+   * Run の理由のうち、コード `SITE_UNAVAILABLE` の最初のものの `detail`（最初に検知した失敗の技術的な詳細のまま。例:
+   * `desktop:passive:TIMEOUT`）。その理由がなければ `null`。
+   */
+  readonly detail: string | null;
+}
+
 /** 要約（設計書 6.1.4 の節1）。 */
 export interface RunSummaryView {
   readonly runId: RunId;
@@ -153,6 +164,12 @@ export interface RunSummaryView {
   readonly load: RunLoad;
   /** 実行（起動）の記録と、実行の回数と、再開の回数（R6）。 */
   readonly executions: RunExecutionsView;
+  /**
+   * サイトの不調で止めたこと（サイトが応答しないときに Run を止める設計書 3.4）。実行の記録の最後の実行の終わり方が
+   * `STOPPED_BY_SITE_UNAVAILABLE` のときだけ値を持ち、そうでなければ `null`（Run の理由ではなく、終わり方で決める）。出すかどうかは、
+   * このモデルの組み立ての中で1回だけ決める。CLI の結果の行は、この値を使い、判断し直さない。
+   */
+  readonly siteUnavailableStop: SiteUnavailableStopView | null;
   /** Run の未完了の理由（`RunSummary.incompleteReasons` の順）。 */
   readonly incompleteReasons: readonly ReasonView[];
   readonly unverifiedInteractionCount: number;
@@ -408,6 +425,20 @@ const copyFinding = (finding: Finding): Finding => ({ ...finding, evidenceRefs: 
 const executionsView = (executions: RunSummary['executions']): RunExecutionsView => {
   const [, ...resumedExecutions] = executions;
   return { count: executions.length, resumeCount: resumedExecutions.length, items: structuredClone(executions) };
+};
+
+/**
+ * サイトの不調で止めたことの表示（サイトが応答しないときに Run を止める設計書 3.4）。出すかどうかを決めるのは、ここだけである。
+ * - 実行の記録の最後の実行の終わり方が `STOPPED_BY_SITE_UNAVAILABLE` のときだけ、値を返す（Run の理由ではなく、終わり方で決める。
+ *   前の実行が不調で止まっていても、最後の実行がほかの終わり方なら `null`）。
+ * - `detail` は、Run の理由のうち、コード `SITE_UNAVAILABLE` の最初のものの `detail`（その理由がなければ `null`）。
+ */
+const siteUnavailableStopView = (run: RunSummary): SiteUnavailableStopView | null => {
+  if (run.executions.at(-1)?.endReason !== 'STOPPED_BY_SITE_UNAVAILABLE') {
+    return null;
+  }
+  const reason = run.incompleteReasons.find(({ code }) => code === 'SITE_UNAVAILABLE');
+  return { detail: reason?.detail ?? null };
 };
 
 /** Safety の事象の記録から取り出す項目（記録にない項目は `null`）。 */
@@ -766,6 +797,7 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
       },
       load: structuredClone(run.load),
       executions: executionsView(run.executions),
+      siteUnavailableStop: siteUnavailableStopView(run),
       incompleteReasons: run.incompleteReasons.map(reasonView),
       unverifiedInteractionCount: run.unverifiedInteractionCount,
       unverifiedInternalLinkCount: run.unverifiedInternalLinkCount,
