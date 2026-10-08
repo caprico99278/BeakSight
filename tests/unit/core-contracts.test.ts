@@ -939,14 +939,20 @@ describe('F12: types derived from the core value arrays', () => {
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_NAVIGATION_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_WEBSOCKET_REASONS>>();
+    // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた理由は、Passive と凍結の後の両方の一覧にある。
+    expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>().toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY'>();
+    // DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、Guard の遮断と出口の中継の拒否を区別する閉じた一覧。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
-      .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
+      .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_REQUEST_REASONS>>();
+    expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
+      .toEqualTypeOf<'INTERACTION_FROZEN' | 'INTERACTION_FROZEN_EGRESS' | 'EGRESS_UPSTREAM_DENIED'>();
     expectTypeOf<CoreEvidence.BlockedInteractionNavigationEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedPopupEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedInteractionWebSocketEvent['reason']>()
-      .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
+      .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_WEBSOCKET_REASONS>>();
+    expectTypeOf<CoreEvidence.BlockedInteractionWebSocketEvent['reason']>().toEqualTypeOf<'INTERACTION_FROZEN' | 'WORKER_CONNECT_POLICY'>();
     expectTypeOf<CoreEvidence.BlockedDownloadEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_DOWNLOAD_REASONS>>();
     expectTypeOf<CoreEvidence.ExcludedInteractionCandidateEvent['reason']>()
@@ -962,8 +968,11 @@ describe('F12: types derived from the core value arrays', () => {
     const reasonLists = {
       BLOCKED_REQUEST_REASONS: ['NON_READ_METHOD'],
       BLOCKED_NAVIGATION_REASONS: ['EXTERNAL_MAIN_FRAME_NAVIGATION'],
-      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET'],
+      // DEF-040（NP3）: `WORKER_CONNECT_POLICY` は、Worker の中の WebSocket を CSP で止めた理由。
+      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY'],
       INTERACTION_FROZEN_REASONS: ['INTERACTION_FROZEN'],
+      BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED'],
+      BLOCKED_INTERACTION_WEBSOCKET_REASONS: ['INTERACTION_FROZEN', 'WORKER_CONNECT_POLICY'],
       BLOCKED_DOWNLOAD_REASONS: ['PASSIVE_DOWNLOAD', 'INTERACTION_FROZEN'],
       // CC-014（P14a）: 外部への作用のため実行しなかった Interaction の候補の理由。
       BLOCKED_EXTERNAL_ACTION_REASONS: ['EXTERNAL_ACTION', 'DOWNLOAD'],

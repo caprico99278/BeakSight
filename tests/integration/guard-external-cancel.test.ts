@@ -694,6 +694,8 @@ async function startFakeGuard(respond: FakeResponder = () => undefined): Promise
     on: (event: string, listener: (value: unknown) => void) => contextEvents.on(event, listener),
     off: (event: string, listener: (value: unknown) => void) => contextEvents.off(event, listener),
     newCDPSession: async () => session as unknown as CDPSession,
+    // DEF-040: Guard は、ページを作る前に、Worker の中の WebSocket を止める CSP の初期化のスクリプトを Context に付ける（偽の Context では何もしない）。
+    addInitScript: async () => undefined,
     routeWebSocket: async () => undefined,
     route: async () => undefined,
     close: async () => undefined,
@@ -716,7 +718,11 @@ async function startFakeGuard(respond: FakeResponder = () => undefined): Promise
     page,
     context,
     commands,
-    emitCdp: (method, params) => sessionEvents.emit(method, params),
+    // DEF-042: この偽の Guard が送る `Fetch.requestPaused` は、すべて main frame の文書の要求なので、`resourceType` を `Document` にして渡す。
+    emitCdp: (method, params) => sessionEvents.emit(
+      method,
+      method === 'Fetch.requestPaused' ? { resourceType: 'Document', ...(params as object) } : params,
+    ),
     emitRequestFailed: (request) => contextEvents.emit('requestfailed', request),
   };
 }

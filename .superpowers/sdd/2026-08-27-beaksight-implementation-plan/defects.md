@@ -473,3 +473,154 @@
 - 原因（設計者の推測）: pacer が保証するのは、読み込みの開始（`beforeNavigation` の戻り）の間隔。サーバに届く時刻は、その後の Context の作成（Interaction で中央 113 ms）や、D3 で加わった観察の開始（ふだん 2 ms、混雑時は数十 ms）の分だけずれ、連続する読み込みでずれの差が 50 ms を超えると失敗する。production の間隔の保証は変わらない。
 - 方針の案: 観察の開始を pacer の待ちの前に移す（待ちの中に吸収される）、または、許容を Context の作成の揺らぎに合わせて見直す。
 - 状態: 記録だけ（全体の検証はやり直して PASS を確かめる）。
+
+## DEF-035 `page-auditor.test.ts` の DEF-008 の場面（Interaction の session を開く期限の後に `ContextConstructionError` が届く）が、全テストの同時の実行で、まれに失敗する（2026-10-08 R9 の後の全体の検証で登録）
+
+- 現象: `npm run verify` の全テストの中で、`closes the Context of a ContextConstructionError that arrives after the Interaction session open deadline` が `expected 0 to be greater than 0`（`sessionCalls` が 0。Interaction の session を開く処理まで進まなかった）で失敗した。5,302 件中この 1 件だけ。
+- 再現: 単独で 3 回、ファイル全体（47 件）で 1 回、いずれも PASS。CPU の混雑のとき（全テストの同時の実行）だけ起きる。
+- 推測（未確認）: 混雑で Passive か幅の走査がページの期限を使い切り、Interaction の段階が始まらなかった。テストが「Interaction の段階まで進む」ことを前提にしている。DEF-034 と同じく、時間に左右されるテストの揺らぎ。production の不具合を示すものではないと考えるが、未確認。
+- 影響: 全体の検証が揺らぎで FAIL し、ビルドが行われないことがある（R9 の後に、ビルドだけ実行し直した）。
+- 扱い: 登録だけ（ユーザーの指示まで直さない）。
+
+## DEF-036 Interaction でポップアップを遮断する場面で、負荷が高いときに、ポップアップの先への GET がサーバに届く（2026-10-08 Task 21 の Step 5 の全体の検証で登録。安全の Gate S04 に関わる）
+
+- 現象: `npm run verify` の全テストの中で、`tests/integration/isolated-interaction.test.ts` の `blocks an admitted /popup-button.html action before its target reaches the server` が失敗した。結果は `BLOCKED_BY_SAFETY`、`blockedPopups` の記録もあったが、サーバの記録に `GET /popup-target.html` があった（1943 行の確かめ）。違反の記録は、このテストでは確かめる前に失敗したので未確認。
+- 再現: 単独で 8 回とも PASS。全テストの同時の実行（CPU の混雑）で 1 回だけ起きた（R9 の後の 1 回目の全体の検証では起きていない）。同じ場面の Gate のテスト（`safety-gates.test.ts` の GATE-S04 Interaction）は、同じ全体の検証で PASS した。
+- 仕組み（読んだ範囲）: Guard は、凍結の段階（`isFrozenPhase`）では、Context の `route('**/*')` で、すべての HTTP の要求を止めて記録する。ポップアップは `page`/`popup` の事象で記録して閉じる。
+- 推測（未確認）: 混雑で、ポップアップの移動の要求が、凍結の段階の外（凍結が解けた後か、段階が変わる間）に出て、Passive の分類で許可された。あるいは、閉じる処理との競合。
+- 影響: 本来の監査対象のサイトの Run（起動 1〜9）では、ポップアップの遮断の記録は 0 件、違反も 0 件で、この場面は起きていない。届いたのは GET（読み取り）で、送信（POST など）ではない。ただし、Interaction の安全の不変条件（ポップアップの先へ要求を届けない）が、混雑のときに破れる可能性がある。
+- 扱い: 調査を実装者に依頼した（DEF-036-investigation）。
+- 調査の結果（2026-10-08。設計者が Playwright の該当箇所と記録を確かめた）: **Guard の振る舞いの不具合。重大度 Critical。** 凍結中のポップアップを Guard がすぐ `page.close()` すると、Playwright はそのページの要求で Context の route の処理を呼ばなくなり（`_onRoute` の `_closeWasCalled` の確かめ）、Chromium は target を閉じる途中で、止める前の要求をネットワークへ出すことがある。ポップアップの中のフォームの POST が 40 回中 37 回届いた（違反の記録 0）。ポップアップを閉じない対照では、GET 0/150、POST 0/100。ほかの場面（移動、WebSocket、ページの中の POST、`form target=_blank`、Passive の段階）は 0 件。実サイトの Run ではポップアップの遮断 0 件で、起きていない。
+- 修正: 設計書 `doc/design/2026-10-08-beaksight-def-036-frozen-popup-design.md`（凍結中のポップアップは記録だけで、閉じない。要求は Context の route で止める。Context と一緒に閉じる）。DEF-036-fix → DEF-036-gate → DEF-036R。Task 21 のチェックポイントと、実サイトの再開は、この修正とレビューの後。
+
+## DEF-037 Interaction の候補の読み込みの観察のテストが、ブラウザの時計と Node の時計の 1 ms のずれで、まれに失敗する（2026-10-08 DEF-036 の後の全体の検証で登録）
+
+- 現象: `tests/integration/isolated-interaction.test.ts` の `the observation of the target load of an interaction candidate` の 2 件（200 と 503）が、8590 行の `observationStartedAtMs <= hops[0].issuedAtMs` で、1 ms の差で失敗した（例: 1791439672627 と 1791439672626）。
+- 原因: `issuedAtMs` は CDP の `wallTime`（Chromium の壁時計の秒）を ms に丸めた値、`observationStartedAtMs` は Node の `Date.now()`（`src/browser/navigation-diagnostics.ts` の 95 行、411〜424 行）。2 つの時計と丸めの差で、前後が 1 ms 入れ替わることがある。記録の値そのものは設計どおり（診断の記録で、判定には使わない）。
+- 再現: 単独では PASS（5 件）。全体の検証の中で 1 回だけ起きた。
+- 扱い: テストの確かめ方の不具合（許容の幅のない、別の時計の比べ）。直し方の案: 丸めの幅（1 ms）を許容する、または開始の時刻と発行の時刻の比べを外して、発行の時刻が数であることだけを確かめる。登録だけ（ユーザーの指示まで直さない。DEF-034、DEF-035 と同じく、時間に左右されるテストの揺らぎ）。
+
+## DEF-038 Passive のページを閉じるときに、ページを離れるときの送信（`sendBeacon`、keepalive の `fetch` の POST）が Guard を通らずに届く（2026-10-08 独立レビュー DEF-036R の C1。Critical。修正の前からある）
+
+- 現象: `closePassivePageAndContext`（`src/orchestration/passive-session-close.ts`）は、Guard の付いたページを `page.close()`（`closePassiveGuardedPage`）で閉じてから Context を閉じる。ページの `pagehide` と `visibilitychange` の処理から送る beacon と keepalive の POST が、サーバに届く（レビュー担当 5/5、3/3、5/5。設計者も 3/3 と 3/3 を再現。`blockedRequests` の記録なし、違反 0）。Context だけを閉じた対照では 0（レビュー担当 5/5、設計者 3/3）。DEF-036 と同じ仕組み（`page.close()` の後は Playwright が route の処理を呼ばない）と推測。
+- 使う箇所: Passive のすべての読み込み（Page Auditor の Passive、幅の走査、PREFLIGHT、環境の確認、robots.txt と sitemap.xml）。Interaction の Context は、Context だけを閉じるので当たらない。
+- **本来の監査対象のサイトへの影響（推測。サイトの側では確かめられない）**: 実サイトのトップページでは、読み込みの間に Guard が、Google Analytics（`g/collect`）、Microsoft Clarity、Cloudflare の計測（対象のサイトの Origin の `/cdn-cgi/rum`）、プラットフォームの閲覧の記録（`page_views`）、Google 広告の計測への POST を止めていた（PAGE-000001 の Safety の Evidence）。これらの多くはページを離れるときにも送信する。Task 21 の Run（9 回の起動、Passive の読み込み 1,929 回）で、ページを閉じるたびに、これらの送信が出た可能性が高い。業務のデータ（予約など）を変える送信ではないが、計測のデータに監査の閲覧が加わった可能性がある。
+- 扱い: 修正の設計書 `doc/design/2026-10-08-beaksight-def-038-passive-page-close-design.md`。実サイトの再開は、DEF-038〜DEF-040 の修正と独立レビューの後。
+
+## DEF-039 凍結中に、ページ自身がポップアップを閉じると、ポップアップの中の送信が Guard を通らずに届く（2026-10-08 DEF-036R の C2。Critical。修正の前からある）
+
+- 現象: ページが `const p = open('about:blank')` の後、`p` に `pagehide` か `unload` の beacon と keepalive の POST を付け、`p.close()` で閉じる。同じ処理の中で閉じても（5/5）、300 ms 後に閉じても（8/8）、サーバに届く。結果は `blockedPopups` で BLOCKED、要求の記録なし、違反 0。DEF-036 の修正（Guard が閉じない）では防げない（ページの側から target を閉じるため）。
+- 扱い: 直し方の選択肢を調査する（DEF-039-040-research）。
+
+## DEF-040 Worker（Dedicated、Shared）の中の WebSocket の接続が、Passive でも Interaction でも止まらない（2026-10-08 DEF-036R の C3。Critical。修正の前からある）
+
+- 現象: Worker の中で開いた `new WebSocket(...)` の接続の要求（HTTP の Upgrade）が、毎回サーバに届く。`blocked*WebSockets` の記録なし、違反 0。Playwright の `routeWebSocket` はページに差し込むスクリプトで差し替える方式なので、Worker の中に効かないと推測。
+- 扱い: 直し方の選択肢を調査する（DEF-039-040-research）。
+
+## DEF-036R の Minor（記録）
+
+- M1: 凍結中のポップアップの about:blank の文書から出した `fetch`、beacon、keepalive、ping、Worker の `fetch` の POST は届かないが、`blockedInteractionRequests` に記録されない（止めたまま Context と破棄されると推測）。
+- M2: GATE-S04 の POST の場面が route の記録を求めない分担を、コメントに書く。
+- M3: `src/report/chatgpt-bundle.ts` の 2 行目のコメントの古いバンドルの名前。
+- M4: CC-048（最後の実行を選ぶ処理が 2 か所）。
+- M5: `bundleFileName` は `Date` で読める文字列なら ISO 8601 でなくても受ける（入力はスキーマで確かめた値）。
+
+## DEF-041 Context を閉じる処理と、Run 全体のキャッシュへの書き込みの競争（2026-10-08 DEF-038-fix の報告の発見事項 1。負荷に関わる。監視の項目）
+
+- 内容: factory は、`requestfinished` の後に `response.body()` を非同期に読んでからキャッシュに入れる（PC1）。DEF-038 で、Guard の付いた Passive のページを個別に閉じずに、すぐ Context を閉じるようになったので、本文を読み終える前に Context を閉じることがある。前は、ページを閉じる間に読み終わっていたと推測。
+- 現れ方: `tests/component/context-factory.test.ts` の L5b（読み込みの直後に閉じる）が 3 回中 1 回失敗した。テストの側で、キャッシュに入ったことを待ってから閉じる形に直した。
+- 影響（推測）: Page Auditor は、読み込みの後に Evidence を集めてから閉じるので、影響は小さいと推測。キャッシュに入らなかった分は、次のページで取り直すので、サイトへの転送量が増える方向。未確認。
+- 扱い: 次の実サイトの起動の前に、fixture の Run でキャッシュから返した件数を、DEF-038 の前の記録と比べて確かめる。差があれば、factory が Context を閉じる前に、読みかけの本文を短い期限で待つ設計を書く。
+
+## DEF-042 Passive で、ページ自身が別の文書へ移動するとき、ページを離れるときの送信（beacon、keepalive の POST）が Guard を通らずに届く（2026-10-08 独立レビュー T21R の C1。Critical。修正の前からある）
+
+- 現象: Guard の付いた Passive のページで、ページ自身の `location.href` による移動でも、`goto` による 2 回目の移動でも、`pagehide` の `sendBeacon` と keepalive の `fetch` の POST がサーバに届く（headless shell と CLI の Chromium の両方。15 回で 60 件と 45 件）。`blockedRequests` 0、違反 0。読み込みの途中の POST は遮断・記録される（対照）。
+- 条件: BeakSight 自身の移動は about:blank から 1 回だけなので起きない。サイト自身のクライアント側の移動（JS のリダイレクト、meta refresh など）で起きる。Interaction の凍結の前にも起きうる（推測）。
+- **実サイトの記録（設計者の確認）**: 237 ビューポート（119 ページ）のうち、main frame の文書の要求が 1 つだけのものが 223、サーバのリダイレクトの連鎖（3xx の後に 1 つ）が 14、**文書が確定した後にページの中から別の文書へ移動したものは 0**。この経路は、実サイトの Run では起きていない。
+- 原因（推測）: 離れる文書の要求で Playwright が route の処理を呼ばない（DEF-036、DEF-038 と同じ仕組み）。Guard の CDP の Fetch は Document だけを横取りするので、keepalive の POST を見ていない。
+- 扱い: 直し方を調査する（DEF-042-research）。候補: Guard の CDP の Fetch をすべての要求に広げる（離れる文書の keepalive が `Fetch.requestPaused` に来るか）、Passive での 2 回目の main frame の移動を要求の段階で止める（文書が確定しないので `pagehide` が起きない。監査の結果への影響あり）、Chromium の設定。
+
+## DEF-038 の追記（2026-10-08 T21R の I1）
+
+- レビュー担当の実験: 旧経路（ページを閉じてから Context を閉じる）で、headless shell では 15 回中 12 件届いたが、**CLI の Chromium（`channel: 'chromium'` の `chrome.exe` の新しい headless）では 0 件**。新経路（Context だけ）はどちらも 0。Task 21 は headed で実行したので、headed で Context を破棄したときに `pagehide` が出るかは未確認。
+- 訂正: 台帳と `progress.md` の「実サイトで計測の送信が出た可能性が高い」は強すぎる。正しくは「可能性がある（CLI の Chromium の headless では 0/15。headed は未確認）」。
+- DEF-038 の Gate は headless shell で RED を検出した。CLI の起動の設定（`chromiumLaunchOptions`）でも Gate を動かすことは、DEF-030 の扱いとあわせて検討（監視の項目）。
+- 修正の状態: 修正済み（2026-10-08 DEF-038-fix。RED: 3 場面とも 5/5 届いた（headless shell）。GREEN: 3 回のくり返り PASS。全体の検証 126 ファイル 5,342 件 PASS、ビルド PASS。`verify-20261008-def038.log`）。
+
+## DEF-043 Guard が main frame の移動を `BlockedByClient` で止めると、エラーページが確定して DOM が消える（2026-10-08 DEF-042 の調査の実験 7 で登録。監査の証拠の質の問題。監視の項目）
+
+- 現象: Guard が許可 Origin の外への main frame の移動（`EXTERNAL_MAIN_FRAME_NAVIGATION`）を `Fetch.failRequest`（`BlockedByClient`）で止めると、`chrome-error://chromewebdata/` のエラーページが確定し、元の文書の DOM が消え、`pagehide` が起きる。`Aborted` なら、移動は静かに失敗して DOM が残る。
+- 影響: 送信の漏れは DEF-042 の修正で止まる。残るのは、止めた後の監査の証拠（DOM、スクリーンショット）が壊れる点。
+- 扱い: 今は直さない。`Aborted` への変更は、DEF-027 の外部からの取り消し（`ERR_ABORTED`）の判定と `expectedCdpFailures` の `errorText` の対応に関わるので、設計を書いてから。
+
+## DEF-044 Shared Worker の中の fetch / XHR の POST が、Passive と凍結の前の Interaction で Guard を通らずに届く（2026-10-08 独立レビュー NPR-T21R2 の C1。Critical。修正の前からある）
+
+- 現象: blob の SharedWorker からの `fetch` POST、XHR POST、keepalive POST が、Passive で両方の Chromium とも 6/6 届く。`blockedRequests` 0、違反 0。凍結の前の Interaction（中継 `OPEN`）でも届く。凍結の後だけ中継が止める。対照の Dedicated Worker は route で止まり記録される。
+- 原因（推測）: Playwright 1.62.1 は `shared_worker` の target に session を付けないので、`context.route` が効かない。Guard の CDP の横取りは page と OOPIF の session だけ。
+- 実サイト: Shared Worker を使っているかは未確認。Playwright が target を付けないので、network の Evidence にも載らず、記録からは判別できない（推測）。
+- 扱い: 修正の設計書 `doc/design/2026-10-08-beaksight-def-044-046-review-fixes-design.md`。Task 21 を閉じる前に直す。
+
+## DEF-045 Interaction の凍結の段階で、owner の close を始めた後の「閉じた target」による `Fetch.failRequest` の失敗が違反になる（2026-10-08 NPR-T21R2 の I1。Important）
+
+- 現象: 1 ms ごとに beacon と keepalive の POST を出すページで、凍結 → `session.close()` を 10 回行うと、両方の Chromium で 3/10 に `INTERACTION_CDP_FAIL_REQUEST_FAILED: cdpSession.send: Target page, context or browser has been closed` が記録され、`close()` が「invalidated」で reject。届いた要求は 0（安全の弱まりではない）。
+- 原因: `handlePausedRequest` は `isFrozenPhase` の分岐を `isClosingOrInvalidatingPhase` より先に通し、凍結の分岐の失敗は `isClosedTargetFailure` を見ない（DEF-042 の設計書 2.4 の「閉じる途中の閉じた失敗は違反にしない」からの逸脱）。Document の凍結の分岐も同じ形（既存）。
+- 影響: ポーリングのあるページの Interaction で、閉じる瞬間の要求により Run が `ABORTED_BY_SAFETY` になりうる（誤検出）。
+- 扱い: 同上の設計書。
+
+## DEF-046 Chromium 自身の通信（`CONNECT www.google.com:443`）が中継の記録に載り、Interaction の結果を `BLOCKED_BY_SAFETY` にしうる（2026-10-08 NPR-T21R2 の I2。Important）
+
+- 現象: CLI の Chromium（`chrome.exe`）は、Interaction の Context の中継へ `CONNECT www.google.com:443` を毎回 2〜4 回出し、凍結の後にも 1 回出て `INTERACTION_FROZEN_EGRESS` になる。`isolated-auditor.ts` の `hasFreezeEvent` は `blockedInteractionRequests` が 1 件以上なら `BLOCKED_BY_SAFETY` にするので、ページの操作と関係なく結果が BLOCKED になりうる（headless shell では出ない。production の方針では凍結の前の CONNECT は転送され、`freeze()` でトンネルが切れた後に再接続すれば同じ記録になる。推測）。
+- 影響: Interaction の結果の区分の誤り（安全の弱まりではない）。production では、BeakSight の Node の process が Chromium の代わりに外部へ TCP 接続を開く（露出は増えないが新しい振る舞い）。
+- Chromium 自身が www.google.com へ接続する理由は未調査（Playwright の既定の引数で止まっていない何か。推測）。これは中継の前からある振る舞い。
+- 扱い: 同上の設計書（結果の区分から中継の記録を外す）。Chromium 自身の通信を止める引数の調査は、別の監視の項目（DEF-047）。
+
+## DEF-047 CLI の Chromium（`chrome.exe`）が、監査と関係なく www.google.com へ接続する（2026-10-08 登録。監視の項目）
+
+- 現象: Interaction の Context ごとに `CONNECT www.google.com:443` が 2〜4 回（中継の記録で観測。DEF-039-040 の調査、NPR-T21R2）。headless shell では出ない。
+- 扱い: 止める起動の引数を調べる（Playwright の既定の `--disable-background-networking` などで止まっていない通信の正体）。Task 21 の後。
+
+## NPR-T21R2 の Minor（記録）
+
+- M1: テストの既定の headless shell では speculation rules の prefetch/prerender が動き、Passive で GET が記録なしに届く（CLI の Chromium は DEF-023 の引数で止まる）。テストの起動の補助に、先読みを止める引数を含めるかは別途（監視）。
+- M2: DEF-036・038・039 の Gate は headless shell だけ（DEF-040・042 は両方）。
+- M3: T21R の M1（Architecture の検査の抜け道。grep で該当 0 件）、M4（`site-metadata.ts` の変更に問題なし）、M5（DEF-041 は安全に影響なし）は、設計者が受け取ったまま記録していなかった → ここに記録。
+- M4: `WORKER_CONNECT_POLICY_INIT_SCRIPT` の MutationObserver は head のない文書（SVG/XML）で解除されない（軽微）。
+
+## DEF-048 `cli-interrupt-windows.test.ts` の再開の場面が、全テストの同時の実行（CPU の混雑）で、まれに終了コード 2 になる（2026-10-08 NP5 の後の全体の検証で登録。揺らぎ）
+
+- 現象: 1 回目の Ctrl+C の後の再開で、「中断しなかった Run と同じ終了コード（0）」の期待に対し 2（`PARTIAL`）。同じ describe の「同じページと状態」も失敗。単独では 16 件 PASS。
+- 推測: 混雑で、再開した Run のページの監査が期限を過ぎ、一部未完了になった（DEF-034・035・037 と同じ、時間に左右されるテストの揺らぎ）。安全の Gate ではない。
+- 扱い: 登録だけ。
+
+## DEF-049 Service Worker の遮断（`serviceWorkers: 'block'`）をページが回避すると、Service Worker の中の POST が Passive でも凍結の前でも届く（2026-10-08 独立レビュー NPR2 の C1。Critical。修正の前からある）
+
+- 現象: Playwright の `serviceWorkers: 'block'` は、init script で `navigator.serviceWorker.register` をインスタンスのプロパティとして上書きするだけ。ページが `ServiceWorkerContainer.prototype.register.call(navigator.serviceWorker, '/sw.js')` を呼ぶ（または `delete navigator.serviceWorker.register` の後に呼ぶ）と登録が成功し、install と activate の中の `fetch` POST がサーバに届く（両 Chromium、Passive と凍結の前で 12/12、4/4）。`blockedRequests` 0、違反 0。凍結の後は中継が Service Worker の script の GET を拒む（Guard の CDP と route は見ない）。GATE-S08 は通常の呼び出しだけを確かめている。
+- 引き金: ページが Playwright の上書きを迂回する書き方をしたときだけ。普通のサイトの書き方では起きない（推測）。実サイトで起きたかは不明。
+- 扱い: 設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` の 5 に追補。Task 21 を閉じる前に直す。
+
+## DEF-050 Document の閉じる途中の分岐（`failPausedDocumentForLifecycle`）が、閉じた target による失敗を違反にする（2026-10-08 NPR2 の I1。Important。DEF-045 と同種）
+
+- 現象: iframe の `src` を 1 ms ごとに変えるページで Context を閉じると、`CDP_LIFECYCLE_FAIL_REQUEST_FAILED: ... has been closed` が記録される（headless shell 3/20、CLI の Chromium 4/20。凍結の直後に閉じた場面でも 1/20）。届いた POST は 0。
+- 原因: DEF-042 の設計書 2.4 の「閉じる途中の閉じた失敗は違反にしない」が Document の分岐に及んでいない（DEF-042-fix で「Document の横取りは変えない」としたため）。
+- 扱い: 同上の設計書の 6。
+
+## NPR2 の Minor（記録）
+
+- M1: 自己検査は、所有する Context がない時点の通知を捨てる（印を残さない）。実験では起きていない（閉じる直前に Shared Worker を作る 50 回すべて違反）。理論上の抜け道。
+- M2: 中継の記録だけになる場面（SVG 文書の Worker の WebSocket、Service Worker の script の GET）では、結果が BLOCKED にならない（安全には影響なし。区分が甘い）。
+- M3: Chromium 自身の `GET /favicon.ico` が凍結の後に `INTERACTION_FROZEN` で記録される（凍結が読み込みの直後のとき）。中継の `CONNECT www.google.com:443` の記録は `SAFETY_NON_READ_REQUEST_BLOCKED` の Finding になる（推測）。`catalog.ts` の説明に Chromium 自身の通信を含むことを書く（NP6 で）。
+- M4: headed での `--disable-shared-workers` は未確認。
+
+## DEF-051 iframe の `src` を 1 ms ごとに変えるページで、Guard がリダイレクトの対応付けの上限（`REDIRECT_PREDECESSOR_LIMIT_REACHED`）で Context を無効にすることがある（2026-10-08 NP6 の発見事項。監視の項目。DEF-014 の 1 と同じ種類）
+
+- 現象: DEF-050 の実機のテスト（iframe の移動を高頻度でくり返すページ）で、閉じる前の Passive の段階に違反 `REDIRECT_PREDECESSOR_LIMIT_REACHED` が記録され Context が無効になった（Interaction 120 回中 1 回、Passive 1 回）。
+- 推測: 取り消された iframe の移動は応答を受けないので、対応付けの記録（上限 64、保持 1 秒）が埋まる。
+- 影響: iframe の移動を高頻度でくり返すページで、安全側に倒れて Run が止まりうる（偽の違反。DEF-014 の監視の項目と同じ）。実サイトでは起きていない（違反 0）。
+- テストでの扱い: DEF-050 の実機のテストは、違反がこの 1 件だけの回を「除いた回」として出力に残し、回数の半分未満であることを確かめる（NPR3 で弱体化ではないと判断）。除いた回の数は `--reporter=verbose` でだけ見える（NPR3 の Minor-2）。
+- 扱い: 登録だけ。
+
+## NPR3 の Minor（記録。2026-10-08）
+
+- Minor-1: `catalog.ts` の `blockedInteractionRequests` の説明は、中継の記録に Chromium 自身の通信が含まれることは書いたが、`INTERACTION_FROZEN`（Guard の記録）にも Chromium 自身の `GET /favicon.ico` が含まれうることと、「Guard を通らずに出た要求の証拠」の書き方の整合は、設計書 7 に「書かない」と記録（Chromium 自身の通信の正体は DEF-047 で調べてから直す）。
+- Minor-2: DEF-050 の「除いた回」と DEF-049 の自己検査の届いた要求の数は `console.info` で、`--reporter=verbose` のときだけ出る。DEF-051 の監視は verbose で実行する（台帳の DEF-051 に追記）。
+- Minor-3: GATE-S08 の回帰は top・同じ Origin の iframe・about:blank × 2 経路。ポップアップと OOPIF の経路は実験のみ（将来の候補）。

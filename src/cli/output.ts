@@ -8,12 +8,13 @@
  */
 import type { ConfigError, ConfigErrorKind } from '../config/config-error.js';
 import type { AuditConfig } from '../config/types.js';
-import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath } from '../core/artifact-layout.js';
+import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath, bundleFileName } from '../core/artifact-layout.js';
 import { RUN_STATUSES, type RunProgressReport, type RunStatus } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace } from '../core/text.js';
 import {
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SEVERITY_CATALOG,
   SEVERITY_GROUP_CATALOG,
@@ -54,7 +55,7 @@ import {
   unreadableCheckpointText,
   versionDifferenceText,
 } from '../presentation/messages.js';
-import type { RunSummaryView } from '../report/view-model.js';
+import type { RunExecutionsView, RunSummaryView } from '../report/view-model.js';
 import { CLI_COMMANDS, CLI_OPTION_NAMES } from './arguments.js';
 import {
   CONFIG_ERROR_EXIT_CODE,
@@ -232,9 +233,19 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
 }
 
 /**
+ * 最後の実行の終わりの時刻（表示用モデルの `executions.items` の最後の `finishedAt`）。ChatGPT 用バンドルの名前を決める時刻で、`run` の
+ * 結果のバンドルの行と、`finishAuditRun` がバンドルを書くときの名前の両方が、これを使う（ChatGPT 用バンドルのファイル名の設計書 2.1、2.3）。
+ */
+export function lastExecutionFinishedAt(executions: Pick<RunExecutionsView, 'items'>): string {
+  const [firstExecution, ...laterExecutions] = executions.items;
+  return (laterExecutions.at(-1) ?? firstExecution).finishedAt;
+}
+
+/**
  * `run` の結果の行（設計書 第7章）。値は、表示用モデルの `summary` から取る。
  * - Run Status の日本語のラベル（値そのものを添える）
- * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス
+ * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス。バンドルの名前は、最後の実行の終わりの時刻
+ *   （`lastExecutionFinishedAt`）から `bundleFileName` で作る（ChatGPT 用バンドルのファイル名の設計書 2.3。日時の書式を作り直さない）
  * - ページの網羅（発見、監査、一部未完了、失敗、スキップ）
  * - severity の区分（サイト品質、Safety）ごとの、severity ごとの件数
  * - サイトへの負荷（ページの読み込みの回数と、許可 Origin への要求の件数と1分あたりの最大。サイトへの負荷の制御の設計書 4.5）。
@@ -242,8 +253,12 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
  *   HTML レポートと共通の `formatRequestsWithPeak` で示す（L7）
  * - 実行の記録（実行の回数と再開の回数。例: `実行: 3回、再開 2回`。中断した Run の再開の設計書 4.8 の「表示」。R6）。負荷の行の後、
  *   未完了の理由の行の前に置く（HTML レポートの要約の小節の順と同じ）。実行が1回でも示す。回数は、表示用モデルの値を `formatTimes` で示す
- * - サイトの不調で止めた場合は、止めたことと再開のしかたの1行（サイトが応答しないときに Run を止める設計書 3.4）。実行の記録の行の次、
- *   未完了の理由の行の前に置く。出すかどうかと詳細は、表示用モデルの `siteUnavailableStop` のまま（ここで判断し直さない）
+ * - この起動の終わり方（例: `この起動の終わり方: 実行時間の上限で停止（STOPPED_BY_RUNTIME_LIMIT）`。中断した Run の再開の設計書 4.8 の
+ *   2026-10-08 の追補。R9）。実行の記録の行の次に、毎回置く（`COMPLETED` でも示す）。終わり方は、表示用モデルの
+ *   `executions.lastEndReason` のまま（ここで決め直さない）。ラベルは表示カタログで引き、Run の状態の行と同じ `labelWithCodeText` で
+ *   コードを添える。説明の文は付けない
+ * - サイトの不調で止めた場合は、止めたことと再開のしかたの1行（サイトが応答しないときに Run を止める設計書 3.4）。この起動の終わり方の
+ *   行の次、未完了の理由の行の前に置く。出すかどうかと詳細は、表示用モデルの `siteUnavailableStop` のまま（ここで判断し直さない）
  * - 未完了の理由がある場合は、その件数
  */
 export function runSummaryLines(summary: RunSummaryView, runDirectory: string): readonly string[] {
@@ -263,7 +278,7 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
     cliFieldText(RUN_SUMMARY_TEXT.runStatus, labelWithCodeText(RUN_STATUS_CATALOG[summary.runStatus].label, summary.runStatus)),
     cliFieldText(CLI_TEXT.run.outputDirectory, runDirectory),
     cliFieldText(CLI_TEXT.run.report, artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.report)),
-    cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.bundle)),
+    cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, bundleFileName(lastExecutionFinishedAt(executions)))),
     cliFieldText(
       RUN_SUMMARY_TEXT.coverageHeading,
       listText([
@@ -285,6 +300,10 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
     cliFieldText(
       CLI_TEXT.run.executions,
       listText([formatTimes(executions.count), cliCountText(CLI_TEXT.run.resumes, formatTimes(executions.resumeCount))]),
+    ),
+    cliFieldText(
+      CLI_TEXT.run.lastEndReason,
+      labelWithCodeText(RUN_EXECUTION_END_REASON_CATALOG[executions.lastEndReason].label, executions.lastEndReason),
     ),
     ...(summary.siteUnavailableStop === null ? [] : [siteUnavailableStopText(summary.siteUnavailableStop.detail)]),
     ...(summary.incompleteReasons.length > 0

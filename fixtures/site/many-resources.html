@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Many Resources</title></head>
+  <body>
+    <h1>Fixture Many Resources</h1>
+    <p>This page loads many images at once (more than the Guard's general task limit of 256), each with a distinct URL.</p>
+    <script>
+      // DEF-042-fix-round-1（設計書 2.4「Guard の作業の上限」）: Guard の CDP の横取りがすべての要求を作業にするので、一度に多くの資源を
+      // 読むページで、作業の上限（`MAX_PENDING_GUARD_REQUEST_TASKS`）を超えないことを確かめる。同じ画像を、別のクエリで RESOURCE_COUNT 回
+      // 読む（クエリが違えば別の要求になる）。読み終えた（load か error）数を html 要素の data-settled に、総数を data-total に残す。
+      const RESOURCE_COUNT = 700;
+      const root = document.documentElement;
+      root.dataset.total = String(RESOURCE_COUNT);
+      root.dataset.settled = '0';
+      let settled = 0;
+      const onSettled = () => {
+        settled += 1;
+        root.dataset.settled = String(settled);
+      };
+      for (let index = 0; index < RESOURCE_COUNT; index += 1) {
+        const image = new Image();
+        image.addEventListener('load', onSettled);
+        image.addEventListener('error', onSettled);
+        image.src = `/unsized-image.svg?i=${index}`;
+        document.body.append(image);
+      }
+    </script>
+  </body>
+</html>

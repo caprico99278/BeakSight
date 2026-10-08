@@ -1,14 +1,17 @@
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Browser, BrowserContext, CDPSession, Download, Page, Request, Route, WebSocketRoute } from 'playwright';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { INVALID_INTERCEPTION_ID_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
 import type { CachedResource } from '../../src/browser/resource-delivery.js';
+import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
-import { MAX_URL_LENGTH } from '../../src/core/limits.js';
+import { MAX_PENDING_GUARD_REQUEST_TASKS, MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
+import { closePassivePageAndContext } from '../../src/orchestration/passive-session-close.js';
 import {
   awaitPassiveRequestGuardReady,
   assertPassiveRequestGuardActive,
@@ -17,13 +20,19 @@ import {
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
+  SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT,
+  WORKER_CONNECT_POLICY,
+  WORKER_CONNECT_POLICY_INIT_SCRIPT,
+  workerConnectPolicyViolationUrl,
   type GuardResourceDelivery,
   type PassiveRequestGuardOptions,
 } from '../../src/safety/passive-request-guard.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS, NO_NON_READ_REQUESTS, openServerWindow } from '../helpers/gate-harness.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 /** Chromium がナビゲーションの失敗の後に表示するエラーのページの URL。 */
 const CHROMIUM_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
@@ -147,6 +156,10 @@ interface GuardHarness {
   readonly cdpCloseHandler: (() => void) | undefined;
   /** Guard の page の session の `Network.loadingFailed` の listener（DEF-026。取り消しの証拠）。 */
   readonly cdpLoadingFailedHandler: ((event: FakeCdpLoadingFailedEvent) => void) | undefined;
+  /** Guard の page の session の `Network.requestWillBeSent` の listener（DEF-027、DEF-042 の CORS の事前確認の判定）。 */
+  readonly cdpRequestWillBeSentHandler: ((event: unknown) => void) | undefined;
+  /** Guard の page の session の `Log.entryAdded` の listener（DEF-040。Worker の中の CSP の違反の観察）。 */
+  readonly cdpLogEntryAddedHandler: ((event: unknown) => void) | undefined;
   registerPage(page: Page): void;
 }
 
@@ -170,9 +183,16 @@ interface FakeCdpPausedEvent {
   /** Network の domain の要求の ID（DEF-026。取り消しの証拠の `Network.loadingFailed` の `requestId` と対応付ける）。 */
   readonly networkId?: string;
   readonly frameId: string;
-  readonly request: { readonly method: string; readonly url: string };
+  readonly request: { readonly method: string; readonly url: string; readonly headers?: Readonly<Record<string, string>> };
+  /**
+   * 要求の種類（DEF-042）。偽の harness の `cdpRequestPausedHandler` は、指定のない事象を `Document` の事象として Guard に渡す
+   * （DEF-042 より前のテストは、Document の事象だけを送っていた）。Document でない要求のテストは、明示して渡す。
+   */
+  readonly resourceType?: string;
   /** 応答の段階（Response stage）の事象だけが持つ項目（C18g）。 */
   readonly responseStatusCode?: number;
+  /** 応答の status の文言（DEF-040。`Fetch.continueResponse` の `responsePhrase` に使う）。 */
+  readonly responseStatusText?: string;
   readonly responseErrorReason?: string;
   readonly responseHeaders?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
 }
@@ -184,6 +204,13 @@ interface FakeCdpLoadingFailedEvent {
   /** 要求の種類（Network の domain の ResourceType。取り消しの証拠になるのは `Document` だけ）。 */
   readonly type?: string;
   readonly errorText?: string;
+}
+
+/** 偽の harness の `calls` に残す、Guard の初期化のスクリプトの名前（DEF-040、DEF-049）。 */
+function initScriptName(content: string | undefined): string {
+  if (content === WORKER_CONNECT_POLICY_INIT_SCRIPT) return 'WORKER_CONNECT_POLICY';
+  if (content === SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT) return 'SERVICE_WORKER_REGISTRATION_BLOCK';
+  return 'UNKNOWN';
 }
 
 function createGuardHarness(options: {
@@ -222,10 +249,17 @@ function createGuardHarness(options: {
   let cdpRequestPausedHandler: GuardHarness['cdpRequestPausedHandler'];
   let cdpCloseHandler: GuardHarness['cdpCloseHandler'];
   let cdpLoadingFailedHandler: GuardHarness['cdpLoadingFailedHandler'];
+  let cdpRequestWillBeSentHandler: GuardHarness['cdpRequestWillBeSentHandler'];
+  let cdpLogEntryAddedHandler: GuardHarness['cdpLogEntryAddedHandler'];
   const registeredPages: Page[] = [];
   const rawContext = {
     pages(): object[] {
       return options.hasPage === true ? [{}] : registeredPages;
+    },
+    // DEF-040: Guard は、ページを作る前に、Worker の中の WebSocket を止める CSP の初期化のスクリプトを Context に付ける。
+    // DEF-049: Service Worker の登録の入口を塞ぐ初期化のスクリプトも付ける。どのスクリプトかを `calls` に残す。
+    async addInitScript(script?: { readonly content?: string }): Promise<void> {
+      calls.push(`INIT_SCRIPT:${initScriptName(script?.content)}`);
     },
     on(event: string, handler: (value: unknown) => void): void {
       calls.push(`ON:${event}`);
@@ -259,6 +293,10 @@ function createGuardHarness(options: {
             cdpCloseHandler = handler;
           } else if (event === 'Network.loadingFailed') {
             cdpLoadingFailedHandler = handler as (event: FakeCdpLoadingFailedEvent) => void;
+          } else if (event === 'Network.requestWillBeSent') {
+            cdpRequestWillBeSentHandler = handler as (event: unknown) => void;
+          } else if (event === 'Log.entryAdded') {
+            cdpLogEntryAddedHandler = handler as (event: unknown) => void;
           }
         },
         off(event: string, handler: (value?: FakeCdpPausedEvent) => void): void {
@@ -268,6 +306,7 @@ function createGuardHarness(options: {
           }
           if (event === 'close' && cdpCloseHandler === handler) cdpCloseHandler = undefined;
           if (event === 'Network.loadingFailed' && cdpLoadingFailedHandler === handler) cdpLoadingFailedHandler = undefined;
+          if (event === 'Log.entryAdded' && cdpLogEntryAddedHandler === handler) cdpLogEntryAddedHandler = undefined;
         },
         async send(method: string, params?: unknown): Promise<unknown> {
           cdpCommands.push(method);
@@ -350,13 +389,21 @@ function createGuardHarness(options: {
       return pageHandler;
     },
     get cdpRequestPausedHandler(): GuardHarness['cdpRequestPausedHandler'] {
-      return cdpRequestPausedHandler;
+      // DEF-042: `resourceType` の指定のない偽の事象は、Document の事象として渡す（`FakeCdpPausedEvent.resourceType`）。
+      const handler = cdpRequestPausedHandler;
+      return handler === undefined ? undefined : (event) => handler({ resourceType: 'Document', ...event });
     },
     get cdpCloseHandler(): GuardHarness['cdpCloseHandler'] {
       return cdpCloseHandler;
     },
     get cdpLoadingFailedHandler(): GuardHarness['cdpLoadingFailedHandler'] {
       return cdpLoadingFailedHandler;
+    },
+    get cdpRequestWillBeSentHandler(): GuardHarness['cdpRequestWillBeSentHandler'] {
+      return cdpRequestWillBeSentHandler;
+    },
+    get cdpLogEntryAddedHandler(): GuardHarness['cdpLogEntryAddedHandler'] {
+      return cdpLogEntryAddedHandler;
     },
     registerPage(page: Page): void {
       registeredPages.push(page);
@@ -1244,12 +1291,22 @@ describe('installPassiveRequestGuard installation', () => {
     expect(snapshot.blockedInteractionWebSockets).toHaveLength(1);
   });
 
-  it('installs WebSocket and HTTP interception before resolving', async () => {
+  it('installs the connect policy and the Service Worker registration block init scripts, then WebSocket and HTTP interception before resolving', async () => {
     const harness = createGuardHarness();
 
     await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
-    expect(harness.calls).toEqual(['ON:page', 'ON:requestfailed', 'ON:request', 'WEBSOCKET', 'HTTP']);
+    // DEF-040: 初期化のスクリプト（meta の CSP）は、ページの事象を受け始める前（ページを作る前）に付ける。
+    // DEF-049: Service Worker の登録の入口を塞ぐ初期化のスクリプトも、同じく、ページを作る前に付ける。
+    expect(harness.calls).toEqual([
+      'INIT_SCRIPT:WORKER_CONNECT_POLICY',
+      'INIT_SCRIPT:SERVICE_WORKER_REGISTRATION_BLOCK',
+      'ON:page',
+      'ON:requestfailed',
+      'ON:request',
+      'WEBSOCKET',
+      'HTTP',
+    ]);
     expect(harness.closeCount).toBe(0);
   });
 
@@ -1768,32 +1825,41 @@ describe('installPassiveRequestGuard installation', () => {
     }]));
   });
 
-  it('drains a deferred popup-close rejection before guarded context close returns', async () => {
+  // DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 2.1）: 凍結中のポップアップは、1回だけ記録し、Guard は
+  // `page.close()` を呼ばない（Context と一緒に閉じる）。以前は、ポップアップをすぐに閉じ、その失敗を Context を閉じる前に drain する
+  // ことを確かめていた（`INTERACTION_POPUP_CLOSE_FAILED`）。
+  it('records a frozen popup once and leaves its close to the guarded context close (DEF-036)', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
-    const popupCloseGate = createDeferred<void>();
+    const openerHandlers = new Map<string, (...arguments_: unknown[]) => void>();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
-    const page = await readyHarnessPage(harness);
-    Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
+    const page = createHarnessPage(harness, {
+      url: 'https://example.test/fixture',
+      onEvent: (event, handler) => openerHandlers.set(event, handler),
+    });
+    await awaitPassiveRequestGuardReady(page);
     await activateInteractionFreeze(page);
-    createHarnessPage(harness, {
-      url: 'https://example.test/popup',
-      closeGate: popupCloseGate.promise,
+    // `page` の事象は `createHarnessPage` の中で同期的に届き、以前の Guard は、閉じる処理を次の microtask で始めていた。
+    // そのため、作った直後に差し替えた `close` で、Guard が呼んだかどうかを数えられる。
+    let popupCloseCalls = 0;
+    const popup = createHarnessPage(harness, { url: 'https://example.test/popup' });
+    const popupClose = popup.close.bind(popup);
+    Object.defineProperty(popup, 'close', {
+      value: async (): Promise<void> => {
+        popupCloseCalls += 1;
+        await popupClose();
+      },
     });
+    openerHandlers.get('popup')?.(popup);
+    await Promise.resolve();
 
-    let closeSettled = false;
-    const closing = closePassiveGuardedContext(harness.context).finally(() => {
-      closeSettled = true;
-    });
-    await expect.poll(() => harness.closeCount).toBe(1);
-    expect(closeSettled).toBe(false);
+    await closePassiveGuardedContext(harness.context);
 
-    popupCloseGate.reject(new Error('deferred popup close failed'));
-    await expect(closing).rejects.toThrow('Passive request guard context was invalidated');
-    expect(ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([{
-      code: 'INTERACTION_POPUP_CLOSE_FAILED',
-      message: 'deferred popup close failed',
-    }]));
+    expect(harness.closeCount).toBe(1);
+    expect(popupCloseCalls).toBe(0);
+    expect(popup.isClosed()).toBe(false);
+    expect(ledger.snapshot().blockedPopups).toEqual([{ url: 'https://example.test/popup', reason: 'INTERACTION_FROZEN' }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
   });
 
   it('performs a drain-only retry after a listener-task drain timeout', async () => {
@@ -1905,12 +1971,20 @@ describe('installPassiveRequestGuard installation', () => {
     expect(harness.calls.filter((call) => call === 'CDP')).toEqual([]);
   });
 
+  // DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 2.1）で、popup の場面の決まりを変えた。以前は、Guard が
+  // 凍結中のポップアップをすぐに閉じ、その遅れた失敗（`INTERACTION_POPUP_CLOSE_FAILED`）が最終の snapshot に入ることを確かめていた。
+  // 今は、Guard はポップアップを閉じない（記録だけ）ので、閉じる処理が呼ばれず、違反のない BLOCKED_BY_SAFETY になることを確かめる。
   it.each(['download', 'popup'] as const)(
-    'drains deferred %s cleanup failure into the final interaction audit snapshot',
+    'reflects the frozen %s handling in the final interaction audit snapshot (download: drains a deferred cancel failure; popup: records without closing, DEF-036)',
     async (kind) => {
       const harness = createGuardHarness();
       const ledger = new SafetyLedger();
       const cleanupGate = createDeferred<void>();
+      let popupCloseCalls = 0;
+      const closeAuditPopup = (): Promise<void> => {
+        popupCloseCalls += 1;
+        return cleanupGate.promise;
+      };
       const eventHandlers = new Map<string, (value: unknown) => void>();
       let candidate: InteractionCandidate = {
         candidateId: `interaction-candidate:sha256:${'0'.repeat(64)}`,
@@ -1962,7 +2036,7 @@ describe('installPassiveRequestGuard installation', () => {
           }
           harness.pageHandler?.({
             url: () => 'https://example.test/audit-popup',
-            close: () => cleanupGate.promise,
+            close: closeAuditPopup,
           } as unknown as Page);
         },
         scrollIntoViewIfNeeded: async () => undefined,
@@ -1983,6 +2057,10 @@ describe('installPassiveRequestGuard installation', () => {
         url: () => 'https://example.test/fixture',
         on(event: string, handler: (value: unknown) => void): Page {
           eventHandlers.set(event, handler);
+          return page;
+        },
+        // DEF-036: popup の場面で違反が0件であることを確かめるため、Guard の listener の後始末（`page.off`）を受け付ける。
+        off(): Page {
           return page;
         },
         goto: async () => null,
@@ -2019,7 +2097,7 @@ describe('installPassiveRequestGuard installation', () => {
                 }
                 harness.pageHandler?.({
                   url: () => 'https://example.test/audit-popup',
-                  close: () => cleanupGate.promise,
+                  close: closeAuditPopup,
                 } as unknown as Page);
               },
               dispose: async () => undefined,
@@ -2063,6 +2141,19 @@ describe('installPassiveRequestGuard installation', () => {
         auditSettled = true;
       });
       await expect.poll(() => harness.closeCount).toBe(1);
+
+      if (kind === 'popup') {
+        const result = await auditing;
+
+        expect(result.status).toBe('BLOCKED_BY_SAFETY');
+        expect(result.safety.blockedPopups).toEqual([
+          { url: 'https://example.test/audit-popup', reason: 'INTERACTION_FROZEN' },
+        ]);
+        expect(result.safety.invariantViolations).toEqual([]);
+        expect(popupCloseCalls).toBe(0);
+        return;
+      }
+
       expect(auditSettled).toBe(false);
 
       cleanupGate.reject(new Error(`deferred ${kind} cleanup failed`));
@@ -2070,7 +2161,7 @@ describe('installPassiveRequestGuard installation', () => {
 
       expect(result.status).toBe('BLOCKED_BY_SAFETY');
       expect(result.safety.invariantViolations).toContainEqual({
-        code: kind === 'download' ? 'INTERACTION_DOWNLOAD_CANCEL_FAILED' : 'INTERACTION_POPUP_CLOSE_FAILED',
+        code: 'INTERACTION_DOWNLOAD_CANCEL_FAILED',
         message: `deferred ${kind} cleanup failed`,
       });
     },
@@ -3524,6 +3615,12 @@ describe('installPassiveRequestGuard installation', () => {
       options: { cdpSendErrorMethod: 'Target.setAutoAttach' },
       message: 'Target.setAutoAttach failed',
     },
+    // DEF-040: Worker の中の CSP の違反の観察（`Log.enable`）も、page の準備の一部である（記録は best-effort だが、準備は fail-closed）。
+    {
+      stage: 'Log.enable',
+      options: { cdpSendErrorMethod: 'Log.enable' },
+      message: 'Log.enable failed',
+    },
   ])('invalidates and rejects readiness when $stage setup fails', async ({ options, message }) => {
     const harness = createGuardHarness(options);
     const ledger = new SafetyLedger();
@@ -4449,7 +4546,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
     return { harness, ledger, page };
   }
 
-  it('enables the Document interception at the Response stage in addition to the Request stage', async () => {
+  it('enables the Document interception at the Response stage in addition to the Request stage, every request at the Request stage (DEF-042), and the Other responses (DEF-040)', async () => {
     const { harness } = await readyGuard();
 
     expect(commandsOf(harness, 'Fetch.enable')).toEqual([{
@@ -4458,6 +4555,8 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
         patterns: [
           { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
           { urlPattern: '*', resourceType: 'Document', requestStage: 'Response' },
+          { urlPattern: '*', requestStage: 'Request' },
+          { urlPattern: '*', resourceType: 'Other', requestStage: 'Response' },
         ],
       },
     }]);
@@ -5689,4 +5788,935 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
 
     expect(ledger.snapshot().invariantViolations).toEqual(expectedViolations);
   });
+});
+
+// DEF-042（設計書 `2026-10-08-beaksight-def-042-guard-fetch-all-design.md` 2.1）: Guard の CDP の Fetch の横取りを、すべての要求の
+// Request の段階に広げる。Document でない要求（`resourceType` が `Document` 以外）は、Guard が CDP の段階で判定する。
+// - Passive: `classifyPassiveRequest`（ナビゲーションでない要求として）で、許可は `Fetch.continueRequest`、拒否は `Fetch.failRequest` と
+//   `blockedRequests` の記録（理由は分類のもの。route と同じ）。
+// - 凍結の後: `Fetch.failRequest` と `blockedInteractionRequests`（`INTERACTION_FROZEN`。ナビゲーションの記録は作らない）。
+// - 閉じる途中: `Fetch.failRequest` だけ（route の今の扱いと同じで、記録しない）。
+// - 命令の失敗が、一時停止の ID が無効な形なら、ブラウザが先に取り消した要求として扱う。それ以外の失敗と、method や URL のない要求は
+//   fail-closed（違反にして Context を閉じる）。
+// 本物の Chromium での確かめ（ページを離れるときの送信が届かないこと、記録が 1 回であること）は `guard-unload-requests.test.ts`。
+describe('DEF-042: the CDP interception covers every request at the Request stage and judges the non-Document requests', () => {
+  const ORIGIN = 'https://example.test';
+  const OTHER_ORIGIN = 'https://other.test';
+
+  /** Request の段階の、Document でない偽の `Fetch.requestPaused` の事象（既定は、root frame の `Ping`（sendBeacon）の POST）。 */
+  const subresourceEvent = (overrides: Partial<FakeCdpPausedEvent> = {}): FakeCdpPausedEvent => ({
+    requestId: 'subresource-1',
+    networkId: 'network-subresource-1',
+    frameId: 'root-frame',
+    resourceType: 'Ping',
+    request: { method: 'POST', url: `${ORIGIN}/__mutation` },
+    ...overrides,
+  });
+
+  const commandsOf = (harness: GuardHarness, method: string): ReadonlyArray<{ readonly method: string; readonly params: unknown }> =>
+    harness.cdpCommandLog.filter((entry) => entry.method === method);
+
+  const failed = (requestId: string): { readonly method: string; readonly params: unknown } => ({
+    method: 'Fetch.failRequest',
+    params: { requestId, errorReason: 'BlockedByClient' },
+  });
+
+  const continued = (requestId: string): { readonly method: string; readonly params: unknown } => ({
+    method: 'Fetch.continueRequest',
+    params: { requestId },
+  });
+
+  async function readyGuard(options: Parameters<typeof createGuardHarness>[0] = {}): Promise<{
+    readonly harness: GuardHarness;
+    readonly ledger: SafetyLedger;
+    readonly page: Page;
+  }> {
+    const harness = createGuardHarness(options);
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = await readyHarnessPage(harness);
+    return { harness, ledger, page };
+  }
+
+  it.each(['Ping', 'Fetch', 'XHR', 'Other'] as const)('Passive: fails a paused %s POST with BlockedByClient and records it once as NON_READ_METHOD', async (resourceType) => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    expect(ledger.snapshot().blockedRequestsByMethod).toEqual({ POST: 1 });
+    expect(ledger.snapshot().blockedNavigations).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('Passive: fails a paused non-Document request without a networkId (the leaving requests of a page) and records it', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    const withoutNetworkId: FakeCdpPausedEvent = {
+      requestId: 'subresource-1',
+      frameId: 'root-frame',
+      resourceType: 'Ping',
+      request: { method: 'POST', url: `${ORIGIN}/__mutation` },
+    };
+    harness.cdpRequestPausedHandler?.(withoutNetworkId);
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it.each([
+    ['GET', ORIGIN, 'Image'],
+    ['HEAD', ORIGIN, 'Fetch'],
+    ['GET', OTHER_ORIGIN, 'Script'],
+  ] as const)('Passive: continues a paused %s %s %s without a record (non-Document requests are not bound to the allowed Origins, even in the root frame)', async (method, origin, resourceType) => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType, request: { method, url: `${origin}/asset` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([continued('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().blockedNavigations).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('keeps the Document path for Document events: a paused Document GET outside the allowed Origin in the root frame is still a blocked navigation', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({
+      resourceType: 'Document',
+      request: { method: 'GET', url: `${OTHER_ORIGIN}/page` },
+    }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(ledger.snapshot().blockedNavigations).toEqual([
+      { method: 'GET', url: `${OTHER_ORIGIN}/page`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+    ]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('after the Interaction freeze: fails the paused non-Document request and records INTERACTION_FROZEN without a navigation record', async () => {
+    const { harness, ledger, page } = await readyGuard();
+    Object.defineProperty(page, 'url', { value: () => `${ORIGIN}/fixture` });
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Image', request: { method: 'GET', url: `${ORIGIN}/late.png` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([{ method: 'GET', url: `${ORIGIN}/late.png`, reason: 'INTERACTION_FROZEN' }]);
+    expect(ledger.snapshot().blockedInteractionNavigations).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    await wait(10);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('while the owner Context close is pending: fails the paused non-Document request without a record', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ contextCloseGate: closeGate.promise });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Image', request: { method: 'GET', url: `${ORIGIN}/late.png` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    closeGate.resolve();
+    await closing;
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it.each(INVALID_INTERCEPTION_ID_FAILURE_TEXTS)('treats "%s" on Fetch.failRequest for a non-Document request as a request the browser canceled: no violation, and the block stays recorded', async (text) => {
+    const { harness, ledger } = await readyGuard({
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest' ? Promise.reject(new Error(text)) : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent());
+
+    await expect.poll(() => ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    await wait(10);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('treats an invalid interception id on Fetch.continueRequest for a non-Document request as a request the browser canceled: no violation, no record', async () => {
+    const { harness, ledger } = await readyGuard({
+      cdpSendOverride: (method) => (method === 'Fetch.continueRequest'
+        ? Promise.reject(new Error(INVALID_INTERCEPTION_ID_FAILURE_TEXTS[0]))
+        : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Image', request: { method: 'GET', url: `${ORIGIN}/late.png` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toEqual([continued('subresource-1')]);
+    await wait(10);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('records another failure of Fetch.failRequest for a non-Document request as a violation without a blocked record, and invalidates the Context (fail-closed)', async () => {
+    const { harness, ledger } = await readyGuard({ cdpSendErrorMethod: 'Fetch.failRequest' });
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent());
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_FAIL_REQUEST_FAILED', message: 'Fetch.failRequest failed' }]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+  });
+
+  it('records another failure of Fetch.continueRequest for a non-Document request as a violation and invalidates the Context (fail-closed)', async () => {
+    const { harness, ledger } = await readyGuard({ cdpSendErrorMethod: 'Fetch.continueRequest' });
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Image', request: { method: 'GET', url: `${ORIGIN}/late.png` } }));
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: 'Fetch.continueRequest failed' }]);
+  });
+
+  // DEF-042 の設計書 2.4（閉じる途中の命令の失敗）: owner の close を始めた後に、session か target の閉鎖で命令が失敗した場合は、
+  // target とともに消えた要求として扱い、違反にも記録にもしない。それ以外の失敗は、今までどおり違反。
+  it.each([
+    ['the page session', 'cdpSession.send: Target page, context or browser has been closed'],
+    ['an OOPIF session', 'OOPIF interception session was detached'],
+  ] as const)('while the owner Context close is pending: a Fetch.failRequest failure of %s because the target closed is neither a violation nor a record', async (_label, text) => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({
+      contextCloseGate: closeGate.promise,
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest' ? Promise.reject(new Error(text)) : undefined),
+    });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}/favicon.ico` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    closeGate.resolve();
+    await closing;
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
+  });
+
+  it('while the owner Context close is pending: another Fetch.failRequest failure stays a violation (CDP_LIFECYCLE_FAIL_REQUEST_FAILED)', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ contextCloseGate: closeGate.promise, cdpSendErrorMethod: 'Fetch.failRequest' });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}/favicon.ico` } }));
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([
+      { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: 'Fetch.failRequest failed' },
+    ]);
+    closeGate.resolve();
+    await closing;
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('in the Passive phase (not closing): a Fetch.failRequest failure because the target closed stays a violation (fail-closed)', async () => {
+    const { harness, ledger } = await readyGuard({
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest'
+        ? Promise.reject(new Error('cdpSession.send: Target page, context or browser has been closed'))
+        : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent());
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      { code: 'CDP_FAIL_REQUEST_FAILED', message: 'cdpSession.send: Target page, context or browser has been closed' },
+    ]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+  });
+
+  // DEF-045（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 2）: 凍結の段階で、owner の close を始めた後
+  // （`FROZEN_CLOSING`、`FROZEN_INVALIDATING`、close の試みあり）に、命令が session か target の閉鎖で失敗した場合は、違反にしない
+  // （止める前の `INTERACTION_FROZEN` の記録は残る）。owner の close を始める前（`FROZEN_ACTIVE`）の同じ失敗は、今までどおり違反。
+  // Document でない要求（`handlePausedRequest`）と、Document の要求（Document の凍結の分岐）の両方で確かめる。
+  const CLOSED_TARGET_FAILURE_TEXT = 'cdpSession.send: Target page, context or browser has been closed';
+  const FROZEN_CLOSE_RACE_REQUESTS = [
+    ['non-Document', `${ORIGIN}/__mutation`, subresourceEvent()],
+    ['Document', `${ORIGIN}/frozen-next`, subresourceEvent({ resourceType: 'Document', request: { method: 'GET', url: `${ORIGIN}/frozen-next` } })],
+  ] as const;
+
+  /** 凍結した Guard（Interaction の段階）を用意する。 */
+  async function frozenGuard(options: Parameters<typeof createGuardHarness>[0] = {}): Promise<{
+    readonly harness: GuardHarness;
+    readonly ledger: SafetyLedger;
+  }> {
+    const { harness, ledger, page } = await readyGuard(options);
+    Object.defineProperty(page, 'url', { value: () => `${ORIGIN}/fixture` });
+    await activateInteractionFreeze(page);
+    return { harness, ledger };
+  }
+
+  it.each(FROZEN_CLOSE_RACE_REQUESTS)('DEF-045 after the freeze, while the owner Context close is pending: a %s Fetch.failRequest failure because the target closed is not a violation, the frozen record stays, and the close is not invalidated', async (_label, url, event) => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await frozenGuard({
+      contextCloseGate: closeGate.promise,
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest' ? Promise.reject(new Error(CLOSED_TARGET_FAILURE_TEXT)) : undefined),
+    });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(event);
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    await wait(10);
+    closeGate.resolve();
+    await expect(closing).resolves.toBeUndefined();
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([
+      { method: event.request.method, url, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it.each(FROZEN_CLOSE_RACE_REQUESTS)('DEF-045 a %s request paused while frozen, whose Fetch.failRequest fails because the target closed after the owner Context close started, is not a violation', async (_label, url, event) => {
+    const closeGate = createDeferred<void>();
+    const failGate = createDeferred<unknown>();
+    const { harness, ledger } = await frozenGuard({
+      contextCloseGate: closeGate.promise,
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest' ? failGate.promise : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(event);
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+    failGate.reject(new Error(CLOSED_TARGET_FAILURE_TEXT));
+    await wait(10);
+    closeGate.resolve();
+
+    await expect(closing).resolves.toBeUndefined();
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([
+      { method: event.request.method, url, reason: 'INTERACTION_FROZEN' },
+    ]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it.each(FROZEN_CLOSE_RACE_REQUESTS)('DEF-045 control: after the freeze, before the owner close (FROZEN_ACTIVE), a %s Fetch.failRequest failure because the target closed stays a violation (fail-closed)', async (_label, _url, event) => {
+    const { harness, ledger } = await frozenGuard({
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest' ? Promise.reject(new Error(CLOSED_TARGET_FAILURE_TEXT)) : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(event);
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      { code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED', message: CLOSED_TARGET_FAILURE_TEXT },
+    ]);
+  });
+
+  // DEF-050（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 6）: Document の閉じる途中の分岐
+  // （`failPausedDocumentForLifecycle`）で、Context の閉じる処理が始まった後（owner の close か無効化。Passive と凍結の両方）に、命令が
+  // session か target の閉鎖で失敗した場合は、違反にしない。Context の閉じる処理の前（page だけを閉じる途中）の同じ失敗は、今までどおり違反。
+  const DOCUMENT_REQUEST_EVENT = subresourceEvent({ resourceType: 'Document', request: { method: 'GET', url: `${ORIGIN}/next` } });
+  const DOCUMENT_RESPONSE_EVENT = subresourceEvent({
+    resourceType: 'Document',
+    request: { method: 'GET', url: `${ORIGIN}/next` },
+    responseStatusCode: 200,
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+  });
+  const rejectFailRequestAsClosed = (method: string): Promise<unknown> | undefined => (
+    method === 'Fetch.failRequest' ? Promise.reject(new Error(CLOSED_TARGET_FAILURE_TEXT)) : undefined
+  );
+
+  it.each([
+    ['Request', DOCUMENT_REQUEST_EVENT],
+    ['Response', DOCUMENT_RESPONSE_EVENT],
+  ] as const)('DEF-050 Passive, while the owner Context close is pending: a Document %s stage Fetch.failRequest failure because the target closed is not a violation, and the close is not invalidated', async (_stage, event) => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ contextCloseGate: closeGate.promise, cdpSendOverride: rejectFailRequestAsClosed });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(event);
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    await wait(10);
+    closeGate.resolve();
+    await expect(closing).resolves.toBeUndefined();
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('DEF-050 frozen, while the owner Context close is pending: a Document Response stage Fetch.failRequest failure because the target closed is not a violation, and the close is not invalidated', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await frozenGuard({ contextCloseGate: closeGate.promise, cdpSendOverride: rejectFailRequestAsClosed });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(DOCUMENT_RESPONSE_EVENT);
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    await wait(10);
+    closeGate.resolve();
+    await expect(closing).resolves.toBeUndefined();
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(1);
+  });
+
+  it('DEF-050 while the Guard invalidates the Context: a Document Request stage Fetch.failRequest failure because the target closed is not a violation beyond the invalidation cause', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({
+      contextCloseGate: closeGate.promise,
+      cdpSendOverride: (method, params) => {
+        const { requestId } = (params ?? {}) as { readonly requestId?: string };
+        if (method === 'Fetch.failRequest' && requestId === 'invalidating-cause') {
+          return Promise.reject(new Error('fixture failure that invalidates'));
+        }
+        return rejectFailRequestAsClosed(method);
+      },
+    });
+    // 閉じた形でない失敗（違反）で、Guard が Context の無効化を始める。
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ requestId: 'invalidating-cause' }));
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(DOCUMENT_REQUEST_EVENT);
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toHaveLength(2);
+    await wait(10);
+    closeGate.resolve();
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      { code: 'CDP_FAIL_REQUEST_FAILED', message: 'fixture failure that invalidates' },
+    ]);
+  });
+
+  it('DEF-050 control: before the Context close, while only the page is being closed by its owner, a Document Fetch.failRequest failure because the target closed stays a violation (CDP_LIFECYCLE_FAIL_REQUEST_FAILED)', async () => {
+    const pageCloseGate = createDeferred<void>();
+    const harness = createGuardHarness({ cdpSendOverride: rejectFailRequestAsClosed });
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = createHarnessPage(harness, { closeGate: pageCloseGate.promise });
+    await awaitPassiveRequestGuardReady(page);
+    const pageClosing = closePassiveGuardedPage(page);
+
+    harness.cdpRequestPausedHandler?.(DOCUMENT_REQUEST_EVENT);
+
+    await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([
+      { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: CLOSED_TARGET_FAILURE_TEXT },
+    ]);
+    pageCloseGate.resolve();
+    await pageClosing.catch(() => undefined);
+  });
+
+  // DEF-042 の設計書 2.4（CORS の事前確認）: `initiator.type` が `preflight` の `OPTIONS`（取れなければ `Access-Control-Request-Method`
+  // ヘッダあり）は、Playwright と同じ応答（204 と CORS のヘッダ）で満たし、記録しない。事前確認でない `OPTIONS` は止めて記録する。
+  const PREFLIGHT_HEADERS = Object.freeze({
+    'Origin': ORIGIN,
+    'Access-Control-Request-Method': 'GET',
+    'Access-Control-Request-Headers': 'x-fixture-preflight',
+  });
+  const preflightEvent = (overrides: Partial<FakeCdpPausedEvent> = {}): FakeCdpPausedEvent => subresourceEvent({
+    resourceType: 'Preflight',
+    request: { method: 'OPTIONS', url: `${OTHER_ORIGIN}/api`, headers: PREFLIGHT_HEADERS },
+    ...overrides,
+  });
+  const fulfilledPreflight = (headers: readonly { readonly name: string; readonly value: string }[]): { readonly method: string; readonly params: unknown } => ({
+    method: 'Fetch.fulfillRequest',
+    params: { requestId: 'subresource-1', responseCode: 204, responsePhrase: 'No Content', responseHeaders: headers, body: '' },
+  });
+
+  it('answers a CORS preflight identified by Network.requestWillBeSent (initiator preflight) with 204 and the CORS headers of the request, without a record', async () => {
+    const { harness, ledger } = await readyGuard();
+    harness.cdpRequestWillBeSentHandler?.({ requestId: 'network-subresource-1', initiator: { type: 'preflight' }, request: { method: 'OPTIONS', url: `${OTHER_ORIGIN}/api` } });
+
+    harness.cdpRequestPausedHandler?.(preflightEvent());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([fulfilledPreflight([
+      { name: 'Access-Control-Allow-Origin', value: ORIGIN },
+      { name: 'Access-Control-Allow-Methods', value: 'GET' },
+      { name: 'Access-Control-Allow-Credentials', value: 'true' },
+      { name: 'Access-Control-Allow-Headers', value: 'x-fixture-preflight' },
+    ])]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('answers a CORS preflight identified only by its Access-Control-Request-Method header (no initiator) with the default CORS headers when the request has no Origin', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(preflightEvent({
+      networkId: undefined as unknown as string,
+      request: { method: 'OPTIONS', url: `${OTHER_ORIGIN}/api`, headers: { 'access-control-request-method': 'PUT' } },
+    }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([fulfilledPreflight([
+      { name: 'Access-Control-Allow-Origin', value: '*' },
+      { name: 'Access-Control-Allow-Methods', value: 'PUT' },
+      { name: 'Access-Control-Allow-Credentials', value: 'true' },
+    ])]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('answers a CORS preflight whose initiator record is known but whose headers are missing (initiator takes precedence)', async () => {
+    const { harness } = await readyGuard();
+    harness.cdpRequestWillBeSentHandler?.({ requestId: 'network-subresource-1', initiator: { type: 'preflight' } });
+
+    harness.cdpRequestPausedHandler?.(preflightEvent({ request: { method: 'OPTIONS', url: `${OTHER_ORIGIN}/api` } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([fulfilledPreflight([
+      { name: 'Access-Control-Allow-Origin', value: '*' },
+      { name: 'Access-Control-Allow-Methods', value: 'GET, POST, OPTIONS, DELETE' },
+      { name: 'Access-Control-Allow-Credentials', value: 'true' },
+    ])]);
+  });
+
+  it('still fails and records an OPTIONS request that is not a CORS preflight (no initiator record, no Access-Control-Request-Method)', async () => {
+    const { harness, ledger } = await readyGuard();
+    harness.cdpRequestWillBeSentHandler?.({ requestId: 'network-subresource-1', initiator: { type: 'script' } });
+
+    harness.cdpRequestPausedHandler?.(preflightEvent({ resourceType: 'Fetch', request: { method: 'OPTIONS', url: `${ORIGIN}/api`, headers: { 'Origin': ORIGIN } } }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'OPTIONS', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD' }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('after the Interaction freeze: a CORS preflight is failed and recorded as INTERACTION_FROZEN like any other request', async () => {
+    const { harness, ledger, page } = await readyGuard();
+    Object.defineProperty(page, 'url', { value: () => `${ORIGIN}/fixture` });
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(preflightEvent());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    expect(commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([{ method: 'OPTIONS', url: `${OTHER_ORIGIN}/api`, reason: 'INTERACTION_FROZEN' }]);
+  });
+
+  it('records a failure of Fetch.fulfillRequest for a CORS preflight as a violation and invalidates the Context (fail-closed)', async () => {
+    const { harness, ledger } = await readyGuard({ cdpSendErrorMethod: 'Fetch.fulfillRequest' });
+
+    harness.cdpRequestPausedHandler?.(preflightEvent());
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_PREFLIGHT_FULFILL_FAILED', message: 'Fetch.fulfillRequest failed' }]);
+  });
+
+  // DEF-042 の設計書 2.4（Guard の作業の上限）: 要求の横取りの作業は `MAX_PENDING_GUARD_REQUEST_TASKS` で数え、ほかの作業の上限
+  // （256）には数えない。上限を超えた要求は一時停止のまま進めず、`GUARD_TASK_LIMIT_REACHED` にして Context を閉じる。
+  it('admits more than 256 pending request-interception tasks without reaching the general task limit', async () => {
+    const continueGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ cdpSendGate: { method: 'Fetch.continueRequest', promise: continueGate.promise } });
+    /** ほかの作業の上限（Guard の `MAX_PENDING_GUARD_TASKS` = 256）を超え、要求の作業の上限（4,096）には届かない数。 */
+    const count = 300;
+
+    for (let index = 0; index < count; index += 1) {
+      harness.cdpRequestPausedHandler?.(subresourceEvent({
+        requestId: `image-${index}`,
+        networkId: `network-image-${index}`,
+        resourceType: 'Image',
+        request: { method: 'GET', url: `${ORIGIN}/image-${index}.svg` },
+      }));
+    }
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueRequest')).toHaveLength(count);
+
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+    continueGate.resolve();
+    await closePassiveGuardedContext(harness.context);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('fails closed when the pending request-interception tasks exceed MAX_PENDING_GUARD_REQUEST_TASKS: one GUARD_TASK_LIMIT_REACHED violation and the Context closes', async () => {
+    const continueGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ cdpSendGate: { method: 'Fetch.continueRequest', promise: continueGate.promise } });
+
+    for (let index = 0; index < MAX_PENDING_GUARD_REQUEST_TASKS + 1; index += 1) {
+      harness.cdpRequestPausedHandler?.(subresourceEvent({
+        requestId: `image-${index}`,
+        networkId: `network-image-${index}`,
+        resourceType: 'Image',
+        request: { method: 'GET', url: `${ORIGIN}/image-${index}.svg` },
+      }));
+    }
+    await expect.poll(() => harness.closeCount).toBe(1);
+    // 上限までの要求は、命令を受ける（無効化の順によって、続ける命令か、閉じる途中の止める命令か）。超えた 1 件は、命令を受けない。
+    const commandedRequestIds = (): Set<unknown> => new Set(harness.cdpCommandLog
+      .filter((entry) => entry.method === 'Fetch.continueRequest' || entry.method === 'Fetch.failRequest')
+      .map((entry) => (entry.params as { readonly requestId: unknown }).requestId));
+    await expect.poll(() => commandedRequestIds().size).toBe(MAX_PENDING_GUARD_REQUEST_TASKS);
+
+    expect(commandedRequestIds().has(`image-${MAX_PENDING_GUARD_REQUEST_TASKS}`)).toBe(false);
+    expect(ledger.snapshot().invariantViolations.filter(({ code }) => code === 'GUARD_TASK_LIMIT_REACHED')).toEqual([
+      { code: 'GUARD_TASK_LIMIT_REACHED', message: 'paused CDP request' },
+    ]);
+    continueGate.resolve();
+  });
+
+  it('fails closed a paused non-Document request whose method or URL is missing: the request fails, a violation is recorded, and the Context closes', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ request: { method: undefined, url: `${ORIGIN}/__mutation` } as unknown as FakeCdpPausedEvent['request'] }));
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_REQUEST_FACTS_INVALID', message: 'Paused request had no method or URL' }]);
+    expect(ledger.snapshot().blockedRequests).toEqual([]);
+  });
+});
+
+describe('DEF-040: the Other responses receive the Worker connect policy header, and the Worker CSP violations are recorded from the Log domain', () => {
+  const ORIGIN = 'https://example.test';
+  const SOCKET_URL = 'wss://example.test/socket';
+  /** Chromium が Worker の中の CSP の違反のときに Log に残す文（NP3 で確かめた形）。 */
+  const violationText = (url: string, policy: string = WORKER_CONNECT_POLICY): string =>
+    `Connecting to '${url}' violates the following Content Security Policy directive: "${policy}". The action has been blocked.`;
+  const workerLogEntry = (text: string, source = 'worker'): { readonly entry: { readonly source: string; readonly level: string; readonly text: string } } =>
+    ({ entry: { source, level: 'error', text } });
+  const otherResponse = (overrides: Partial<FakeCdpPausedEvent> = {}): FakeCdpPausedEvent => ({
+    requestId: 'worker-script-1',
+    networkId: 'network-worker-script-1',
+    frameId: 'root-frame',
+    resourceType: 'Other',
+    request: { method: 'GET', url: `${ORIGIN}/worker.js` },
+    responseStatusCode: 200,
+    responseStatusText: 'OK',
+    responseHeaders: [{ name: 'Content-Type', value: 'text/javascript' }],
+    ...overrides,
+  });
+  const commandsOf = (harness: GuardHarness, method: string): ReadonlyArray<{ readonly method: string; readonly params: unknown }> =>
+    harness.cdpCommandLog.filter((entry) => entry.method === method);
+  const policyHeader = { name: 'Content-Security-Policy', value: WORKER_CONNECT_POLICY };
+
+  async function readyGuard(options: Parameters<typeof createGuardHarness>[0] = {}, pageUrl?: string): Promise<{
+    readonly harness: GuardHarness;
+    readonly ledger: SafetyLedger;
+    readonly page: Page;
+  }> {
+    const harness = createGuardHarness(options);
+    const ledger = new SafetyLedger();
+    await installPassiveRequestGuard(harness.context, ledger, new Set([ORIGIN]));
+    const page = createHarnessPage(harness, pageUrl === undefined ? {} : { url: pageUrl });
+    await awaitPassiveRequestGuardReady(page);
+    return { harness, ledger, page };
+  }
+
+  it('keeps the connect policy as the closed string of the design (2.2) and enables the Log domain on the page session after the interception', async () => {
+    const { harness } = await readyGuard();
+
+    expect(WORKER_CONNECT_POLICY).toBe('connect-src http: https: data: blob:');
+    expect(harness.cdpCommands.indexOf('Log.enable')).toBeGreaterThan(harness.cdpCommands.indexOf('Fetch.enable'));
+    expect(harness.cdpCommands.indexOf('Log.enable')).toBeGreaterThan(harness.cdpCommands.indexOf('Target.setAutoAttach'));
+    expect(harness.cdpLogEntryAddedHandler).toBeTypeOf('function');
+  });
+
+  it('continues a paused Other response with responseCode, responsePhrase and the original headers plus the connect policy header', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpRequestPausedHandler?.(otherResponse());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueResponse')).toEqual([{
+      method: 'Fetch.continueResponse',
+      params: {
+        requestId: 'worker-script-1',
+        responseCode: 200,
+        responsePhrase: 'OK',
+        responseHeaders: [{ name: 'Content-Type', value: 'text/javascript' }, policyHeader],
+      },
+    }]);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('uses the standard phrase of the status when the browser gives no status text, and adds the header to a response without headers', async () => {
+    const { harness } = await readyGuard();
+
+    const { responseHeaders: _headers, ...withoutHeaders } = otherResponse();
+    harness.cdpRequestPausedHandler?.({ ...withoutHeaders, responseStatusCode: 404, responseStatusText: '' });
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueResponse')).toEqual([{
+      method: 'Fetch.continueResponse',
+      params: { requestId: 'worker-script-1', responseCode: 404, responsePhrase: 'Not Found', responseHeaders: [policyHeader] },
+    }]);
+  });
+
+  it('continues a paused Other response that has no status (a network error) unchanged', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    const { responseStatusCode: _status, responseStatusText: _text, responseHeaders: _headers, ...withoutResponse } = otherResponse();
+    harness.cdpRequestPausedHandler?.({ ...withoutResponse, responseErrorReason: 'Failed' });
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueResponse')).toEqual([{
+      method: 'Fetch.continueResponse',
+      params: { requestId: 'worker-script-1' },
+    }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('after the freeze: still continues the Other response (of a request continued before the freeze) with the connect policy header', async () => {
+    const { harness, ledger, page } = await readyGuard({}, `${ORIGIN}/fixture`);
+    await activateInteractionFreeze(page);
+
+    harness.cdpRequestPausedHandler?.(otherResponse());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueResponse')).toHaveLength(1);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
+  });
+
+  it('fails closed when Fetch.continueResponse fails: the response is failed, WORKER_CONNECT_POLICY_INJECTION_FAILED is recorded, and the Context closes', async () => {
+    const { harness, ledger } = await readyGuard({ cdpSendErrorMethod: 'Fetch.continueResponse' });
+
+    harness.cdpRequestPausedHandler?.(otherResponse());
+
+    await expect.poll(() => harness.closeCount).toBe(1);
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([{
+      method: 'Fetch.failRequest',
+      params: { requestId: 'worker-script-1', errorReason: 'BlockedByClient' },
+    }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([
+      { code: 'WORKER_CONNECT_POLICY_INJECTION_FAILED', message: 'Fetch.continueResponse failed' },
+    ]);
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(true);
+  });
+
+  it('treats an Invalid InterceptionId failure of Fetch.continueResponse (the browser canceled the response) as settled, without a violation', async () => {
+    const { harness, ledger } = await readyGuard({
+      cdpSendOverride: (method) => (method === 'Fetch.continueResponse'
+        ? Promise.reject(new Error(INVALID_INTERCEPTION_ID_FAILURE_TEXTS[2]))
+        : undefined),
+    });
+
+    harness.cdpRequestPausedHandler?.(otherResponse());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.continueResponse')).toHaveLength(1);
+    await flushGuardProtocolCallbacks();
+    expect(commandsOf(harness, 'Fetch.failRequest')).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+    expect(harness.closeCount).toBe(0);
+  });
+
+  it('while the owner Context close is pending: fails the paused Other response instead of continuing it, and a target-closed failure is neither a violation nor a record', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({
+      contextCloseGate: closeGate.promise,
+      cdpSendOverride: (method) => (method === 'Fetch.failRequest'
+        ? Promise.reject(new Error('cdpSession.send: Target page, context or browser has been closed'))
+        : undefined),
+    });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpRequestPausedHandler?.(otherResponse());
+
+    await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toHaveLength(1);
+    expect(commandsOf(harness, 'Fetch.continueResponse')).toEqual([]);
+    closeGate.resolve();
+    await closing;
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('records a Worker CSP violation of the connect policy as blockedWebSockets WORKER_CONNECT_POLICY in the Passive phase', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText(SOCKET_URL)));
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText('ws://example.test/plain')));
+
+    expect(ledger.snapshot().blockedWebSockets).toEqual([
+      { url: SOCKET_URL, reason: 'WORKER_CONNECT_POLICY' },
+      { url: 'ws://example.test/plain', reason: 'WORKER_CONNECT_POLICY' },
+    ]);
+    expect(ledger.snapshot().blockedInteractionWebSockets).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('records a Worker CSP violation of the connect policy as blockedInteractionWebSockets WORKER_CONNECT_POLICY after the freeze', async () => {
+    const { harness, ledger, page } = await readyGuard({}, `${ORIGIN}/fixture`);
+    await activateInteractionFreeze(page);
+
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText(SOCKET_URL)));
+
+    expect(ledger.snapshot().blockedInteractionWebSockets).toEqual([{ url: SOCKET_URL, reason: 'WORKER_CONNECT_POLICY' }]);
+    expect(ledger.snapshot().blockedWebSockets).toEqual([]);
+  });
+
+  it('does not record Log entries that are not Worker WebSocket violations of the connect policy', async () => {
+    const { harness, ledger } = await readyGuard();
+
+    // page の文（Worker ではない）、別の policy（サイト自身の CSP）、WebSocket でない接続、解析できない URL、違反でない文、形の違う事象。
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText(SOCKET_URL), 'security'));
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText(SOCKET_URL, "default-src 'self'")));
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText('about:blank')));
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText('not a url')));
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry("Fetch API cannot load about:blank. Refused to connect because it violates the document's Content Security Policy."));
+    harness.cdpLogEntryAddedHandler?.({ entry: null });
+    harness.cdpLogEntryAddedHandler?.(undefined);
+
+    expect(ledger.snapshot().blockedWebSockets).toEqual([]);
+    expect(ledger.snapshot().blockedInteractionWebSockets).toEqual([]);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
+  });
+
+  it('does not record a Worker CSP violation while the owner Context close is pending, and removes the Log listener on close', async () => {
+    const closeGate = createDeferred<void>();
+    const { harness, ledger } = await readyGuard({ contextCloseGate: closeGate.promise });
+    const closing = closePassiveGuardedContext(harness.context);
+    await expect.poll(() => harness.closeCount).toBe(1);
+
+    harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText(SOCKET_URL)));
+
+    closeGate.resolve();
+    await closing;
+    expect(ledger.snapshot().blockedWebSockets).toEqual([]);
+    expect(harness.removedListeners).toContain('CDP:Log.entryAdded');
+  });
+
+  it('extracts the WebSocket URL only from the connect policy violation text of a Worker (workerConnectPolicyViolationUrl)', () => {
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText(SOCKET_URL)))).toBe(SOCKET_URL);
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText('ws://127.0.0.1:4173/socket')))).toBe('ws://127.0.0.1:4173/socket');
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText(SOCKET_URL), 'javascript'))).toBeNull();
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText(SOCKET_URL, 'connect-src https:')))).toBeNull();
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText('https://example.test/api')))).toBeNull();
+    expect(workerConnectPolicyViolationUrl(workerLogEntry(violationText('')))).toBeNull();
+    expect(workerConnectPolicyViolationUrl(workerLogEntry("Connecting to 'wss://example.test/socket' was fine."))).toBeNull();
+    expect(workerConnectPolicyViolationUrl('text')).toBeNull();
+  });
+});
+
+/** DEF-050 の実機の確かめで、iframe の `src` を 1 ms ごとに変えるページ（`fixtures/site/`）。 */
+const IFRAME_SRC_CHURN_PAGE = '/iframe-src-churn.html';
+/** DEF-050 の実機の確かめの viewport。 */
+const viewportForChurn: Viewport = Object.freeze({ width: 800, height: 600 });
+/**
+ * DEF-050 の実機の確かめで、読み込み → Context を閉じる処理をくり返す回数。NPR2 の再現の実験では、修正の前に、Passive の Context を
+ * 閉じる場面で、headless shell は 20 回のうち 3 回、CLI の Chromium は 20 回のうち 4 回、違反が出た。
+ */
+const IFRAME_SRC_CHURN_CLOSE_ROUNDS = 20;
+/** 読み込みから閉じる処理（Passive）か凍結（Interaction）までの待ちの、基本の時間と、回ごとにずらす幅・種類の数。 */
+const IFRAME_SRC_CHURN_BEFORE_CLOSE_MS = 100;
+const IFRAME_SRC_CHURN_BEFORE_CLOSE_STEP_MS = 37;
+const IFRAME_SRC_CHURN_BEFORE_CLOSE_STEPS = 5;
+/** Interaction の凍結から owner の close までの待ちの種類の数（0〜3 ms。凍結の直後に閉じる）。 */
+const IFRAME_SRC_CHURN_AFTER_FREEZE_STEPS = 4;
+/** 1 回の上限の目安（ms。読み込み、待ち、閉じる処理）。テストの期限の計算に使う。 */
+const IFRAME_SRC_CHURN_ROUND_BUDGET_MS = 2_000;
+/**
+ * 閉じる処理の前（Passive の段階）に、Guard がリダイレクトの対応付けの上限で Context を無効にした回の違反のコード（DEF-050 とは別の
+ * 事象。NP6-round-1 の発見事項）。1 ms ごとに取り消される iframe の移動は応答を受けないので、対応付けの記録（上限
+ * `MAX_REDIRECT_PREDECESSORS`、保持 1 秒）が埋まることがある（NP6-round-1 の実行で、Passive と Interaction の両方で、まれに起きた）。その回は、
+ * 閉じる処理の前に Context が閉じたので、DEF-050 の確かめにならない。除いた回は出力に残し、回数の半分未満であることを確かめる。
+ */
+const PRE_FREEZE_REDIRECT_LIMIT_VIOLATION_CODE = 'REDIRECT_PREDECESSOR_LIMIT_REACHED';
+/** その回の違反が、`PRE_FREEZE_REDIRECT_LIMIT_VIOLATION_CODE` の 1 件だけか。 */
+const isPreFreezeRedirectLimitRound = (violations: readonly { readonly code: string }[]): boolean =>
+  violations.length === 1 && violations[0]?.code === PRE_FREEZE_REDIRECT_LIMIT_VIOLATION_CODE;
+const IFRAME_SRC_CHURN_TEST_TIMEOUT_MS = IFRAME_SRC_CHURN_CLOSE_ROUNDS * IFRAME_SRC_CHURN_ROUND_BUDGET_MS
+  + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
+
+/**
+ * DEF-050（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 6）: iframe の `src` を 1 ms ごとに変え、sendBeacon の POST も
+ * 送るページを読み込み、Context を閉じる（Passive は製品の手順 `closePassivePageAndContext`、Interaction は凍結の直後の owner の close）。
+ * これを `IFRAME_SRC_CHURN_CLOSE_ROUNDS` 回くり返し、どの回も違反 0 と閉じる処理の成功、全部の回の後に
+ * `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ってから、GET・HEAD 以外の要求がサーバに届いていないことを確かめる。テストの既定の
+ * headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）の両方で確かめる。
+ */
+describe.each([
+  { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
+  { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
+])('DEF-050: closing the Context of a page that keeps changing its iframe src, with $name', ({ name, launch }) => {
+  let churnBrowser: Browser;
+  let churnFactory: BrowserContextFactory;
+  let churnServer: FixtureServer;
+
+  beforeAll(async () => {
+    churnServer = await startFixtureServer();
+    churnBrowser = await launch();
+    churnFactory = new BrowserContextFactory(churnBrowser, createTestConfig(churnServer.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+  });
+
+  afterAll(async () => {
+    await churnBrowser?.close();
+    await churnServer?.close();
+  });
+
+  const beforeCloseMs = (round: number): number => IFRAME_SRC_CHURN_BEFORE_CLOSE_MS
+    + (round % IFRAME_SRC_CHURN_BEFORE_CLOSE_STEPS) * IFRAME_SRC_CHURN_BEFORE_CLOSE_STEP_MS;
+
+  it.each([
+    {
+      mode: 'Passive (closePassivePageAndContext)',
+      round: async (round: number): Promise<{ readonly ledger: SafetyLedger; readonly closeFailure: string | null }> => {
+        const context = await churnFactory.createPassiveContext(viewportForChurn);
+        const failures: string[] = [];
+        try {
+          const page = await churnFactory.createPassivePage(context);
+          await page.goto(`${churnServer.origin}${IFRAME_SRC_CHURN_PAGE}`, { waitUntil: 'load' });
+          await wait(beforeCloseMs(round));
+        } catch (error) {
+          // 読み込みの失敗（Guard が Context を閉じた場合など）も、その回の失敗として記録する（Ledger の違反とあわせて出す）。
+          failures.push(`action:${String(error)}`);
+        }
+        const closeFailures = await closePassivePageAndContext(churnFactory, context);
+        failures.push(...closeFailures.map(({ step, error }) => `${step}:${String(error)}`));
+        return { ledger: churnFactory.getSafetyLedger(context), closeFailure: failures.length === 0 ? null : failures.join('|') };
+      },
+    },
+    {
+      mode: 'Interaction (the owner close right after the freeze)',
+      round: async (round: number): Promise<{ readonly ledger: SafetyLedger; readonly closeFailure: string | null }> => {
+        const session = await churnFactory.createInteractionSession(viewportForChurn);
+        const failures: string[] = [];
+        try {
+          await session.page.goto(`${churnServer.origin}${IFRAME_SRC_CHURN_PAGE}`, { waitUntil: 'load' });
+          await wait(beforeCloseMs(round));
+          await session.activateInteractionFreeze();
+          await wait(round % IFRAME_SRC_CHURN_AFTER_FREEZE_STEPS);
+        } catch (error) {
+          // 読み込みや凍結の失敗（Guard が Context を閉じた場合など）も、その回の失敗として記録する（Ledger の違反とあわせて出す）。
+          failures.push(`action:${String(error)}`);
+        } finally {
+          await session.close().catch((error: unknown) => {
+            failures.push(`close:${String(error)}`);
+          });
+        }
+        return { ledger: session.ledger, closeFailure: failures.length === 0 ? null : failures.join('|') };
+      },
+    },
+  ])('$mode: records no violation and closes without failure in every round, and no POST reaches the server', async ({ mode, round: runRound }) => {
+    const allRoundsWindow = openServerWindow(churnServer);
+    const failedRounds: unknown[] = [];
+    const excludedRounds: unknown[] = [];
+    for (let round = 0; round < IFRAME_SRC_CHURN_CLOSE_ROUNDS; round += 1) {
+      const { ledger, closeFailure } = await runRound(round);
+      const { invariantViolations } = ledger.snapshot();
+      const summary = { round, invariantViolations, closeFailure };
+      if (isPreFreezeRedirectLimitRound(invariantViolations)) {
+        excludedRounds.push(summary);
+      } else if (invariantViolations.length !== 0 || closeFailure !== null) {
+        failedRounds.push(summary);
+      }
+    }
+    await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+    console.info(`DEF-050 ${name} ${mode}: ${JSON.stringify({ rounds: IFRAME_SRC_CHURN_CLOSE_ROUNDS, failedRounds, excludedRounds })}`);
+
+    expect(failedRounds).toEqual([]);
+    expect(excludedRounds.length).toBeLessThan(IFRAME_SRC_CHURN_CLOSE_ROUNDS / 2);
+    expect(allRoundsWindow.count(null, '/__mutation')).toBe(0);
+    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  }, IFRAME_SRC_CHURN_TEST_TIMEOUT_MS);
 });

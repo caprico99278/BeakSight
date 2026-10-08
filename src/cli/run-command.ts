@@ -64,6 +64,7 @@ import {
   finalizingRunLines,
   finishedCheckpointCleanupFailedLines,
   joinLines,
+  lastExecutionFinishedAt,
   resumingRunLines,
   runDirectoryUnavailableLines,
   runNoticeLines,
@@ -444,7 +445,9 @@ async function reportRunResumeUnavailable(error: RunResumeUnavailableError, stde
  * 2. `buildReportViewModel(written.result)`
  * 3. `renderHtmlReport(viewModel)`
  * 4. `createChatGptBundle(viewModel, written.result, readArtifactFile)`
- * 5. `ArtifactWriter.writePresentation(written, { reportHtml, bundle })`
+ * 5. `ArtifactWriter.writePresentation(written, { reportHtml, bundle: { bytes, lastExecutionFinishedAt } })`（バンドルの名前は、最後の
+ *    実行の終わりの時刻から作る。結果の行と同じ `lastExecutionFinishedAt` で、表示用モデルから取る。ChatGPT 用バンドルのファイル名の
+ *    設計書 2.1）
  * 終了コードは、`writeRun` が返した最終の Run（導き直した後の Run Status）から、`exit-codes.ts` の表で決める。
  * 渡された `result` の Run Status（導き直しの前）は使わない。
  */
@@ -454,7 +457,10 @@ export async function finishAuditRun(result: AuditRunResult, outputDirectory: st
   const viewModel = buildReportViewModel(written.result);
   const reportHtml = renderHtmlReport(viewModel);
   const bundle = await createChatGptBundle(viewModel, written.result, artifactFileReader(written.runDirectory));
-  await writer.writePresentation(written, { reportHtml, bundle });
+  await writer.writePresentation(written, {
+    reportHtml,
+    bundle: { bytes: bundle, lastExecutionFinishedAt: lastExecutionFinishedAt(viewModel.summary.executions) },
+  });
 
   await stdout.write(joinLines(['', ...runSummaryLines(viewModel.summary, written.runDirectory)]));
   return exitCodeForRunStatus(written.result.run.runStatus);

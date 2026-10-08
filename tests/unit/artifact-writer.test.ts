@@ -3,7 +3,7 @@
 // rename で書く。書き出すテキストは、UTF-8 と LF にする。
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join, relative } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   RUN_ARTIFACT_FILE_NAMES,
@@ -70,6 +70,9 @@ import { createTestConfig } from '../helpers/test-config.js';
 // ---------------------------------------------------------------------------------------------------------------
 // スキーマに合う Run の見本（組み立ては `tests/helpers/audit-run-fixture.ts`）
 // ---------------------------------------------------------------------------------------------------------------
+
+/** `writePresentation` に渡す、最後の実行の終わりの時刻（バンドルの名前は `beaksight-audit-bundle_20261008030930.zip`）。 */
+const LAST_FINISHED_AT = '2026-10-08T03:09:30.000Z';
 
 const E_DOM_1_DESKTOP = dom(1, PAGE_1, 'desktop', '見出し\r\n本文の1行目\r2行目\n3行目');
 const E_DOM_1_MOBILE = dom(2, PAGE_1, 'mobile', 'モバイルの本文');
@@ -186,11 +189,11 @@ describe('ArtifactWriter.writeRun: the layout (design 6.1.2)', () => {
       `${RUN_ID}/run.json`,
     ]);
     expect(pageArtifactRelativePath(PAGE_1, 'page')).toBe('pages/PAGE-000001/page.json');
+    // ChatGPT 用バンドルの名前は、日時を含むので、名前の表には置かない（`bundleFileName`。バンドルのファイル名の設計書 2.1）。
     expect(RUN_ARTIFACT_FILE_NAMES).toEqual({
       run: 'run.json',
       audit: 'audit.json',
       report: 'report.html',
-      bundle: 'beaksight-audit-bundle.zip',
     });
   });
 
@@ -457,11 +460,15 @@ describe('ArtifactWriter.writePresentation: report.html and the bundle go throug
     const writer = new ArtifactWriter();
     const written = await writer.writeRun(auditRun(), { outputDirectory: root });
     const bundle = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x0d, 0x0a]);
-    const files = await writer.writePresentation(written, { reportHtml: '<p>日本語</p>\r\n<p>2</p>\r', bundle });
+    const files = await writer.writePresentation(written, {
+      reportHtml: '<p>日本語</p>\r\n<p>2</p>\r',
+      bundle: { bytes: bundle, lastExecutionFinishedAt: LAST_FINISHED_AT },
+    });
 
-    expect(files).toEqual(['report.html', 'beaksight-audit-bundle.zip']);
+    // BN1: バンドルの名前は、最後の実行の終わりの時刻（UTC）を含む（バンドルのファイル名の設計書 2.1）。
+    expect(files).toEqual(['report.html', 'beaksight-audit-bundle_20261008030930.zip']);
     expect(await readFile(join(written.runDirectory, 'report.html'), 'utf8')).toBe('<p>日本語</p>\n<p>2</p>\n');
-    expect([...(await readFile(join(written.runDirectory, 'beaksight-audit-bundle.zip')))]).toEqual([...bundle]);
+    expect([...(await readFile(join(written.runDirectory, 'beaksight-audit-bundle_20261008030930.zip')))]).toEqual([...bundle]);
     expect((await listTree(root)).filter((path) => path.includes('.tmp'))).toEqual([]);
   });
 
@@ -471,6 +478,166 @@ describe('ArtifactWriter.writePresentation: report.html and the bundle go throug
     const written = await writer.writeRun(auditRun(), { outputDirectory: root });
     await expect(writer.writePresentation(written, { reportHtml: 'x' })).resolves.toEqual(['report.html']);
     await expect(writer.writePresentation(written, {})).resolves.toEqual([]);
+  });
+});
+
+// BN1（バンドルのファイル名の設計書 2.2）: 新しい名前でバンドルを書き終えた後に、Run のディレクトリの直下の、ほかのバンドルの名前の
+// 普通のファイル（前の形と、日時の違う新しい形）を消す。Run のディレクトリには、最新のバンドルを1つだけ残す。
+describe('ArtifactWriter.writePresentation: only the newest bundle is left in the run directory (bundle file name design 2.2)', () => {
+  const BUNDLE_BYTES = new Uint8Array([0x50, 0x4b, 0x05, 0x06]);
+  const NEW_NAME = 'beaksight-audit-bundle_20261008030930.zip';
+  const OLDER_NAME = 'beaksight-audit-bundle_20261006010240.zip';
+  const LEGACY_NAME = 'beaksight-audit-bundle.zip';
+  /** バンドルの名前に似ているが、バンドルの名前ではないファイル（消さない）。 */
+  const SIMILAR_NAMES = Object.freeze([
+    'beaksight-audit-bundle_2026100603024.zip',
+    'beaksight-audit-bundle_20261006010240.zip.bak',
+    'beaksight-audit-bundle.zip.old',
+    'copy-beaksight-audit-bundle.zip',
+  ]);
+
+  /** Run のディレクトリに、前の回の出力を置く（中身は名前）。 */
+  const putEarlierFiles = async (runDirectory: string, names: readonly string[]): Promise<void> => {
+    for (const name of names) {
+      await writeFile(join(runDirectory, name), name, 'utf8');
+    }
+  };
+  const runDirectoryFiles = async (runDirectory: string): Promise<string[]> => (await readdir(runDirectory)).sort();
+
+  it('writes the bundle with the new name and removes the earlier-form bundle and the bundles of other times', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, OLDER_NAME]);
+
+    const files = await writer.writePresentation(written, {
+      reportHtml: '<p>レポート</p>',
+      bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT },
+    });
+
+    expect(files).toEqual(['report.html', NEW_NAME]);
+    expect((await runDirectoryFiles(written.runDirectory)).filter((name) => name.endsWith('.zip'))).toEqual([NEW_NAME]);
+    expect([...(await readFile(join(written.runDirectory, NEW_NAME)))]).toEqual([...BUNDLE_BYTES]);
+  });
+
+  it('keeps report.html, run.json, audit.json, pages/ and files whose names only look like bundle names', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, ...SIMILAR_NAMES]);
+    // 下のディレクトリの、バンドルの名前のファイルも消さない（消すのは Run のディレクトリの直下だけ）。
+    await writeFile(join(written.runDirectory, 'pages', LEGACY_NAME), 'nested', 'utf8');
+
+    await writer.writePresentation(written, {
+      reportHtml: '<p>レポート</p>',
+      bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT },
+    });
+
+    expect(await runDirectoryFiles(written.runDirectory)).toEqual(
+      ['audit.json', NEW_NAME, ...SIMILAR_NAMES, 'pages', 'report.html', 'run.json'].sort(),
+    );
+    expect(await readFile(join(written.runDirectory, 'pages', LEGACY_NAME), 'utf8')).toBe('nested');
+  });
+
+  it('writes the same name again for the same Run, and leaves that one bundle', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    await writer.writePresentation(written, { bundle: { bytes: new Uint8Array([1]), lastExecutionFinishedAt: LAST_FINISHED_AT } });
+
+    await expect(writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT } }))
+      .resolves.toEqual([NEW_NAME]);
+    expect((await runDirectoryFiles(written.runDirectory)).filter((name) => name.endsWith('.zip'))).toEqual([NEW_NAME]);
+    expect([...(await readFile(join(written.runDirectory, NEW_NAME)))]).toEqual([...BUNDLE_BYTES]);
+  });
+
+  it('does not follow or remove a link (symlink or junction) that has a bundle name', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    const outside = join(root, 'outside');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'kept.txt'), 'outside', 'utf8');
+    // Windows では、権限のいらない junction にする（リンク先は、一時ディレクトリの中）。
+    await symlink(outside, join(written.runDirectory, OLDER_NAME), process.platform === 'win32' ? 'junction' : 'dir');
+
+    await writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT } });
+
+    expect((await lstat(join(written.runDirectory, OLDER_NAME))).isSymbolicLink()).toBe(true);
+    expect(await readFile(join(outside, 'kept.txt'), 'utf8')).toBe('outside');
+    expect(await readdir(outside)).toEqual(['kept.txt']);
+  });
+
+  it('keeps the earlier bundles when writing the new bundle fails', async () => {
+    const root = await outputDirectory();
+    const written = await new ArtifactWriter().writeRun(auditRun(), { outputDirectory: root });
+    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, OLDER_NAME]);
+    const removed: string[] = [];
+    const failure = Object.assign(new Error('the disk is full'), { code: 'ENOSPC' });
+    const writer = new ArtifactWriter({
+      fileOperations: {
+        mkdir,
+        open,
+        rename: async (oldPath, newPath) => {
+          if (basename(newPath) === NEW_NAME) {
+            throw failure;
+          }
+          await rename(oldPath, newPath);
+        },
+        rm: async (path, options) => {
+          removed.push(basename(path));
+          await rm(path, options);
+        },
+      },
+    });
+
+    const writing = writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT } });
+
+    await expect(writing).rejects.toBeInstanceOf(ArtifactWriteError);
+    await expect(writing).rejects.toMatchObject({ path: join(written.runDirectory, NEW_NAME), cause: failure });
+    expect(removed).toEqual([]);
+    expect(await readFile(join(written.runDirectory, LEGACY_NAME), 'utf8')).toBe(LEGACY_NAME);
+    expect(await readFile(join(written.runDirectory, OLDER_NAME), 'utf8')).toBe(OLDER_NAME);
+    expect((await runDirectoryFiles(written.runDirectory)).filter((name) => name.endsWith('.zip')).sort())
+      .toEqual([LEGACY_NAME, OLDER_NAME].sort());
+  });
+
+  it('throws ArtifactWriteError with the path when an earlier bundle cannot be removed', async () => {
+    const root = await outputDirectory();
+    const written = await new ArtifactWriter().writeRun(auditRun(), { outputDirectory: root });
+    await putEarlierFiles(written.runDirectory, [OLDER_NAME]);
+    const failure = Object.assign(new Error('the file is in use'), { code: 'EBUSY' });
+    const writer = new ArtifactWriter({
+      fileOperations: {
+        mkdir,
+        open,
+        rename,
+        rm: async () => {
+          throw failure;
+        },
+      },
+    });
+
+    const writing = writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT } });
+
+    await expect(writing).rejects.toBeInstanceOf(ArtifactWriteError);
+    await expect(writing).rejects.toMatchObject({ path: join(resolve(written.runDirectory), OLDER_NAME), cause: failure });
+    // 新しいバンドルは、書き終えている。
+    expect([...(await readFile(join(written.runDirectory, NEW_NAME)))]).toEqual([...BUNDLE_BYTES]);
+  });
+
+  it('refuses an invalid end time of the last execution with RangeError, before writing anything', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    await putEarlierFiles(written.runDirectory, [LEGACY_NAME]);
+    const before = await runDirectoryFiles(written.runDirectory);
+
+    await expect(writer.writePresentation(written, {
+      reportHtml: '<p>レポート</p>',
+      bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: 'not a time' },
+    })).rejects.toBeInstanceOf(RangeError);
+    expect(await runDirectoryFiles(written.runDirectory)).toEqual(before);
   });
 });
 

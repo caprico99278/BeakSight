@@ -20,8 +20,10 @@ import { finishAuditRun } from '../../src/cli/run-command.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
   artifactFilePath,
+  bundleFileName,
   CHECKPOINT_ARTIFACT_DIRECTORY,
   checkpointArtifactRelativePath,
+  isBundleFileName,
   pageArtifactRelativePath,
   PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
@@ -671,10 +673,19 @@ describe('R4b2: a Run stopped by the stop signal after the k-th page and resumed
     await expectSchemaValid(resumed);
   });
 
-  it('leaves the same set of output files in the run directory as the Run without the stop (except checkpoint/)', async () => {
+  // BN1（ChatGPT 用バンドルのファイル名の設計書 2.1）: バンドルの名前は、その Run の最後の実行の終わりの時刻を含むので、中断しなかった Run と
+  // 再開した Run とで違う。名前の一致は求めず、ほかのファイルの一覧を比べる。バンドルは、それぞれの Run のディレクトリにちょうど1つあり、
+  // 名前は、それぞれの run.json の `executions` の最後の `finishedAt` から `bundleFileName` で作ったものであることを確かめる。
+  it('leaves the same set of output files in the run directory as the Run without the stop (except checkpoint/ and the bundle name)', async () => {
     const files = await outputFilesUnder(runDirectory);
+    const withoutBundles = (paths: readonly string[]): readonly string[] => paths.filter((path) => !isBundleFileName(path));
     expect(files.length).toBeGreaterThan(0);
-    expect(files).toEqual(await outputFilesUnder(uninterruptedDirectory));
+    expect(withoutBundles(files)).toEqual(withoutBundles(await outputFilesUnder(uninterruptedDirectory)));
+    for (const directory of [runDirectory, uninterruptedDirectory]) {
+      const written = await readJson(artifactFilePath(directory, RUN_ARTIFACT_FILE_NAMES.run)) as RunSummary;
+      const expectedBundle = bundleFileName(written.executions[written.executions.length - 1]?.finishedAt ?? '');
+      expect((await outputFilesUnder(directory)).filter(isBundleFileName), directory).toEqual([expectedBundle]);
+    }
   });
 
   it('records the stopped execution and the resumed one in run.json, and finishes the checkpoint as FINISHED', async () => {

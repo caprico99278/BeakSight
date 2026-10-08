@@ -1,6 +1,6 @@
 // RC18 の M4（C18p）: `withGuardedPassivePage` の `expectNoViolations` の指定。
 // - 指定すると、`run` が終わった後（page と Context を閉じる前）に、Safety Ledger の違反が0件であることを確かめる。違反があれば、
-//   違反の内容が分かる形で失敗する。閉じる処理は、失敗しても必ず行う。
+//   違反の内容が分かる形で失敗する。閉じる処理（Context を、page と一緒に閉じる。DEF-038）は、失敗しても必ず行う。
 // - 既定（指定しない）は、確かめない（違反を確かめるテストが、この補助を使うため）。
 // ブラウザを使わず、偽の factory で確かめる。
 import type { BrowserContext, Page } from 'playwright';
@@ -53,10 +53,11 @@ function createFakeFactory(onClose?: (ledger: SafetyLedger) => void): FakeFactor
   return { factory, ledger, events };
 }
 
-const OPEN_AND_CLOSE = ['createPassiveContext', 'createPassivePage', 'run', 'closePassivePage', 'closePassiveContext'];
+// DEF-038: page は個別に閉じず、Context と一緒に閉じる（以前は、Context の前に `closePassivePage` を呼んでいた）。
+const OPEN_AND_CLOSE = ['createPassiveContext', 'createPassivePage', 'run', 'closePassiveContext'];
 
 describe('withGuardedPassivePage expectNoViolations', () => {
-  it('fails with the violation details when the Safety Ledger has a violation, and still closes the page and the Context', async () => {
+  it('fails with the violation details when the Safety Ledger has a violation, and still closes the Context with its page', async () => {
     const fake = createFakeFactory();
 
     const outcome = withGuardedPassivePage(fake.factory, VIEWPORT, async (_page, _context, ledger) => {
