@@ -2,7 +2,8 @@
  * CLI の Chromium の起動の設定（`chromium.launch` に渡す値）の置き場所（中断した Run の再開の設計書 4.10、サイトへの負荷の制御の設計書 4.9）。
  * CLI の本番の起動（`src/cli/run-command.ts` の `PRODUCTION_RUN_DEPENDENCIES.launchBrowser`）は、`chromiumLaunchOptions` の値で
  * `chromium.launch` を呼ぶ。channel、起動の引数、シグナルの扱いは、ここだけに書く。
- * テストの中で直接 Chromium を起動するもの（`tests/helpers/chromium.ts` など）は、この設定を使わない。
+ * テストの中で直接 Chromium を起動するもの（`tests/helpers/chromium.ts` など）は、この設定を使わない。ただし、Shared Worker を無効にする
+ * 引数（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`。DEF-044）は、テストの起動の補助も既定で使う（外すのは、テストの明示の選択だけ）。
  */
 import type { LaunchOptions } from 'playwright';
 
@@ -66,6 +67,23 @@ export const CHROMIUM_PRELOADING_DISABLED_ARGS = Object.freeze([
   `--enable-features=${[...PLAYWRIGHT_DEFAULT_ENABLED_FEATURES, ...CHROMIUM_PRELOADING_DISABLED_FEATURES].join(',')}`,
 ] as const);
 
+/**
+ * Shared Worker を無効にする、Chromium の起動の引数の閉じた一覧（DEF-044。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md`
+ * 1.2）。CLI の起動（`chromiumLaunchOptions`）と、テストの起動の補助（`tests/helpers/chromium.ts`）の両方が使う。
+ * Playwright（1.62.1）は `shared_worker` の target に session を付けないので、Shared Worker の中の要求（fetch、XHR、keepalive の POST）は、
+ * Guard の route も CDP の横取りも通らずにサーバに届く。そのため、Shared Worker そのものを無効にする（`typeof SharedWorker` が `undefined`
+ * になる。機能の検出で Dedicated Worker などに切り替えるページは動き、切り替えないページでは、Shared Worker に依存する機能が動かない）。
+ * 引数が効かずに Shared Worker が作られた場合は、`BrowserContextFactory` の自己検査が違反 `SHARED_WORKER_OBSERVED` にする（fail-closed）。
+ *
+ * Chromium 151（Playwright 1.62.1）で、headless shell と `channel: 'chromium'` の `chrome.exe` の両方で確かめて選んだ（NP5）:
+ * - `--disable-shared-workers`（選んだもの）: Shared Worker を無効にする専用の switch。ほかの引数と値を共有しないので、Playwright の
+ *   既定の引数を上書きしない。両方の Chromium で `typeof SharedWorker === 'undefined'` になり、`typeof Worker` は `function` のまま。
+ * - `--disable-blink-features=SharedWorker`: 同じく効いた。Playwright の既定の引数には `--disable-blink-features` はないが、値を
+ *   カンマで並べる形の引数なので、将来の既定や別の指定と重なると上書きのおそれがある（DEF-023 の `--enable-features` の教訓）。
+ * - `--disable-features=SharedWorker`: 効いたが、Playwright の既定の `--disable-features` を上書きするので使えない。
+ */
+export const CHROMIUM_SHARED_WORKERS_DISABLED_ARGS = Object.freeze(['--disable-shared-workers'] as const);
+
 /** `chromiumLaunchOptions` の指定。 */
 export interface ChromiumLaunchSettings {
   /** headless で起動するか（設定の `browser.headed` の逆）。 */
@@ -75,7 +93,8 @@ export interface ChromiumLaunchSettings {
 /**
  * CLI の `chromium.launch` に渡す値を作る（呼ぶたびに新しい値）。
  * - `channel`: `CHROMIUM_CHANNEL`（Ctrl+C で Chromium が終わらないため）。
- * - `args`: `CHROMIUM_PRELOADING_DISABLED_ARGS`（ページの先読みを止めるため）。
+ * - `args`: `CHROMIUM_PRELOADING_DISABLED_ARGS`（ページの先読みを止めるため）と、`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`（Shared Worker を
+ *   無効にするため。DEF-044）。
  * - `handleSIGINT`・`handleSIGTERM`・`handleSIGHUP`: `false`。Playwright の既定のシグナルの処理（SIGINT・SIGTERM・SIGHUP で Browser を
  *   閉じてプロセスを終える）を止める（中断した Run の再開の設計書 4.7）。Playwright がプロセスを終えると、最後の処理（出力の書き出し）が
  *   行われないためである。シグナルは、BeakSight が受ける（R5b）。
@@ -84,7 +103,7 @@ export function chromiumLaunchOptions(settings: ChromiumLaunchSettings): LaunchO
   return {
     headless: settings.headless,
     channel: CHROMIUM_CHANNEL,
-    args: [...CHROMIUM_PRELOADING_DISABLED_ARGS],
+    args: [...CHROMIUM_PRELOADING_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS],
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,

@@ -26,6 +26,8 @@ import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import {
   artifactFilePath,
+  bundleFileName,
+  isBundleFileName,
   pageArtifactRelativePath,
   RUN_ARTIFACT_FILE_NAMES,
 } from '../../src/core/artifact-layout.js';
@@ -286,9 +288,12 @@ describe('fixture full crawl through the built CLI with the default settings (Ta
   });
 
   it('writes run.json, audit.json, report.html, every page.json and the bundle, and they match their schemas', async () => {
-    for (const name of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
+    // BN1: バンドルの名前は、最後の実行の終わりの時刻（UTC）を含み、Run のディレクトリに1つだけある（バンドルのファイル名の設計書 2.1、2.2）。
+    const bundleName = bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
+    for (const name of [...Object.values(RUN_ARTIFACT_FILE_NAMES), bundleName]) {
       expect(fileAt(name), name).toBeDefined();
     }
+    expect(files.map(({ path }) => path).filter(isBundleFileName)).toEqual([bundleName]);
     await expect(validateArtifact('audit', await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit)))).resolves.toEqual({ ok: true });
     const writtenPages: PageAuditResult[] = [];
     for (const page of audit.pages) {
@@ -300,7 +305,7 @@ describe('fixture full crawl through the built CLI with the default settings (Ta
     expect(textOf(fileAt(RUN_ARTIFACT_FILE_NAMES.report))).toContain(HTML_REPORT_TEXT.title);
 
     // ChatGPT 用のバンドル: manifest が同じ Run を指し、run.json と各 page.json を、書き出したものと同じバイト列で含む。
-    const inBundle = (name: string): ArtifactFileContent | undefined => fileAt(`${RUN_ARTIFACT_FILE_NAMES.bundle}!/${name}`);
+    const inBundle = (name: string): ArtifactFileContent | undefined => fileAt(`${bundleName}!/${name}`);
     const manifest = JSON.parse(textOf(inBundle(CHATGPT_BUNDLE_FILE_NAMES.manifest))) as ChatGptBundleManifest;
     expect(manifest).toMatchObject({ runId: run.runId, runStatus: 'COMPLETE' });
     expect(manifest.omittedFiles.filter(({ reason }) => reason === 'ARTIFACT_FILE_NOT_FOUND')).toEqual([]);

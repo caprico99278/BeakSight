@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Frozen Close Race Posts</title></head>
+  <body>
+    <h1>Fixture Frozen Close Race Posts</h1>
+    <p>This page keeps sending POST requests to /__mutation every millisecond (sendBeacon and keepalive fetch), and once more while it is being left.</p>
+    <script>
+      // DEF-045: 1 ms ごとに、`navigator.sendBeacon` と keepalive の `fetch` で、同じ Origin の /__mutation へ POST を送り続ける。
+      // ページを離れるとき（`pagehide`）にも、同じ 2 つを送る。凍結の後の owner の close と、一時停止した要求の命令が重なる場面を作る。
+      // 送った回数は、html 要素の data-posts-sent に残す（送り始めたことの確かめに使う）。
+      const sendPosts = () => {
+        try {
+          navigator.sendBeacon('/__mutation', 'fixture');
+        } catch {
+          // 遮断された場合の例外は、ページの失敗にしない。
+        }
+        void fetch('/__mutation', { method: 'POST', body: 'fixture', keepalive: true }).catch(() => undefined);
+      };
+      let sent = 0;
+      setInterval(() => {
+        sendPosts();
+        sent += 1;
+        document.documentElement.dataset.postsSent = String(sent);
+      }, 1);
+      window.addEventListener('pagehide', sendPosts);
+    </script>
+  </body>
+</html>

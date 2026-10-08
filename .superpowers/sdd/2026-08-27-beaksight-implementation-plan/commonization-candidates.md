@@ -541,3 +541,24 @@
 - 場所: `src/orchestration/passive-session-open.ts`（`passiveSessionOpenDeadlineAtMs`）、`src/interaction/isolated-auditor.ts`（session の作成と観察の開始）、`src/evidence/layout-collector.ts`（観察の開始）。
 - 方針: `src/core/deadline.ts` に小さな補助を置き、3 か所がそれを使う（evidence と interaction は orchestration を import できないため）。
 - 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-048 「最後の実行」を選ぶ処理が 2 か所にある（2026-10-08 BN1 の報告で登録）
+
+- 場所: `src/report/view-model.ts` の `executionsView`（`lastEndReason`。R9）と、`src/cli/output.ts` の `lastExecutionFinishedAt`（BN1。`run-command.ts` も使う）。
+- 方針: 表示用モデルの `RunExecutionsView` に、最後の実行の終わりの時刻も持たせ（例: `lastFinishedAt`）、CLI はそれを使う。
+- 状態: 未着手（共通化はユーザーの明示の指示まで着手しない）。
+
+## CC-049 使わなくなったページを閉じる期限の項目の整理（2026-10-08 DEF-038 の設計で登録）
+
+- 場所: `src/core/limits.ts` の `PAGE_CLOSE_TIMEOUT_MS`、`PassiveSessionCloseTimeouts.pageCloseTimeoutMs`、`src/orchestration/passive-session-open.ts` の `resolvePassiveSessionDeadlines`、関係するテスト。
+- 内容: DEF-038 で、Guard の付いた Passive のページを個別に閉じなくなったので、production では使わない。テストの後片付けの関数（`closePassivePage` など）は残す。
+- 追記（DEF-038-fix の報告）: 通らなくなった分岐とコメントもある。`stress-session.ts` の2件の失敗の `AggregateError` の分岐と 63・132 行のコメント、`page-auditor.ts` の `passive-page-close` のラベル・`closeFailureReasons` の `step === 'page'` の分岐・1181 行の `PassivePageCloseDeadlineError` の判定、`PassiveSessionCloseStep` の `'page'`、`PassivePageCloseDeadlineError`、`PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE`。
+- 方針: 項目を除き、テストの後片付けも Context を閉じる形にそろえる。
+- 状態: 未着手（ユーザーの明示の指示まで着手しない）。
+
+## CC-050 Guard の CDP の横取りと Playwright の route の二重の判定（2026-10-08 DEF-042-fix で登録）
+
+- 場所: `src/safety/passive-request-guard.ts` の `handlePausedRequest`（CDP。すべての要求）と `context.route('**/*')` の処理（Playwright。許可された要求だけが来る）。
+- 内容: 判定は `classifyPassiveRequest` の 1 か所だが、呼ぶ場所が 2 つになった。route は、キャッシュから返す処理（`resourceDelivery`）と二重の網として残している。
+- 方針: route の判定を「CDP が許可したものの確認だけ」に整理するか、route をキャッシュの処理だけにする。安全の境界の変更なので、独立レビューの後に判断する。
+- 状態: 未着手（ユーザーの明示の指示まで着手しない）。

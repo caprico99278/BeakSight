@@ -381,7 +381,8 @@ describe('navigatePage', () => {
   });
 });
 
-// DEF-005: 実際の Run と同じ形（1つの page で1回だけナビゲーションし、その直後に、製品の閉じる処理で page と Context を閉じる）で、
+// DEF-005: 実際の Run と同じ形（1つの page で1回だけナビゲーションし、その直後に、製品の閉じる処理で Context を（page と一緒に。
+// DEF-038）閉じる）で、
 // 遮断や接続拒否の後の閉じる処理が、期限の中で終わること。閉じる処理は、Page Auditor と同じ `closePassivePageAndContext` を使う。
 describe('closing the guarded page and Context right after a failed navigation', () => {
   it.each([
@@ -405,7 +406,7 @@ describe('closing the guarded page and Context right after a failed navigation',
     const activeFactory = factory as BrowserContextFactory;
 
     const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(activeFactory, guardedContext, guardedPage);
+    const failures = await closePassivePageAndContext(activeFactory, guardedContext);
     const elapsedMs = performance.now() - startedAt;
     factory = undefined;
     context = undefined;

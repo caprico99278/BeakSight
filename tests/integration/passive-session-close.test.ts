@@ -2,17 +2,16 @@
 // Context は閉じ直さない）と、その失敗の一覧を返す部品。例外にするか理由にするかは、呼び出し側が決める。
 import { createServer } from 'node:http';
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
-import { PAGE_CLOSE_TIMEOUT_MS } from '../../src/core/limits.js';
 import { navigatePage } from '../../src/orchestration/page-navigation.js';
 import {
   closePassiveContextBeforeDeadline,
   closePassivePageAndContext,
   closePassivePageBeforeDeadline,
   PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE,
-  PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE,
   PassiveContextCloseDeadlineError,
   PassivePageCloseDeadlineError,
 } from '../../src/orchestration/passive-session-close.js';
@@ -20,6 +19,14 @@ import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-gu
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import {
+  closeUnguardedUnloadBeaconPage,
+  createGateFactory,
+  NO_NON_READ_REQUESTS,
+  runGuardedUnloadBeaconRounds,
+  UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
+  UNLOAD_BEACON_TARGET_PATH,
+} from '../helpers/gate-harness.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -47,7 +54,6 @@ const FAKE_CLOSE_MARGIN_MS = 1_000;
 const SHORT_DEADLINE_TEST_TIMEOUT_MS = 3_000;
 /** タイマーが少し早く発火する場合の許容。 */
 const TIMER_TOLERANCE_MS = 50;
-
 /** 閉じる処理の呼び出しを記録する、偽の factory。Guard の状態を持たない偽の Context は、Guard が閉じていないと判定される。 */
 function fakeFactory(
   behavior: {
@@ -82,63 +88,63 @@ describe('closePassivePageAndContext (CC-018)', () => {
   it('does nothing when there is no Context', async () => {
     const { factory, events } = fakeFactory();
 
-    const failures = await closePassivePageAndContext(factory, undefined, fakePage);
+    const failures = await closePassivePageAndContext(factory, undefined);
 
     expect(failures).toEqual([]);
     expect(events).toEqual([]);
   });
 
-  it('closes the page before the Context and returns no failures', async () => {
+  // DEF-038: page は個別に閉じず、Context だけを閉じる（page は Context と一緒に閉じる）。
+  it('closes only the Context, without closing the page by itself, and returns no failures (DEF-038)', async () => {
     const { factory, events } = fakeFactory();
 
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage);
+    const failures = await closePassivePageAndContext(factory, fakeContext);
 
     expect(failures).toEqual([]);
     expect(Object.isFrozen(failures)).toBe(true);
-    expect(events).toEqual(['closePage', 'closeContext']);
-  });
-
-  it('closes only the Context when there is no page', async () => {
-    const { factory, events } = fakeFactory();
-
-    await expect(closePassivePageAndContext(factory, fakeContext, undefined)).resolves.toEqual([]);
     expect(events).toEqual(['closeContext']);
   });
 
-  it('still closes the Context after the page close failed and returns the page failure as it was thrown', async () => {
+  // DEF-038: page を閉じる処理の期限（`pageCloseTimeoutMs`）は、閉じる手順で読まない（整理は CC-049）。
+  it('does not read the page close deadline (DEF-038)', async () => {
+    const { factory, events } = fakeFactory();
+
+    await expect(closePassivePageAndContext(factory, fakeContext, { pageCloseTimeoutMs: 0 })).resolves.toEqual([]);
+    expect(events).toEqual(['closeContext']);
+  });
+
+  // DEF-038: page を閉じる処理（失敗する場合も）を呼ばないので、page の失敗は返らない。
+  it('does not call the page close even when it would fail, and returns no page failure (DEF-038)', async () => {
     const pageError = new Error('page close failed');
     const { factory, events } = fakeFactory({ pageError });
 
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage);
+    const failures = await closePassivePageAndContext(factory, fakeContext);
 
-    expect(events).toEqual(['closePage', 'closeContext']);
-    expect(failures).toHaveLength(1);
-    expect(failures[0]?.step).toBe('page');
-    expect(failures[0]?.error).toBe(pageError);
-    expect(Object.isFrozen(failures[0])).toBe(true);
+    expect(events).toEqual(['closeContext']);
+    expect(failures).toEqual([]);
   });
 
-  it('returns the Context close failure', async () => {
+  it('returns the Context close failure as it was thrown', async () => {
     const contextError = new Error('context close failed');
     const { factory } = fakeFactory({ contextError });
 
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage);
+    const failures = await closePassivePageAndContext(factory, fakeContext);
 
     expect(failures.map(({ step }) => step)).toEqual(['context']);
     expect(failures[0]?.error).toBe(contextError);
+    expect(Object.isFrozen(failures[0])).toBe(true);
   });
 
-  it('returns both failures in the order page, Context', async () => {
+  // DEF-038: page を閉じる処理が失敗する場合も、返るのは Context を閉じる処理の失敗だけである。
+  it('returns only the Context close failure even when the page close would fail (DEF-038)', async () => {
     const pageError = new Error('page close failed');
     const contextError = new Error('context close failed');
-    const { factory } = fakeFactory({ pageError, contextError });
+    const { factory, events } = fakeFactory({ pageError, contextError });
 
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage);
+    const failures = await closePassivePageAndContext(factory, fakeContext);
 
-    expect(failures.map(({ step, error }) => ({ step, error }))).toEqual([
-      { step: 'page', error: pageError },
-      { step: 'context', error: contextError },
-    ]);
+    expect(events).toEqual(['closeContext']);
+    expect(failures.map(({ step, error }) => ({ step, error }))).toEqual([{ step: 'context', error: contextError }]);
   });
 
   it('does not close again a Context that the Guard closed after its installation failed', async () => {
@@ -153,25 +159,29 @@ describe('closePassivePageAndContext (CC-018)', () => {
     expect(isPassiveRequestGuardClosed(context)).toBe(true);
     const closeContext = vi.spyOn(factory, 'closePassiveContext');
 
-    await expect(closePassivePageAndContext(factory, context, undefined)).resolves.toEqual([]);
+    await expect(closePassivePageAndContext(factory, context)).resolves.toEqual([]);
     expect(closeContext).not.toHaveBeenCalled();
   });
 
-  it('returns only the page failure when the page close failure made the Guard close the Context', async () => {
+  // DEF-038: 本物の Guard の付いた page は、`page.close()` を呼ばずに、Context と一緒に閉じる。違反も、閉じる処理の失敗もない。
+  // （以前は、page を閉じる処理の失敗で Guard が Context を閉じる場面を確かめていた。page を個別に閉じなくなったので、その場面はない。）
+  it('closes a real guarded page together with its Context, without calling page.close() (DEF-038)', async () => {
     const factory = new BrowserContextFactory(browser, createTestConfig(ORIGIN), () => new SafetyLedger());
     const context = await factory.createPassiveContext(VIEWPORT);
     const page = await factory.createPassivePage(context);
-    const pageError = new Error('fixture page close failure');
-    vi.spyOn(page, 'close').mockRejectedValueOnce(pageError);
-    const closeContext = vi.spyOn(factory, 'closePassiveContext');
+    const pageClose = vi.spyOn(page, 'close');
+    const closePage = vi.spyOn(factory, 'closePassivePage');
 
-    const failures = await closePassivePageAndContext(factory, context, page);
+    const failures = await closePassivePageAndContext(factory, context);
 
+    expect(failures).toEqual([]);
+    expect(pageClose).not.toHaveBeenCalled();
+    expect(closePage).not.toHaveBeenCalled();
+    expect(page.isClosed()).toBe(true);
     expect(isPassiveRequestGuardClosed(context)).toBe(true);
-    expect(failures.map(({ step, error }) => ({ step, error }))).toEqual([{ step: 'page', error: pageError }]);
-    expect(closeContext).not.toHaveBeenCalled();
-    expect(factory.getSafetyLedger(context).snapshot().invariantViolations.map(({ code }) => code))
-      .toContain('GUARDED_PAGE_CLOSE_FAILED');
+    expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+    // factory は、閉じた Context の page を、もう持たない（DEF-038）。
+    await expect(factory.closePassivePage(page)).rejects.toThrow(/owned/i);
   });
 });
 
@@ -298,55 +308,51 @@ describe('closePassiveContextBeforeDeadline (DEF-008)', () => {
   });
 });
 
-// DEF-008: `closePassivePageAndContext` は、Context を `closePassiveContextBeforeDeadline` で閉じる。期限は、どちらも注入できる。
+// DEF-008: `closePassivePageAndContext` は、Context を `closePassiveContextBeforeDeadline` で閉じる。期限は注入できる。
 describe('closePassivePageAndContext with deadlines (DEF-008)', () => {
   it('returns the Context close deadline failure when closing the Context does not finish', async () => {
     const { factory, events } = fakeFactory({ contextHangs: true });
 
     const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage, {
-      pageCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
+    const failures = await closePassivePageAndContext(factory, fakeContext, {
       contextCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
     });
     const elapsedMs = performance.now() - startedAt;
 
     expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
-    expect(events).toEqual(['closePage', 'closeContext']);
+    expect(events).toEqual(['closeContext']);
     expect(failures).toHaveLength(1);
     expect(failures[0]?.step).toBe('context');
     expect(failures[0]?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
   }, SHORT_DEADLINE_TEST_TIMEOUT_MS);
 
-  it('returns both deadline failures in the order page, Context when neither close finishes', async () => {
+  // DEF-038: page を閉じる処理（終わらない場合も）を待たないので、待つのは Context を閉じる処理の期限の1回分だけである。
+  // （以前は、page と Context の両方の期限切れを、この順に返すことを確かめていた。）
+  it('waits only for the Context close deadline, not for a page close that would not finish (DEF-038)', async () => {
     const { factory, events } = fakeFactory({ pageHangs: true, contextHangs: true });
 
     const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, fakeContext, fakePage, {
+    const failures = await closePassivePageAndContext(factory, fakeContext, {
       pageCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
       contextCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
     });
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(2 * SHORT_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(2 * SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
-    expect(events).toEqual(['closePage', 'closeContext']);
-    expect(failures.map(({ step }) => step)).toEqual(['page', 'context']);
-    expect(failures[0]?.error).toBeInstanceOf(PassivePageCloseDeadlineError);
-    expect(failures[1]?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
+    expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
+    expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
+    expect(events).toEqual(['closeContext']);
+    expect(failures.map(({ step }) => step)).toEqual(['context']);
+    expect(failures[0]?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
   }, SHORT_DEADLINE_TEST_TIMEOUT_MS);
 });
 
 // DEF-006: エラーページを表示している page で、次のナビゲーションも失敗し、その直後に page を閉じると、Chromium は page を閉じず、
-// `page.close()` が終わらない（DEF-005 の調査）。page を閉じる処理は `PAGE_CLOSE_TIMEOUT_MS` で見切り、Context を閉じる処理に進む。
+// `page.close()` が終わらない（DEF-005 の調査）。DEF-038 の後は、page を個別に閉じず、Context と一緒に閉じるので、page を閉じる処理を
+// 待たない。この条件でも、Context を閉じる処理が page を閉じ、止まらずに戻ることを確かめる。
 describe('closePassivePageAndContext with a page that Chromium does not close (DEF-006)', () => {
-  /**
-   * 注入する page を閉じる処理の期限（R15r-4。実際の `PAGE_CLOSE_TIMEOUT_MS` を待たない）。ふだんの page を閉じる処理（数十 ms）より
-   * 長くし、止まらなかった場合に誤って期限切れにしにくくする（期限切れになっても、次のテストの条件は満たす）。
-   */
-  const INJECTED_PAGE_CLOSE_TIMEOUT_MS = 500;
-  /** 期限を過ぎてから、Context を閉じて戻るまでの余裕。 */
-  const CLOSE_MARGIN_MS = 5_000;
-  const TEST_TIMEOUT_MS = INJECTED_PAGE_CLOSE_TIMEOUT_MS + CLOSE_MARGIN_MS + 10_000;
+  /** Context を閉じて戻るまでの余裕（ms）。既定の page を閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`）より短い。 */
+  const CLOSE_MARGIN_MS = 3_000;
+  const TEST_TIMEOUT_MS = CLOSE_MARGIN_MS + 10_000;
 
   /** 127.0.0.1 の、いま使われていないポートの Origin（ポートを一度確保して、すぐに解放する。接続を拒否する）。 */
   async function unusedLoopbackOrigin(): Promise<string> {
@@ -385,65 +391,88 @@ describe('closePassivePageAndContext with a page that Chromium does not close (D
     vi.spyOn(factory, 'closePassivePage').mockImplementation(() => new Promise<never>(() => undefined));
   }
 
-  // Chromium が page を閉じないかどうかは、タイミングで変わる（多くの実行で止まるが、止まらないこともある）。
-  // そのため、ここでは、どちらの場合も期限の中で戻り、Context が閉じることを確かめる。止まった場合の記録は、次のテストで確かめる。
-  it('returns within the page close deadline and closes the Context under the DEF-005 condition', async () => {
+  // DEF-038: page を個別に閉じないので、page を閉じる処理の期限切れはない。Context を閉じる処理が、page も閉じる。
+  // （以前は、page を閉じる処理が期限の中で戻ること、止まった場合は期限切れが記録されることを確かめていた。）
+  it('closes the Context, and the page with it, without closing the page by itself, under the DEF-005 condition', async () => {
     const { factory, context, page, ledger } = await openPageShowingErrorAfterTwoFailures();
+    const closePage = vi.spyOn(factory, 'closePassivePage');
 
     const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, context, page, {
-      pageCloseTimeoutMs: INJECTED_PAGE_CLOSE_TIMEOUT_MS,
-    });
+    const failures = await closePassivePageAndContext(factory, context);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(INJECTED_PAGE_CLOSE_TIMEOUT_MS + CLOSE_MARGIN_MS);
+    expect(elapsedMs).toBeLessThan(CLOSE_MARGIN_MS);
+    expect(failures).toEqual([]);
+    expect(closePage).not.toHaveBeenCalled();
     expect(isPassiveRequestGuardClosed(context)).toBe(true);
     expect(page.isClosed()).toBe(true);
-    // 止まった場合は、page を閉じる処理の期限切れだけが記録される。
-    expect(failures.length).toBeLessThanOrEqual(1);
-    for (const failure of failures) {
-      expect(failure.step).toBe('page');
-      expect((failure.error as Error).message).toBe(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
-    }
-    // 見切った page を閉じる処理は、Context を閉じた後に終わる。その結果は封じ込め、Guard の違反にもならない。
     expect(ledger.snapshot().invariantViolations).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it('records the missed deadline as a page close failure and then closes the Context', async () => {
+  // DEF-038: page を閉じる処理が止まる場合も、それを呼ばないので、待たずに Context を閉じる。
+  // （以前は、止まった page を閉じる処理を期限で見切り、page を閉じる処理の失敗として記録することを確かめていた。）
+  it('does not wait for a page close that would not finish, and closes the Context', async () => {
     const { factory, context, page, ledger } = await openPageShowingErrorAfterTwoFailures();
     makePageCloseHang(factory);
 
     const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, context, page, {
-      pageCloseTimeoutMs: INJECTED_PAGE_CLOSE_TIMEOUT_MS,
-    });
+    const failures = await closePassivePageAndContext(factory, context);
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(INJECTED_PAGE_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(INJECTED_PAGE_CLOSE_TIMEOUT_MS + CLOSE_MARGIN_MS);
-    expect(failures).toHaveLength(1);
-    expect(failures[0]?.step).toBe('page');
-    expect(failures[0]?.error).toBeInstanceOf(Error);
-    expect((failures[0]?.error as Error).message).toBe(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
-    expect(Object.isFrozen(failures[0])).toBe(true);
+    // 既定の page を閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`）を待った場合は、ここで失敗する。
+    expect(elapsedMs).toBeLessThan(CLOSE_MARGIN_MS);
+    expect(failures).toEqual([]);
+    expect(vi.mocked(factory.closePassivePage)).not.toHaveBeenCalled();
     expect(isPassiveRequestGuardClosed(context)).toBe(true);
     expect(page.isClosed()).toBe(true);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it('lets the test cleanup helper close such a page and its Context without waiting forever', async () => {
+  // B2（DEF-038-fix-round-1）: テストの後片付けも、page を個別に閉じず、Context と一緒に閉じる。
+  // （以前は、page を閉じる処理を注入した期限で見切ってから Context を閉じることを確かめていた。）
+  it('lets the test cleanup helper close such a page with its Context, without closing the page by itself', async () => {
     const { factory, context, page } = await openPageShowingErrorAfterTwoFailures();
     makePageCloseHang(factory);
 
-    // 期限を注入し、既定の `PAGE_CLOSE_TIMEOUT_MS` を実際には待たない（P18e。P18a の発見事項1）。
     const startedAt = performance.now();
-    await closePassiveResources({ factory, context, page }, { pageCloseTimeoutMs: INJECTED_PAGE_CLOSE_TIMEOUT_MS });
+    await closePassiveResources({ factory, context, page });
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(INJECTED_PAGE_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    // 既定の期限（`PAGE_CLOSE_TIMEOUT_MS`）を待った場合は、ここで失敗する。
-    expect(elapsedMs).toBeLessThan(PAGE_CLOSE_TIMEOUT_MS);
+    expect(elapsedMs).toBeLessThan(CLOSE_MARGIN_MS);
+    expect(vi.mocked(factory.closePassivePage)).not.toHaveBeenCalled();
     expect(isPassiveRequestGuardClosed(context)).toBe(true);
     expect(page.isClosed()).toBe(true);
   }, TEST_TIMEOUT_MS);
+});
+
+// DEF-038（設計書 `2026-10-08-beaksight-def-038-passive-page-close-design.md` 4）: Guard の付いた Passive のページを閉じるときの
+// `pagehide`・`visibilitychange` の送信（`sendBeacon` と keepalive の `fetch` の POST）は、製品の閉じる手順
+// （`closePassivePageAndContext`）では、サーバに届かない。page を個別に閉じると、Playwright は閉じ始めたページの要求で Context の
+// route を呼ばないので、Guard を通らずに届く。Context だけを閉じる（page は Context と一緒に閉じる）と届かない。
+describe('closePassivePageAndContext with a page that sends POST requests while it is being left (DEF-038)', () => {
+  let server: FixtureServer;
+
+  beforeAll(async () => {
+    server = await startFixtureServer();
+  });
+
+  afterAll(async () => {
+    await server?.close();
+  });
+
+  it('delivers no POST to the server and records no violation, in every round and after the settle wait', async () => {
+    const factory = createGateFactory(browser, server.origin);
+
+    const { failedRounds, allRoundsWindow } = await runGuardedUnloadBeaconRounds(factory, server, VIEWPORT);
+
+    expect(failedRounds).toEqual([]);
+    expect(allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
+    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  }, UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS);
+
+  it('control: without the Guard, closing the same page with page.close() delivers the POST', async () => {
+    const window = await closeUnguardedUnloadBeaconPage(browser, server, VIEWPORT);
+
+    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
+  });
 });

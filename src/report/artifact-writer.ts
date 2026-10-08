@@ -36,9 +36,11 @@ import {
   PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
+  bundleFileName,
   checkpointArtifactRelativePath,
   checkpointPageArtifactRelativePath,
   checkpointPageIdOfFileName,
+  isBundleFileName,
   isPortableArtifactPathSegment,
   isPreflightTemporaryFileName,
   pageArtifactRelativePath,
@@ -147,8 +149,19 @@ export interface ArtifactWriteResult {
 export interface RunPresentationFiles {
   /** `report.html` の中身。改行は LF にして、UTF-8 で書く。 */
   readonly reportHtml?: string;
-  /** `beaksight-audit-bundle.zip` の中身（バイト列のまま書く）。 */
-  readonly bundle?: Uint8Array;
+  /** ChatGPT 用バンドル（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。ChatGPT 用バンドルのファイル名の設計書 2.1、2.2）。 */
+  readonly bundle?: RunPresentationBundle;
+}
+
+/** `writePresentation` で書く ChatGPT 用バンドルの、中身と、名前を決める時刻。 */
+export interface RunPresentationBundle {
+  /** ZIP の中身（バイト列のまま書く）。 */
+  readonly bytes: Uint8Array;
+  /**
+   * その Run の最後の実行の終わりの時刻（`RunExecution.finishedAt`。ISO 8601）。名前は、これから `bundleFileName`
+   * （`src/core/artifact-layout.ts`）で作る。
+   */
+  readonly lastExecutionFinishedAt: string;
 }
 
 /** artifact の入出力の失敗。`path` は、書けなかったファイルかディレクトリ。 */
@@ -738,7 +751,8 @@ export class ArtifactWriter {
   /**
    * `options` は省略できる（保存とロックの書き出しのファイルの操作、実行している環境、名前の変更をやり直す前の待ち。テスト用の差し替え口）。
    * 最後の artifact の書き出し（`writeRun`、`writePresentation`）は、差し替えたファイルの操作のうち、名前の変更（`rename`）だけを使う
-   * （名前の変更のやり直しを、保存と同じ1か所にするため。`renameWithRetry`）。
+   * （名前の変更のやり直しを、保存と同じ1か所にするため。`renameWithRetry`）。ただし、`writePresentation` が古い ChatGPT 用バンドルを
+   * 消すときは、差し替えたファイルの操作の `rm` を使う（ロックのファイルを消すときと同じ。消せなかった場合を確かめるテストのため）。
    * 不正な設定は `TypeError` を投げる。
    */
   constructor(options: ArtifactWriterOptions = {}) {
@@ -847,9 +861,16 @@ export class ArtifactWriter {
   }
 
   /**
-   * 表示用モデルから作ったファイル（`report.html`、`beaksight-audit-bundle.zip`）を、`writeRun` が書いた Run のディレクトリに書く。
+   * 表示用モデルから作ったファイル（`report.html`、ChatGPT 用バンドル）を、`writeRun` が書いた Run のディレクトリに書く。
    * 与えられたものだけを、この順に、一時ファイルと rename で書く。書いたファイルの相対パスを返す。入出力の失敗は
    * `ArtifactWriteError` を投げる。
+   * - バンドルの名前は、`bundle.lastExecutionFinishedAt`（最後の実行の終わりの時刻）から `bundleFileName` で作る（ChatGPT 用バンドルの
+   *   ファイル名の設計書 2.1）。時刻が不正なら、何も書かずに `RangeError` を投げる。
+   * - バンドルを書き終えた後に、Run のディレクトリの直下の、ほかのバンドルの名前（`isBundleFileName`。前の形と、日時の違う新しい形）の
+   *   普通のファイルを消す（設計書 2.2。Run のディレクトリには、最新のバンドルを1つだけ残す）。リンク（symlink、junction）は、たどらず、
+   *   消さない。ほかのファイルと、下のディレクトリには触れない。消す前に、パスが Run のディレクトリの中にあることを確かめる。
+   *   新しいバンドルを書けなかった場合は、古いバンドルを消さない。古いバンドルを消せなかった場合は `ArtifactWriteError`（`path` は、
+   *   消せなかったファイル）を投げる。
    */
   async writePresentation(
     written: Pick<ArtifactWriteResult, 'runDirectory'>,
@@ -858,16 +879,44 @@ export class ArtifactWriter {
     if (!isRecord(written) || typeof written.runDirectory !== 'string' || written.runDirectory.length === 0) {
       throw new TypeError('ArtifactWriter.writePresentation requires the result of writeRun');
     }
+    // 書く前に、バンドルの名前を作る（時刻が不正なら、何も書かずに `RangeError`）。
+    const bundle = files.bundle === undefined
+      ? null
+      : { name: bundleFileName(files.bundle.lastExecutionFinishedAt), bytes: files.bundle.bytes };
     const writtenFiles: string[] = [];
     if (files.reportHtml !== undefined) {
       await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.report), toLf(files.reportHtml), this.#rename);
       writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.report);
     }
-    if (files.bundle !== undefined) {
-      await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.bundle), files.bundle, this.#rename);
-      writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.bundle);
+    if (bundle !== null) {
+      await writeFileAtomically(artifactFilePath(written.runDirectory, bundle.name), bundle.bytes, this.#rename);
+      writtenFiles.push(bundle.name);
+      await this.#removeOtherBundles(written.runDirectory, bundle.name);
     }
     return Object.freeze(writtenFiles);
+  }
+
+  /**
+   * Run のディレクトリの直下の、`keptName` 以外のバンドルの名前（`isBundleFileName`）の普通のファイルを消す（ChatGPT 用バンドルの
+   * ファイル名の設計書 2.2）。リンク（symlink、junction）と、ファイルでないものは消さない。消す前に、パスが Run のディレクトリの中に
+   * あることを確かめる。消せなかった場合は `ArtifactWriteError` を投げる。
+   */
+  async #removeOtherBundles(runDirectory: string, keptName: string): Promise<void> {
+    const root = resolve(runDirectory);
+    for (const entry of await listRealDirectory(root, null)) {
+      if (!entry.isFile() || entry.name === keptName || !isBundleFileName(entry.name)) {
+        continue;
+      }
+      const path = artifactFilePath(root, entry.name);
+      if (!isInsideDirectory(root, path)) {
+        throw new RangeError(`refusing to remove a path outside the run directory: ${entry.name}`);
+      }
+      try {
+        await this.#fileOperations.rm(path, { force: true });
+      } catch (error) {
+        throw new ArtifactWriteError(path, error);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------------------------------------------

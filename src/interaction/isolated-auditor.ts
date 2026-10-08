@@ -541,9 +541,12 @@ function clickFailureOutcome(
  * freeze の後にページが起こした作用を遮断したか、または外部スキームへの移動を試みたか。Passive フェーズ（読み込み中）の
  * ダウンロード（`PASSIVE_DOWNLOAD`）と外部スキームへの移動の試み（`phase: 'PASSIVE'`。C18a）は、Ledger に記録されていれば足り、
  * Interaction の結果を BLOCKED にしない。
+ * 遮断したリクエストは、Guard が止めたページの要求（理由 `INTERACTION_FROZEN`）だけを数える（DEF-046。設計書
+ * `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 3）。出口の中継の記録（`INTERACTION_FROZEN_EGRESS`、
+ * `EGRESS_UPSTREAM_DENIED`）は、ネットワークの層の記録で、Chromium 自身の通信を含みうるので数えない（Ledger には残る）。
  */
 function hasFreezeEvent(snapshot: SafetyLedgerSnapshot): boolean {
-  return snapshot.blockedInteractionRequests.length > 0
+  return snapshot.blockedInteractionRequests.some(({ reason }) => reason === 'INTERACTION_FROZEN')
     || snapshot.blockedInteractionNavigations.length > 0
     || snapshot.blockedPopups.length > 0
     || snapshot.blockedDownloads.some(({ reason }) => reason === 'INTERACTION_FROZEN')

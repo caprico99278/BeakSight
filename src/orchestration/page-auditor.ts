@@ -729,7 +729,7 @@ export class PageAuditor {
       if (stages !== undefined) {
         page?.off('crash', stages.onCrash);
       }
-      reasons.push(...await closePassiveSession(factory, context, page, this.#deadlines));
+      reasons.push(...await closePassiveSession(factory, context, this.#deadlines));
     }
 
     // 描画プロセスが落ちた場合は FAILED にする（設計書 4.5.4）。
@@ -1068,7 +1068,6 @@ export class PageAuditor {
         sink.reasons.push(...await closePassiveSession(
           factory,
           error.context,
-          undefined,
           deadlines,
           SESSION_FAILURE_LABELS.interactionContextClose,
         ));
@@ -1458,18 +1457,17 @@ function sessionFailureReason(label: string, error: unknown): IncompleteReason {
 }
 
 /**
- * page と Context を `closePassivePageAndContext` で閉じる（page を閉じてから Context を閉じる。Guard がすでに Context を
- * 閉じていれば、Context は閉じ直さない）。どちらも期限（`deadlines` の `pageCloseTimeoutMs`、`contextCloseTimeoutMs`）付きで待つ
- * （DEF-006、DEF-008）。失敗（期限切れを含む）は投げずに、`UNHANDLED_FAILURE` の理由として返す（隠さない）。
+ * page と Context を `closePassivePageAndContext` で閉じる（page は個別に閉じず、Context と一緒に閉じる。DEF-038。Guard がすでに
+ * Context を閉じていれば、Context は閉じ直さない）。Context を閉じる処理は期限（`deadlines` の `contextCloseTimeoutMs`）付きで待つ
+ * （DEF-008）。失敗（期限切れを含む）は投げずに、`UNHANDLED_FAILURE` の理由として返す（隠さない）。
  */
 async function closePassiveSession(
   factory: BrowserContextFactory,
   context: BrowserContext | undefined,
-  page: Page | undefined,
   deadlines: ResolvedPassiveSessionDeadlines,
   contextCloseLabel: ContextCloseLabel = SESSION_FAILURE_LABELS.contextClose,
 ): Promise<IncompleteReason[]> {
-  return closeFailureReasons(await closePassivePageAndContext(factory, context, page, deadlines), contextCloseLabel);
+  return closeFailureReasons(await closePassivePageAndContext(factory, context, deadlines), contextCloseLabel);
 }
 
 /** 閉じる処理の失敗を、場面（page は `passive-page-close`、Context は `contextCloseLabel`）の `UNHANDLED_FAILURE` の理由にする。 */

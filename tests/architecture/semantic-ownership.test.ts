@@ -249,6 +249,50 @@ const findFinalFileWrites = (source: ScannedSource): readonly string[] => [
   ...matchesOf(source.code, FILE_WRITE_CODE_PATTERNS),
 ];
 
+/**
+ * DEF-038: Guard の付いた Passive の page を個別に閉じる関数。page を個別に閉じると、ページを離れるときの送信が Guard を通らずに
+ * 出るので、production では呼ばない（テストの後片付けだけで使う）。Passive の page は、Context と一緒に閉じる。
+ */
+const INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS = ['closePassivePage', 'closePassiveGuardedPage', 'closePassivePageBeforeDeadline'] as const;
+
+/** `INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS` の呼び出しを、`name(` の形で返す（定義は数えない）。 */
+const findIndividualPassivePageCloses = (source: ScannedSource): readonly string[] =>
+  INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS.flatMap((name) => callsOf(source, name));
+
+/** `bare` の `open` の位置の開き括弧（`(` か `{`）に対応する閉じ括弧の位置。見つからなければ `-1`（近似。DEF-038 の検査だけで使う）。 */
+const matchingBracket = (bare: string, open: number): number => {
+  const opener = bare[open];
+  const closer = opener === '(' ? ')' : '}';
+  let depth = 0;
+  for (let cursor = open; cursor < bare.length; cursor += 1) {
+    if (bare[cursor] === opener) {
+      depth += 1;
+    } else if (bare[cursor] === closer) {
+      depth -= 1;
+      if (depth === 0) {
+        return cursor;
+      }
+    }
+  }
+  return -1;
+};
+
+/**
+ * `definition`（関数かメソッドの定義の始まりから、引数の開き括弧 `(` までに一致する正規表現）の本体の範囲（`{` から `}` まで）。
+ * 定義が1つだけ見つからない場合は `null`（近似。引数の型の中の `{}` は、引数の括弧の対応で飛ばす）。
+ */
+const definitionBodyRange = (bare: string, definition: RegExp): { readonly start: number; readonly end: number } | null => {
+  const matches = [...bare.matchAll(new RegExp(definition.source, 'gu'))];
+  const [match] = matches;
+  if (matches.length !== 1 || match === undefined) {
+    return null;
+  }
+  const parametersEnd = matchingBracket(bare, match.index + match[0].length - 1);
+  const start = parametersEnd < 0 ? -1 : bare.indexOf('{', parametersEnd);
+  const end = start < 0 ? -1 : matchingBracket(bare, start);
+  return end < 0 ? null : { start, end };
+};
+
 // ---------------------------------------------------------------------------------------------------------------
 // 検出の関数の単体テスト（違反の例と、違反でない例）
 // ---------------------------------------------------------------------------------------------------------------
@@ -667,6 +711,30 @@ const PREFLIGHT = 'src/orchestration/preflight.ts';
 /** page rule のファイル（`src/audit/*-rules.ts`。Cross-page rule のファイルを除く）。 */
 const isPageRuleFile = (path: string): boolean => /^src\/audit\/[^/]+-rules\.ts$/u.test(path) && path !== CROSS_PAGE_RULES_OWNER;
 
+/**
+ * DEF-038: page を個別に閉じる関数（`INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS`）の定義のファイルと、その中で許す呼び出し。
+ * - `defines`: そのファイルで定義する関数の、定義の始まりから引数の `(` までに一致する正規表現。
+ * - `allowedCalls`: 呼んでよい関数と、その呼び出しを囲む定義（その定義の本体の中でだけ許す。例: `closePassivePageAndContext` の中では
+ *   呼ばない）。
+ */
+const INDIVIDUAL_PASSIVE_PAGE_CLOSE_DEFINITIONS: ReadonlyMap<string, {
+  readonly defines: RegExp;
+  readonly allowedCalls: readonly { readonly call: string; readonly within: RegExp }[];
+}> = new Map([
+  ['src/safety/passive-request-guard.ts', {
+    defines: /\bexport\s+async\s+function\s+closePassiveGuardedPage\s*\(/u,
+    allowedCalls: [],
+  }],
+  ['src/browser/context-factory.ts', {
+    defines: /\basync\s+closePassivePage\s*\(/u,
+    allowedCalls: [{ call: 'closePassiveGuardedPage(', within: /\basync\s+closePassivePage\s*\(/u }],
+  }],
+  ['src/orchestration/passive-session-close.ts', {
+    defines: /\bexport\s+async\s+function\s+closePassivePageBeforeDeadline\s*\(/u,
+    allowedCalls: [{ call: 'closePassivePage(', within: /\bexport\s+async\s+function\s+closePassivePageBeforeDeadline\s*\(/u }],
+  }],
+]);
+
 // ---------------------------------------------------------------------------------------------------------------
 // Gate
 // ---------------------------------------------------------------------------------------------------------------
@@ -791,6 +859,52 @@ describe('GATE-ARCH02〜08 Semantic Ownership', () => {
       ...detectIn(filesOtherThan([SCHEMA_VALIDATION_OWNER]), findSchemaValidatorUses),
       ...detectIn(filesOtherThan([ARTIFACT_WRITER]), findFinalFileWrites),
     ]);
+    expect(violations).toEqual([]);
+  });
+});
+
+// DEF-038（設計書 `2026-10-08-beaksight-def-038-passive-page-close-design.md` の変更履歴の DEF-038-fix の Blocker の行）:
+// Guard の付いた Passive の page を個別に閉じると、ページを離れるときの送信が Guard を通らずに出る。production の page は、
+// Context と一緒に閉じる。page を個別に閉じる関数は、テストの後片付けだけで使う。
+describe('DEF-038: guarded Passive pages are closed only together with their Context', () => {
+  it('detects the calls of the functions that close a guarded Passive page by itself, and ignores their definitions', () => {
+    for (const line of [
+      'await factory.closePassivePage(page);',
+      'await closePassiveGuardedPage(page);',
+      'const failure = await closePassivePageBeforeDeadline(factory, page, { timeoutMs });',
+    ]) {
+      expect(detects(findIndividualPassivePageCloses, line), line).toHaveLength(1);
+    }
+    for (const line of [
+      'async closePassivePage(page: Page): Promise<void> {',
+      'export async function closePassiveGuardedPage(page: Page): Promise<void> {',
+      '// factory.closePassivePage(page)',
+      "const name = 'closePassivePage(page)';",
+      'await closePassivePageAndContext(factory, context, deadlines);',
+    ]) {
+      expect(detects(findIndividualPassivePageCloses, line), line).toHaveLength(0);
+    }
+  });
+
+  it('calls them nowhere in src/** but inside their own definitions', () => {
+    const violations: string[] = [];
+    for (const [path, { defines, allowedCalls }] of INDIVIDUAL_PASSIVE_PAGE_CLOSE_DEFINITIONS) {
+      const file = sourceFile(path);
+      expect(definitionBodyRange(file.bare, defines), `${path}: ${defines.source}`).not.toBeNull();
+      const calls = INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS.flatMap((name) =>
+        findCallSites(file.bare, name).map(({ index }) => ({ call: `${name}(`, index })));
+      const inside = calls.filter(({ call, index }) => allowedCalls.some((allowed) => {
+        const range = allowed.call === call ? definitionBodyRange(file.bare, allowed.within) : null;
+        return range !== null && index > range.start && index < range.end;
+      }));
+      violations.push(...calls.filter((call) => !inside.includes(call)).map(({ call }) => `${path}: ${call}`));
+      // 許した呼び出しが古くなっていない（定義の中に実際にある）ことの確かめ。
+      expect(inside.map(({ call }) => call).sort(), path).toEqual(allowedCalls.map(({ call }) => call).sort());
+    }
+    violations.push(...detectIn(
+      filesOtherThan([...INDIVIDUAL_PASSIVE_PAGE_CLOSE_DEFINITIONS.keys()]),
+      findIndividualPassivePageCloses,
+    ).map(detectionKey));
     expect(violations).toEqual([]);
   });
 });
