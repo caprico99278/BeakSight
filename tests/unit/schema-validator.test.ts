@@ -92,7 +92,7 @@ import { useHeadlessChromium } from '../helpers/chromium.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { sampleRunCheckpoint } from '../helpers/run-checkpoint-samples.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory } from '../helpers/temporary-build.js';
-import { createTestConfig } from '../helpers/test-config.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 const pageId = createPageId(1);
 const observedAt = '2026-08-27T00:00:00.000Z';
@@ -2082,6 +2082,8 @@ describe('T12d0: safety Evidence', () => {
     ledger.recordBlockedRequest({ method: 'put', url: 'https://example.test/item', reason: 'NON_READ_METHOD' });
     ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
     ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' });
+    // DEF-040（NP3）: Worker の中の WebSocket を CSP で止めた記録（Passive と凍結の後）。
+    ledger.recordBlockedWebSocket({ url: 'wss://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY' });
     ledger.recordBlockedExternalAction({ candidateId: safetyCandidateId, url: null, reason: 'DOWNLOAD' });
     ledger.recordExcludedInteractionCandidate({ candidateId: safetyCandidateId, reason: 'NAVIGATION_HREF' });
     ledger.recordBlockedInteractionRequest({ method: 'POST', url: 'https://example.test/api', reason: 'INTERACTION_FROZEN' });
@@ -2089,6 +2091,7 @@ describe('T12d0: safety Evidence', () => {
     ledger.recordBlockedPopup({ url: 'https://example.test/popup', reason: 'INTERACTION_FROZEN' });
     ledger.recordBlockedDownload({ url: 'https://example.test/file', suggestedFilename: 'file', reason: 'INTERACTION_FROZEN' });
     ledger.recordBlockedInteractionWebSocket({ url: 'wss://example.test/live', reason: 'INTERACTION_FROZEN' });
+    ledger.recordBlockedInteractionWebSocket({ url: 'wss://example.test/worker-live', reason: 'WORKER_CONNECT_POLICY' });
     ledger.recordExternalSchemeNavigation({
       url: 'mailto:nobody@example.invalid',
       scheme: 'mailto',
@@ -2159,6 +2162,11 @@ describe('T12d0: safety Evidence', () => {
     ['a frozen Interaction navigation reason outside its closed list', {
       ...safetyPayload,
       blockedInteractionNavigations: [{ method: 'GET', url: 'https://example.test/', reason: 'PASSIVE_WEBSOCKET' }],
+    }],
+    // DEF-039・DEF-040 の設計書 2.1.3: 出口の中継の理由は、操作中に遮断したリクエストだけのもので、ナビゲーションには使わない。
+    ['a frozen Interaction navigation with the egress request reason', {
+      ...safetyPayload,
+      blockedInteractionNavigations: [{ method: 'GET', url: 'https://example.test/', reason: 'INTERACTION_FROZEN_EGRESS' }],
     }],
     ['a popup reason outside its closed list', {
       ...safetyPayload,
@@ -2352,7 +2360,7 @@ describe('C8: real collector output from local fixtures', () => {
         const ledger = new SafetyLedger();
         passiveLedgers.push(ledger);
         return ledger;
-      });
+      }, TEST_FACTORY_OPTIONS);
       const evidence: EvidenceRecord[] = [];
       const pathnames = ['/index.html', '/js-error.html', '/bad-contrast.html', '/element-overlap.html', '/post-form.html'];
       for (const [index, pathname] of pathnames.entries()) {
@@ -2412,7 +2420,7 @@ describe('C8: real collector output from local fixtures', () => {
   it('accepts the actual controlledScroll results, COMPLETE and PARTIAL, as scroll Evidence (R\'2 I-2)', async () => {
     const server = await startFixtureServer();
     try {
-      const factory = new BrowserContextFactory(browser, createTestConfig(server.origin), () => new SafetyLedger());
+      const factory = new BrowserContextFactory(browser, createTestConfig(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
       const results: EvidencePayloadByType['scroll'][] = [];
       for (const pathname of [
         '/lazy-content.html',

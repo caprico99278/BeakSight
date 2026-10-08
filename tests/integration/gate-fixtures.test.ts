@@ -4,7 +4,13 @@ import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchHeadlessChromium, oopifTargetUrls, SITE_PER_PROCESS_ARGS, useHeadlessChromium } from '../helpers/chromium.js';
+import {
+  launchCliChromium,
+  launchHeadlessChromium,
+  oopifTargetUrls,
+  SITE_PER_PROCESS_ARGS,
+  useHeadlessChromium,
+} from '../helpers/chromium.js';
 import {
   collectRedirectedNavigations,
   CROSS_SITE_FRAME_PAGE,
@@ -27,7 +33,33 @@ import {
   selfNavigatingFramePath,
   SLOW_REDIRECT_PATH,
 } from '../helpers/external-scheme-fixture.js';
-import { openServerWindow, withGuardedPassivePage, withUnguardedPage, type ServerWindow } from '../helpers/gate-harness.js';
+import {
+  closeUnguardedUnloadBeaconPage,
+  leaveUnguardedUnloadBeaconPage,
+  openServerWindow,
+  openUnguardedWorkerWebSocketPage,
+  readServiceWorkerBypassState,
+  readSharedWorkerFixtureState,
+  SERVICE_WORKER_BYPASS_FRAMES,
+  SERVICE_WORKER_BYPASS_WAYS,
+  SERVICE_WORKER_BYPASS_WORKER_PATH,
+  serviceWorkerBypassPath,
+  SHARED_WORKER_POST_KINDS,
+  sharedWorkerPostsPath,
+  UNAVAILABLE_WORKER_WEBSOCKET_KINDS,
+  pageUrlIs,
+  readFetchLaterState,
+  UNLOAD_BEACON_FETCH_LATER_PAGE,
+  UNLOAD_BEACON_PAGE,
+  UNLOAD_BEACON_TARGET_PATH,
+  unloadBeaconSelfNavigationPath,
+  withGuardedPassivePage,
+  withUnguardedPage,
+  WORKER_WEBSOCKET_KINDS,
+  WORKER_WEBSOCKET_PASSIVE_PAGE,
+  workerWebSocketScriptRequestLines,
+  type ServerWindow,
+} from '../helpers/gate-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 /**
@@ -92,6 +124,21 @@ describe('Task 18 fixtures: targets of blocked navigation and popups (DEF-010 co
     });
   });
 
+  it('sends POST /__mutation from the form written into the popup in an unguarded control Context (DEF-036)', async () => {
+    await withControlPage(async (page) => {
+      await page.goto(`${server.origin}/popup-form-post.html`);
+      await page.waitForLoadState('load');
+      expect(server.getCounters().post).toBe(0);
+
+      const popupEvent = page.waitForEvent('popup');
+      await page.getByRole('button', { name: 'Open popup form' }).click();
+      await popupEvent;
+
+      await expect.poll(() => serverWindow.count('POST', '/__mutation')).toBe(1);
+      expect(server.getCounters()).toMatchObject({ post: 1, put: 0, patch: 0, delete: 0 });
+    });
+  });
+
   it('navigates to /navigation-target.html from the navigation button in an unguarded control Context', async () => {
     await withControlPage(async (page) => {
       await page.goto(`${server.origin}/navigation-button.html`);
@@ -102,6 +149,62 @@ describe('Task 18 fixtures: targets of blocked navigation and popups (DEF-010 co
       expect(await page.title()).toBe(NAVIGATION_TARGET_HEADING);
       expect(serverWindow.count('GET', NAVIGATION_TARGET_PAGE)).toBeGreaterThan(0);
     });
+  });
+});
+
+describe('DEF-038 fixture: a page that sends POST requests only while it is being left', () => {
+  it('sends nothing while it loads, and POST /__mutation when the page is closed, in an unguarded control Context', async () => {
+    const window = await closeUnguardedUnloadBeaconPage(browser, server, viewport);
+
+    expect(serverWindow.requestLines().filter((line) => line.startsWith('GET '))).toContain(`GET ${UNLOAD_BEACON_PAGE}`);
+    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
+    expect(window.nonReadCounters()).toMatchObject({ put: 0, patch: 0, delete: 0 });
+  });
+});
+
+// DEF-042 の対照: ページ自身が別の文書へ移る fixture は、Guard のない Context では、ページを離れるときの POST（`pagehide` の beacon と
+// keepalive の `fetch`、`fetchLater()` の予約）をサーバに届ける。Gate と Guard のテストの「届かなかった」の確認が空振りしないためである。
+describe('DEF-042 fixtures: pages that send POST requests only while they leave by themselves', () => {
+  it('delivers POST /__mutation when the page leaves by itself to the same site (pagehide beacon, keepalive fetch), in an unguarded control Context', async () => {
+    const window = await leaveUnguardedUnloadBeaconPage(
+      browser,
+      server,
+      viewport,
+      unloadBeaconSelfNavigationPath('same-site'),
+      pageUrlIs(`${server.origin}${NAVIGATION_TARGET_PAGE}`),
+    );
+
+    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
+    expect(window.count('GET', NAVIGATION_TARGET_PAGE)).toBe(1);
+    expect(window.nonReadCounters()).toMatchObject({ put: 0, patch: 0, delete: 0 });
+  });
+
+  it('delivers POST /__mutation to the allowed Origin when the page leaves by itself to the other host name (cross-site), in an unguarded control Context', async () => {
+    const crossSiteTarget = `${crossSiteOriginOf(server.origin)}${NAVIGATION_TARGET_PAGE}`;
+    const window = await leaveUnguardedUnloadBeaconPage(
+      browser,
+      server,
+      viewport,
+      unloadBeaconSelfNavigationPath('cross-site'),
+      pageUrlIs(crossSiteTarget),
+    );
+
+    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
+    expect(window.count('GET', NAVIGATION_TARGET_PAGE)).toBe(1);
+  });
+
+  it('schedules a fetchLater() POST and delivers POST /__mutation when the page leaves by itself, in an unguarded control Context', async () => {
+    const window = await leaveUnguardedUnloadBeaconPage(
+      browser,
+      server,
+      viewport,
+      UNLOAD_BEACON_FETCH_LATER_PAGE,
+      pageUrlIs(`${server.origin}${NAVIGATION_TARGET_PAGE}`),
+      { afterDomContentLoaded: async (page) => expect(await readFetchLaterState(page)).toBe('scheduled') },
+    );
+
+    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
+    expect(window.nonReadCounters()).toMatchObject({ put: 0, patch: 0, delete: 0 });
   });
 });
 
@@ -299,6 +402,52 @@ describe('C18i fixtures: a cross-site iframe that runs in a separate process (OO
   });
 });
 
+/**
+ * DEF-040（NP3）の fixture: 読み込みのときに Worker（blob、http の script、Shared、module、入れ子、srcdoc の iframe）の中で WebSocket を開く
+ * ページと、WebSocket 以外の接続を行う対照のページが、Guard のない Context で実際にサーバへ届く（遮断の確認が空振りしない）。
+ */
+describe('DEF-040 fixtures: pages that open a WebSocket from inside a Worker while they load, and the connection controls', () => {
+  // DEF-044（NP5）: テストの Chromium は Shared Worker を無効にして起動するので、Shared の場面は、Shared Worker が作れず（fixture が
+  // `unavailable` を残す）、Upgrade は届かない。
+  it.each(WORKER_WEBSOCKET_KINDS)('delivers the WebSocket upgrade from inside the %s Worker, and the Worker script GETs, in an unguarded control Context, except the Shared Worker that cannot be created', async (kind) => {
+    const window = await openUnguardedWorkerWebSocketPage(browser, server, viewport, kind);
+
+    if (UNAVAILABLE_WORKER_WEBSOCKET_KINDS.includes(kind)) {
+      expect(window.counters().webSocketUpgrade).toBe(0);
+    } else {
+      expect(window.counters().webSocketUpgrade).toBeGreaterThan(0);
+    }
+    expect(window.requestLines()).toEqual(expect.arrayContaining([
+      `GET ${WORKER_WEBSOCKET_PASSIVE_PAGE}`,
+      ...workerWebSocketScriptRequestLines(kind),
+    ]));
+  });
+
+  it('delivers the GET connections (fetch, XHR, EventSource, img, script, Worker fetch) and the POST (beacon, ping) of the controls page, in an unguarded control Context', async () => {
+    await withControlPage(async (page) => {
+      await page.goto(`${server.origin}/worker-connect-policy-controls.html`, { waitUntil: 'load' });
+
+      await expect.poll(() => serverWindow.count('POST', '/__mutation')).toBeGreaterThanOrEqual(2);
+      await expect.poll(() => page.evaluate(() => document.documentElement.dataset['workerFetch'])).toBe('done');
+      for (const path of ['/external-script.js', '/short-content.html', '/robots.txt', '/sitemap.xml', '/unsized-image.svg', '/resource-item.css']) {
+        expect(serverWindow.count('GET', path), path).toBeGreaterThan(0);
+      }
+      expect(await page.evaluate(() => ({ ...document.documentElement.dataset }))).toMatchObject({
+        fetchGet: 'done',
+        xhrGet: 'done',
+        eventSource: 'done',
+        image: 'done',
+        script: 'done',
+        dataFetch: 'ok',
+        blobFetch: 'ok',
+        workerFetch: 'done',
+        beacon: 'queued',
+        ping: 'clicked',
+      });
+    });
+  });
+});
+
 describe('Task 18 fixtures: a Service Worker that sends a POST itself', () => {
   it('registers the worker, which sends POST /__mutation from inside the worker, in an unguarded control Context', async () => {
     await withControlPage(async (page) => {
@@ -314,4 +463,73 @@ describe('Task 18 fixtures: a Service Worker that sends a POST itself', () => {
       expect(await page.evaluate(() => document.documentElement.outerHTML)).not.toMatch(/method:\s*'POST'/u);
     });
   });
+});
+
+/**
+ * DEF-044（NP5。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 1.3）の対照: Shared Worker を無効にする引数
+ * （`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`）を外した Chromium（`tests/helpers/chromium.ts` の明示の選択 `sharedWorkers: 'allow'`）では、`shared-worker-posts.html` の
+ * Shared Worker が作られ、その中の fetch・XHR・keepalive の POST が、Guard のない Context でサーバに届く（遮断の確かめが空振りしない）。
+ * テストの既定の headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）から引数を外したものの両方で確かめる。
+ */
+describe.each([
+  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium({ sharedWorkers: 'allow' }) },
+  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium({ sharedWorkers: 'allow' }) },
+])('DEF-044 fixtures: a Shared Worker posts from inside, with $name launched without the Shared Worker disabling arguments', ({ launch }) => {
+  let allowingBrowser: Browser;
+
+  beforeAll(async () => {
+    allowingBrowser = await launch();
+  });
+
+  afterAll(async () => {
+    await allowingBrowser?.close();
+  });
+
+  it.each(SHARED_WORKER_POST_KINDS)('creates the Shared Worker and delivers its %s POST to /__mutation in an unguarded control Context', async (kind) => {
+    await withUnguardedPage(allowingBrowser, viewport, async (page) => {
+      await page.goto(`${server.origin}${sharedWorkerPostsPath(kind)}`, { waitUntil: 'load' });
+
+      await expect.poll(() => readSharedWorkerFixtureState(page)).toEqual({ type: 'function', state: 'started' });
+      await expect.poll(() => serverWindow.count('POST', '/__mutation')).toBeGreaterThan(0);
+    });
+  });
+});
+
+/**
+ * DEF-049（NP6。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 5）の対照: Guard のない Context では、factory と同じ
+ * `serviceWorkers: 'block'` を付けていても、`service-worker-bypass.html` の 2 つの迂回（`prototype.register.call`、`delete` の後の
+ * 呼び出し）が、ページの文書、同じ Origin の iframe、about:blank の iframe のどこからでも Service Worker を登録し、その install と
+ * activate の POST がサーバに届く（GATE-S08 の迂回の確かめが空振りしない）。テストの既定の headless shell と、CLI の起動の設定の両方で
+ * 確かめる。
+ */
+describe.each([
+  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
+  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
+])('DEF-049 fixtures: the Service Worker registration bypasses the instance override of serviceWorkers: block, with $name', ({ launch }) => {
+  let bypassBrowser: Browser;
+
+  beforeAll(async () => {
+    bypassBrowser = await launch();
+  });
+
+  afterAll(async () => {
+    await bypassBrowser?.close();
+  });
+
+  it.each(SERVICE_WORKER_BYPASS_WAYS.flatMap((way) => SERVICE_WORKER_BYPASS_FRAMES.map((where) => ({ way, where }))))(
+    'registers the worker with the $way bypass in the $where frame, and its POST reaches /__mutation in an unguarded control Context',
+    async ({ way, where }) => {
+      const context = await bypassBrowser.newContext({ viewport, serviceWorkers: 'block' });
+      try {
+        const page = await context.newPage();
+        await page.goto(`${server.origin}${serviceWorkerBypassPath(way, where)}`, { waitUntil: 'load' });
+
+        await expect.poll(() => readServiceWorkerBypassState(page)).toBe('registered');
+        await expect.poll(() => serverWindow.count('POST', '/__mutation')).toBeGreaterThan(0);
+        expect(serverWindow.count('GET', SERVICE_WORKER_BYPASS_WORKER_PATH)).toBeGreaterThan(0);
+      } finally {
+        await context.close();
+      }
+    },
+  );
 });

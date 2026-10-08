@@ -130,7 +130,7 @@ function createSessionHandle(
       }
       closeStarted = true;
       // Guard が Context を無効にして閉じた場合は、Context は閉じ直さず、page の失敗だけを投げる。
-      const errors = (await closePassivePageAndContext(factory, context, page, deadlines)).map((failure) => failure.error);
+      const errors = (await closePassivePageAndContext(factory, context, deadlines)).map((failure) => failure.error);
       if (errors.length > 1) {
         throw new AggregateError(errors, 'Stress sweep session page close and Context close both failed');
       }
@@ -148,7 +148,7 @@ async function closeAfterFailure(
   cause: unknown,
   deadlines: ResolvedPassiveSessionDeadlines,
 ): Promise<never> {
-  throwWithCloseFailures(cause, await closePassivePageAndContext(factory, context, undefined, deadlines));
+  throwWithCloseFailures(cause, await closePassivePageAndContext(factory, context, deadlines));
 }
 
 /** 作成の失敗を投げる。閉じる処理の失敗があれば、両方を `AggregateError` にまとめて投げる。 */

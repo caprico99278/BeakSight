@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Popup Self Close Beacon</title></head>
+  <body>
+    <button type="button" data-scenario="same-task">Close popup in the same task</button>
+    <button type="button" data-scenario="delayed">Close popup after a delay</button>
+    <button type="button" data-scenario="unload">Close popup with unload beacon</button>
+    <script>
+      // DEF-039: クリックで about:blank のポップアップを開き、ポップアップを離れるとき（`pagehide` か `unload`）に、
+      // `navigator.sendBeacon` と keepalive の `fetch` で、同じ Origin の /__mutation へ POST を送る。ポップアップは、
+      // ページ自身が `popup.close()` で閉じる（Guard ではなく、ページの側から閉じる）。
+      // - same-task: 開いた同じ処理の中で閉じる。
+      // - delayed: `DELAYED_CLOSE_MS` の後に閉じる。
+      // - unload: `unload` で beacon だけを送り、同じ処理の中で閉じる。
+      const DELAYED_CLOSE_MS = 300;
+      const mutationUrl = new URL('/__mutation', window.location.href).href;
+      const sendLeavingRequests = (popup) => {
+        try {
+          popup.navigator.sendBeacon(mutationUrl, 'fixture');
+        } catch {
+          // 遮断された場合の例外は、ページの失敗にしない。
+        }
+        void popup.fetch(mutationUrl, { method: 'POST', body: 'fixture', keepalive: true }).catch(() => undefined);
+      };
+      const scenarios = {
+        'same-task': (popup) => {
+          popup.addEventListener('pagehide', () => sendLeavingRequests(popup));
+          popup.close();
+        },
+        delayed: (popup) => {
+          popup.addEventListener('pagehide', () => sendLeavingRequests(popup));
+          setTimeout(() => popup.close(), DELAYED_CLOSE_MS);
+        },
+        unload: (popup) => {
+          popup.addEventListener('unload', () => {
+            try {
+              popup.navigator.sendBeacon(mutationUrl, 'fixture');
+            } catch {
+              // 遮断された場合の例外は、ページの失敗にしない。
+            }
+          });
+          popup.close();
+        },
+      };
+      for (const button of document.querySelectorAll('button[data-scenario]')) {
+        button.addEventListener('click', () => {
+          const popup = window.open('about:blank');
+          if (popup === null) {
+            return;
+          }
+          scenarios[button.dataset.scenario](popup);
+        });
+      }
+    </script>
+  </body>
+</html>

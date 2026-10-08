@@ -4,7 +4,10 @@ import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS, PAGE_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import { isPassiveRequestGuardClosed } from '../safety/passive-request-guard.js';
 
-/** 閉じる処理のどの手順で失敗したか。`page` は page を閉じる処理、`context` は Context を閉じる処理。 */
+/**
+ * 閉じる処理のどの手順で失敗したか。`page` は page を閉じる処理、`context` は Context を閉じる処理。
+ * DEF-038 の後は、`page` を返すのは `closePassivePageBeforeDeadline`（production では使わない）だけである。
+ */
 export type PassiveSessionCloseStep = 'page' | 'context';
 
 /** page を閉じる処理が期限（`PAGE_CLOSE_TIMEOUT_MS`）の中で終わらなかったときの、失敗のメッセージ（DEF-006）。 */
@@ -52,13 +55,20 @@ export interface PassiveCloseDeadlineOptions {
 
 /** page と Context を閉じる処理を待つ時間の上限（ms）の注入口（R15r-4）。省略した項目は、既定の定数を使う。 */
 export interface PassiveSessionCloseTimeouts {
-  /** page を閉じる処理を待つ上限。既定は `PAGE_CLOSE_TIMEOUT_MS`。 */
+  /**
+   * page を閉じる処理を待つ上限。既定は `PAGE_CLOSE_TIMEOUT_MS`。
+   * DEF-038 で、Guard の付いた Passive のページを個別に閉じなくなったので、production では使わない（整理は CC-049）。
+   * `closePassivePageAndContext` は、この値を読まない。
+   */
   readonly pageCloseTimeoutMs?: number | undefined;
   /** Context を閉じる処理を待つ上限。既定は `CONTEXT_CLOSE_TIMEOUT_MS`。 */
   readonly contextCloseTimeoutMs?: number | undefined;
 }
 
 /**
+ * Guard の付いたページを個別に閉じると、ページを離れるときの送信が Guard を通らずに出る（DEF-038）。production では使わない。
+ * テストの後片付けだけで使う（production の page は、`closePassivePageAndContext` で Context と一緒に閉じる）。
+ *
  * Guard の付いた Passive の page を、factory の `closePassivePage` で閉じる。終わりを待つのは `options.timeoutMs`
  * （既定は `PAGE_CLOSE_TIMEOUT_MS`）までである（DEF-006。page を期限付きで閉じる処理は、ここだけで行う）。
  * - 期限の中で終われば `null`、失敗すれば、その失敗（`step` は `page`）を返す。
@@ -124,31 +134,25 @@ export async function closePassiveContextBeforeDeadline(
 /**
  * Guard の付いた Passive の page と Context を閉じる（CC-018。この手順は、ここだけで行う）。
  * - `context` が `undefined` なら、何もしない。
- * - `page` があれば、`closePassivePageBeforeDeadline` で先に閉じる（期限は `timeouts.pageCloseTimeoutMs`、既定は
- *   `PAGE_CLOSE_TIMEOUT_MS`）。失敗しても、期限を過ぎても、次の手順に進む。
- * - Context は `closePassiveContextBeforeDeadline` で閉じる（期限は `timeouts.contextCloseTimeoutMs`、既定は
- *   `CONTEXT_CLOSE_TIMEOUT_MS`。DEF-008）。Guard がすでに Context を閉じていれば、閉じ直さない。
+ * - page を個別に閉じない。Context を `closePassiveContextBeforeDeadline` で閉じ、その Context の page は、Context と一緒に閉じる
+ *   （DEF-038。page を個別に閉じると、ページを離れるとき（`pagehide`・`visibilitychange`）の送信が、Guard を通らずにサーバに届く。
+ *   Playwright は、閉じ始めたページの要求で Context の route を呼ばないためである）。
+ * - Context を閉じる処理の期限は `timeouts.contextCloseTimeoutMs`（既定は `CONTEXT_CLOSE_TIMEOUT_MS`。DEF-008）。Guard がすでに
+ *   Context を閉じていれば、閉じ直さない。`timeouts.pageCloseTimeoutMs` は読まない（DEF-038。整理は CC-049）。
  *
- * 失敗は投げずに、起きた順（page、Context の順）の一覧で返す。例外にするか、理由として記録するかは、呼び出し側が決める。
- * 例外を投げる（reject する）のは、注入した期限が正の安全な整数でない場合（`RangeError`）だけで、そのときは閉じない。
+ * 失敗は投げずに、一覧で返す（Context を閉じる処理の失敗だけなので、0件か1件）。例外にするか、理由として記録するかは、
+ * 呼び出し側が決める。例外を投げる（reject する）のは、注入した Context を閉じる処理の期限が正の安全な整数でない場合
+ * （`RangeError`）だけで、そのときは閉じない。
  */
 export async function closePassivePageAndContext(
-  factory: Pick<BrowserContextFactory, 'closePassivePage' | 'closePassiveContext'>,
+  factory: Pick<BrowserContextFactory, 'closePassiveContext'>,
   context: BrowserContext | undefined,
-  page: Page | undefined,
   timeouts: PassiveSessionCloseTimeouts = {},
 ): Promise<readonly PassiveSessionCloseFailure[]> {
-  const pageCloseTimeoutMs = resolveTimeoutMs(timeouts.pageCloseTimeoutMs, PAGE_CLOSE_TIMEOUT_MS);
   const contextCloseTimeoutMs = resolveTimeoutMs(timeouts.contextCloseTimeoutMs, CONTEXT_CLOSE_TIMEOUT_MS);
   const failures: PassiveSessionCloseFailure[] = [];
   if (context === undefined) {
     return Object.freeze(failures);
-  }
-  if (page !== undefined) {
-    const pageFailure = await closePassivePageBeforeDeadline(factory, page, { timeoutMs: pageCloseTimeoutMs });
-    if (pageFailure !== null) {
-      failures.push(pageFailure);
-    }
   }
   const contextFailure = await closePassiveContextBeforeDeadline(factory, context, { timeoutMs: contextCloseTimeoutMs });
   if (contextFailure !== null) {

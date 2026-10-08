@@ -43,11 +43,20 @@ import { isConfigError } from '../../src/config/config-error.js';
 import {
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
+  bundleFileName,
   checkpointArtifactRelativePath,
   checkpointPageArtifactRelativePath,
+  isBundleFileName,
   runArtifactDirectory,
 } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, RunExecutionEndReason, RunLoad, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
+import {
+  RUN_EXECUTION_END_REASONS,
+  type AuditRunResult,
+  type RunExecutionEndReason,
+  type RunLoad,
+  type RunProgressReport,
+  type RunSummary,
+} from '../../src/core/contracts.js';
 import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
@@ -56,6 +65,7 @@ import {
   type RunNotice,
 } from '../../src/orchestration/run-coordinator.js';
 import {
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SEVERITY_GROUP_CATALOG,
   SEVERITY_GROUPS,
@@ -162,6 +172,13 @@ const expectedLoadLine = (load: RunLoad): string =>
  */
 const expectedExecutionsLine = (count: number, resumeCount: number): string =>
   cliFieldText(CLI_TEXT.run.executions, listText([formatTimes(count), cliCountText(CLI_TEXT.run.resumes, formatTimes(resumeCount))]));
+
+/**
+ * `run` の結果の、この起動の終わり方の1行の期待値（R9。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補）。見出しは `messages.ts`、
+ * ラベルは表示カタログ `RUN_EXECUTION_END_REASON_CATALOG`、書式は Run の状態の行と同じ `labelWithCodeText` と `cliFieldText` のもの。
+ */
+const expectedLastEndReasonLine = (endReason: RunExecutionEndReason): string =>
+  cliFieldText(CLI_TEXT.run.lastEndReason, labelWithCodeText(RUN_EXECUTION_END_REASON_CATALOG[endReason].label, endReason));
 
 /**
  * 実行中の進み具合の1行の期待値（L7。サイトへの負荷の制御の設計書 4.8）。項目の名前は `messages.ts`、書式は `format.ts` のもの。
@@ -818,9 +835,13 @@ describe('CLI run: failures, in process without a browser', () => {
     expect(stdout.text()).toContain(`${RUN_SUMMARY_TEXT.reasonsHeading}: `);
     expect(stderr.text()).toBe('');
     const [runDirectory] = await readdir(output);
-    expect(await readdir(join(output, runDirectory ?? ''))).toEqual(
-      expect.arrayContaining(['run.json', 'audit.json', 'report.html', 'beaksight-audit-bundle.zip']),
-    );
+    // BN1: バンドルの名前は、最後の実行の終わりの時刻を含む（バンドルのファイル名の設計書 2.1）。バンドルは1つだけ。
+    const run = JSON.parse(await readFile(join(output, runDirectory ?? '', RUN_ARTIFACT_FILE_NAMES.run), 'utf8')) as RunSummary;
+    const bundleName = bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
+    const runDirectoryFiles = await readdir(join(output, runDirectory ?? ''));
+    expect(runDirectoryFiles).toEqual(expect.arrayContaining(['run.json', 'audit.json', 'report.html', bundleName]));
+    expect(runDirectoryFiles.filter(isBundleFileName)).toEqual([bundleName]);
+    expect(stdout.text()).toContain(artifactFilePath(join(output, runDirectory ?? ''), bundleName));
   });
 
   // L6（サイトへの負荷の制御の設計書 4.5）: 実際の `run` の結果の表示にも、負荷の1行が、書き出した run.json の `load` の値で出る。
@@ -1152,9 +1173,11 @@ describe('CLI run: the site load line of the result', () => {
     expect(coverageIndex).toBeGreaterThanOrEqual(0);
     expect(groupIndexes.every((index) => index > coverageIndex)).toBe(true);
     expect(loadIndexes).toEqual([Math.max(...groupIndexes) + 1]);
-    // R6: 負荷の行と未完了の理由の行の間には、実行の記録の行だけがある（中断した Run の再開の設計書 4.8 の「表示」）。
+    // R6: 負荷の行と未完了の理由の行の間には、実行の記録の行と、この起動の終わり方の行（R9）だけがある（中断した Run の再開の設計書
+    // 4.8 の「表示」と、その 2026-10-08 の追補）。
     expect(executionsIndex).toBe((loadIndexes[0] ?? -1) + 1);
-    expect(reasonsIndex).toBe(executionsIndex + 1);
+    expect(lines[executionsIndex + 1]).toBe(expectedLastEndReasonLine(summary.executions.lastEndReason));
+    expect(reasonsIndex).toBe(executionsIndex + 2);
   });
 
   it('shows the navigation count and the requests to the allowed origins with the peak per minute, from the view model', () => {
@@ -1216,6 +1239,130 @@ describe('CLI run: the executions line of the result', () => {
   });
 });
 
+// BN1（バンドルのファイル名の設計書 2.3）: `run` の結果の「ChatGPT 用のバンドル」の行は、最後の実行の終わりの時刻（表示用モデルの
+// `summary.executions.items` の最後）から `bundleFileName` で作った名前のパスを示す。CLI で日時の書式を作り直さない。
+describe('CLI run: the bundle line of the result', () => {
+  const BUNDLE_PREFIX = `${CLI_TEXT.run.bundle}: `;
+  const bundleLinesOf = (lines: readonly string[]): readonly string[] => lines.filter((line) => line.startsWith(BUNDLE_PREFIX));
+
+  it('shows the path of the bundle named with the end of the last execution, for a resumed Run', () => {
+    const result = edgeCaseAuditRun();
+    const { summary } = buildReportViewModel({ ...result, run: { ...result.run, executions: executionsDisplaySample() } });
+    const runDirectory = join('artifacts', 'RUN-20260924000000');
+
+    expect(bundleLinesOf(runSummaryLines(summary, runDirectory))).toEqual([
+      `${BUNDLE_PREFIX}${join(runDirectory, 'beaksight-audit-bundle_20261002094030.zip')}`,
+    ]);
+    expect(bundleLinesOf(runSummaryLines(summary, runDirectory))).toEqual([
+      `${BUNDLE_PREFIX}${artifactFilePath(runDirectory, bundleFileName(executionsDisplaySample()[2]?.finishedAt ?? ''))}`,
+    ]);
+  });
+
+  it('shows the path of the bundle named with the end of the only execution, for a Run that was not interrupted', () => {
+    const { summary } = buildReportViewModel(auditRun());
+    const [execution] = summary.executions.items;
+
+    expect(bundleLinesOf(runSummaryLines(summary, 'out'))).toEqual([
+      `${BUNDLE_PREFIX}${artifactFilePath('out', bundleFileName(execution.finishedAt))}`,
+    ]);
+    expect(runSummaryLines(summary, 'out')).not.toContain(`${BUNDLE_PREFIX}${join('out', 'beaksight-audit-bundle.zip')}`);
+  });
+
+  it('uses the last item of the executions of the view model as it is', () => {
+    const { summary } = buildReportViewModel(auditRun());
+    const [execution] = summary.executions.items;
+    const altered = {
+      ...summary,
+      executions: {
+        ...summary.executions,
+        items: [execution, { ...execution, finishedAt: '2026-10-08T15:09:30.000Z' }] as const,
+      },
+    };
+
+    expect(bundleLinesOf(runSummaryLines(altered, 'out'))).toEqual([
+      `${BUNDLE_PREFIX}${join('out', 'beaksight-audit-bundle_20261008150930.zip')}`,
+    ]);
+  });
+});
+
+// R9（中断した Run の再開の設計書 4.8 の 2026-10-08 の追補）: `run` の結果の行に、この起動の終わり方の1行を、実行の記録の行の次に毎回
+// 加える（`COMPLETED` でも出す）。終わり方は、表示用モデルの `summary.executions.lastEndReason`（最後の実行の終わり方）から取り、
+// ラベルは表示カタログで引く。CLI の側で実行の記録から決め直さない。説明の文は付けない。
+describe('CLI run: the line of how this execution ended', () => {
+  const LAST_END_REASON_PREFIX = `${CLI_TEXT.run.lastEndReason}: `;
+  /** 終わり方が、前から順に `endReasons` の実行の記録を持つ Run（見本の Run には未完了の理由がある）。 */
+  const runEndedBy = (...endReasons: readonly [RunExecutionEndReason, ...RunExecutionEndReason[]]): AuditRunResult => {
+    const result = edgeCaseAuditRun();
+    const [first, ...rest] = endReasons.map((endReason, index) => ({
+      startedAt: `2026-10-0${index + 1}T00:00:00.000Z`,
+      finishedAt: `2026-10-0${index + 1}T00:10:00.000Z`,
+      endReason,
+    }));
+    if (first === undefined) {
+      throw new Error('at least one execution is needed');
+    }
+    return { ...result, run: { ...result.run, executions: [first, ...rest] } };
+  };
+  const lastEndReasonLinesOf = (lines: readonly string[]): readonly string[] =>
+    lines.filter((line) => line.startsWith(LAST_END_REASON_PREFIX));
+  const indexOfLineStartingWith = (lines: readonly string[], label: string): number =>
+    lines.findIndex((line) => line.startsWith(`${label}: `));
+
+  it('shows one line of the label and the code of the end reason right after the executions line, for every end reason', () => {
+    for (const endReason of RUN_EXECUTION_END_REASONS) {
+      const { summary } = buildReportViewModel(runEndedBy(endReason));
+      const lines = runSummaryLines(summary, 'out');
+      const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
+
+      expect(executionsIndex, endReason).toBeGreaterThanOrEqual(0);
+      expect(lastEndReasonLinesOf(lines), endReason).toEqual([expectedLastEndReasonLine(endReason)]);
+      expect(lines[executionsIndex + 1], endReason).toBe(expectedLastEndReasonLine(endReason));
+      // 説明の文は付けない。
+      expect(lines.join('\n'), endReason).not.toContain(RUN_EXECUTION_END_REASON_CATALOG[endReason].description);
+    }
+  });
+
+  it('shows the line also when the Run was completed in one execution', () => {
+    const { summary } = buildReportViewModel(auditRun());
+    const lines = runSummaryLines(summary, 'out');
+
+    expect(lastEndReasonLinesOf(lines)).toEqual(['この起動の終わり方: 最後まで実行（COMPLETED）']);
+  });
+
+  it('uses the end reason of the last execution, not of an earlier one', () => {
+    const { summary } = buildReportViewModel(runEndedBy('STOPPED_BY_SITE_UNAVAILABLE', 'STOPPED_BY_RUNTIME_LIMIT'));
+    const lines = runSummaryLines(summary, 'out');
+
+    expect(lastEndReasonLinesOf(lines)).toEqual(['この起動の終わり方: 実行時間の上限で停止（STOPPED_BY_RUNTIME_LIMIT）']);
+    expect(lines.join('\n')).not.toContain(RUN_EXECUTION_END_REASON_CATALOG.STOPPED_BY_SITE_UNAVAILABLE.label);
+  });
+
+  it('puts the lines in the order: executions, the end reason, the stop by site unavailability, the incomplete reasons', () => {
+    const base = runEndedBy('STOPPED_BY_RUNTIME_LIMIT', 'STOPPED_BY_SITE_UNAVAILABLE');
+    const result: AuditRunResult = {
+      ...base,
+      run: { ...base.run, incompleteReasons: [...base.run.incompleteReasons, { code: 'SITE_UNAVAILABLE', detail: 'desktop:passive:TIMEOUT' }] },
+    };
+    const { summary } = buildReportViewModel(result);
+    const lines = runSummaryLines(summary, 'out');
+    const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
+
+    expect(lines.slice(executionsIndex, executionsIndex + 4)).toEqual([
+      expectedExecutionsLine(2, 1),
+      'この起動の終わり方: サイトの不調で停止（STOPPED_BY_SITE_UNAVAILABLE）',
+      siteUnavailableStopText('desktop:passive:TIMEOUT'),
+      cliFieldText(RUN_SUMMARY_TEXT.reasonsHeading, formatCount(summary.incompleteReasons.length)),
+    ]);
+  });
+
+  it('uses the end reason of the view model as it is (does not decide again from the executions)', () => {
+    const { summary } = buildReportViewModel(runEndedBy('COMPLETED'));
+    const altered = { ...summary, executions: { ...summary.executions, lastEndReason: 'STOPPED_BY_SIGNAL' as const } };
+
+    expect(lastEndReasonLinesOf(runSummaryLines(altered, 'out'))).toEqual(['この起動の終わり方: 中断の指示で停止（STOPPED_BY_SIGNAL）']);
+  });
+});
+
 // SU4（サイトが応答しないときに Run を止める設計書 3.4）: 最後の実行がサイトの不調で止まった Run では、`run` の結果の行に、止めたことと
 // 再開のしかたの1行を加える。置く位置は、実行の記録の行の次、未完了の理由の行の前。出すかどうかと詳細は、表示用モデルの
 // `summary.siteUnavailableStop` から取る（CLI の側で判断し直さない）。文言は `messages.ts` の `siteUnavailableStopText`。
@@ -1249,8 +1396,10 @@ describe('CLI run: the line of the stop by site unavailability', () => {
     const reasonsIndex = indexOfLineStartingWith(lines, RUN_SUMMARY_TEXT.reasonsHeading);
 
     expect(executionsIndex).toBeGreaterThanOrEqual(0);
-    expect(lines[executionsIndex + 1]).toBe(siteUnavailableStopText(DETAIL));
-    expect(reasonsIndex).toBe(executionsIndex + 2);
+    // R9: 実行の記録の行の次は、この起動の終わり方の行。その次に、サイトの不調で止めた1行がある。
+    expect(lines[executionsIndex + 1]).toBe(expectedLastEndReasonLine('STOPPED_BY_SITE_UNAVAILABLE'));
+    expect(lines[executionsIndex + 2]).toBe(siteUnavailableStopText(DETAIL));
+    expect(reasonsIndex).toBe(executionsIndex + 3);
     expect(lines.filter((line) => line === siteUnavailableStopText(DETAIL))).toHaveLength(1);
     // 文言の確かめ（詳細は、技術的な詳細のまま括弧の中に示す）。
     expect(lines).toContain(
@@ -1263,7 +1412,8 @@ describe('CLI run: the line of the stop by site unavailability', () => {
     const lines = runSummaryLines(summary, 'out');
     const executionsIndex = indexOfLineStartingWith(lines, CLI_TEXT.run.executions);
 
-    expect(lines[executionsIndex + 1]).toBe(siteUnavailableStopText(null));
+    // R9: 実行の記録の行の次の、この起動の終わり方の行の次にある。
+    expect(lines[executionsIndex + 2]).toBe(siteUnavailableStopText(null));
     expect(lines).toContain('サイトが応答しないため、監査を止めました。サイトが戻ってから、同じコマンドで続きから再開してください。');
   });
 
@@ -1275,8 +1425,9 @@ describe('CLI run: the line of the stop by site unavailability', () => {
 
       expect(lines, endReason).not.toContain(siteUnavailableStopText(DETAIL));
       expect(lines, endReason).not.toContain(siteUnavailableStopText(null));
-      // 実行の記録の行の次は、未完了の理由の行（間に行がない）。
-      expect(indexOfLineStartingWith(lines, RUN_SUMMARY_TEXT.reasonsHeading), endReason).toBe(executionsIndex + 1);
+      // 実行の記録の行の次は、この起動の終わり方の行（R9）で、その次は未完了の理由の行（間にほかの行がない）。
+      expect(lines[executionsIndex + 1], endReason).toBe(expectedLastEndReasonLine(endReason));
+      expect(indexOfLineStartingWith(lines, RUN_SUMMARY_TEXT.reasonsHeading), endReason).toBe(executionsIndex + 2);
     }
   });
 

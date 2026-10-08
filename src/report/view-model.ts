@@ -38,6 +38,7 @@ import {
   type PageId,
   type RunEnvironment,
   type RunExecution,
+  type RunExecutionEndReason,
   type RunId,
   type RunLoad,
   type RunSafetySummary,
@@ -124,6 +125,12 @@ export interface RunExecutionsView {
   readonly count: number;
   /** 再開の回数（最初の実行の後の、実行の数。`count - 1`）。 */
   readonly resumeCount: number;
+  /**
+   * この起動の終わり方（`items` の最後の実行の終わり方。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補。R9）。`items` は1件以上
+   * なので、`null` にならない。どの実行の終わり方かは、ここで1回だけ決める。CLI の結果の「この起動の終わり方」の行は、この値を
+   * 表示カタログで引くだけにし、`summary.json` には、コードのまま出る。
+   */
+  readonly lastEndReason: RunExecutionEndReason;
   /** 実行の記録の値の写し（`RunSummary.executions` の順のまま）。終わり方のラベルと説明は、描画する側がカタログで引く。 */
   readonly items: readonly [RunExecution, ...RunExecution[]];
 }
@@ -420,11 +427,18 @@ const copyFinding = (finding: Finding): Finding => ({ ...finding, evidenceRefs: 
 
 /**
  * 実行の記録の表示（R6）。実行の回数と再開の回数を数えるのは、ここだけである。最初の実行の後の実行が、再開である。
+ * この起動の終わり方（最後の実行の終わり方。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補。R9）を決めるのも、ここだけである。
  * 記録の値は、写して持つ（入力を凍結しない）。
  */
 const executionsView = (executions: RunSummary['executions']): RunExecutionsView => {
-  const [, ...resumedExecutions] = executions;
-  return { count: executions.length, resumeCount: resumedExecutions.length, items: structuredClone(executions) };
+  const [first, ...resumedExecutions] = executions;
+  const lastExecution = resumedExecutions.at(-1) ?? first;
+  return {
+    count: executions.length,
+    resumeCount: resumedExecutions.length,
+    lastEndReason: lastExecution.endReason,
+    items: structuredClone(executions),
+  };
 };
 
 /**

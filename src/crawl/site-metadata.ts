@@ -24,12 +24,7 @@ import { MAX_ERROR_MESSAGE_LENGTH, MAX_SITE_METADATA_TEXT_LENGTH, MAX_SITEMAP_UR
 import { truncateText } from '../core/text.js';
 import { createEvidenceRecord, type EvidenceRecordContext } from '../orchestration/evidence-builder.js';
 import { IdAllocator } from '../orchestration/id-allocator.js';
-import {
-  closePassivePageAndContext,
-  closePassivePageBeforeDeadline,
-  PassivePageCloseDeadlineError,
-  type PassiveSessionCloseFailure,
-} from '../orchestration/passive-session-close.js';
+import { closePassivePageAndContext, type PassiveSessionCloseFailure } from '../orchestration/passive-session-close.js';
 import {
   openPassiveContextBeforeDeadline,
   openPassivePageBeforeDeadline,
@@ -99,9 +94,8 @@ export interface SiteMetadataOptions {
   /**
    * 各ファイルの読み込み（`page.goto`）の観測を受け取る口（サイトが応答しないときに Run を止める設計書 2.1。幅の走査の
    * `StressLayoutOptions.afterNavigation` と同じ名前と形）。読み込みを始めたファイルごとに1回、読み込みが終わった（応答か例外が出た）
-   * 直後に呼ぶ。読み込みを始めなかったファイル（間隔の待ちが失敗した、Context や page を開けなかった、前の page を閉じる処理が期限を
-   * 過ぎた）では呼ばない。観測は `src/browser/main-frame-load.ts` の部品で作る。この部品は判定をしない（判定は、受け取った Run Coordinator
-   * が行う）。省略できる。省略しても、取得の結果は同じである。関数でない値は、Context を作らずに `TypeError` を投げる。受け口が投げた例外は、
+   * 直後に呼ぶ。読み込みを始めなかったファイル（間隔の待ちが失敗した、Context や page を開けなかった）では呼ばない。観測は
+   * `src/browser/main-frame-load.ts` の部品で作る。この部品は判定をしない（判定は、受け取った Run Coordinator が行う）。省略できる。省略しても、取得の結果は同じである。関数でない値は、Context を作らずに `TypeError` を投げる。受け口が投げた例外は、
    * そのまま reject する（呼び出し側の誤り）。
    */
   readonly afterNavigation?: ((observation: MainFrameLoadObservation) => void) | undefined;
@@ -134,8 +128,8 @@ export interface SiteMetadataResult {
   /** 取得に使った Passive Context の Safety Ledger の snapshot（Context を閉じた後に取る）。Context を作れなかった場合は `null`。 */
   readonly ledgerSnapshot: SafetyLedgerSnapshot | null;
   /**
-   * page と Context を閉じる処理の失敗（期限切れを含む）。前の page を閉じる処理、page の作成が期限を過ぎた場合に部品が Context を
-   * 閉じる処理、最後の `closePassivePageAndContext` の結果を、起きた順に並べる。
+   * Context を閉じる処理の失敗（期限切れを含む）。page の作成が期限を過ぎた場合に部品が Context を閉じる処理、最後の
+   * `closePassivePageAndContext` の結果を、起きた順に並べる（page は個別に閉じない。DEF-038）。
    */
   readonly closeFailures: readonly PassiveSessionCloseFailure[];
 }
@@ -203,17 +197,16 @@ type OpenedPage =
  *   許可 Origin の外の URL も残す。正規化できないものは `sitemapUrls` に入れず、件数を `unnormalizableSitemapUrlCount` で返す。
  * - sitemap の index（`<sitemapindex>`）の入れ子の sitemap は、たどらない（制約）。入れ子の sitemap の URL はページの URL ではないので、
  *   `sitemapUrls` は `null` にする（入れ子の URL は、本文 `text` に事実として残る。Task 14〜17 の設計書 5.6.2）。
- * - Passive Context は1つで、ファイルごとに新しい page で開く（前の page は、`closePassivePageBeforeDeadline` で閉じる）。
- *   期限切れで終わらなかったナビゲーションを次のナビゲーションで中断すると、Guard が不変条件の違反にするためである。
- *   前の page を閉じる処理が期限（`PAGE_CLOSE_TIMEOUT_MS`）を過ぎた場合は、その失敗を `closeFailures` に記録し、残りのファイルは
- *   取得せずに `FAILED`（`failures` の `detail` は、期限切れのメッセージ）とする（DEF-006、R15 の Minor-1）。
- * - 最後の page と Context は、`finally` で `closePassivePageAndContext` で閉じる。
+ * - Passive Context は1つで、ファイルごとに新しい page で開く。期限切れで終わらなかったナビゲーションを次のナビゲーションで中断すると、
+ *   Guard が不変条件の違反にするためである。前の page は個別に閉じずに残し（page は最大で取得するファイルの数）、最後に Context と
+ *   一緒に閉じる（DEF-038。page を個別に閉じると、ページを離れるときの送信が Guard を通らずに出る。残した page の要求も、Guard の
+ *   route を通る）。
+ * - Context（と、その page）は、`finally` で `closePassivePageAndContext` で閉じる。
  * - Context と page の作成は、期限（`deadlines.sessionOpenTimeoutMs`、既定は `SESSION_OPEN_TIMEOUT_MS`）付きで待つ（DEF-008）。
  *   Context の作成が期限を過ぎた場合は、Context を作れなかった場合と同じく、すべてのファイルを `FAILED` にする。page の作成が
  *   期限を過ぎた場合は、部品が Context を閉じるので、その Context での取得をやめ、残りのファイルも `FAILED` にする。どちらも
  *   `failures` の `timedOut` は真、`detail` は期限切れのメッセージである。部品が Context を閉じる処理の失敗は `closeFailures` に記録する。
- * - 閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）も注入できる。Context を閉じる処理の期限切れは、
- *   `closeFailures` に記録する。
+ * - Context を閉じる処理の期限（`CONTEXT_CLOSE_TIMEOUT_MS`）も注入できる。その期限切れは、`closeFailures` に記録する。
  * - 各ファイルの読み込みの直前に、ページの読み込みの間隔の待ち（`beforeNavigation`）を呼ぶ。各ファイルの期限は、待った後の時刻から
  *   数える（サイトへの負荷の制御の設計書 4.1、4.4）。
  *
@@ -234,8 +227,7 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
   const failures: SiteMetadataFetchFailure[] = [];
   let unnormalizableSitemapUrlCount = 0;
   const closeFailures: PassiveSessionCloseFailure[] = [];
-  let page: Page | undefined;
-  // 前の page を閉じる処理か、page の作成が期限を過ぎた場合の、残りの取得の失敗。この Context では、それ以上取得しない。
+  // page の作成が期限を過ぎた場合の、残りの取得の失敗。この Context では、それ以上取得しない。
   let abandonedFailure: Omit<SiteMetadataFetchFailure, 'kind'> | null = null;
   // page の作成が期限を過ぎて、部品が Context を閉じた場合は真。`finally` で Context を閉じ直さない。
   let contextReleased = false;
@@ -247,26 +239,12 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
       } else {
         // ファイルごとに新しい page で開く。期限切れなどで終わらなかったナビゲーションを、次のナビゲーションで中断させないためである
         // （Guard は、メインフレームのナビゲーションの予期しない中断（`net::ERR_ABORTED`）を不変条件の違反にする）。
-        // 前の page は、factory の page を閉じる処理（Guard が中断を予期する経路）で、期限付きで閉じる（DEF-006、R15 の Minor-1）。
-        // 期限を過ぎた場合は、この Context での取得をやめ、`finally` で Context を閉じる（Context を閉じると、止まった page も閉じる）。
-        if (page !== undefined && abandonedFailure === null) {
-          const previous = page;
-          page = undefined;
-          const pageFailure = await closePassivePageBeforeDeadline(contextFactory, previous, {
-            timeoutMs: deadlines.pageCloseTimeoutMs,
-          });
-          if (pageFailure !== null) {
-            closeFailures.push(pageFailure);
-            if (pageFailure.error instanceof PassivePageCloseDeadlineError) {
-              abandonedFailure = { timedOut: false, detail: pageFailure.error.message };
-            }
-          }
-        }
+        // 前の page は個別に閉じずに残し、`finally` で Context と一緒に閉じる（DEF-038。page を個別に閉じると、ページを離れるときの
+        // 送信が Guard を通らずに出る）。
         if (abandonedFailure !== null) {
           fetched = { outcome: 'FAILED', httpStatus: null, body: null, failure: abandonedFailure };
         } else {
           const opened = await openPage(contextFactory, session.context, deadlines);
-          page = opened.page;
           if (opened.page === undefined) {
             fetched = { outcome: 'FAILED', httpStatus: null, body: null, failure: opened.failure };
             closeFailures.push(...opened.closeFailures);
@@ -311,7 +289,7 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
     }
   } finally {
     closeFailures.push(
-      ...(await closePassivePageAndContext(contextFactory, contextReleased ? undefined : session.context, page, deadlines)),
+      ...(await closePassivePageAndContext(contextFactory, contextReleased ? undefined : session.context, deadlines)),
     );
   }
 

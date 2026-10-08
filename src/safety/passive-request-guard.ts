@@ -1,3 +1,4 @@
+import { STATUS_CODES } from 'node:http';
 import type {
   BrowserContext,
   CDPSession,
@@ -11,8 +12,13 @@ import { ERROR_HTTP_STATUS_RANGE, isHttpStatusInRange } from '../audit/rule-help
 import { isInvalidInterceptionIdFailure } from '../browser/playwright-errors.js';
 import type { ResourceDeliveryDecision, ResourceDeliveryRequestFacts } from '../browser/resource-delivery.js';
 import { safeErrorMessage } from '../core/errors.js';
-import { NON_EXTERNAL_NAVIGATION_SCHEMES } from '../core/evidence-types.js';
-import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../core/limits.js';
+import { NON_EXTERNAL_NAVIGATION_SCHEMES, WORKER_CONNECT_POLICY_REASON } from '../core/evidence-types.js';
+import {
+  MAX_ERROR_MESSAGE_LENGTH,
+  MAX_HTTP_METHOD_LENGTH,
+  MAX_PENDING_GUARD_REQUEST_TASKS,
+  MAX_URL_LENGTH,
+} from '../core/limits.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
 import { isNetworkLayerFailure, isResponseReceivedFailure } from './network-layer-failure.js';
 import { classifyPassiveRequest, isReadMethod, type PassiveRequestDecision } from './request-policy.js';
@@ -150,19 +156,44 @@ interface PausedDocumentEvent {
    */
   readonly networkId?: string;
   readonly frameId: string;
-  readonly request: CorrelationRequest;
+  /** 要求（method と URL。CORS の事前確認の判定には、要求のヘッダも使う。DEF-042 の設計書 2.4）。 */
+  readonly request: CorrelationRequest & { readonly headers?: Readonly<Record<string, string>> };
+  /**
+   * 要求の種類（CDP の `Network.ResourceType`。DEF-042）。`Document` の事象は、Document の横取り（Request と Response の段階。リダイレクトの
+   * 対応付け、取り消しの証拠、外部スキームの判定）で扱う。それ以外の事象は、Request の段階の、ナビゲーションでない要求として判定する
+   * （`handlePausedRequest`）。
+   */
+  readonly resourceType?: string;
   /**
    * 応答の段階（Response stage）の事象だけが持つ項目（C18g）。CDP では、`responseStatusCode` か `responseErrorReason` の
    * どちらかがあれば応答の段階、どちらもなければリクエストの段階である。
    */
   readonly responseStatusCode?: number;
+  /** 応答の段階の事象の、応答の status の文言（CDP の `responseStatusText`。空のことがある。DEF-040 の `Fetch.continueResponse` に渡す）。 */
+  readonly responseStatusText?: string;
   readonly responseErrorReason?: string;
   readonly responseHeaders?: readonly { readonly name: string; readonly value: string }[];
 }
 
-/** 一時停止した Document の事象が、応答の段階のものか（C18g）。 */
-function isPausedDocumentResponse(event: PausedDocumentEvent): boolean {
+/** 一時停止の事象が、Document の要求のものか（DEF-042。`resourceType` が `Document` の事象だけを Document として扱う）。 */
+function isPausedDocument(event: PausedDocumentEvent): boolean {
+  return event.resourceType === 'Document';
+}
+
+/** 一時停止の事象が、応答の段階のものか（C18g。Document でも、Document 以外（DEF-040 の `Other`）でも同じ判定）。 */
+function isPausedResponse(event: PausedDocumentEvent): boolean {
   return event.responseStatusCode !== undefined || event.responseErrorReason !== undefined;
+}
+
+/**
+ * Document でない一時停止の要求の、判定に使う事実（method と URL。DEF-042）。どちらかが文字列でなければ `null`（呼び出し側が fail-closed に
+ * する）。URL の長さの上限（`boundedCorrelationRequest`）は、route の判定と同じく使わない（記録のときに Ledger が切り詰める）。
+ */
+function pausedRequestFacts(event: PausedDocumentEvent): CorrelationRequest | null {
+  const request = event.request as Partial<CorrelationRequest> | undefined;
+  return typeof request?.method === 'string' && typeof request.url === 'string'
+    ? { method: request.method, url: request.url }
+    : null;
 }
 
 /** 外部スキームへのリダイレクトの宛先（`Location` を解決した URL と、そのスキーム）。 */
@@ -232,7 +263,9 @@ interface GuardCdpChannel {
 }
 
 /**
- * 1つの session の Document の横取り（C18i）。
+ * 1つの session の横取り（C18i）。
+ * - `onRequestPaused`: その session の `Fetch.requestPaused` を受ける。Document の要求（Request と Response の段階）と、Document でない
+ *   要求（Request の段階だけ。DEF-042）の両方。
  * - `onLoadingFailed`: その session の `Network.loadingFailed` を受ける（DEF-026。一時停止した文書の要求の取り消しの証拠）。
  * - `onResponseReceived`・`onRequestWillBeSent`・`onLoadingFinished`: その session の `Network.responseReceived`・
  *   `Network.requestWillBeSent`・`Network.loadingFinished` を受ける（DEF-027。main frame の文書の要求が、応答を受けたか、終わったか）。
@@ -251,19 +284,36 @@ interface DocumentInterception {
   readonly clear: () => void;
 }
 
-/** Document の横取りを付ける（page の session と OOPIF の session で同じパターン。C18g、C18i）。 */
-async function enableDocumentInterception(channel: GuardCdpChannel): Promise<void> {
+/** CDP の Fetch の横取りを付ける（page の session と OOPIF の session で同じパターン。C18g、C18i、DEF-042）。 */
+async function enableRequestInterception(channel: GuardCdpChannel): Promise<void> {
   // DEF-026: 一時停止した文書の要求の、ブラウザによる取り消しの証拠（`Network.loadingFailed` の canceled）を受けるため、横取りの前に
   // Network の domain を有効にする。失敗したら、横取りの取り付けの失敗と同じく扱う（呼び出し側が fail-closed にする）。
   await channel.send('Network.enable');
   // Document は、リクエストの段階（許可 Origin とメソッドの判定）と、応答の段階（外部スキームへのリダイレクトを、たどる前に
   // 止める。C18g）の両方で横取りする。
+  // DEF-042（設計書 `2026-10-08-beaksight-def-042-guard-fetch-all-design.md` 2.1）: それ以外のすべての要求も、リクエストの段階で
+  // 横取りする。ページを離れるときの送信（`pagehide` の `sendBeacon`、keepalive の `fetch`、`fetchLater()`）は、`networkId` なしで
+  // 一時停止の通知に来て、Playwright が route を呼ばずに進めるので、Playwright の route では止められないためである。
+  // DEF-040（設計書 `2026-10-08-beaksight-def-039-040-egress-design.md` 2.2）: `Other` の応答（Worker の script の応答は、CDP の Fetch では
+  // `Other` として来る。`Worker` の種類はない）は、応答の段階でも横取りし、Worker の中の WebSocket を止める CSP のヘッダを加える
+  // （`handlePausedResponse`）。CSP のヘッダは文書と Worker 以外の応答には効かないので、`Other` のすべてに加える。
   await channel.send('Fetch.enable', {
     patterns: [
       { urlPattern: '*', resourceType: 'Document', requestStage: 'Request' },
       { urlPattern: '*', resourceType: 'Document', requestStage: 'Response' },
+      { urlPattern: '*', requestStage: 'Request' },
+      { urlPattern: '*', resourceType: 'Other', requestStage: 'Response' },
     ],
   });
+}
+
+/**
+ * Guard の page の session で、ブラウザの Log の domain を有効にする（DEF-040 の設計書 2.2）。Worker の中の CSP の違反は、page の console
+ * には出ず、page の session の `Log.entryAdded`（source `worker`）に来るので、その観察で、Worker の中で止めた WebSocket を記録する
+ * （`workerConnectPolicyViolationUrl`）。page の session だけで行う（OOPIF の session の Worker の違反は、観察しない。設計書 2.2 の残る経路）。
+ */
+async function enableWorkerConnectPolicyObservation(channel: GuardCdpChannel): Promise<void> {
+  await channel.send('Log.enable');
 }
 
 /**
@@ -441,6 +491,11 @@ interface GuardState {
   readonly allowedOrigins: ReadonlySet<string>;
   readonly pageGuards: WeakMap<Page, PageGuardRecord>;
   readonly pendingTasks: Set<Promise<void>>;
+  /**
+   * `pendingTasks` のうち、要求の横取りの作業（`handlePausedRequest`。DEF-042 の設計書 2.4）の数。この作業は
+   * `MAX_PENDING_GUARD_REQUEST_TASKS` で数え、ほかの作業の上限（`MAX_PENDING_GUARD_TASKS`）には数えない。
+   */
+  pendingRequestTaskCount: number;
   readonly listenerCleanups: ListenerCleanupOwnership;
   overflowInvalidation: Promise<void> | undefined;
   rawCloseConfirmed: boolean;
@@ -471,6 +526,27 @@ function ownerClosingPhase(phase: GuardPhase): GuardPhase {
   if (phase === 'PASSIVE_ACTIVE') return 'PASSIVE_CLOSING';
   if (phase === 'FROZEN_ACTIVE') return 'FROZEN_CLOSING';
   throw new Error(`Guarded Context close is invalid from ${phase}`);
+}
+
+/**
+ * 凍結の段階で、命令の失敗を受けた時点で、owner の close（または無効化）がもう始まっているか（DEF-045。設計書
+ * `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 2）。`FROZEN_CLOSING`、`FROZEN_INVALIDATING`、close の試みがある
+ * （`CLOSED` を含む）のどれか。凍結の分岐で、閉じた形の失敗（`isClosedTargetFailure`）を違反にしないかの判定だけに使う。
+ */
+function hasFrozenCloseStarted(guardState: GuardState): boolean {
+  return guardState.phase === 'FROZEN_CLOSING'
+    || guardState.phase === 'FROZEN_INVALIDATING'
+    || guardState.closeAttempt !== undefined;
+}
+
+/**
+ * Context の閉じる処理（owner の close か無効化。Passive と凍結の両方）が、もう始まっているか（DEF-050。設計書
+ * `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 6）。閉じる途中・無効化の段階（`CLOSED` を含む）か、close の試みがある。
+ * page だけを閉じる途中（`ownerClosingPages`）は含めない。Document の閉じる途中の分岐（`failPausedDocumentForLifecycle`）で、閉じた形の
+ * 失敗（`isClosedTargetFailure`）を違反にしないかの判定だけに使う。
+ */
+function hasContextCloseStarted(guardState: GuardState): boolean {
+  return isClosingOrInvalidatingPhase(guardState.phase) || guardState.closeAttempt !== undefined;
 }
 
 function invalidatingPhase(phase: GuardPhase): GuardPhase {
@@ -813,7 +889,7 @@ class CanceledDocumentRegistry {
     }
     this.#purgeMainFrameDocuments(now);
     const record = this.#mainFrameDocuments.get(networkId);
-    if (isPausedDocumentResponse(event)) {
+    if (isPausedResponse(event)) {
       if (record !== undefined) record.responded = true;
       this.#wakeMainFrameWaiters();
       return;
@@ -1022,6 +1098,289 @@ async function settlePausedDocumentCommand(
   }
 }
 
+/**
+ * Document でない一時停止の要求への Guard の命令（`send`）を送り、その結果を決める（DEF-042。設計書 2.1）。
+ * - 成功: 解決する。
+ * - 失敗の文言が、一時停止の ID が無効な形（`isInvalidInterceptionIdFailure`）なら、ブラウザが先に取り消した要求への命令として、成功と
+ *   同じに解決する。Document の取り消しの証拠（DEF-026。`CanceledDocumentRegistry`）は Document の要求だけを対象にし、Document でない
+ *   要求には集めない（ページを離れるときに取り消される要求は数が多く、証拠の上限を超えうるため）。
+ * - それ以外の失敗は、そのまま投げる（呼び出し側が違反にする。fail-closed）。
+ */
+async function settlePausedRequestCommand(send: () => Promise<unknown>): Promise<void> {
+  try {
+    await send();
+  } catch (error) {
+    if (!isInvalidInterceptionIdFailure(errorMessage(error))) {
+      throw error;
+    }
+  }
+}
+
+/**
+ * Guard の CDP の命令が、session か target が閉じたために失敗したときの、失敗の文言の閉じた一覧（DEF-042 の設計書 2.4）。
+ * - page の session（Playwright の `CDPSession.send`）: Playwright が、閉じた target への命令に付ける文言（Playwright 1.62.1。
+ *   `fixture-full-crawl` の CLI の Chromium で、Context を閉じる途中に実際に起きた失敗から取った）。
+ * - OOPIF の session（`OopifTargetChannel`）: Guard 自身が、閉じた session への命令を失敗させるときの文言。
+ * 照合は完全一致で、前方一致や部分一致にはしない（一覧にない文言は、閉じた失敗とみなさない。違反にする側に倒す）。
+ */
+const CLOSED_TARGET_FAILURE_TEXTS: ReadonlySet<string> = new Set([
+  'cdpSession.send: Target page, context or browser has been closed',
+  OOPIF_SESSION_CLOSED_MESSAGE,
+]);
+
+/** 命令の失敗の文言が、session か target が閉じた形（`CLOSED_TARGET_FAILURE_TEXTS` のどれか）と完全に一致するか。 */
+function isClosedTargetFailure(message: string): boolean {
+  return CLOSED_TARGET_FAILURE_TEXTS.has(message);
+}
+
+/**
+ * CORS の事前確認（preflight）の要求の `networkId` を覚えておく時間（ms。DEF-042 の設計書 2.4）。`Network.requestWillBeSent`
+ * （`initiator.type` が `preflight`）を受けてから数える。同じ要求の `Fetch.requestPaused`（Request の段階）は、ふつう数 ms 以内に届く。
+ * 過ぎた記録は捨て、その要求は、ヘッダ（`Access-Control-Request-Method`）で判定する。
+ */
+const PREFLIGHT_INITIATOR_RETENTION_MS = 1_000;
+/** 同時に覚えておく、CORS の事前確認の要求の `networkId` の数の上限。超えた要求は覚えず、ヘッダで判定する。 */
+const MAX_PREFLIGHT_INITIATORS = 256;
+
+/**
+ * 同じ session の `Network.requestWillBeSent` で、`initiator.type` が `preflight` だった要求の `networkId` の記録（DEF-042 の設計書 2.4。
+ * CORS の事前確認の判定の第一の根拠）。
+ */
+class PreflightInitiatorRegistry {
+  readonly #entries = new Map<string, number>();
+
+  /** `Network.requestWillBeSent` を受けたとき。事前確認の要求なら、その `requestId` を覚える。 */
+  record(event: unknown, now: number): void {
+    const { requestId, initiator } = (typeof event === 'object' && event !== null ? event : {}) as {
+      readonly requestId?: unknown;
+      readonly initiator?: { readonly type?: unknown };
+    };
+    if (typeof requestId !== 'string' || requestId.length === 0 || initiator?.type !== 'preflight') {
+      return;
+    }
+    this.#purge(now);
+    if (this.#entries.size >= MAX_PREFLIGHT_INITIATORS) {
+      return;
+    }
+    this.#entries.set(requestId, now + PREFLIGHT_INITIATOR_RETENTION_MS);
+  }
+
+  /** `networkId` の要求が事前確認として覚えられているか。あれば、その記録を消して真を返す。 */
+  take(networkId: string, now: number): boolean {
+    this.#purge(now);
+    return this.#entries.delete(networkId);
+  }
+
+  clear(): void {
+    this.#entries.clear();
+  }
+
+  #purge(now: number): void {
+    for (const [requestId, expiresAt] of this.#entries) {
+      if (expiresAt <= now) this.#entries.delete(requestId);
+    }
+  }
+}
+
+/** 要求のヘッダ（CDP の `Network.Headers`）から、名前が `name`（大文字小文字を区別しない）のものの値を返す。なければ `undefined`。 */
+function requestHeader(headers: Readonly<Record<string, string>> | undefined, name: string): string | undefined {
+  if (headers === undefined) return undefined;
+  const wanted = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === wanted && typeof value === 'string') return value;
+  }
+  return undefined;
+}
+
+/** CORS の事前確認の要求が持つヘッダの名前。 */
+const ACCESS_CONTROL_REQUEST_METHOD_HEADER = 'Access-Control-Request-Method';
+const ACCESS_CONTROL_REQUEST_HEADERS_HEADER = 'Access-Control-Request-Headers';
+/** `Fetch.fulfillRequest` で事前確認に返す応答の状態（Playwright と同じ `204 No Content`）。 */
+const PREFLIGHT_RESPONSE_CODE = 204;
+const PREFLIGHT_RESPONSE_PHRASE = 'No Content';
+/** 要求に `Access-Control-Request-Method` がないときに返す `Access-Control-Allow-Methods` の値（Playwright と同じ）。 */
+const PREFLIGHT_DEFAULT_ALLOW_METHODS = 'GET, POST, OPTIONS, DELETE';
+
+/**
+ * CORS の事前確認に返す応答のヘッダ（DEF-042 の設計書 2.4）。Playwright が横取りのあるときに事前確認を自分で満たす処理
+ * （`isInterceptedOptionsPreflight`）と同じ値にする: `Access-Control-Allow-Origin` は要求の `Origin` か `*`、`Allow-Methods` は要求の
+ * `Access-Control-Request-Method` か既定の一覧、`Allow-Credentials` は `true`、`Allow-Headers` は要求の `Access-Control-Request-Headers`
+ * があるときだけ、その値。
+ */
+function preflightResponseHeaders(
+  headers: Readonly<Record<string, string>> | undefined,
+): { name: string; value: string }[] {
+  const responseHeaders = [
+    { name: 'Access-Control-Allow-Origin', value: requestHeader(headers, 'Origin') ?? '*' },
+    { name: 'Access-Control-Allow-Methods', value: requestHeader(headers, ACCESS_CONTROL_REQUEST_METHOD_HEADER) ?? PREFLIGHT_DEFAULT_ALLOW_METHODS },
+    { name: 'Access-Control-Allow-Credentials', value: 'true' },
+  ];
+  const requestedHeaders = requestHeader(headers, ACCESS_CONTROL_REQUEST_HEADERS_HEADER);
+  if (requestedHeaders !== undefined) {
+    responseHeaders.push({ name: 'Access-Control-Allow-Headers', value: requestedHeaders });
+  }
+  return responseHeaders;
+}
+
+/**
+ * Worker の中の WebSocket を止める CSP の policy（DEF-040。設計書 `2026-10-08-beaksight-def-039-040-egress-design.md` 2.2。NP2 の調査で確定）。
+ * `connect-src` は、WebSocket（`ws:`・`wss:`）と `about:` などのスキームへの接続を止め、http(s)・data・blob への接続（fetch、XHR、beacon、
+ * EventSource、ping、img、script）は変えない。Guard が、次の 2 つの経路で、Passive と Interaction のすべての Context に適用する。
+ * - 文書: Context の `addInitScript`（`WORKER_CONNECT_POLICY_INIT_SCRIPT`）で、文書の始まりに meta の CSP を入れてすぐ外す。meta を外しても
+ *   policy は文書に残り、blob・data の Worker（入れ子、srcdoc・about:blank の iframe の中を含む）に引き継がれる。DOM の Evidence には写らない。
+ *   Document の応答にヘッダを加えても、文書の CSP としては効かない（NP2）ので、meta が要る。
+ * - http(s) の script の Worker（Dedicated、Shared、module）: Worker の CSP は script の応答のものなので、CDP の Fetch の `Other` の応答の
+ *   段階で、同じ policy のヘッダを加える（`handlePausedResponse`）。
+ * 残る経路（設計書 2.2）: SVG の文書（meta を入れられない）、WebTransport（`https:` で許される。推測）。
+ */
+export const WORKER_CONNECT_POLICY = 'connect-src http: https: data: blob:';
+
+/** 応答に加える CSP のヘッダの名前（meta の `http-equiv` も同じ名前）。 */
+const CONTENT_SECURITY_POLICY_HEADER = 'Content-Security-Policy';
+
+/**
+ * 文書の始まりに meta の CSP（`WORKER_CONNECT_POLICY`）を入れてすぐ外す、Context の初期化のスクリプト（DEF-040。設計書 2.2）。
+ * meta の CSP は head の中でだけ効くので、head がまだなければ（HTML の解析の前に動くとき）、head ができるのを MutationObserver で待つ。
+ * HTML の解析は、script を実行する前に microtask の checkpoint を行うので、ページの最初の script より前に policy が効く。
+ */
+export const WORKER_CONNECT_POLICY_INIT_SCRIPT = `(() => {
+  const enforce = () => {
+    const meta = document.createElement('meta');
+    meta.httpEquiv = ${JSON.stringify(CONTENT_SECURITY_POLICY_HEADER)};
+    meta.content = ${JSON.stringify(WORKER_CONNECT_POLICY)};
+    document.head.prepend(meta);
+    meta.remove();
+  };
+  if (document.head !== null) {
+    enforce();
+    return;
+  }
+  const observer = new MutationObserver(() => {
+    if (document.head !== null) {
+      observer.disconnect();
+      enforce();
+    }
+  });
+  observer.observe(document, { childList: true, subtree: true });
+})();`;
+
+/**
+ * Service Worker の登録の入口を塞いだ関数が投げる例外の文言（DEF-049。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 5 と
+ * 変更履歴の NP6 の Blocker の行）。ページの回避の試みは、この文言の例外になる（ページの console に出て、Evidence に写る）。
+ */
+export const SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE = 'Service Worker registration blocked by BeakSight';
+
+/**
+ * Service Worker の登録の入口を塞ぐ、Context の初期化のスクリプト（DEF-049 の主な防御）。Playwright の `serviceWorkers: 'block'` は、
+ * `navigator.serviceWorker` のインスタンスの `register` を置き換えるだけなので、ページは `ServiceWorkerContainer.prototype.register.call` や、
+ * インスタンスの `register` を `delete` した後の呼び出しで迂回できる（登録された Service Worker の中の要求は、Guard の route も CDP の
+ * 横取りも通らない）。そこで、文書ごとに次を行う。
+ * - `ServiceWorkerContainer.prototype.register` を、`SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE` の例外を投げる関数に置き換え、
+ *   `writable: false`・`configurable: false` で固定する（ページは定義し直せない）。
+ * - `Navigator.prototype.serviceWorker` の getter を、元の getter のまま `configurable: false` にする（同じ Container を返し続ける）。
+ * 通常の呼び出し（Playwright がインスタンスに付けた `register`）は、今までどおり何もせずに解決する。Context の初期化のスクリプトは、
+ * すべての frame（同じ Origin の iframe、about:blank・srcdoc の iframe、ポップアップ）の文書に付く（NP6 の実験で、すべての経路が
+ * 止まることを確かめた）。それでも登録された場合は、factory の自己検査（`SERVICE_WORKER_OBSERVED`）が Context を閉じる。
+ */
+export const SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT = `(() => {
+  const Container = globalThis.ServiceWorkerContainer;
+  if (typeof Container === 'function') {
+    const register = function register() {
+      throw new Error(${JSON.stringify(SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE)});
+    };
+    Object.defineProperty(Container.prototype, 'register', {
+      value: register,
+      writable: false,
+      enumerable: true,
+      configurable: false,
+    });
+  }
+  const NavigatorConstructor = globalThis.Navigator;
+  const descriptor = typeof NavigatorConstructor === 'function'
+    ? Object.getOwnPropertyDescriptor(NavigatorConstructor.prototype, 'serviceWorker')
+    : undefined;
+  if (descriptor !== undefined && descriptor.configurable) {
+    Object.defineProperty(NavigatorConstructor.prototype, 'serviceWorker', {
+      get: descriptor.get,
+      enumerable: descriptor.enumerable,
+      configurable: false,
+    });
+  }
+})();`;
+
+/** `Fetch.continueResponse` に渡す応答の文言が、ブラウザからも Node の一覧（`STATUS_CODES`）からも取れないときの値。 */
+const DEFAULT_RESPONSE_PHRASE = 'OK';
+
+/**
+ * `Fetch.continueResponse` に渡す、`Other` の応答に CSP のヘッダ（`WORKER_CONNECT_POLICY`）を加えた指定（DEF-040。設計書 2.2）。
+ * - status のある応答: `responseCode`・`responsePhrase`・`responseHeaders`（元のヘッダ + CSP）の 3 つを必ず渡す。`responseHeaders` だけを
+ *   渡すと Chromium が受け付けず、要求が一時停止のまま残る（NP2 で固まった原因）。文言は、ブラウザの `responseStatusText`、なければ
+ *   Node の `STATUS_CODES`、それもなければ `DEFAULT_RESPONSE_PHRASE`。
+ * - status のない応答（ネットワークの失敗。`responseErrorReason`）: 本文がなく Worker は動かないので、何も変えずに続ける（`requestId` だけ）。
+ */
+function workerConnectPolicyResponse(event: PausedDocumentEvent): {
+  readonly requestId: string;
+  readonly responseCode?: number;
+  readonly responsePhrase?: string;
+  readonly responseHeaders?: { readonly name: string; readonly value: string }[];
+} {
+  const status = event.responseStatusCode;
+  if (status === undefined) {
+    return { requestId: event.requestId };
+  }
+  const statusText = event.responseStatusText;
+  return {
+    requestId: event.requestId,
+    responseCode: status,
+    responsePhrase: typeof statusText === 'string' && statusText.length > 0
+      ? statusText
+      : STATUS_CODES[status] ?? DEFAULT_RESPONSE_PHRASE,
+    responseHeaders: [
+      ...(event.responseHeaders ?? []).map(({ name, value }) => ({ name, value })),
+      { name: CONTENT_SECURITY_POLICY_HEADER, value: WORKER_CONNECT_POLICY },
+    ],
+  };
+}
+
+/** `Log.entryAdded` の `entry.source` のうち、Worker の中の文。 */
+const WORKER_LOG_SOURCE = 'worker';
+/**
+ * Chromium が、`WORKER_CONNECT_POLICY` の違反のときに Log に残す文の形（Chromium 151。NP3 で両方の Chromium で確かめた）:
+ * `Connecting to '<url>' violates the following Content Security Policy directive: "<policy>". The action has been blocked.`
+ * policy の部分を照合するので、サイト自身の CSP の違反（別の policy の文）は記録しない。
+ */
+const WORKER_CONNECT_POLICY_VIOLATION_PREFIX = "Connecting to '";
+const WORKER_CONNECT_POLICY_VIOLATION_SUFFIX = `' violates the following Content Security Policy directive: "${WORKER_CONNECT_POLICY}"`;
+/** WebSocket の URL のスキーム（`URL.protocol` の形）。`connect-src` は `about:` などへの fetch も止めるが、それは WebSocket の記録にしない。 */
+const WEBSOCKET_PROTOCOLS: ReadonlySet<string> = new Set(['ws:', 'wss:']);
+
+/**
+ * Guard の page の session の `Log.entryAdded` の事象が、Worker の中の WebSocket を `WORKER_CONNECT_POLICY` で止めた文なら、その WebSocket の
+ * URL を返す（DEF-040 の設計書 2.2 の記録）。それ以外（Worker 以外の文、別の policy の違反、WebSocket でない接続、解析できない URL）は `null`。
+ */
+export function workerConnectPolicyViolationUrl(event: unknown): string | null {
+  const { entry } = (typeof event === 'object' && event !== null ? event : {}) as { readonly entry?: unknown };
+  const { source, text } = (typeof entry === 'object' && entry !== null ? entry : {}) as {
+    readonly source?: unknown;
+    readonly text?: unknown;
+  };
+  if (source !== WORKER_LOG_SOURCE || typeof text !== 'string' || !text.startsWith(WORKER_CONNECT_POLICY_VIOLATION_PREFIX)) {
+    return null;
+  }
+  const end = text.indexOf(WORKER_CONNECT_POLICY_VIOLATION_SUFFIX, WORKER_CONNECT_POLICY_VIOLATION_PREFIX.length);
+  if (end < 0) {
+    return null;
+  }
+  const url = text.slice(WORKER_CONNECT_POLICY_VIOLATION_PREFIX.length, end);
+  let protocol: string;
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    return null;
+  }
+  return WEBSOCKET_PROTOCOLS.has(protocol) ? url : null;
+}
+
 function recordGuardTaskDrainTimeoutOnce(guardState: GuardState): void {
   if (guardState.drainTimeoutReported) return;
   guardState.drainTimeoutReported = true;
@@ -1210,8 +1569,18 @@ function beginOverflowInvalidationOnce(guardState: GuardState): void {
   void reservedInvalidation.catch(() => undefined);
 }
 
-function admitGuardTask(guardState: GuardState, purpose: string): boolean {
-  if (guardState.pendingTasks.size >= MAX_PENDING_GUARD_TASKS) {
+/**
+ * Guard の作業の種類（DEF-042 の設計書 2.4）。`REQUEST` は要求の横取りの作業（`handlePausedRequest`）で、上限は
+ * `MAX_PENDING_GUARD_REQUEST_TASKS`。`GENERAL` はそれ以外の作業で、上限は `MAX_PENDING_GUARD_TASKS`（要求の横取りの作業は数えない）。
+ */
+type GuardTaskKind = 'GENERAL' | 'REQUEST';
+
+function admitGuardTask(guardState: GuardState, purpose: string, kind: GuardTaskKind): boolean {
+  const pending = kind === 'REQUEST'
+    ? guardState.pendingRequestTaskCount
+    : guardState.pendingTasks.size - guardState.pendingRequestTaskCount;
+  const limit = kind === 'REQUEST' ? MAX_PENDING_GUARD_REQUEST_TASKS : MAX_PENDING_GUARD_TASKS;
+  if (pending >= limit) {
     if (!guardState.taskLimitReported) {
       guardState.taskLimitReported = true;
       guardState.ledger.recordInvariantViolation({ code: 'GUARD_TASK_LIMIT_REACHED', message: purpose });
@@ -1227,8 +1596,9 @@ function trackGuardTask(
   purpose: string,
   rejectionCode: string,
   factory: () => Promise<unknown>,
+  kind: GuardTaskKind = 'GENERAL',
 ): boolean {
-  if (!admitGuardTask(guardState, purpose)) return false;
+  if (!admitGuardTask(guardState, purpose, kind)) return false;
   let owned!: Promise<void>;
   owned = Promise.resolve().then(factory).then(
     () => undefined,
@@ -1236,8 +1606,12 @@ function trackGuardTask(
       code: rejectionCode,
       message: errorMessage(error),
     }),
-  ).finally(() => guardState.pendingTasks.delete(owned));
+  ).finally(() => {
+    guardState.pendingTasks.delete(owned);
+    if (kind === 'REQUEST') guardState.pendingRequestTaskCount -= 1;
+  });
   guardState.pendingTasks.add(owned);
+  if (kind === 'REQUEST') guardState.pendingRequestTaskCount += 1;
   return true;
 }
 
@@ -1253,7 +1627,7 @@ function runGuardProtocolTask(
   if (guardState.phase === 'CLOSED') {
     return Promise.resolve();
   }
-  if (!admitGuardTask(guardState, purpose)) return Promise.resolve();
+  if (!admitGuardTask(guardState, purpose, 'GENERAL')) return Promise.resolve();
   let invalidationRequested = false;
   let invalidation: Promise<void> | undefined;
   let failed = false;
@@ -1391,9 +1765,14 @@ async function failPausedDocumentForLifecycle(
     await commands.failRequest();
   } catch (error) {
     if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
+    const message = errorMessage(error);
+    // DEF-050: Context の閉じる処理が始まった後の、閉じた形の失敗は、target とともに消えた要求として違反にしない（DEF-042 の設計書
+    // 2.4、DEF-045 と同じ考え）。page だけを閉じる途中など、Context の閉じる処理の前の同じ失敗は、今までどおり違反。
+    const guardState = guardStates.get(context);
+    if (isClosedTargetFailure(message) && guardState !== undefined && hasContextCloseStarted(guardState)) return;
     ledger.recordInvariantViolation({
       code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED',
-      message: errorMessage(error),
+      message,
     });
     if (!isClosingOrInvalidatingPhase(guardStates.get(context)?.phase ?? 'CLOSED')) {
       initiateInvalidation(context, ledger);
@@ -1492,6 +1871,11 @@ export async function activateInteractionFreeze(page: Page): Promise<void> {
   guardState.phase = 'FROZEN_ACTIVE';
 }
 
+/**
+ * Guard の付いたページを個別に閉じると、ページを離れるときの送信が Guard を通らずに出る（DEF-038。Playwright は、閉じ始めたページの
+ * 要求で Context の route を呼ばない）。production では使わない。テストの後片付けだけで使う（production の page は、
+ * `closePassiveGuardedContext` で Context と一緒に閉じる）。
+ */
 export async function closePassiveGuardedPage(page: Page): Promise<void> {
   const context = page.context();
   const guardState = requireActiveGuardState(context, ['PASSIVE_ACTIVE', 'FROZEN_ACTIVE']);
@@ -1567,6 +1951,7 @@ export async function installPassiveRequestGuard(
     allowedOrigins: authoritySnapshot,
     pageGuards,
     pendingTasks,
+    pendingRequestTaskCount: 0,
     listenerCleanups: {
       context: { active: true, cleanups: [] },
       pages: new Map<Page, ListenerCleanupGroup>(),
@@ -1629,7 +2014,7 @@ export async function installPassiveRequestGuard(
                 await channel.send('Fetch.continueRequest', { requestId: event.requestId });
                 // DEF-027（設計書 2.1 の3 (a)）: Request の段階の命令が成功した（Guard が許可して進めた）ことだけを記録する。命令が失敗した
                 // 場合（ブラウザが取り消したもので、DEF-026 で成功と同じに解決する場合を含む）は、ここに来ないので記録しない。
-                if (networkId !== null && !isPausedDocumentResponse(event)) {
+                if (networkId !== null && !isPausedResponse(event)) {
                   canceledDocuments.recordMainFrameContinued(networkId);
                 }
               }),
@@ -1756,7 +2141,220 @@ export async function installPassiveRequestGuard(
               reason: 'EXTERNAL_SCHEME_REDIRECT_BLOCKED',
             });
           };
+          // DEF-042（設計書 `2026-10-08-beaksight-def-042-guard-fetch-all-design.md` 2.1）: Document でない要求（画像、スクリプト、fetch、
+          // XHR、sendBeacon（Ping）、`fetchLater()`、ページを離れるときの送信など）の、Request の段階の一時停止。Playwright は、`networkId` の
+          // ない要求（ページを離れるときの送信）で route を呼ばずに進めるので、Guard が CDP の段階で判定する。
+          // - 判定は route と同じ `classifyPassiveRequest`（ナビゲーションでない要求として。許可 Origin の判定は main frame のナビゲーション
+          //   だけに働くので、ここでは method の判定になる）。記録の種類と理由も route と同じ（`recordBlockedDecision`、`INTERACTION_FROZEN`）。
+          //   閉じる途中は、route と同じく記録しない。
+          // - Guard の session は、Playwright の session より先に要求を見る（後から付けた session の横取りが外側になる。実際の Chromium で
+          //   確かめた: `guard-unload-requests.test.ts` の「記録は 1 回」のテストが、route の見た要求を出力する）。CDP で止めた要求は route に
+          //   来ないので、記録は重複しない。許可した要求は、Playwright の session で止まり、route の判定（キャッシュから返す処理を含む）に進む。
+          // - Document の記録（リダイレクトの対応付け、取り消しの証拠、`expectedCdpFailures`）には関わらない。Document でない要求の失敗
+          //   （`requestfailed`）は、違反の判定に使わないためである。
+          // - method か URL が文字列でない要求は、止めて違反にし、Context を閉じる（fail-closed。Document の扱いと同じ）。
+          // - 閉じる途中・無効化の段階（owner の close を始めた後）で、命令が session か target の閉鎖で失敗した場合
+          //   （`isClosedTargetFailure`）は、target とともに消えた要求として扱い、違反にも記録にもしない（DEF-042 の設計書 2.4。根拠は
+          //   DEF-038 の Gate: Context の破棄で、止めたままの要求は両方の Chromium で届かない。試した範囲の確かめで、Chromium の仕組みと
+          //   しての保証ではない）。閉じる途中でない段階の失敗は、今までどおり違反。
+          // - CORS の事前確認（`OPTIONS`。`Network.requestWillBeSent` の `initiator.type` が `preflight`。取れなければ
+          //   `Access-Control-Request-Method` ヘッダあり）は、Playwright が横取りのあるときに行うのと同じく、`Fetch.fulfillRequest`
+          //   （204 と CORS のヘッダ）で満たし、記録しない（サーバに届かない。設計書 2.4）。事前確認でない `OPTIONS` は止めて記録する。
+          // - 作業の数は、ほかの作業とは別の上限（`MAX_PENDING_GUARD_REQUEST_TASKS`）で数える（設計書 2.4）。
+          const preflightInitiators = new PreflightInitiatorRegistry();
+          const pausedRequestCommands = (event: PausedDocumentEvent): PausedDocumentCommands & {
+            fulfillPreflight(): Promise<void>;
+            continueResponseWithWorkerConnectPolicy(): Promise<void>;
+          } => ({
+            continueRequest: () => settlePausedRequestCommand(() => channel.send('Fetch.continueRequest', { requestId: event.requestId })),
+            failRequest: () => settlePausedRequestCommand(() => channel.send('Fetch.failRequest', {
+              requestId: event.requestId,
+              errorReason: 'BlockedByClient',
+            })),
+            fulfillPreflight: () => settlePausedRequestCommand(() => channel.send('Fetch.fulfillRequest', {
+              requestId: event.requestId,
+              responseCode: PREFLIGHT_RESPONSE_CODE,
+              responsePhrase: PREFLIGHT_RESPONSE_PHRASE,
+              responseHeaders: preflightResponseHeaders(event.request.headers),
+              body: '',
+            })),
+            // DEF-040: `Other` の応答に、Worker の中の WebSocket を止める CSP のヘッダを加えて続ける（`workerConnectPolicyResponse`）。
+            continueResponseWithWorkerConnectPolicy: () => settlePausedRequestCommand(() => channel.send(
+              'Fetch.continueResponse',
+              workerConnectPolicyResponse(event),
+            )),
+          });
+          /**
+           * DEF-040（設計書 `2026-10-08-beaksight-def-039-040-egress-design.md` 2.2）: Document でない要求（`Other`。Worker の script）の、
+           * Response の段階の一時停止。応答に CSP のヘッダ（`WORKER_CONNECT_POLICY`）を加えて続ける。
+           * - `PASSIVE_ACTIVE` と `FROZEN_ACTIVE`: ヘッダを加えて続ける（凍結の後に届く応答は、凍結の前に続けた要求のもの。凍結の後に始まった
+           *   要求は、Request の段階で止まるので、ここに来ない）。
+           * - 閉じる途中・無効化の段階: Request の段階と同じく止める（session か target の閉鎖による失敗は、違反にしない）。
+           * - fail-closed: `continueResponse` が `Invalid InterceptionId` 以外で失敗したら、その応答を止め（`BlockedByClient`）、違反
+           *   `WORKER_CONNECT_POLICY_INJECTION_FAILED` を記録して Context を無効にする（Worker が CSP なしで動くのを防ぐ）。
+           */
+          const handlePausedResponse = (event: PausedDocumentEvent): void => {
+            const commands = pausedRequestCommands(event);
+            trackGuardTask(guardState, 'paused CDP response', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
+              const phase = guardState.phase;
+              if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
+                try {
+                  await commands.failRequest();
+                } catch (error) {
+                  const message = errorMessage(error);
+                  if (isClosedTargetFailure(message)) {
+                    return;
+                  }
+                  ledger.recordInvariantViolation({ code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message });
+                  if (!isClosingOrInvalidatingPhase(guardState.phase)) {
+                    initiateInvalidation(context, ledger);
+                  }
+                }
+                return;
+              }
+              if (phase !== 'PASSIVE_ACTIVE' && phase !== 'FROZEN_ACTIVE') {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_RESPONSE_PHASE_INVALID',
+                  message: `Paused response observed during ${phase}`,
+                });
+              } else {
+                try {
+                  await commands.continueResponseWithWorkerConnectPolicy();
+                  return;
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'WORKER_CONNECT_POLICY_INJECTION_FAILED',
+                    message: errorMessage(error),
+                  });
+                }
+              }
+              try {
+                await commands.failRequest();
+              } catch (error) {
+                ledger.recordInvariantViolation({ code: 'CDP_FAIL_REQUEST_FAILED', message: errorMessage(error) });
+              }
+              initiateInvalidation(context, ledger);
+            }, 'REQUEST');
+          };
+          /** 一時停止した要求が、CORS の事前確認か（第一の根拠は `initiator`、取れなければヘッダ）。 */
+          const isPreflight = (event: PausedDocumentEvent, facts: CorrelationRequest): boolean => {
+            if (facts.method.toUpperCase() !== 'OPTIONS') return false;
+            const networkId = typeof event.networkId === 'string' && event.networkId.length > 0 ? event.networkId : null;
+            const byInitiator = networkId !== null && preflightInitiators.take(networkId, Date.now());
+            return byInitiator || requestHeader(event.request.headers, ACCESS_CONTROL_REQUEST_METHOD_HEADER) !== undefined;
+          };
+          const handlePausedRequest = (event: PausedDocumentEvent): void => {
+            const commands = pausedRequestCommands(event);
+            trackGuardTask(guardState, 'paused CDP request', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
+              const phase = guardState.phase;
+              const facts = pausedRequestFacts(event);
+              /** 止める。失敗したら `code` の違反を記録して偽を返す（止められたか分からないので、呼び出し側は止めた記録にしない）。 */
+              const fail = async (code: string): Promise<boolean> => {
+                try {
+                  await commands.failRequest();
+                  return true;
+                } catch (error) {
+                  ledger.recordInvariantViolation({ code, message: errorMessage(error) });
+                  return false;
+                }
+              };
+              if (isFrozenPhase(phase)) {
+                if (facts !== null) {
+                  ledger.recordBlockedInteractionRequest({ method: facts.method, url: facts.url, reason: 'INTERACTION_FROZEN' });
+                }
+                // DEF-045: owner の close を始めた後の、閉じた形の失敗は、target とともに消えた要求として違反にしない（記録は残す）。
+                try {
+                  await commands.failRequest();
+                } catch (error) {
+                  const message = errorMessage(error);
+                  if (isClosedTargetFailure(message) && hasFrozenCloseStarted(guardState)) return;
+                  ledger.recordInvariantViolation({ code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED', message });
+                  initiateInvalidation(context, ledger);
+                }
+                return;
+              }
+              if (isClosingOrInvalidatingPhase(phase) || ownerClosingPages.has(page)) {
+                try {
+                  await commands.failRequest();
+                } catch (error) {
+                  const message = errorMessage(error);
+                  if (isClosedTargetFailure(message)) {
+                    return;
+                  }
+                  ledger.recordInvariantViolation({ code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message });
+                  if (!isClosingOrInvalidatingPhase(guardState.phase)) {
+                    initiateInvalidation(context, ledger);
+                  }
+                }
+                return;
+              }
+              if (phase !== 'PASSIVE_ACTIVE') {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_REQUEST_PHASE_INVALID',
+                  message: `Paused request observed during ${phase}`,
+                });
+                await fail('CDP_FAIL_REQUEST_FAILED');
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              if (facts === null) {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_REQUEST_FACTS_INVALID',
+                  message: 'Paused request had no method or URL',
+                });
+                await fail('CDP_FAIL_REQUEST_FAILED');
+                initiateInvalidation(context, ledger);
+                return;
+              }
+              if (isPreflight(event, facts)) {
+                try {
+                  await commands.fulfillPreflight();
+                } catch (error) {
+                  ledger.recordInvariantViolation({
+                    code: 'CDP_PREFLIGHT_FULFILL_FAILED',
+                    message: errorMessage(error),
+                  });
+                  initiateInvalidation(context, ledger);
+                }
+                return;
+              }
+              const decision = classifyPassiveRequest({
+                kind: 'HTTP',
+                method: facts.method,
+                url: facts.url,
+                isNavigationRequest: false,
+                isMainFrame: false,
+              }, authoritySnapshot);
+              if (decision.action === 'BLOCK') {
+                if (await fail('CDP_FAIL_REQUEST_FAILED')) {
+                  recordBlockedDecision(ledger, decision, facts);
+                } else {
+                  initiateInvalidation(context, ledger);
+                }
+                return;
+              }
+              try {
+                await commands.continueRequest();
+              } catch (error) {
+                ledger.recordInvariantViolation({
+                  code: 'CDP_CONTINUE_REQUEST_FAILED',
+                  message: errorMessage(error),
+                });
+                initiateInvalidation(context, ledger);
+              }
+            }, 'REQUEST');
+          };
           const onRequestPaused = (event: PausedDocumentEvent): void => {
+            // DEF-042: Document でない要求は、Request の段階のナビゲーションでない要求として判定する（Document の記録には関わらない）。
+            // DEF-040: その Response の段階（`Other` の応答）は、CSP のヘッダを加えて続ける。
+            if (!isPausedDocument(event)) {
+              if (isPausedResponse(event)) {
+                handlePausedResponse(event);
+              } else {
+                handlePausedRequest(event);
+              }
+              return;
+            }
             // DEF-027: main frame の文書の要求の一時停止を、事象を受けた順に記録する（Request の段階は記録を作り、Response の段階は応答を
             // 受けたと記録する）。Guard の作業（下の非同期の処理）の順は、事象の順と入れ替わることがある（DEF-026-fix の報告）ため、ここで
             // 同期に記録する。
@@ -1767,7 +2365,7 @@ export async function installPassiveRequestGuard(
             const commands = pausedDocumentCommands(event);
             trackGuardTask(guardState, 'paused CDP Document request', 'GUARD_CDP_PAUSED_TASK_FAILED', async () => {
               const phase = guardState.phase;
-              if (isPausedDocumentResponse(event)) {
+              if (isPausedResponse(event)) {
                 await handlePausedDocumentResponse(event, phase, commands);
                 return;
               }
@@ -1825,11 +2423,15 @@ export async function installPassiveRequestGuard(
                   await commands.failRequest();
                 } catch (error) {
                   if (expectedFailure !== null) expectedCdpFailures.remove(page, expectedFailure);
-                  ledger.recordInvariantViolation({
-                    code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED',
-                    message: errorMessage(error),
-                  });
-                  invalidationNeeded = true;
+                  const message = errorMessage(error);
+                  // DEF-045: owner の close を始めた後の、閉じた形の失敗は、target とともに消えた要求として違反にしない（記録は残す）。
+                  if (!(isClosedTargetFailure(message) && hasFrozenCloseStarted(guardState))) {
+                    ledger.recordInvariantViolation({
+                      code: 'INTERACTION_CDP_FAIL_REQUEST_FAILED',
+                      message,
+                    });
+                    invalidationNeeded = true;
+                  }
                 }
                 if (invalidationNeeded) initiateInvalidation(context, ledger);
                 return;
@@ -1925,13 +2527,18 @@ export async function installPassiveRequestGuard(
             onLoadingFailed,
             // DEF-027: 同じ session の、main frame の文書の要求が応答を受けたか、終わったか（記録のない要求の事象は、何もしない）。
             onResponseReceived: (event: unknown): void => canceledDocuments.recordResponseReceived(event),
-            onRequestWillBeSent: (event: unknown): void => canceledDocuments.recordRequestWillBeSent(event),
+            // DEF-042 の設計書 2.4: CORS の事前確認の要求（`initiator.type` が `preflight`）も、ここで覚える。
+            onRequestWillBeSent: (event: unknown): void => {
+              canceledDocuments.recordRequestWillBeSent(event);
+              preflightInitiators.record(event, Date.now());
+            },
             onLoadingFinished: (event: unknown): void => canceledDocuments.recordLoadingFinished(event),
             awaitMainFrameCancellation: (request: CorrelationRequest, waitMs: number): Promise<boolean> =>
               canceledDocuments.awaitMainFrameCancellation(request, waitMs),
             clear: () => {
               redirectedPredecessors.clear();
               canceledDocuments.clear();
+              preflightInitiators.clear();
             },
           });
         };
@@ -1991,6 +2598,11 @@ export async function installPassiveRequestGuard(
               interception?.onLoadingFailed(eventParams);
               return;
             }
+            // DEF-042 の設計書 2.4: この OOPIF の session の `Network.requestWillBeSent`（CORS の事前確認の判定の根拠）。
+            if (method === 'Network.requestWillBeSent') {
+              interception?.onRequestWillBeSent(eventParams);
+              return;
+            }
             onTargetEvent(channel, children, method, eventParams);
           });
           interception = createDocumentInterception(channel, null);
@@ -2010,7 +2622,7 @@ export async function installPassiveRequestGuard(
               return;
             }
             try {
-              await enableDocumentInterception(channel);
+              await enableRequestInterception(channel);
               await enableOopifAutoAttach(channel);
               if (closing() || channel.closed) {
                 return;
@@ -2103,15 +2715,34 @@ export async function installPassiveRequestGuard(
         listenerGroup.cleanups.push(() => session.off('Target.receivedMessageFromTarget', onPageOopifMessage));
         session.on('Target.detachedFromTarget', onPageOopifDetached);
         listenerGroup.cleanups.push(() => session.off('Target.detachedFromTarget', onPageOopifDetached));
+        // DEF-040（設計書 2.2）: page の session の `Log.entryAdded`（source `worker`）で、Worker の中の WebSocket を CSP で止めたことを記録する
+        // （best-effort の観察。Shared Worker の違反は来ない）。Passive の段階は `blockedWebSockets`、凍結の段階は
+        // `blockedInteractionWebSockets` に、理由 `WORKER_CONNECT_POLICY` で残す。閉じる途中は、route と同じく記録しない。
+        const onLogEntryAdded = (event: unknown): void => {
+          const url = workerConnectPolicyViolationUrl(event);
+          if (url === null) {
+            return;
+          }
+          const phase = guardState.phase;
+          if (isFrozenPhase(phase)) {
+            ledger.recordBlockedInteractionWebSocket({ url, reason: WORKER_CONNECT_POLICY_REASON });
+          } else if (phase === 'PASSIVE_ACTIVE') {
+            ledger.recordBlockedWebSocket({ url, reason: WORKER_CONNECT_POLICY_REASON });
+          }
+        };
+        session.on('Log.entryAdded', onLogEntryAdded);
+        listenerGroup.cleanups.push(() => session.off('Log.entryAdded', onLogEntryAdded));
         // C18h: page の listener を外すとき（page が閉じたとき、Context が閉じたとき）に、リダイレクトの対応付けの登録を消す。
         // CDP の session の `close`（`onSessionClose`）が先に届いた場合も、同じく消える。
         // C18i: OOPIF の session も閉じ、その登録を消す（応答を待つ命令を失敗させ、後片付けの drain が待ち続けないようにする）。
         listenerGroup.cleanups.push(() => pageInterception.clear());
         listenerGroup.cleanups.push(() => disposeOopifSessions(pageOopifSessions));
-        await enableDocumentInterception(session);
+        await enableRequestInterception(session);
         // C18i: 横取りを付けた後に、OOPIF への自動の付与を始める。どちらかが失敗したら、page の準備の失敗（`CDP_SETUP_FAILED`）として
         // Context を閉じる（fail-closed）。
         await enableOopifAutoAttach(session);
+        // DEF-040: Worker の中の CSP の違反の観察（記録のため）。失敗したら、上と同じく page の準備の失敗にする。
+        await enableWorkerConnectPolicyObservation(session);
         const guard = { session, rootFrameId, awaitMainFrameCancellation: pageInterception.awaitMainFrameCancellation };
         record.status = 'READY';
         resolveReady(guard);
@@ -2142,34 +2773,27 @@ export async function installPassiveRequestGuard(
     throw error;
   }
 
-  const recordAndCloseFrozenPopup = (page: Page): void => {
+  /**
+   * DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 2.1）: 凍結の段階で開いたポップアップを、1つのページにつき
+   * 1回だけ `blockedPopups` に記録する。`page.close()` は呼ばない。Playwright は、`page.close()` を呼んだページの要求で Context の
+   * route の処理を呼ばなくなり、Chromium は target を閉じる途中で、止める前の要求をネットワークへ出すことがあるからである。
+   * ポップアップの中の要求は、凍結の段階の Context の `route`（すべての HTTP の要求）と `routeWebSocket` が止めて記録する。ポップアップは、
+   * Interaction の Context を閉じるときに、Context と一緒に閉じる。ポップアップには `ensurePageGuard` を付けない。
+   * ポップアップを閉じる処理だけが使っていた違反のコード `INTERACTION_POPUP_CLOSE_FAILED` と `GUARD_POPUP_CLOSE_TASK_FAILED` は、
+   * この変更で記録しなくなった（どちらも、スキーマの enum や型の閉じた一覧には載っていない文字列なので、一覧の変更はない。前の結果の
+   * ファイルに残っていても、読み込みには影響しない）。
+   */
+  const recordFrozenPopup = (page: Page): void => {
     if (recordedFrozenPopups.has(page)) {
       return;
     }
     recordedFrozenPopups.add(page);
     ledger.recordBlockedPopup({ url: page.url(), reason: 'INTERACTION_FROZEN' });
-    ownerClosingPages.add(page);
-    const admitted = trackGuardTask(
-      guardState,
-      'frozen popup close',
-      'GUARD_POPUP_CLOSE_TASK_FAILED',
-      async (): Promise<void> => {
-        try {
-          await page.close();
-        } catch (error) {
-          ledger.recordInvariantViolation({ code: 'INTERACTION_POPUP_CLOSE_FAILED', message: errorMessage(error) });
-          initiateInvalidation(context, ledger);
-        } finally {
-          ownerClosingPages.delete(page);
-        }
-      },
-    );
-    if (!admitted) ownerClosingPages.delete(page);
   };
   const onPage = (page: Page): void => {
     const phase = guardState.phase;
     if (isFrozenPhase(phase)) {
-      recordAndCloseFrozenPopup(page);
+      recordFrozenPopup(page);
       return;
     }
     if (isClosingOrInvalidatingPhase(phase)) {
@@ -2231,7 +2855,7 @@ export async function installPassiveRequestGuard(
     };
     const onPopup = (popup: Page): void => {
       if (isFrozenPhase(guardState.phase)) {
-        recordAndCloseFrozenPopup(popup);
+        recordFrozenPopup(popup);
       }
     };
     const onFrameNavigated = (frame: Frame): void => {
@@ -2425,6 +3049,11 @@ export async function installPassiveRequestGuard(
   };
 
   try {
+    // DEF-040（設計書 2.2）: ページを作る前に、文書の始まりに meta の CSP を入れてすぐ外すスクリプトを、Context のすべての文書に付ける
+    // （Worker の中の WebSocket を止める policy。`WORKER_CONNECT_POLICY_INIT_SCRIPT`）。Passive と Interaction のすべての Context に付ける。
+    await context.addInitScript({ content: WORKER_CONNECT_POLICY_INIT_SCRIPT });
+    // DEF-049: 同じく、すべての文書で、Service Worker の登録の入口を塞ぐ（`SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT`）。
+    await context.addInitScript({ content: SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT });
     context.on('page', onPage);
     guardState.listenerCleanups.context.cleanups.push(() => context.off('page', onPage));
     context.on('requestfailed', onRequestFailed);

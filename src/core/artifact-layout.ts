@@ -5,7 +5,9 @@
  * - Run のディレクトリからの相対パスは、区切りを `/` にする（artifact の中に書く値。環境によらない）。
  *   ファイルのパス（`runArtifactDirectory`、`artifactFilePath`）は、実行している環境の区切りにする（`node:path` の `join`）。
  * - 配置:
- *   - `<出力先>/<runId>/`: `run.json`、`audit.json`、`report.html`、`beaksight-audit-bundle.zip`
+ *   - `<出力先>/<runId>/`: `run.json`、`audit.json`、`report.html`、`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`（ChatGPT 用バンドル。
+ *     日時は、その Run の最後の実行の終わりの時刻。UTC。Run の ID と同じ書式。名前は `bundleFileName` で作り、`isBundleFileName` で
+ *     見分ける。ChatGPT 用バンドルのファイル名の設計書 2.1）
  *   - `pages/<pageId>/`: `page.json`、`visible-text.txt`
  *   - `pages/<pageId>/<ビューポート>/`: `viewport.png`、`full-page.png`（Page Auditor が撮る。Task 14 の設計 4.5.5）
  *   - 再試行の前の試行のスクリーンショット: `pages/<pageId>/retry-<n>/<ビューポート>/`（DEF-007）
@@ -32,14 +34,60 @@ import type { ScreenshotCaptureType } from './evidence-types.js';
 import { isPositiveSafeInteger, isRecord } from './guards.js';
 import { isPageId, isRunId } from './ids.js';
 import { compareCodeUnits } from './text.js';
+import { formatCompactUtcTimestamp, isCompactUtcTimestamp } from './utc-timestamp.js';
 
-/** Run のディレクトリの直下のファイルの名前。 */
+/**
+ * Run のディレクトリの直下のファイルの名前（ChatGPT 用バンドルを除く。バンドルの名前は日時を含むので、`bundleFileName` で作る）。
+ */
 export const RUN_ARTIFACT_FILE_NAMES = Object.freeze({
   run: 'run.json',
   audit: 'audit.json',
   report: 'report.html',
-  bundle: 'beaksight-audit-bundle.zip',
 } as const);
+
+/** ChatGPT 用バンドルのファイル名の部品（`<語幹><区切り><YYYYMMDDHHmmss><拡張子>`。ChatGPT 用バンドルのファイル名の設計書 2.1）。 */
+const BUNDLE_FILE_NAME_STEM = 'beaksight-audit-bundle';
+const BUNDLE_FILE_NAME_TIME_SEPARATOR = '_';
+const BUNDLE_FILE_NAME_EXTENSION = '.zip';
+/** 新しい形のバンドルの名前の、日時の前の部分（`beaksight-audit-bundle_`）。 */
+const BUNDLE_FILE_NAME_PREFIX = `${BUNDLE_FILE_NAME_STEM}${BUNDLE_FILE_NAME_TIME_SEPARATOR}`;
+/** `bundleFileName` の誤りの文で、時刻の名前として示す語。 */
+const BUNDLE_TIME_SUBJECT = 'end time of the last execution for the bundle name';
+
+/**
+ * 前の形の ChatGPT 用バンドルの名前（`beaksight-audit-bundle.zip`。日時を含まない）。今は書かない。前の版が書いたものを、
+ * `ArtifactWriter.writePresentation` が片付けるときに見分けるため（`isBundleFileName`）に残す。
+ */
+export const LEGACY_BUNDLE_FILE_NAME = `${BUNDLE_FILE_NAME_STEM}${BUNDLE_FILE_NAME_EXTENSION}`;
+
+/**
+ * ChatGPT 用バンドルのファイル名（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。ChatGPT 用バンドルのファイル名の設計書 2.1）。名前を作るのは、
+ * ここだけである。`finishedAt` は、その Run の最後の実行の終わりの時刻（`RunSummary.executions` の最後の `finishedAt`。ISO 8601）。
+ * 日時は UTC で、Run の ID と同じ書式（`formatCompactUtcTimestamp`）にする。同じ Run の結果からは、同じ名前になる（書き出しの時刻は
+ * 使わない）。文字列でない値、時刻として読めない文字列、UTC の年が4桁でない時刻は、`RangeError` を投げる。
+ */
+export function bundleFileName(finishedAt: string): string {
+  const given: unknown = finishedAt;
+  if (typeof given !== 'string') {
+    throw new RangeError(`${BUNDLE_TIME_SUBJECT} must be an ISO 8601 string`);
+  }
+  return `${BUNDLE_FILE_NAME_PREFIX}${formatCompactUtcTimestamp(new Date(given), BUNDLE_TIME_SUBJECT)}${BUNDLE_FILE_NAME_EXTENSION}`;
+}
+
+/**
+ * ChatGPT 用バンドルの名前か。新しい形（`beaksight-audit-bundle_` と、ASCII の数字14桁と、`.zip`）と、前の形（`LEGACY_BUNDLE_FILE_NAME`）の
+ * 両方を真にする。似た名前（拡張子の違い、桁の違い、前後に文字があるもの、大文字と小文字の違い）は偽にする。
+ * `ArtifactWriter.writePresentation` が、Run のディレクトリの直下の古いバンドルを見分けるために使う。
+ */
+export function isBundleFileName(name: string): boolean {
+  if (name === LEGACY_BUNDLE_FILE_NAME) {
+    return true;
+  }
+  if (!name.startsWith(BUNDLE_FILE_NAME_PREFIX) || !name.endsWith(BUNDLE_FILE_NAME_EXTENSION)) {
+    return false;
+  }
+  return isCompactUtcTimestamp(name.slice(BUNDLE_FILE_NAME_PREFIX.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length));
+}
 
 /** `pages/<pageId>/` の中のファイルの名前。 */
 export const PAGE_ARTIFACT_FILE_NAMES = Object.freeze({

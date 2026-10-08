@@ -11,6 +11,7 @@ import {
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
   DIAGNOSTICS_ARTIFACT_DIRECTORY,
+  LEGACY_BUNDLE_FILE_NAME,
   PAGE_ARTIFACT_FILE_NAMES,
   PAGES_ARTIFACT_DIRECTORY,
   PREFLIGHT_TEMPORARY_FILE_PREFIX,
@@ -19,10 +20,12 @@ import {
   RUN_ARTIFACT_FILE_NAMES,
   SCREENSHOT_FILE_NAMES,
   artifactFilePath,
+  bundleFileName,
   checkpointArtifactRelativePath,
   checkpointPageArtifactRelativePath,
   checkpointPageIdOfFileName,
   createRunArtifactDirectory,
+  isBundleFileName,
   isPortableArtifactPathSegment,
   isPortableRelativeArtifactPath,
   isPreflightTemporaryFileName,
@@ -33,6 +36,8 @@ import {
   screenshotRelativePath,
   siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
+import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
+import { createRunIdFromTime } from '../../src/orchestration/run-id.js';
 
 const RUN_ID = createRunId(20260924000000);
 /** ディレクトリへのリンクの種類（Windows では、権限のいらない junction にする。リンク先は、どれも一時ディレクトリの中）。 */
@@ -42,11 +47,11 @@ const PAGE_12 = createPageId(12);
 
 describe('artifact layout: names (design 6.1.2)', () => {
   it('names the files of the run directory, the page directory and the screenshots', () => {
+    // ChatGPT 用バンドルの名前は、日時を含むので、名前の表には置かない（`bundleFileName`。バンドルのファイル名の設計書 2.1）。
     expect(RUN_ARTIFACT_FILE_NAMES).toEqual({
       run: 'run.json',
       audit: 'audit.json',
       report: 'report.html',
-      bundle: 'beaksight-audit-bundle.zip',
     });
     expect(PAGE_ARTIFACT_FILE_NAMES).toEqual({ page: 'page.json', visibleText: 'visible-text.txt' });
     expect(PAGES_ARTIFACT_DIRECTORY).toBe('pages');
@@ -59,6 +64,80 @@ describe('artifact layout: names (design 6.1.2)', () => {
     expect(Object.isFrozen(RUN_ARTIFACT_FILE_NAMES)).toBe(true);
     expect(Object.isFrozen(PAGE_ARTIFACT_FILE_NAMES)).toBe(true);
     expect(Object.isFrozen(SCREENSHOT_FILE_NAMES)).toBe(true);
+  });
+});
+
+// BN1（ChatGPT 用バンドルのファイル名の設計書 2.1）: バンドルの名前は `beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。日時は、その Run の
+// 最後の実行の終わりの時刻（UTC。Run の ID と同じ書式）。名前を作るのも、バンドルの名前かを見分けるのも、ここだけで行う。
+describe('artifact layout: the file name of the ChatGPT bundle (bundle file name design 2.1)', () => {
+  it('names the bundle with the end of the last execution, in UTC, with a 24-hour clock', () => {
+    expect(bundleFileName('2026-10-08T03:09:30.000Z')).toBe('beaksight-audit-bundle_20261008030930.zip');
+    expect(bundleFileName('2026-10-08T15:09:30.999Z')).toBe('beaksight-audit-bundle_20261008150930.zip');
+    // 日本時間の 2026-10-09 00:05:09 は、UTC では 2026-10-08 15:05:09 である。
+    expect(bundleFileName('2026-10-09T00:05:09+09:00')).toBe('beaksight-audit-bundle_20261008150509.zip');
+  });
+
+  it('zero-pads every month, day, hour, minute and second field', () => {
+    expect(bundleFileName('2027-01-02T03:04:05.000Z')).toBe('beaksight-audit-bundle_20270102030405.zip');
+    expect(bundleFileName('2027-01-01T00:00:00.000Z')).toBe('beaksight-audit-bundle_20270101000000.zip');
+  });
+
+  it('uses the same 14-digit format as the run ID made from the same instant', () => {
+    const finishedAt = '2026-10-08T03:09:30.000Z';
+    const runIdDigits = createRunIdFromTime(new Date(finishedAt)).slice('RUN-'.length);
+
+    expect(bundleFileName(finishedAt)).toBe(`beaksight-audit-bundle_${runIdDigits}.zip`);
+    expect(bundleFileName(finishedAt)).toBe(`beaksight-audit-bundle_${formatCompactUtcTimestamp(new Date(finishedAt), 'x')}.zip`);
+  });
+
+  it('rejects a time that is not a valid ISO 8601 instant, or whose UTC year does not have four digits', () => {
+    for (const invalid of ['', 'not a time', '2026-13-01T00:00:00.000Z', '0999-12-31T23:59:59.000Z', '+010000-01-01T00:00:00.000Z']) {
+      expect(() => bundleFileName(invalid), invalid).toThrow(RangeError);
+    }
+    expect(() => bundleFileName(1_760_000_000_000 as unknown as string)).toThrow(RangeError);
+    expect(() => bundleFileName(null as unknown as string)).toThrow(RangeError);
+  });
+
+  it('keeps the earlier name as a constant, to clean it up', () => {
+    expect(LEGACY_BUNDLE_FILE_NAME).toBe('beaksight-audit-bundle.zip');
+  });
+
+  it('recognizes the new names and the earlier name as bundle names', () => {
+    expect(isBundleFileName(bundleFileName('2026-10-08T03:09:30.000Z'))).toBe(true);
+    expect(isBundleFileName('beaksight-audit-bundle_20261006010240.zip')).toBe(true);
+    expect(isBundleFileName('beaksight-audit-bundle_00000000000000.zip')).toBe(true);
+    expect(isBundleFileName(LEGACY_BUNDLE_FILE_NAME)).toBe(true);
+  });
+
+  it('does not recognize similar names: another extension, other digits, or extra characters before or after', () => {
+    for (const similar of [
+      'beaksight-audit-bundle_20261008030930.zi',
+      'beaksight-audit-bundle_20261008030930.zip.tmp',
+      'beaksight-audit-bundle_20261008030930.ZIP',
+      'beaksight-audit-bundle.zip.tmp',
+      'beaksight-audit-bundle.ZIP',
+      'beaksight-audit-bundle_2026100803093.zip',
+      'beaksight-audit-bundle_202610080309301.zip',
+      'beaksight-audit-bundle_2026100803093a.zip',
+      'beaksight-audit-bundle_.zip',
+      'beaksight-audit-bundle-20261008030930.zip',
+      'beaksight-audit-bundle20261008030930.zip',
+      'beaksight-audit-bundle_20261008030930_1.zip',
+      'Beaksight-audit-bundle_20261008030930.zip',
+      'copy of beaksight-audit-bundle_20261008030930.zip',
+      'xbeaksight-audit-bundle.zip',
+      '.beaksight-audit-bundle_20261008030930.zip.0b0e1f40-6a65-4c55-9d0e-3bd1a5c1d6a0.tmp',
+      'beaksight-audit-bundle.zip ',
+      'report.html',
+      '',
+    ]) {
+      expect(isBundleFileName(similar), similar).toBe(false);
+    }
+  });
+
+  it('gives bundle names that are portable path segments', () => {
+    expect(isPortableArtifactPathSegment(bundleFileName('2026-10-08T03:09:30.000Z'))).toBe(true);
+    expect(isPortableArtifactPathSegment(LEGACY_BUNDLE_FILE_NAME)).toBe(true);
   });
 });
 

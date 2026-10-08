@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Worker WebSocket Button</title></head>
+  <body>
+    <button type="button">Open WebSocket in worker</button>
+    <script>
+      // DEF-040: クリックで Dedicated Worker（blob の script）を作り、その中で同じサーバの /socket へ WebSocket の接続を開く。
+      // ページの中ではなく Worker の中で開くので、ページに差し込む方式の WebSocket の差し替え（`routeWebSocket`）は効かない。
+      document.querySelector('button').addEventListener('click', () => {
+        const socketUrl = location.origin.replace(/^http/, 'ws') + '/socket';
+        const script = [
+          'try {',
+          `  const socket = new WebSocket(${JSON.stringify(socketUrl)});`,
+          '  socket.addEventListener("error", () => undefined);',
+          '} catch {',
+          '  // 接続できない場合の例外は、Worker の失敗にしない。',
+          '}',
+        ].join('\n');
+        const worker = new Worker(URL.createObjectURL(new Blob([script], { type: 'text/javascript' })));
+        worker.addEventListener('error', () => undefined);
+      });
+    </script>
+  </body>
+</html>

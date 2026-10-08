@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Popup Form Post</title></head>
+  <body>
+    <button type="button">Open popup form</button>
+    <script>
+      // DEF-036: クリックで about:blank のポップアップを開き、その文書にフォームを書いて、同じ Origin の /__mutation へ POST で送る。
+      document.querySelector('button').addEventListener('click', () => {
+        const popup = window.open('about:blank');
+        if (popup === null) {
+          return;
+        }
+        const form = popup.document.createElement('form');
+        form.method = 'post';
+        form.action = new URL('/__mutation', window.location.href).href;
+        const field = popup.document.createElement('input');
+        field.name = 'example';
+        field.value = 'fixture';
+        form.appendChild(field);
+        popup.document.body.appendChild(form);
+        form.submit();
+      });
+    </script>
+  </body>
+</html>

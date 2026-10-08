@@ -201,10 +201,13 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   // CC-014（P14a）
   mapping('page', '/$defs/blockedExternalActionEvent/properties/reason/enum', 'BLOCKED_EXTERNAL_ACTION_REASONS'),
   mapping('page', '/$defs/excludedInteractionCandidateEvent/properties/reason/enum', 'INTERACTION_REJECTION_REASONS'),
-  mapping('page', '/$defs/blockedInteractionRequestEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
+  // DEF-039・DEF-040 の設計書 2.1.3: リクエストは出口の中継の理由を含む閉じた一覧、ナビゲーションは凍結の理由だけ。
+  mapping('page', '/$defs/blockedInteractionRequestEvent/properties/reason/enum', 'BLOCKED_INTERACTION_REQUEST_REASONS'),
+  mapping('page', '/$defs/blockedInteractionNavigationEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
   mapping('page', '/$defs/blockedPopupEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
   mapping('page', '/$defs/blockedDownloadEvent/properties/reason/enum', 'BLOCKED_DOWNLOAD_REASONS'),
-  mapping('page', '/$defs/blockedInteractionWebSocketEvent/properties/reason/enum', 'INTERACTION_FROZEN_REASONS'),
+  // DEF-040（NP3）: 凍結の後の WebSocket は、Worker の中のもの（`WORKER_CONNECT_POLICY`）を含む閉じた一覧。
+  mapping('page', '/$defs/blockedInteractionWebSocketEvent/properties/reason/enum', 'BLOCKED_INTERACTION_WEBSOCKET_REASONS'),
   // C18a（DEF-012）: 外部スキームへの移動の試み。
   mapping('page', '/$defs/externalSchemeNavigationEvent/properties/frame/enum', 'EXTERNAL_SCHEME_NAVIGATION_FRAMES'),
   mapping('page', '/$defs/externalSchemeNavigationEvent/properties/phase/enum', 'EXTERNAL_SCHEME_NAVIGATION_PHASES'),

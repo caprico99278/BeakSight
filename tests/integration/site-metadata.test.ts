@@ -1,5 +1,6 @@
 // R15b（Task 14〜17 の設計書 5.6.2）: robots.txt と sitemap.xml を、Guard の付いた Passive Context の GET のナビゲーションで取得し、
 // `metadata` の Evidence にする。sitemap の `<loc>` は、切り詰める前の本文から取り出して正規化する。
+import { readFile } from 'node:fs/promises';
 import { createServer, type Server, type ServerResponse } from 'node:http';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -8,6 +9,7 @@ import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { EvidenceRecordFor } from '../../src/core/contracts.js';
+import { wait } from '../../src/core/deadline.js';
 import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { MAX_SITE_METADATA_TEXT_LENGTH, MAX_SITEMAP_URLS } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -18,10 +20,7 @@ import {
   type SiteMetadataResult,
 } from '../../src/crawl/site-metadata.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
-import {
-  PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE,
-  PassiveContextCloseDeadlineError,
-} from '../../src/orchestration/passive-session-close.js';
+import { PassiveContextCloseDeadlineError } from '../../src/orchestration/passive-session-close.js';
 import { PASSIVE_SESSION_OPEN_DEADLINE_MESSAGE } from '../../src/orchestration/passive-session-open.js';
 import { siteUnavailabilityOf } from '../../src/orchestration/site-availability.js';
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
@@ -29,9 +28,18 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { BROWSER_DEFAULT_FAVICON_PATH, useHeadlessChromium } from '../helpers/chromium.js';
+import {
+  FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
+  QUIET_PERIOD_MS,
+  UNLOAD_BEACON_CLOSE_ROUNDS,
+  UNLOAD_BEACON_PAGE,
+  UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
+} from '../helpers/gate-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_TIMEOUT_MS = 120_000;
+/** 取得するファイルの数（robots.txt と sitemap.xml）。結果の `records` の長さと同じ。 */
+const SITE_METADATA_FILE_COUNT = 2;
 const SHORT_NAVIGATION_TIMEOUT_MS = 1_000;
 /** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`PAGE_CLOSE_TIMEOUT_MS` など）を待たない。 */
 const INJECTED_TIMEOUT_MS = 300;
@@ -444,6 +452,48 @@ describe('collectSiteMetadata', () => {
     await expectValidPageEvidence(timeoutRun);
   }, TEST_TIMEOUT_MS);
 
+  // DEF-038（設計書 `2026-10-08-beaksight-def-038-passive-page-close-design.md` の変更履歴の DEF-038-fix の Blocker）: robots.txt を
+  // HTML として返し、そのページが離れるとき（`pagehide`・`visibilitychange`）に POST を送っても、サーバに届かない。前の page
+  // （robots.txt）は個別に閉じず、最後に Context と一緒に閉じる。`UNLOAD_BEACON_CLOSE_ROUNDS` 回くり返し、全部の回の後に
+  // `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ってから、改めて確かめる。
+  it('delivers no POST sent while the robots.txt page (served as HTML) is being left, and records no violation (DEF-038)', async () => {
+    const unloadBeaconHtml = await readFile(new URL(`../../fixtures/site${UNLOAD_BEACON_PAGE}`, import.meta.url), 'utf8');
+    const server = await startCustomServer({
+      '/robots.txt': { contentType: 'text/html; charset=utf-8', body: unloadBeaconHtml },
+      '/sitemap.xml': { contentType: 'application/xml', body: '<urlset><url><loc>{{ORIGIN}}/a.html</loc></url></urlset>' },
+    });
+    const failedRounds: unknown[] = [];
+
+    for (let round = 0; round < UNLOAD_BEACON_CLOSE_ROUNDS; round += 1) {
+      const before = server.nonReadRequests();
+      const { result } = await collect(server.origin);
+      await wait(QUIET_PERIOD_MS);
+      const summary = {
+        round,
+        delivered: server.nonReadRequests() - before,
+        robots: robotsOf(result).payload.outcome,
+        sitemap: sitemapOf(result).payload.outcome,
+        invariantViolations: result.ledgerSnapshot?.invariantViolations,
+        closeFailures: result.closeFailures.map(({ step, error }) => ({ step, error: String(error) })),
+        contexts: browser.contexts().length,
+      };
+      if (
+        summary.delivered !== 0
+        || summary.robots !== 'OK'
+        || summary.sitemap !== 'OK'
+        || summary.invariantViolations?.length !== 0
+        || summary.closeFailures.length !== 0
+        || summary.contexts !== 0
+      ) {
+        failedRounds.push(summary);
+      }
+    }
+    await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+
+    expect(failedRounds).toEqual([]);
+    expect(server.nonReadRequests()).toBe(0);
+  }, UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS);
+
   it('sends only GET requests for robots.txt and sitemap.xml, and does not follow sitemap URLs', async () => {
     const server = await startServer();
     server.resetCounters();
@@ -475,35 +525,53 @@ describe('collectSiteMetadata', () => {
     await expectValidPageEvidence(failing);
   }, TEST_TIMEOUT_MS);
 
-  // R15 の Minor-1（DEF-006 と同じ扱い）: 前の page を閉じる処理が終わらない場合は、`PAGE_CLOSE_TIMEOUT_MS` で見切り、
-  // その Context での取得をやめて、Context を閉じる処理に進む。
-  it('stops using the Context and closes it when closing the previous page does not finish before its deadline', async () => {
+  // DEF-038（決まりの変更。以前は R15 の Minor-1: 前の page を閉じる処理が終わらない場合は、期限で見切り、その Context での取得を
+  // やめることを確かめていた）: 前の page（robots.txt）は個別に閉じずに残し、最後に Context と一緒に閉じる。page を閉じる処理を
+  // 呼ばないので、それが止まる場合も待たず、sitemap.xml も取得する。
+  it('does not close the previous page by itself, so a page close that would not finish neither delays nor stops the collection (DEF-038)', async () => {
     const server = await startServer();
+    const pageCloseCalls: number[] = [];
+    const openPages: Page[] = [];
     class HangingPageCloseFactory extends BrowserContextFactory {
+      override async createPassivePage(context: BrowserContext): Promise<Page> {
+        const page = await super.createPassivePage(context);
+        openPages.push(page);
+        return page;
+      }
+
       override async closePassivePage(): Promise<void> {
+        pageCloseCalls.push(performance.now());
         await new Promise<never>(() => undefined);
       }
     }
     server.resetRequestObservations();
+    const pagesOpenWhenSitemapLoads: boolean[] = [];
 
     const startedAt = performance.now();
     const run = await collect(server.origin, {
       createFactory: (config) => new HangingPageCloseFactory(browser, config, () => new SafetyLedger()),
-      // 期限は注入する（R15r-4。実際の 5 秒を待たない）。
+      // 期限は注入する（R15r-4。以前のこの場面で、実際の 5 秒を待たないため。今は読まない。DEF-038）。
       deadlines: { pageCloseTimeoutMs: INJECTED_TIMEOUT_MS },
+      afterNavigation: () => {
+        // 2つ目（sitemap.xml）の読み込みの時点で、前の page（robots.txt）が開いたままであること。
+        if (openPages.length === SITE_METADATA_FILE_COUNT) {
+          pagesOpenWhenSitemapLoads.push(...openPages.map((page) => !page.isClosed()));
+        }
+      },
     });
     const elapsedMs = performance.now() - startedAt;
     const { result } = run;
     expect(elapsedMs).toBeLessThan(INJECTED_TIMEOUT_MS + RETURN_MARGIN_MS);
 
-    expect(result.closeFailures).toHaveLength(1);
-    expect(result.closeFailures[0]?.step).toBe('page');
-    expect((result.closeFailures[0]?.error as Error).message).toBe(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
+    expect(pageCloseCalls).toEqual([]);
+    expect(pagesOpenWhenSitemapLoads).toEqual([true, true]);
+    expect(openPages.every((page) => page.isClosed())).toBe(true);
+    expect(result.closeFailures).toEqual([]);
     expect(robotsOf(result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
-    expect(sitemapOf(result).payload).toMatchObject({ outcome: 'FAILED', httpStatus: null, text: null, sitemapUrls: null });
-    expect(result.failures).toEqual([{ kind: 'SITEMAP_XML', timedOut: false, detail: PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE }]);
+    expect(sitemapOf(result).payload).toMatchObject({ outcome: 'OK', httpStatus: 200 });
+    expect(result.failures).toEqual([]);
     expect(result.ledgerSnapshot?.invariantViolationCount).toBe(0);
-    expect(server.getRequestObservations().map(({ pathname }) => pathname)).not.toContain('/sitemap.xml');
+    expect(server.getRequestObservations().map(({ pathname }) => pathname)).toContain('/sitemap.xml');
     expect(browser.contexts()).toHaveLength(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);

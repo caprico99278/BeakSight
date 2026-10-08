@@ -1,5 +1,25 @@
+import type { BrowserContextFactoryOptions } from '../../src/browser/context-factory.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import type { AuditConfig } from '../../src/config/types.js';
+import type { EgressUpstreamPolicy } from '../../src/safety/egress-proxy.js';
+
+/**
+ * テストの Interaction の Context の出口の中継（`src/safety/egress-proxy.ts`）が、上流として許す host（URL の hostname の形）。
+ * loopback だけである（実在の外部のサイトにアクセスしない決まり。DEF-039・DEF-040 の設計書 2.1.1）。`localhost` は、別のサイトの
+ * iframe（OOPIF）の fixture が、同じ fixture のサーバを別のホスト名で読むために要る（`tests/helpers/external-scheme-fixture.ts`）。
+ */
+const LOOPBACK_EGRESS_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/** テストの出口の中継の上流の方針: loopback だけを許す。production の方針（すべて許す）は、テストの factory には渡さない。 */
+export const LOOPBACK_EGRESS_UPSTREAM_POLICY: EgressUpstreamPolicy = (host) => LOOPBACK_EGRESS_HOSTS.has(host);
+
+/**
+ * テストの `BrowserContextFactory` の構築の指定。Interaction の session を作る factory は、必ずこれ（かこれを含む指定）で作り、
+ * 出口の中継が loopback 以外へ中継しないようにする。
+ */
+export const TEST_FACTORY_OPTIONS: BrowserContextFactoryOptions = Object.freeze({
+  egressUpstreamPolicy: LOOPBACK_EGRESS_UPSTREAM_POLICY,
+});
 
 /** `site` 以外の各セクションを、項目単位で上書きする指定。上書きの値はそのまま使う（複製しない）。 */
 export type TestConfigOverrides = {

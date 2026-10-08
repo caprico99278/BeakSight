@@ -1626,11 +1626,51 @@ export const BLOCKED_REQUEST_REASONS = Object.freeze(['NON_READ_METHOD'] as cons
 /** Passive の Guard が、許可Originの外へのメインフレームの遷移を遮断した理由の閉じた一覧。 */
 export const BLOCKED_NAVIGATION_REASONS = Object.freeze(['EXTERNAL_MAIN_FRAME_NAVIGATION'] as const);
 
-/** Passive の Guard が、WebSocket を遮断した理由の閉じた一覧。 */
-export const BLOCKED_WEBSOCKET_REASONS = Object.freeze(['PASSIVE_WEBSOCKET'] as const);
+/**
+ * Worker（Dedicated、Shared）の中で開く WebSocket の接続を、Guard が文書と Worker の script に加える CSP（`connect-src`。
+ * `src/safety/passive-request-guard.ts` の `WORKER_CONNECT_POLICY`）で止めたときの理由（DEF-040。DEF-039・DEF-040 の設計書 2.2）。
+ * Passive の段階は `blockedWebSockets`、Interaction の凍結の後は `blockedInteractionWebSockets` に残す。止めるのは CSP で決定的だが、
+ * 記録は Guard の page の session の `Log.entryAdded`（source `worker`）の観察で、取りこぼしうる（best-effort。Shared Worker の違反は
+ * page の session に出ないので、記録されない）。
+ */
+export const WORKER_CONNECT_POLICY_REASON = 'WORKER_CONNECT_POLICY';
+
+/**
+ * Passive の Guard が、WebSocket を遮断した理由の閉じた一覧。
+ * - `PASSIVE_WEBSOCKET`: ページの中の WebSocket（Context の `routeWebSocket`）。
+ * - `WORKER_CONNECT_POLICY`: Worker の中の WebSocket（CSP。`WORKER_CONNECT_POLICY_REASON`）。
+ */
+export const BLOCKED_WEBSOCKET_REASONS = Object.freeze(['PASSIVE_WEBSOCKET', WORKER_CONNECT_POLICY_REASON] as const);
 
 /** Interaction の凍結中に、ページが起こした通信・遷移・popup・WebSocket を遮断した理由の閉じた一覧。 */
 export const INTERACTION_FROZEN_REASONS = Object.freeze(['INTERACTION_FROZEN'] as const);
+
+/**
+ * Interaction の Context で、凍結の後に遮断した WebSocket（`blockedInteractionWebSockets`）の理由の閉じた一覧（DEF-040）。
+ * - `INTERACTION_FROZEN`: ページの中の WebSocket（Context の `routeWebSocket`）。
+ * - `WORKER_CONNECT_POLICY`: Worker の中の WebSocket（CSP。`WORKER_CONNECT_POLICY_REASON`）。
+ * popup とナビゲーションの理由は、`INTERACTION_FROZEN_REASONS` のままである。
+ */
+export const BLOCKED_INTERACTION_WEBSOCKET_REASONS = Object.freeze([
+  ...INTERACTION_FROZEN_REASONS,
+  WORKER_CONNECT_POLICY_REASON,
+] as const);
+
+/**
+ * Interaction の Context で、操作中に遮断したリクエスト（`blockedInteractionRequests`）の理由の閉じた一覧
+ * （DEF-039・DEF-040 の設計書 2.1.3）。
+ * - `INTERACTION_FROZEN`: 凍結の後に、Guard の route と CDP が止めたもの。
+ * - `INTERACTION_FROZEN_EGRESS`: 凍結の後に、Interaction の Context の出口の中継（`src/safety/egress-proxy.ts`）が拒んだもの。
+ *   Guard を通らずに出た要求の証拠である（ページ自身が閉じるポップアップの送信、Worker の中の WebSocket など）。
+ *   CONNECT の `url` は `host:port` の形で、https か wss かは分からない。
+ * - `EGRESS_UPSTREAM_DENIED`: 凍結の前に、中継の上流の方針で拒んだもの（production の方針はすべて許すので起きない。テストの方針で起きる）。
+ * 操作中に遮断したナビゲーション（`blockedInteractionNavigations`）の理由は、`INTERACTION_FROZEN_REASONS` のままである。
+ */
+export const BLOCKED_INTERACTION_REQUEST_REASONS = Object.freeze([
+  ...INTERACTION_FROZEN_REASONS,
+  'INTERACTION_FROZEN_EGRESS',
+  'EGRESS_UPSTREAM_DENIED',
+] as const);
 
 /**
  * ダウンロードを遮断した理由の閉じた一覧。フェーズを区別する。
@@ -1716,13 +1756,19 @@ export interface ExcludedInteractionCandidateEvent {
   readonly reason: InteractionRejectionReasonEvidence;
 }
 
+/** 操作中に遮断したリクエスト。理由は `BLOCKED_INTERACTION_REQUEST_REASONS`（Guard が止めたものと、出口の中継が拒んだものを区別する）。 */
 export interface BlockedInteractionRequestEvent {
+  readonly method: string;
+  readonly url: string;
+  readonly reason: (typeof BLOCKED_INTERACTION_REQUEST_REASONS)[number];
+}
+
+/** 操作中に遮断したナビゲーション。理由は `INTERACTION_FROZEN_REASONS` のまま（リクエストとは別の型。DEF-039・DEF-040 の設計書 2.1.3）。 */
+export interface BlockedInteractionNavigationEvent {
   readonly method: string;
   readonly url: string;
   readonly reason: (typeof INTERACTION_FROZEN_REASONS)[number];
 }
-
-export interface BlockedInteractionNavigationEvent extends BlockedInteractionRequestEvent {}
 
 export interface BlockedPopupEvent {
   readonly url: string;
@@ -1736,9 +1782,10 @@ export interface BlockedDownloadEvent {
   readonly reason: (typeof BLOCKED_DOWNLOAD_REASONS)[number];
 }
 
+/** 凍結の後に遮断した WebSocket。理由は `BLOCKED_INTERACTION_WEBSOCKET_REASONS`（ページの中のものと、Worker の中のものを区別する）。 */
 export interface BlockedInteractionWebSocketEvent {
   readonly url: string;
-  readonly reason: (typeof INTERACTION_FROZEN_REASONS)[number];
+  readonly reason: (typeof BLOCKED_INTERACTION_WEBSOCKET_REASONS)[number];
 }
 
 /**
