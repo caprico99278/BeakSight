@@ -11,6 +11,8 @@ import {
   INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE,
   MAX_ERROR_MESSAGE_LENGTH,
   MAX_HTTP_METHOD_LENGTH,
+  MAX_NETWORK_REQUESTS,
+  MAX_PENDING_GUARD_REQUEST_TASKS,
   MAX_SELECTOR_DEPTH,
   MAX_SELECTOR_LENGTH,
   MAX_URL_LENGTH,
@@ -55,6 +57,12 @@ describe('shared limits', () => {
 describe('page audit timing limits', () => {
   it('owns the cleanup allowance of one Interaction candidate', () => {
     expect(INTERACTION_CLEANUP_ALLOWANCE_MS).toBe(2_000);
+  });
+
+  // DEF-042 の設計書 2.4: 要求の横取りの作業の上限は、1 ページで記録するネットワークの要求の上限より大きい。
+  it('owns the limit of pending Guard request-interception tasks, above the per-page network request record limit', () => {
+    expect(MAX_PENDING_GUARD_REQUEST_TASKS).toBe(4_096);
+    expect(MAX_PENDING_GUARD_REQUEST_TASKS).toBeGreaterThan(MAX_NETWORK_REQUESTS);
   });
 
   // P14e（R14 の m2）: Page Auditor の候補ごとの期限と、設定の検証が、同じ倍数を使う。

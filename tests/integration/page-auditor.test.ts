@@ -26,7 +26,6 @@ import {
   COLLECTOR_DEADLINE_MARGIN_MS,
   CONTEXT_CLOSE_TIMEOUT_MS,
   MAX_ERROR_MESSAGE_LENGTH,
-  PAGE_CLOSE_TIMEOUT_MS,
   SESSION_OPEN_TIMEOUT_MS,
 } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -49,7 +48,7 @@ import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-pa
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
-import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
 
 const AUDIT_TEST_TIMEOUT_MS = 180_000;
 const SLOW_RESPONSE_DELAY_MS = 30_000;
@@ -145,7 +144,7 @@ function normalized(url: string, config: AuditConfig): NormalizedHttpUrlEvidence
 async function auditFixture(server: FixtureServer, pathname: string, options: AuditFixtureOptions = {}): Promise<AuditRun> {
   const config = createTestConfig(server.origin, '/', options.overrides);
   const contextFactory = options.createFactory?.(config)
-    ?? new BrowserContextFactory(browser, config, () => new SafetyLedger());
+    ?? new BrowserContextFactory(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
   const allocator = new IdAllocator();
   const screenshotRootDirectory = await mkdtemp(join(tmpdir(), 'beaksight-page-auditor-'));
   (options.keepScreenshotsForSuite === true ? suiteTemporaryDirectories : temporaryDirectories).push(screenshotRootDirectory);
@@ -659,7 +658,7 @@ describe('PageAuditor attempt argument (DEF-007)', () => {
     const config = createTestConfig(server.origin, '/', NO_STRESS_SWEEP);
     const allocator = new IdAllocator();
     const auditor = new PageAuditor({
-      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger()),
+      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       config,
       allocator,
       clock: () => new Date(),
@@ -679,12 +678,11 @@ describe('PageAuditor attempt argument (DEF-007)', () => {
   });
 });
 
-// DEF-006: page を閉じる処理が終わらない場合は、期限（`PAGE_CLOSE_TIMEOUT_MS`）で見切り、場面 `passive-page-close` の理由として
-// 記録してから、Context を閉じる。
-// P18c（R15r-4）: 実際の期限（5秒）を待たず、短い期限を注入する。page を閉じ始めてから Context を閉じ始めるまでの時間で、
-// 注入した期限で見切ったことを確かめる。
-describe('PageAuditor page close deadline (DEF-006)', () => {
-  it('records passive-page-close for a page close that does not finish, and still closes the Context', async () => {
+// DEF-038（決まりの変更）: page は個別に閉じず、Context と一緒に閉じる。以前は DEF-006 として、page を閉じる処理が終わらない場合は
+// 期限（`PAGE_CLOSE_TIMEOUT_MS`）で見切り、場面 `passive-page-close` の理由として記録してから Context を閉じることを確かめていた。
+// 今は、page を閉じる処理（止まる場合も）を呼ばないので、その理由は記録されず、待たずに Context を閉じることを確かめる。
+describe('PageAuditor page close deadline (DEF-006, DEF-038)', () => {
+  it('does not close the page by itself, so a page close that does not finish is never waited for, and closes the Context', async () => {
     const server = await startServer();
     const pageCloseStartedAt: number[] = [];
     const contextCloseStartedAt: number[] = [];
@@ -709,20 +707,15 @@ describe('PageAuditor page close deadline (DEF-006)', () => {
 
     expect(remainingContextCount).toBe(0);
     for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(outcome.result.viewports[viewport].status).toBe('PARTIAL');
-      expect(outcome.result.viewports[viewport].incompleteReasons).toEqual([
-        { code: 'UNHANDLED_FAILURE', detail: `passive-page-close:${PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE}` },
-      ]);
+      expect(outcome.result.viewports[viewport].status).toBe('AUDITED');
+      // 場面 `passive-page-close` の理由（以前の DEF-006 の記録）は、もう出ない。
+      expect(outcome.result.viewports[viewport].incompleteReasons).toEqual([]);
+      expect(JSON.stringify(outcome.result.viewports[viewport].incompleteReasons)).not.toContain(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
     }
     expect(outcome.safety.invariantViolationCount).toBe(0);
-    // 2つのビューポートで、それぞれ注入した期限まで待ってから、Context を閉じる。止まり続けない。
-    expect(pageCloseStartedAt).toHaveLength(2);
+    // 2つのビューポートで、page を閉じる処理を呼ばずに、Context を閉じる。止まり続けない。
+    expect(pageCloseStartedAt).toEqual([]);
     expect(contextCloseStartedAt).toHaveLength(2);
-    pageCloseStartedAt.forEach((pageCloseAt, index) => {
-      const waitedMs = (contextCloseStartedAt[index] ?? Number.NaN) - pageCloseAt;
-      expect(waitedMs).toBeGreaterThanOrEqual(SHORT_CLOSE_DEADLINE_MS - TIMER_TOLERANCE_MS);
-      expect(waitedMs).toBeLessThan(PAGE_CLOSE_TIMEOUT_MS);
-    });
     expect(elapsedMs).toBeLessThan(AUDIT_TEST_TIMEOUT_MS / 2);
   }, AUDIT_TEST_TIMEOUT_MS);
 });
@@ -747,7 +740,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           contextCalls += 1;
           return new Promise<never>(() => undefined);
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
     });
     const elapsedMs = performance.now() - startedAt;
@@ -784,7 +777,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           lateContexts += 1;
           return context;
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
     });
     expect(outcome.result.viewports.desktop.incompleteReasons)
@@ -808,7 +801,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           pageCalls += 1;
           return new Promise<never>(() => undefined);
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
     });
     const elapsedMs = performance.now() - startedAt;
@@ -852,7 +845,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           await super.closePassiveContext(context);
           await new Promise<never>(() => undefined);
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { contextCloseTimeoutMs: SHORT_CLOSE_DEADLINE_MS },
     }).finally(() => {
       auditReturnedAt = performance.now();
@@ -901,7 +894,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           }
           return super.createPassiveContext(viewport);
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       // 作成の期限そのものは長くして、ページの期限で見切ることを確かめる。
       deadlines: { sessionOpenTimeoutMs: AUDIT_TEST_TIMEOUT_MS },
       collectors: {
@@ -956,7 +949,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
             await new Promise<never>(() => undefined);
           }
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { contextCloseTimeoutMs: SHORT_CLOSE_DEADLINE_MS },
     });
 
@@ -1019,7 +1012,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
           lateSessions += 1;
           return session;
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
     });
     const elapsedMs = performance.now() - startedAt;
@@ -1071,7 +1064,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
             lateFailures += 1;
             throw new ContextConstructionError(context, this.getSafetyLedger(context), new Error('late guard failure'));
           }
-        })(browser, config, () => new SafetyLedger()),
+        })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
         deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
       });
       expect(sessionCalls).toBeGreaterThan(0);
@@ -1267,7 +1260,7 @@ describe('PageAuditor Guard installation failure that closes the Context (R14r I
     const { outcome } = await auditFixture(server, '/index.html', {
       overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false } },
       // 1回目の Context は、Desktop の Passive Context である。
-      createFactory: (config) => new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, { onlyOnCall: 1 }), config, () => new SafetyLedger()),
+      createFactory: (config) => new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, { onlyOnCall: 1 }), config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
     });
 
     expect(outcome.safety.invariantViolationCount).toBe(1);
@@ -1289,7 +1282,7 @@ describe('PageAuditor Guard installation failure that closes the Context (R14r I
     const { outcome } = await auditFixture(server, '/index.html', {
       overrides: { viewports: { stressWidths: [320] }, audit: { interactions: false } },
       // 1回目は Desktop の Passive Context、2回目は幅の走査のセッションの Context である。
-      createFactory: (config) => new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, { onlyOnCall: 2 }), config, () => new SafetyLedger()),
+      createFactory: (config) => new BrowserContextFactory(browserOpeningPageAfterNewContext(browser, { onlyOnCall: 2 }), config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
     });
 
     expect(outcome.safety.invariantViolationCount).toBe(1);
@@ -1334,7 +1327,7 @@ describe('PageAuditor collector deadline margin (R14r Minor-2)', () => {
           latestPageDeadlines.push(Date.now() + pageTimeoutMs);
           return super.createPassiveContext(viewport);
         }
-      })(browser, config, () => new SafetyLedger()),
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
     });
 
     expect(receivedDeadlines).toHaveLength(2);
@@ -1413,7 +1406,7 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
     readonly #violatingCall: number;
 
     constructor(config: AuditConfig, createLedger: () => SafetyLedger, violatingCall: number) {
-      super(browser, config, createLedger);
+      super(browser, config, createLedger, TEST_FACTORY_OPTIONS);
       this.#violatingCall = violatingCall;
     }
 
@@ -1544,7 +1537,7 @@ describe('PageAuditor: no new viewport or stress width after a safety invariant 
 describe('PageAuditor requires the safety violation check (C18f)', () => {
   it('is a type error and a TypeError to construct a PageAuditor without safetyViolationRecorded', () => {
     const config = createTestConfig('http://127.0.0.1:1', '/');
-    const contextFactory = new BrowserContextFactory(browser, config, () => new SafetyLedger());
+    const contextFactory = new BrowserContextFactory(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
     const withoutCheck = {
       contextFactory,
       config,
@@ -1567,7 +1560,7 @@ describe('PageAuditor requires the navigation pacer (load control design 4.1)', 
   it('is a type error and a TypeError to construct a PageAuditor without a navigation pacer', () => {
     const config = createTestConfig('http://127.0.0.1:1', '/');
     const withoutPacer = {
-      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger()),
+      contextFactory: new BrowserContextFactory(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
       config,
       allocator: new IdAllocator(),
       clock: () => new Date(),

@@ -14,7 +14,9 @@ import {
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
+  bundleFileName,
   checkpointArtifactRelativePath,
+  isBundleFileName,
 } from '../../src/core/artifact-layout.js';
 import type { Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -128,7 +130,11 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
     const html = await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.report), 'utf8');
     expect(html).toContain('<html lang="ja">');
     expect(html).toContain(HTML_REPORT_TEXT.title);
-    const bundle = unzipSync(new Uint8Array(await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.bundle))));
+    // BN1: バンドルの名前は、最後の実行の終わりの時刻（UTC）を含み、Run のディレクトリに1つだけある（バンドルのファイル名の設計書 2.1、2.2）。
+    const bundleName = bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
+    expect((await readdir(runDirectory)).filter(isBundleFileName)).toEqual([bundleName]);
+    expect(result.stdout).toContain(artifactFilePath(runDirectory, bundleName));
+    const bundle = unzipSync(new Uint8Array(await readFile(join(runDirectory, bundleName))));
     const manifest = JSON.parse(new TextDecoder().decode(bundle['manifest.json'])) as { readonly runId: string; readonly runStatus: string };
     expect(manifest).toMatchObject({ runId: run.runId, runStatus: run.runStatus });
     expect(Object.keys(bundle)).toContain('run.json');
@@ -200,9 +206,11 @@ describe('CLI run: a PARTIAL Run (page limit)', () => {
   });
 
   it('writes into the configured output directory (relative to the working directory) when --output is not given', async () => {
-    for (const file of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
+    const bundleName = bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
+    for (const file of [...Object.values(RUN_ARTIFACT_FILE_NAMES), bundleName]) {
       await expect(readFile(join(runDirectory, file))).resolves.toBeInstanceOf(Buffer);
     }
+    expect((await readdir(runDirectory)).filter(isBundleFileName)).toEqual([bundleName]);
   });
 
   // R5a（中断した Run の再開の設計書 3.2、4.7.1）: ページ数の上限による PARTIAL は、再開の対象にしない（保存の状態は FINISHED）。

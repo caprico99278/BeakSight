@@ -32,7 +32,7 @@ import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
-import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
 
 const AUDIT_TEST_TIMEOUT_MS = 180_000;
 /** 幅の走査・performance・accessibility・スクリーンショットをしない設定（Interaction の段階を確かめるテストを速くする）。 */
@@ -77,7 +77,7 @@ class CountingFactory extends BrowserContextFactory {
   readonly #wrapSession: WrapSession;
 
   constructor(config: AuditConfig, wrapSession: WrapSession = (session) => session, targetBrowser: Browser = browser) {
-    super(targetBrowser, config, () => new SafetyLedger());
+    super(targetBrowser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
     this.#wrapSession = wrapSession;
   }
 

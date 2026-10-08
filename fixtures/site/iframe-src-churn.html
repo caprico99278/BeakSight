@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Iframe Src Churn</title></head>
+  <body>
+    <h1>Fixture Iframe Src Churn</h1>
+    <p>This page changes the src of its iframe every millisecond, and sends a beacon to /__mutation each time.</p>
+    <iframe id="churn" title="churn"></iframe>
+    <script>
+      // DEF-050: 1 ms ごとに iframe の `src` を変え（Document の要求が次々に一時停止する）、同じ Origin の /__mutation へ sendBeacon の
+      // POST も送る。Context を閉じる処理と、一時停止した Document の要求の命令が重なる場面を作る。変えた回数は、html 要素の
+      // data-frame-loads に残す（変え始めたことの確かめに使う）。
+      const frame = document.getElementById('churn');
+      let changed = 0;
+      setInterval(() => {
+        changed += 1;
+        frame.src = `/navigation-target.html?churn=${changed}`;
+        try {
+          navigator.sendBeacon('/__mutation', 'fixture');
+        } catch {
+          // 遮断された場合の例外は、ページの失敗にしない。
+        }
+        document.documentElement.dataset.frameLoads = String(changed);
+      }, 1);
+    </script>
+  </body>
+</html>

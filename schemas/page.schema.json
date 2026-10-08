@@ -2515,7 +2515,7 @@
       "required": ["url", "reason"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["PASSIVE_WEBSOCKET"] }
+        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY"] }
       }
     },
     "blockedExternalActionEvent": {
@@ -2556,6 +2556,16 @@
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
+        "reason": { "enum": ["INTERACTION_FROZEN", "INTERACTION_FROZEN_EGRESS", "EGRESS_UPSTREAM_DENIED"] }
+      }
+    },
+    "blockedInteractionNavigationEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "url": { "type": "string" },
         "reason": { "enum": ["INTERACTION_FROZEN"] }
       }
     },
@@ -2584,7 +2594,7 @@
       "required": ["url", "reason"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["INTERACTION_FROZEN"] }
+        "reason": { "enum": ["INTERACTION_FROZEN", "WORKER_CONNECT_POLICY"] }
       }
     },
     "externalSchemeNavigationEvent": {
@@ -2645,7 +2655,7 @@
           "items": { "$ref": "#/$defs/excludedInteractionCandidateEvent" }
         },
         "blockedInteractionRequests": { "type": "array", "items": { "$ref": "#/$defs/blockedInteractionRequestEvent" } },
-        "blockedInteractionNavigations": { "type": "array", "items": { "$ref": "#/$defs/blockedInteractionRequestEvent" } },
+        "blockedInteractionNavigations": { "type": "array", "items": { "$ref": "#/$defs/blockedInteractionNavigationEvent" } },
         "blockedPopups": { "type": "array", "items": { "$ref": "#/$defs/blockedPopupEvent" } },
         "blockedDownloads": { "type": "array", "items": { "$ref": "#/$defs/blockedDownloadEvent" } },
         "blockedInteractionWebSockets": {

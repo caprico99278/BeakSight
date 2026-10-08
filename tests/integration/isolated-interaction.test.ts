@@ -3,8 +3,9 @@ import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { Browser, Page } from 'playwright';
+import { chromium, type Browser, type Page, type Request } from 'playwright';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory, type InteractionGuardedSession } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import { NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE } from '../../src/browser/navigation-diagnostics.js';
@@ -17,6 +18,7 @@ import {
   INTERACTION_NOT_VERIFIABLE_REASON_CODES,
   INTERACTION_REASON_CODES,
   INTERACTION_REASON_CODES_BY_STATUS,
+  type BlockedInteractionRequestEvent,
   type InteractionChangeEvidence,
   type InteractionClosedLifecycle,
   type InteractionLifecycleReasonCode,
@@ -55,15 +57,19 @@ import {
   type InteractionCandidate,
 } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import {
   discoverInteractionCandidate,
+  FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
   GATE_INTERACTION_TIMING,
   interactionAuditInput,
+  NO_NON_READ_REQUESTS,
+  openServerWindow,
+  QUIET_PERIOD_MS,
   withGuardedPassivePage,
 } from '../helpers/gate-harness.js';
-import { createTestConfig } from '../helpers/test-config.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 type ExpectedStructuredInteractionResult = Awaited<ReturnType<typeof auditInteraction>> & {
   readonly work: {
@@ -353,7 +359,7 @@ useHeadlessChromium((launched) => {
 });
 
 beforeAll(() => {
-  factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger());
+  factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
 });
 
 /**
@@ -361,6 +367,36 @@ beforeAll(() => {
  * page と Context を閉じる前に、Safety Ledger の違反が0件であることを確かめる。
  */
 const EXPECT_NO_GUARD_VIOLATIONS = Object.freeze({ expectNoViolations: true });
+
+/**
+ * DEF-036: 凍結中のポップアップの要求を確かめるテストで、同じ監査をくり返す回数。調査では、ポップアップの中のフォームの POST が、
+ * 修正の前に 40 回中 37 回届いたので、この回数なら修正の前にはほぼ確実に失敗する。
+ */
+const FROZEN_POPUP_AUDIT_ROUNDS = 10;
+/**
+ * DEF-036: くり返しの監査のテストの期限（ms）。1回の監査の期限（`GATE_INTERACTION_TIMING.overallMs`）と待ち時間の、くり返しの分と、
+ * 最後の待ち時間。
+ */
+const FROZEN_POPUP_AUDIT_TEST_TIMEOUT_MS = FROZEN_POPUP_AUDIT_ROUNDS * (GATE_INTERACTION_TIMING.overallMs + QUIET_PERIOD_MS)
+  + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
+/** DEF-039: ページ自身が開いて閉じるポップアップの fixture（`fixtures/site/`）。 */
+const FROZEN_POPUP_SELF_CLOSE_PAGE = '/popup-self-close-beacon.html';
+/**
+ * DEF-039: 凍結中にページ自身が開いて閉じるポップアップの送信を確かめるテストで、同じ場面をくり返す回数。修正の前の調査では、
+ * 同じ処理の中で閉じて 5 回中 5 回、300 ms 後に閉じて 8 回中 8 回届いたので、この回数なら修正の前にはほぼ確実に失敗する。
+ */
+const FROZEN_POPUP_SELF_CLOSE_ROUNDS = 5;
+/** DEF-039: fixture の「後で閉じる」場面が、ポップアップを閉じるまでの時間（ms。fixture の `DELAYED_CLOSE_MS` と同じ値）。 */
+const FROZEN_POPUP_SELF_CLOSE_DELAY_MS = 300;
+/**
+ * DEF-039: 1 回の場面（Interaction の session を開き、fixture を読み込み、凍結し、click し、ポップアップが閉じるのを待ち、閉じる）の
+ * 上限の見積もり（ms）。期限の値ではない。
+ */
+const FROZEN_POPUP_SELF_CLOSE_ROUND_BUDGET_MS = GATE_INTERACTION_TIMING.navigationTimeoutMs
+  + FROZEN_POPUP_SELF_CLOSE_DELAY_MS + QUIET_PERIOD_MS + GATE_INTERACTION_TIMING.overallMs;
+/** DEF-039 のくり返しのテストの期限（ms）。回ごとの上限の見積もりと、最後の待ち時間。 */
+const FROZEN_POPUP_SELF_CLOSE_TEST_TIMEOUT_MS = FROZEN_POPUP_SELF_CLOSE_ROUNDS * FROZEN_POPUP_SELF_CLOSE_ROUND_BUDGET_MS
+  + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
 
 async function discover(
   path: string,
@@ -1944,6 +1980,267 @@ describe('isolated fail-closed interaction audit', () => {
     expect(server.getCounters()).toMatchObject({ post: 0, put: 0, patch: 0, delete: 0, download: 0, webSocketUpgrade: 0 });
     expect(result.safety.invariantViolations).toEqual([]);
   });
+
+  /**
+   * DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 2.1、2.3、4、5 の変更履歴）: 凍結の後に開いたポップアップの
+   * 中の要求は、Guard がポップアップを先に閉じる処理と競合せず、サーバに届かない。閉じる処理との競合は毎回は起きないので、同じ
+   * テストの中で `FROZEN_POPUP_AUDIT_ROUNDS` 回くり返し、どの回も確かめる。
+   * - すべての回: `BLOCKED_BY_SAFETY`、`blockedPopups` が1件以上、違反 0 件、その回の直後にサーバに禁止のパスが届いていない、
+   *   GET・HEAD 以外のカウンタが 0。
+   * - すべての回で、次のどれか（`FrozenPopupRoundKind`）:
+   *   - `ROUTED`: route で止めて `blockedInteractionRequests` に記録した。
+   *   - `NOT_ISSUED`: ポップアップの要求そのものが出なかった（auditor は凍結の事象で直ちに Context を閉じるので、フォームが要求を
+   *     出す前に閉じることがある）。
+   *   - `ABORTED_WITHOUT_ROUTE`: 要求は出たが、route の記録がなく、出た要求のどれもが応答を受けずに失敗した（Context の
+   *     `requestfailed` があり、`response` も `requestfinished` もない。閉じ始めた Context の要求は route の処理が呼ばれず、Context
+   *     ごと破棄される。設計書 2.3）。
+   *   どれでもない回（`UNSETTLED_OR_RESPONDED`。要求が出て、応答を受けたか、終わり方が分からない）は失敗にする。
+   * - 場面ごとに、`ROUTED` の回が少なくとも1回ある（route で止める経路が実際に働いた証拠）。
+   * - 全部の回の後に `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ち、遅れて届いた禁止のパスへの要求がないことを確かめる。
+   * 回ごとの結果をまとめてから確かめるので、失敗したときは、失敗した回とその内容がすべて分かる。区分の内訳は、テストの出力に残す。
+   */
+  it.each([
+    ['/popup-form-post.html', 'Open popup form', 'POST', '/__mutation'],
+    ['/popup-button.html', 'Open popup', 'GET', '/popup-target.html'],
+  ] as const)('blocks every %s popup request through the frozen Context route in repeated audits (DEF-036)', async (
+    path,
+    name,
+    forbiddenMethod,
+    forbiddenPath,
+  ) => {
+    type FrozenPopupRoundKind = 'ROUTED' | 'NOT_ISSUED' | 'ABORTED_WITHOUT_ROUTE' | 'UNSETTLED_OR_RESPONDED';
+    const candidate = await candidateNamed(path, name);
+    const allRoundsWindow = openServerWindow(server);
+    const failedRounds: unknown[] = [];
+    const roundKinds: FrozenPopupRoundKind[] = [];
+    const isForbidden = (request: Request): boolean => (
+      request.method() === forbiddenMethod && new URL(request.url()).pathname === forbiddenPath
+    );
+
+    for (let round = 0; round < FROZEN_POPUP_AUDIT_ROUNDS; round += 1) {
+      const window = openServerWindow(server);
+      // Context の事象で観測した、禁止の要求とその終わり方（`request` は route より前に出る）。
+      const issued = new Set<Request>();
+      const failed = new Map<Request, string>();
+      const responded = new Set<Request>();
+      const finished = new Set<Request>();
+      // 診断: 要求の事象が、owner の close（Context を閉じる処理）を始めた後に来たか。区分の判定には使わない
+      // （Playwright の事象の順に左右されるため）。
+      const issuedTiming: string[] = [];
+      let ownerCloseStarted = false;
+      const sessionFactory = async (sessionViewport: Viewport): Promise<InteractionGuardedSession> => {
+        const session = await factory.createInteractionSession(sessionViewport);
+        const context = session.page.context();
+        context.on('request', (request) => {
+          if (isForbidden(request)) {
+            issued.add(request);
+            issuedTiming.push(ownerCloseStarted ? 'AFTER_OWNER_CLOSE_STARTED' : 'BEFORE_OWNER_CLOSE');
+          }
+        });
+        context.on('requestfailed', (request) => {
+          if (isForbidden(request)) {
+            failed.set(request, request.failure()?.errorText ?? '');
+          }
+        });
+        context.on('response', (response) => {
+          if (isForbidden(response.request())) {
+            responded.add(response.request());
+          }
+        });
+        context.on('requestfinished', (request) => {
+          if (isForbidden(request)) {
+            finished.add(request);
+          }
+        });
+        return {
+          ...session,
+          close: async (): Promise<void> => {
+            ownerCloseStarted = true;
+            await session.close();
+          },
+        };
+      };
+      const result = await auditInteraction({ ...input(path, candidate), sessionFactory });
+      await wait(QUIET_PERIOD_MS);
+
+      const routedPopupRequests = result.safety.blockedInteractionRequests.filter((entry) => (
+        entry.method === forbiddenMethod && new URL(entry.url).pathname === forbiddenPath
+      ));
+      const abortedWithoutResponse = issued.size > 0
+        && [...issued].every((request) => failed.has(request))
+        && responded.size === 0
+        && finished.size === 0;
+      let kind: FrozenPopupRoundKind;
+      if (routedPopupRequests.length > 0) {
+        kind = 'ROUTED';
+      } else if (issued.size === 0) {
+        kind = 'NOT_ISSUED';
+      } else if (abortedWithoutResponse) {
+        kind = 'ABORTED_WITHOUT_ROUTE';
+      } else {
+        kind = 'UNSETTLED_OR_RESPONDED';
+      }
+      roundKinds.push(kind);
+      const summary = {
+        round,
+        kind,
+        status: result.status,
+        blockedPopups: result.safety.blockedPopups.length,
+        routedPopupRequests: routedPopupRequests.length,
+        delivered: window.count(null, forbiddenPath),
+        nonReadCounters: window.nonReadCounters(),
+        invariantViolations: result.safety.invariantViolations,
+        issuedTiming,
+        failedPopupRequests: [...failed.values()],
+        respondedPopupRequests: responded.size,
+        finishedPopupRequests: finished.size,
+      };
+      if (
+        summary.status !== 'BLOCKED_BY_SAFETY'
+        || summary.blockedPopups === 0
+        || kind === 'UNSETTLED_OR_RESPONDED'
+        || summary.delivered !== 0
+        || Object.values(summary.nonReadCounters).some((count) => count !== 0)
+        || summary.invariantViolations.length !== 0
+      ) {
+        failedRounds.push(summary);
+      }
+    }
+    await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+    // 回ごとの区分の内訳（検証の記録のため。既定の報告では、PASS したテストの出力は表示されない）。
+    console.info(`DEF-036 ${forbiddenMethod} ${forbiddenPath} rounds: ${roundKinds.join(',')}`);
+
+    expect(failedRounds).toEqual([]);
+    expect(roundKinds).toContain('ROUTED');
+    expect(allRoundsWindow.count(null, forbiddenPath)).toBe(0);
+    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  }, FROZEN_POPUP_AUDIT_TEST_TIMEOUT_MS);
+
+  it('leaves a frozen popup open until the Interaction session close closes it with the Context (DEF-036)', async () => {
+    const path = '/popup-form-post.html';
+    const candidate = await candidateNamed(path, 'Open popup form');
+    const popups: Page[] = [];
+    const popupClosedAtOwnerClose: boolean[] = [];
+    const sessionFactory = async (sessionViewport: Viewport): Promise<InteractionGuardedSession> => {
+      const session = await factory.createInteractionSession(sessionViewport);
+      session.page.context().on('page', (opened) => {
+        popups.push(opened);
+      });
+      return {
+        ...session,
+        close: async (): Promise<void> => {
+          popupClosedAtOwnerClose.push(...popups.map((popup) => popup.isClosed()));
+          await session.close();
+        },
+      };
+    };
+
+    const result = await auditInteraction({ ...input(path, candidate), sessionFactory });
+
+    expect(result.status).toBe('BLOCKED_BY_SAFETY');
+    expect(result.safety.blockedPopups.length).toBeGreaterThan(0);
+    expect(result.safety.invariantViolations).toEqual([]);
+    expect(popups.length).toBeGreaterThan(0);
+    expect(popupClosedAtOwnerClose.length).toBeGreaterThan(0);
+    expect(popupClosedAtOwnerClose.every((closed) => !closed)).toBe(true);
+    expect(popups.every((popup) => popup.isClosed())).toBe(true);
+  });
+
+  /**
+   * DEF-039（設計書 `2026-10-08-beaksight-def-039-040-egress-design.md` 2.1.4）: 凍結の後にページ自身が開き、ページ自身が閉じる
+   * ポップアップの、ページを離れるときの送信（`pagehide` か `unload` の beacon と keepalive の POST）は、Guard の route を通らずに
+   * 出る（Chromium が閉じる途中で出す要求は、CDP の横取りを通らない。推測）。Interaction の Context の出口の中継は、凍結の後は
+   * すべての要求を拒むので、サーバに届かない。
+   * - 本物の Guard と中継の session を直接使い（`createInteractionSession` → 読み込み → 凍結 → click）、ポップアップが閉じるのを
+   *   待ってから session を閉じる。auditor の流れ（ポップアップの事象で直ちに閉じる）は、Gate（`safety-gates.test.ts` の GATE-S04）
+   *   が受け持つ。
+   * - 3 つの場面（同じ処理の中で閉じる、`FROZEN_POPUP_SELF_CLOSE_DELAY_MS` 後に閉じる、`unload` の beacon）を、それぞれ
+   *   `FROZEN_POPUP_SELF_CLOSE_ROUNDS` 回くり返し、どの回も、届かない、GET・HEAD 以外のカウンタが 0、違反 0、`blockedPopups` が
+   *   1 件以上、閉じる処理が成功、であることを確かめる。
+   * - DEF-042 の設計書 2.4（出口の中継との重なり）: Guard の CDP の横取り（すべての要求の Request の段階）が、opener の page の session
+   *   でポップアップの送信も先に止める（理由 `INTERACTION_FROZEN`）ようになった。そのため、回ごとに、Guard の記録
+   *   （`blockedInteractionRequests` の `INTERACTION_FROZEN`）か中継の記録（`INTERACTION_FROZEN_EGRESS`）のどちらかがあることを確かめる
+   *   （中継の記録が場面ごとに 1 回以上という条件は外した）。中継が働く証拠は、中継の単体テスト（`tests/integration/egress-proxy.test.ts`）と
+   *   factory の部品のテスト（`tests/component/context-factory.test.ts`）で示す（Worker の WebSocket は CSP が Worker の中で止めるので、
+   *   中継に CONNECT は来ない。DEF-040 の NP3）。
+   * - 全部の回の後に `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ち、遅れて届いた POST がないことを確かめる。
+   * 回ごとの結果をまとめてから確かめるので、失敗したときは、失敗した回とその内容がすべて分かる。
+   */
+  it.each([
+    ['closed in the same task', 'Close popup in the same task'],
+    ['closed after a delay', 'Close popup after a delay'],
+    ['closed with an unload beacon', 'Close popup with unload beacon'],
+  ] as const)('never delivers the leaving requests of a popup the frozen page itself opens and closes (%s; DEF-039)', async (
+    _label,
+    buttonName,
+  ) => {
+    const allRoundsWindow = openServerWindow(server);
+    const failedRounds: unknown[] = [];
+    const egressRecordsByRound: string[][] = [];
+    const guardRecordsByRound: string[][] = [];
+
+    for (let round = 0; round < FROZEN_POPUP_SELF_CLOSE_ROUNDS; round += 1) {
+      const session = await factory.createInteractionSession(viewport);
+      let closeFailure: unknown = null;
+      let summary: unknown;
+      try {
+        await session.page.goto(`${server.origin}${FROZEN_POPUP_SELF_CLOSE_PAGE}`, { waitUntil: 'load' });
+        await session.activateInteractionFreeze();
+        const window = openServerWindow(server);
+        await session.page.getByRole('button', { name: buttonName }).click();
+        await wait(FROZEN_POPUP_SELF_CLOSE_DELAY_MS + QUIET_PERIOD_MS);
+        const snapshot = session.ledger.snapshot();
+        const egressRecords = snapshot.blockedInteractionRequests
+          .filter((entry) => entry.reason === 'INTERACTION_FROZEN_EGRESS')
+          .map((entry) => `${entry.method} ${entry.url}`);
+        const guardRecords = snapshot.blockedInteractionRequests
+          .filter((entry) => entry.reason === 'INTERACTION_FROZEN')
+          .map((entry) => `${entry.method} ${entry.url}`);
+        egressRecordsByRound.push(egressRecords);
+        guardRecordsByRound.push(guardRecords);
+        summary = {
+          round,
+          delivered: window.count(null, '/__mutation'),
+          deliveredLines: window.requestLines(),
+          nonReadCounters: window.nonReadCounters(),
+          blockedPopups: snapshot.blockedPopups.length,
+          invariantViolations: snapshot.invariantViolations,
+          egressRecords,
+          guardRecords,
+        };
+      } finally {
+        await session.close().catch((error: unknown) => {
+          closeFailure = error;
+        });
+      }
+      const result = summary as {
+        readonly delivered: number;
+        readonly nonReadCounters: Readonly<Record<string, number>>;
+        readonly blockedPopups: number;
+        readonly invariantViolations: readonly unknown[];
+        readonly egressRecords: readonly string[];
+        readonly guardRecords: readonly string[];
+      };
+      if (
+        result.delivered !== 0
+        || Object.values(result.nonReadCounters).some((count) => count !== 0)
+        || result.blockedPopups === 0
+        || result.invariantViolations.length !== 0
+        || (result.egressRecords.length === 0 && result.guardRecords.length === 0)
+        || closeFailure !== null
+      ) {
+        failedRounds.push({ ...result, closeFailure: closeFailure === null ? null : String(closeFailure) });
+      }
+    }
+    await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+    // 回ごとの中継と Guard の記録（検証の記録のため。既定の報告では、PASS したテストの出力は表示されない）。
+    console.info(`DEF-039 ${buttonName} egress records by round: ${JSON.stringify(egressRecordsByRound)}`);
+    console.info(`DEF-039 ${buttonName} guard records by round: ${JSON.stringify(guardRecordsByRound)}`);
+
+    expect(failedRounds).toEqual([]);
+    expect(allRoundsWindow.count(null, '/__mutation')).toBe(0);
+    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  }, FROZEN_POPUP_SELF_CLOSE_TEST_TIMEOUT_MS);
 
   it('cancels and records a generated data-URL download without making a server-delivery claim', async () => {
     const candidate = await candidateNamed('/download-button.html', 'Attempt generated download');
@@ -8338,7 +8635,7 @@ describe('the observation of the target load of an interaction candidate (site u
       statusServer.close((error) => (error === undefined ? resolveClose() : reject(error)));
     });
     statusOrigin = `http://127.0.0.1:${port}`;
-    statusFactory = new BrowserContextFactory(browser, configFor(statusOrigin), () => new SafetyLedger());
+    statusFactory = new BrowserContextFactory(browser, configFor(statusOrigin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
   });
 
   afterAll(async () => {
@@ -8523,4 +8820,132 @@ describe('the observation of the target load of an interaction candidate (site u
     } as unknown as InteractionAuditInput)).rejects.toThrow(/receiver/u);
     expect(factoryCalls).toBe(0);
   });
+});
+
+/**
+ * DEF-046（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 3）: Interaction の結果の区分（`hasFreezeEvent`）は、
+ * `blockedInteractionRequests` のうち、Guard が止めたページの要求（理由 `INTERACTION_FROZEN`）だけを数える。出口の中継の記録
+ * （`INTERACTION_FROZEN_EGRESS`、`EGRESS_UPSTREAM_DENIED`）は、Chromium 自身の通信を含みうるので数えない（Ledger には残る）。
+ * 本物の Guard の付いた session の凍結の直後に、Ledger に記録を 1 件加えて、変化を確かめられる候補（`/accordion.html`）を監査する。
+ */
+describe('DEF-046: the egress proxy records do not make the Interaction result BLOCKED_BY_SAFETY', () => {
+  /** 凍結の直後に、理由 `reason` の記録を Ledger に 1 件加える session の factory。 */
+  const sessionRecordingAfterFreeze = (reason: BlockedInteractionRequestEvent['reason']) => async (
+    sessionViewport: Viewport,
+  ): Promise<InteractionGuardedSession> => {
+    const session = await factory.createInteractionSession(sessionViewport);
+    return Object.freeze({
+      ...session,
+      activateInteractionFreeze: async (): Promise<void> => {
+        await session.activateInteractionFreeze();
+        session.ledger.recordBlockedInteractionRequest({ method: 'CONNECT', url: 'https://unrelated.example.test:443', reason });
+      },
+    });
+  };
+
+  it.each(['INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED'] as const)('an egress proxy record (%s) alone does not make the result BLOCKED_BY_SAFETY, and stays in the Ledger', async (reason) => {
+    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
+
+    const result = await auditInteraction({ ...input('/accordion.html', candidate), sessionFactory: sessionRecordingAfterFreeze(reason) });
+
+    expect(result.status).toBe('VERIFIED');
+    expect(result.safety.blockedInteractionRequests).toEqual([
+      { method: 'CONNECT', url: 'https://unrelated.example.test:443', reason },
+    ]);
+    expect(result.safety.invariantViolations).toEqual([]);
+  });
+
+  it('control: a record of the Guard (INTERACTION_FROZEN) makes the result BLOCKED_BY_SAFETY', async () => {
+    const candidate = await candidateNamed('/accordion.html', 'Toggle details');
+
+    const result = await auditInteraction({
+      ...input('/accordion.html', candidate),
+      sessionFactory: sessionRecordingAfterFreeze('INTERACTION_FROZEN'),
+    });
+
+    expect(result.status).toBe('BLOCKED_BY_SAFETY');
+    expectReason(result, 'SAFETY_FREEZE_BLOCKED');
+  });
+});
+
+/** DEF-045 の実機の確かめで、1 ms ごとに POST を出すページ（`fixtures/site/`）。 */
+const FROZEN_CLOSE_RACE_PAGE = '/frozen-close-race-posts.html';
+/**
+ * DEF-045 の実機の確かめで、凍結 → owner の close をくり返す回数。NPR-T21R2 の再現の実験では、修正の前に、どちらの Chromium でも
+ * 10 回のうち 1〜3 回で違反が出た。
+ */
+const FROZEN_CLOSE_RACE_ROUNDS = 10;
+/** 読み込みから凍結までの待ちの、基本の時間と、回ごとにずらす幅・種類の数（閉じる瞬間と、一時停止した要求の重なり方を変える）。 */
+const FROZEN_CLOSE_RACE_BEFORE_FREEZE_MS = 50;
+const FROZEN_CLOSE_RACE_BEFORE_FREEZE_STEP_MS = 23;
+const FROZEN_CLOSE_RACE_BEFORE_FREEZE_STEPS = 5;
+/** 凍結から owner の close までの待ちの、基本の時間と、回ごとにずらす幅・種類の数。 */
+const FROZEN_CLOSE_RACE_BEFORE_CLOSE_MS = 50;
+const FROZEN_CLOSE_RACE_BEFORE_CLOSE_STEP_MS = 40;
+const FROZEN_CLOSE_RACE_BEFORE_CLOSE_STEPS = 3;
+/** 1 回の上限の目安（ms。読み込み、待ち、閉じる処理）。テストの期限の計算に使う。 */
+const FROZEN_CLOSE_RACE_ROUND_BUDGET_MS = 3_000;
+const FROZEN_CLOSE_RACE_TEST_TIMEOUT_MS = FROZEN_CLOSE_RACE_ROUNDS * FROZEN_CLOSE_RACE_ROUND_BUDGET_MS
+  + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
+
+/**
+ * DEF-045（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 2）: 1 ms ごとに POST（sendBeacon、keepalive の fetch）を出す
+ * ページを、Interaction の session で読み込み、凍結してから owner の close（`session.close()`）を行う。これを
+ * `FROZEN_CLOSE_RACE_ROUNDS` 回くり返し、どの回も、違反 0、閉じる処理が成功（無効化で reject しない）であること、全部の回の後に
+ * `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ってから、GET・HEAD 以外の要求がサーバに届いていないことを確かめる。テストの既定の
+ * headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）の両方で確かめる。
+ */
+describe.each([
+  { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
+  { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => chromium.launch(chromiumLaunchOptions({ headless: true })) },
+])('DEF-045: the owner close right after the freeze of a page that keeps posting, with $name', ({ name, launch }) => {
+  let raceBrowser: Browser;
+  let raceFactory: BrowserContextFactory;
+
+  beforeAll(async () => {
+    raceBrowser = await launch();
+    raceFactory = new BrowserContextFactory(raceBrowser, configFor(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+  });
+
+  afterAll(async () => {
+    await raceBrowser?.close();
+  });
+
+  it('records no violation and closes without invalidation in every round, and no POST reaches the server', async () => {
+    const allRoundsWindow = openServerWindow(server);
+    const rounds: unknown[] = [];
+    const failedRounds: unknown[] = [];
+    for (let round = 0; round < FROZEN_CLOSE_RACE_ROUNDS; round += 1) {
+      const session = await raceFactory.createInteractionSession(viewport);
+      let closeFailure: string | null = null;
+      try {
+        await session.page.goto(`${server.origin}${FROZEN_CLOSE_RACE_PAGE}`, { waitUntil: 'load' });
+        await wait(FROZEN_CLOSE_RACE_BEFORE_FREEZE_MS + (round % FROZEN_CLOSE_RACE_BEFORE_FREEZE_STEPS) * FROZEN_CLOSE_RACE_BEFORE_FREEZE_STEP_MS);
+        await session.activateInteractionFreeze();
+        await wait(FROZEN_CLOSE_RACE_BEFORE_CLOSE_MS + (round % FROZEN_CLOSE_RACE_BEFORE_CLOSE_STEPS) * FROZEN_CLOSE_RACE_BEFORE_CLOSE_STEP_MS);
+      } finally {
+        await session.close().catch((error: unknown) => {
+          closeFailure = String(error);
+        });
+      }
+      const snapshot = session.ledger.snapshot();
+      const summary = {
+        round,
+        invariantViolations: snapshot.invariantViolations,
+        closeFailure,
+        frozenRecords: snapshot.blockedInteractionRequests.filter((entry) => entry.reason === 'INTERACTION_FROZEN').length,
+      };
+      rounds.push(summary);
+      if (summary.invariantViolations.length !== 0 || summary.closeFailure !== null) {
+        failedRounds.push(summary);
+      }
+    }
+    await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+    console.info(`DEF-045 ${name}: ${JSON.stringify(rounds)}`);
+
+    expect(failedRounds).toEqual([]);
+    expect(rounds.every((round) => (round as { readonly frozenRecords: number }).frozenRecords > 0)).toBe(true);
+    expect(allRoundsWindow.count(null, '/__mutation')).toBe(0);
+    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+  }, FROZEN_CLOSE_RACE_TEST_TIMEOUT_MS);
 });

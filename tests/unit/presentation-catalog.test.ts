@@ -201,6 +201,14 @@ describe('the kinds of Safety events (design 6.1.10)', () => {
     expect(description).toContain('リダイレクト');
     expect(description).toContain('止め');
   });
+
+  // M3（NPR2。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 7）: 中継の記録には、ページの通信だけでなく、Chromium 自身の
+  // 通信（例: Google への接続）も含まれうることを、操作中に遮断したリクエストの説明で示す。
+  it('tells that the records of the egress proxy may include the own traffic of Chromium', () => {
+    const { description } = SAFETY_EVENT_KIND_CATALOG.blockedInteractionRequests;
+    expect(description).toContain('Chromium 自身の通信');
+    expect(description).toContain('Google');
+  });
 });
 
 // R6（中断した Run の再開の設計書 4.8 の「表示」）: 実行（起動）の終わり方の表示カタログ。HTML レポートの「実行の記録」の表は、

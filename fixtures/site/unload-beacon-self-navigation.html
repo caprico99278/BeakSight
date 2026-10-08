@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Unload Beacon Self Navigation</title></head>
+  <body>
+    <h1>Fixture Unload Beacon Self Navigation</h1>
+    <p>This page sends POST requests to /__mutation only while it is being left (pagehide and visibilitychange), and leaves by itself (location.href) shortly after load.</p>
+    <script>
+      // DEF-042: ページを離れるとき（`pagehide` と、隠れたときの `visibilitychange`）に、`navigator.sendBeacon` と keepalive の `fetch` で、
+      // 同じ Origin の /__mutation へ POST を送る（`unload-beacon.html` と同じ）。読み込みの後に、ページ自身が `location.href` で別の文書へ
+      // 移る。移動の先は、クエリの to（固定の一覧の名前）で選ぶ。一覧にない値の場合は、移動しない。
+      // - same-site: 同じ Origin の /navigation-target.html（Guard が許可する移動）。
+      // - cross-site: 同じサーバの別のホスト名（`127.0.0.1` と `localhost` を入れ替える。ポートは同じ）の /navigation-target.html。
+      //   許可 Origin の外なので、Guard が main frame の移動を止める（DEF-042 の調査の実験 7）。インターネット上のサイトは使わない。
+      const SELF_NAVIGATION_DELAY_MS = 100;
+      const sendLeavingRequests = () => {
+        try {
+          navigator.sendBeacon('/__mutation', 'fixture');
+        } catch {
+          // 遮断された場合の例外は、ページの失敗にしない。
+        }
+        void fetch('/__mutation', { method: 'POST', body: 'fixture', keepalive: true }).catch(() => undefined);
+      };
+      window.addEventListener('pagehide', sendLeavingRequests);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          sendLeavingRequests();
+        }
+      });
+      const to = new URLSearchParams(location.search).get('to');
+      const otherHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      const destinations = {
+        'same-site': '/navigation-target.html',
+        'cross-site': `${location.protocol}//${otherHost}:${location.port}/navigation-target.html`,
+      };
+      if (to !== null && Object.hasOwn(destinations, to)) {
+        window.addEventListener('load', () => {
+          setTimeout(() => {
+            location.href = destinations[to];
+          }, SELF_NAVIGATION_DELAY_MS);
+        });
+      }
+    </script>
+  </body>
+</html>

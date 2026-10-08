@@ -10,6 +10,7 @@ import type {
 } from '../../src/core/contracts.js';
 import {
   BLOCKED_EXTERNAL_ACTION_REASONS,
+  BLOCKED_INTERACTION_REQUEST_REASONS,
   INTERACTION_REJECTION_REASONS,
   type BlockedExternalActionReason,
   type InteractionRejectionReasonEvidence,
@@ -55,6 +56,20 @@ describe('SafetyLedger', () => {
         reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
       }],
       blockedWebSockets: [{ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' }],
+      invariantViolations: [],
+    });
+  });
+
+  // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた記録は、Passive では `blockedWebSockets`、
+  // 凍結の後は `blockedInteractionWebSockets` に、理由 `WORKER_CONNECT_POLICY` で残る（記録の種類は増えない）。
+  it('records the WebSockets stopped inside Workers by the connect policy with the WORKER_CONNECT_POLICY reason, in both phases', () => {
+    const ledger = new SafetyLedger();
+    ledger.recordBlockedWebSocket({ url: 'ws://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY' });
+    ledger.recordBlockedInteractionWebSocket({ url: 'wss://example.test/worker-live', reason: 'WORKER_CONNECT_POLICY' });
+
+    expect(ledger.snapshot()).toMatchObject({
+      blockedWebSockets: [{ url: 'ws://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY' }],
+      blockedInteractionWebSockets: [{ url: 'wss://example.test/worker-live', reason: 'WORKER_CONNECT_POLICY' }],
       invariantViolations: [],
     });
   });
@@ -632,6 +647,24 @@ describe('P14a: page safety summary from the Ledger snapshots of a page', () => 
     }))).toBe('ABORTED_BY_SAFETY');
     expectTypeOf(summarizePageSafety).parameters.toEqualTypeOf<[readonly SafetyLedgerSnapshot[]]>();
     expectTypeOf(summarizePageSafety).returns.toEqualTypeOf<PageSafetySummary>();
+  });
+});
+
+// DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、閉じた一覧（`BLOCKED_INTERACTION_REQUEST_REASONS`）にする。
+describe('blocked Interaction request reasons (egress proxy)', () => {
+  it.each(BLOCKED_INTERACTION_REQUEST_REASONS)('records the reason %s as it is', (reason) => {
+    const ledger = new SafetyLedger();
+    ledger.recordBlockedInteractionRequest({ method: 'connect', url: '127.0.0.1:443', reason });
+
+    expect(ledger.snapshot().blockedInteractionRequests).toEqual([{ method: 'CONNECT', url: '127.0.0.1:443', reason }]);
+    expect(ledger.snapshot().recordLimits.truncatedTextCount).toBe(0);
+  });
+
+  it('types the request reason as the closed list and keeps the navigation reason as the frozen reason only', () => {
+    expectTypeOf<Parameters<SafetyLedger['recordBlockedInteractionRequest']>[0]['reason']>()
+      .toEqualTypeOf<(typeof BLOCKED_INTERACTION_REQUEST_REASONS)[number]>();
+    expectTypeOf<Parameters<SafetyLedger['recordBlockedInteractionNavigation']>[0]['reason']>()
+      .toEqualTypeOf<'INTERACTION_FROZEN'>();
   });
 });
 

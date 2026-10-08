@@ -340,12 +340,15 @@ describe('collectRunEnvironment (R15c)', () => {
     }
   }, DEADLINE_TEST_TIMEOUT_MS);
 
-  // RP18 の指摘1: page を閉じる処理の失敗も、捨てずに渡す（Context は、そのあと閉じる）。
-  it('hands over a page close failure and still closes the Context', async () => {
+  // DEF-038（決まりの変更。以前は RP18 の指摘1: page を閉じる処理の失敗も、捨てずに渡すことを確かめていた）: page は個別に閉じず、
+  // Context と一緒に閉じる。page を閉じる処理は呼ばないので、それが失敗する場合も、閉じる処理の失敗はない。
+  it('does not close the page by itself, so a failing page close is never called, and closes the Context (DEF-038)', async () => {
     const config = createTestConfig(server.origin);
     const pageCloseError = new Error('fixture page close failure');
+    const pageCloseCalls: number[] = [];
     class FailingPageCloseFactory extends BrowserContextFactory {
       override async closePassivePage(): Promise<void> {
+        pageCloseCalls.push(performance.now());
         throw pageCloseError;
       }
     }
@@ -361,7 +364,8 @@ describe('collectRunEnvironment (R15c)', () => {
     });
 
     expect(environment.userAgents.desktop).toMatch(/^Mozilla\/5\.0 .*Chrome\//u);
-    expect(closeFailures).toEqual([{ step: 'page', error: pageCloseError }, { step: 'page', error: pageCloseError }]);
+    expect(pageCloseCalls).toEqual([]);
+    expect(closeFailures).toEqual([]);
     expect(browser.contexts()).toEqual([]);
   });
 

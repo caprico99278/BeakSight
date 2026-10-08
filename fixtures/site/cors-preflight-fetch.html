@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture CORS Preflight Fetch</title></head>
+  <body>
+    <h1>Fixture CORS Preflight Fetch</h1>
+    <p>This page fetches two pages of the same fixture server through its other host name: one with a custom request header (which needs a CORS preflight), and one simple GET (which does not).</p>
+    <script>
+      // DEF-042-fix-round-1（設計書 2.4「CORS の事前確認」）: 読み込みの後に、同じ fixture のサーバを別のホスト名（`127.0.0.1` と `localhost` を
+      // 入れ替える。ポートは同じ）で読む。
+      // - 独自のヘッダ（X-Fixture-Preflight）つきの GET /navigation-target.html: ブラウザが先に事前確認（OPTIONS）を送る。
+      // - 単純な GET /popup-target.html: 事前確認は要らない。
+      // fixture のサーバは CORS の応答のヘッダを返さないので、ページのスクリプトからは本体の応答を読めない（fetch は失敗する）。
+      // ここでは、試みた結果（ok か error）を html 要素の data-preflighted と data-simple に残し、両方が終わったら data-done を '1' にする。
+      // サーバに届いたかどうかは、テストがサーバの記録で確かめる。インターネット上のサイトは使わない。
+      const otherHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
+      const otherOrigin = `${location.protocol}//${otherHost}:${location.port}`;
+      const root = document.documentElement;
+      const record = (name, promise) => promise.then(
+        (response) => { root.dataset[name] = `ok:${response.status}`; },
+        (error) => { root.dataset[name] = `error:${error instanceof Error ? error.name : 'unknown'}`; },
+      );
+      window.addEventListener('load', () => {
+        void Promise.all([
+          record('preflighted', fetch(`${otherOrigin}/navigation-target.html`, { headers: { 'X-Fixture-Preflight': '1' } })),
+          record('simple', fetch(`${otherOrigin}/popup-target.html`)),
+        ]).then(() => { root.dataset.done = '1'; });
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Worker WebSocket (Passive)</title></head>
+  <body>
+    <p>Opens a WebSocket from inside a Worker while the page loads (no click). The kind of Worker is chosen by the query <code>kind</code>.</p>
+    <script>
+      // DEF-040（NP3）: 読み込みのとき（クリックなし。Passive の段階）に Worker を作り、その中で同じサーバの /socket へ WebSocket の
+      // 接続を開く。Worker の種類はクエリ `kind` で選ぶ:
+      // - blob: blob の script の Dedicated Worker
+      // - http: http の script（/worker-websocket-connect.js）の Dedicated Worker
+      // - shared: http の script の Shared Worker
+      // - module: module の Worker（/worker-websocket-connect-module.js。接続を開く script を import で読む）
+      // - nested: http の script の Worker（/worker-websocket-nested.js）が作る、blob の script の入れ子の Worker
+      // - srcdoc: srcdoc の iframe の中の script が作る、blob の script の Worker
+      // 始めた結果は、html 要素の data-worker-websocket に残す（started、unavailable、failed、unknown-kind）。
+      // DEF-044: Shared Worker を無効にした Chromium（`typeof SharedWorker === 'undefined'`）では、shared は unavailable にする。
+      // `typeof SharedWorker` の値は、data-shared-worker-type に残す。
+      const kind = new URLSearchParams(location.search).get('kind');
+      const connectScript = [
+        'try {',
+        "  const socket = new WebSocket(self.location.origin.replace(/^http/, 'ws') + '/socket');",
+        '  socket.addEventListener("error", () => undefined);',
+        '} catch {',
+        '  // 接続できない場合の例外は、Worker の失敗にしない。',
+        '}',
+      ].join('\n');
+      const blobUrl = () => URL.createObjectURL(new Blob([connectScript], { type: 'text/javascript' }));
+      const starters = {
+        blob: () => new Worker(blobUrl()),
+        http: () => new Worker('/worker-websocket-connect.js'),
+        shared: () => new SharedWorker('/worker-websocket-connect.js'),
+        module: () => new Worker('/worker-websocket-connect-module.js', { type: 'module' }),
+        nested: () => new Worker('/worker-websocket-nested.js'),
+        srcdoc: () => {
+          const frame = document.createElement('iframe');
+          frame.srcdoc = '<script>new Worker(URL.createObjectURL(new Blob([' + JSON.stringify(connectScript)
+            + '], { type: "text/javascript" })))<\/script>';
+          document.body.appendChild(frame);
+          return null;
+        },
+      };
+      const start = starters[kind];
+      document.documentElement.dataset.sharedWorkerType = typeof SharedWorker;
+      if (start === undefined) {
+        document.documentElement.dataset.workerWebsocket = 'unknown-kind';
+      } else if (kind === 'shared' && typeof SharedWorker === 'undefined') {
+        document.documentElement.dataset.workerWebsocket = 'unavailable';
+      } else {
+        try {
+          const worker = start();
+          if (worker !== null) worker.addEventListener('error', () => undefined);
+          document.documentElement.dataset.workerWebsocket = 'started';
+        } catch {
+          document.documentElement.dataset.workerWebsocket = 'failed';
+        }
+      }
+    </script>
+  </body>
+</html>

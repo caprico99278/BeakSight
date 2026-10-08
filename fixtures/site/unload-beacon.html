@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Unload Beacon</title></head>
+  <body>
+    <h1>Fixture Unload Beacon</h1>
+    <p>This page sends POST requests to /__mutation only while it is being left (pagehide and visibilitychange).</p>
+    <script>
+      // DEF-038: ページを離れるとき（`pagehide` と、隠れたときの `visibilitychange`）に、`navigator.sendBeacon` と keepalive の
+      // `fetch` で、同じ Origin の /__mutation へ POST を送る。読み込みの間は、何も送らない。
+      const sendLeavingRequests = () => {
+        try {
+          navigator.sendBeacon('/__mutation', 'fixture');
+        } catch {
+          // 遮断された場合の例外は、ページの失敗にしない。
+        }
+        void fetch('/__mutation', { method: 'POST', body: 'fixture', keepalive: true }).catch(() => undefined);
+      };
+      window.addEventListener('pagehide', sendLeavingRequests);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          sendLeavingRequests();
+        }
+      });
+    </script>
+  </body>
+</html>

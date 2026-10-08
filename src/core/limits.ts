@@ -102,6 +102,19 @@ export const MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS = INTERACTION_STABILITY_WINDOW
 export const INTERACTION_CLEANUP_ALLOWANCE_MS = 2_000;
 
 /**
+ * Guard が同時に持てる、要求の横取りの作業（CDP の `Fetch.requestPaused` で一時停止した、Document でない要求の判定。
+ * `src/safety/passive-request-guard.ts` の `handlePausedRequest`）の数の上限（DEF-042 の設計書 2.4）。超えた要求は一時停止のまま進めず、
+ * 違反 `GUARD_TASK_LIMIT_REACHED` にして Context を閉じる（fail-closed。ほかの作業の上限 `MAX_PENDING_GUARD_TASKS` = 256 と同じ扱い）。
+ * 値の根拠: DEF-042 で Guard の CDP の横取りをすべての要求に広げたので、ページが一度に始める資源の要求（画像、スクリプトなど）が、
+ * それぞれ 1 つの作業になる。Chromium は、接続の数の上限とは別に、要求の開始の時点で横取りするので、700 個の画像を一度に読む
+ * fixture（`many-resources.html`）では、数百の要求が同時に一時停止する。ほかの作業の上限（256）は、ダウンロードの取り消しや Document の
+ * 横取りのような、同時に数十までの作業を想定した値で、これには足りない。1 ページで記録するネットワークの要求の上限
+ * （`MAX_NETWORK_REQUESTS` = 2,000）の 2 倍にし、記録の上限を超えるページと、同じ page の OOPIF の session の要求（同じ Guard の作業に
+ * 数える）にも余裕を持たせた。
+ */
+export const MAX_PENDING_GUARD_REQUEST_TASKS = 4_096;
+
+/**
  * Guard の付いた Passive の page を閉じる処理（factory の `closePassivePage`）を待つ時間の上限（ms。DEF-006）。
  * この時間を過ぎたら、page を閉じる処理の失敗として記録し、Context を閉じる処理に進む（Context を閉じると、止まった page も閉じる）。
  * 背景: エラーページを表示している page で、次のナビゲーションも失敗し、その直後に page を閉じると、Chromium は page を閉じず、
@@ -109,6 +122,9 @@ export const INTERACTION_CLEANUP_ALLOWANCE_MS = 2_000;
  * 値の根拠: page を閉じる処理は、ふだん数十 ms で終わる（DEF-005 の測定）。負荷の高い環境でも誤って期限切れにしないよう、
  * その 100 倍程度の余裕を取った。止まった場合は永久に終わらないので、有限の値であれば止まり続けることはない。
  * 既定のページの期限（60,000ms）の 10% 未満である。
+ * DEF-038 で、Guard の付いた Passive のページを個別に閉じなくなったので、production では使わない（整理は CC-049）。
+ * Passive の page は、Context と一緒に閉じる（`closePassivePageAndContext`）。`resolvePassiveSessionDeadlines` は、今も既定値として
+ * この値を埋めるが、閉じる手順はその値を読まない。
  */
 export const PAGE_CLOSE_TIMEOUT_MS = 5_000;
 

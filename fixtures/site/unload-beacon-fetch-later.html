@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Unload Beacon Fetch Later</title></head>
+  <body>
+    <h1>Fixture Unload Beacon Fetch Later</h1>
+    <p>This page schedules a fetchLater() POST to /__mutation, which the browser sends when the page is left, and leaves by itself (location.href) shortly after load.</p>
+    <script>
+      // DEF-042: `fetchLater()` で、同じ Origin の /__mutation への POST を予約する。ブラウザは、ページを離れるときに、この POST を
+      // ページのスクリプトとは別に送る（Playwright の route を通らない経路）。読み込みの後に、ページ自身が `location.href` で、同じ Origin の
+      // /navigation-target.html へ移る。
+      // `fetchLater` がないブラウザでは予約せず、html 要素の data-fetch-later を 'unavailable' にする（予約できたら 'scheduled'）。
+      // 対照のテストは、この値で、fixture が意味を持つこと（予約できたこと）を確かめる。
+      const SELF_NAVIGATION_DELAY_MS = 100;
+      try {
+        if (typeof fetchLater === 'function') {
+          fetchLater('/__mutation', { method: 'POST', body: 'fixture' });
+          document.documentElement.dataset.fetchLater = 'scheduled';
+        } else {
+          document.documentElement.dataset.fetchLater = 'unavailable';
+        }
+      } catch {
+        document.documentElement.dataset.fetchLater = 'unavailable';
+      }
+      window.addEventListener('load', () => {
+        setTimeout(() => {
+          location.href = '/navigation-target.html';
+        }, SELF_NAVIGATION_DELAY_MS);
+      });
+    </script>
+  </body>
+</html>

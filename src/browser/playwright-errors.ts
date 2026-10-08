@@ -49,7 +49,8 @@ export function isBlockedByClientFailure(errorText: string | null | undefined): 
  * 2章）。ブラウザが、一時停止している要求を取り消した（読み込みの途中で iframe が消された、など）後に命令が届くと、この失敗になる。
  *
  * 文言は、Playwright 1.62.1 の Chromium（CLI の起動の設定。headless）で、実際に起こした失敗から取った（DEF-026 の調査と、その修正の結合テスト）。
- * - page の session（Playwright の `CDPSession.send`）: 命令の名前を含む形。進める命令と止める命令の2つ。
+ * - page の session（Playwright の `CDPSession.send`）: 命令の名前を含む形。進める命令と止める命令と、応答を続ける命令
+ *   （`Fetch.continueResponse`。DEF-040）の3つ。
  * - 別のプロセスの iframe（OOPIF）の session（Guard が `Target.sendMessageToTarget` で送った命令の応答）: Chromium の失敗の応答の `message`
  *   そのもの（命令の名前を含まない）。進める命令と止める命令で同じ。
  *
@@ -59,6 +60,9 @@ export const INVALID_INTERCEPTION_ID_FAILURE_TEXTS = Object.freeze([
   'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.',
   'cdpSession.send: Protocol error (Fetch.failRequest): Invalid InterceptionId.',
   'Invalid InterceptionId.',
+  // DEF-040（NP3 の発見事項 1）: Worker の script の応答に CSP のヘッダを加える `Fetch.continueResponse` が、ブラウザが先に取り消した
+  // 応答に対して失敗した形。page の session の文言。末尾に加えた（前の 3 つの並びを変えない）。
+  'cdpSession.send: Protocol error (Fetch.continueResponse): Invalid InterceptionId.',
 ] as const);
 
 const INVALID_INTERCEPTION_ID_FAILURE_TEXT_SET: ReadonlySet<string> = new Set(INVALID_INTERCEPTION_ID_FAILURE_TEXTS);

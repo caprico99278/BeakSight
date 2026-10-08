@@ -227,7 +227,7 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
   it('copies the executions of run.json in their order, with the number of executions and of resumes (3 executions)', () => {
     const result = auditRun({ executions: executionsDisplaySample() });
     const model = buildReportViewModel(result);
-    expect(model.summary.executions).toEqual({ count: 3, resumeCount: 2, items: executionsDisplaySample() });
+    expect(model.summary.executions).toEqual({ count: 3, resumeCount: 2, lastEndReason: 'COMPLETED', items: executionsDisplaySample() });
     // 写しであって、入力の値そのものではない（入力を凍結しない）。
     expect(model.summary.executions.items).not.toBe(result.run.executions);
     expect(model.summary.executions.items[0]).not.toBe(result.run.executions[0]);
@@ -239,7 +239,30 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
     const result = auditRun();
     expect(result.run.executions).toHaveLength(1);
     const model = buildReportViewModel(result);
-    expect(model.summary.executions).toEqual({ count: 1, resumeCount: 0, items: [...result.run.executions] });
+    expect(model.summary.executions).toEqual({ count: 1, resumeCount: 0, lastEndReason: 'COMPLETED', items: [...result.run.executions] });
+  });
+
+  // R9（中断した Run の再開の設計書 4.8 の 2026-10-08 の追補）: この起動の終わり方は、実行の記録の最後の実行の終わり方である（前の実行の
+  // 終わり方ではない）。決めるのは表示用モデルの組み立ての1か所だけで、CLI の結果の行は、この値をカタログで引くだけにする。
+  it('has the end reason of the last execution as lastEndReason, for every end reason (not the one of an earlier execution)', () => {
+    for (const endReason of RUN_EXECUTION_END_REASONS) {
+      const earlier: RunExecutionEndReason =
+        endReason === 'STOPPED_BY_SITE_UNAVAILABLE' ? 'STOPPED_BY_RUNTIME_LIMIT' : 'STOPPED_BY_SITE_UNAVAILABLE';
+      const model = buildReportViewModel(auditRun({
+        executions: [
+          { startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:10:00.000Z', endReason: earlier },
+          { startedAt: '2026-10-02T00:00:00.000Z', finishedAt: '2026-10-02T00:10:00.000Z', endReason },
+        ],
+      }));
+      expect(model.summary.executions.lastEndReason, endReason).toBe(endReason);
+    }
+  });
+
+  it('has the end reason of the only execution as lastEndReason for a Run with one execution', () => {
+    const model = buildReportViewModel(auditRun({
+      executions: [{ startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:10:00.000Z', endReason: 'STOPPED_BY_RUNTIME_LIMIT' }],
+    }));
+    expect(model.summary.executions.lastEndReason).toBe('STOPPED_BY_RUNTIME_LIMIT');
   });
 });
 

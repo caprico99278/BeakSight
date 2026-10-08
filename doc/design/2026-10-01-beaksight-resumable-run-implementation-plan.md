@@ -38,6 +38,7 @@
 | R7e | R7d の後の古い記述（`evidence-types.ts` のコメント、README の headless を勧める理由）を直す | R7d | 完了（2026-10-02） |
 | RR2 | 修正の後の独立レビュー（読み取り専用） | R7a、R7b、R7c | 完了（2026-10-02。承認。Critical 0、Important 0、Minor 5） |
 | R8 | RR2 の Minor（テストの後片付けのプロセス ID、README の1文、保存を読むときの作り直しの確かめと、作り直せない場合のテスト） | RR2 | 未着手 |
+| R9 | CLI の結果に「この起動の終わり方」の1行（設計書 4.8 の 2026-10-08 の追補）。表示用モデルの `RunExecutionsView.lastEndReason`、CLI の行、README | R6 | 完了（2026-10-08。fix-round-1 を含む） |
 | DEF-023 | ページの先読み（speculation rules）を、CLI の Chromium の起動の引数で止める（RR2 の Minor-2。Task 21 の前に直す） | RR2 | 未着手 |
 
 R1 は、L のサブタスクとファイルが重ならないので、L2〜L4 と並行で行ってよい。
@@ -133,3 +134,11 @@ R1 は、L のサブタスクとファイルが重ならないので、L2〜L4 �
 - 設計書 4.9、4.10。指示書: 作業記録置き場の `R7a-brief.md`、`R7b-brief.md`、`R7c-brief.md`。RR の結果は `RR-review-result.md`。
 - R7a と R7b は、変更するファイルが重ならないので並行で行う。R7c は、Run Coordinator の保存の終わり方の型に触れるので、R7b の後に行う。
 - RR2 で、Critical 0件、Important 0件になれば完了とする。
+
+## R9: CLI の終わり方の行（2026-10-08）
+
+**変更するファイル**
+- 変更: `src/report/view-model.ts`（`RunExecutionsView.lastEndReason`）、`src/cli/output.ts`（`runSummaryLines`）、`src/presentation/messages.ts`（行の見出しの文言）、`README.md`（CLI の結果の項目と例）
+- テスト: `tests/unit/cli.test.ts`、表示用モデルの単体テスト、`tests/unit/chatgpt-bundle.test.ts`（`summary.json` の形が変わる分）、必要なら CLI の結合テストの行の順の確かめ
+
+**受け入れ条件**: 終わり方の6つの値のそれぞれで、実行の行の次に `この起動の終わり方: <ラベル>（<コード>）` が1行出る。最後の実行の終わり方を使う（前の実行の終わり方ではない）。サイトの不調の1行と未完了の理由の行の順は変わらない。HTML、`run.json`、保存の形は変わらない。UI Gate が PASS する。

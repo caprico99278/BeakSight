@@ -1,19 +1,58 @@
 import { createServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import type { Browser, BrowserContext, Download, Page } from 'playwright';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
+import type { Browser, BrowserContext, CDPSession, Download, Page } from 'playwright';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { BrowserContextFactory, ContextConstructionError, type BrowserContextFactoryOptions } from '../../src/browser/context-factory.js';
 import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
 import type { LoadMeter } from '../../src/crawl/load-meter.js';
 import { startFixtureServer } from '../../fixtures/server.js';
+import type { EgressProxy, EgressProxyOptions } from '../../src/safety/egress-proxy.js';
+import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import {
+  browserWithoutServiceWorkerRegistrationBlock,
+  launchCliChromium,
+  launchHeadlessChromium,
+  useHeadlessChromium,
+} from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import {
+  openServerWindow,
+  QUIET_PERIOD_MS,
+  readSharedWorkerFixtureState,
+  SERVICE_WORKER_BYPASS_WORKER_PATH,
+  serviceWorkerBypassPath,
+  SHARED_WORKER_DISABLED_FIXTURE_STATE,
+  sharedWorkerPostsPath,
+} from '../helpers/gate-harness.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
-import { createTestConfig } from '../helpers/test-config.js';
+import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+
+/**
+ * 出口の中継（`startEgressProxy`）の差し替えの口（DEF-039・DEF-040 の設計書 2.1.2 の確かめ）。既定では本物の中継を作り、作った中継と
+ * その指定（`onRejected`、`onError`）を `created` に残す。`failWith` を入れると、中継を作らずにその例外を投げる。
+ */
+const egressProxyControl = vi.hoisted(() => ({
+  failWith: null as unknown,
+  created: [] as { readonly proxy: EgressProxy; readonly options: EgressProxyOptions }[],
+}));
+vi.mock('../../src/safety/egress-proxy.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/safety/egress-proxy.js')>();
+  return {
+    ...actual,
+    startEgressProxy: async (options: EgressProxyOptions): Promise<EgressProxy> => {
+      if (egressProxyControl.failWith !== null) {
+        throw egressProxyControl.failWith;
+      }
+      const proxy = await actual.startEgressProxy(options);
+      egressProxyControl.created.push({ proxy, options });
+      return proxy;
+    },
+  };
+});
 
 const viewport: Viewport = { width: 800, height: 600 };
 let browser: Browser;
@@ -23,8 +62,17 @@ function configFor(origin = 'https://example.test'): AuditConfig {
   return createTestConfig(origin, '/', { browser: { locale: 'en-GB', timezone: 'Europe/London' } });
 }
 
-function factoryFor(config = configFor()): BrowserContextFactory {
-  return new BrowserContextFactory(browser, config, () => new SafetyLedger());
+/** 何もしない、偽の Browser の CDP の session（DEF-044 の自己検査の取り付けを通すだけ）。 */
+function fakeBrowserCdpSession(): CDPSession {
+  return {
+    on: vi.fn(),
+    send: vi.fn(async () => ({})),
+    detach: vi.fn(async () => undefined),
+  } as unknown as CDPSession;
+}
+
+function factoryFor(config = configFor(), options: BrowserContextFactoryOptions = {}): BrowserContextFactory {
+  return new BrowserContextFactory(browser, config, () => new SafetyLedger(), { ...TEST_FACTORY_OPTIONS, ...options });
 }
 
 useHeadlessChromium((launched) => {
@@ -38,6 +86,8 @@ afterEach(async () => {
     }
     await context.close().catch(() => undefined);
   }));
+  egressProxyControl.failWith = null;
+  await Promise.all(egressProxyControl.created.splice(0).map(({ proxy }) => proxy.close()));
   vi.restoreAllMocks();
 });
 
@@ -71,6 +121,9 @@ describe('BrowserContextFactory', () => {
     const failedContext = {
       pages: () => [],
       on: vi.fn(),
+      // DEF-040: Guard は、取り付けの先頭で、Worker の中の WebSocket を止める CSP の初期化のスクリプトを Context に付ける（偽の Context では
+      // 何もしない）。route の取り付けの失敗を確かめるテストなので、これより前で失敗させない。
+      addInitScript: vi.fn(async () => undefined),
       routeWebSocket: vi.fn(async () => {
         throw new Error('fixture route installation failure');
       }),
@@ -78,6 +131,8 @@ describe('BrowserContextFactory', () => {
     } as unknown as BrowserContext;
     const failedBrowser = {
       newContext: vi.fn(async () => failedContext),
+      // DEF-044（NP5）: factory は、構築のときに Browser の CDP の session を開き、Shared Worker の自己検査を付ける（偽の session）。
+      newBrowserCDPSession: vi.fn(async () => fakeBrowserCdpSession()),
     } as unknown as Browser;
     const factory = new BrowserContextFactory(failedBrowser, configFor(), () => new SafetyLedger());
 
@@ -565,12 +620,13 @@ describe('BrowserContextFactory', () => {
     it('blocks Service Worker registration in the passive Context', async () => {
       const server = await startFixtureServer();
       const factory = factoryFor(configFor(server.origin));
-      const context = await factory.createPassiveContext(viewport);
-      contexts.push(context);
-      const page = await factory.createPassivePage(context);
       // 対照: 遮断しない Context では、同じページで登録でき、Worker のスクリプトが取得される（テストが空振りしないことの確認）。
+      // DEF-049: factory の自己検査は、同じ Browser のどの Context の Service Worker を見ても、その時点で所有するすべての Context を閉じる
+      // ので、対照は、Guard の付いた Context を作る前に行う。
       const unblockedContext = await browser.newContext({ viewport });
       contexts.push(unblockedContext);
+      let context: BrowserContext | undefined;
+      let page: Page | undefined;
       try {
         const unblockedPage = await unblockedContext.newPage();
         await unblockedPage.goto(`${server.origin}/service-worker.html`);
@@ -584,6 +640,9 @@ describe('BrowserContextFactory', () => {
         await unblockedContext.close();
         server.resetRequestObservations();
 
+        context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        page = await factory.createPassivePage(context);
         await page.goto(`${server.origin}/service-worker.html`);
         // fixture のボタンの処理（`navigator.serviceWorker.register('/fixture-service-worker.js')`）を実行する。
         await page.evaluate(() => {
@@ -728,7 +787,7 @@ describe('BrowserContextFactory', () => {
         browser,
         configFor(server.origin),
         () => new SafetyLedger(),
-        { loadMeter: recording.meter },
+        { ...TEST_FACTORY_OPTIONS, loadMeter: recording.meter },
       );
       const context = await factory.createPassiveContext(viewport);
       contexts.push(context);
@@ -846,11 +905,17 @@ describe('BrowserContextFactory', () => {
       return { factory: new BrowserContextFactory(browser, configFor(origin), () => new SafetyLedger(), { resourceCache: cache }), cache };
     }
 
-    /** `factory` で `role` の Context と page を作り、`url` を読み込んでから閉じる。 */
+    /**
+     * `factory` で `role` の Context と page を作り、`url` を読み込んでから閉じる。`beforeClose` があれば、閉じる前に待つ。
+     * DEF-038: page を個別に閉じず、Context と一緒に閉じるようになったので、読み込みの直後に閉じると、Run 全体のキャッシュに応答の
+     * 本文を入れる処理（`response.body()`）が終わる前に Context が閉じることがある。キャッシュに入ることを前提にする読み込みは、
+     * `beforeClose` でキャッシュに入ったことを待ってから閉じる。
+     */
     async function loadOnce(
       factory: BrowserContextFactory,
       url: string,
       role?: 'PRIMARY' | 'REVISIT',
+      beforeClose?: () => Promise<void>,
     ): Promise<void> {
       const context = await factory.createPassiveContext(viewport, role);
       contexts.push(context);
@@ -858,6 +923,7 @@ describe('BrowserContextFactory', () => {
       try {
         await page.goto(url, { waitUntil: 'load' });
         expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+        await beforeClose?.();
       } finally {
         await closePassiveResources({ factory, context, page });
       }
@@ -870,8 +936,9 @@ describe('BrowserContextFactory', () => {
       const server = await startFixtureServer();
       const { factory, cache } = cachedFactoryFor(server.origin);
       try {
-        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
-        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, undefined, async () => {
+          await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        });
         // 空振りでないこと: 1回目（キャッシュが空）の読み込みでは、画像はサーバに届いた。
         expect(imageRequests(server)).toBe(1);
 
@@ -904,10 +971,11 @@ describe('BrowserContextFactory', () => {
           throw new Error('not used in this test');
         },
       };
-      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { resourceCache: cache, loadMeter });
+      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { ...TEST_FACTORY_OPTIONS, resourceCache: cache, loadMeter });
       try {
-        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
-        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY', async () => {
+          await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        });
         expect(served).toHaveLength(0);
 
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'PRIMARY');
@@ -925,8 +993,9 @@ describe('BrowserContextFactory', () => {
       const server = await startFixtureServer();
       const { factory, cache } = cachedFactoryFor(server.origin);
       try {
-        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`);
-        await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, undefined, async () => {
+          await expect.poll(() => cache.lookup(`${server.origin}${IMAGE_PATH}`)).toBeDefined();
+        });
 
         await loadOnce(factory, `${server.origin}${IMAGE_PAGE}`, 'REVISIT');
         // Interaction の session の Context も、REVISIT である（呼び出し側は役割を渡さない）。
@@ -1076,7 +1145,7 @@ describe('BrowserContextFactory', () => {
         }
       });
       const cache = new ResourceCache({ limits });
-      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { resourceCache: cache });
+      const factory = new BrowserContextFactory(browser, configFor(server.origin), () => new SafetyLedger(), { ...TEST_FACTORY_OPTIONS, resourceCache: cache });
       const context = await factory.createPassiveContext(viewport);
       contexts.push(context);
       const page = await factory.createPassivePage(context);
@@ -1147,5 +1216,443 @@ describe('BrowserContextFactory', () => {
         await server.close();
       }
     });
+  });
+
+  // DEF-039・DEF-040 の設計書 2.1.2: Interaction の Context の出口の中継。
+  describe('egress proxy of the Interaction Context (DEF-039, DEF-040)', () => {
+    /** 直前に作られた中継とその指定。 */
+    const lastEgressProxy = (): { readonly proxy: EgressProxy; readonly options: EgressProxyOptions } => {
+      const last = egressProxyControl.created.at(-1);
+      if (last === undefined) {
+        throw new Error('no egress proxy was created');
+      }
+      return last;
+    };
+
+    it('passes the proxy of a fresh egress proxy to the Interaction Context only, never to the Passive Context', async () => {
+      const newContext = vi.spyOn(browser, 'newContext');
+      const factory = factoryFor();
+
+      const passive = await factory.createPassiveContext(viewport);
+      contexts.push(passive);
+      const session = await factory.createInteractionSession(viewport);
+      contexts.push(session.page.context());
+      try {
+        const { proxy } = lastEgressProxy();
+        expect(newContext).toHaveBeenCalledTimes(2);
+        expect(newContext.mock.calls[0]?.[0]).not.toHaveProperty('proxy');
+        expect(newContext.mock.calls[1]?.[0]).toMatchObject({ proxy: { server: proxy.server } });
+        expect(proxy.server).toBe(`http://127.0.0.1:${proxy.port}`);
+        expect(proxy.state).toBe('OPEN');
+      } finally {
+        await session.close();
+      }
+    });
+
+    it('routes the traffic of the Interaction Context through the proxy and consults the injected upstream policy', async () => {
+      const server = await startFixtureServer();
+      const consulted: [string, number][] = [];
+      try {
+        const factory = factoryFor(configFor(server.origin), {
+          egressUpstreamPolicy: (host, port) => {
+            consulted.push([host, port]);
+            return host === '127.0.0.1';
+          },
+        });
+        const session = await factory.createInteractionSession(viewport);
+        contexts.push(session.page.context());
+        try {
+          const response = await session.page.goto(`${server.origin}/`, { waitUntil: 'load' });
+
+          expect(response?.status()).toBe(200);
+          expect(consulted).toContainEqual(['127.0.0.1', Number(new URL(server.origin).port)]);
+          expect(consulted.every(([host]) => host === '127.0.0.1')).toBe(true);
+          expect(session.ledger.snapshot().blockedInteractionRequests).toEqual([]);
+          expect(session.ledger.snapshot().invariantViolations).toEqual([]);
+        } finally {
+          await session.close();
+        }
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('records an upstream denied by the policy as EGRESS_UPSTREAM_DENIED and the request does not reach the server', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin), { egressUpstreamPolicy: () => false });
+        const session = await factory.createInteractionSession(viewport);
+        contexts.push(session.page.context());
+        try {
+          const response = await session.page.goto(`${server.origin}/`, { waitUntil: 'load' }).catch(() => null);
+
+          expect(response?.status() ?? null).not.toBe(200);
+          expect(server.getCounters().get).toBe(0);
+          expect(session.ledger.snapshot().blockedInteractionRequests).toContainEqual({
+            method: 'GET',
+            url: `${server.origin}/`,
+            reason: 'EGRESS_UPSTREAM_DENIED',
+          });
+        } finally {
+          await session.close();
+        }
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('throws the egress proxy start failure as it is and creates no Context', async () => {
+      const failure = new Error('egress proxy listen failed');
+      egressProxyControl.failWith = failure;
+      const newContext = vi.spyOn(browser, 'newContext');
+      const factory = factoryFor();
+
+      await expect(factory.createInteractionSession(viewport)).rejects.toBe(failure);
+
+      expect(newContext).not.toHaveBeenCalled();
+      expect(browser.contexts()).toEqual([]);
+    });
+
+    it('closes the proxy when the Context or the page cannot be created', async () => {
+      const pageCreationFailure = new Error('fixture interaction page creation failure');
+      const rawNewContext = browser.newContext.bind(browser);
+      vi.spyOn(browser, 'newContext').mockImplementationOnce(async (options) => {
+        const context = await rawNewContext(options);
+        contexts.push(context);
+        vi.spyOn(context, 'newPage').mockRejectedValueOnce(pageCreationFailure);
+        return context;
+      });
+      const factory = factoryFor();
+
+      const failure: unknown = await factory.createInteractionSession(viewport).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ContextConstructionError);
+      expect(lastEgressProxy().proxy.state).toBe('CLOSED');
+    });
+
+    it('freezes the proxy after the Guard freeze, and also when the Guard freeze fails', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin));
+        const session = await factory.createInteractionSession(viewport);
+        contexts.push(session.page.context());
+        const { proxy } = lastEgressProxy();
+        await session.page.goto(`${server.origin}/`, { waitUntil: 'load' });
+        expect(proxy.state).toBe('OPEN');
+
+        await session.activateInteractionFreeze();
+
+        expect(proxy.state).toBe('FROZEN');
+        await session.close();
+        expect(proxy.state).toBe('CLOSED');
+
+        // Guard の凍結の失敗（owner の page が 1 つでない）でも、中継は凍結する。
+        const failing = await factory.createInteractionSession(viewport);
+        contexts.push(failing.page.context());
+        const { proxy: failingProxy } = lastEgressProxy();
+        await failing.page.goto(`${server.origin}/`, { waitUntil: 'load' });
+        await factory.createPassivePage(failing.page.context());
+        await expect(failing.activateInteractionFreeze()).rejects.toThrow(/exactly one current owner page/u);
+        expect(failingProxy.state).toBe('FROZEN');
+        expect(failing.ledger.snapshot().invariantViolations.map((violation) => violation.code))
+          .toContain('INTERACTION_FREEZE_ACTIVATION_FAILED');
+        await expect.poll(() => failing.isClosed()).toBe(true);
+        await failing.close().catch(() => undefined);
+        expect(failingProxy.state).toBe('CLOSED');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('closes the proxy after the Context close even when that close fails, and the retried close still works', async () => {
+      const factory = factoryFor();
+      const session = await factory.createInteractionSession(viewport);
+      const context = session.page.context();
+      contexts.push(context);
+      const { proxy } = lastEgressProxy();
+      const originalClose = context.close.bind(context);
+      let attempts = 0;
+      vi.spyOn(context, 'close').mockImplementation(async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('first retained close failed');
+        await originalClose();
+      });
+
+      await expect(session.close()).rejects.toThrow('first retained close failed');
+
+      expect(proxy.state).toBe('CLOSED');
+      expect(session.isClosed()).toBe(false);
+      // 閉じる処理の失敗の後の再試行は、invalidation を経て CLOSED に達する（設計書 4.1。上の「lifecycle priority」のテストと同じ）。
+      await expect(session.close()).rejects.toThrow('Passive request guard context was invalidated');
+      expect(session.isClosed()).toBe(true);
+      expect(proxy.state).toBe('CLOSED');
+      expect(attempts).toBe(2);
+    });
+
+    it('records EGRESS_PROXY_FAILED and closes the Context when the proxy reports a failure after listening (fail-closed)', async () => {
+      const factory = factoryFor();
+      const session = await factory.createInteractionSession(viewport);
+      const context = session.page.context();
+      contexts.push(context);
+      const { options } = lastEgressProxy();
+
+      options.onError(new Error('egress listener died'));
+
+      expect(session.ledger.snapshot().invariantViolations).toContainEqual({
+        code: 'EGRESS_PROXY_FAILED',
+        message: 'egress listener died',
+      });
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+      expect(session.page.isClosed()).toBe(true);
+      // session の close は、始まっている閉じる処理に合流する。
+      await expect(session.close()).resolves.toBeUndefined();
+      expect(session.isClosed()).toBe(true);
+      expect(lastEgressProxy().proxy.state).toBe('CLOSED');
+      expect(session.ledger.snapshot().invariantViolationCount).toBe(1);
+    });
+  });
+});
+
+/** DEF-044 の自己検査の違反のコード（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 1.2）。 */
+const SHARED_WORKER_OBSERVED_CODE = 'SHARED_WORKER_OBSERVED';
+
+const sharedWorkerViolationsOf = (ledger: SafetyLedger): readonly unknown[] => ledger.snapshot().invariantViolations
+  .filter((violation) => violation.code === SHARED_WORKER_OBSERVED_CODE);
+
+/**
+ * DEF-044（設計書 1.2 の fail-closed の自己検査）: factory は、Browser の CDP の session で target を見張り、Shared Worker の target
+ * （`type === 'shared_worker'`）を見たら、起動の引数が効いていないとみなし、所有するすべての Context の Ledger に違反
+ * `SHARED_WORKER_OBSERVED` を記録して、その Context を閉じる。引数を外した Chromium（テストの明示の選択 `sharedWorkers: 'allow'`）で、
+ * テストの既定の headless shell と CLI の Chromium の両方で確かめる。
+ */
+describe.each([
+  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium({ sharedWorkers: 'allow' }) },
+  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium({ sharedWorkers: 'allow' }) },
+])('DEF-044: the Shared Worker self-check of the factory, with $name launched without the Shared Worker disabling arguments', ({ launch }) => {
+  let allowingBrowser: Browser;
+  let server: Awaited<ReturnType<typeof startFixtureServer>>;
+
+  beforeAll(async () => {
+    server = await startFixtureServer();
+    allowingBrowser = await launch();
+  });
+
+  afterAll(async () => {
+    await allowingBrowser?.close();
+    await server?.close();
+  });
+
+  it('records SHARED_WORKER_OBSERVED in the Ledger of every owned Context and closes them, when a page creates a Shared Worker', async () => {
+    const factory = new BrowserContextFactory(allowingBrowser, configFor(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+    try {
+      const context = await factory.createPassiveContext(viewport);
+      const page = await factory.createPassivePage(context);
+      const idle = await factory.createPassiveContext(viewport);
+      const session = await factory.createInteractionSession(viewport);
+
+      // Context が閉じると、読み込みは失敗しうる（閉じたことは下で確かめる）。
+      await page.goto(`${server.origin}${sharedWorkerPostsPath('fetch')}`, { waitUntil: 'load' }).catch(() => undefined);
+
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+      await expect.poll(() => isPassiveRequestGuardClosed(idle)).toBe(true);
+      await expect.poll(() => session.isClosed()).toBe(true);
+      for (const ledger of [factory.getSafetyLedger(context), factory.getSafetyLedger(idle), session.ledger]) {
+        expect(sharedWorkerViolationsOf(ledger)).toHaveLength(1);
+      }
+      expect(page.isClosed()).toBe(true);
+      expect(session.page.isClosed()).toBe(true);
+      // 持ち主の閉じる処理は、始まっている閉じる処理に合流する（失敗しない）。
+      await expect(factory.closePassiveContext(context)).resolves.toBeUndefined();
+      await expect(factory.closePassiveContext(idle)).resolves.toBeUndefined();
+      await expect(session.close()).resolves.toBeUndefined();
+    } finally {
+      await factory.close();
+    }
+  });
+});
+
+describe('DEF-044: the Shared Worker self-check of the factory, with the Shared Worker disabling arguments (test default)', () => {
+  let server: Awaited<ReturnType<typeof startFixtureServer>>;
+
+  beforeAll(async () => {
+    server = await startFixtureServer();
+  });
+
+  afterAll(async () => {
+    await server?.close();
+  });
+
+  it('records nothing and keeps the Context open: the page cannot create a Shared Worker', async () => {
+    const factory = factoryFor(configFor(server.origin));
+    try {
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const page = await factory.createPassivePage(context);
+
+      await page.goto(`${server.origin}${sharedWorkerPostsPath('fetch')}`, { waitUntil: 'load' });
+      await expect.poll(() => readSharedWorkerFixtureState(page)).toEqual(SHARED_WORKER_DISABLED_FIXTURE_STATE);
+      await wait(QUIET_PERIOD_MS);
+
+      expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
+      await closePassiveResources({ factory, context, page });
+    } finally {
+      await factory.close();
+    }
+  });
+});
+
+describe('DEF-044: the Browser CDP session of the factory', () => {
+  it('throws the failure to open the Browser session as it is from the first Context creation, without creating a Context (no Run starts)', async () => {
+    const failure = new Error('fixture browser session failure');
+    const newContext = vi.fn();
+    const failingBrowser = {
+      newContext,
+      newBrowserCDPSession: vi.fn(async () => {
+        throw failure;
+      }),
+    } as unknown as Browser;
+    const factory = new BrowserContextFactory(failingBrowser, configFor(), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+
+    await expect(factory.createPassiveContext(viewport)).rejects.toBe(failure);
+    await expect(factory.createInteractionSession(viewport)).rejects.toBe(failure);
+    expect(newContext).not.toHaveBeenCalled();
+    expect(egressProxyControl.created.every(({ proxy }) => proxy.state === 'CLOSED')).toBe(true);
+    await expect(factory.close()).resolves.toBeUndefined();
+  });
+
+  it('throws the failure of Target.setDiscoverTargets as it is, and detaches the session', async () => {
+    const failure = new Error('fixture discover failure');
+    const session = fakeBrowserCdpSession();
+    vi.mocked(session.send).mockRejectedValue(failure);
+    const newContext = vi.fn();
+    const failingBrowser = { newContext, newBrowserCDPSession: vi.fn(async () => session) } as unknown as Browser;
+    const factory = new BrowserContextFactory(failingBrowser, configFor(), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+
+    await expect(factory.createPassiveContext(viewport)).rejects.toBe(failure);
+    expect(newContext).not.toHaveBeenCalled();
+    expect(session.detach).toHaveBeenCalledOnce();
+  });
+
+  it('watches the targets before any Context: listens to Target.targetCreated, then sends Target.setDiscoverTargets', async () => {
+    const session = fakeBrowserCdpSession();
+    const fakeBrowser = { newBrowserCDPSession: vi.fn(async () => session) } as unknown as Browser;
+    const factory = new BrowserContextFactory(fakeBrowser, configFor(), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+    await factory.close();
+
+    expect(session.on).toHaveBeenCalledWith('Target.targetCreated', expect.any(Function));
+    expect(session.send).toHaveBeenCalledWith('Target.setDiscoverTargets', { discover: true });
+    const listenedAt = vi.mocked(session.on).mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY;
+    const discoveredAt = vi.mocked(session.send).mock.invocationCallOrder[0] ?? Number.NEGATIVE_INFINITY;
+    expect(listenedAt).toBeLessThan(discoveredAt);
+  });
+
+  it('close() detaches the Browser session, can be called again, does not throw a detach failure, and no Context is created after it', async () => {
+    const session = fakeBrowserCdpSession();
+    vi.mocked(session.detach).mockRejectedValueOnce(new Error('fixture detach failure'));
+    const newContext = vi.fn();
+    const fakeBrowser = { newContext, newBrowserCDPSession: vi.fn(async () => session) } as unknown as Browser;
+    const factory = new BrowserContextFactory(fakeBrowser, configFor(), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+
+    await expect(factory.close()).resolves.toBeUndefined();
+    await expect(factory.close()).resolves.toBeUndefined();
+    expect(session.detach).toHaveBeenCalled();
+    await expect(factory.createPassiveContext(viewport)).rejects.toThrow(/closed/i);
+    expect(newContext).not.toHaveBeenCalled();
+  });
+});
+
+/** DEF-049 の自己検査の違反のコード（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 5 と変更履歴の NP6 の Blocker の行）。 */
+const SERVICE_WORKER_OBSERVED_CODE = 'SERVICE_WORKER_OBSERVED';
+
+const serviceWorkerViolationsOf = (ledger: SafetyLedger): readonly unknown[] => ledger.snapshot().invariantViolations
+  .filter((violation) => violation.code === SERVICE_WORKER_OBSERVED_CODE);
+
+/**
+ * DEF-049（fail-closed の自己検査）: factory は、Browser の CDP の session の auto-attach（`service_worker`）で Service Worker の target を
+ * 見たら、Guard の初期化のスクリプト（登録の入口を塞ぐ主な防御）が効いていないとみなし、所有するすべての Context の Ledger に違反
+ * `SERVICE_WORKER_OBSERVED` を記録して、その Context を直ちに閉じる。入口を塞ぐスクリプトだけを付けない Browser の Proxy（テストの明示の
+ * 選択 `browserWithoutServiceWorkerRegistrationBlock`）で、テストの既定の headless shell と CLI の Chromium の両方で確かめる。
+ * Playwright が Service Worker の target を再開させるので、止める保証はない（競争）。届いた要求の数は記録するが、条件にしない。
+ */
+describe.each([
+  { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
+  { name: 'the CLI Chromium', launch: (): Promise<Browser> => launchCliChromium() },
+])('DEF-049: the Service Worker self-check of the factory, with $name and without the registration block script', ({ name, launch }) => {
+  let realBrowser: Browser;
+  let server: Awaited<ReturnType<typeof startFixtureServer>>;
+
+  beforeAll(async () => {
+    server = await startFixtureServer();
+    realBrowser = await launch();
+  });
+
+  afterAll(async () => {
+    await realBrowser?.close();
+    await server?.close();
+  });
+
+  it('records SERVICE_WORKER_OBSERVED in the Ledger of every owned Context and closes them, when a page registers a Service Worker', async () => {
+    const unblocked = browserWithoutServiceWorkerRegistrationBlock(realBrowser);
+    const factory = new BrowserContextFactory(unblocked, configFor(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+    const window = openServerWindow(server);
+    try {
+      const context = await factory.createPassiveContext(viewport);
+      const page = await factory.createPassivePage(context);
+      const idle = await factory.createPassiveContext(viewport);
+      const session = await factory.createInteractionSession(viewport);
+
+      // Context が閉じると、読み込みは失敗しうる（閉じたことは下で確かめる）。
+      await page.goto(`${server.origin}${serviceWorkerBypassPath('prototype', 'top')}`, { waitUntil: 'load' }).catch(() => undefined);
+
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+      await expect.poll(() => isPassiveRequestGuardClosed(idle)).toBe(true);
+      await expect.poll(() => session.isClosed()).toBe(true);
+      for (const ledger of [factory.getSafetyLedger(context), factory.getSafetyLedger(idle), session.ledger]) {
+        expect(serviceWorkerViolationsOf(ledger)).toHaveLength(1);
+      }
+      expect(page.isClosed()).toBe(true);
+      expect(session.page.isClosed()).toBe(true);
+      // 持ち主の閉じる処理は、始まっている閉じる処理に合流する（失敗しない）。
+      await expect(factory.closePassiveContext(context)).resolves.toBeUndefined();
+      await expect(factory.closePassiveContext(idle)).resolves.toBeUndefined();
+      await expect(session.close()).resolves.toBeUndefined();
+      await wait(QUIET_PERIOD_MS);
+      // 届いた要求の数は記録する（条件にしない。設計書の変更履歴の NP6 の Blocker の行）。
+      console.info(`DEF-049 self-check ${name}: ${JSON.stringify({
+        workerScriptGets: window.count('GET', SERVICE_WORKER_BYPASS_WORKER_PATH),
+        mutationPosts: window.count('POST', '/__mutation'),
+      })}`);
+    } finally {
+      await factory.close();
+    }
+  });
+});
+
+describe('DEF-049: the Service Worker auto-attach of the Browser CDP session of the factory', () => {
+  it('listens to Target.attachedToTarget, then sends Target.setAutoAttach for service_worker targets, waiting for the debugger and flattened', async () => {
+    const session = fakeBrowserCdpSession();
+    const fakeBrowser = { newBrowserCDPSession: vi.fn(async () => session) } as unknown as Browser;
+    const factory = new BrowserContextFactory(fakeBrowser, configFor(), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+    await factory.close();
+
+    expect(session.on).toHaveBeenCalledWith('Target.attachedToTarget', expect.any(Function));
+    expect(session.send).toHaveBeenCalledWith('Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+      flatten: true,
+      filter: [{ type: 'service_worker', exclude: false }],
+    });
+    const onCalls = vi.mocked(session.on).mock.calls;
+    const listenedAt = vi.mocked(session.on).mock.invocationCallOrder[
+      onCalls.findIndex(([event]) => String(event) === 'Target.attachedToTarget')
+    ] ?? Number.POSITIVE_INFINITY;
+    const sendCalls = vi.mocked(session.send).mock.calls;
+    const attachedAt = vi.mocked(session.send).mock.invocationCallOrder[
+      sendCalls.findIndex(([method]) => method === 'Target.setAutoAttach')
+    ] ?? Number.NEGATIVE_INFINITY;
+    expect(listenedAt).toBeLessThan(attachedAt);
+    // 再開の命令は送らない（Service Worker の target を、こちらから動かさない）。
+    expect(sendCalls.map(([method]) => method)).not.toContain('Runtime.runIfWaitingForDebugger');
   });
 });

@@ -322,7 +322,7 @@ async function checkPassiveGuard(
       return failedWithCloseFailures(opened.error, opened.closeFailures);
   }
 
-  const closeFailures = await closePassivePageAndContext(factory, context, page, deadlines);
+  const closeFailures = await closePassivePageAndContext(factory, context, deadlines);
   if (!result.passed) {
     // すでに失敗が決まっている場合も、閉じる処理の失敗を、その失敗のメッセージに加える（RP18r の Minor-1）。
     return failedWithCloseFailures(result.failure, closeFailures);

@@ -528,6 +528,11 @@ export const CLI_TEXT = deepFreeze({
     executions: '実行',
     /** 実行の記録の行の、再開の回数の短い名前（HTML レポートの名前は `HTML_REPORT_TEXT.summary.executions.resumeCount`）。 */
     resumes: '再開',
+    /**
+     * 結果の、この起動の終わり方の行（例: `この起動の終わり方: 実行時間の上限で停止（STOPPED_BY_RUNTIME_LIMIT）`。中断した Run の再開の
+     * 設計書 4.8 の 2026-10-08 の追補。R9）の名前。ラベルは表示カタログ `RUN_EXECUTION_END_REASON_CATALOG` のもの。
+     */
+    lastEndReason: 'この起動の終わり方',
   },
   /**
    * 実行中の進み具合の行（サイトへの負荷の制御の設計書 4.8）の、CLI だけで使う文言。発見したページは `RUN_SUMMARY_TEXT.coverage.discovered`、

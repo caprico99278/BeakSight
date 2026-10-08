@@ -5,16 +5,24 @@
 // 任せることも、Run Coordinator を差し替える口（`createRunCoordinator`）で確かめる。
 // R5a（中断した Run の再開の設計書 4.7、4.7.1）: 偽の Run Coordinator は、保存の終わり方（`checkpointConclusion()`）も返す。`run` が、保存の
 // セッションと止める印を Run Coordinator に渡すことと、本番の Browser の起動が Playwright の既定のシグナルの処理を止めることも確かめる。
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { unzipSync } from 'fflate';
 import { chromium, type Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { CHROMIUM_PRELOADING_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
+import { CHROMIUM_PRELOADING_DISABLED_ARGS, CHROMIUM_SHARED_WORKERS_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { runNoticeLines } from '../../src/cli/output.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
-import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
+import {
+  LEGACY_BUNDLE_FILE_NAME,
+  RUN_ARTIFACT_FILE_NAMES,
+  artifactFilePath,
+  bundleFileName,
+  isBundleFileName,
+  runArtifactDirectory,
+} from '../../src/core/artifact-layout.js';
 import type { PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
@@ -39,6 +47,10 @@ beforeAll(async () => {
 afterAll(async () => {
   await rm(workDirectory, { recursive: true, force: true });
 });
+
+/** Run の最後の実行の終わりの時刻から作った、ChatGPT 用バンドルの名前（BN1。バンドルのファイル名の設計書 2.1）。 */
+const lastBundleFileName = (run: Pick<RunSummary, 'executions'>): string =>
+  bundleFileName(run.executions[run.executions.length - 1]?.finishedAt ?? '');
 
 /** `auditRun()` の既定のページに、page のスキーマにない項目を加えた Run。`run.runStatus` と `statusInput` は、COMPLETE のまま。 */
 function schemaInvalidRun() {
@@ -79,10 +91,50 @@ describe('finishAuditRun: the exit code comes from the Run Status after the sche
 
     expect(code).toBe(EXIT_CODES.COMPLETE);
     const runDirectory = runArtifactDirectory(outputDirectory, result.run.runId);
-    for (const file of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
+    for (const file of [...Object.values(RUN_ARTIFACT_FILE_NAMES), lastBundleFileName(result.run)]) {
       await expect(readFile(join(runDirectory, file))).resolves.toBeInstanceOf(Buffer);
     }
     expect(stdout.text()).toContain(labelWithCodeText(RUN_STATUS_CATALOG.COMPLETE.label, 'COMPLETE'));
+  });
+});
+
+// BN1（バンドルのファイル名の設計書 2.2、4）: Run の後、Run のディレクトリには、最後の実行の終わりの時刻の名前のバンドルが1つだけある。
+// 中断した Run を再開して書き出した後も1つだけで、名前は、再開した実行の終わりの時刻になる（前の回のバンドルと、前の形の名前のバンドルは消える）。
+describe('finishAuditRun: only the newest bundle is left in the run directory (bundle file name design 2.2)', () => {
+  const bundlesIn = async (runDirectory: string): Promise<readonly string[]> => (await readdir(runDirectory)).filter(isBundleFileName);
+
+  it('leaves one bundle named with the end of the execution after a Run, and one named with the end of the resumed execution after a resume', async () => {
+    const outputDirectory = join(workDirectory, 'bundle-name');
+    const first = auditRun();
+    const [firstExecution] = first.run.executions;
+    const resumed = auditRun({
+      run: {
+        executions: [
+          { ...firstExecution, endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
+          { startedAt: '2026-10-08T03:00:00.000Z', finishedAt: '2026-10-08T03:09:30.000Z', endReason: 'COMPLETED' },
+        ],
+        finishedAt: '2026-10-08T03:09:30.000Z',
+      },
+    });
+    const runDirectory = runArtifactDirectory(outputDirectory, first.run.runId);
+
+    // 最初の実行。前の形の名前のバンドル（この変更の前の版が書いたもの）が残っている Run のディレクトリに書く。
+    await mkdir(runDirectory, { recursive: true });
+    await writeFile(join(runDirectory, LEGACY_BUNDLE_FILE_NAME), 'earlier form', 'utf8');
+    const firstStdout = captureCliOutput();
+    await finishAuditRun(first, outputDirectory, firstStdout.output);
+
+    expect(await bundlesIn(runDirectory)).toEqual([lastBundleFileName(first.run)]);
+    expect(firstStdout.text()).toContain(artifactFilePath(runDirectory, lastBundleFileName(first.run)));
+
+    // 再開した実行。
+    const resumedStdout = captureCliOutput();
+    await finishAuditRun(resumed, outputDirectory, resumedStdout.output);
+
+    expect(await bundlesIn(runDirectory)).toEqual(['beaksight-audit-bundle_20261008030930.zip']);
+    expect(lastBundleFileName(resumed.run)).toBe('beaksight-audit-bundle_20261008030930.zip');
+    expect(resumedStdout.text()).toContain(artifactFilePath(runDirectory, 'beaksight-audit-bundle_20261008030930.zip'));
+    expect(unzipSync(new Uint8Array(await readFile(join(runDirectory, 'beaksight-audit-bundle_20261008030930.zip'))))).toHaveProperty(['run.json']);
   });
 });
 
@@ -126,7 +178,7 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
     const runDirectory = runArtifactDirectory(outputDirectory, result.run.runId);
     const run = JSON.parse(await readFile(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run), 'utf8')) as RunSummary;
     expect(run.runStatus).toBe('PARTIAL');
-    for (const file of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
+    for (const file of [...Object.values(RUN_ARTIFACT_FILE_NAMES), lastBundleFileName(run)]) {
       await expect(readFile(join(runDirectory, file))).resolves.toBeInstanceOf(Buffer);
     }
     expect(stdout.text()).toContain(labelWithCodeText(RUN_STATUS_CATALOG.PARTIAL.label, 'PARTIAL'));
@@ -206,12 +258,14 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 // プログラムなので、Windows では、1回目の Ctrl+C の CTRL_C_EVENT を受けて終わってしまうためである。
 // DEF-023（サイトへの負荷の制御の設計書 4.9）: ページの先読みを止める起動の引数（`CHROMIUM_PRELOADING_DISABLED_ARGS`）も渡す。値は
 // `src/browser/chromium-launch.ts` の1か所にあり、先読みが止まることは tests/integration/preloading-disabled.test.ts で確かめる。
+// DEF-044（NP5）: Shared Worker を無効にする起動の引数（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`）も渡す。効くことは、
+// tests/integration/safety-gates.test.ts の GATE-S01 の Shared Worker の場面で確かめる。
 describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading and disable Shared Workers, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
     const browser = { marker: 'the fake browser' } as unknown as Browser;
     const launch = vi.spyOn(chromium, 'launch').mockResolvedValue(browser);
 
@@ -221,7 +275,7 @@ describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwrigh
     expect(launch).toHaveBeenCalledWith({
       headless,
       channel: 'chromium',
-      args: [...CHROMIUM_PRELOADING_DISABLED_ARGS],
+      args: [...CHROMIUM_PRELOADING_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS],
       handleSIGINT: false,
       handleSIGTERM: false,
       handleSIGHUP: false,
