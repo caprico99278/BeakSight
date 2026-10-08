@@ -628,7 +628,10 @@ describe('renderHtmlReport: the executions in the summary (R6)', () => {
     const { executions } = viewModel.summary;
     const altered: ReportViewModel = {
       ...viewModel,
-      summary: { ...viewModel.summary, executions: { count: 9, resumeCount: 4, items: [executions.items[0]] } },
+      summary: {
+        ...viewModel.summary,
+        executions: { count: 9, resumeCount: 4, lastEndReason: executions.lastEndReason, items: [executions.items[0]] },
+      },
     };
     const part = executionsPart(renderHtmlReport(altered));
     expect(part).toContain(keyValue(text.executions.count, escapeHtml(formatTimes(9))));

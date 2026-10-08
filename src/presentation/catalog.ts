@@ -329,7 +329,9 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     label: '遮断した WebSocket',
     order: 3,
     tone: 'shield',
-    description: 'WebSocket の接続を、遮断しました。',
+    // DEF-040（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
+    description:
+      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。',
   },
   blockedExternalActions: {
     label: '実行しなかった外部への作用',
@@ -347,7 +349,10 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     label: '操作中に遮断したリクエスト',
     order: 6,
     tone: 'shield',
-    description: 'Interaction の操作の間に、ページが起こしたリクエストを遮断しました。',
+    // DEF-039（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。M3（NPR2）: 中継の記録に
+    // Chromium 自身の通信が含まれうることも示す。
+    description:
+      'Interaction の操作の間に、ページが起こしたリクエストを遮断しました。理由が INTERACTION_FROZEN の記録は、通信を止めた後に Guard が止めたものです。理由が INTERACTION_FROZEN_EGRESS の記録は、通信を止めた後に、Interaction の環境の通信を通す BeakSight の中継（127.0.0.1 の proxy）が拒んだものです。Guard を通らずに出た要求の証拠で、CONNECT の記録の URL は host:port の形です。理由が EGRESS_UPSTREAM_DENIED の記録は、中継の上流の方針で拒んだものです（通常は出ません）。中継の記録には、ページの通信のほかに、Chromium 自身の通信（例: Google への接続）も含まれることがあります。',
   },
   blockedInteractionNavigations: {
     label: '操作中に遮断したナビゲーション',
@@ -371,7 +376,9 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     label: '操作中に遮断した WebSocket',
     order: 10,
     tone: 'shield',
-    description: 'Interaction の操作の間に、ページが起こした WebSocket の接続を遮断しました。',
+    // DEF-040（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
+    description:
+      'Interaction の操作の間に、ページが起こした WebSocket の接続を遮断しました。理由が INTERACTION_FROZEN の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。',
   },
   externalSchemeNavigations: {
     label: '外部スキームへの移動の試み',

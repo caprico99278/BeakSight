@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Fixture Worker Connect Policy Controls</title>
+    <script src="/external-script.js"></script>
+  </head>
+  <body>
+    <p>Performs the connections that the Worker connect policy (DEF-040) must not change: fetch, XHR, EventSource, img, script, ping, beacon, data: and blob: fetch, and a fetch from inside a Worker.</p>
+    <a id="ping-link" href="#pinged" ping="/__mutation">ping</a>
+    <script>
+      // DEF-040（NP3）の対照: Guard が文書と Worker の script に加える CSP（connect-src http: https: data: blob:）が、WebSocket 以外の
+      // 接続を変えないことを確かめるための、読み込みのとき（クリックなし）の接続。
+      // - 同じサーバへの GET（fetch、XHR、EventSource、img、script、Worker の中の fetch）は、届く。
+      // - POST（sendBeacon、a 要素の ping）は、今までどおり Guard が止める（CSP ではない）。
+      // - data: と blob: への fetch は、成功する（結果を html 要素の data-* に残す）。
+      const root = document.documentElement.dataset;
+      fetch('/short-content.html').then(() => { root.fetchGet = 'done'; }, () => { root.fetchGet = 'failed'; });
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/robots.txt');
+      xhr.addEventListener('loadend', () => { root.xhrGet = 'done'; });
+      xhr.send();
+      const source = new EventSource('/sitemap.xml');
+      source.addEventListener('error', () => { source.close(); root.eventSource = 'done'; });
+      const image = new Image();
+      image.addEventListener('load', () => { root.image = 'done'; });
+      image.addEventListener('error', () => { root.image = 'failed'; });
+      image.src = '/unsized-image.svg';
+      root.script = globalThis.fixtureExternalScriptLoaded === true ? 'done' : 'failed';
+      fetch('data:text/plain,ok').then((response) => response.text()).then((text) => { root.dataFetch = text; }, () => { root.dataFetch = 'failed'; });
+      fetch(URL.createObjectURL(new Blob(['ok'], { type: 'text/plain' }))).then((response) => response.text())
+        .then((text) => { root.blobFetch = text; }, () => { root.blobFetch = 'failed'; });
+      // blob の Worker の中では、相対の URL は blob: を基準に解決できないので、Origin から組み立てる。
+      const workerScript = "fetch(self.location.origin + '/resource-item.css').then(() => postMessage('done'), () => postMessage('failed'));";
+      const worker = new Worker(URL.createObjectURL(new Blob([workerScript], { type: 'text/javascript' })));
+      worker.addEventListener('message', (event) => { root.workerFetch = String(event.data); });
+      worker.addEventListener('error', () => { root.workerFetch = 'error'; });
+      root.beacon = navigator.sendBeacon('/__mutation', 'beacon') ? 'queued' : 'rejected';
+      document.getElementById('ping-link').click();
+      root.ping = 'clicked';
+    </script>
+  </body>
+</html>

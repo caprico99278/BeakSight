@@ -1,5 +1,5 @@
 // U16d（Task 14〜17 の設計書 6.1.2、6.1.8、6.1.9。上位の設計書 第19章）: 表示用モデルから、ChatGPT 用バンドル
-// （`beaksight-audit-bundle.zip`）の中身を作る。ファイルは書かない。ZIP の中身とパスは決定論的で、生のレスポンス本文を含まず、
+// （`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。名前はバンドルのファイル名の設計書 2.1）の中身を作る。ファイルは書かない。ZIP の中身とパスは決定論的で、生のレスポンス本文を含まず、
 // `evidence-index.json` から一次証跡（`page.json` と JSON Pointer）へたどれる。
 // R16f（設計書 6.1.11）: 各ページの `page.json` を ZIP に入れ、ZIP だけで一次証跡へたどれるようにする。スクリーンショットの
 // 合計の大きさに上限（`CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES`）を設ける。
@@ -472,7 +472,7 @@ describe('createChatGptBundle', () => {
     const entries = unzipSync(await bundleOf(result));
     const summary = jsonOf(entries, 'summary.json') as { readonly executions?: unknown };
 
-    expect(summary.executions).toEqual({ count: 3, resumeCount: 2, items: executionsDisplaySample() });
+    expect(summary.executions).toEqual({ count: 3, resumeCount: 2, lastEndReason: 'COMPLETED', items: executionsDisplaySample() });
     expect(summary.executions).toEqual(JSON.parse(JSON.stringify(model.summary.executions)));
     const text = decodeUtf8(entries['summary.json'] ?? new Uint8Array());
     for (const spec of Object.values<DisplaySpec>(RUN_EXECUTION_END_REASON_CATALOG)) {
@@ -485,7 +485,29 @@ describe('createChatGptBundle', () => {
     const entries = unzipSync(await bundleOf(result));
     const summary = jsonOf(entries, 'summary.json') as { readonly executions?: unknown };
 
-    expect(summary.executions).toEqual({ count: 1, resumeCount: 0, items: JSON.parse(JSON.stringify(result.run.executions)) });
+    expect(summary.executions).toEqual({
+      count: 1,
+      resumeCount: 0,
+      lastEndReason: 'COMPLETED',
+      items: JSON.parse(JSON.stringify(result.run.executions)),
+    });
+  });
+
+  // R9（中断した Run の再開の設計書 4.8 の 2026-10-08 の追補）: この起動の終わり方（最後の実行の終わり方）は、`summary.json` の
+  // `executions` の中に、コードのまま入る（日本語のラベルは入れない）。
+  it('puts the end reason of the last execution as a code in the executions of summary.json, without the label', async () => {
+    const base = edgeCaseAuditRun();
+    const executions: AuditRunResult['run']['executions'] = [
+      ...executionsDisplaySample(),
+      { startedAt: '2026-10-03T00:00:00.000Z', finishedAt: '2026-10-03T00:10:00.000Z', endReason: 'STOPPED_BY_SIGNAL' },
+    ];
+    const result: AuditRunResult = { ...base, run: { ...base.run, executions } };
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly executions?: { readonly lastEndReason?: unknown } };
+
+    expect(summary.executions?.lastEndReason).toBe('STOPPED_BY_SIGNAL');
+    const text = decodeUtf8(entries['summary.json'] ?? new Uint8Array());
+    expect(text).not.toContain(RUN_EXECUTION_END_REASON_CATALOG.STOPPED_BY_SIGNAL.label);
   });
 
   it('writes JSON with two-space indentation and a trailing LF, keeping codes and leaving out Japanese labels', async () => {

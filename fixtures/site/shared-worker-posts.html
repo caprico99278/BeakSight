@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Shared Worker Posts</title></head>
+  <body>
+    <h1>Fixture Shared Worker Posts</h1>
+    <p>While it loads (no click), this page starts a Shared Worker that sends a POST request to /__mutation. The kind of POST is chosen by the query <code>kind</code>.</p>
+    <script>
+      // DEF-044: 読み込みのとき（クリックなし）に、blob の script の Shared Worker を作り、その中から同じ Origin の /__mutation へ POST を送る。
+      // POST の種類はクエリ `kind` で選ぶ:
+      // - fetch: `fetch` の POST
+      // - xhr: `XMLHttpRequest` の POST
+      // - keepalive: keepalive の `fetch` の POST
+      // html 要素に、次の 2 つを残す:
+      // - data-shared-worker-type: `typeof SharedWorker` の値（Shared Worker を無効にした Chromium では `undefined`）
+      // - data-shared-worker: 始めた結果（started、unavailable（Shared Worker がない）、failed、unknown-kind）
+      const kind = new URLSearchParams(location.search).get('kind');
+      const posts = {
+        fetch: "fetch(origin + '/__mutation', { method: 'POST', body: 'fixture' }).catch(() => undefined);",
+        xhr: "const request = new XMLHttpRequest(); request.open('POST', origin + '/__mutation'); request.send('fixture');",
+        keepalive: "fetch(origin + '/__mutation', { method: 'POST', body: 'fixture', keepalive: true }).catch(() => undefined);",
+      };
+      document.documentElement.dataset.sharedWorkerType = typeof SharedWorker;
+      const post = posts[kind];
+      if (post === undefined) {
+        document.documentElement.dataset.sharedWorker = 'unknown-kind';
+      } else if (typeof SharedWorker === 'undefined') {
+        document.documentElement.dataset.sharedWorker = 'unavailable';
+      } else {
+        try {
+          const body = 'onconnect = (event) => { const port = event.ports[0]; port.onmessage = (message) => { const origin = message.data; '
+            + post + ' }; };';
+          const worker = new SharedWorker(URL.createObjectURL(new Blob([body], { type: 'text/javascript' })));
+          worker.addEventListener('error', () => undefined);
+          worker.port.start();
+          worker.port.postMessage(location.origin);
+          document.documentElement.dataset.sharedWorker = 'started';
+        } catch {
+          document.documentElement.dataset.sharedWorker = 'failed';
+        }
+      }
+    </script>
+  </body>
+</html>

@@ -6,10 +6,7 @@ import { BrowserContextFactory, ContextConstructionError } from '../../src/brows
 import { ResourceCache } from '../../src/browser/resource-delivery.js';
 import type { Viewport } from '../../src/config/types.js';
 import { collectStressLayout } from '../../src/evidence/layout-collector.js';
-import {
-  PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE,
-  PassiveContextCloseDeadlineError,
-} from '../../src/orchestration/passive-session-close.js';
+import { PassiveContextCloseDeadlineError } from '../../src/orchestration/passive-session-close.js';
 import { PassiveSessionOpenDeadlineError } from '../../src/orchestration/passive-session-open.js';
 import { createStressSessionFactory } from '../../src/orchestration/stress-session.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
@@ -20,10 +17,6 @@ import { createTestConfig } from '../helpers/test-config.js';
 
 const STRESS_DEADLINE_MS = 60_000;
 const STRESS_VIEWPORT: Viewport = Object.freeze({ width: 320, height: 800 });
-/** 期限を過ぎてから戻るまでの余裕。 */
-const CLOSE_MARGIN_MS = 5_000;
-/** タイマーが少し早く発火する場合の許容。 */
-const TIMER_TOLERANCE_MS = 50;
 /** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`PAGE_CLOSE_TIMEOUT_MS` など）を待たない。 */
 const INJECTED_TIMEOUT_MS = 200;
 /** 期限のテストの上限。期限を守らない（既定の期限を待つか、止まり続ける）場合は、この時間で失敗する。 */
@@ -246,20 +239,22 @@ describe('createStressSessionFactory with a real browser', () => {
 });
 
 describe('createStressSessionFactory close and construction failures', () => {
-  it('rethrows a page close failure after still closing the Context', async () => {
+  // DEF-038（決まりの変更。以前は、page を閉じる処理の失敗を、Context を閉じた後に投げ直すことを確かめていた）: page は個別に
+  // 閉じず、Context と一緒に閉じる。page を閉じる処理は呼ばないので、それが失敗する場合も、close() は成功する。
+  it('closes only the Context, without closing the page by itself, even when the page close would fail (DEF-038)', async () => {
     const calls: FakeFactoryCalls = { events: [] };
     const closePageError = new Error('page close failed');
     const stress = createStressSessionFactory(fakeFactory(calls, { closePageError }));
 
     const session = await stress.createSession(STRESS_VIEWPORT);
-    await expect(session.close()).rejects.toBe(closePageError);
+    await expect(session.close()).resolves.toBeUndefined();
 
-    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closePage', 'closeContext']);
+    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closeContext']);
   });
 
-  // DEF-006: page を閉じる処理が終わらない場合は、期限（`PAGE_CLOSE_TIMEOUT_MS`）で見切り、Context を閉じてから、期限切れの失敗を投げる。
-  // 期限は注入する（R15r-4。実際の 5 秒を待たない）。
-  it('throws the page close deadline failure after closing the Context when the page close does not finish', async () => {
+  // DEF-038（決まりの変更。以前は DEF-006: page を閉じる処理が終わらない場合は、期限で見切り、Context を閉じてから、期限切れの失敗を
+  // 投げることを確かめていた）: page を閉じる処理を呼ばないので、それが止まる場合も待たずに、Context を閉じて成功する。
+  it('does not wait for a page close that would not finish, and closes the Context (DEF-038)', async () => {
     const calls: FakeFactoryCalls = { events: [] };
     const stress = createStressSessionFactory(fakeFactory(calls, { closePageHangs: true }), {
       deadlines: { pageCloseTimeoutMs: INJECTED_TIMEOUT_MS },
@@ -267,13 +262,12 @@ describe('createStressSessionFactory close and construction failures', () => {
 
     const session = await stress.createSession(STRESS_VIEWPORT);
     const startedAt = performance.now();
-    await expect(session.close()).rejects.toThrow(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
+    await expect(session.close()).resolves.toBeUndefined();
     const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(INJECTED_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(INJECTED_TIMEOUT_MS + CLOSE_MARGIN_MS);
-    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closePage', 'closeContext']);
-  }, INJECTED_TIMEOUT_MS + CLOSE_MARGIN_MS + 10_000);
+    expect(elapsedMs).toBeLessThan(INJECTED_TIMEOUT_MS);
+    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closeContext']);
+  }, DEADLINE_TEST_TIMEOUT_MS);
 
   // DEF-008（Task 18 の前の整理の設計書 4.4）: 作成か終了が終わらない場合も、期限の中で失敗を投げる（今の失敗の扱いと同じく、
   // 幅の走査の collector は、その幅を未完了にする）。
@@ -290,7 +284,8 @@ describe('createStressSessionFactory close and construction failures', () => {
 
     expect(rejection).toBeInstanceOf(PassiveContextCloseDeadlineError);
     expect(elapsedMs).toBeLessThan(INJECTED_TIMEOUT_MS + FAKE_RETURN_MARGIN_MS);
-    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closePage', 'closeContext']);
+    // DEF-038: page は個別に閉じない（以前は、Context の前に page を閉じていた）。
+    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closeContext']);
   }, DEADLINE_TEST_TIMEOUT_MS);
 
   it('throws the open deadline failure without a Ledger when creating the Context does not finish', async () => {
@@ -385,7 +380,9 @@ describe('createStressSessionFactory close and construction failures', () => {
     await expect(session.close()).rejects.toBe(closeContextError);
   });
 
-  it('reports both failures when the page close and the Context close fail', async () => {
+  // DEF-038（決まりの変更。以前は、page と Context の両方の失敗を AggregateError で投げることを確かめていた）: page を閉じる処理を
+  // 呼ばないので、投げるのは Context を閉じる処理の失敗だけである。
+  it('throws only the Context close failure, even when the page close would fail (DEF-038)', async () => {
     const calls: FakeFactoryCalls = { events: [] };
     const closePageError = new Error('page close failed');
     const closeContextError = new Error('context close failed');
@@ -394,8 +391,8 @@ describe('createStressSessionFactory close and construction failures', () => {
     const session = await stress.createSession(STRESS_VIEWPORT);
     const rejection = await session.close().then(() => undefined, (error: unknown) => error);
 
-    expect(rejection).toBeInstanceOf(AggregateError);
-    expect((rejection as AggregateError).errors).toEqual([closePageError, closeContextError]);
+    expect(rejection).toBe(closeContextError);
+    expect(calls.events).toEqual(['createContext:320x800', 'createPage', 'closeContext']);
   });
 
   it('closes the Context, keeps its Ledger and rethrows when the page cannot be created', async () => {

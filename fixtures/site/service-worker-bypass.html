@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Service Worker Bypass</title></head>
+  <body>
+    <h1>Fixture Service Worker Bypass</h1>
+    <p>This page registers a Service Worker on load, avoiding the instance override of the registration (DEF-049).</p>
+    <script>
+      // DEF-049: 読み込みのときに、Playwright の `serviceWorkers: 'block'` の置き換え（`navigator.serviceWorker` のインスタンスの
+      // `register`）を迂回して、Service Worker を登録する。Service Worker の script は、install と activate で /__mutation へ POST を送る。
+      // - クエリ `way`: 迂回の方法。`prototype`（`ServiceWorkerContainer.prototype.register.call`）、`delete`（インスタンスの `register` を
+      //   消した後の呼び出し）。
+      // - クエリ `where`: 呼び出す場所。`top`（この文書）、`iframe`（同じ Origin の iframe の文書。その iframe の `navigator.serviceWorker`
+      //   と `ServiceWorkerContainer` を使う）、`blank`（動的に作った about:blank の iframe の realm の `register` を、この文書の
+      //   `navigator.serviceWorker` に対して呼ぶ。about:blank の文書は、自分の `navigator.serviceWorker` では登録できない（InvalidStateError）
+      //   ので、関数だけを借りる）。
+      // 結果は、html 要素の data-service-worker-bypass に残す（`registered`、`threw:<文言>`、`rejected:<文言>`、`unavailable`、
+      // `unknown-way`、`unknown-where`）。ページのスクリプト自身は、GET・HEAD 以外の要求を送らない。
+      const params = new URLSearchParams(location.search);
+      const way = params.get('way');
+      const where = params.get('where') ?? 'top';
+      const workerUrl = new URL('/service-worker-bypass-worker.js', location.href).href;
+      const report = (state) => {
+        document.documentElement.dataset.serviceWorkerBypass = state;
+      };
+      // iframe の realm の例外は、この文書の `Error` の instance ではないので、`message` の有無で文言を取る。
+      const messageOf = (error) => (typeof error?.message === 'string' ? error.message : String(error));
+      // `win` は関数を取り出す realm、`target` は登録に使う `navigator.serviceWorker` の持ち主。
+      const register = (win, target) => {
+        const own = win.navigator.serviceWorker;
+        const container = target.navigator.serviceWorker;
+        if (own === undefined || container === undefined) {
+          return 'unavailable';
+        }
+        if (way === 'prototype') {
+          return win.ServiceWorkerContainer.prototype.register.call(container, workerUrl);
+        }
+        if (way === 'delete') {
+          delete own.register;
+          return own.register.call(container, workerUrl);
+        }
+        return 'unknown-way';
+      };
+      const run = (win, target = win) => {
+        let pending;
+        try {
+          pending = register(win, target);
+        } catch (error) {
+          report(`threw:${messageOf(error)}`);
+          return;
+        }
+        if (typeof pending === 'string') {
+          report(pending);
+          return;
+        }
+        Promise.resolve(pending).then(
+          (registration) => report(registration ? 'registered' : 'resolved-without-registration'),
+          (error) => report(`rejected:${messageOf(error)}`),
+        );
+      };
+      if (where === 'top') {
+        run(window);
+      } else if (where === 'blank') {
+        const frame = document.createElement('iframe');
+        document.body.append(frame);
+        run(frame.contentWindow, window);
+      } else if (where === 'iframe') {
+        const frame = document.createElement('iframe');
+        frame.src = '/navigation-target.html';
+        frame.addEventListener('load', () => run(frame.contentWindow), { once: true });
+        document.body.append(frame);
+      } else {
+        report('unknown-where');
+      }
+    </script>
+  </body>
+</html>

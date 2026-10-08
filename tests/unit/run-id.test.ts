@@ -3,6 +3,7 @@
 import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 import { createRunId } from '../../src/core/ids.js';
+import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { createRunIdFromTime } from '../../src/orchestration/run-id.js';
 
 const runSchemaUrl = new URL('../../schemas/run.schema.json', import.meta.url);
@@ -46,5 +47,16 @@ describe('createRunIdFromTime (R15c)', () => {
     expect(() => createRunIdFromTime(new Date('0999-12-31T23:59:59.000Z'))).toThrow(RangeError);
     expect(() => createRunIdFromTime(new Date('+010000-01-01T00:00:00.000Z'))).toThrow(RangeError);
     expect(() => createRunIdFromTime('2026-09-24T00:00:00Z' as unknown as Date)).toThrow(RangeError);
+  });
+
+  // BN1（ChatGPT 用バンドルのファイル名の設計書 2.1）: 14桁の書式は core の1か所（`formatCompactUtcTimestamp`）にあり、Run の ID も
+  // それを使う。誤りの種類と文は変えない。
+  it('uses the shared 14-digit UTC format of the core, and keeps the RangeError messages', () => {
+    const date = new Date('2026-10-08T15:09:30.000Z');
+
+    expect(createRunIdFromTime(date)).toBe(createRunId(Number(formatCompactUtcTimestamp(date, 'run start time'))));
+    expect(() => createRunIdFromTime(new Date(Number.NaN))).toThrow(new RangeError('run start time must be a valid Date'));
+    expect(() => createRunIdFromTime(new Date('0999-12-31T23:59:59.000Z')))
+      .toThrow(new RangeError('run start time must have a four-digit UTC year'));
   });
 });

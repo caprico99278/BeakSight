@@ -186,7 +186,7 @@ async function readUserAgent(
   // 閉じた処理の失敗（`opened.closeFailures`）を先に渡す。
   const closeFailures = [
     ...(opened.status === 'DEADLINE_EXCEEDED' ? opened.closeFailures : []),
-    ...(await closePassivePageAndContext(factory, context, page, deadlines)),
+    ...(await closePassivePageAndContext(factory, context, deadlines)),
   ];
   for (const failure of closeFailures) {
     onCloseFailure(failure);
