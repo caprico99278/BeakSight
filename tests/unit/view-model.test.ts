@@ -227,7 +227,9 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
   it('copies the executions of run.json in their order, with the number of executions and of resumes (3 executions)', () => {
     const result = auditRun({ executions: executionsDisplaySample() });
     const model = buildReportViewModel(result);
-    expect(model.summary.executions).toEqual({ count: 3, resumeCount: 2, lastEndReason: 'COMPLETED', items: executionsDisplaySample() });
+    expect(model.summary.executions).toEqual({
+      count: 3, resumeCount: 2, lastEndReason: 'COMPLETED', lastFinishedAt: executionsDisplaySample()[2]?.finishedAt, items: executionsDisplaySample(),
+    });
     // 写しであって、入力の値そのものではない（入力を凍結しない）。
     expect(model.summary.executions.items).not.toBe(result.run.executions);
     expect(model.summary.executions.items[0]).not.toBe(result.run.executions[0]);
@@ -239,7 +241,9 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
     const result = auditRun();
     expect(result.run.executions).toHaveLength(1);
     const model = buildReportViewModel(result);
-    expect(model.summary.executions).toEqual({ count: 1, resumeCount: 0, lastEndReason: 'COMPLETED', items: [...result.run.executions] });
+    expect(model.summary.executions).toEqual({
+      count: 1, resumeCount: 0, lastEndReason: 'COMPLETED', lastFinishedAt: result.run.executions[0]?.finishedAt, items: [...result.run.executions],
+    });
   });
 
   // R9（中断した Run の再開の設計書 4.8 の 2026-10-08 の追補）: この起動の終わり方は、実行の記録の最後の実行の終わり方である（前の実行の
@@ -258,11 +262,24 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
     }
   });
 
+  // CCX-19（CC-048）: 最後の実行の終わりの時刻も、表示用モデルの組み立ての 1 か所で決める（CLI のバンドルの行とバンドルの名前は、この値を使う）。
+  it('has the finish time of the last execution as lastFinishedAt (not the one of an earlier execution)', () => {
+    const model = buildReportViewModel(auditRun({
+      executions: [
+        { startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:10:00.000Z', endReason: 'STOPPED_BY_SIGNAL' },
+        { startedAt: '2026-10-02T00:00:00.000Z', finishedAt: '2026-10-02T00:20:00.000Z', endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
+        { startedAt: '2026-10-03T00:00:00.000Z', finishedAt: '2026-10-03T00:30:00.000Z', endReason: 'COMPLETED' },
+      ],
+    }));
+    expect(model.summary.executions.lastFinishedAt).toBe('2026-10-03T00:30:00.000Z');
+  });
+
   it('has the end reason of the only execution as lastEndReason for a Run with one execution', () => {
     const model = buildReportViewModel(auditRun({
       executions: [{ startedAt: '2026-10-01T00:00:00.000Z', finishedAt: '2026-10-01T00:10:00.000Z', endReason: 'STOPPED_BY_RUNTIME_LIMIT' }],
     }));
     expect(model.summary.executions.lastEndReason).toBe('STOPPED_BY_RUNTIME_LIMIT');
+    expect(model.summary.executions.lastFinishedAt).toBe('2026-10-01T00:10:00.000Z');
   });
 });
 

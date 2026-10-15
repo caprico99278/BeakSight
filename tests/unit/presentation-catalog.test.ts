@@ -249,6 +249,13 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         description:
           'プロセスが途中で終わりました（強制終了、停電、端末の再起動、2回目の Ctrl+C など）。終わりの時刻は、最後に保存した時刻です。',
       },
+      // T25c（Task 25 の設計書 4.3）: 認証つきの Run で、セッションの切れで止まった。core の一覧の並び（最後）に合わせる。
+      STOPPED_BY_AUTH_SESSION_LOST: {
+        label: 'ログインの切れで停止',
+        order: 7,
+        tone: 'caution',
+        description: 'ログインの状態が切れた（ログインの画面に移った）ため、そのページを監査せず、残りのページも監査せずに止めました。',
+      },
     });
     expect(sortByDisplayOrder(RUN_EXECUTION_END_REASONS, RUN_EXECUTION_END_REASON_CATALOG)).toEqual([...RUN_EXECUTION_END_REASONS]);
   });

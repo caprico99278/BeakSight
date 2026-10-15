@@ -3,9 +3,13 @@ import { URL_REJECTION_REASONS } from '../../src/core/evidence-types.js';
 import { MAX_URL_LENGTH } from '../../src/core/limits.js';
 import { classifyUrl } from '../../src/crawl/admission-policy.js';
 import {
+  LOOPBACK_HOSTNAMES,
+  canonicalHttpOriginOf,
   canonicalizeAllowedOrigins,
   hasUrlCredentials,
   isHttpProtocol,
+  isLoopbackUrl,
+  isOriginInAllowedOrigins,
   normalizeUrl,
   redactUrlCredentials,
 } from '../../src/crawl/normalize-url.js';
@@ -322,5 +326,151 @@ describe('canonicalizeAllowedOrigins', () => {
     ['the whole representative policy against an unlisted origin', policyEntries, 'https://unlisted.example.test/probe', 'EXTERNAL_RECORD_ONLY'],
   ])('lets the crawl admission policy classify %s to a fixed kind', (_case, allowedOrigins, url, expectedKind) => {
     expect(classifyUrl(new URL(url), { allowedOrigins: new Set(allowedOrigins) }).kind).toBe(expectedKind);
+  });
+});
+
+// T22b（Task 22 の設計書 4.3、変更履歴の T22b の Blocker の案 A）: loopback の host の定義と、Origin の 2 つの部品。
+// URL の意味の owner（このファイルの対象）に置き、設定の検証（`validate-config.ts`）とプロファイルの判定（`profile-policy.ts`）が呼ぶ。
+describe('LOOPBACK_HOSTNAMES and isLoopbackUrl', () => {
+  it('lists the loopback hosts in the order that the configuration error message shows', () => {
+    expect([...LOOPBACK_HOSTNAMES]).toEqual(['127.0.0.1', '[::1]', 'localhost']);
+  });
+
+  // T22d（T22R の M2）: 公開した一覧を書き換えようとしても、一覧も判定も変わらない（凍結した配列。判定は閉じた集合）。
+  it('cannot be modified from outside, and the loopback decision does not change', () => {
+    const outsider = 'evil.example.invalid';
+    const outsiderUrl = new URL(`http://${outsider}`);
+    const before = [...LOOPBACK_HOSTNAMES];
+    expect(Object.isFrozen(LOOPBACK_HOSTNAMES)).toBe(true);
+    const writable = LOOPBACK_HOSTNAMES as unknown as {
+      add?: (value: string) => unknown;
+      clear?: () => unknown;
+      push?: (value: string) => unknown;
+      [index: number]: string;
+    };
+    const attempts: readonly (() => unknown)[] = [
+      () => writable.add?.(outsider),
+      () => writable.push?.(outsider),
+      () => {
+        writable[0] = outsider;
+      },
+      () => writable.clear?.(),
+    ];
+    for (const attempt of attempts) {
+      try {
+        attempt();
+      } catch {
+        // 凍結した値への書き込みは、strict mode では TypeError になる。
+      }
+    }
+    try {
+      expect([...LOOPBACK_HOSTNAMES]).toEqual(before);
+      expect(isLoopbackUrl(outsiderUrl)).toBe(false);
+      expect(isLoopbackUrl(new URL('http://127.0.0.1'))).toBe(true);
+    } finally {
+      // 実装が書き換えを許したとき（RED）に、ほかのテストへ影響を残さない。
+      const restorable = LOOPBACK_HOSTNAMES as unknown as { delete?: (value: string) => unknown; add?: (value: string) => unknown };
+      if (!Object.isFrozen(LOOPBACK_HOSTNAMES) && restorable.delete !== undefined && restorable.add !== undefined) {
+        restorable.delete(outsider);
+        for (const host of before) {
+          restorable.add(host);
+        }
+      }
+    }
+  });
+
+  it.each([
+    'http://127.0.0.1',
+    'http://127.0.0.1:4173/',
+    'https://127.0.0.1:8443/path',
+    'http://[::1]',
+    'http://[::1]:4173',
+    'http://localhost',
+    'http://LOCALHOST:4173',
+    'https://localhost/',
+  ])('treats %s as a loopback URL', (url) => {
+    expect(isLoopbackUrl(new URL(url))).toBe(true);
+  });
+
+  it.each([
+    'https://example.com',
+    'http://127.0.0.2',
+    'http://0.0.0.0',
+    'http://[::2]',
+    'http://[0:0:0:0:0:0:0:2]',
+    'http://localhost.example.invalid',
+    'http://localhost.',
+    'http://example.invalid',
+  ])('does not treat %s as a loopback URL', (url) => {
+    expect(isLoopbackUrl(new URL(url))).toBe(false);
+  });
+});
+
+describe('canonicalHttpOriginOf', () => {
+  it.each([
+    'https://example.com',
+    'https://app.example.invalid',
+    'http://example.com',
+    'http://127.0.0.1:4173',
+    'https://[::1]:8443',
+    'http://localhost',
+    'https://xn--r8jz45g.example.invalid',
+  ])('returns the canonical HTTP(S) origin serialization %s unchanged', (value) => {
+    expect(canonicalHttpOriginOf(value)).toBe(value);
+  });
+
+  it.each([
+    ['a trailing slash', 'https://example.com/'],
+    ['a path', 'https://example.com/path'],
+    ['a query', 'https://example.com?q=1'],
+    ['an empty query', 'https://example.com?'],
+    ['a fragment', 'https://example.com#top'],
+    ['an uppercase scheme and host', 'HTTPS://EXAMPLE.COM'],
+    ['an uppercase host', 'https://Example.com'],
+    ['the default port', 'https://example.com:443'],
+    ['the default http port', 'http://example.com:80'],
+    ['a username', 'https://user@example.com'],
+    ['a password', 'https://user:secret@example.com'],
+    ['an IDN host instead of its punycode form', 'https://例え.example.invalid'],
+    ['surrounding spaces', ' https://example.com '],
+    ['a non-HTTP scheme', 'ftp://example.com'],
+    ['a websocket scheme', 'wss://example.com'],
+    ['a blob URL', 'blob:https://example.com/uuid'],
+    ['a file URL', 'file:///tmp/example'],
+    ['the opaque origin text', 'null'],
+    ['an empty string', ''],
+    ['an unparsable value', 'not a url'],
+    ['a scheme only', 'https://'],
+  ])('returns undefined for %s', (_case, value) => {
+    expect(canonicalHttpOriginOf(value)).toBeUndefined();
+  });
+});
+
+describe('isOriginInAllowedOrigins', () => {
+  it.each<[string, readonly string[], string]>([
+    ['the same origin', ['https://example.com'], 'https://example.com'],
+    ['an allowed origin written with a trailing slash', ['https://example.com/'], 'https://example.com'],
+    ['an allowed origin written with path, default port and uppercase', ['HTTPS://EXAMPLE.COM:443/path'], 'https://example.com'],
+    ['one of several allowed origins', ['https://example.com', 'http://127.0.0.1:4173'], 'http://127.0.0.1:4173'],
+    ['an IDN allowed origin against its punycode form', ['https://例え.example.invalid'], 'https://xn--r8jz45g.example.invalid'],
+  ])('accepts %s', (_case, allowedOrigins, origin) => {
+    expect(isOriginInAllowedOrigins(allowedOrigins, origin)).toBe(true);
+    expect(isOriginInAllowedOrigins(new Set(allowedOrigins), origin)).toBe(true);
+  });
+
+  it.each<[string, readonly string[], string]>([
+    ['the other scheme', ['https://example.com'], 'http://example.com'],
+    ['another port', ['http://127.0.0.1:4173'], 'http://127.0.0.1:4174'],
+    ['a subdomain', ['https://example.com'], 'https://app.example.com'],
+    ['a parent domain', ['https://app.example.com'], 'https://example.com'],
+    ['an allowed-origin entry carrying credentials', ['https://user:secret@example.com'], 'https://example.com'],
+    ['a non-HTTP(S) allowed-origin entry', ['ftp://example.com'], 'ftp://example.com'],
+    ['an unparsable allowed-origin entry', ['not a url'], 'not a url'],
+    ['an empty allowed-origin list', [], 'https://example.com'],
+    ['a non-canonical origin argument (trailing slash)', ['https://example.com'], 'https://example.com/'],
+    ['a non-canonical origin argument (uppercase)', ['https://example.com'], 'HTTPS://EXAMPLE.COM'],
+    ['a URL with a path as the origin argument', ['https://example.com'], 'https://example.com/path'],
+  ])('rejects %s', (_case, allowedOrigins, origin) => {
+    expect(isOriginInAllowedOrigins(allowedOrigins, origin)).toBe(false);
   });
 });

@@ -115,20 +115,6 @@ export const INTERACTION_CLEANUP_ALLOWANCE_MS = 2_000;
 export const MAX_PENDING_GUARD_REQUEST_TASKS = 4_096;
 
 /**
- * Guard の付いた Passive の page を閉じる処理（factory の `closePassivePage`）を待つ時間の上限（ms。DEF-006）。
- * この時間を過ぎたら、page を閉じる処理の失敗として記録し、Context を閉じる処理に進む（Context を閉じると、止まった page も閉じる）。
- * 背景: エラーページを表示している page で、次のナビゲーションも失敗し、その直後に page を閉じると、Chromium は page を閉じず、
- * `page.close()` が終わらない（DEF-005 の調査）。
- * 値の根拠: page を閉じる処理は、ふだん数十 ms で終わる（DEF-005 の測定）。負荷の高い環境でも誤って期限切れにしないよう、
- * その 100 倍程度の余裕を取った。止まった場合は永久に終わらないので、有限の値であれば止まり続けることはない。
- * 既定のページの期限（60,000ms）の 10% 未満である。
- * DEF-038 で、Guard の付いた Passive のページを個別に閉じなくなったので、production では使わない（整理は CC-049）。
- * Passive の page は、Context と一緒に閉じる（`closePassivePageAndContext`）。`resolvePassiveSessionDeadlines` は、今も既定値として
- * この値を埋めるが、閉じる手順はその値を読まない。
- */
-export const PAGE_CLOSE_TIMEOUT_MS = 5_000;
-
-/**
  * Browser を閉じる処理（`browser.close()`）を待つ時間の上限（ms。R15 の Minor-2）。Run Coordinator と PREFLIGHT が使う。
  * この時間を過ぎたら、閉じる処理の失敗として記録し、終わりを待たずに進む。
  * 値の根拠: Browser を閉じる処理は、Context と page を閉じ、Chromium のプロセスを終えるまでで、ふだん 1 秒未満で終わる。
@@ -140,10 +126,19 @@ export const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
  * Guard の付いた Passive Context を閉じる処理（factory の `closePassiveContext`）を待つ時間の上限（ms。DEF-008。
  * Task 18 の前の整理の設計書 4.2）。この時間を過ぎたら、Context を閉じる処理の失敗として記録し、終わりを待たずに進む。
  * 待つのをやめるだけで、Guard の状態は変えない（Context を閉じる処理が終わらない間も、Guard はリクエストを止め続ける）。
- * 値の根拠: page を閉じる処理の上限（`PAGE_CLOSE_TIMEOUT_MS`）と同じにした。Context を閉じる処理は、Guard が保留中の処理を待つ時間
+ * 値の根拠: 以前の page を閉じる処理の上限（DEF-006 の 5 秒。DEF-038 で Passive の page を個別に閉じなくなり、CCX-21 で消した）と同じにした。
+ * Context を閉じる処理は、Guard が保留中の処理を待つ時間
  * （`GUARD_PENDING_TASK_DRAIN_TIMEOUT_MS`。2026-09-25 時点で 1,000ms）と、page と Context を閉じる時間で、ふだん 1 秒程度で終わる。
  */
 export const CONTEXT_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
+ * 認証つきの Run（Task 25 の設計書 4.3。T25c）で、Context の認証済みの状態（`storageState()`）を取り出す処理を待つ時間の上限（ms）。
+ * この時間を過ぎたら、取り出しの失敗として数え、前の状態のまま進む（値は記録しない）。公開監査では使わない。
+ * 値の根拠: 取り出しは、Cookie の読み出しと、Origin ごとの localStorage の読み出し（開いている page の中か、通信をしない隠れた page）で、
+ * ふだん数十 ms で終わる（T25c の実験）。閉じる処理の中で行うので、閉じる処理を待つ上限（`CONTEXT_CLOSE_TIMEOUT_MS`）の半分未満にした。
+ */
+export const AUTHENTICATED_STATE_READ_TIMEOUT_MS = 2_000;
 
 /**
  * Guard の付いた Passive Context と page を作る処理（`newContext`、Guard の取り付け、`newPage`、Guard の準備）を待つ時間の上限

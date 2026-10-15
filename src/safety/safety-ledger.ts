@@ -1,6 +1,8 @@
 import type { PageSafetySummary, SafetyInvariantViolationSummary } from '../core/contracts.js';
 import {
   BLOCKED_EXTERNAL_ACTION_REASONS,
+  type BlockedAuditExclusionEvent,
+  type BlockedAuditExclusionsRecord,
   type BlockedDownloadEvent,
   type BlockedExternalActionEvent,
   type BlockedExternalActionReason,
@@ -20,12 +22,15 @@ import {
 } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_HTTP_METHOD_LENGTH } from '../core/limits.js';
+import { saturatingAdd, saturatingIncrement } from '../core/saturating-count.js';
 import { truncateText } from '../core/text.js';
 import { redactUrlCredentials } from '../crawl/normalize-url.js';
 
 // 事象の型と記録の上限の情報の型は、Safety の Evidence と同じ型なので、`src/core/evidence-types.ts` に1か所だけ置く
 // （Task 12・13 の設計書 5.4.1）。既存の import 元を保つため、同じ名前で re-export する。
 export type {
+  BlockedAuditExclusionEvent,
+  BlockedAuditExclusionsRecord,
   BlockedDownloadEvent,
   BlockedExternalActionEvent,
   BlockedInteractionNavigationEvent,
@@ -52,7 +57,7 @@ export type InvariantViolationEvent = SafetyInvariantViolationSummary;
  * `blockedRequestsByMethod` の上限の分類（`#recordUncountedBlockedRequest`）は、この型に含めない
  * （`SafetyLedgerUncountedBlockedRequestCategory`）。
  */
-export type SafetyLedgerRecordCategory = SafetyEventKind | 'invariantViolations';
+export type SafetyLedgerRecordCategory = SafetyEventKind | 'blockedAuditExclusions' | 'invariantViolations';
 
 /**
  * 上限のために `blockedRequestsByMethod` で数えられなかった遮断の分類の名前（CC-028 の残り。P18e）。
@@ -141,6 +146,14 @@ export class SafetyLedger {
   readonly #blockedDownloads: BlockedDownloadEvent[] = [];
   readonly #blockedInteractionWebSockets: BlockedInteractionWebSocketEvent[] = [];
   readonly #externalSchemeNavigations: ExternalSchemeNavigationEvent[] = [];
+  /** 監査の段の除外で遮断した要求（T25b round 1）。件数は、記録の上限を超えた分も数える。 */
+  readonly #blockedAuditExclusions: BlockedAuditExclusionEvent[] = [];
+  #blockedAuditExclusionCount = 0;
+  /**
+   * 監査の段の除外の記録のうち、上限のために記録しなかった件数（T25c。`#droppedEventCount` にも数える）。除外の記録は、設定どおりに止めた
+   * 記録で、件数（`#blockedAuditExclusionCount`）は上限を超えた分も正しく数えるので、この分だけでは記録を不完全（`truncated`）にしない。
+   */
+  #droppedAuditExclusionEventCount = 0;
   readonly #invariantViolations: InvariantViolationEvent[] = [];
   #invariantViolationCount = 0;
   #droppedEventCount = 0;
@@ -252,6 +265,23 @@ export class SafetyLedger {
     }, 'externalSchemeNavigations');
   }
 
+  /**
+   * 監査の段の除外で遮断した要求を記録する（T25b round 1。Task 25 の設計書 4.2）。method と URL は、ほかの要求の記録
+   * （`recordBlockedRequest`）と同じく、上限の長さまで切り詰める。値や本文は受け取らない。件数は、記録の上限を超えた分も数える。
+   */
+  recordBlockedAuditExclusion(event: BlockedAuditExclusionEvent): void {
+    this.#blockedAuditExclusionCount = saturatingIncrement(this.#blockedAuditExclusionCount);
+    if (this.#blockedAuditExclusions.length >= MAX_LEDGER_EVENTS) {
+      this.#droppedAuditExclusionEventCount = saturatingIncrement(this.#droppedAuditExclusionEventCount);
+    }
+    this.#pushEvent(this.#blockedAuditExclusions, {
+      method: this.#boundedMethod(event.method),
+      url: this.#boundedText(event.url),
+      mainFrameNavigation: event.mainFrameNavigation,
+      reason: event.reason,
+    }, 'blockedAuditExclusions');
+  }
+
   recordInvariantViolation(event: InvariantViolationEvent): void {
     this.#invariantViolationCount = saturatingIncrement(this.#invariantViolationCount);
     this.#pushEvent(this.#invariantViolations, {
@@ -264,6 +294,16 @@ export class SafetyLedger {
     const immutableEvents = <Event extends object>(events: readonly Event[]): readonly Readonly<Event>[] => (
       Object.freeze(events.map((event) => Object.freeze({ ...event })))
     );
+    // T25b round 1: 監査の段の除外の記録は、1 件でも記録したときだけ snapshot に入れる（公開監査の出力は変えない）。
+    const blockedAuditExclusions: { readonly blockedAuditExclusions?: BlockedAuditExclusionsRecord } =
+      this.#blockedAuditExclusionCount === 0
+        ? {}
+        : {
+          blockedAuditExclusions: Object.freeze({
+            count: this.#blockedAuditExclusionCount,
+            events: immutableEvents(this.#blockedAuditExclusions),
+          }),
+        };
     return Object.freeze({
       blockedRequestsByMethod: Object.freeze(Object.assign(
         Object.create(null) as Record<string, number>,
@@ -283,12 +323,14 @@ export class SafetyLedger {
       invariantViolations: immutableEvents(this.#invariantViolations),
       invariantViolationCount: this.#invariantViolationCount,
       recordLimits: Object.freeze({
-        truncated: this.#droppedEventCount > 0 || this.#uncountedBlockedRequestCount > 0,
+        // T25c: 監査の段の除外の記録だけが上限を超えた場合は、不完全にしない（件数は `blockedAuditExclusions.count` に正しく残る）。
+        truncated: this.#droppedEventCount > this.#droppedAuditExclusionEventCount || this.#uncountedBlockedRequestCount > 0,
         droppedEventCount: this.#droppedEventCount,
         uncountedBlockedRequestCount: this.#uncountedBlockedRequestCount,
         truncatedTextCount: this.#truncatedTextCount,
         reachedCategories: Object.freeze([...this.#reachedCategories]),
       }),
+      ...blockedAuditExclusions,
     });
   }
 
@@ -329,14 +371,3 @@ export class SafetyLedger {
     this.#reachedCategories.add(category);
   }
 }
-
-/** 件数を1増やす。安全な整数の上限で止め、`RunStatusInput` の検証を通る値に保つ。 */
-function saturatingIncrement(count: number): number {
-  return saturatingAdd(count, 1);
-}
-
-/** 件数を足す。安全な整数の上限で止め、`RunStatusInput` の検証を通る値に保つ。 */
-function saturatingAdd(count: number, increment: number): number {
-  return Math.min(count + increment, Number.MAX_SAFE_INTEGER);
-}
-

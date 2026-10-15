@@ -1,0 +1,223 @@
+{
+  "$id": "urn:beaksight:schema:control:scenario:1",
+  "description": "One revision of a write scenario (Task 28 design 4.1): one CREATE or UPDATE candidate of the latest discovery, the request shape, the fields to send, the READ checks to compare with, the side effect confirmations, the limits and the approval TTL (at most the defaults) and the reference to the input rules. The value lists and limits are owned by src/control/approval/scenario-contracts.ts; the draft rules against the candidate are checked by src/control/approval/scenario-policy.ts. The verification spec (Task 30 design 3, T30a: the success and input error conditions, the way to take the record id and the READ verification bound to the generated values) is required and each item is null while not specified; a scenario with an unspecified item can be approved but gets no execution grant. The UPDATE spec (Task 31 design 3, T31b: the CREATE scenario of the ledger, the path templates of the update form and of the action with {id} once as a whole segment, the fields to keep and the templated identity digest of the candidate) is required; it is null for a CREATE scenario, and null for an UPDATE revision stored before the UPDATE spec (readable, but neither approved nor granted); the draft validation requires it for an UPDATE draft. No property holds an input value, a token, an option label or a credential. The state (DRAFT, APPROVED, REVOKED) is kept by the store, not in a revision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "scenarioId",
+    "profileId",
+    "revision",
+    "kind",
+    "candidate",
+    "request",
+    "fieldNames",
+    "readChecks",
+    "sideEffectConfirmations",
+    "limits",
+    "approvalTtlDays",
+    "verification",
+    "update",
+    "inputRuleReference",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "beaksight-scenario/1" },
+    "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "kind": { "enum": ["CREATE", "UPDATE"] },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identityDigest", "ruleDigest"],
+      "properties": {
+        "identityDigest": { "$ref": "#/$defs/fingerprint" },
+        "ruleDigest": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "request": { "$ref": "#/$defs/request" },
+    "fieldNames": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 200,
+      "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+    },
+    "readChecks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/readCheckReference" } },
+    "sideEffectConfirmations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["TEST_RECORDS_ONLY", "NO_EXTERNAL_NOTIFICATION", "NO_PAYMENT_OR_EXTERNAL_SERVICE", "NOT_DESTRUCTIVE"],
+      "properties": {
+        "TEST_RECORDS_ONLY": { "type": "boolean" },
+        "NO_EXTERNAL_NOTIFICATION": { "type": "boolean" },
+        "NO_PAYMENT_OR_EXTERNAL_SERVICE": { "type": "boolean" },
+        "NOT_DESTRUCTIVE": { "type": "boolean" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxCreatesPerRun", "maxCumulativeCreates"],
+      "properties": {
+        "maxCreatesPerRun": { "type": "integer", "minimum": 1, "maximum": 1 },
+        "maxCumulativeCreates": { "type": "integer", "minimum": 1, "maximum": 20 }
+      }
+    },
+    "approvalTtlDays": { "type": "integer", "minimum": 1, "maximum": 30 },
+    "verification": { "$ref": "#/$defs/verification" },
+    "update": { "anyOf": [{ "$ref": "#/$defs/update" }, { "type": "null" }] },
+    "inputRuleReference": { "anyOf": [{ "$ref": "#/$defs/inputRuleReference" }, { "type": "null" }] },
+    "createdAt": { "$ref": "#/$defs/timestamp" },
+    "updatedAt": { "$ref": "#/$defs/timestamp" }
+  },
+  "if": { "properties": { "kind": { "const": "CREATE" } }, "required": ["kind"] },
+  "then": { "properties": { "update": { "type": "null" } } },
+  "$defs": {
+    "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "timestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["formMethod", "methodOverride", "origin", "path", "enctype"],
+      "properties": {
+        "formMethod": { "const": "POST" },
+        "methodOverride": { "anyOf": [{ "enum": ["PUT", "PATCH"] }, { "type": "null" }] },
+        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 },
+        "enctype": { "enum": ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"] }
+      }
+    },
+    "readCheckReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "revision"],
+      "properties": {
+        "readCheckId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "inputRuleReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ruleSetId", "revision", "digest"],
+      "properties": {
+        "ruleSetId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "digest": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "update": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetCreateScenarioId", "formPathTemplate", "actionPathTemplate", "keepFieldNames", "templatedIdentityDigest"],
+      "properties": {
+        "targetCreateScenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 },
+        "actionPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 },
+        "keepFieldNames": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 200,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "templatedIdentityDigest": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["successCondition", "inputErrorCondition", "recordId", "readVerification"],
+      "properties": {
+        "successCondition": { "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
+        "inputErrorCondition": { "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
+        "recordId": { "anyOf": [{ "$ref": "#/$defs/recordId" }, { "type": "null" }] },
+        "readVerification": { "anyOf": [{ "$ref": "#/$defs/readVerification" }, { "type": "null" }] }
+      }
+    },
+    "resultCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "pattern": "^/", "maxLength": 2048 },
+        "selector": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] }
+      }
+    },
+    "recordId": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "pathPattern"],
+          "properties": {
+            "source": { "const": "URL_PATH_PATTERN" },
+            "pathPattern": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "selector"],
+          "properties": {
+            "source": { "const": "ELEMENT" },
+            "selector": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        }
+      ]
+    },
+    "readVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "revision", "bindings", "expectations"],
+      "properties": {
+        "readCheckId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "bindings": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "$ref": "#/$defs/binding" } },
+        "expectations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/verificationExpectation" } }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parameterName", "fieldName"],
+      "properties": {
+        "parameterName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "verificationExpectation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "count"],
+          "properties": {
+            "kind": { "const": "ROW_COUNT_EQUALS" },
+            "count": { "type": "integer", "minimum": 1, "maximum": 100000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fieldName"],
+          "properties": {
+            "kind": { "const": "TEXT_CONTAINS" },
+            "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "field", "fieldName"],
+          "properties": {
+            "kind": { "const": "DETAIL_FIELD_EQUALS" },
+            "field": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -9,9 +9,13 @@
  *   session の開閉で送る命令は、`NAVIGATION_DIAGNOSTICS_CDP_COMMANDS` の説明に書く。
  * - 要求と応答の header の中身と、本文は記録しない（Cookie を含むため）。
  * - 判定はしない（サイトの不調の判定は `src/orchestration/site-availability.ts`）。
+ * - 出口の中継（DEF-085 fix round 2）: 中継を通す Context では、CDP の応答の接続先（`remoteIPAddress`、`remotePort`）は中継の待ち受けの
+ *   アドレスになる。factory が、その Context の中継の「上流の相手のアドレスを引く口」を登録していれば（`registerEgressUpstreamAddressSource`）、
+ *   接続先が中継の待ち受けのアドレスと同じ応答は、応答の URL の host と port で、上流の相手のアドレスを引いて記録する。引けなければ `null`。
+ *   中継の待ち受けのアドレスを、相手のアドレスとして記録することはない。登録のない Context（Interaction の Context を含む）は、今のまま。
  */
 import { isIP } from 'node:net';
-import type { CDPSession, Page } from 'playwright';
+import type { BrowserContext, CDPSession, Page } from 'playwright';
 import type {
   NavigationDiagnostics,
   NavigationDocumentLoadingFailure,
@@ -25,6 +29,7 @@ import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../core/limits.js';
 import { truncateText } from '../core/text.js';
+import { MILLISECONDS_PER_SECOND } from '../core/time-units.js';
 
 /**
  * 1回の観察（1つのビューポートの Passive の読み込み）で記録する、main frame の文書の要求の最大件数（設計書 2.1）。超えた要求は、
@@ -62,8 +67,37 @@ export const NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE = 'Navigation diagnos
 
 /** 文書の要求の、Network の domain の資源の種類。 */
 const DOCUMENT_RESOURCE_TYPE = 'Document';
-/** CDP の `wallTime`（秒）を、`Date.now()` と同じ ms にする倍率。 */
-const MILLISECONDS_PER_SECOND = 1_000;
+
+/** 上流の相手のアドレス（IP アドレスと port）。 */
+export interface EgressUpstreamAddressRecord {
+  readonly address: string;
+  readonly port: number;
+}
+
+/**
+ * 出口の中継の、上流の相手のアドレスを引く口（DEF-085 fix round 2）。factory が、中継を通す Context ごとに登録する。
+ * - `listenAddress`、`listenPort`: 中継の待ち受けのアドレスと port（CDP の応答の接続先が、これと同じなら中継を通った応答）。
+ * - `upstreamAddressOf(host, port)`: 要求の URL の hostname（小文字。IPv6 は `[...]`）と port で、最後に接続できた上流の相手のアドレス。
+ *   覚えていなければ `null`。
+ */
+export interface EgressUpstreamAddressSource {
+  readonly listenAddress: string;
+  readonly listenPort: number;
+  upstreamAddressOf(host: string, port: number): EgressUpstreamAddressRecord | null;
+}
+
+/** Context ごとの、上流の相手のアドレスを引く口（登録した Context だけ）。 */
+const egressUpstreamAddressSources = new WeakMap<BrowserContext, EgressUpstreamAddressSource>();
+
+/**
+ * `context` の出口の中継の、上流の相手のアドレスを引く口を登録する（DEF-085 fix round 2。factory だけが呼ぶ）。登録の後に始めた観察から使う。
+ */
+export function registerEgressUpstreamAddressSource(context: BrowserContext, source: EgressUpstreamAddressSource): void {
+  egressUpstreamAddressSources.set(context, source);
+}
+
+/** URL の scheme ごとの既定の port（応答の URL に port がないとき）。 */
+const DEFAULT_PORTS: Readonly<Record<string, number>> = Object.freeze({ 'http:': 80, 'https:': 443 });
 
 /** `startNavigationDiagnostics` の指定。 */
 export interface NavigationDiagnosticsOptions {
@@ -174,7 +208,7 @@ class NavigationObservation {
       // 期限を過ぎて止めた後は、`Network.enable` を送らない（session は `stop` が閉じた）。
       throw new Error(NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE);
     }
-    const log = new DocumentRequestLog(frameTree.frame.id);
+    const log = new DocumentRequestLog(frameTree.frame.id, egressUpstreamAddressSources.get(page.context()) ?? null);
     for (const [name, receiver] of NETWORK_EVENT_RECEIVERS) {
       const listener = (event: unknown): void => log[receiver](event, Date.now());
       session.on(name, listener);
@@ -253,13 +287,16 @@ interface RequestRecord {
  */
 class DocumentRequestLog {
   readonly #mainFrameId: string;
+  /** その Context の出口の中継の、上流の相手のアドレスを引く口（DEF-085 fix round 2）。なければ `null`（今のまま記録する）。 */
+  readonly #egress: EgressUpstreamAddressSource | null;
   readonly #requests = new Map<string, RequestRecord>();
   #eventCount = 0;
   #omittedDocumentRequestCount = 0;
   #omittedEventCount = 0;
 
-  constructor(mainFrameId: string) {
+  constructor(mainFrameId: string, egress: EgressUpstreamAddressSource | null) {
     this.#mainFrameId = mainFrameId;
+    this.#egress = egress;
   }
 
   /** `Network.requestWillBeSent`: main frame の文書の要求の発行。記録した要求の ID なら、リダイレクト（同じ要求の次の回）。 */
@@ -286,7 +323,7 @@ class DocumentRequestLog {
     }
     const redirected = request.hops.at(-1);
     if (redirected !== undefined && isRecord(event.redirectResponse)) {
-      recordResponse(redirected, event.redirectResponse, receivedAtMs);
+      recordResponse(redirected, event.redirectResponse, receivedAtMs, this.#egress);
       if (typeof event.redirectHasExtraInfo === 'boolean') {
         redirected.extraInfoExpected = event.redirectHasExtraInfo;
       }
@@ -328,7 +365,7 @@ class DocumentRequestLog {
     }
     const hop = request.hops.at(-1);
     if (hop !== undefined && isRecord(event.response)) {
-      recordResponse(hop, event.response, receivedAtMs);
+      recordResponse(hop, event.response, receivedAtMs, this.#egress);
       if (typeof event.hasExtraInfo === 'boolean') {
         hop.extraInfoExpected = event.hasExtraInfo;
       }
@@ -422,6 +459,7 @@ function hopOf(event: Readonly<Record<string, unknown>>, receivedAtMs: number): 
 /** CDP の `wallTime`（UNIX エポックからの秒）を、`Date.now()` と同じ基準の ms に丸める。正の有限の数でなければ `null`。 */
 function wallTimeMs(wallTime: unknown): number | null {
   return typeof wallTime === 'number' && Number.isFinite(wallTime) && wallTime > 0
+    // CDP の `wallTime`（秒）を、`Date.now()` と同じ ms にする。
     ? Math.round(wallTime * MILLISECONDS_PER_SECOND)
     : null;
 }
@@ -434,12 +472,48 @@ function recordResponseHeaders(hop: HopRecord, receivedAtMs: number, status: unk
   }
 }
 
-/** CDP の応答（`Network.Response`）の、status と接続先の IP と port を、まだなければ記録する。header は読まない。 */
-function recordResponse(hop: HopRecord, response: Readonly<Record<string, unknown>>, receivedAtMs: number): void {
+/**
+ * CDP の応答（`Network.Response`）の、status と接続先の IP と port を、まだなければ記録する。header は読まない。
+ * 接続先が、その Context の出口の中継の待ち受けのアドレスと同じなら（DEF-085 fix round 2）、応答の URL の host と port で上流の相手の
+ * アドレスを引いて記録する（引けなければ `null`。中継の待ち受けのアドレスは記録しない）。
+ */
+function recordResponse(
+  hop: HopRecord,
+  response: Readonly<Record<string, unknown>>,
+  receivedAtMs: number,
+  egress: EgressUpstreamAddressSource | null,
+): void {
   recordResponseHeaders(hop, receivedAtMs, response.status);
-  hop.remoteIpAddress ??= ipAddressOf(response.remoteIPAddress);
-  if (hop.remotePort === null && isNonNegativeSafeInteger(response.remotePort)) {
-    hop.remotePort = response.remotePort;
+  const remoteIpAddress = ipAddressOf(response.remoteIPAddress);
+  const remotePort = isNonNegativeSafeInteger(response.remotePort) ? response.remotePort : null;
+  if (egress !== null && remoteIpAddress === ipAddressOf(egress.listenAddress) && remotePort === egress.listenPort) {
+    // 中継を通った応答。中継の待ち受けのアドレスは記録せず、上流の相手のアドレスを引く（まだ記録がなければ）。
+    if (hop.remoteIpAddress === null && hop.remotePort === null) {
+      const upstream = upstreamAddressOfResponse(egress, response.url);
+      hop.remoteIpAddress = upstream === null ? null : ipAddressOf(upstream.address);
+      hop.remotePort = upstream !== null && isNonNegativeSafeInteger(upstream.port) ? upstream.port : null;
+    }
+    return;
+  }
+  hop.remoteIpAddress ??= remoteIpAddress;
+  hop.remotePort ??= remotePort;
+}
+
+/** 応答の URL の host と port で、中継の上流の相手のアドレスを引く（DEF-085 fix round 2）。URL を解析できないか、引けなければ `null`。 */
+function upstreamAddressOfResponse(egress: EgressUpstreamAddressSource, url: unknown): EgressUpstreamAddressRecord | null {
+  if (typeof url !== 'string' || !URL.canParse(url)) {
+    return null;
+  }
+  const parsed = new URL(url);
+  const port = parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORTS[parsed.protocol];
+  if (port === undefined || parsed.hostname.length === 0) {
+    return null;
+  }
+  try {
+    // http と https の URL の hostname は、URL の解析器が小文字にしている（中継の表も、小文字で比べる）。
+    return egress.upstreamAddressOf(parsed.hostname, port);
+  } catch {
+    return null;
   }
 }
 

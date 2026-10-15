@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-update:1",
+  "description": "Local UI Server Function input: update a profile to its next revision. The profile document itself is validated by validateSiteProfile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile", "expectedRevision"],
+  "properties": {
+    "profile": { "type": "object" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+  }
+}

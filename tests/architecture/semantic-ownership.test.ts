@@ -10,9 +10,12 @@ import {
   countIdentifier,
   findCallSites,
   findImportSpecifiers,
+  findModuleReferences,
+  findModuleSpecifiers,
   loadSourceFiles,
   scanSource,
   splitTopLevelArguments,
+  withoutModuleExtension,
   type ScannedSource,
   type SourceFile,
 } from './source-scan.js';
@@ -30,9 +33,13 @@ const matchesOf = (text: string, patterns: readonly RegExp[]): readonly string[]
 /** `name(…)` の呼び出しを、`name(` の形で返す（コメントと文字列の中は数えない）。 */
 const callsOf = (source: ScannedSource, name: string): readonly string[] => findCallSites(source.bare, name).map(() => `${name}(`);
 
-/** 指定子の最後の部分（拡張子 `.js`・`.ts` を除く）が `pattern` に一致する import の指定子。 */
+/**
+ * 指定子の最後の部分（拡張子 `.js`・`.ts` を除く）が `pattern` に一致する参照の指定子。CCX-27（CC-074）: 使う検査（ARCH02・03・07）は
+ * owner の外の参照を禁じるので、import の文だけでなく、`require`・`createRequire`・テンプレートの指定子・`new URL(…, import.meta.url)` も
+ * 数える（`findModuleSpecifiers`。広げると強くなる側）。
+ */
 const importsMatching = (source: ScannedSource, pattern: RegExp): readonly string[] =>
-  findImportSpecifiers(source.code).filter((specifier) => pattern.test(specifier.replace(/\.[cm]?[jt]s$/u, '').split('/').at(-1) ?? ''));
+  findModuleSpecifiers(source.code).filter((specifier) => pattern.test(withoutModuleExtension(specifier).split('/').at(-1) ?? ''));
 
 /** ARCH02: `loadConfig(…)` の呼び出し。 */
 const findLoadConfigCalls = (source: ScannedSource): readonly string[] => callsOf(source, 'loadConfig');
@@ -230,8 +237,26 @@ const findArtifactValidations = (source: ScannedSource): readonly string[] => ca
 
 /** ARCH08: スキーマの検証の部品（Ajv）を直接使う式（`ajv` の import と、`Ajv` の参照）。 */
 const findSchemaValidatorUses = (source: ScannedSource): readonly string[] => [
-  ...findImportSpecifiers(source.code).filter((specifier) => /^ajv(?:$|[/-])/u.test(specifier)),
+  // CCX-27（CC-074）: `require('ajv')` なども数える（禁じる検査なので、広げると強くなる側）。
+  ...findModuleSpecifiers(source.code).filter((specifier) => /^ajv(?:$|[/-])/u.test(specifier)),
   ...matchesOf(source.bare, [/(?<![\w$])Ajv(?![\w$])/gu]),
+];
+
+/** ARCH08（Task 22 の T22d。T22R の I2）: 成果物のスキーマの検証の owner のモジュール（`…/schema-validator`。`control-schema-validator` は含まない）。 */
+const SCHEMA_VALIDATOR_MODULE_SPECIFIER = /(?:^|\/)schema-validator(?:\.[cm]?[jt]s)?$/u;
+
+/**
+ * ARCH08（T22d）: スキーマの検証器の登録の部品（`createSchemaValidatorRegistry`）を呼べる参照（近似）。
+ * - 識別子 `createSchemaValidatorRegistry`（`bare`。import、呼び出し、再 export、分割代入を含む）
+ * - `src/core/schema-validator` のモジュールの全体を受け取る形。名前を書かずに、モジュールの全体から部品を引けるので数える。
+ *   CCX-9（台帳の CC-054）: 全体を受け取る形は、`source-scan.ts` の `findModuleReferences` の `wholeModule`（`import * as`、`export *`、
+ *   動的 import、`require`、`createRequire(…)(…)`、`getBuiltinModule`。テンプレートの指定子を含む）で取る。報告は、書いたままの形。
+ */
+const findSchemaValidatorRegistryReferences = (source: ScannedSource): readonly string[] => [
+  ...matchesOf(source.bare, [/(?<![\w$])createSchemaValidatorRegistry(?![\w$])/gu]),
+  ...findModuleReferences(source.code)
+    .filter((reference) => reference.wholeModule && SCHEMA_VALIDATOR_MODULE_SPECIFIER.test(reference.specifier))
+    .map((reference) => reference.text),
 ];
 
 /**
@@ -254,6 +279,7 @@ const findFinalFileWrites = (source: ScannedSource): readonly string[] => [
  * 出るので、production では呼ばない（テストの後片付けだけで使う）。Passive の page は、Context と一緒に閉じる。
  */
 const INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS = ['closePassivePage', 'closePassiveGuardedPage', 'closePassivePageBeforeDeadline'] as const;
+// CCX-21（CC-049）: `closePassivePageBeforeDeadline` は消した。名前は一覧に残し、作り直して呼ぶことも止める。
 
 /** `INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS` の呼び出しを、`name(` の形で返す（定義は数えない）。 */
 const findIndividualPassivePageCloses = (source: ScannedSource): readonly string[] =>
@@ -346,6 +372,9 @@ describe('GATE-ARCH02〜08 detectors', () => {
     }
     expect(detects(findLoadConfigImports, "import { loadConfig } from '../config/load-config.js';")).toHaveLength(1);
     expect(detects(findLoadConfigImports, "import type { AuditConfig } from '../config/types.js';")).toHaveLength(0);
+    // CCX-27（CC-074）: import の文のほかの読み込み方も数える。
+    expect(detects(findLoadConfigImports, "const config = require('../config/load-config.js');")).toHaveLength(1);
+    expect(detects(findLoadConfigImports, "const load = createRequire(import.meta.url); load('../config/load-config.js');")).toHaveLength(1);
   });
 
   it('ARCH03: detect anchor and href extraction, and references to the link discovery', () => {
@@ -564,6 +593,34 @@ describe('GATE-ARCH02〜08 detectors', () => {
       expect(detects(findFinalFileWrites, line), line).toHaveLength(0);
     }
   });
+
+  it('ARCH08 (T22d): detect references that can call createSchemaValidatorRegistry', () => {
+    for (const line of [
+      "import { createSchemaValidatorRegistry } from '../core/schema-validator.js';",
+      "import { createSchemaValidatorRegistry as create } from '../core/schema-validator.js';",
+      "export { createSchemaValidatorRegistry } from '../core/schema-validator.js';",
+      'const registry = createSchemaValidatorRegistry(schemas);',
+      "const { createSchemaValidatorRegistry: create } = await import('../core/schema-validator.js');",
+      "import * as validators from '../core/schema-validator.js';",
+      "export * from '../core/schema-validator.js';",
+      "export * as validators from '../core/schema-validator';",
+      "const validators = await import('../core/schema-validator.js');",
+      "const validators = require('./schema-validator.js');",
+    ]) {
+      expect(detects(findSchemaValidatorRegistryReferences, line), line).not.toHaveLength(0);
+    }
+    for (const line of [
+      "import { validateArtifact } from '../core/schema-validator.js';",
+      "import type { ArtifactSchemaName } from './schema-validator.js';",
+      "import { validateControlDocument } from './control-schema-validator.js';",
+      "import * as control from './control-schema-validator.js';",
+      '// const registry = createSchemaValidatorRegistry(schemas);',
+      "const label = 'createSchemaValidatorRegistry';",
+      'const registry = createSchemaValidatorRegistryFor(schemas);',
+    ]) {
+      expect(detects(findSchemaValidatorRegistryReferences, line), line).toHaveLength(0);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -597,6 +654,17 @@ type ExclusionScope =
 const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> = {
   ARCH02: new Map([
     ['src/config/load-config.ts', '`loadConfig` の定義の場所（Effective configuration の owner。呼び出し元ではない）'],
+    // T24d（Task 24 の設計書 4.2）: 監査のワーカーは、CLI と同じ監査の入口（画面から始めた監査を動かす）。設定の意味の owner は
+    // `load-config.ts` のまま。上書きは、CLI の `--headless` に当たるもの（`WORKER_CONFIG_OVERRIDES`）だけ。
+    // T25d: ワーカーの入口の組み立てを `audit-worker-process.ts` に移した（入口 `audit-worker.ts` は、それを呼ぶだけ）。
+    [
+      'src/worker/audit-worker-process.ts: ../config/load-config.js',
+      'ワーカーの入口が、CLI と同じ `loadConfig` を、ワーカーの流れに渡す（Task 24 の設計書 4.2。設定の owner は変えない）',
+    ],
+    [
+      'src/worker/audit-worker-session.ts: loadConfig(',
+      'ワーカーの流れが、入口から渡された `loadConfig` を、検証した `START` のパスと `--headless` に当たる上書きだけで呼ぶ（Task 24 の設計書 4.2）',
+    ],
   ]),
   'ARCH03-extraction': new Map([
     [
@@ -612,7 +680,15 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'レイアウトの要素の種類（link）の分類と、大きさ0の操作できる要素の判定のセレクタ。href の値を読まない',
     ],
   ]),
-  'ARCH03-discovery': new Map(),
+  'ARCH03-discovery': new Map([
+    // T27d（Task 27 の設計書 4.2、T27d の指示書の「リンクの抽出（`discoverLinks`）を使って」）: 発見のジョブは、監査の Page Auditor を通らずに
+    // 管理画面を巡回する（今の監査の流れに手を入れないため。設計書 3 章）。リンクの抽出は、唯一の入口 `discoverLinks` を同じページで 1 回だけ
+    // 呼ぶ（抽出を書き写さない。Link の Evidence は作らない）。
+    [
+      'src/worker/discovery-run.ts',
+      '発見のジョブの巡回（Task 27 の設計書 3 章、4.2）が、リンクの抽出の唯一の入口 `discoverLinks` を、発見と同じページで 1 回だけ呼ぶ',
+    ],
+  ]),
   ARCH04: new Map([
     [
       'src/safety/request-policy.ts: .has(candidate.origin)',
@@ -634,13 +710,104 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'src/interaction/discover-candidates.ts: .origin ===',
       'Interaction の候補の hrefKind（文書と同じ Origin か）の Evidence。Interaction の受け入れの owner は `src/safety/interaction-policy.ts`',
     ],
+    // T27e（Task 27 の設計書 4.5、3 章の「READ は URL を組み立てて GET で読む」）: READ の URL は、候補の送信先（Origin と path）に、定義の送る値だけを
+    // form の GET と同じ符号化で付けて組み立てる（巡回の正規化 `normalizeUrl` は通さない、と設計書が決めている）。組み立てた URL の受け入れは、
+    // 読み込む前にワーカーが要求の判定の owner（`classifyPassiveRequest`）で行う（`src/worker/read-check-run.ts` の `isReadUrlAllowed`）。
+    [
+      'src/discovery/read-check-evaluation.ts: .pathname =',
+      'READ の URL の組み立て（候補の送信先の path を置く。設計書 4.5。巡回の正規化を通さない）。受け入れは `classifyPassiveRequest`',
+    ],
+    [
+      'src/discovery/read-check-evaluation.ts: new URLSearchParams(',
+      'READ の URL の組み立て（定義の送る値を、form の GET と同じ符号化で付ける。設計書 4.5）。受け入れは `classifyPassiveRequest`',
+    ],
+    [
+      'src/discovery/read-check-evaluation.ts: .origin}${url.pathname',
+      'READ の URL の組み立て（Origin と path と、送る値だけの query をつなぐ。設計書 4.5）。受け入れは `classifyPassiveRequest`',
+    ],
+    [
+      'src/discovery/read-check-evaluation.ts: .origin !==',
+      'READ の URL の組み立てで、送信先の path が Origin を変えない（`//` で始まる path など）かの入力の検証。受け入れの判定ではない',
+    ],
+    [
+      'src/discovery/read-check-evaluation.ts: !== action.origin',
+      'READ の URL の組み立てで、送信先の path が Origin を変えない（`//` で始まる path など）かの入力の検証。受け入れの判定ではない',
+    ],
     [
       'src/audit/technical-rules.ts: .origin ===',
       '`normalizeUrl` が受け入れなかったリンク（正規化した URL がなく、`classifyUrl` にかけられない）を、ページと同じ Origin かで内部とみなす Rule の判定。page rule の入力には許可 Origin がない',
     ],
   ]),
-  ARCH05: new Map(),
-  ARCH06: new Map(),
+  ARCH05: new Map([
+    // T24d（Task 24 の設計書 4.3）: IPC の契約は、中核の結果の Run Status を写すだけで、決めない。`null` は Run Status を持たない結果の種類。
+    [
+      'src/control/worker-protocol.ts: runStatus: RunStatus | null',
+      'IPC の契約の型の注記（Run Status を持たない結果の種類では null）。Run Status を決めない',
+    ],
+    [
+      'src/worker/audit-worker-session.ts: runStatus: null',
+      'Run Status を持たない結果の種類（RUN_ACTIVE、VERSION_MISMATCH、RESUME_UNAVAILABLE）の IPC の写し。Run Status を決めない',
+    ],
+    // T27d（Task 27 の設計書の変更履歴「Blocker: T27d」の行）: 発見のジョブは監査の Run（`run.json`）を作らない。発見の Run Status の owner は
+    // `src/discovery/discovery-result.ts` の `discoveryRunStatusOf`。Run のディレクトリを作れなかったときだけ、監査の
+    // `RUN_DIRECTORY_UNAVAILABLE`（`deriveRunStatus` が `FAILED` と導く）と同じ値を、結果の型の値として返す。
+    // T27e: Run のディレクトリとロックの部品を、READ の確かめのジョブと共有するために `worker-run-session.ts` に切り出した（振る舞いは同じ）。
+    [
+      "src/worker/worker-run-session.ts: runStatus: 'FAILED'",
+      '発見と READ の確かめのジョブの、Run のディレクトリを作れなかった結果（監査の RUN_DIRECTORY_UNAVAILABLE と同じ FAILED）。監査の Run の Run Status は決めない',
+    ],
+    [
+      'src/discovery/discovery-result.ts: deriveRunStatus(',
+      '発見の Run Status は、発見の事実を Run Status の入力に写して、唯一の判定 `deriveRunStatus` に任せる（判定を書き写さない）',
+    ],
+    [
+      'src/discovery/discovery-result.ts: ): RunStatus =>',
+      '`discoveryRunStatusOf` は、`deriveRunStatus` の結果をそのまま返す（入力を写すだけ。判定はしない）',
+    ],
+    [
+      'src/worker/discovery-run.ts: runStatus: discoveryRunStatusOf(crawled',
+      '成果物 discovery.json の Run Status に、`deriveRunStatus` に任せた `discoveryRunStatusOf` の結果を入れる（判定はしない）',
+    ],
+    // T27e（Task 27 の設計書 4.5）: READ の確かめのジョブも監査の Run（`run.json`）を作らない。READ の確かめの Run Status の owner は
+    // `src/discovery/read-check-evaluation.ts` の `readEvidenceRunStatusOf`（事実を `deriveRunStatus` の入力に写すだけ）。
+    [
+      'src/discovery/read-check-evaluation.ts: deriveRunStatus(',
+      'READ の確かめの Run Status は、事実を Run Status の入力に写して、唯一の判定 `deriveRunStatus` に任せる（判定を書き写さない）',
+    ],
+    [
+      'src/discovery/read-check-evaluation.ts: ): RunStatus =>',
+      '`readEvidenceRunStatusOf` は、`deriveRunStatus` の結果をそのまま返す（入力を写すだけ。判定はしない）',
+    ],
+    // T30f（Task 30 の設計書 3 章の「記録」）: 書き込みのジョブも監査の Run（`run.json`）を作らない。書き込みの Run Status は、書き込みの流れの
+    // `writeRunStatusOf`（事実を `deriveRunStatus` の入力に写すだけ）。
+    [
+      'src/worker/write-create-run.ts: deriveRunStatus(',
+      '書き込みの Run Status は、事実を Run Status の入力に写して、唯一の判定 `deriveRunStatus` に任せる（判定を書き写さない）',
+    ],
+    [
+      'src/worker/write-create-run.ts: ): RunStatus =>',
+      '`writeRunStatusOf` は、`deriveRunStatus` の結果をそのまま返す（入力を写すだけ。判定はしない）',
+    ],
+    [
+      'src/worker/write-create-run.ts: runStatus = writeRunStatusOf(outcome.result',
+      '書き込みのジョブの結果の Run Status に、`deriveRunStatus` に任せた `writeRunStatusOf` の結果を入れる（判定はしない）',
+    ],
+    [
+      'src/worker/read-check-run.ts: runStatus: readEvidenceRunStatusOf(base',
+      '成果物 read-evidence.json の Run Status に、`deriveRunStatus` に任せた `readEvidenceRunStatusOf` の結果を入れる（判定はしない）',
+    ],
+  ]),
+  ARCH06: new Map([
+    // T24h-1 の M3: IPC の契約が、ターゲット JSON のファイルの内容の SHA-256 を求める（親の検証とワーカーの読み込みの間に、設定が変わって
+    // いないことの確かめ）。Finding の fingerprint ではない（Finding の fingerprint の owner は `createFindingFingerprint` のまま）。
+    // SHA-256 の計算は、CCX-11（CC-059）で `src/core/ids.ts` の `sha256HexOfBytes`・`sha256HexOfText` に移したので、計算の除外はもうない。
+    ['src/control/worker-protocol.ts: literal "/targetConfigSha256 must match "', '`START` の項目の名前（`targetConfigSha256`）を含む、英語の検証の誤りの文'],
+    // T25d: 同じ方式で、認証の設定の文書と許可 Origin の SHA-256（`workerAuthenticationDigestOf`）を求める。Finding の fingerprint ではない。
+    [
+      'src/control/worker-protocol.ts: literal "/authentication/authenticationSha256 must match "',
+      '`START` の項目の名前（`authenticationSha256`）を含む、英語の検証の誤りの文',
+    ],
+  ]),
   'ARCH07-registry': new Map([
     [
       'src/audit/cross-page-rules.ts: RULE_CATALOG',
@@ -657,6 +824,26 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/orchestration/preflight.ts: writeFile(',
       'PREFLIGHT が、出力先に書けるかを、空の一時ファイルを新しく作ってすぐ消して確かめる（artifact ではない）',
+    ],
+    // T26a（Task 26 の設計書 4.1）: 資格情報のファイル（`local/secrets/`。Run の artifact ではない）の唯一の owner が、一時のファイルに書いて
+    // fsync してから rename する。境界は `tests/architecture/credential-boundary.test.ts`。
+    // T27d（Task 27 の設計書の変更履歴「T27b・T27c の報告と T27d の前の判断」の (3)、「Blocker: T27d」の行）: ジョブの管理（親）が、ワーカーが
+    // ArtifactWriter で書いた `discovery.json` を読み、成果物のスキーマの検証の owner（`validateArtifact`）で確かめてから、索引を更新する。
+    // `src/control/` は ArtifactWriter（`src/report/`。`src/safety/` を読み込む）を import できない（`control-boundary.test.ts` の (b)）ので、
+    // 検証の関数そのものを呼ぶ。検証器は作らない（Ajv は使わない）。
+    [
+      'src/control/job/audit-job-manager.ts: validateArtifact(',
+      '発見のジョブの終わりに、ワーカーの書いた discovery.json を、成果物のスキーマで確かめる（Task 27 の設計書の変更履歴「Blocker: T27d」）',
+    ],
+    // T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: ジョブの管理（親）が、書き込みのジョブの締めで、ワーカーが ArtifactWriter で
+    // 書いた書き込みの報告の 2 つの JSON を、成果物のスキーマの検証の owner で確かめる（上の T27d と同じ理由。検証器は作らない）。書かない。
+    [
+      'src/control/job/write-report-check.ts: validateArtifact(',
+      '書き込みのジョブの締めに、ワーカーの書いた action-evidence.json と approval-summary.json を、成果物のスキーマで確かめる（Task 32 の設計書 4.1）',
+    ],
+    [
+      'src/control/credentials/credential-store.ts: writeFile(',
+      '資格情報のファイルの置き換え（一時のファイルの `FileHandle.writeFile`）。最終の JSON・HTML・バンドルの書き出しではない（Task 26 の設計書 4.1）',
     ],
   ]),
 };
@@ -707,6 +894,8 @@ const RULE_CATALOG_OWNER = 'src/audit/rule-catalog.ts';
 const CROSS_PAGE_RULES_OWNER = 'src/audit/cross-page-rules.ts';
 const SCHEMA_VALIDATION_OWNER = 'src/core/schema-validator.ts';
 const PREFLIGHT = 'src/orchestration/preflight.ts';
+/** `createSchemaValidatorRegistry` を呼べるファイル（定義の owner と、Control のスキーマの検証の部品。T22d）。 */
+const SCHEMA_VALIDATOR_REGISTRY_USERS: readonly string[] = [SCHEMA_VALIDATION_OWNER, 'src/control/control-schema-validator.ts'];
 
 /** page rule のファイル（`src/audit/*-rules.ts`。Cross-page rule のファイルを除く）。 */
 const isPageRuleFile = (path: string): boolean => /^src\/audit\/[^/]+-rules\.ts$/u.test(path) && path !== CROSS_PAGE_RULES_OWNER;
@@ -728,10 +917,6 @@ const INDIVIDUAL_PASSIVE_PAGE_CLOSE_DEFINITIONS: ReadonlyMap<string, {
   ['src/browser/context-factory.ts', {
     defines: /\basync\s+closePassivePage\s*\(/u,
     allowedCalls: [{ call: 'closePassiveGuardedPage(', within: /\basync\s+closePassivePage\s*\(/u }],
-  }],
-  ['src/orchestration/passive-session-close.ts', {
-    defines: /\bexport\s+async\s+function\s+closePassivePageBeforeDeadline\s*\(/u,
-    allowedCalls: [{ call: 'closePassivePage(', within: /\bexport\s+async\s+function\s+closePassivePageBeforeDeadline\s*\(/u }],
   }],
 ]);
 
@@ -859,6 +1044,16 @@ describe('GATE-ARCH02〜08 Semantic Ownership', () => {
       ...detectIn(filesOtherThan([SCHEMA_VALIDATION_OWNER]), findSchemaValidatorUses),
       ...detectIn(filesOtherThan([ARTIFACT_WRITER]), findFinalFileWrites),
     ]);
+    expect(violations).toEqual([]);
+  });
+
+  // Task 22 の T22d（T22R の I2）: スキーマの検証器を作れるのは、成果物のスキーマの検証の owner（定義）と、Control のスキーマの検証の
+  // 部品の 2 つだけ（ほかのファイルが、閉じたスキーマの名前の一覧を通らずに、検証器を作らない）。
+  it('GATE-ARCH08 (T22d): only the schema validation owner and the Control schema validator can call createSchemaValidatorRegistry', () => {
+    for (const user of SCHEMA_VALIDATOR_REGISTRY_USERS) {
+      expect(findSchemaValidatorRegistryReferences(sourceFile(user)).length, user).toBeGreaterThan(0);
+    }
+    const violations = detectIn(filesOtherThan(SCHEMA_VALIDATOR_REGISTRY_USERS), findSchemaValidatorRegistryReferences).map(detectionKey);
     expect(violations).toEqual([]);
   });
 });

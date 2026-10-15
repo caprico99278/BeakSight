@@ -13,8 +13,7 @@
 // - サーバは、このテストの中の 127.0.0.1 の `node:http` のサーバだけを使う。
 // - 証拠の部品の上限、session を閉じた後、区別できない場合は、偽の page の session と偽の Context で確かめる（DEF-026 のテストのやり方）。
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Page, type Request } from 'playwright';
@@ -42,8 +41,10 @@ import {
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGateFactory } from '../helpers/gate-harness.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
+import { createGuardHarness, createHarnessPage, GUARD_HARNESS_ROOT_FRAME_ID } from '../helpers/passive-guard-harness.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
 
 /** ブラウザが文書の要求を取り消したときの、失敗の理由（Playwright の `requestfailed` と CDP の `Network.loadingFailed` の `errorText`）。 */
@@ -155,9 +156,9 @@ afterEach(async () => {
 async function startCancelServer(): Promise<CancelServer> {
   const requests: ReceivedRequest[] = [];
   const waiters: Array<{ readonly pathname: string; readonly resolve: () => void }> = [];
-  const server = createServer((request, response: ServerResponse) => {
+  const server = await startLoopbackHttpServer((request, response: ServerResponse) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
-    const received: ReceivedRequest = { method: request.method ?? '', pathname, abortedByClient: false };
+    const received: ReceivedRequest ={ method: request.method ?? '', pathname, abortedByClient: false };
     requests.push(received);
     response.on('close', () => {
       if (!response.writableFinished) received.abortedByClient = true;
@@ -209,12 +210,10 @@ async function startCancelServer(): Promise<CancelServer> {
         response.end('not found\n');
     }
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address() as AddressInfo;
   const getCount = (pathname: string): number =>
     requests.filter((entry) => entry.method === 'GET' && entry.pathname === pathname).length;
   const started: CancelServer = {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     requests,
     received: (pathname) => {
       if (getCount(pathname) > 0) return Promise.resolve();
@@ -223,10 +222,7 @@ async function startCancelServer(): Promise<CancelServer> {
       return deferred.promise;
     },
     getCount,
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: server.close,
   };
   servers.push(started);
   return started;
@@ -629,29 +625,8 @@ function dropLoadingFailed(real: CDPSession): CDPSession {
 // 偽の page の session と偽の Context（証拠の部品の上限、session を閉じた後、区別できない場合。DEF-026 のテストのやり方）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 偽の Context と page の session の、事象の受け渡し。 */
-class FakeEmitter {
-  readonly #listeners = new Map<string, Set<(value: unknown) => void>>();
-
-  on(event: string, listener: (value: unknown) => void): this {
-    const listeners = this.#listeners.get(event) ?? new Set<(value: unknown) => void>();
-    listeners.add(listener);
-    this.#listeners.set(event, listeners);
-    return this;
-  }
-
-  off(event: string, listener: (value: unknown) => void): this {
-    this.#listeners.get(event)?.delete(listener);
-    return this;
-  }
-
-  emit(event: string, value?: unknown): void {
-    for (const listener of [...(this.#listeners.get(event) ?? [])]) listener(value);
-  }
-}
-
 const FAKE_ORIGIN = 'https://example.test';
-const FAKE_ROOT_FRAME_ID = 'root-frame';
+const FAKE_ROOT_FRAME_ID = GUARD_HARNESS_ROOT_FRAME_ID;
 
 interface FakeCommand {
   readonly method: string;
@@ -672,58 +647,31 @@ interface FakeGuard {
   emitRequestFailed(request: Request): void;
 }
 
-/** 偽の Context に Guard を取り付け、偽の page を Guard の準備ができた状態にする。 */
+/**
+ * 偽の Context に Guard を取り付け、偽の page を Guard の準備ができた状態にする。偽の Context と page の session と page は、
+ * Guard のテストの共通の補助（`createGuardHarness`・`createHarnessPage`。CC-044）で作る。session の命令の応答は `respond` で決め、
+ * `Page.getFrameTree` には main frame（`FAKE_ROOT_FRAME_ID`）を返す。
+ */
 async function startFakeGuard(respond: FakeResponder = () => undefined): Promise<FakeGuard> {
-  const contextEvents = new FakeEmitter();
-  const sessionEvents = new FakeEmitter();
-  const commands: FakeCommand[] = [];
-  const pages: Page[] = [];
-  const session = {
-    on: (event: string, listener: (value: unknown) => void) => sessionEvents.on(event, listener),
-    off: (event: string, listener: (value: unknown) => void) => sessionEvents.off(event, listener),
-    send: async (method: string, params?: FakeCommand['params']): Promise<unknown> => {
-      commands.push({ method, params });
-      const responded = respond(method, params);
-      if (responded !== undefined) return responded;
-      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: FAKE_ROOT_FRAME_ID } } };
-      return undefined;
-    },
-  };
-  const context = {
-    pages: () => pages,
-    on: (event: string, listener: (value: unknown) => void) => contextEvents.on(event, listener),
-    off: (event: string, listener: (value: unknown) => void) => contextEvents.off(event, listener),
-    newCDPSession: async () => session as unknown as CDPSession,
-    // DEF-040: Guard は、ページを作る前に、Worker の中の WebSocket を止める CSP の初期化のスクリプトを Context に付ける（偽の Context では何もしない）。
-    addInitScript: async () => undefined,
-    routeWebSocket: async () => undefined,
-    route: async () => undefined,
-    close: async () => undefined,
-  } as unknown as BrowserContext;
-  const page = {
-    context: () => context,
-    isClosed: () => false,
-    url: () => `${FAKE_ORIGIN}/`,
-    on: () => page,
-    off: () => page,
-  } as unknown as Page;
+  const harness = createGuardHarness({ cdpSendOverride: (method, params) => respond(method, params as FakeCommand['params']) });
   const ledger = new SafetyLedger();
-  await installPassiveRequestGuard(context, ledger, new Set([FAKE_ORIGIN]));
-  pages.push(page);
-  contextEvents.emit('page', page);
+  await installPassiveRequestGuard(harness.context, ledger, new Set([FAKE_ORIGIN]));
+  const page = createHarnessPage(harness, { url: `${FAKE_ORIGIN}/` });
   await awaitPassiveRequestGuardReady(page);
-  fakeGuards.push(context);
+  fakeGuards.push(harness.context);
   return {
     ledger,
     page,
-    context,
-    commands,
+    context: harness.context,
+    commands: harness.cdpCommandLog as readonly FakeCommand[],
     // DEF-042: この偽の Guard が送る `Fetch.requestPaused` は、すべて main frame の文書の要求なので、`resourceType` を `Document` にして渡す。
-    emitCdp: (method, params) => sessionEvents.emit(
+    emitCdp: (method, params) => harness.emitCdp(
       method,
       method === 'Fetch.requestPaused' ? { resourceType: 'Document', ...(params as object) } : params,
     ),
-    emitRequestFailed: (request) => contextEvents.emit('requestfailed', request),
+    emitRequestFailed: (request) => {
+      void harness.requestFailedHandler?.(request);
+    },
   };
 }
 

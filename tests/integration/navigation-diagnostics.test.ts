@@ -8,8 +8,7 @@
 // - 事象の順の組み合わせ（リダイレクトの応答の ExtraInfo が、次の要求の発行の後に届く、ネットワークに出ない内部のリダイレクト）と、上限と、
 //   観察を始められない場合の一部は、偽の CDP の session で確かめる（`main-frame-load.test.ts` の偽の page と同じやり方）。
 import { EventEmitter } from 'node:events';
-import { createServer, type IncomingHttpHeaders, type ServerResponse } from 'node:http';
-import type { AddressInfo, Socket } from 'node:net';
+import type { IncomingHttpHeaders, ServerResponse } from 'node:http';
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
@@ -18,6 +17,7 @@ import {
   MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
   NAVIGATION_DIAGNOSTICS_CDP_COMMANDS,
   NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE,
+  registerEgressUpstreamAddressSource,
   startNavigationDiagnostics,
 } from '../../src/browser/navigation-diagnostics.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
@@ -36,6 +36,7 @@ import {
 import { launchHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGateFactory, withGuardedPassivePage, withUnguardedPage } from '../helpers/gate-harness.js';
+import { LOOPBACK_HOST, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 
 /** 終わる読み込み（200、リダイレクト）の Playwright の期限（ms）。読み込みは数十 ms で終わるので、十分に長くする。 */
 const COMPLETING_LOAD_TIMEOUT_MS = 10_000;
@@ -52,7 +53,6 @@ const START_TIMEOUT_MS = SESSION_OPEN_TIMEOUT_MS;
 const OK_STATUS = 200;
 const FOUND_STATUS = 302;
 const NOT_FOUND_STATUS = 404;
-const LOOPBACK_ADDRESS = '127.0.0.1';
 const HTML_TYPE = Object.freeze({ 'Content-Type': 'text/html; charset=utf-8' });
 
 /** サーバのパス（パスごとに応答の種類が決まる。`startDiagnosticsServer`）。 */
@@ -124,36 +124,17 @@ function respond(pathname: string, response: ServerResponse): void {
 
 async function startDiagnosticsServer(): Promise<DiagnosticsServer> {
   const requests: ReceivedRequest[] = [];
-  const sockets = new Set<Socket>();
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split('?', 1)[0] ?? '/';
     requests.push({ pathname, headers: request.headers });
     respond(pathname, response);
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen({ host: LOOPBACK_ADDRESS, port: 0 }, resolve);
-  });
-  const { port } = server.address() as AddressInfo;
-  let closing: Promise<void> | undefined;
   const diagnosticsServer: DiagnosticsServer = {
-    origin: `http://${LOOPBACK_ADDRESS}:${port}`,
-    port,
+    origin: server.origin,
+    port: server.port,
     requests,
     count: (pathname) => requests.filter((request) => request.pathname === pathname).length,
-    close: () => {
-      closing ??= new Promise<void>((resolve, reject) => {
-        for (const socket of sockets) {
-          socket.destroy();
-        }
-        server.close((error) => (error === undefined ? resolve() : reject(error)));
-      });
-      return closing;
-    },
+    close: server.close,
   };
   servers.push(diagnosticsServer);
   return diagnosticsServer;
@@ -218,7 +199,7 @@ function expectAnswered(
     method: 'GET',
     truncated: false,
     httpStatus: expected.status,
-    remoteIpAddress: LOOPBACK_ADDRESS,
+    remoteIpAddress: LOOPBACK_HOST,
     remotePort: expected.port,
   });
   expectWithinObservation(diagnostics, hop?.issuedAtMs ?? null);
@@ -342,6 +323,58 @@ describe.each(CHROMIUM_BUILDS)('startNavigationDiagnostics in a Guarded Passive 
     expectWithinObservation(observed, hop?.issuedAtMs ?? null);
     expect(request.loadingFinishedAtMs).toBeNull();
     expect(request.loadingFailure).toBeNull();
+  });
+
+  /**
+   * DEF-085 fix round 2: Passive の Context は出口の中継を通るので、CDP の応答の接続先は中継の待ち受けのアドレスになる。診断の記録には、
+   * 中継の待ち受けのアドレスを記録せず、中継が覚えた上流の相手（サーバ）のアドレスを記録する。中継が上流の相手のアドレスを引けない URL は
+   * `null` にする（中継の待ち受けのアドレスにはしない）。中継の待ち受けのアドレスは、Playwright の `response.serverAddr()` で知る。
+   */
+  it('records the upstream server instead of the listening address of the egress proxy, and null when the proxy cannot tell it (DEF-085)', async () => {
+    const server = await startDiagnosticsServer();
+    const url = `${server.origin}${PATHS.ok}`;
+
+    const outcome = await withGuardedPassivePage(createGateFactory(browser, server.origin), viewport, async (page, context) => {
+      const first = await observeLoad(page, url, COMPLETING_LOAD_TIMEOUT_MS);
+      const proxyAddress = (await (await page.goto(url, { waitUntil: 'domcontentloaded' }))?.serverAddr()) ?? null;
+      // 同じ Context の口を、上流の相手のアドレスを引けない口に差し替える（待ち受けのアドレスと port は本物の中継のもの）。
+      if (proxyAddress !== null) {
+        registerEgressUpstreamAddressSource(context, {
+          listenAddress: proxyAddress.ipAddress,
+          listenPort: proxyAddress.port,
+          upstreamAddressOf: () => null,
+        });
+      }
+      const unknown = await observeLoad(page, url, COMPLETING_LOAD_TIMEOUT_MS);
+      return { first, unknown, proxyAddress };
+    }, { expectNoViolations: true });
+
+    // 中継を通っている（Playwright が見る接続先は、中継の待ち受けのアドレスで、サーバの port ではない）。
+    expect(outcome.proxyAddress).not.toBeNull();
+    expect(outcome.proxyAddress?.port).not.toBe(server.port);
+    const firstHop = onlyDocumentRequest(expectObserved(outcome.first.diagnostics)).hops[0];
+    expect(firstHop).toMatchObject({ remoteIpAddress: LOOPBACK_HOST, remotePort: server.port });
+    expect(firstHop?.remotePort).not.toBe(outcome.proxyAddress?.port);
+    const unknownHop = onlyDocumentRequest(expectObserved(outcome.unknown.diagnostics)).hops[0];
+    expect(unknownHop).toMatchObject({ httpStatus: OK_STATUS, remoteIpAddress: null, remotePort: null });
+  });
+
+  it('records the null address, never the listening address of the egress proxy, when the upstream refuses the connection (DEF-085)', async () => {
+    const refused = await startDiagnosticsServer();
+    const refusedUrl = `${refused.origin}${PATHS.ok}`;
+    await refused.close();
+
+    const load = await withGuardedPassivePage(
+      createGateFactory(browser, refused.origin),
+      viewport,
+      (page) => observeLoad(page, refusedUrl, COMPLETING_LOAD_TIMEOUT_MS),
+      { expectNoViolations: true },
+    );
+
+    expect(load.loadRejected).toBe(true);
+    const request = onlyDocumentRequest(expectObserved(load.diagnostics));
+    expect(request.hops[0]).toMatchObject({ url: refusedUrl, httpStatus: null, remoteIpAddress: null, remotePort: null });
+    expect(request.loadingFailure?.errorText).toEqual(expect.any(String));
   });
 
   it('records a 302 redirect and its 200 target as two hops of the same document request', async () => {

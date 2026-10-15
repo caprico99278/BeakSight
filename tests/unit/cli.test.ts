@@ -1268,15 +1268,12 @@ describe('CLI run: the bundle line of the result', () => {
     expect(runSummaryLines(summary, 'out')).not.toContain(`${BUNDLE_PREFIX}${join('out', 'beaksight-audit-bundle.zip')}`);
   });
 
-  it('uses the last item of the executions of the view model as it is', () => {
+  // CCX-19（CC-048）: 最後の実行の終わりの時刻は、表示用モデルの `executions.lastFinishedAt` のまま使う（CLI の側で実行の記録から決め直さない）。
+  it('uses the lastFinishedAt of the executions of the view model as it is', () => {
     const { summary } = buildReportViewModel(auditRun());
-    const [execution] = summary.executions.items;
     const altered = {
       ...summary,
-      executions: {
-        ...summary.executions,
-        items: [execution, { ...execution, finishedAt: '2026-10-08T15:09:30.000Z' }] as const,
-      },
+      executions: { ...summary.executions, lastFinishedAt: '2026-10-08T15:09:30.000Z' },
     };
 
     expect(bundleLinesOf(runSummaryLines(altered, 'out'))).toEqual([

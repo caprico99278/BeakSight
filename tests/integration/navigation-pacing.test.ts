@@ -6,12 +6,14 @@
 //   「k 番目の開始 ≦ k 番目の要求 ≦ k+1 番目の開始」（どの要求も、それぞれの開始の後に送られた）と、「開始の間隔 ≧ 設定」を確かめる。
 //   要求の数は、fixture のサーバが受け取った数とも比べる。
 //   RL-fix（RL の Minor-4 (b)）: ページの監査の間隔は、サーバの側で受け取った文書の要求の時刻の間隔でも確かめる（テストの中だけの
-//   小さなサーバで、受け取った時刻を記録する）。
+//   小さなサーバで、受け取った時刻を記録する）。サーバの側の間隔は、開始から届くまでの遅れの分だけ揺れるので、従の確かめとして、
+//   根拠を測った許容（`SERVER_ARRIVAL_DELAY_TOLERANCE_MS`。DEF-034-fix）を置いていた（DEF-100 fix から 0）。開始の間隔も許容なしに確かめる。
+//   DEF-100 fix: pacer は、開始と、前の読み込みの文書の要求を送った時刻・その応答を受けた時刻（Guard が記録する）の最も遅い方から間隔を
+//   数える。サイトに届く間隔が設定以上であることは、間隔の待ちの後の Context の作成を遅らせた場合（ページの監査と Run）で、許容なしで確かめる。
 // - 期限から待ち時間を除く: ページの期限より長い待ちがあっても、Passive の監査、幅の走査、1件目の Interaction の候補が期限切れにならない。
 //   RL-fix（RL の Minor-4 (a)）: 延ばし過ぎ（例: 待った時間の2倍）も見分ける。注入した時計と、期限を受け取る collector に渡された期限で、
 //   延長の量そのものを確かめる。Interaction の段階は、期限で止まるはずの候補が、待った時間 + 期限で止まることを確かめる。
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,9 +36,10 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditCollectors } from '../../src/orchestration/page-auditor.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { overrideBrowser } from '../helpers/browser-proxies.js';
+import { browserDelayingNewContext, overrideBrowser } from '../helpers/browser-proxies.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
-import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
+import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
+import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createRunLauncher } from '../helpers/run-harness.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -59,7 +62,7 @@ const PACING_OVERRIDES: TestConfigOverrides = {
 
 let browser: Browser;
 const servers: FixtureServer[] = [];
-const timedServers: Server[] = [];
+const timedServers: LoopbackHttpServer[] = [];
 const temporaryDirectories: string[] = [];
 const runLaunchers: ReturnType<typeof createRunLauncher>[] = [];
 
@@ -80,8 +83,7 @@ afterEach(async () => {
     await server.close();
   }
   for (const server of timedServers.splice(0)) {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await server.close();
   }
   for (const directory of temporaryDirectories.splice(0)) {
     await rm(directory, { recursive: true, force: true });
@@ -115,7 +117,7 @@ interface ReceivedRequest {
 async function startTimedTogglePageServer(): Promise<{ readonly origin: string; readonly received: readonly ReceivedRequest[] }> {
   const body = await readFile(fileURLToPath(new URL(`../../fixtures/site${TOGGLE_PAGE}`, import.meta.url)), 'utf8');
   const received: ReceivedRequest[] = [];
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
     received.push({ pathname, atMs: Date.now() });
     const found = pathname === TOGGLE_PAGE;
@@ -124,18 +126,7 @@ async function startTimedTogglePageServer(): Promise<{ readonly origin: string; 
     response.end(found ? body : 'not found\n');
   });
   timedServers.push(server);
-  const port = await new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('the timed server has no port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-  return { origin: `http://127.0.0.1:${port}`, received };
+  return { origin: server.origin, received };
 }
 
 /** ページの読み込み（main frame のナビゲーション）の要求。`atMs` は、Node 側で事象を受けた時刻。 */
@@ -173,15 +164,11 @@ function recordingDocumentRequests(real: Browser, requests: DocumentRequest[]): 
 
 /** `pacer` の待ちを通すたびに、記録された読み込みの開始の時刻を `starts` に記録する（待ちと記録は `pacer` が行う）。 */
 function recordingPacer(pacer: NavigationPacer, starts: number[]): NavigationPacer {
-  return {
-    beforeNavigation: async () => {
-      const waitedMs = await pacer.beforeNavigation();
-      starts.push(pacer.snapshot().lastNavigationStartedAtMs ?? Number.NaN);
-      return waitedMs;
-    },
-    snapshot: () => pacer.snapshot(),
-    raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
-  };
+  return forwardingNavigationPacer(pacer, async () => {
+    const waitedMs = await pacer.beforeNavigation();
+    starts.push(pacer.snapshot().lastNavigationStartedAtMs ?? Number.NaN);
+    return waitedMs;
+  });
 }
 
 /** k 番目の要求が k 番目の開始の後に送られ、開始の間隔が `intervalMs` 以上である。 */
@@ -195,7 +182,7 @@ function expectPacedRequests(starts: readonly number[], requests: readonly Docum
       expect(request.atMs, `request ${index} is sent before the next start`).toBeLessThanOrEqual(nextStart);
     }
     if (index > 0) {
-      expect(start - (starts[index - 1] ?? Number.NaN), `interval before navigation ${index}`).toBeGreaterThanOrEqual(intervalMs);
+      expect(start - (starts[index - 1] ?? Number.NaN), `pacer-side interval before navigation ${index}`).toBeGreaterThanOrEqual(intervalMs);
     }
   }
 }
@@ -239,7 +226,8 @@ async function auditWith(
 ): Promise<PageAuditOutcome> {
   const allocator = new IdAllocator();
   const auditor = new PageAuditor({
-    contextFactory: new BrowserContextFactory(targetBrowser, config, () => new SafetyLedger()),
+    // 本番（Run Coordinator）と同じく、同じ pacer を factory にも渡す（Guard が送った時刻を記録する。DEF-100 fix）。
+    contextFactory: new BrowserContextFactory(targetBrowser, config, () => new SafetyLedger(), { navigationPacer }),
     config,
     allocator,
     clock: () => new Date(),
@@ -257,17 +245,72 @@ const deadlineReasonsOf = (outcome: PageAuditOutcome): string[] => outcome.resul
     ? [`${code}:${detail ?? ''}`]
     : []));
 
+/**
+ * 届く間隔の test（DEF-100 fix）の、ページの読み込みの最小の間隔（ms）。Passive の監査の後の処理（固定の待ちなど。ループバックの fixture で
+ * 約 1.1 s）と、遅らせた Context の作成（`DESKTOP_CONTEXT_CREATION_DELAY_MS`）を足しても、この間隔に届かないので、pacer は間隔のちょうどまで
+ * 待つ。前の読み込みの要求が、その開始より遅れてサーバに届いた分だけ、開始から数える間隔ではサーバの側の間隔が短くなる（DEF-100）。
+ */
+const ARRIVAL_INTERVAL_MS = 3_000;
+/**
+ * 届く間隔の test で、Desktop の幅の Context（Desktop の Passive の監査と Interaction の候補。どちらも、間隔の待ちの後に作る）の作成を
+ * 遅らせる時間（ms）。混雑した環境で Context の作成が遅い場合（DEF-100 の調査で、CLI の監査で最大約 0.7 s）を作る。ほかの幅の Context
+ * （幅の走査と Mobile）は遅らせない（揺れ）。
+ */
+const DESKTOP_CONTEXT_CREATION_DELAY_MS = 1_200;
+/** 届く間隔の test の設定（`PACING_OVERRIDES` の間隔だけを変える）。 */
+const ARRIVAL_PACING_OVERRIDES: TestConfigOverrides = {
+  ...PACING_OVERRIDES,
+  crawl: { minNavigationIntervalMs: ARRIVAL_INTERVAL_MS },
+};
+
+/** Desktop の幅（`desktopWidth`）の Context だけ、作成を `DESKTOP_CONTEXT_CREATION_DELAY_MS` 遅らせる（`browserDelayingNewContext` に渡す）。 */
+const delayingDesktopContexts = (desktopWidth: number) => (options: Parameters<Browser['newContext']>[0]): number =>
+  (options?.viewport?.width === desktopWidth ? DESKTOP_CONTEXT_CREATION_DELAY_MS : 0);
+
+/** サーバが受け取った順の要求の、受け取った時刻の間隔が、どれも `intervalMs` 以上である（許容なし。DEF-100 fix）。 */
+function expectServerArrivalIntervals(received: readonly ReceivedRequest[], intervalMs: number): void {
+  for (const [index, request] of received.entries()) {
+    if (index > 0) {
+      expect(request.atMs - (received[index - 1]?.atMs ?? Number.NaN), `server-side interval before ${request.pathname} (${index})`)
+        .toBeGreaterThanOrEqual(intervalMs);
+    }
+  }
+}
+
 describe('Navigation pacing of a page audit (load control design 4.1)', () => {
   /**
-   * サーバが受け取った文書の要求の時刻の間隔で許す、設定の間隔からの不足（ms。RL-fix。RL の Minor-4 (b)）。pacer は、待ちの終わりを
-   * 読み込みの開始として記録し、要求がサーバに届くのは、その後である。待ちの終わりから要求が届くまでの時間は、読み込みの種類で違う。
-   * Passive の監査と Interaction の候補では、待った後に Context と page を作ってから読み込み、幅の走査では、セッションを作ってから
-   * 待つので、待った後すぐに読み込む。この違い（Context の作成の揺れ）の分だけ、サーバの側の間隔は、設定の間隔より短くなりうる。
-   * 実装の時点のこの環境では、待ちの終わりから要求が届くまで、Passive と Interaction は約 60〜110 ms、幅の走査は約 10〜20 ms だった。
-   * 間隔のちょうどで待つのは、幅と幅の間と、幅から Interaction の候補の間で、どちらも揺れは数十 ms に収まる（Desktop の Passive から
-   * 1つ目の幅の間は、Passive の監査の固定の待ち（DOM の準備、scroll）のために間隔より長くかかり、待たない）。
+   * サーバが受け取った文書の要求の時刻の間隔で許す、設定の間隔からの不足（ms。RL-fix。RL の Minor-4 (b)。DEF-034-fix で根拠を測り直した）。
+   * DEF-100 fix から 0（許容なし）。pacer は、開始と、前の読み込みの文書の要求を送った時刻・その応答を受けた時刻（Guard が記録する）の最も遅い方
+   * から間隔を数える。応答はサーバが要求を受けた後にしか来ないので、次の要求がサーバに届くのは、前の要求が届いてから必ず間隔以上後である
+   * （下の「前回の遅れ」は、サーバの側の間隔を短くしない）。この名前は、ほかのテスト（`discovery-job-fork.test.ts`、`write-job-harness.ts`、
+   * 画面の `discovery-secret-markers.test.ts`）が根拠として参照するので残す。以下は、DEF-100 fix の前の根拠の記録である。
+   *
+   * 間隔の保証そのものは、pacer の側の開始の時刻（`snapshot().lastNavigationStartedAtMs`）の間隔が設定以上であることで、
+   * `expectPacedRequests` が許容なしで確かめる（主な確かめ）。この許容は、サーバの側の間隔の確かめ（従の確かめ）だけに使う。
+   *
+   * pacer は、待ちの終わりを読み込みの開始として記録し、要求がサーバに届くのは、その後である。「開始から届くまで」を遅れと呼ぶと、
+   * サーバの側の間隔 = pacer の側の間隔 + 今回の遅れ − 前回の遅れ である。今回の遅れは 0 以上（届く時刻 ≧ 開始は別に確かめる）なので、
+   * サーバの側の間隔が pacer の側の間隔より短くなる量は、前回の遅れ以下である。遅れの中身は、読み込みの種類で違う。
+   * - 幅の走査の幅: セッション（Context と page）は待つ前に作るので、待った後は、読み込みの観察の開始（CDP の session と
+   *   `Network.enable`）と、`goto` から要求が Guard を通ってサーバに届くまで、だけである。
+   * - Passive の監査と Interaction の候補: 待った後に Context と page を作り、観察を始めてから読み込む。
+   * この test で間隔のちょうどで待つのは、幅と幅の間と、幅から Interaction の候補の間で、どちらも前回は幅の走査の幅である。
+   * Desktop の Passive から1つ目の幅の間と、Interaction の候補から Mobile の Passive の間は、前回の読み込みの後の処理（Passive の監査の
+   * 固定の待ち、Interaction の操作と落ち着くまでの待ち）が間隔より長くかかるので、サーバの側の間隔も設定の間隔より十分に長い。
+   *
+   * 測った値（DEF-034-fix。2026-10-09、Windows 11、16 論理 CPU。この test を 207 回。混雑は、`tests/integration` の並行の実行
+   * （最大2つ）、この test の並行の実行（最大3つ）、CPU を回し続ける 12 個の process を重ねた。最も重い混雑では、この test 1回が、
+   * 混雑のないときの約 3〜6 倍の時間かかり、全体の検証の中で失敗した 4 回の不足（60〜100 ms 程度）を上回る不足を再現した）:
+   * - 幅の走査の幅の遅れ: 混雑のないとき 9〜20 ms。最も重い混雑で最大 183 ms（内訳は、後の 37 回で測った。観察の開始の
+   *   完了まで最大 113 ms、その後サーバに届くまで最大 77 ms）。
+   * - Passive と Interaction の遅れ（Context の作成と観察の開始を含む）: 混雑のないとき 72〜113 ms、最も重い混雑で最大約 5 s。
+   * - pacer の側の間隔の最小: 1,000 ms（設定どおり。設定より短い回は 0 回）。
+   * - サーバの側の間隔の最小: 幅と幅の間 931 ms、幅から Interaction の候補の間 1,076 ms、Desktop の Passive から1つ目の幅の間
+   *   1,204 ms、Interaction の候補から Mobile の Passive の間 1,311 ms。
+   * DEF-100 fix の前の許容は、ちょうどで待つ間隔の前回（幅の走査の幅）の遅れの最大 183 ms に、余裕を足した 250 ms だった（その前の 50 ms は、
+   * 混雑のないときの遅れだけを根拠にしていたので、混雑のときに足りなかった。DEF-034）。
    */
-  const CONTEXT_CREATION_JITTER_TOLERANCE_MS = 50;
+  const SERVER_ARRIVAL_DELAY_TOLERANCE_MS = 0;
 
   it('starts every page navigation (Passive, stress widths, Interaction candidates) at least the interval after the previous one', async () => {
     const server = await startTimedTogglePageServer();
@@ -284,20 +327,44 @@ describe('Navigation pacing of a page audit (load control design 4.1)', () => {
     const received = server.received.filter(({ pathname }) => pathname === TOGGLE_PAGE);
     expect(received).toHaveLength(5);
     expect(pacer.snapshot().navigationCount).toBe(5);
+    // 主な確かめ: pacer の側の開始の時刻の間隔は、設定の間隔以上である（許容なし）。要求は、それぞれの開始の後に送られる。
     expectPacedRequests(starts, requests, PACING_INTERVAL_MS);
-    // サーバの側でも、文書の要求は、それぞれの読み込みの開始の後に届き、受け取った時刻の間隔は、設定の間隔（Context の作成の揺れの
-    // 分を除く）以上である。
+    // 従の確かめ: サーバの側でも、文書の要求は、それぞれの読み込みの開始の後に届き、受け取った時刻の間隔は、設定の間隔から
+    // 前回の読み込みの遅れの分（`SERVER_ARRIVAL_DELAY_TOLERANCE_MS` の説明を参照）を除いた長さ以上である。
     for (const [index, request] of received.entries()) {
       expect(request.atMs, `request ${index} reaches the server after its start`).toBeGreaterThanOrEqual(starts[index] ?? Number.NaN);
       if (index > 0) {
         expect(request.atMs - (received[index - 1]?.atMs ?? Number.NaN), `server-side interval before navigation ${index}`)
-          .toBeGreaterThanOrEqual(PACING_INTERVAL_MS - CONTEXT_CREATION_JITTER_TOLERANCE_MS);
+          .toBeGreaterThanOrEqual(PACING_INTERVAL_MS - SERVER_ARRIVAL_DELAY_TOLERANCE_MS);
       }
     }
     // 少なくとも1回は待った（幅の走査の幅と幅の間など）。
     expect(pacer.snapshot().totalWaitMs).toBeGreaterThan(0);
 
     expect(evidenceOf(outcome, 'interaction', 'desktop')).toHaveLength(1);
+    expect(outcome.result.viewports.desktop).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
+    expect(outcome.result.viewports.mobile).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
+  }, TEST_TIMEOUT_MS);
+
+  it('keeps the intervals at which the documents reach the server at least the interval when the Context creation after the wait is slow (DEF-100)', async () => {
+    const server = await startTimedTogglePageServer();
+    const config = createTestConfig(server.origin, '/', ARRIVAL_PACING_OVERRIDES);
+    const pacer = createTestNavigationPacer(config);
+    const starts: number[] = [];
+    const requests: DocumentRequest[] = [];
+    const slowBrowser = browserDelayingNewContext(
+      recordingDocumentRequests(browser, requests),
+      delayingDesktopContexts(config.viewports.primaryDesktop.width),
+    );
+
+    const outcome = await auditWith(server.origin, config, recordingPacer(pacer, starts), slowBrowser);
+
+    // Desktop、幅の走査の2つの幅、Interaction の1つの候補、Mobile の順に読み込む。
+    const received = server.received.filter(({ pathname }) => pathname === TOGGLE_PAGE);
+    expect(received).toHaveLength(5);
+    expectPacedRequests(starts, requests, ARRIVAL_INTERVAL_MS);
+    // 主な確かめ（DEF-100 fix）: サーバに届いた文書の要求の間隔は、設定の間隔以上である（許容なし）。
+    expectServerArrivalIntervals(received, ARRIVAL_INTERVAL_MS);
     expect(outcome.result.viewports.desktop).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
     expect(outcome.result.viewports.mobile).toMatchObject({ status: 'AUDITED', incompleteReasons: [] });
   }, TEST_TIMEOUT_MS);
@@ -344,8 +411,9 @@ describe('Navigation pacing waits do not use up the page deadlines (load control
         return delayMs;
       },
       snapshot: () => Object.freeze({ navigationCount, totalWaitMs, lastNavigationStartedAtMs }),
-      // 独立の偽物なので、最小の間隔を上げる操作（SU6）は何もしない。
+      // 独立の偽物なので、最小の間隔を上げる操作（SU6）と、送った時刻の記録（DEF-100 fix）は何もしない。
       raiseMinimumInterval: () => undefined,
+      recordDocumentRequestSent: () => undefined,
     };
   }
 
@@ -572,5 +640,30 @@ describe('Navigation pacing of a Run (load control design 4.1)', () => {
     expectPacedRequests(pageStarts, requests.slice(2), PACING_INTERVAL_MS);
     expect(result.pages.map((page) => page.status)).toEqual(['AUDITED']);
     expect(result.run.incompleteReasons.filter(({ code }) => code === 'DEADLINE_EXCEEDED')).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('keeps the intervals at which robots.txt, sitemap.xml and every page document reach the server at least the interval (DEF-100)', async () => {
+    const server = await startTimedTogglePageServer();
+    const config = createTestConfig(server.origin, TOGGLE_PAGE, ARRIVAL_PACING_OVERRIDES);
+    const launcher = createRunLauncher((launched) => browserDelayingNewContext(
+      launched,
+      delayingDesktopContexts(config.viewports.primaryDesktop.width),
+    ));
+    runLaunchers.push(launcher);
+
+    const result = await new RunCoordinator({
+      config,
+      launchBrowser: launcher.launcher,
+      createSafetyLedger: () => new SafetyLedger(),
+      clock: () => new Date(),
+      now: () => Date.now(),
+      outputDirectory: await temporaryDirectory('beaksight-navigation-arrival-run-'),
+    }).run();
+
+    // robots.txt と sitemap.xml（どちらも 404）、ページの 5 回の読み込みの順に届く。
+    const received = server.received.filter(({ pathname }) => ['/robots.txt', '/sitemap.xml', TOGGLE_PAGE].includes(pathname));
+    expect(received.map(({ pathname }) => pathname)).toEqual(['/robots.txt', '/sitemap.xml', ...Array.from({ length: 5 }, () => TOGGLE_PAGE)]);
+    expectServerArrivalIntervals(received, ARRIVAL_INTERVAL_MS);
+    expect(result.pages.map((page) => page.status)).toEqual(['AUDITED']);
   }, TEST_TIMEOUT_MS);
 });

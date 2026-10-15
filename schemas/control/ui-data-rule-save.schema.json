@@ -1,0 +1,15 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-data-rule-save:1",
+  "description": "Local UI Server Function input: save a new revision of the input rules of one write scenario and attach it to the scenario (two steps; Task 29 design 4.3, 4.4). expectedScenarioRevision and expectedRuleSetRevision (null when the scenario has no rule set yet) are the revisions the screen read. The content has the shape of the rule set document (schemas/control/data-rule.schema.json); the server checks it again with assertStorableRuleSet and rejects fixed values of secret-looking fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedScenarioRevision", "expectedRuleSetRevision", "fieldRules", "relations", "uniqueKeyFieldNames"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedScenarioRevision": { "type": "integer", "minimum": 1 },
+    "expectedRuleSetRevision": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+    "fieldRules": { "$ref": "urn:beaksight:schema:control:data-rule:1#/properties/fieldRules" },
+    "relations": { "$ref": "urn:beaksight:schema:control:data-rule:1#/properties/relations" },
+    "uniqueKeyFieldNames": { "$ref": "urn:beaksight:schema:control:data-rule:1#/properties/uniqueKeyFieldNames" }
+  }
+}

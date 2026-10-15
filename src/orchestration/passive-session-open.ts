@@ -2,8 +2,8 @@ import type { BrowserContext, Page } from 'playwright';
 import { ContextConstructionError, type BrowserContextFactory } from '../browser/context-factory.js';
 import type { ResourceDeliveryRole } from '../browser/resource-delivery.js';
 import type { Viewport } from '../config/types.js';
-import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
-import { CONTEXT_CLOSE_TIMEOUT_MS, PAGE_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../core/limits.js';
+import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, resolveTimeoutMs } from '../core/deadline.js';
+import { CONTEXT_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../core/limits.js';
 import type { SafetyLedger } from '../safety/safety-ledger.js';
 import {
   closePassiveContextBeforeDeadline,
@@ -66,7 +66,7 @@ export interface PassiveSessionOpenOptions {
 
 /**
  * 呼び出し元（PREFLIGHT、環境、サイトの metadata、幅の走査など）が受け取る、作成と終了の期限の注入口（R15r-4）。
- * 省略した項目は、`limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
+ * 省略した項目は、`limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
  * Context の役割（`role`）は含まない（作るたびに、呼び出し側が作成の部品の引数で選ぶ）。期限の注入口に `role` を書くと、型の誤りになる
  * （受け取って黙って捨てる形を残さない。RL の 7-2）。
  */
@@ -78,7 +78,6 @@ export interface PassiveSessionDeadlineOptions extends PassiveSessionCloseTimeou
 /** 検証して既定値で埋めた、作成と終了の期限（`resolvePassiveSessionDeadlines` の結果）。 */
 export interface ResolvedPassiveSessionDeadlines {
   readonly sessionOpenTimeoutMs: number;
-  readonly pageCloseTimeoutMs: number;
   readonly contextCloseTimeoutMs: number;
   readonly onLateContextRelease: ((release: LatePassiveContextRelease) => void) | undefined;
 }
@@ -100,7 +99,6 @@ export function resolvePassiveSessionDeadlines(
   }
   return Object.freeze({
     sessionOpenTimeoutMs: resolveTimeoutMs(options.sessionOpenTimeoutMs, SESSION_OPEN_TIMEOUT_MS),
-    pageCloseTimeoutMs: resolveTimeoutMs(options.pageCloseTimeoutMs, PAGE_CLOSE_TIMEOUT_MS),
     contextCloseTimeoutMs: resolveTimeoutMs(options.contextCloseTimeoutMs, CONTEXT_CLOSE_TIMEOUT_MS),
     onLateContextRelease,
   });
@@ -182,14 +180,13 @@ const NO_CLOSE_FAILURES: readonly PassiveSessionCloseFailure[] = Object.freeze([
 
 /**
  * 作成の期限（`Date.now()` の絶対時刻）を決める（設計書 4.2）。今から `options.timeoutMs`（既定は `SESSION_OPEN_TIMEOUT_MS`）後と、
- * 呼び出し元のより短い全体の期限 `options.notAfterMs`（ページの期限など）の、早い方である。
+ * 呼び出し元のより短い全体の期限 `options.notAfterMs`（ページの期限など）の、早い方である（計算は `deadlineWithinTimeoutAtMs`。CCX-7b）。
  * `options.timeoutMs` が正の安全な整数でなければ `RangeError` を投げる。
  */
 export function passiveSessionOpenDeadlineAtMs(
   options: { readonly timeoutMs?: number | undefined; readonly notAfterMs?: number | undefined } = {},
 ): number {
-  const openDeadlineAtMs = Date.now() + resolveTimeoutMs(options.timeoutMs, SESSION_OPEN_TIMEOUT_MS);
-  return options.notAfterMs === undefined ? openDeadlineAtMs : Math.min(openDeadlineAtMs, options.notAfterMs);
+  return deadlineWithinTimeoutAtMs(options.notAfterMs, resolveTimeoutMs(options.timeoutMs, SESSION_OPEN_TIMEOUT_MS));
 }
 
 /**

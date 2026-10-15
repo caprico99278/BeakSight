@@ -19,6 +19,8 @@ import {
   type PassiveStressSessionFactory,
   type StressLayoutOptions,
 } from '../../src/evidence/layout-collector.js';
+import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
+import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
 
 function rawLayout(width: number, height: number) {
   return {
@@ -123,12 +125,6 @@ function completeLayout(result: LayoutCollectionResult): LayoutEvidence {
 function neverSettles(): Promise<never> {
   return new Promise<never>(() => undefined);
 }
-
-/**
- * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。幅の走査の間隔の待ちは省略できないので、間隔を確かめない
- * テストは、待たないことを、この関数で明示して渡す。
- */
-const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 /** 間隔を確かめないテストの、幅の走査の引数。期限は、呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
 function unpacedStressOptions(widths: readonly number[]): StressLayoutOptions {
@@ -738,7 +734,9 @@ describe('responsive layout stress main frame load observation (site unavailabil
       );
       const elapsedMs = Date.now() - startedAtMs;
 
-      expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS);
+      // 観察の開始の期限は `setTimeout` で待つ（`awaitBeforeDeadline`）。偽の session のほかの処理はほぼ時間を使わないため、下限は待つ時間から
+      // 時刻の単位の違い（`TIMER_CLOCK_GRANULARITY_MS`）だけを引いたものにする（DEF-065）。
+      expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_SESSION_OPEN_TIMEOUT_MS - TIMER_CLOCK_GRANULARITY_MS);
       expect(elapsedMs).toBeLessThan(RETURN_LIMIT_MS);
       expect(diagnostics).toEqual([{ status: 'NOT_OBSERVED', reason: NAVIGATION_DIAGNOSTICS_START_DEADLINE_MESSAGE }]);
       // 読み込みと、幅の結果は、観察を始められなくても今までどおりである。

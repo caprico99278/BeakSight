@@ -1,7 +1,7 @@
 // R15b（Task 14〜17 の設計書 5.6.2）: robots.txt と sitemap.xml を、Guard の付いた Passive Context の GET のナビゲーションで取得し、
 // `metadata` の Evidence にする。sitemap の `<loc>` は、切り詰める前の本文から取り出して正規化する。
 import { readFile } from 'node:fs/promises';
-import { createServer, type Server, type ServerResponse } from 'node:http';
+import type { ServerResponse } from 'node:http';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
@@ -35,28 +35,25 @@ import {
   UNLOAD_BEACON_PAGE,
   UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
 } from '../helpers/gate-harness.js';
+import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
+import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_TIMEOUT_MS = 120_000;
 /** 取得するファイルの数（robots.txt と sitemap.xml）。結果の `records` の長さと同じ。 */
 const SITE_METADATA_FILE_COUNT = 2;
 const SHORT_NAVIGATION_TIMEOUT_MS = 1_000;
-/** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`PAGE_CLOSE_TIMEOUT_MS` など）を待たない。 */
+/** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`CONTEXT_CLOSE_TIMEOUT_MS` など）を待たない。 */
 const INJECTED_TIMEOUT_MS = 300;
 /** 期限を過ぎてから戻るまでの余裕。既定の期限（5 秒）を待った場合と区別できるよう、それより短くする。 */
 const RETURN_MARGIN_MS = 3_000;
 /** 期限のテストの上限。期限を守らない（既定の期限を待つか、止まり続ける）場合は、この時間で失敗する。 */
 const DEADLINE_TEST_TIMEOUT_MS = 2 * INJECTED_TIMEOUT_MS + RETURN_MARGIN_MS + 2_000;
 const OBSERVED_AT = new Date('2026-09-24T00:00:00.000Z');
-/**
- * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。metadata の取得の間隔の待ちは省略できないので、間隔を確かめない
- * テストは、待たないことを、この関数で明示して渡す。
- */
-const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 let browser: Browser;
 const fixtureServers: FixtureServer[] = [];
-const customServers: Server[] = [];
+const customServers: LoopbackHttpServer[] = [];
 
 useHeadlessChromium((launched) => {
   browser = launched;
@@ -72,8 +69,7 @@ afterEach(async () => {
     await server.close();
   }
   for (const server of customServers.splice(0)) {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await server.close();
   }
   expect(leftoverContexts, 'Contexts left in the browser after the test').toHaveLength(0);
 });
@@ -113,7 +109,7 @@ async function startCustomServer(
 }> {
   let nonReadRequests = 0;
   const requestedPaths: string[] = [];
-  const server = createServer((request, response: ServerResponse) => {
+  const server = await startLoopbackHttpServer((request, response: ServerResponse) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       nonReadRequests += 1;
     }
@@ -138,19 +134,8 @@ async function startCustomServer(
     response.end(request.method === 'HEAD' ? undefined : body);
   });
   customServers.push(server);
-  const port = await new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('custom server did not bind to a TCP port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     nonReadRequests: () => nonReadRequests,
     requestedPaths: () => [...requestedPaths],
   };
@@ -550,8 +535,7 @@ describe('collectSiteMetadata', () => {
     const startedAt = performance.now();
     const run = await collect(server.origin, {
       createFactory: (config) => new HangingPageCloseFactory(browser, config, () => new SafetyLedger()),
-      // 期限は注入する（R15r-4。以前のこの場面で、実際の 5 秒を待たないため。今は読まない。DEF-038）。
-      deadlines: { pageCloseTimeoutMs: INJECTED_TIMEOUT_MS },
+      // page を閉じる処理の期限は、DEF-038 で読まなくなり、CCX-21（CC-049）で消した（注入しない）。
       afterNavigation: () => {
         // 2つ目（sitemap.xml）の読み込みの時点で、前の page（robots.txt）が開いたままであること。
         if (openPages.length === SITE_METADATA_FILE_COUNT) {
