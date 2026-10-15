@@ -62,6 +62,7 @@ import {
   fastRunConfig,
   readJson,
   readRunAudit,
+  RUN_IDENTITY_AUDIT_OVERRIDES,
 } from '../helpers/run-harness.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
@@ -166,6 +167,8 @@ const findingKey = ({ findingId, ruleId, fingerprint }: Finding): readonly strin
  * - 時刻（`startedAt`、`finishedAt`、Evidence の `observedAt`）と、時刻や読み込みにかかった時間を含む Evidence の値（`payload`）。
  * - `load`（中断したページを2回読むので、読み込みと要求の数が違う）。
  * - 実行の記録（保存の `executions`）と環境（`environment`）。
+ * 中断しなかった Run と比べる Run は、性能の指標を集めない（`RUN_IDENTITY_AUDIT_OVERRIDES`。計測の値で決まる性能の Finding が、混雑で片方に
+ * だけ出て、Finding の ID がずれるため。DEF-079）。
  */
 function comparableRun(result: AuditRunResult): unknown {
   const { run } = result;
@@ -293,8 +296,9 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
   const resumedCalls: StoreCall[] = [];
 
   beforeAll(async () => {
-    // スクリーンショットを撮る（監査の途中だったページのディレクトリに、前の回のスクリーンショットが残るようにする）。
-    config = fastRunConfig(server.origin, START_PATH, { audit: { screenshots: true } });
+    // スクリーンショットを撮る（監査の途中だったページのディレクトリに、前の回のスクリーンショットが残るようにする）。性能の指標は
+    // 集めない（混雑で片方の Run にだけ性能の Finding が出て、Finding の ID がずれるため。`RUN_IDENTITY_AUDIT_OVERRIDES`。DEF-079）。
+    config = fastRunConfig(server.origin, START_PATH, { audit: { ...RUN_IDENTITY_AUDIT_OVERRIDES, screenshots: true } });
 
     // A: 中断しない Run。
     const uninterruptedOutput = join(workDirectory, 'uninterrupted');
@@ -602,8 +606,9 @@ describe('R4b2: a Run stopped by the stop signal after the k-th page and resumed
     (await filesUnder(directory)).filter((file) => !file.startsWith(`${CHECKPOINT_ARTIFACT_DIRECTORY}/`));
 
   beforeAll(async () => {
-    // スクリーンショットを撮る（STOPPED の回と再開の後の出力のファイルの集まりを、スクリーンショットを含めて比べる）。
-    const config = fastRunConfig(server.origin, START_PATH, { audit: { screenshots: true } });
+    // スクリーンショットを撮る（STOPPED の回と再開の後の出力のファイルの集まりを、スクリーンショットを含めて比べる）。性能の指標は
+    // 集めない（`RUN_IDENTITY_AUDIT_OVERRIDES`。DEF-079）。
+    const config = fastRunConfig(server.origin, START_PATH, { audit: { ...RUN_IDENTITY_AUDIT_OVERRIDES, screenshots: true } });
 
     // A: 中断しない Run。
     const uninterruptedOutput = join(workDirectory, 'signal-uninterrupted');

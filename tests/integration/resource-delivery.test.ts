@@ -6,8 +6,7 @@
 //   許可 Origin の外への、キャッシュにない要求を送らない。文書の要求は、どの読み込みでも送る。
 // - 凍結の後の要求と、GET・HEAD 以外の要求は、届け方の部品に渡らず、今のまま Guard が止めて Safety の記録に残す。
 // 2つ目の Origin（許可 Origin の外）は、fixture のサーバをもう1つ起動して作る（ポートが違うので、別の Origin になる）。
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,6 +31,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { BROWSER_DEFAULT_FAVICON_PATH, useHeadlessChromium } from '../helpers/chromium.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createRunLauncher, expectOnlyReadRequests, runWithCoordinator } from '../helpers/run-harness.js';
@@ -452,7 +452,7 @@ function sendVideo(request: IncomingMessage, response: ServerResponse, video: Bu
 /** `label` の部品を返す、この試験だけのサーバを起動する。 */
 async function startResourceServer(label: ResourceServerLabel, video: Buffer): Promise<ResourceServer> {
   const received: ResourceServerRequest[] = [];
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split('?', 1)[0] ?? '/';
     received.push({ method: request.method ?? '', pathname, range: request.headers.range ?? null });
     switch (pathname) {
@@ -489,15 +489,10 @@ async function startResourceServer(label: ResourceServerLabel, video: Buffer): P
         response.end();
     }
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
-  const { port } = server.address() as AddressInfo;
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     received: () => received.filter(({ method, pathname }) => !(method === 'GET' && pathname === BROWSER_DEFAULT_FAVICON_PATH)),
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: server.close,
   };
 }
 

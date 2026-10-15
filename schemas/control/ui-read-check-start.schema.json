@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-read-check-start:1",
+  "description": "Local UI Server Function input: start the READ checks (READ_CHECK) of one TEST_AUTH_PASSIVE or TEST_APPROVED_WRITE profile (Task 27 design 4.7; Task 28 design 4.5). The job manager checks the profile, the revision, the mode, the auth setup and the definitions again.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+  }
+}

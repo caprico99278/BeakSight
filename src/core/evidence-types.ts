@@ -1572,8 +1572,10 @@ export type SiteMetadataKind = (typeof SITE_METADATA_KINDS)[number];
  * - `OK`: 本文を得た。
  * - `NOT_FOUND`: ファイルがなかった（例: 404）。
  * - `FAILED`: そのほかの理由で取得できなかった。
+ * - `EXCLUDED`: 認証つきの Run で、監査の段の除外に当たるので、取りに行かなかった（Task 25 の設計書 4.2、4.7。T25c round 3）。応答も本文も
+ *   ない。公開監査（認証の指定のない Run）では現れない。sitemap の判定には使わない（`sitemapEvidenceFromMetadata` が `null` を返す）。
  */
-export const SITE_METADATA_OUTCOMES = Object.freeze(['OK', 'NOT_FOUND', 'FAILED'] as const);
+export const SITE_METADATA_OUTCOMES = Object.freeze(['OK', 'NOT_FOUND', 'FAILED', 'EXCLUDED'] as const);
 export type SiteMetadataOutcome = (typeof SITE_METADATA_OUTCOMES)[number];
 
 interface SiteMetadataEvidenceBase {
@@ -1627,6 +1629,12 @@ export const BLOCKED_REQUEST_REASONS = Object.freeze(['NON_READ_METHOD'] as cons
 export const BLOCKED_NAVIGATION_REASONS = Object.freeze(['EXTERNAL_MAIN_FRAME_NAVIGATION'] as const);
 
 /**
+ * Passive の Guard が、監査の段の除外（Task 25 の設計書 4.2。除外のパス、読む範囲の外、危険な語）に当たる読み取りの要求を遮断した
+ * 理由の閉じた一覧（T25b round 1）。`blockedAuditExclusions` の記録の中だけで使う（ほかの理由の一覧には足さない）。
+ */
+export const BLOCKED_AUDIT_EXCLUSION_REASONS = Object.freeze(['AUDIT_EXCLUDED_URL'] as const);
+
+/**
  * Worker（Dedicated、Shared）の中で開く WebSocket の接続を、Guard が文書と Worker の script に加える CSP（`connect-src`。
  * `src/safety/passive-request-guard.ts` の `WORKER_CONNECT_POLICY`）で止めたときの理由（DEF-040。DEF-039・DEF-040 の設計書 2.2）。
  * Passive の段階は `blockedWebSockets`、Interaction の凍結の後は `blockedInteractionWebSockets` に残す。止めるのは CSP で決定的だが、
@@ -1664,12 +1672,18 @@ export const BLOCKED_INTERACTION_WEBSOCKET_REASONS = Object.freeze([
  *   Guard を通らずに出た要求の証拠である（ページ自身が閉じるポップアップの送信、Worker の中の WebSocket など）。
  *   CONNECT の `url` は `host:port` の形で、https か wss かは分からない。
  * - `EGRESS_UPSTREAM_DENIED`: 凍結の前に、中継の上流の方針で拒んだもの（production の方針はすべて許すので起きない。テストの方針で起きる）。
+ * - `GUARD_BYPASS_EGRESS`（DEF-085）: Passive とログインの段の Context の出口の中継が、要求の方針（Guard の許可を中継から見た範囲。method と
+ *   URL）で拒んだもの。Guard が許すはずのない要求が、Guard を通らずに出ようとした証拠である。Passive の Context の記録も、この一覧に置く。
+ *   Guard が Context を閉じる直前に中継を凍結した後の拒否は、どの理由でも記録しない（DEF-085 fix round 3。閉じる途中の要求は、Guard が許した
+ *   普通の要求か、横取りを外れた要求かを中継から区別できないため）。Passive の Context でも、Guard の凍結の段（発見の凍結）の後の中継の拒否は
+ *   `INTERACTION_FROZEN_EGRESS` で記録する。
  * 操作中に遮断したナビゲーション（`blockedInteractionNavigations`）の理由は、`INTERACTION_FROZEN_REASONS` のままである。
  */
 export const BLOCKED_INTERACTION_REQUEST_REASONS = Object.freeze([
   ...INTERACTION_FROZEN_REASONS,
   'INTERACTION_FROZEN_EGRESS',
   'EGRESS_UPSTREAM_DENIED',
+  'GUARD_BYPASS_EGRESS',
 ] as const);
 
 /**
@@ -1740,6 +1754,30 @@ export interface BlockedWebSocketEvent {
   readonly reason: (typeof BLOCKED_WEBSOCKET_REASONS)[number];
 }
 
+/**
+ * 監査の段の除外で遮断した読み取りの要求（T25b round 1。Task 25 の設計書 4.2）。値や本文は持たない。
+ * - `method`、`url`: 要求の method と URL（ほかの要求の記録と同じく、Ledger の上限の長さまで切り詰める）。
+ * - `mainFrameNavigation`: main frame のナビゲーションか（偽は、サブの frame の要求と、ナビゲーションでない要求）。
+ */
+export interface BlockedAuditExclusionEvent {
+  readonly method: string;
+  readonly url: string;
+  readonly mainFrameNavigation: boolean;
+  readonly reason: (typeof BLOCKED_AUDIT_EXCLUSION_REASONS)[number];
+}
+
+/**
+ * 監査の段の除外の記録（`SafetyEventsEvidence.blockedAuditExclusions`。T25b round 1）。
+ * - `count`: 遮断した要求の件数。`events` の記録の上限を超えた分も数える（安全な整数の上限で止める）。
+ * - `events`: 記録できた事象（上限を超えた分は、`recordLimits` の `droppedEventCount` に数え、`reachedCategories` に分類を残す）。
+ * この記録は、設定どおりに止めた記録で、`count` は正しく数えるので、この記録だけが上限を超えても、`recordLimits.truncated` にしない
+ * （Run を PARTIAL にしない。T25c）。
+ */
+export interface BlockedAuditExclusionsRecord {
+  readonly count: number;
+  readonly events: readonly BlockedAuditExclusionEvent[];
+}
+
 /** 外部への作用（外部Origin、`tel:`・`mailto:` などの特殊scheme、ダウンロード）のため実行しなかった Interaction の候補。 */
 export interface BlockedExternalActionEvent {
   readonly candidateId: string;
@@ -1756,7 +1794,11 @@ export interface ExcludedInteractionCandidateEvent {
   readonly reason: InteractionRejectionReasonEvidence;
 }
 
-/** 操作中に遮断したリクエスト。理由は `BLOCKED_INTERACTION_REQUEST_REASONS`（Guard が止めたものと、出口の中継が拒んだものを区別する）。 */
+/**
+ * 操作中に遮断したリクエスト。理由は `BLOCKED_INTERACTION_REQUEST_REASONS`（Guard が止めたものと、出口の中継が拒んだものを区別する）。
+ * DEF-085 から、中継の要求の方針で拒んだ要求（`GUARD_BYPASS_EGRESS`）と、凍結の段の後の中継の拒否（`INTERACTION_FROZEN_EGRESS`）は、Passive の
+ * Context の Ledger にも残る。
+ */
 export interface BlockedInteractionRequestEvent {
   readonly method: string;
   readonly url: string;
@@ -1813,9 +1855,12 @@ export interface ExternalSchemeNavigationEvent {
  * `truncated` の Run は `PARTIAL` にする（`RunStatusInput.safetyLedgerTruncated`）。
  */
 export interface SafetyLedgerRecordLimits {
-  /** 上限のために、記録しなかったイベントか、数えられなかったブロックがあるか。 */
+  /**
+   * 上限のために、記録しなかったイベントか、数えられなかったブロックがあるか。監査の段の除外の記録（`blockedAuditExclusions`）だけが上限を
+   * 超えた場合は、件数が正しく残るので、真にしない（T25c）。
+   */
   readonly truncated: boolean;
-  /** 上限のために記録しなかったイベントの件数（違反を含む）。 */
+  /** 上限のために記録しなかったイベントの件数（違反と、監査の段の除外の記録を含む）。 */
   readonly droppedEventCount: number;
   /** 上限のために `blockedRequestsByMethod` で数えられなかったブロックの件数。 */
   readonly uncountedBlockedRequestCount: number;
@@ -1851,6 +1896,12 @@ export interface SafetyEventsEvidence {
   /** 外部スキームへの移動の試み（C18a）。 */
   readonly externalSchemeNavigations: readonly ExternalSchemeNavigationEvent[];
   readonly recordLimits: SafetyLedgerRecordLimits;
+  /**
+   * 監査の段の除外で遮断した要求（T25b round 1。Task 25 の設計書 4.2）。省略できる項目で、1 件でも記録した Ledger の記録にだけ現れる
+   * （除外の口を渡さない公開監査の出力には現れない）。事象の一覧（配列）ではないので、`SAFETY_EVENT_KINDS` には含めない
+   * （表示は、この Task では変えない）。
+   */
+  readonly blockedAuditExclusions?: BlockedAuditExclusionsRecord;
 }
 
 /**

@@ -1,0 +1,96 @@
+{
+  "$id": "urn:beaksight:schema:discovery:1.0",
+  "description": "The result of one discovery job (discovery.json in the Run directory; Task 27 design 4.2, 4.6). The value lists and limits are owned by src/discovery/discovery-result.ts. The candidates are the candidate schema (schemas/control/candidate.schema.json), referenced and not copied. No property holds an input value, a token, a cookie, an option label or the text of a submit button.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "jobId",
+    "runId",
+    "startedAt",
+    "finishedAt",
+    "runStatus",
+    "endReason",
+    "maxPages",
+    "pages",
+    "omittedUnreadPages"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "discovery-schema/1.0" },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "finishedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
+    "endReason": {
+      "enum": [
+        "COMPLETED",
+        "MAX_PAGES_REACHED",
+        "MAX_RUNTIME_REACHED",
+        "STOPPED",
+        "AUTH_SESSION_LOST",
+        "SAFETY_VIOLATION",
+        "PREFLIGHT_FAILED"
+      ]
+    },
+    "maxPages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
+    "omittedUnreadPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+  },
+  "$defs": {
+    "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "page": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url", "state", "record", "blockedRequests"],
+          "properties": {
+            "url": { "$ref": "#/$defs/url" },
+            "state": { "const": "READ" },
+            "record": { "$ref": "#/$defs/record" },
+            "blockedRequests": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["url", "state", "reason"],
+          "properties": {
+            "url": { "$ref": "#/$defs/url" },
+            "state": { "const": "NOT_READ" },
+            "reason": {
+              "enum": [
+                "EXCLUDED",
+                "MAX_DEPTH_REACHED",
+                "NAVIGATION_FAILED",
+                "MAX_PAGES_REACHED",
+                "MAX_RUNTIME_REACHED",
+                "STOPPED",
+                "AUTH_SESSION_LOST",
+                "SAFETY_VIOLATION",
+                "PREFLIGHT_FAILED"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location", "incompleteReasons", "candidates"],
+      "properties": {
+        "location": {
+          "anyOf": [
+            { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/location" },
+            { "type": "null" }
+          ]
+        },
+        "incompleteReasons": { "$ref": "urn:beaksight:schema:control:candidate:1#/properties/incompleteReasons" },
+        "candidates": { "type": "array", "items": { "$ref": "urn:beaksight:schema:control:candidate:1" } }
+      }
+    }
+  }
+}

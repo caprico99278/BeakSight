@@ -113,6 +113,14 @@
         "meter": { "$ref": "urn:beaksight:schema:run:1.0#/properties/load/properties/requests" }
       }
     },
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["settingsDigest"],
+      "properties": {
+        "settingsDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+      }
+    },
     "completedPageIds": {
       "type": "array",
       "uniqueItems": true,
@@ -135,6 +143,7 @@
             "STOPPED_BY_SAFETY_VIOLATION",
             "STOPPED_BY_SITE_UNAVAILABLE",
             "INTERRUPTED_ABNORMALLY",
+            "STOPPED_BY_AUTH_SESSION_LOST",
             null
           ]
         },
@@ -210,6 +219,7 @@
           "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence/properties/externalSchemeNavigations"
         },
         "recordLimits": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyLedgerRecordLimits" },
+        "blockedAuditExclusions": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/blockedAuditExclusions" },
         "invariantViolations": { "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolations" },
         "invariantViolationCount": {
           "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolationCount"

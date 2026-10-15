@@ -1,0 +1,197 @@
+{
+  "newRun": [
+    {
+      "code": 0,
+      "stdout": [
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 1件（発見したページ 3件、上限 500件）・ページの読み込み 4回・許可 Origin への要求 4件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 2件（発見したページ 4件、上限 500件）・ページの読み込み 6回・許可 Origin への要求 6件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 3件（発見したページ 4件、上限 500件）・ページの読み込み 8回・許可 Origin への要求 8件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 4件（発見したページ 5件、上限 500件）・ページの読み込み 10回・許可 Origin への要求 10件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 5件（発見したページ 5件、上限 500件）・ページの読み込み 12回・許可 Origin への要求 12件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 完了（COMPLETE）",
+        "出力先: <WORK>/newRun-output/<RUN_ID_1>",
+        "HTML レポート: <WORK>/newRun-output/<RUN_ID_1>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/newRun-output/<RUN_ID_1>/<BUNDLE>",
+        "ページの網羅: 発見したページ 5件、監査したページ 5件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 0件",
+        "サイト品質の指摘: エラー 7件、警告 10件、情報 4件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 12回、許可 Origin への要求 12件（1分あたり最大 <PEAK>）",
+        "実行: 1回、再開 0回",
+        "この起動の終わり方: 最後まで実行（COMPLETED）",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    }
+  ],
+  "stopAndResume": [
+    {
+      "code": 2,
+      "stdout": [
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 1件（発見したページ 3件、上限 500件）・ページの読み込み 4回・許可 Origin への要求 4件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 2件（発見したページ 4件、上限 500件）・ページの読み込み 6回・許可 Origin への要求 6件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 一部未完了（PARTIAL）",
+        "出力先: <WORK>/stopAndResume-output/<RUN_ID_1>",
+        "HTML レポート: <WORK>/stopAndResume-output/<RUN_ID_1>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/stopAndResume-output/<RUN_ID_1>/<BUNDLE>",
+        "ページの網羅: 発見したページ 4件、監査したページ 2件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 2件",
+        "サイト品質の指摘: エラー 0件、警告 0件、情報 3件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 6回、許可 Origin への要求 6件（1分あたり最大 <PEAK>）",
+        "実行: 1回、再開 0回",
+        "この起動の終わり方: 中断の指示で停止（STOPPED_BY_SIGNAL）",
+        "未完了の理由: 1件",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    },
+    {
+      "code": 0,
+      "stdout": [
+        "途中の Run（<RUN_ID_1>。監査を終えたページ 2件）を、続きから再開します。最初から始めるには --new を付けてください。",
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 3件（発見したページ 4件、上限 500件）・ページの読み込み 8回・許可 Origin への要求 8件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 4件（発見したページ 5件、上限 500件）・ページの読み込み 10回・許可 Origin への要求 10件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 5件（発見したページ 5件、上限 500件）・ページの読み込み 12回・許可 Origin への要求 12件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 完了（COMPLETE）",
+        "出力先: <WORK>/stopAndResume-output/<RUN_ID_1>",
+        "HTML レポート: <WORK>/stopAndResume-output/<RUN_ID_1>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/stopAndResume-output/<RUN_ID_1>/<BUNDLE>",
+        "ページの網羅: 発見したページ 5件、監査したページ 5件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 0件",
+        "サイト品質の指摘: エラー 7件、警告 10件、情報 4件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 12回、許可 Origin への要求 12件（1分あたり最大 <PEAK>）",
+        "実行: 2回、再開 1回",
+        "この起動の終わり方: 最後まで実行（COMPLETED）",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    }
+  ],
+  "activeRun": [
+    {
+      "code": 4,
+      "stdout": [
+        ""
+      ],
+      "stderr": [
+        "同じ出力先で、別の Run（<RUN_ID_1>）が実行中です。その Run が終わってから実行してください。",
+        ""
+      ]
+    }
+  ],
+  "configDiffers": [
+    {
+      "code": 2,
+      "stdout": [
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 1件（発見したページ 3件、上限 2件）・ページの読み込み 4回・許可 Origin への要求 4件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 一部未完了（PARTIAL）",
+        "出力先: <WORK>/configDiffers-output/<RUN_ID_1>",
+        "HTML レポート: <WORK>/configDiffers-output/<RUN_ID_1>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/configDiffers-output/<RUN_ID_1>/<BUNDLE>",
+        "ページの網羅: 発見したページ 3件、監査したページ 1件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 2件",
+        "サイト品質の指摘: エラー 0件、警告 0件、情報 4件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 4回、許可 Origin への要求 4件（1分あたり最大 <PEAK>）",
+        "実行: 1回、再開 0回",
+        "この起動の終わり方: 中断の指示で停止（STOPPED_BY_SIGNAL）",
+        "未完了の理由: 1件",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    },
+    {
+      "code": 2,
+      "stdout": [
+        "設定が違うため、途中の Run（<RUN_ID_1>）は再開しません（違う項目: crawl.maxPages）。新しい Run を始めます。",
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 1件（発見したページ 3件、上限 3件）・ページの読み込み 4回・許可 Origin への要求 4件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 2件（発見したページ 4件、上限 3件）・ページの読み込み 6回・許可 Origin への要求 6件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "進み具合: 監査を終えたページ 3件（発見したページ 4件、上限 3件）・ページの読み込み 8回・許可 Origin への要求 8件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 一部未完了（PARTIAL）",
+        "出力先: <WORK>/configDiffers-output/<RUN_ID_2>",
+        "HTML レポート: <WORK>/configDiffers-output/<RUN_ID_2>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/configDiffers-output/<RUN_ID_2>/<BUNDLE>",
+        "ページの網羅: 発見したページ 4件、監査したページ 3件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 1件",
+        "サイト品質の指摘: エラー 7件、警告 10件、情報 3件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 8回、許可 Origin への要求 8件（1分あたり最大 <PEAK>）",
+        "実行: 1回、再開 0回",
+        "この起動の終わり方: 最後まで実行（COMPLETED）",
+        "未完了の理由: 1件",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    }
+  ],
+  "versionDiffers": [
+    {
+      "code": 2,
+      "stdout": [
+        "監査を始めます。",
+        "対象: cli-output-parity",
+        "開始の URL: <ORIGIN>/crawl/index.html",
+        "進み具合: 監査を終えたページ 1件（発見したページ 3件、上限 2件）・ページの読み込み 4回・許可 Origin への要求 4件（直近1分 <RECENT>、1分あたり最大 <PEAK>）・許可 Origin の外 0件・経過 <ELAPSED>",
+        "",
+        "監査の結果",
+        "Run の状態: 一部未完了（PARTIAL）",
+        "出力先: <WORK>/versionDiffers-output/<RUN_ID_1>",
+        "HTML レポート: <WORK>/versionDiffers-output/<RUN_ID_1>/report.html",
+        "ChatGPT 用のバンドル: <WORK>/versionDiffers-output/<RUN_ID_1>/<BUNDLE>",
+        "ページの網羅: 発見したページ 3件、監査したページ 1件、一部未完了のページ 0件、失敗したページ 0件、スキップしたページ 2件",
+        "サイト品質の指摘: エラー 0件、警告 0件、情報 4件",
+        "安全の指摘: 安全 0件",
+        "サイトへの負荷: ページの読み込み 4回、許可 Origin への要求 4件（1分あたり最大 <PEAK>）",
+        "実行: 1回、再開 0回",
+        "この起動の終わり方: 中断の指示で停止（STOPPED_BY_SIGNAL）",
+        "未完了の理由: 1件",
+        ""
+      ],
+      "stderr": [
+        ""
+      ]
+    },
+    {
+      "code": 4,
+      "stdout": [
+        ""
+      ],
+      "stderr": [
+        "途中の Run（<RUN_ID_1>）は、版が違うため再開できません（BeakSight の版: 保存 0.0.0-saved-by-another-version → 今 <TOOL_VERSION>）。最初から始めるには --new を付けてください。",
+        ""
+      ]
+    }
+  ]
+}

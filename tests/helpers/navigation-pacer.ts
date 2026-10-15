@@ -11,3 +11,32 @@ import { createNavigationPacer, type NavigationPacer } from '../../src/crawl/nav
 export function createTestNavigationPacer(config: AuditConfig): NavigationPacer {
   return createNavigationPacer({ minIntervalMs: config.crawl.minNavigationIntervalMs, now: () => Date.now(), sleep: wait });
 }
+
+/**
+ * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5。CC-038）。幅の走査や metadata の取得の間隔の待ちは省略できないので、
+ * 間隔を確かめないテストは、待たないことを、この関数で明示して渡す。待った時間（ms）として 0 を返す。
+ */
+export const NO_PACING_WAIT = async (): Promise<number> => 0;
+
+/**
+ * `pacer` の読み込みの開始の待ち（`beforeNavigation`）だけを `beforeNavigation` に差し替え、ほかの操作（記録の写し、間隔の引き上げ、
+ * 送った時刻の記録）は `pacer` にそのまま渡す pacer（DEF-100 fix。テストが開始の時刻や呼び出しの順を記録するための包み）。送った時刻の記録は、
+ * `pacer` に渡す前に `onDocumentRequestSent` を呼ぶ（テストが送った時刻を記録するため）。
+ * 送った時刻の記録（`recordDocumentRequestSent`）を渡し忘れると、届く間隔の保証がテストの中だけ外れるので、包みはこの関数で作る。
+ */
+export function forwardingNavigationPacer(
+  pacer: NavigationPacer,
+  beforeNavigation: () => Promise<number>,
+  onDocumentRequestSent: () => void = () => undefined,
+): NavigationPacer {
+  return {
+    beforeNavigation,
+    snapshot: () => pacer.snapshot(),
+    raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
+    // 受け口を先に呼ぶ（受け口が読む時刻は、pacer が記録する時刻以下になる）。
+    recordDocumentRequestSent: () => {
+      onDocumentRequestSent();
+      pacer.recordDocumentRequestSent();
+    },
+  };
+}

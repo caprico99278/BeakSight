@@ -1,6 +1,4 @@
 import { readFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
-import type { Socket } from 'node:net';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page, type Request } from 'playwright';
@@ -36,6 +34,9 @@ import {
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
   INTERACTION_CANDIDATE_SELECTOR,
+  interactionCandidateReadsOf,
+  withInteractionCandidateReads,
+  type InteractionCandidateReads,
 } from '../../src/interaction/discover-candidates.js';
 import {
   auditInteraction as auditInteractionUnderTest,
@@ -59,6 +60,7 @@ import {
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { guardContextListenerEvents } from '../helpers/passive-guard-harness.js';
 import {
   discoverInteractionCandidate,
   FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
@@ -69,6 +71,16 @@ import {
   QUIET_PERIOD_MS,
   withGuardedPassivePage,
 } from '../helpers/gate-harness.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
+import {
+  adaptFakePage,
+  candidateReferenceOf,
+  evaluateInCandidateReadWorld,
+  fakeCandidateReference,
+  isRealPage,
+  readsFromEvaluateMocks,
+  readsOnPage,
+} from '../helpers/interaction-candidate-reads.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
 type ExpectedStructuredInteractionResult = Awaited<ReturnType<typeof auditInteraction>> & {
@@ -150,7 +162,16 @@ function expectCodedLifecycleReason(lifecycle: InteractionClosedLifecycle | Inte
 async function auditInteraction(input: InteractionAuditInput): ReturnType<typeof auditInteractionUnderTest> {
   let result: Awaited<ReturnType<typeof auditInteractionUnderTest>>;
   try {
-    result = await auditInteractionUnderTest(input);
+    // T32j-4 fix round 1: 偽の session の page（`evaluate`・`evaluateHandle` に結果を差し込む形）は、製品の候補の読み取りの口に写す。
+    const sessionFactory = input.sessionFactory;
+    result = await auditInteractionUnderTest(typeof sessionFactory !== 'function' ? input : {
+      ...input,
+      sessionFactory: async (viewport) => {
+        const session = await sessionFactory(viewport);
+        adaptFakePage(session.page);
+        return session;
+      },
+    });
   } catch (error) {
     if (error instanceof InteractionOwnerCleanupError) {
       expectCodedWorkReason(error.work);
@@ -243,8 +264,14 @@ function boundedResolutionEnvelope(handle: {
  * 実際のブラウザは記録を必ず返すので、`preparedAttributes` を渡さない場合は、属性のない記録を返す。
  */
 function withScrollPreparation(page: Page, candidate: InteractionCandidate, preparedAttributes?: unknown): Page {
+  // T32j-4 fix round 1: 最初の発見と最初の解決を、製品の候補の読み取りの口で受け持つ。ほかの読み取りは、元の page の読み取り（偽の page なら
+  // `evaluate`・`evaluateHandle` の差し込みの写し、本物の page なら isolated world の読み取り）に渡す。
+  const base: InteractionCandidateReads = isRealPage(page)
+    ? interactionCandidateReadsOf(page)
+    : readsFromEvaluateMocks(page as never, interactionCandidateReadsOf(page));
   let discoveryServed = false;
   let resolutionServed = false;
+  const preparationId = -1;
   const preparationHandle = {
     evaluate: async () => ({
       status: 'CONNECTED',
@@ -257,31 +284,29 @@ function withScrollPreparation(page: Page, candidate: InteractionCandidate, prep
     focus: async () => undefined,
     dispose: async () => undefined,
   };
-  return new Proxy(page, {
-    get(target, property, receiver) {
-      const original: unknown = Reflect.get(target, property, receiver);
-      if (property === 'evaluate' && typeof original === 'function') {
-        return async (callback: unknown, argument?: unknown) => {
-          if (argument !== undefined && !discoveryServed) {
-            discoveryServed = true;
-            return { candidates: [rawCandidateFor(candidate)], completeness: 'COMPLETE', domWorkUsed: 0 };
-          }
-          return (original as (...args: unknown[]) => unknown).call(target, callback, argument);
-        };
+  const reads: InteractionCandidateReads = {
+    discover: async (target, input, deadlineAtMs) => {
+      if (!discoveryServed) {
+        discoveryServed = true;
+        return { status: 'READ', value: { candidates: [rawCandidateFor(candidate)], completeness: 'COMPLETE', domWorkUsed: 0 } };
       }
-      if (property === 'evaluateHandle' && (typeof original === 'function' || !resolutionServed)) {
-        // 元の偽のページに evaluateHandle がなくても、下準備の解決は受け持つ。凍結の後の解決は、元の偽のページに渡す。
-        return async (...args: unknown[]) => {
-          if (!resolutionServed) {
-            resolutionServed = true;
-            return boundedResolutionEnvelope(preparationHandle);
-          }
-          return (original as (...args: unknown[]) => unknown).apply(target, args);
-        };
-      }
-      return original;
+      return base.discover(target, input, deadlineAtMs);
     },
-  });
+    resolve: async (target, input, deadlineAtMs) => {
+      if (!resolutionServed) {
+        resolutionServed = true;
+        return { status: 'READ', value: { status: 'FOUND', domWorkUsed: 0 }, elements: [{ backendNodeId: preparationId, path: [] }] };
+      }
+      return base.resolve(target, input, deadlineAtMs);
+    },
+    handleOf: async (target, reference, deadlineAtMs) => (reference.backendNodeId === preparationId
+      ? preparationHandle as never
+      : base.handleOf(target, reference, deadlineAtMs)),
+    inspect: async (target, backendNodeId, input, deadlineAtMs) => (backendNodeId === preparationId
+      ? { status: 'READ', value: await preparationHandle.evaluate() }
+      : base.inspect(target, backendNodeId, input, deadlineAtMs)),
+  };
+  return withInteractionCandidateReads(new Proxy(page, {}), reads);
 }
 
 function injectedResolutionEnvelope(
@@ -295,9 +320,7 @@ function injectedResolutionEnvelope(
 }
 
 function injectedResolutionPage(envelope: unknown): Page {
-  return {
-    evaluateHandle: async () => envelope,
-  } as unknown as Page;
+  return adaptFakePage({ evaluateHandle: async () => envelope }) as unknown as Page;
 }
 
 function rawCandidateFor(candidate: InteractionCandidate) {
@@ -449,11 +472,14 @@ async function totalBudgetPage(section?: string): Promise<Page> {
   return page;
 }
 
+// DEF-073: Interaction の候補の処理は、`document` の名前つきの要素に隠されないように `Document.prototype.createTreeWalker` を呼ぶ。
+// 走査を測る補助は、`document` のインスタンスではなく `Document.prototype` の `createTreeWalker` を差し替える（`querySelectorAll` の
+// 差し替えと同じ形）。差し替えはそのページの中だけに効き、各テストが `finally` でページを閉じると、ページごと捨てられて元に戻る。
 async function installTotalTraversalProbe(page: Page): Promise<() => Promise<number>> {
-  await page.evaluate(() => {
+  await evaluateInCandidateReadWorld(page, () => {
     const original = document.createTreeWalker.bind(document);
     let count = 0;
-    Object.defineProperty(document, 'createTreeWalker', {
+    Object.defineProperty(Document.prototype, 'createTreeWalker', {
       configurable: true,
       value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
         const walker = original(root, whatToShow, filter);
@@ -471,7 +497,7 @@ async function installTotalTraversalProbe(page: Page): Promise<() => Promise<num
     });
     Object.defineProperty(globalThis, '__totalDomTraversalCount', { get: () => count });
   });
-  return () => page.evaluate(() => (
+  return () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __totalDomTraversalCount: number }
   ).__totalDomTraversalCount);
 }
@@ -482,12 +508,12 @@ async function installTotalTraversalProbe(page: Page): Promise<() => Promise<num
  * 文書の根は走査の最初に1回数えるので、対象に達するまでの消費は `1 + preceding` になる。
  */
 async function installPrecedingWorkWalker(page: Page, targetSelector: string, preceding: number): Promise<void> {
-  await page.evaluate(({ selector, count }) => {
+  await evaluateInCandidateReadWorld(page, ({ selector, count }) => {
     const target = document.querySelector(selector);
     if (target === null) throw new Error('Missing preceding-work target');
     const dummy = document.createElement('div');
     const originalCreateTreeWalker = document.createTreeWalker.bind(document);
-    Object.defineProperty(document, 'createTreeWalker', {
+    Object.defineProperty(Document.prototype, 'createTreeWalker', {
       configurable: true,
       value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
         if (root === document.documentElement && whatToShow === NodeFilter.SHOW_ELEMENT) {
@@ -507,28 +533,140 @@ async function installPrecedingWorkWalker(page: Page, targetSelector: string, pr
   }, { selector: targetSelector, count: preceding });
 }
 
-/** 要素の `getBoundingClientRect` を読んだ回数を数える。 */
+/**
+ * 要素の `getBoundingClientRect` を読んだ回数を数える。候補の処理は、要素の上書きを受けないように `Element.prototype` のメソッドを
+ * 呼ぶので（DEF-069）、要素のインスタンスではなく `Element.prototype` を差し替え、対象の要素への呼び出しだけを数える（DEF-075）。
+ * 差し替えはそのページの中だけに効き、テストがページを閉じると、ページごと捨てられて元に戻る。
+ */
 async function installGeometryReadCounter(page: Page, targetSelector: string): Promise<() => Promise<number>> {
-  await page.evaluate((selector) => {
+  await evaluateInCandidateReadWorld(page, (selector) => {
     const target = document.querySelector(selector);
     if (target === null) throw new Error('Missing geometry target');
-    const original = target.getBoundingClientRect.bind(target);
+    const original = Element.prototype.getBoundingClientRect;
     let reads = 0;
-    target.getBoundingClientRect = () => {
-      reads += 1;
-      return original();
+    Element.prototype.getBoundingClientRect = function getBoundingClientRect(this: Element): DOMRect {
+      if (this === target) reads += 1;
+      return original.call(this);
     };
     Object.defineProperty(globalThis, '__geometryReads', { configurable: true, get: () => reads });
   }, targetSelector);
-  return () => page.evaluate(() => (
+  return () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __geometryReads: number }
   ).__geometryReads);
 }
 
+/** `installIdentityFactCounters` が数えた値。 */
+interface IdentityFactCounts {
+  /** 文書の根（html）の `matches` が呼ばれたか。 */
+  readonly rootInspected: boolean;
+  /** 対象の要素の `getAttribute` が呼ばれた回数。 */
+  readonly factReads: number;
+}
+
+/**
+ * 文書の根の `matches` の呼び出しと、対象の要素の `getAttribute` の呼び出しを数える。数えた値は、ページの中では
+ * `globalThis.__identityFactCounts` で読める（走査の差し替えが、根を調べたかで前の要素の数を変えるため）。
+ * 候補の処理は `Element.prototype` のメソッドを呼ぶので（DEF-069）、`Element.prototype` を差し替え、根と対象への呼び出しだけを数える
+ * （DEF-075）。差し替えはそのページの中だけに効き、テストがページを閉じると、ページごと捨てられて元に戻る。
+ */
+async function installIdentityFactCounters(page: Page, targetSelector: string): Promise<() => Promise<IdentityFactCounts>> {
+  await evaluateInCandidateReadWorld(page, (selector) => {
+    const target = document.querySelector(selector);
+    if (target === null) throw new Error('Missing identity fact target');
+    const root = document.documentElement;
+    const counts = { rootInspected: false, factReads: 0 };
+    const originalMatches = Element.prototype.matches;
+    Element.prototype.matches = function matches(this: Element, selectors: string): boolean {
+      if (this === root) counts.rootInspected = true;
+      return originalMatches.call(this, selectors);
+    } as typeof Element.prototype.matches;
+    const originalGetAttribute = Element.prototype.getAttribute;
+    Element.prototype.getAttribute = function getAttribute(this: Element, name: string): string | null {
+      if (this === target) counts.factReads += 1;
+      return originalGetAttribute.call(this, name);
+    };
+    Object.defineProperty(globalThis, '__identityFactCounts', { configurable: true, get: () => ({ ...counts }) });
+  }, targetSelector);
+  return () => evaluateInCandidateReadWorld(page, () => (
+    globalThis as typeof globalThis & { readonly __identityFactCounts: IdentityFactCounts }
+  ).__identityFactCounts);
+}
+
+// DEF-075: 計測の補助が、候補の処理の読み取りを実際に数えることの対照。作業量の上限に達しない場面では、対象の幾何の読み取り、
+// 文書の根の一致判定、対象の属性の読み取りが起きるので、数えた値は 0 にならない（上限に達する場面の「0 回」の確かめが、空振りでないことを示す）。
+describe('DEF-075: the instrumentation counts the reads of the interaction probe', () => {
+  // T32j-4 fix round 1（対照）: 候補の処理は isolated world で読むので、main world の仕掛けには何も数えられず、製品が読む world の仕掛け
+  // （`evaluateInCandidateReadWorld`）には数えられる。このファイルの計測の仕掛けを、製品が読む world に入れる理由。
+  it('counts the reads only in the world where the probe reads, not in the main world (the control of the instrumentation)', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<button id="early" type="button" aria-controls="panel" aria-label="Early candidate">x</button><div id="panel">Panel</div>');
+      await page.evaluate(() => {
+        const target = document.querySelector('#early');
+        const original = Element.prototype.getBoundingClientRect;
+        let reads = 0;
+        Element.prototype.getBoundingClientRect = function getBoundingClientRect(this: Element): DOMRect {
+          if (this === target) reads += 1;
+          return original.call(this);
+        };
+        Object.defineProperty(globalThis, '__mainWorldGeometryReads', { configurable: true, get: () => reads });
+      });
+      const readTargetGeometry = await installGeometryReadCounter(page, '#early');
+      const result = await discoverInteractionCandidates(page);
+      expect(result.completeness).toBe('COMPLETE');
+      expect(await readTargetGeometry()).toBeGreaterThan(0);
+      expect(await page.evaluate(() => (globalThis as typeof globalThis & { readonly __mainWorldGeometryReads: number }).__mainWorldGeometryReads)).toBe(0);
+    } finally { await page.close(); }
+  });
+
+  it('counts geometry reads of the candidate during discovery without budget pressure', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<button id="early" type="button" aria-controls="panel" aria-label="Early candidate">x</button><div id="panel">Panel</div>');
+      const readTargetGeometry = await installGeometryReadCounter(page, '#early');
+      const result = await discoverInteractionCandidates(page);
+      expect(result.completeness).toBe('COMPLETE');
+      expect(await readTargetGeometry()).toBeGreaterThan(0);
+    } finally { await page.close(); }
+  });
+
+  it('counts geometry reads of the controlled element during retained inspection without budget pressure', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<button type="button" aria-controls="controlled" aria-label="Boundary">Boundary</button><div id="controlled" style="width:1px;height:1px"></div>');
+      const handle = await page.locator('button').elementHandle();
+      const handleReference = await candidateReferenceOf(page, 'button');
+      if (handle === null) throw new Error('Missing control candidate');
+      try {
+        const readControlledGeometry = await installGeometryReadCounter(page, '#controlled');
+        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toMatchObject({ status: 'CONNECTED' });
+        expect(await readControlledGeometry()).toBeGreaterThan(0);
+      } finally { await handle.dispose(); }
+    } finally { await page.close(); }
+  });
+
+  it('counts the root match and the attribute reads of the retained candidate without budget pressure', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<button type="button" aria-controls="controlled">Boundary</button><div id="controlled"></div>');
+      const handle = await page.locator('button').elementHandle();
+      const handleReference = await candidateReferenceOf(page, 'button');
+      if (handle === null) throw new Error('Missing control candidate');
+      try {
+        const readCounts = await installIdentityFactCounters(page, 'button');
+        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toMatchObject({ status: 'CONNECTED' });
+        const counts = await readCounts();
+        expect(counts.rootInspected).toBe(true);
+        expect(counts.factReads).toBeGreaterThan(0);
+      } finally { await handle.dispose(); }
+    } finally { await page.close(); }
+  });
+});
+
 it('avoids whole-DOM selector enumeration during discovery', async () => {
   const page = await totalBudgetPage();
   try {
-    await page.evaluate(() => {
+    await evaluateInCandidateReadWorld(page, () => {
       Document.prototype.querySelectorAll = () => { throw new Error('Forbidden whole-DOM query'); };
     });
     await expect(discoverInteractionCandidates(page)).resolves.toBeDefined();
@@ -585,18 +723,18 @@ it('bounded exact-handle resolution preserves the child after envelope disposal 
   const page = await browser.newPage();
   try {
     await page.setContent('<button type="button">Retained child</button>');
-    await page.evaluate(() => {
+    await evaluateInCandidateReadWorld(page, () => {
       Document.prototype.querySelectorAll = () => { throw new Error('Forbidden whole-DOM query'); };
     });
     const resolution = await resolveInteractionCandidateHandle(page, 0);
     expect(resolution.status).toBe('FOUND');
     if (resolution.status !== 'FOUND') throw new Error('Expected retained child');
     try {
-      expect(await resolution.handle.evaluate((element) => element.isConnected)).toBe(true);
+      expect(await resolution.reference.handle.evaluate((element) => element.isConnected)).toBe(true);
       expect(Object.isFrozen(resolution)).toBe(true);
-      const snapshot = await inspectInteractionCandidateHandle(resolution.handle, 0);
+      const snapshot = await inspectInteractionCandidateHandle(resolution.reference, 0);
       expect(snapshot).toMatchObject({ status: 'CONNECTED', candidate: { accessibleName: 'Retained child' } });
-    } finally { await resolution.handle.dispose(); }
+    } finally { await resolution.reference.handle.dispose(); }
   } finally { await page.close(); }
 });
 
@@ -615,6 +753,7 @@ it('retained inspection reports shared visibility-check budget exhaustion distin
   try {
     await page.setContent('<button id="early" type="button" aria-controls="panel" aria-label="Early candidate">x</button><div id="panel">Panel</div>');
     const handle = await page.locator('#early').elementHandle();
+    const handleReference = await candidateReferenceOf(page, '#early');
     if (handle === null) throw new Error('Missing early fixture node');
     try {
       // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + aria-controls の解決1 + 制御対象の可視判定1
@@ -622,7 +761,7 @@ it('retained inspection reports shared visibility-check budget exhaustion distin
       await installPrecedingWorkWalker(page, '#early', 16_376);
       const readTargetGeometry = await installGeometryReadCounter(page, '#early');
 
-      expect(await inspectInteractionCandidateHandle(handle, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
+      expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
       expect(await readTargetGeometry()).toBe(0);
     } finally { await handle.dispose(); }
   } finally { await page.close(); }
@@ -631,10 +770,11 @@ it('retained inspection reports shared visibility-check budget exhaustion distin
 it('retained inspection reports late live-ordinal budget exhaustion distinctly from disconnected', async () => {
   const page = await totalBudgetPage('no-early-candidate');
   const handle = await page.locator('button').elementHandle();
+  const handleReference = await candidateReferenceOf(page, 'button');
   if (handle === null) throw new Error('Missing late fixture node');
   try {
     const count = await installTotalTraversalProbe(page);
-    expect(await inspectInteractionCandidateHandle(handle, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
+    expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
     expect(await count()).toBeLessThanOrEqual(16_384);
   } finally { await handle.dispose(); await page.close(); }
 });
@@ -660,9 +800,10 @@ it('retained inspection shares total DOM work between live ordinal and candidate
       }
     });
     const handle = await page.locator('button').elementHandle();
+    const handleReference = await candidateReferenceOf(page, 'button');
     if (handle === null) throw new Error('Missing combined fixture node');
     try {
-      expect(await inspectInteractionCandidateHandle(handle, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
+      expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 16_384 });
     } finally { await handle.dispose(); }
   } finally { await page.close(); }
 });
@@ -675,9 +816,9 @@ it('bounded exact-handle resolution and retained inspection distinguish true abs
     const resolution = await resolveInteractionCandidateHandle(page, 0);
     if (resolution.status !== 'FOUND') throw new Error('Expected retained node');
     try {
-      await resolution.handle.evaluate((element) => element.remove());
-      expect(await inspectInteractionCandidateHandle(resolution.handle, 0)).toMatchObject({ status: 'DISCONNECTED' });
-    } finally { await resolution.handle.dispose(); }
+      await resolution.reference.handle.evaluate((element) => element.remove());
+      expect(await inspectInteractionCandidateHandle(resolution.reference, 0)).toMatchObject({ status: 'DISCONNECTED' });
+    } finally { await resolution.reference.handle.dispose(); }
   } finally { await page.close(); }
 });
 
@@ -687,26 +828,19 @@ describe('Task 2 correction boundaries', () => {
     try {
       await page.setContent('<button type="button" aria-controls="controlled">Boundary</button><div id="controlled"></div>');
       const handle = await page.locator('button').elementHandle();
+      const handleReference = await candidateReferenceOf(page, 'button');
       if (handle === null) throw new Error('Missing boundary candidate');
       try {
-        await page.evaluate(() => {
+        const readCounts = await installIdentityFactCounters(page, 'button');
+        await evaluateInCandidateReadWorld(page, () => {
           const target = document.querySelector('button')!;
           const dummy = document.createElement('div');
           const originalCreateTreeWalker = document.createTreeWalker.bind(document);
-          const originalRootMatches = document.documentElement.matches.bind(document.documentElement);
-          let rootInspected = false;
-          let factReads = 0;
+          const counts = (): IdentityFactCounts => (
+            globalThis as typeof globalThis & { readonly __identityFactCounts: IdentityFactCounts }
+          ).__identityFactCounts;
           let descendantWalkers = 0;
-          document.documentElement.matches = ((selector: string) => {
-            rootInspected = true;
-            return originalRootMatches(selector);
-          }) as typeof document.documentElement.matches;
-          const originalGetAttribute = target.getAttribute.bind(target);
-          target.getAttribute = ((name: string) => {
-            factReads += 1;
-            return originalGetAttribute(name);
-          }) as typeof target.getAttribute;
-          Object.defineProperty(document, 'createTreeWalker', {
+          Object.defineProperty(Document.prototype, 'createTreeWalker', {
             configurable: true,
             value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
               if (root === document.documentElement && whatToShow === NodeFilter.SHOW_ELEMENT) {
@@ -714,7 +848,7 @@ describe('Task 2 correction boundaries', () => {
                 return {
                   nextNode(): Node | null {
                     index += 1;
-                    const preceding = rootInspected ? 16_381 : 16_382;
+                    const preceding = counts().rootInspected ? 16_381 : 16_382;
                     if (index <= preceding) return dummy;
                     if (index === preceding + 1) return target;
                     return null;
@@ -727,19 +861,21 @@ describe('Task 2 correction boundaries', () => {
           });
           Object.defineProperty(globalThis, '__retainedIdentityBoundary', {
             configurable: true,
-            get: () => ({ factReads, descendantWalkers }),
+            get: () => ({ descendantWalkers }),
           });
         });
 
-        expect(await inspectInteractionCandidateHandle(handle, 0)).toEqual({
+        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({
           status: 'DOM_WORK_BUDGET_REACHED',
           domWorkUsed: 16_384,
         });
-        expect(await page.evaluate(() => (
+        const counts = await readCounts();
+        expect({ rootInspected: counts.rootInspected, factReads: counts.factReads }).toEqual({ rootInspected: true, factReads: 0 });
+        expect(await evaluateInCandidateReadWorld(page, () => (
           globalThis as typeof globalThis & {
-            readonly __retainedIdentityBoundary: { readonly factReads: number; readonly descendantWalkers: number };
+            readonly __retainedIdentityBoundary: { readonly descendantWalkers: number };
           }
-        ).__retainedIdentityBoundary)).toEqual({ factReads: 0, descendantWalkers: 0 });
+        ).__retainedIdentityBoundary)).toEqual({ descendantWalkers: 0 });
       } finally {
         await handle.dispose();
       }
@@ -755,13 +891,14 @@ describe('Task 2 correction boundaries', () => {
     try {
       await page.setContent('<button type="button" aria-controls="controlled" aria-label="Boundary">Boundary</button><div id="controlled" style="width:1px;height:1px"></div>');
       const handle = await page.locator('button').elementHandle();
+      const handleReference = await candidateReferenceOf(page, 'button');
       if (handle === null) throw new Error('Missing visibility boundary candidate');
       try {
         // 根1 + 前の要素 + 対象の走査と一致判定2 + 事実の収集の開始1 + aria-controls の解決1 + 制御対象の可視判定1 = 16,384
         await installPrecedingWorkWalker(page, 'button', 16_378);
         const readControlledGeometry = await installGeometryReadCounter(page, '#controlled');
 
-        expect(await inspectInteractionCandidateHandle(handle, 0)).toEqual({
+        expect(await inspectInteractionCandidateHandle(handleReference, 0)).toEqual({
           status: 'DOM_WORK_BUDGET_REACHED',
           domWorkUsed: 16_384,
         });
@@ -787,12 +924,12 @@ describe('Task 2 correction boundaries', () => {
           unrelated.textContent = 'Unrelated';
           document.body.prepend(unrelated);
         });
-        await expect(inspectInteractionCandidateHandle(resolution.handle, 0)).resolves.toMatchObject({
+        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toMatchObject({
           status: 'CONNECTED',
           candidate: { ordinal: 1, accessibleName: 'Target' },
         });
       } finally {
-        await resolution.handle.dispose();
+        await resolution.reference.handle.dispose();
       }
     } finally {
       await page.close();
@@ -819,12 +956,12 @@ describe('Task 2 correction boundaries', () => {
           target.before(fragment);
         });
 
-        await expect(inspectInteractionCandidateHandle(resolution.handle, 0)).resolves.toMatchObject({
+        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toMatchObject({
           status: 'CONNECTED',
           candidate: { ordinal: 99, accessibleName: 'Target' },
         });
       } finally {
-        await resolution.handle.dispose();
+        await resolution.reference.handle.dispose();
       }
     } finally {
       await page.close();
@@ -851,7 +988,7 @@ describe('Task 2 correction boundaries', () => {
           target.before(fragment);
         });
 
-        const snapshot = await inspectInteractionCandidateHandle(resolution.handle, 0);
+        const snapshot = await inspectInteractionCandidateHandle(resolution.reference, 0);
         expect(snapshot).toEqual({
           status: 'CANDIDATE_LIMIT_REACHED',
           domWorkUsed: expect.any(Number),
@@ -860,7 +997,7 @@ describe('Task 2 correction boundaries', () => {
         expect(Object.hasOwn(snapshot, 'candidate')).toBe(false);
         expect(Object.isFrozen(snapshot)).toBe(true);
       } finally {
-        await resolution.handle.dispose();
+        await resolution.reference.handle.dispose();
       }
     } finally {
       await page.close();
@@ -884,13 +1021,13 @@ describe('Task 2 correction boundaries', () => {
       const resolution = await resolveInteractionCandidateHandle(page, 0);
       if (resolution.status !== 'FOUND') throw new Error('Expected root candidate');
       try {
-        expect(await resolution.handle.evaluate((element) => element === document.documentElement)).toBe(true);
-        await expect(inspectInteractionCandidateHandle(resolution.handle, 0)).resolves.toMatchObject({
+        expect(await resolution.reference.handle.evaluate((element) => element === document.documentElement)).toBe(true);
+        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toMatchObject({
           status: 'CONNECTED',
           candidate: { ordinal: 0, tagName: 'html', accessibleName: 'Root candidate' },
         });
       } finally {
-        await resolution.handle.dispose();
+        await resolution.reference.handle.dispose();
       }
     } finally {
       await page.close();
@@ -957,13 +1094,13 @@ describe('Task 2 correction boundaries', () => {
       try {
         const readAcceptedTextNodes = await installTextTraversalCounter(page);
 
-        await expect(inspectInteractionCandidateHandle(resolution.handle, 0)).resolves.toEqual({
+        await expect(inspectInteractionCandidateHandle(resolution.reference, 0)).resolves.toEqual({
           status: 'TEXT_NODE_LIMIT_REACHED',
           domWorkUsed: expect.any(Number),
         });
         expect(await readAcceptedTextNodes()).toBe(INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
       } finally {
-        await resolution.handle.dispose();
+        await resolution.reference.handle.dispose();
       }
     } finally {
       await page.close();
@@ -972,160 +1109,179 @@ describe('Task 2 correction boundaries', () => {
 });
 
 describe('Task 2 correction resolver ownership and envelope validation', () => {
-  function probeProperty(
-    name: string,
-    disposed: string[],
-    options: {
-      readonly value?: unknown;
-      readonly element?: unknown;
-      readonly readError?: Error;
-      readonly disposeError?: Error;
-    } = {},
-  ) {
-    return {
-      async jsonValue() {
-        if (options.readError !== undefined) throw options.readError;
-        return options.value;
-      },
-      asElement: () => options.element ?? null,
-      async dispose() {
-        disposed.push(name);
-        if (options.disposeError !== undefined) throw options.disposeError;
-      },
-    };
+  // T32j-4 fix round 1: 解決は isolated world の読み取り（CDP の session と、その session の中の remote object）で行う。今までの「封筒
+  // （JSHandle）の項目を、成功・失敗のどれでも手放す」テストは、同じ性質（読み取りに使った資源を、成功・失敗・期限切れのどれでも残さない）を、
+  // 新しい資源で確かめる形に置き換えた: 読み取りの session を必ず切る（session を切ると、その中の remote object も手放される）、操作のために
+  // 得た handle のうち使わないものは手放す。偽の CDP の session と page で確かめる（命令の結果を差し込む）。
+  interface FakeResolutionOptions {
+    /** 解決の読み取りの値（`{ status, domWorkUsed }` の形。形の誤りも差し込む）。 */
+    readonly value?: unknown;
+    /** 解決の読み取りの要素の位置（要素の数だけ。null は shadow root の中）。 */
+    readonly paths?: readonly (readonly number[] | null)[];
+    /** 解決の読み取りの、ページの中の関数が例外を投げる。 */
+    readonly pageFunctionThrows?: boolean;
+    /** 値と位置を受け取る命令が失敗する。 */
+    readonly summaryFails?: boolean;
+    /** 要素の backendNodeId（解決の読み取り）。 */
+    readonly resolvedIds?: readonly number[];
+    /** 合図の受け手を付ける命令（`DOM.resolveNode`）が失敗する（解決した要素が、もうない）。 */
+    readonly armFails?: boolean;
+    /** 合図つきの位置の Locator が返す handle の数（0 は、位置の要素が解決した要素でない）。 */
+    readonly handleCount?: number;
+    /** session を切る命令が失敗する。 */
+    readonly detachFails?: boolean;
   }
 
-  it('cleans every acquired resolver property when status reading fails', async () => {
-    const disposed: string[] = [];
-    const candidate = probeProperty('element', disposed);
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', probeProperty('status', disposed, { readError: new Error('status read failed') })],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 1 })],
-      ['element', candidate],
-      ['extra', probeProperty('extra', disposed, { value: 'unused' })],
-    ]), async () => { disposed.push('envelope'); });
-
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).rejects.toThrow('status read failed');
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'element', 'envelope', 'extra', 'status'].sort());
-  });
-
-  it('Task 2 fix round 2 preserves an undefined resolver rejection after successful cleanup', async () => {
-    const disposed: string[] = [];
-    const undefinedRejectingStatus = {
-      jsonValue: async (): Promise<never> => Promise.reject(undefined),
-      asElement: () => null,
-      dispose: async () => { disposed.push('status'); },
+  /** 偽の CDP の session と page。開いた・切った session の数と、得た・手放した handle を記録する。 */
+  function fakeResolutionPage(options: FakeResolutionOptions = {}) {
+    const record = { opened: 0, detached: 0, armed: 0, disarmed: 0, locatorCalls: 0, handles: [] as string[], disposed: [] as string[] };
+    const newSession = () => {
+      record.opened += 1;
+      let readInput: Record<string, unknown> = {};
+      return {
+        send: async (method: string, params: Record<string, unknown> = {}) => {
+          switch (method) {
+            case 'Page.getFrameTree':
+              return { frameTree: { frame: { id: 'main-frame' }, childFrames: [] } };
+            case 'Page.createIsolatedWorld':
+              return { executionContextId: 7 };
+            case 'DOM.resolveNode': {
+              if (options.armFails === true) throw new Error('No node with the given id');
+              record.armed += 1;
+              return { object: { type: 'object', subtype: 'node', objectId: `armed-${String(params['backendNodeId'])}` } };
+            }
+            case 'Runtime.callFunctionOn': {
+              if (String(params['objectId'] ?? '').startsWith('armed-')) {
+                return { result: { type: 'boolean', value: true } };
+              }
+              const firstArgument = (params['arguments'] as { value: unknown }[] | undefined)?.[0]?.value;
+              if (params['executionContextId'] !== undefined && Array.isArray(firstArgument)) {
+                record.disarmed += firstArgument.length;
+                return { result: { type: 'number', value: firstArgument.length } };
+              }
+              if (params['executionContextId'] !== undefined) {
+                readInput = ((params['arguments'] as { value: Record<string, unknown> }[])[0]?.value) ?? {};
+                return options.pageFunctionThrows === true && readInput['mode'] === 'RESOLVE'
+                  ? { result: { type: 'undefined' }, exceptionDetails: { text: 'thrown' } }
+                  : { result: { type: 'object', objectId: 'envelope' } };
+              }
+              if (params['arguments'] === undefined) {
+                if (options.summaryFails === true && readInput['mode'] === 'RESOLVE') throw new Error('summary failed');
+                const verifying = readInput['mode'] !== 'RESOLVE';
+                return { result: { type: 'object', value: verifying
+                  ? { value: true, paths: readInput['paths'] }
+                  : { value: options.value, paths: options.paths ?? [] } } };
+              }
+              const index = (params['arguments'] as { value: number }[])[0]?.value ?? 0;
+              return { result: { type: 'object', subtype: 'node', objectId: `${readInput['mode'] === 'RESOLVE' ? 'resolved' : 'verified'}-${index}` } };
+            }
+            case 'DOM.describeNode': {
+              const objectId = String(params['objectId']);
+              const index = Number(objectId.split('-')[1]);
+              const backendNodeId = options.resolvedIds?.[index] ?? 100 + index;
+              return { node: { backendNodeId } };
+            }
+            default:
+              throw new Error(`unexpected command: ${method}`);
+          }
+        },
+        detach: async () => {
+          record.detached += 1;
+          if (options.detachFails === true) throw new Error('detach failed');
+        },
+      };
     };
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', undefinedRejectingStatus],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 1 })],
-      ['element', probeProperty('element', disposed)],
-      ['extra', probeProperty('extra', disposed, { value: 'unused' })],
-    ]), async () => { disposed.push('envelope'); });
+    const page = {
+      context: () => ({ newCDPSession: async () => newSession() }),
+      locator: () => ({
+        elementHandles: async () => {
+          record.locatorCalls += 1;
+          return Array.from({ length: options.handleCount ?? 1 }, (_value, index) => {
+            const name = `handle-${index}`;
+            record.handles.push(name);
+            return { dispose: async () => { record.disposed.push(name); } };
+          });
+        },
+      }),
+    } as unknown as Page;
+    return { page, record };
+  }
 
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).rejects.toBeUndefined();
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'element', 'envelope', 'extra', 'status'].sort());
+  it('detaches the read session when reading the resolution result fails (was: cleans every acquired resolver property when status reading fails)', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 1 }, paths: [[0, 1, 0]], summaryFails: true });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate isolated read failed');
+    expect(record).toMatchObject({ opened: 1, detached: 1, locatorCalls: 0 });
   });
 
-  it('Task 2 fix round 2 retains undefined primary presence with cleanup failures', async () => {
-    const disposed: string[] = [];
-    const cleanupError = new Error('metadata cleanup failed');
-    const undefinedRejectingStatus = {
-      jsonValue: async (): Promise<never> => Promise.reject(undefined),
-      asElement: () => null,
-      dispose: async () => { disposed.push('status'); },
-    };
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', undefinedRejectingStatus],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 1, disposeError: cleanupError })],
-      ['element', probeProperty('element', disposed)],
-      ['extra', probeProperty('extra', disposed, { value: 'unused' })],
-    ]), async () => { disposed.push('envelope'); });
-
-    let rejection: unknown;
-    try {
-      await resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0);
-    } catch (error) {
-      rejection = error;
-    }
-    expect(rejection).toBeInstanceOf(AggregateError);
-    expect((rejection as AggregateError).errors).toEqual([undefined, cleanupError]);
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'element', 'envelope', 'extra', 'status'].sort());
+  it('detaches the read session when the page function throws (was: preserves an undefined resolver rejection after successful cleanup)', async () => {
+    const { page, record } = fakeResolutionPage({ pageFunctionThrows: true });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate isolated read failed');
+    expect(record).toMatchObject({ opened: 1, detached: 1, locatorCalls: 0 });
   });
 
-  it('attempts all resolver cleanup after metadata disposal fails and reclaims the prospective FOUND child', async () => {
-    const disposed: string[] = [];
-    const candidate = probeProperty('element', disposed);
-    candidate.asElement = () => candidate;
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', probeProperty('status', disposed, { value: 'FOUND', disposeError: new Error('status dispose failed') })],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 2 })],
-      ['element', candidate],
-      ['extra', probeProperty('extra', disposed, { value: 'unused' })],
-    ]), async () => { disposed.push('envelope'); });
-
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).rejects.toThrow('status dispose failed');
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'element', 'envelope', 'extra', 'status'].sort());
+  it('keeps the read failure when detaching the session also fails (was: retains undefined primary presence with cleanup failures)', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 1 }, paths: [[0, 1, 0]], summaryFails: true, detachFails: true });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate isolated read failed');
+    expect(record).toMatchObject({ opened: 1, detached: 1, locatorCalls: 0 });
   });
 
-  it('disposes unknown resolver properties on a successful non-FOUND envelope', async () => {
-    const disposed: string[] = [];
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', probeProperty('status', disposed, { value: 'MISSING' })],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 2 })],
-      ['extra', probeProperty('extra', disposed, { value: 'unused' })],
-    ]), async () => { disposed.push('envelope'); });
-
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).resolves.toEqual({
-      status: 'MISSING',
-      domWorkUsed: 2,
-    });
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'envelope', 'extra', 'status'].sort());
+  // T32R-fix-I1: handle は、合図の受け手を付けた要素だけを返す Locator で得る（得た後に別の確かめをしない）。位置の要素が解決した要素で
+  // なければ、Locator は要素を返さないので、handle を得ず、受け手を外し、session をすべて切る。
+  it('acquires no handle, disarms the signal and detaches every session when the element at the path is not the resolved element (was: attempts all resolver cleanup after metadata disposal fails and reclaims the prospective FOUND child)', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], resolvedIds: [41], handleCount: 0 });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate handle is unavailable');
+    expect(record).toMatchObject({ armed: 1, disarmed: 1, locatorCalls: 1, handles: [], disposed: [] });
+    expect(record.opened).toBe(2);
+    expect(record.detached).toBe(record.opened);
   });
 
-  it('reclaims a prospective FOUND child when envelope cleanup fails before transfer', async () => {
-    const disposed: string[] = [];
-    const candidate = probeProperty('element', disposed);
-    candidate.asElement = () => candidate;
-    const envelope = injectedResolutionEnvelope(new Map([
-      ['status', probeProperty('status', disposed, { value: 'FOUND' })],
-      ['domWorkUsed', probeProperty('domWorkUsed', disposed, { value: 2 })],
-      ['element', candidate],
-    ]), async () => {
-      disposed.push('envelope');
-      throw new Error('envelope dispose failed');
-    });
+  it('acquires no handle and detaches every session when the signal receiver cannot be armed', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], armFails: true });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate handle is unavailable');
+    expect(record).toMatchObject({ armed: 0, disarmed: 0, locatorCalls: 0, handles: [] });
+    expect(record.opened).toBe(2);
+    expect(record.detached).toBe(record.opened);
+  });
 
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).rejects.toThrow('envelope dispose failed');
-    expect(disposed.sort()).toEqual(['domWorkUsed', 'element', 'envelope', 'status'].sort());
+  it('detaches the read session after a successful non-FOUND resolution and acquires no handle (was: disposes unknown resolver properties on a successful non-FOUND envelope)', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'MISSING', domWorkUsed: 2 }, paths: [] });
+    await expect(resolveInteractionCandidateHandle(page, 0)).resolves.toEqual({ status: 'MISSING', domWorkUsed: 2 });
+    expect(record).toMatchObject({ opened: 1, detached: 1, locatorCalls: 0, handles: [] });
+  });
+
+  it('disposes every handle when the path matches more than one element (was: reclaims a prospective FOUND child when envelope cleanup fails before transfer)', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], handleCount: 2 });
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow('Interaction candidate handle is unavailable');
+    expect(record.disposed.sort()).toEqual(['handle-0', 'handle-1']);
+    expect(record).toMatchObject({ armed: 1, disarmed: 1 });
+    expect(record.detached).toBe(record.opened);
+  });
+
+  it('hands over the verified handle of the resolved element and detaches every session', async () => {
+    const { page, record } = fakeResolutionPage({ value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], resolvedIds: [42], handleCount: 1 });
+    const resolution = await resolveInteractionCandidateHandle(page, 0);
+    expect(resolution).toMatchObject({ status: 'FOUND', domWorkUsed: 2, reference: { backendNodeId: 42 } });
+    expect(record.disposed).toEqual([]);
+    expect(record).toMatchObject({ armed: 1, disarmed: 1, locatorCalls: 1 });
+    expect(record.opened).toBe(2);
+    expect(record.detached).toBe(record.opened);
   });
 
   it.each([
-    ['unknown status', new Map<string, unknown>([['status', 'UNKNOWN'], ['domWorkUsed', 0]])],
-    ['negative work', new Map<string, unknown>([['status', 'MISSING'], ['domWorkUsed', -1]])],
-    ['out-of-range work', new Map<string, unknown>([['status', 'MISSING'], ['domWorkUsed', 16_385]])],
-    ['fractional work', new Map<string, unknown>([['status', 'MISSING'], ['domWorkUsed', 1.5]])],
-    ['missing FOUND child', new Map<string, unknown>([['status', 'FOUND'], ['domWorkUsed', 2]])],
-    ['non-element FOUND child', new Map<string, unknown>([['status', 'FOUND'], ['domWorkUsed', 2], ['element', null]])],
-    ['contradictory MISSING child', new Map<string, unknown>([['status', 'MISSING'], ['domWorkUsed', 2], ['element', 'element']])],
-    ['contradictory budget child', new Map<string, unknown>([['status', 'DOM_WORK_BUDGET_REACHED'], ['domWorkUsed', 2], ['element', 'element']])],
-  ] as const)('rejects malformed resolver envelope: %s', async (_label, values) => {
-    const disposed: string[] = [];
-    let candidate: ReturnType<typeof probeProperty> | undefined;
-    const properties = new Map<string, unknown>();
-    for (const [name, value] of values) {
-      if (name === 'element') {
-        candidate = probeProperty('element', disposed);
-        if (value === 'element') candidate.asElement = () => candidate as ReturnType<typeof probeProperty>;
-        properties.set(name, candidate);
-      } else {
-        properties.set(name, probeProperty(name, disposed, { value }));
-      }
-    }
-    const envelope = injectedResolutionEnvelope(properties, async () => { disposed.push('envelope'); });
-    await expect(resolveInteractionCandidateHandle(injectedResolutionPage(envelope), 0)).rejects.toThrow();
-    expect(disposed).toContain('envelope');
-    expect(disposed).toEqual(expect.arrayContaining([...properties.keys()]));
+    ['unknown status', { value: { status: 'UNKNOWN', domWorkUsed: 0 }, paths: [] }],
+    ['negative work', { value: { status: 'MISSING', domWorkUsed: -1 }, paths: [] }],
+    ['out-of-range work', { value: { status: 'MISSING', domWorkUsed: 16_385 }, paths: [] }],
+    ['fractional work', { value: { status: 'MISSING', domWorkUsed: 1.5 }, paths: [] }],
+    ['missing FOUND child', { value: { status: 'FOUND', domWorkUsed: 2 }, paths: [] }],
+    ['non-element FOUND child', { value: { status: 'FOUND', domWorkUsed: 2 }, paths: [[0, 1, 0]], summaryFails: true }],
+    ['contradictory MISSING child', { value: { status: 'MISSING', domWorkUsed: 2 }, paths: [[0, 1, 0]] }],
+    ['contradictory budget child', { value: { status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 2 }, paths: [[0, 1, 0]] }],
+  ] as const)('rejects malformed resolver envelope: %s', async (_label, options) => {
+    const { page, record } = fakeResolutionPage(options);
+    await expect(resolveInteractionCandidateHandle(page, 0)).rejects.toThrow();
+    expect(record.locatorCalls).toBe(0);
+    expect(record.opened).toBeGreaterThan(0);
+    expect(record.detached).toBe(record.opened);
   });
 
   it.each([
@@ -1141,14 +1297,12 @@ describe('Task 2 correction resolver ownership and envelope validation', () => {
     ['contradictory candidate-limit raw', { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 1, raw: {} }],
     ['out-of-range candidate-limit work', { status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 16_385 }],
   ] as const)('rejects malformed retained snapshot: %s', async (_label, value) => {
-    const handle = { evaluate: async () => value } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+    const handle = fakeCandidateReference(async () => value);
     await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow();
   });
 
   it('accepts an immutable candidate-limit retained snapshot without a candidate payload', async () => {
-    const handle = {
-      evaluate: async () => ({ status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 }),
-    } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+    const handle = fakeCandidateReference(async () => ({ status: 'CANDIDATE_LIMIT_REACHED', domWorkUsed: 205 }));
 
     const snapshot = await inspectInteractionCandidateHandle(handle, 0);
 
@@ -1169,10 +1323,10 @@ function input(path: string, candidate: InteractionCandidate): InteractionAuditI
 }
 
 async function installTextTraversalCounter(page: Page): Promise<() => Promise<number>> {
-  await page.evaluate(() => {
+  await evaluateInCandidateReadWorld(page, () => {
     const original = document.createTreeWalker.bind(document);
     let acceptedTextNodes = 0;
-    Object.defineProperty(document, 'createTreeWalker', {
+    Object.defineProperty(Document.prototype, 'createTreeWalker', {
       configurable: true,
       value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
         const walker = original(root, whatToShow, filter);
@@ -1191,16 +1345,16 @@ async function installTextTraversalCounter(page: Page): Promise<() => Promise<nu
       get: () => acceptedTextNodes,
     });
   });
-  return () => page.evaluate(() => (
+  return () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __acceptedTextNodes: number }
   ).__acceptedTextNodes);
 }
 
 async function installTraversalProbe(page: Page): Promise<() => Promise<number>> {
-  await page.evaluate((maxNodes) => {
+  await evaluateInCandidateReadWorld(page, (maxNodes) => {
     const original = document.createTreeWalker.bind(document);
     let nextNodeCalls = 0;
-    Object.defineProperty(document, 'createTreeWalker', {
+    Object.defineProperty(Document.prototype, 'createTreeWalker', {
       configurable: true,
       value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
         if (whatToShow !== NodeFilter.SHOW_ALL) return original(root, whatToShow, filter);
@@ -1226,16 +1380,16 @@ async function installTraversalProbe(page: Page): Promise<() => Promise<number>>
       get: () => nextNodeCalls,
     });
   }, INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
-  return async () => page.evaluate(() => (
+  return async () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __beakSightTraversalCount: number }
   ).__beakSightTraversalCount);
 }
 
 async function installAggregateTraversalProbe(page: Page): Promise<() => Promise<number>> {
-  await page.evaluate((maxNodes) => {
+  await evaluateInCandidateReadWorld(page, (maxNodes) => {
     const original = document.createTreeWalker.bind(document);
     let nonNullNextNodeCalls = 0;
-    Object.defineProperty(document, 'createTreeWalker', {
+    Object.defineProperty(Document.prototype, 'createTreeWalker', {
       configurable: true,
       value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
         if (whatToShow !== NodeFilter.SHOW_ALL) return original(root, whatToShow, filter);
@@ -1264,7 +1418,7 @@ async function installAggregateTraversalProbe(page: Page): Promise<() => Promise
       get: () => nonNullNextNodeCalls,
     });
   }, INTERACTION_CANDIDATE_LIMITS.maxTextNodes);
-  return async () => page.evaluate(() => (
+  return async () => evaluateInCandidateReadWorld(page, () => (
     globalThis as typeof globalThis & { readonly __beakSightAggregateTraversalCount: number }
   ).__beakSightAggregateTraversalCount);
 }
@@ -1313,7 +1467,7 @@ describe('interaction candidate discovery', () => {
   it('does not iterate a hostile NodeList or materialize full descendant text during discovery', async () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
-      await page.evaluate((maxTextNodes) => {
+      await evaluateInCandidateReadWorld(page, (maxTextNodes) => {
         Object.defineProperty(NodeList.prototype, Symbol.iterator, {
           configurable: true,
           value(): never {
@@ -1333,7 +1487,7 @@ describe('interaction candidate discovery', () => {
           },
         });
         const createTreeWalker = document.createTreeWalker.bind(document);
-        Object.defineProperty(document, 'createTreeWalker', {
+        Object.defineProperty(Document.prototype, 'createTreeWalker', {
           configurable: true,
           value(root: Node, whatToShow: number, filter?: NodeFilter | null) {
             if (whatToShow !== NodeFilter.SHOW_ALL) return createTreeWalker(root, whatToShow, filter);
@@ -1384,13 +1538,14 @@ describe('interaction candidate discovery', () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/hostile-candidates.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR);
       if (handle === null) {
         throw new Error('fixture candidate handle missing');
       }
       try {
         const readNextNodeCalls = await installTraversalProbe(page);
 
-        await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({
+        await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
           status: 'TEXT_NODE_LIMIT_REACHED',
         });
         const nextNodeCalls = await readNextNodeCalls();
@@ -1421,13 +1576,14 @@ describe('interaction candidate discovery', () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/multi-root-candidates.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR);
       if (handle === null) {
         throw new Error('fixture candidate handle missing');
       }
       try {
         const readNextNodeCalls = await installAggregateTraversalProbe(page);
 
-        await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({
+        await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
           status: 'TEXT_NODE_LIMIT_REACHED',
         });
         const nextNodeCalls = await readNextNodeCalls();
@@ -1443,11 +1599,12 @@ describe('interaction candidate discovery', () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/accordion.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).first().elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR);
       if (handle === null) {
         throw new Error('fixture candidate handle missing');
       }
       try {
-        await page.evaluate(() => {
+        await evaluateInCandidateReadWorld(page, () => {
           Object.defineProperty(NodeList.prototype, Symbol.iterator, {
             configurable: true,
             value(): never {
@@ -1456,7 +1613,7 @@ describe('interaction candidate discovery', () => {
           });
         });
 
-        await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({ status: 'CONNECTED' });
+        await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({ status: 'CONNECTED' });
       } finally {
         await handle.dispose();
       }
@@ -1467,11 +1624,12 @@ describe('interaction candidate discovery', () => {
     await withGuardedPassivePage(factory, viewport, async (page) => {
       await page.goto(`${server.origin}/candidate-overflow.html`, { waitUntil: 'load' });
       const handle = await page.locator(INTERACTION_CANDIDATE_SELECTOR).nth(100).elementHandle();
+      const handleReference = await candidateReferenceOf(page, INTERACTION_CANDIDATE_SELECTOR, 100);
       if (handle === null) {
         throw new Error('overflow fixture candidate handle missing');
       }
       try {
-        await expect(inspectInteractionCandidateHandle(handle, 99)).resolves.toEqual({
+        await expect(inspectInteractionCandidateHandle(handleReference, 99)).resolves.toEqual({
           status: 'CANDIDATE_LIMIT_REACHED',
           domWorkUsed: expect.any(Number),
         });
@@ -2279,8 +2437,10 @@ describe('isolated fail-closed interaction audit', () => {
         browserClickEvents += 1;
       });
       const wrappedPage = Object.create(page) as Page;
-      const evaluateHandle = page.evaluateHandle.bind(page) as (...args: never[]) => Promise<unknown>;
-      wrappedPage.evaluateHandle = (async (...args: never[]) => {
+      // T32j-4 fix round 1: 解決（`RESOLVE`）の直前に危ない要素を差し込む（今までの `evaluateHandle` の差し込みと同じ時点。今までの
+      // `locator().nth()` の差し込みは、解決が `evaluateHandle` だったので働いていなかった）。読み取りは本物の isolated world の読み取りに任せる。
+      const base = interactionCandidateReadsOf(page);
+      const insertBeforeResolution = async (): Promise<void> => {
         await page.evaluate(() => {
           document.addEventListener('click', () => {
             void (globalThis as typeof globalThis & {
@@ -2293,8 +2453,34 @@ describe('isolated fail-closed interaction audit', () => {
           inserted.textContent = 'Unsafe inserted navigation';
           document.body.prepend(inserted);
         });
-        return evaluateHandle(...args);
-      }) as Page['evaluateHandle'];
+      };
+      withInteractionCandidateReads(wrappedPage, {
+        ...base,
+        resolve: async (_target, resolveInput, deadlineAtMs) => {
+          await insertBeforeResolution();
+          return base.resolve(page, resolveInput, deadlineAtMs);
+        },
+        handleOf: async (_target, reference, deadlineAtMs) => {
+          const handle = await base.handleOf(page, reference, deadlineAtMs);
+          if (handle === null) {
+            return null;
+          }
+          return new Proxy(handle, {
+            get(target, property, receiver) {
+              if (property === 'click') {
+                return async (clickOptions: { readonly timeout?: number }) => {
+                  unsafeClickCalls += 1;
+                  return target.click(clickOptions);
+                };
+              }
+              const value: unknown = Reflect.get(target, property, receiver);
+              return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+            },
+          });
+        },
+        discover: (_target, discoverInput, deadlineAtMs) => base.discover(page, discoverInput, deadlineAtMs),
+        inspect: (_target, backendNodeId, inspectInput, deadlineAtMs) => base.inspect(page, backendNodeId, inspectInput, deadlineAtMs),
+      });
       wrappedPage.locator = ((selector: string) => {
         const locator = page.locator(selector);
         return {
@@ -3164,6 +3350,9 @@ describe('isolated fail-closed interaction audit', () => {
       const rawCloseGate = createDeferred<void>();
       let rawCloseCalls = 0;
       let contextCleanupCalls = 0;
+      // Guard が Context に付ける listener の事象の一覧（DEF-110 fix で `close` が加わった）。Guard の後片付けは、これを同じ順で 1 回ずつ外す。
+      const guardListenerEvents = await guardContextListenerEvents();
+      const contextCleanupEvents: string[] = [];
       const sessionFactory = async (sessionViewport: Viewport): Promise<InteractionGuardedSession> => {
         const session = await factory.createInteractionSession(sessionViewport);
         const context = session.page.context();
@@ -3176,6 +3365,7 @@ describe('isolated fail-closed interaction audit', () => {
         });
         vi.spyOn(context, 'off').mockImplementation((event, listener) => {
           contextCleanupCalls += 1;
+          contextCleanupEvents.push(String(event));
           if (contextCleanupCalls === 1) {
             throw new Error(`late ${joinTiming} listener cleanup evidence`);
           }
@@ -3193,8 +3383,8 @@ describe('isolated fail-closed interaction audit', () => {
               return;
             }
             rawCloseGate.resolve(undefined);
-            // Guard の Context の listener（page、requestfailed、request）の数（C18a で request を加えた）。
-            await expect.poll(() => contextCleanupCalls).toBe(3);
+            // Guard の Context の listener をすべて外し終えるまで待つ（数は Guard が付ける一覧から導く）。
+            await expect.poll(() => contextCleanupCalls).toBe(guardListenerEvents.length);
             await wait(0);
             await session.close();
           },
@@ -3233,7 +3423,8 @@ describe('isolated fail-closed interaction audit', () => {
         },
       ]));
       expect(rawCloseCalls).toBe(1);
-      expect(contextCleanupCalls).toBe(3);
+      expect(contextCleanupCalls).toBe(guardListenerEvents.length);
+      expect(contextCleanupEvents).toEqual(guardListenerEvents);
     },
   );
 
@@ -4790,9 +4981,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           ['Target', expectedVisible],
         ]);
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing visibility fixture candidate');
         try {
-          await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({
+          await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
             status: 'CONNECTED',
             candidate: { accessibleName: 'Target', visible: expectedVisible },
           });
@@ -4828,9 +5020,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         expect(discovery.candidates.map(({ controlledVisible, controlledHidden }) => [controlledVisible, controlledHidden]))
           .toEqual([[expectedVisible, !expectedVisible]]);
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing controlled visibility fixture candidate');
         try {
-          await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({
+          await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({
             status: 'CONNECTED',
             candidate: { controlledVisible: expectedVisible, controlledHidden: !expectedVisible },
           });
@@ -4846,7 +5039,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       const page = await browser.newPage();
       try {
         await page.setContent('<button type="button" aria-controls="panel">Toggle</button><div id="panel">Panel</div>');
-        await page.evaluate(() => {
+        await evaluateInCandidateReadWorld(page, () => {
           const original = Element.prototype.checkVisibility;
           const calls: unknown[] = [];
           Element.prototype.checkVisibility = function checkVisibility(options?: CheckVisibilityOptions) {
@@ -4855,7 +5048,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           };
           Object.defineProperty(globalThis, '__checkVisibilityCalls', { configurable: true, get: () => calls });
         });
-        const readCalls = () => page.evaluate(() => (
+        const readCalls = () => evaluateInCandidateReadWorld(page, () => (
           globalThis as typeof globalThis & { readonly __checkVisibilityCalls: readonly unknown[] }
         ).__checkVisibilityCalls);
 
@@ -4864,9 +5057,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         // 探索では、制御対象と候補自身について1回ずつ呼ぶ。
         expect(await readCalls()).toEqual([VISIBILITY_CHECK_OPTIONS, VISIBILITY_CHECK_OPTIONS]);
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing option probe candidate');
         try {
-          await expect(inspectInteractionCandidateHandle(handle, 0)).resolves.toMatchObject({ status: 'CONNECTED' });
+          await expect(inspectInteractionCandidateHandle(handleReference, 0)).resolves.toMatchObject({ status: 'CONNECTED' });
           expect(await readCalls()).toEqual(Array.from({ length: 4 }, () => VISIBILITY_CHECK_OPTIONS));
         } finally {
           await handle.dispose();
@@ -4924,9 +5118,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         const scrolled = await discoverInteractionCandidates(page);
         expect(scrolled.candidates[0]?.boundingBox).toEqual(initialBox);
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing far candidate');
         try {
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           if (snapshot.status !== 'CONNECTED') throw new Error('Expected connected far candidate');
           expect(snapshot.candidate.boundingBox).toEqual(initialBox);
         } finally {
@@ -5072,13 +5267,11 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
   describe('Q6: malformed browser geometry is rejected with a bounded message', () => {
     it('rejects a retained snapshot whose bounding box is null without a TypeError', async () => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
-      const handle = {
-        evaluate: async () => ({
+      const handle = fakeCandidateReference(async () => ({
           status: 'CONNECTED',
           domWorkUsed: 1,
           raw: { ...rawCandidateFor(candidate), boundingBox: null },
-        }),
-      } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+        }));
 
       const rejection = await inspectInteractionCandidateHandle(handle, 0).catch((error: unknown) => error);
 
@@ -5097,7 +5290,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         }),
       } as unknown as Page;
 
-      const rejection = await discoverInteractionCandidates(page).catch((error: unknown) => error);
+      const rejection = await discoverInteractionCandidates(adaptFakePage(page)).catch((error: unknown) => error);
 
       expect(rejection).toBeInstanceOf(Error);
       expect(rejection).not.toBeInstanceOf(TypeError);
@@ -5786,9 +5979,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           shadow.innerHTML = '<div id="inner" style="height:100px;overflow-y:scroll"><div style="height:50px"></div><slot></slot><div style="height:500px"></div></div>';
         });
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing slotted candidate');
         const record = async () => {
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           if (snapshot.status !== 'CONNECTED') throw new Error('Expected connected slotted candidate');
           return snapshot.scroll;
         };
@@ -5828,10 +6022,11 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       try {
         await page.setContent('<button type="button" aria-label="Budget">x</button>');
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing budget candidate');
         try {
           await installPrecedingWorkWalker(page, 'button', preceding);
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           expect(snapshot).toMatchObject({ status: 'CONNECTED', domWorkUsed: 16_384, scroll: expectedScroll });
         } finally {
           await handle.dispose();
@@ -5850,7 +6045,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     ] as const)('rejects a malformed retained scroll record: %s', async (_label, value) => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = { evaluate: async () => snapshot } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+      const handle = fakeCandidateReference(async () => snapshot);
 
       await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
     });
@@ -6226,9 +6421,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         for (const [label, change, expected] of changes) {
           await page.setContent(content);
           const handle = await page.locator('button').elementHandle();
+          const handleReference = await candidateReferenceOf(page, 'button');
           if (handle === null) throw new Error('Missing attribute candidate');
           const record = async () => {
-            const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+            const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
             if (snapshot.status !== 'CONNECTED') throw new Error('Expected connected attribute candidate');
             return snapshot.attributes;
           };
@@ -6257,9 +6453,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           document.querySelector('button')!.setAttribute('data-long', 'v'.repeat(length));
         }, INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 100);
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing long attribute candidate');
         try {
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           if (snapshot.status !== 'CONNECTED' || snapshot.attributes.status !== 'RECORDED') {
             throw new Error('Expected a recorded attribute list');
           }
@@ -6286,10 +6483,11 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       try {
         await page.setContent('<button type="button" aria-label="Budget">x</button>');
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing budget candidate');
         try {
           await installPrecedingWorkWalker(page, 'button', preceding);
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           expect(snapshot).toMatchObject({
             status: 'CONNECTED',
             domWorkUsed: 16_384,
@@ -6355,7 +6553,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     ] as const)('rejects a malformed retained attribute record: %s', async (_label, value) => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = { evaluate: async () => snapshot } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+      const handle = fakeCandidateReference(async () => snapshot);
 
       await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
     });
@@ -6781,9 +6979,8 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
         await page.setContent(
           '<details><summary>Summary</summary><p>Body</p></details><button type="button">Plain</button>',
         );
-        const summary = await page.locator('summary').elementHandle();
-        const button = await page.locator('button').elementHandle();
-        if (summary === null || button === null) throw new Error('Missing details candidates');
+        const summary = await candidateReferenceOf(page, 'summary');
+        const button = await candidateReferenceOf(page, 'button');
         const detailsOpen = async (handle: typeof summary, ordinal: number) => {
           const snapshot = await inspectInteractionCandidateHandle(handle, ordinal);
           if (snapshot.status !== 'CONNECTED') throw new Error('Expected a connected details candidate');
@@ -6795,8 +6992,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           expect(await detailsOpen(summary, 0)).toBe(true);
           expect(await detailsOpen(button, 1)).toBeNull();
         } finally {
-          await summary.dispose();
-          await button.dispose();
+          // T32j-4 fix round 1: 参照には手放す handle がない（読み取りの CDP の session は、読むたびに切る）。
         }
       } finally {
         await page.close();
@@ -6825,7 +7021,7 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
     ] as const)('rejects a malformed retained details state: %s', async (_label, value) => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
       const snapshot = value.status === 'CONNECTED' ? { ...value, raw: rawCandidateFor(candidate) } : value;
-      const handle = { evaluate: async () => snapshot } as unknown as Parameters<typeof inspectInteractionCandidateHandle>[0];
+      const handle = fakeCandidateReference(async () => snapshot);
 
       await expect(inspectInteractionCandidateHandle(handle, 0)).rejects.toThrow('Invalid bounded interaction handle snapshot');
     });
@@ -7319,6 +7515,11 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
       ['a C1 OSC body terminated by BEL', 'click \u009d0;title\u0007failed', 'click failed'],
       ['an unterminated OSC body', 'click failed \u001b]8;;secret-link', 'click failed'],
       ['bidirectional controls', 'click ‮failed⁦ badly⁩ ‪‫‬‭⁧⁨', 'click failed badly'],
+      // CCX-3: 共通化の前と後で、要約の掃除の結果が変わらないことを固定する（ALM・LRM・RLM、孤立したサロゲート、C0・DEL・C1、行の区切り）。
+      ['an Arabic letter mark and directional marks', 'click\u061c fai\u200eled\u200f badly', 'click failed badly'],
+      ['lone surrogates', 'click \ud800fai\udbffled\udc00 badly\udfff', 'click failed badly'],
+      ['C0, DEL and C1 controls', 'click\u0000failed\u007fbadly\u0085\u0080', 'click failed badly'],
+      ['line and paragraph separators', 'click\u2028failed\u2029badly', 'click failed badly'],
     ] as const)('removes %s from a click failure reason', async (_label, message, expectedReason) => {
       const candidate = await candidateNamed('/accordion.html', 'Toggle details');
 
@@ -8085,9 +8286,10 @@ describe('C3 corrections (foundation corrections design 4.2-4.8, 5.5)', () => {
           attributeLength: INTERACTION_CANDIDATE_LIMITS.maxAttributeLength + 100,
         });
         const handle = await page.locator('button').elementHandle();
+        const handleReference = await candidateReferenceOf(page, 'button');
         if (handle === null) throw new Error('Missing long class candidate');
         try {
-          const snapshot = await inspectInteractionCandidateHandle(handle, 0);
+          const snapshot = await inspectInteractionCandidateHandle(handleReference, 0);
           if (snapshot.status !== 'CONNECTED' || snapshot.attributes.status !== 'RECORDED') {
             throw new Error('Expected a recorded attribute list');
           }
@@ -8603,8 +8805,7 @@ describe('the observation of the target load of an interaction candidate (site u
 
   beforeAll(async () => {
     const accordion = await readFile(resolve(process.cwd(), 'fixtures/site/accordion.html'), 'utf8');
-    const sockets = new Set<Socket>();
-    const statusServer = createServer((request, response) => {
+    const statusServer = await startLoopbackHttpServer((request, response) => {
       const path = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
       const status = Object.hasOwn(STATUS_PATHS, path) ? STATUS_PATHS[path as StatusPath] : STATUS_NOT_FOUND;
       response.writeHead(status, {
@@ -8613,28 +8814,8 @@ describe('the observation of the target load of an interaction candidate (site u
       });
       response.end(accordion);
     });
-    statusServer.on('connection', (socket) => {
-      sockets.add(socket);
-      socket.once('close', () => sockets.delete(socket));
-    });
-    const port = await new Promise<number>((resolvePort, reject) => {
-      statusServer.once('error', reject);
-      statusServer.listen({ host: '127.0.0.1', port: 0 }, () => {
-        const address = statusServer.address();
-        if (address === null || typeof address === 'string') {
-          reject(new Error('status server did not bind to a TCP port'));
-          return;
-        }
-        resolvePort(address.port);
-      });
-    });
-    closeStatusServer = () => new Promise<void>((resolveClose, reject) => {
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      statusServer.close((error) => (error === undefined ? resolveClose() : reject(error)));
-    });
-    statusOrigin = `http://127.0.0.1:${port}`;
+    closeStatusServer = statusServer.close;
+    statusOrigin = statusServer.origin;
     statusFactory = new BrowserContextFactory(browser, configFor(statusOrigin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
   });
 
@@ -8732,6 +8913,9 @@ describe('the observation of the target load of an interaction candidate (site u
       activateInteractionFreeze: () => realSession.activateInteractionFreeze(),
       close: () => realSession.close(),
     };
+    // T32j-4 fix round 1: 候補の読み取りも CDP の session を開くので、観察の開始（Context の CDP の session）だけを開かないようにし、候補の
+    // 読み取りは本物の page で行う（差し替えるのは観察の開始だけ、という今までの準備のとおり）。
+    withInteractionCandidateReads(session.page, readsOnPage(realSession.page));
     const observations: MainFrameLoadObservation[] = [];
     const diagnostics: NavigationDiagnostics[] = [];
     /** 受け口が呼ばれた時刻（`Date.now()`）。 */

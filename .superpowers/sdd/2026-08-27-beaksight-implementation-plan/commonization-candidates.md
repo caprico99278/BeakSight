@@ -562,3 +562,277 @@
 - 内容: 判定は `classifyPassiveRequest` の 1 か所だが、呼ぶ場所が 2 つになった。route は、キャッシュから返す処理（`resourceDelivery`）と二重の網として残している。
 - 方針: route の判定を「CDP が許可したものの確認だけ」に整理するか、route をキャッシュの処理だけにする。安全の境界の変更なので、独立レビューの後に判断する。
 - 状態: 未着手（ユーザーの明示の指示まで着手しない）。
+
+## CC-052 制御文字の正規表現（`/p{Cc}/u`）が 3 か所にある（2026-10-09 T22b の報告で登録）
+
+- 場所: `src/core/artifact-layout.ts`（非公開）、`src/cli/output.ts`（非公開）、`src/control/profile-policy.ts`（U+2028・U+2029 を加えた版）。
+- 方針: core の 1 か所（例: `src/core/text.ts`）に置き、3 か所が使う。
+- 状態: 未着手（ユーザーの明示の指示まで着手しない）。
+
+## CC-053 向きを変える文字と、対になっていないサロゲートの判定が 2 か所にある（2026-10-09 T22d の報告で登録）
+
+- 場所: `src/interaction/isolated-auditor.ts`（非公開の `BIDI_CONTROL_PATTERN`（U+061C を含む）、`LONE_SURROGATE_PATTERN`）、`src/control/profile-policy.ts`（`EVIDENCE_BIDI_CONTROL_CHARACTER`、`isWellFormed()`）。
+- 方針: `src/core/text.ts` などにまとめる（CC-052 の制御文字とあわせて）。
+- 状態: 未着手（ユーザーの明示の指示まで着手しない）。
+
+## CC-054 Architecture Gate の import の指定子の取り出し方が、2 つの Gate で違う（2026-10-09 T22R2 の Minor 1 で登録）
+
+- 場所: `tests/architecture/semantic-ownership.test.ts` の GATE-ARCH08 (T22d) と、`tests/architecture/control-boundary.test.ts` の `moduleSpecifiersOf`（後者は `createRequire`、テンプレート、`new URL` も取り出す）。
+- 方針: 取り出しを `tests/architecture/source-scan.ts` の共通の部品にし、両方の Gate で使う。
+- 状態: 未着手（ユーザーの明示の指示まで着手しない）。
+
+## CC-055 件数の飽和の加算と、取り消しの証拠の診断の照合が、複数の場所にある（2026-10-09 DEF-052-fix round 2 の報告で登録）
+
+- 件数を安全な整数の上限で止める処理（`saturatingIncrement`、`saturatingAdd`）が `src/safety/safety-ledger.ts` の中にだけあり、Guard（`passive-request-guard.ts` の `#recordDroppedAtCapacity`）では `Math.min` で同じことを書いた。
+- 取り消しの証拠の診断の文の照合（正規表現）が、`tests/integration/passive-request-guard.test.ts` と `tests/integration/guard-canceled-document.test.ts` に分かれている（変更の範囲の制約のため。テストの補助に置ける）。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-056 Architecture Gate の import をたどる関数が、2 つの Gate に重なっている（2026-10-09 T23e の報告で登録）
+
+- `tests/architecture/control-boundary.test.ts` と `tests/architecture/local-ui-boundary.test.ts` が、import をたどる関数と指定子の正規表現の一部を、それぞれに持つ（`source-scan.ts` の `scanSource`、`findImportSpecifiers`、`loadSourceFiles` は共用）。CC-054 と関係する。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-057 `isOwnRunLock` が 2 か所にある（2026-10-09 T24c の報告で登録）
+
+- `src/orchestration/run-checkpoint-session.ts` の非公開の `isOwnRunLock` と、T24c で `src/orchestration/run-checkpoint.ts` に足した `isOwnRunLock` が同じ意味。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-058 `--headless` に当たる設定の上書き `{ browser: { headed: false } }` が 2 か所にある（2026-10-09 T24d の報告で登録）
+
+- `src/cli/arguments.ts` と `src/worker/audit-worker-session.ts` の `WORKER_CONFIG_OVERRIDES`。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-059 ファイルの内容の SHA-256 を求める部品が、IPC の契約の中にある（2026-10-09 T24h-1 の報告で登録）
+
+- `src/control/worker-protocol.ts` の `targetConfigDigestOf`。`src/core/` に置けば、ほかの用途（成果物など）とも共有できる。ARCH06（SHA-256 は Finding の fingerprint の owner だけ）の除外も整理できる。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-060 認証済みの状態の型が 2 か所にある（2026-10-10 T25c の報告で登録）
+
+- `src/browser/context-factory.ts` の `AuthenticatedStorageState` と、`src/control/auth/authenticated-state.ts` の `AuthenticatedState` が同じ形。監査の本体は `src/control/` を読めないため別に定義した。`src/core/` に置けば 1 つにできる。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-061 認証の設定の誤りの項目への振り分けが英語の詳細に頼る。テストだけのワーカーの入口が 2 か所にある（2026-10-10 T25e の報告で登録）
+
+- `apps/local-ui/src/server/auth-setup-errors.ts` は、`validateAuthSetup` の誤りの英語の詳細の中の項目の名前で、表示の項目を決めている（検証が項目の位置を返す形のほうが壊れにくい）。
+- `apps/local-ui/tests/helpers/auth-worker.ts` と `tests/integration/audit-worker-auth-fork.test.ts` のテストだけのワーカーの入口がよく似ている。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-062 rename のやり直しの決まりと、誤りのコードの取り出しが複数ある（2026-10-10 T26a の報告で登録）
+
+- `src/control/credentials/credential-store.ts` の `CREDENTIAL_RENAME_*` と、`src/report/artifact-writer.ts` の `renameWithRetry`・`RENAME_*` が同じ意味。`artifact-writer.ts` は `src/safety/redact` を読み込むので、`control-boundary` の (b) により `src/control/` から使えない。`src/core/` に移せば 1 か所になる。
+- `errorCodeOf` が `control-database.ts`、`contained-artifact-file.ts`、`artifact-writer.ts`、`credential-store.ts` の 4 か所にある。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-063 14 桁の UTC の日時を Date に読み戻す部品が `src/core/` にない（2026-10-10 T26c の報告で登録）
+
+- `src/control/job/auto-login-limits.ts` の `dateOfCompactUtcTimestamp`。書く側の `formatCompactUtcTimestamp` と同じ `src/core/utc-timestamp.ts` に置くのが本来の形。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-064 ログインの送信先かの判定を包む関数の置き場所（2026-10-10 T26d-1 の報告で登録）
+
+- `src/worker/login-stage-checks.ts` の `isLoginEndpointPost`（要求の判定の owner に残りの回数 1 の口を渡す）は、`src/browser/login-form-submitter.ts` からは層の都合で使えず、引数で受けている。本来の置き場所は `src/safety/request-policy.ts`。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-065 資格情報を保存できるプラットフォームの値と、起動のときの準備の手順が複数ある（2026-10-11 T26e の報告で登録）
+
+- 保存できるプラットフォームの値（`'win32'`）が、`src/control/credentials/dpapi-protector.ts`、`credential-store.ts`、`apps/local-ui/src/server/credential-runtime.ts` の 3 か所にある。`credential-store.ts` が公開すれば 1 か所になる。
+- 起動のときの準備（`removeTemporaryFiles` の後に `checkProtection`）が、`src/control/setup-local.ts` と `apps/local-ui/src/server/credential-runtime.ts` にある（画面のサーバは `setup-local.ts` を import できない）。`src/control/credentials/` に置けば 1 か所になる。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-066 フォルダの下のすべてのファイル（ZIP の中を含む）を目印で探すテストの補助が複数ある（2026-10-11 T26f の報告で登録）
+
+- `apps/local-ui/tests/helpers/secret-markers.ts`（T26f）と、T25f・T26d-2 のテストの中の同じ意味の関数。テストの補助を 1 つにすれば、UTF-16LE や `-EncodedCommand` の読み方も共有できる。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-067 飽和する数の足し算と、ブラウザ自身の favicon の path の定数が 2 か所にある（2026-10-11 T26g-1 の報告で登録）
+
+- `src/safety/passive-request-guard.ts` の `LoginStageMonitor` の `saturatingCount` と、`src/safety/safety-ledger.ts` の非公開の `saturatingIncrement`。
+- `src/safety/request-policy.ts` の `BROWSER_DEFAULT_FAVICON_PATH` と、`tests/helpers/chromium.ts` の同じ名前の定数（テストは製品の定数を使えば 1 か所になる）。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-068 「標準の prototype の getter とメソッドで読む」処理が、ブラウザの中の関数ごとにある（2026-10-11 DEF-069-fix の報告で登録）
+
+- `src/evidence/dom-collector.ts`、`src/interaction/discover-candidates.ts`、`src/browser/login-form-submitter.ts`（と DEF-072・073 の直しの後の collector）。`page.evaluate` の関数は外の関数を参照できないため、共有には文字列の組み立てや JSHandle の受け渡しが要る（CSP、型、evaluate の回数の代償）。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-069 NFKC と大文字小文字の畳み込みが 2 か所にある（2026-10-11 T27a の報告で登録）
+
+- `src/discovery/classify.ts` の `foldText` と、`src/safety/request-policy.ts` の非公開の `unicodeFoldedPath`。`src/core/text.ts` に置けば 1 か所になる（`src/safety/` は `src/control/` からの間接の検査で import できない）。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## CC-070 発見のジョブの流れが、監査の中核の非公開の処理を書き写している（2026-10-11 T27d の報告で登録）
+
+- 出力先の開始のロックと動いている Run の確かめ（`src/cli/audit-run.ts` の非公開の `acquireOutputStartLock`・`findActiveRun`）、セッションの切れの判定（`page-auditor.ts` の `#authSessionLostAfterNavigation`）、Link の Evidence から `INTERNAL_NAVIGABLE` の URL を取り出す処理（Run Coordinator の `internalNavigableLinks`）と、`src/worker/discovery-run.ts` の同じ意味の処理。画面の記録の型（`DiscoveryPageRecord` と `DiscoveryReadPageRecord`。純粋な部品の Gate のため 2 つ。型の一致はコンパイルで確かめる）。
+- 扱い: 登録だけ。ユーザーの指示まで着手しない。
+
+## 2026-10-11 の整理（`CC-plan.md`）
+
+- 済み: CC-001〜033（`selectorFor` は見送りのまま）、CC-057（`core/process-lock.ts` の 1 か所。`run-checkpoint.ts` は公開し直すだけ）。
+- 新しく見つけたもの: N1（誤りの文の取り出しの戻り。7 か所）、N2（`DATABASE_OPEN_FAILED` への振り分け 2 か所）、N3（秘密に見える名前の 3 つの方針）、N4（画面の側の control の値の直書き）、N5（ms の倍率の定数の増加）、N6（意図した重複）。
+- 共通化の順とまとめ方、設計者の判断は `CC-plan.md` に書いた。CC-049 は共通化ではなく整理として残す。
+- 2026-10-11 CCX-4: N3 は済み（`src/core/secret-query-names.ts` に 3 つの方針を名前つきで。Gate `secret-name-policies`）。
+- 2026-10-11 CCX-2: CC-035 は済み（`BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT`）、CC-042 は Guard の側が済み（`src/core/http-status.ts`。`src/worker/automated-login.ts` の import は T27e の後）、CC-055・067 の前半は済み（`src/core/saturating-count.ts`）。Gate `safety-commonization`。新しい候補: `src/crawl/site-metadata.ts` の `MIN/MAX_SUCCESS_HTTP_STATUS`（`SUCCESS_HTTP_STATUS_RANGE` と同じ意味）、Guard の `NAVIGATION_ABORTED_ERROR_TEXT` を `playwright-errors.ts` へ。
+- 2026-10-12 CCX-1: CC-034 と CC-040 は済み（`src/core/contracts.ts` の確かめの関数、`run-checkpoint.ts` の `restoreRunCheckpointCrawl`。Gate `incomplete-reason-ownership`）。
+- 2026-10-12 CCX-5: CC-065 と N2 は済み（`credential-platform.ts`、`credential-preparation.ts`、`controlStoreFailureOf`。Gate (x)）。N1 は Phase 2 で `src/core/errors.ts` に同じ振る舞いの部品を足して置き換える。
+- 2026-10-12 CCX-8: CC-037、038、041、043（一部。認証の fixture 3 つは残り）、044、055 の後半、067 の後半は済み（`tests/helpers/`）。
+- 2026-10-12 CCX-6: CC-070 は済み（`src/orchestration/output-start-lock.ts`、`authenticated-run.ts` の `sessionLostUrlOf`、`run-coordinator.ts` の `internalNavigableUrlsOf`。Gate `run-lock-session-ownership`）。画面の記録の型 2 つは見送りのまま。新しい候補: `src/audit/cross-page-rules.ts` の同じ意味の否定の式（`INTERNAL_NAVIGABLE` と `normalized.ok`）、`src/control/job/job-store.ts` の同じ名前で意味の違う `isSessionLostUrl`（名前を変える候補）。
+
+## CC-071 画面のテストの補助（`openPage` と CSP の記録、`tabTo`、`screenshot`）が、画面のテストのファイルごとにある（2026-10-12 T27f の報告で登録）
+
+- `apps/local-ui/tests/` の `auth-ui-flows`、`credential-ui-flows`、`discovery-ui-flows` など。`apps/local-ui/tests/helpers/` に寄せる候補（Phase 2）。
+- 2026-10-12 CCX-3: CC-052 と CC-053 は済み（`src/core/text.ts`。Gate `text-character-classes`）。`toWellFormed()` の置き換えを core に寄せるかは残り。
+
+- CC-064・CC-069 の状態（2026-10-12）: 済み（CCX-15）。`isLoginEndpointPost` と `LOGIN_POST_METHOD` は `src/safety/request-policy.ts`（`ONE_REMAINING_POST` は非公開）。NFKC と大文字小文字の畳み込みは `src/core/text.ts` の `foldNfkcCase`。Gate は `text-character-classes` の (d) と `safety-commonization` の (d)。`login-form-submitter.ts` は `isAllowedAction` を引数で受ける形のまま（入力の部品が許可 Origin を知らずに済む）。
+- CC-045・CC-047 の状態（2026-10-12）: 済み（CCX-7a・7b）。`page.goto` の終わり方は `src/browser/main-frame-load.ts` の `settleMainFrameLoad`、期限の早い方は `src/core/deadline.ts` の `deadlineWithinTimeoutAtMs`。Gate は `tests/architecture/load-deadline-commonization.test.ts`（除外 0）。テストの補助 `tests/integration/main-frame-load.test.ts` の `settleGoto` は同じ形の包みが残る（軽微。Gate は `src/` だけを見る）。
+
+## CC-072 ジョブの管理のテストの補助が 5 つのテストファイルに重複している（2026-10-12 DEF-084 の報告で登録）
+
+- `TEST_TIMING`、`waitForJob`・`waitForEnd`、`expectWorkersExited`、afterEach の子の終わりを待つ処理が、`tests/integration/control-audit-jobs*.test.ts`、`control-discovery-jobs.test.ts`、`control-read-check-jobs.test.ts` にある。`control-audit-jobs-auto-login.test.ts` の `countingFork` は、環境を記録する受け手を `createCountingFork`（`tests/helpers/worker-fork.ts`）に渡せる形にすれば共通化できる。
+- 扱い: Phase 2 の共通化で行う。
+- CC-058・059・062・063 の状態（2026-10-12）: 済み（CCX-11）。`src/config/config-overrides.ts` の `HEADLESS_CONFIG_OVERRIDES`、`src/core/ids.ts` の `sha256HexOfBytes`・`sha256HexOfText`（ARCH06 の除外 3 行を消した）、`src/core/rename-retry.ts` と `src/core/errors.ts` の `errorCodeOf`、`src/core/utc-timestamp.ts` の `parseCompactUtcTimestamp`・`dateOfCompactUtcTimestamp`（画面は読み戻せない値を「未観測」で表示）。Gate `core-small-parts-ownership`。
+
+## CC-073 誤りのコードの取り出しが、ほかにもインラインで書かれている（2026-10-12 CCX-11 の報告で登録）
+
+- `src/cli/audit-run.ts:732`、`src/config/load-config.ts:46`（`isFileNotFound`）、`src/core/artifact-layout.ts:281,309`、`src/core/process-lock.ts:181`。`src/core/errors.ts` の `errorCodeOf` を使えば 1 か所になる。
+- 扱い: Phase 2 の共通化で行う。
+- CC-054・CC-056 の状態（2026-10-12）: 済み（CCX-9）。`tests/architecture/source-scan.ts` の `findModuleReferences`（静的・副作用・動的 import、`require`、`createRequire`、`getBuiltinModule`、`new URL(…, import.meta.url)`）と `findImportChains`・`reachableFiles`。9 つの Gate を置き換え、規則 `module-references.test.ts`（指定子を取り出す正規表現を `source-scan.ts` の外に書かない）。CC-054 の「`control-boundary` は `new URL` も取り出す」は誤りだった（今回足した）。
+
+## CC-074 Gate の相対パスの判定と、狭い取り出しの利用者（2026-10-12 CCX-9 の報告で登録）
+
+- 指定子と相対パスの文字列リテラルを合わせる書き方（`literal.startsWith('./') || literal.startsWith('../')`）が 5 つの Gate にある。
+- `findImportSpecifiers` の利用者（ARCH02/03/07、ui-ssot、text-character-classes、secret-name-policies、read-check-ssot、credential の (r)）は `require`・`createRequire` を見ていない。広い取り出しに変えるかは別に判断する。
+- 扱い: Phase 2。
+
+## CC-075 時間の単位の定数（`SECOND_MS`・`MINUTE_MS` など）が別々にある（2026-10-12 T28a の報告で登録）
+
+- `src/control/job/auto-login-limits.ts` と `src/control/approval/scenario-contracts.ts`。CC-046（ms と秒の倍率）と合わせて `src/core/` に 1 つ置く。
+- 扱い: Phase 2。
+
+## CC-076 実際の method を求める式と `_method` の欄の名前の判定が 3 か所にある（2026-10-12 T28a の報告で登録）
+
+- `src/discovery/classify.ts` に 2 か所、`src/control/approval/scenario-policy.ts` に 1 か所（`foldNfkcCase(name) === METHOD_OVERRIDE_FIELD_NAME`）。候補の契約の owner（`src/discovery/candidate-contracts.ts` など）に置く。
+- 扱い: T28c か Phase 2（安全の判定に関わるので早めに）。
+
+## CC-077 「JSON の写し → スキーマで確かめ → 凍結」の手順が 2 か所にある（2026-10-12 T28a の報告で登録）
+
+- `src/control/read-check-policy.ts` と `src/control/approval/scenario-policy.ts`。
+- 扱い: Phase 2。
+
+## CC-078 発見の索引・READ の定義の、トランザクションの中で使える読み出しがない。鍵を並べた JSON の作りが 2 か所（2026-10-12 T28c の報告で登録）
+
+- `scenario-store.ts` は、`readDiscoveryIndex` が自分でトランザクションを開くため、`discovery_jobs` の rowid と `read_checks` の列を直接 SELECT して確かめ直している。索引と READ の定義の owner が、トランザクションの中で使える読み出しを公開すれば 1 か所になる。
+- 鍵を並べた JSON（`withSortedKeys`）が `src/control/worker-protocol.ts`（非公開）と `src/control/auth/auth-setup-digest.ts` にある。`src/core/` に置く。
+- 扱い: Phase 2。
+
+## CC-079 トランザクションの中で使う書き込みの関数を、ファイルの間で受け渡せない（2026-10-13 T28d の Blocker で登録）
+
+- Gate `control-store-boundary` の (g) は、SQL を書くファイルが `withWriteTransaction` の外から届く書き込みの宣言を公開することを違反にする。そのため、表の書き込みを複数の部品に分けると、同じトランザクションで別の部品の書き込みを呼べない。今は 1 ファイル（`scenario-store.ts`）に集めて避けた。
+- 扱い: Gate を弱めずに、トランザクションの口（接続を受け取る書き込みの関数を、トランザクションの中からだけ呼べる型にする、など）の決まりを、必要になったときに設計する。CC-078 と合わせて考える。
+- CC-073・CC-076・CC-078 の後半の状態（2026-10-13）: 済み（CCX-12）。`errorCodeOf` を 5 か所で使う（Gate `core-small-parts-ownership` の (c) を広げた）、`src/discovery/candidate-contracts.ts` の `isMethodOverrideFieldName`・`effectiveFormMethodOf`（Gate (f)）、`src/core/sorted-keys-json.ts` の `sortedKeysJsonOf`（Gate (e)）。残り: `src/safety/egress-proxy.ts` の型つきの `error.code` の比べ、`probe.ts`（ブラウザの中の関数）の `_method` の比べは `toLowerCase` で NFKC でない（全角の `＿ｍｅｔｈｏｄ` は `METHOD_OVERRIDE_UNRECOGNIZED` になり止める側。ブラウザの中なので owner を使えない）。CC-078 の前半（トランザクションの中で使える読み出し）は残り。
+
+## CC-080 シナリオの画面まわりの重複（2026-10-13 T28e の報告で登録）
+
+- 承認の外の事実（ターゲットの設定と認証の設定の digest）の求め方が `apps/local-ui/src/server/scenario-facts.ts` にある。Task 30 のジョブの管理も同じものが要るので、`src/control/` の 1 か所に移す。
+- 候補の画面・READ の画面・シナリオの画面に、プロファイルの要点の欄と、欄の属性・制約の文字の組み立てが重複している。
+- `WRITE_AUDIT_MODE` が Node の部品を読み込むファイルにあり、ブラウザから使えない。
+- 扱い: (a) は Task 30 の前、(b)(c) は Phase 2。
+
+## CC-081 画面の端から端の目印の検査の流れが、テストのファイルごとにある（2026-10-13 T28f の報告で登録）
+
+- `apps/local-ui/tests/discovery-secret-markers.test.ts`（T27g）と `scenario-approval-secret-markers.test.ts`（T28f）に、`authSetupOf`、`prepareProfile`、`registerCredentialOnPage`、`credentialsOf`、ジョブの終わりの待ち、`screenPlaces`、`functionPlaces`、`searchedPlaces` が同じ意味で書かれている。T28e の `scenario-secret-markers.test.ts` とも重なる。`apps/local-ui/tests/helpers/` に「画面の端から端の目印の検査の流れ」の補助としてまとめる。
+- 扱い: Phase 2（CC-066・071 と合わせて）。
+
+## CC-082 Task 29 の初めの重複（2026-10-13 T29a・T29b の報告で登録）
+
+- 欄の名前の語の並びの一致と ASCII の語の判定が、`src/discovery/classify.ts`（非公開。`fieldNameHasDestructiveWord` の中）と `src/control/data-rules/external-delivery-words.ts` にある。`classify.ts` に「欄の名前が語の一覧の語に当たるか」を公開すれば 1 か所になる。
+- Gate の「import をたどって禁じた層に届かない」検出の関数が、`approval-ssot.test.ts` と `data-rules-boundary.test.ts` でほぼ同じ形（`source-scan.ts` に寄せる）。
+- 日付の読み書き（`YYYY-MM-DD`・ISO の週・時刻）が `generic-rules.ts` にあり、増えたら `src/core/` にまとめる。
+- 扱い: 1 つ目は T29c で（語の判定を足すので）、ほかは Phase 2。CC-077（スキーマで確かめた凍結した写し）にも `rule-set-policy.ts` が加わった。
+
+## CC-083 基準日（Asia/Tokyo の `YYYY-MM-DD`）の計算が 2 か所にある（2026-10-13 T30e で発見）
+
+- 場所: `src/control/job/write-job-start.ts` の `writeBaseDateOf` と、`apps/local-ui/src/server/data-rule-functions.ts` の `exampleBaseDate`。
+- 案: `src/core/`（日時の書式の owner）か `src/control/data-rules/` に 1 つ置き、両方が使う。
+- 扱い: Phase 2。
+
+## CC-084 `ACTION_RUN_ARTIFACT_FILE_NAME` が成果物の名前の owner の外にある（2026-10-13 T30e で発見）
+
+- 場所: `src/control/job/write-job-start.ts`。ほかの成果物の名前は `src/core/artifact-layout.ts`。
+- 案: `src/core/artifact-layout.ts` に移す。T30f がワーカーの側で同じ名前を使うので、そこで重ねないこと（T30f は `write-job-start.ts` から import するか、移すなら報告）。
+- 扱い: T30f か Phase 2。
+
+- CC-077・CC-078 の前半の状態（2026-10-13）: 済み（CCX-17）。`src/control/schema-checked-copy.ts`、`readDiscoveryIndexIn`・`noDiscoveryJobRecordedAfterIn`・`listReadChecksIn`、Gate `control-read-ownership`。残り: スキーマで確かめない JSON の写し（`scenario-store.ts` の `draftCopyOf`、`rule-store.ts`）、CC-079。
+
+- CC-066・CC-071・CC-081 の状態（2026-10-13）: 済み（CCX-16）。`apps/local-ui/tests/helpers/ui-page.ts`・`scenario-marker-flow.ts`・`secret-markers.ts`、Gate `ui-test-helper-reuse`。残り: T25f・T26f の端から端の流れ、画面のテストの `started`・`rootOf`・`callFunction` など（CC-072 と合わせて）、`dev-server`・`launcher-server` の CSP の確かめ。
+
+- CC-072 の状態（2026-10-13）: 済み（CCX-18）。`tests/helpers/job-test-support.ts`、`worker-fork.ts` の `createCountingFork({ onFork })`、Gate `control-test-helper-reuse`。残り: 偽のワーカーの引数の組み立て、`managerWith`、テストの値の定数、`tests/unit` の同じ形の待ち。
+
+- CC-046・CC-075・CC-048 の状態（2026-10-13）: 済み（CCX-19）。`src/core/time-units.ts`、`RunExecutionsView.lastFinishedAt`、Gate `time-units-ownership`。残り: T30g の `write-job-functions.ts` の `MINUTE_MS`（Gate の除外 1。T30g の後に置き換える）。
+
+- CC-065・CC-083 の状態（2026-10-13）: CC-065 は CCX-5 で済み（`credential-platform.ts` の `CREDENTIAL_PLATFORM`、`credential-preparation.ts` の `prepareCredentialStorage`。本文の「登録だけ」は古い）。CC-083 は済み（CCX-20。`src/core/base-date.ts`）。送れる欄の型の一覧 `VALUE_INPUT_FIELD_TYPES` も CCX-20 で寄せた。
+
+## CC-085 Run Coordinator が外から pacer を受け取れない（2026-10-13 DEF-102 fix の報告で登録）
+
+- 監査（AUDIT）のジョブは、自動ログインの後、ワーカーの側でログインの段の pacer で待ってから Run Coordinator を始めている。Run Coordinator（`src/orchestration/`、`src/cli/audit-run.ts`）が pacer か記録を受け取る形にすれば、待ちの置き換えができる。
+- 扱い: Phase 2。
+
+- CC-049・CC-085 の状態（2026-10-14）: CC-085 は済み（CCX-22）。CC-049 は大部分が済み（CCX-21）。残り: `run-coordinator.ts` の page の場面の名前 2 つ・`step === 'page'`・コメント、`PassiveSessionCloseStep` の `'page'`、`closePassivePage`・`closePassiveGuardedPage`（T30R-fix-1 の後に判断）。
+
+## CC-086 スキーマの誤りの位置を構造で返さない（2026-10-14 CCX-23 の報告で登録）
+
+- `src/core/schema-validator.ts` の誤りは文（`describeSchemaError`）だけで、instancePath と、なくなった項目の名前を構造で返さない。CCX-23 fix round 1 では、認証の設定の検証が文の形から位置を作る。schema-validator が位置を返せば、その組み立てがなくなる。
+- 扱い: Phase 2。
+- CC-049・CC-061 の状態（2026-10-14）: CC-049 は済み（CCX-21・CCX-23。残りは `closePassivePage`・`closePassiveGuardedPage` の判断だけ）。CC-061 のテストだけのワーカーの入口は済み（`tests/helpers/test-login-worker-entry.ts`。`write-job-harness.ts` の 3 つ目の写しは残り）。誤りの位置は CCX-23 fix round 1。
+
+## CC-087 JSON Pointer の書き方と戻し方が 2 か所。規則の誤りの位置を文字列で置き換える所がある（2026-10-14 CCX-24 の報告で登録）
+
+- 書く側は `src/core/schema-validator.ts` の `escapeJsonPointerSegment`（Ajv を読み込むファイル）、戻す側は画面の `apps/local-ui/src/server/auth-setup-errors.ts` の `segmentsOf`（ブラウザと共用で Node の部品を読めない）。純粋な `src/core/json-pointer.ts` に両方を置けばまとめられる。
+- `src/control/worker-protocol.ts` の 780 行あたりは、自分で作った規則の誤りの文の位置の前置き（`/readChecks/0`）を `/write/readVerification` に文字列で置き換えている。誤りを位置つきで作る形にすれば、置き換えがなくなる。
+- 扱い: Phase 2。CC-086 の状態: 済み（CCX-24）。
+
+## CC-088 Gate の既定の import の見分けが `write-stage-boundary` の中にある（2026-10-14 T30R-fix-1 の報告で登録）
+
+- `tests/architecture/write-stage-boundary.test.ts` の `staticClauseOf` を、`tests/architecture/source-scan.ts` の `ModuleReference` に寄せる（例 `defaultBinding` を持たせる）。CC-074 と合わせて考える。
+- 扱い: Phase 2。
+
+- CC-087 の前半の状態（2026-10-14）: 済み（CCX-25・CCX-26）。後半（`worker-protocol.ts` の位置の前置きの文字列の置き換え）は残り。
+- CC-088 の追記（2026-10-14 T30R2-fix-1）: Gate (e2) の `closingParenthesisOf` が `source-scan.ts` の内部の `matchingParenthesis` と同じ処理。export して共用する。
+
+## CC-089 `scanSource` の冒頭の走査が重い（2026-10-14 DEF-107 fix の報告で登録）
+
+- `tests/architecture/source-scan.ts` の `scanSource` は、`src/`（約 210ms）と `apps/local-ui/`（約 72ms）の走査に時間がかかる。速くすれば、すべての Gate の時間が縮む。
+- 扱い: Phase 2。
+- CC-089 の状態（2026-10-14）: 済み。
+
+- T31f の共通化の候補の状態（2026-10-14）: 1（型に ID を入れる）・3（ID の形の一致）・4（使われない `readWriteGenerationHistory`）は済み（CCX-28）。2（`fieldsMatchedOf` を `action-outcome.ts` へ）は T31g-2。
+
+## 2026-10-15 の状態（CCX-29。Task 32）
+
+- CC-039: 済み。版の表示名は `RUN_SUMMARY_TEXT.toolVersion`・`RUN_SUMMARY_TEXT.playwrightVersion`。`html-report.ts` と `cli/output.ts`（`RUN_VERSION_FIELD_LABELS`）が使う。固定のテストは `html-report.test.ts` の CCX-29 の 1 件。
+- CC-080: (a) は済み（前から）。(b) 済み: `apps/local-ui/src/components/ProfileSummary.tsx`（候補・READ・シナリオの画面）、`apps/local-ui/src/display/candidate-fields.ts` の `candidateFieldFlagsText`・`candidateFieldConstraintsText`（候補の画面、`ScenarioForm`、シナリオの詳細、`DataRuleForm`）。固定のテストは `apps/local-ui/tests/profile-field-summary.test.ts`。(c) 済み: `WRITE_AUDIT_MODE` の定義は import のない `src/control/contracts.ts`。ブラウザで値が要るときはここから直接読む（`approval-view.ts` を通すと Node の部品に届く）。
+- CC-087 の後半: 済み。`worker-protocol.ts` の `readCheckItemRuleErrors(at, readCheck, duplicate)` が位置の区切りを引数に取り、`jsonPointerOf` で組み立てる。文字列の置き換えはなくなった。固定のテストは `worker-protocol-read-check.test.ts`・`worker-protocol-write.test.ts` の CCX-29 の 2 件。
+
+## CC-090 スキーマのテストの補助が 3 つのテストに重複（2026-10-15 T32c の報告で登録）
+
+- `tests/unit/action-run-schema.test.ts`・`action-evidence-schema.test.ts`・`approval-summary-schema.test.ts` に、`$ref` の先の解決 `resolveRef`、項目の名前の走査 `propertyNamesOf`、秘密の語の一覧 `SECRET_PROPERTY_WORDS` がある。`tests/unit/helpers/` に出す候補。
+- 扱い: Task 32 の T32k（テストの補助の残り）で片付ける。
+
+## CC-091 fork のワーカーのテストの補助の重複（2026-10-15 T32i の報告で登録）
+
+- `tests/integration/auth-mode-contrast.test.ts` と自動ログインの fork のテスト（`audit-worker-automated-login-fork.test.ts`）に、テストだけのワーカーの入口の本文（`testLoginWorkerEntrySource`・`ENTRY_SOURCE`）と、`filesUnder`・`tableText`・`leakedPlaces`・`nonReadRequestsOf` がほぼ同じ形である。`tests/helpers/` に移す候補。
+- 扱い: Task 32 の T32k で、CC-090 とあわせて片付ける。
+- CC-050 の状態（2026-10-15）: 済み（T32j-1）。`decideGuardRequest` と `recordGuardVerdictBeforeBlock` を CDP の 2 か所と route が使う。判定 `classifyPassiveRequest` は 1 か所のまま。route の役割（CDP の付いていない page の網と、キャッシュの返し）をコードに明記。
+- CC-068 の状態（2026-10-15）: 1（部品と型つきの組み立てと Gate）は済み（T32j-2。`src/browser/in-page-readers.ts`）。2（ログインの form と候補の発見の isolated world への移行）は T32j-4。
+
+## CC-092 要素のメソッドを `Element.prototype.xxx.call(...)` で呼ぶ書き方が、ページの中の関数ごとにある（2026-10-15 T32j-2 の報告で登録）
+
+- 部品にすると、配列の展開か `bind` が要り、ページの JS が書き換えられる入口が増える（T32j-2 の数えるテストの対照で `bind` 1 回の増加を検出した）。
+- 扱い: 共通化しない（安全の側を優先）。理由とともに記録だけ。共通化するなら引数の個数ごとの形にする。
+- CC-090 の状態（2026-10-15）: 済み（T32k）。`tests/helpers/schema-test-support.ts`、見本は `tests/helpers/approval-facts-sample.ts` の `sampleApprovalSummary` と `tests/helpers/action-report-samples.ts` の `sampleExecutedRead`。
+- CC-091 の状態（2026-10-15）: 済み（T32k）。`tests/helpers/leak-places.ts`、`tests/helpers/auto-login-worker-entry.ts`。残り: `discovery-job-fork` の入口の本文（形が大きく違う）。
+
+## CC-093 `READ_METHODS` の写しが結合のテストの約 8 ファイルに残る（2026-10-15 T32k の報告で登録）
+
+- `automated-login*`・`discovery-*` などのテスト。`tests/helpers/leak-places.ts` の 1 か所にまとめる。`filesUnder` は `resume-run`・`artifact-writer` のテストに別の意味の同じ名前がある（寄せない）。
+- 扱い: 余力があれば Task 32 の中で。

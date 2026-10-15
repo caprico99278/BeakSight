@@ -213,7 +213,7 @@ Page Auditor は、発見した Interaction の候補を、機械的に除外さ
   - scroll: scroll の理由のコード
   - Rule の評価の失敗: `RULE_EVALUATION_FAILED`
 - スクリーンショットが失敗した場合は、途中まで書いたファイルを消す（呼び出し側の責任。progress.md の申し送り）。
-- Context の作成と、閉じる処理が失敗した場合は、理由を `UNHANDLED_FAILURE` とする。detail は `<場面>:<メッセージ>` とする。場面は、`passive-context`、`passive-page-close`、`passive-context-close`、`interaction-context-close` のいずれかである（P14c の判断を承認。`interaction-context-close` は P14f で追加）。
+- Context の作成と、閉じる処理が失敗した場合は、理由を `UNHANDLED_FAILURE` とする。detail は `<場面>:<メッセージ>` とする。場面は、`passive-context`、`passive-context-close`、`interaction-context-close` のいずれかである（P14c の判断を承認。`interaction-context-close` は P14f で追加）。
 - ページ全体の理由は、両方のビューポートの理由を並べ、同じものを1つにまとめたものとする。Run Coordinator は、件数を、ビューポートの理由とページの理由の両方から数えない。
 - スクリーンショットは、根のディレクトリの下の `pages/<pageId>/<ビューポート>/viewport.png` と `full-page.png` に置く（P14c）。Task 16 の artifact の配置は、これに合わせる。
 - 必須の段階は、設定で有効な段階とする。
@@ -918,3 +918,4 @@ run.json に、次の環境の事実を記録する（設計書 18.1）。
 | 2026-09-24 | P14c の報告 | 4.5.4 に `PAGE_CRASHED`、4.5.5 に Context と閉じる処理の失敗、ページ全体の理由、スクリーンショットの配置を加えた。第6章に、スクリーンショットの配置を加えた | P14d、Task 15、16 |
 | 2026-09-24 | P14a の報告 | 4.2 に SKIPPED の扱いを加えた。4.5.7 の候補ごとの期限を、後片付けの実際の上限に合わせて直した | P14d |
 | 2026-09-24 | Task 14 の着手前の調査 | 4.5 を加えた。入口、処理の順序（Interaction を Rule の前にする）、採番、ナビゲーションの結果、理由のコード、幅の走査、期限、後片付けの失敗、共通化を決めた | Task 14、15 |
+| 2026-10-14 | CCX-21・CCX-23（CC-049。DEF-038 で Guard の付いた Passive のページを個別に閉じなくなり、page を閉じる段が通らなくなった） | 閉じる処理の場面の一覧から `passive-page-close` を除いた（site metadata と環境の事実の page の場面の名前も消した）。古い保存の `detail` に残っていても読める（自由な文字列） | 記述と `page-auditor.ts`・`run-coordinator.ts` |

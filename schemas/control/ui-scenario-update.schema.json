@@ -1,0 +1,15 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-update:1",
+  "description": "Local UI Server Function input: change one write scenario (a new revision; Task 28 design 4.6). expectedRevision is the revision the screen read. The draft has no profileId and no candidateIdentityDigest: the server takes them from the scenario (a scenario keeps its candidate). The rest of the draft is validated by validateScenarioDraft.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision", "draft"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "type": "integer", "minimum": 1 },
+    "draft": {
+      "type": "object",
+      "properties": { "profileId": false, "candidateIdentityDigest": false }
+    }
+  }
+}

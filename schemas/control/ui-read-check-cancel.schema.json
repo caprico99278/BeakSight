@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-read-check-cancel:1",
+  "description": "Local UI Server Function input: cancel (delete from the list, keeping the row) one READ check definition (Task 27 design 4.5, 4.7). expectedRevision is the revision the screen read.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["readCheckId", "expectedRevision"],
+  "properties": {
+    "readCheckId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" },
+    "expectedRevision": { "type": "integer", "minimum": 1 }
+  }
+}

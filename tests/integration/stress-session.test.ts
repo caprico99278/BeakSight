@@ -13,21 +13,17 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const STRESS_DEADLINE_MS = 60_000;
 const STRESS_VIEWPORT: Viewport = Object.freeze({ width: 320, height: 800 });
-/** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`PAGE_CLOSE_TIMEOUT_MS` など）を待たない。 */
+/** 注入する短い期限（ms。DEF-008、R15r-4）。実際の期限（`CONTEXT_CLOSE_TIMEOUT_MS` など）を待たない。 */
 const INJECTED_TIMEOUT_MS = 200;
 /** 期限のテストの上限。期限を守らない（既定の期限を待つか、止まり続ける）場合は、この時間で失敗する。 */
 const DEADLINE_TEST_TIMEOUT_MS = 3_000;
 /** 偽の factory で、期限を過ぎてから戻るまでの余裕。 */
 const FAKE_RETURN_MARGIN_MS = 1_000;
-/**
- * 待たない、ページの読み込みの間隔の待ち（RL-fix。RL の Minor-5）。幅の走査の間隔の待ちは省略できないので、間隔を確かめない
- * テストは、待たないことを、この関数で明示して渡す。
- */
-const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 let browser: Browser;
 let server: FixtureServer | undefined;
@@ -256,9 +252,8 @@ describe('createStressSessionFactory close and construction failures', () => {
   // 投げることを確かめていた）: page を閉じる処理を呼ばないので、それが止まる場合も待たずに、Context を閉じて成功する。
   it('does not wait for a page close that would not finish, and closes the Context (DEF-038)', async () => {
     const calls: FakeFactoryCalls = { events: [] };
-    const stress = createStressSessionFactory(fakeFactory(calls, { closePageHangs: true }), {
-      deadlines: { pageCloseTimeoutMs: INJECTED_TIMEOUT_MS },
-    });
+    // page を閉じる処理の期限は、DEF-038 で読まなくなり、CCX-21（CC-049）で消した（注入しない）。
+    const stress = createStressSessionFactory(fakeFactory(calls, { closePageHangs: true }));
 
     const session = await stress.createSession(STRESS_VIEWPORT);
     const startedAt = performance.now();

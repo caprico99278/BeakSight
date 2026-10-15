@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Clobbered collectors fixture</title>
+    <base target="_self">
+    <style>
+      .scroller { height: 60px; overflow-y: auto; }
+      .tall { height: 200px; margin: 0; }
+      .clipper { width: 80px; height: 20px; overflow: hidden; white-space: nowrap; }
+      .zero { display: block; width: 0; height: 0; overflow: hidden; }
+      .filler { height: 1800px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      DEF-072 and DEF-073: the hidden fields hide the standard properties of their forms (DOM clobbering), and the named img and form
+      elements hide the standard properties of the document. dom-clobbered-collectors-control.html has the same structure with
+      harmless names (prefix "control-"), so every collector must return the same result for both pages.
+    -->
+    <main>
+      <h1>Clobbered collectors fixture</h1>
+      <form class="scroller" method="post" action="/submit" aria-label="Scrolling form">
+      <input type="hidden" name="id">
+      <input type="hidden" name="tagName">
+      <input type="hidden" name="nodeType">
+      <input type="hidden" name="childNodes">
+      <input type="hidden" name="children">
+      <input type="hidden" name="parentElement">
+      <input type="hidden" name="parentNode">
+      <input type="hidden" name="previousElementSibling">
+      <input type="hidden" name="shadowRoot">
+      <input type="hidden" name="assignedSlot">
+      <input type="hidden" name="getAttribute">
+      <input type="hidden" name="hasAttribute">
+      <input type="hidden" name="matches">
+      <input type="hidden" name="closest">
+      <input type="hidden" name="contains">
+      <input type="hidden" name="checkVisibility">
+      <input type="hidden" name="getBoundingClientRect">
+      <input type="hidden" name="getClientRects">
+      <input type="hidden" name="clientLeft">
+      <input type="hidden" name="clientTop">
+      <input type="hidden" name="clientWidth">
+      <input type="hidden" name="clientHeight">
+      <input type="hidden" name="scrollWidth">
+      <input type="hidden" name="scrollHeight">
+      <input type="hidden" name="scrollLeft">
+      <input type="hidden" name="scrollTop">
+      <input type="hidden" name="innerText">
+      <input type="hidden" name="hidden">
+      <input type="hidden" name="attributes">
+      <input type="hidden" name="isConnected">
+      <input type="hidden" name="elements">
+      <input type="hidden" name="method">
+      <input type="hidden" name="action">
+      <input type="hidden" name="target">
+      <input type="hidden" name="enctype">
+        <p class="tall">Tall text inside the scrolling form</p>
+        <button type="submit">Send scrolling form</button>
+      </form>
+      <form class="clipper" method="get" action="/search" aria-label="Clipping form">
+      <input type="hidden" name="id">
+      <input type="hidden" name="tagName">
+      <input type="hidden" name="nodeType">
+      <input type="hidden" name="childNodes">
+      <input type="hidden" name="children">
+      <input type="hidden" name="parentElement">
+      <input type="hidden" name="parentNode">
+      <input type="hidden" name="previousElementSibling">
+      <input type="hidden" name="shadowRoot">
+      <input type="hidden" name="assignedSlot">
+      <input type="hidden" name="getAttribute">
+      <input type="hidden" name="hasAttribute">
+      <input type="hidden" name="matches">
+      <input type="hidden" name="closest">
+      <input type="hidden" name="contains">
+      <input type="hidden" name="checkVisibility">
+      <input type="hidden" name="getBoundingClientRect">
+      <input type="hidden" name="getClientRects">
+      <input type="hidden" name="clientLeft">
+      <input type="hidden" name="clientTop">
+      <input type="hidden" name="clientWidth">
+      <input type="hidden" name="clientHeight">
+      <input type="hidden" name="scrollWidth">
+      <input type="hidden" name="scrollHeight">
+      <input type="hidden" name="scrollLeft">
+      <input type="hidden" name="scrollTop">
+      <input type="hidden" name="innerText">
+      <input type="hidden" name="hidden">
+      <input type="hidden" name="attributes">
+      <input type="hidden" name="isConnected">
+      <input type="hidden" name="elements">
+      <input type="hidden" name="method">
+      <input type="hidden" name="action">
+      <input type="hidden" name="target">
+      <input type="hidden" name="enctype">
+        Clipped text that is wider than the clipping form box
+      </form>
+      <form class="zero" role="button" aria-label="Zero size form">
+      <input type="hidden" name="id">
+      <input type="hidden" name="tagName">
+      <input type="hidden" name="nodeType">
+      <input type="hidden" name="childNodes">
+      <input type="hidden" name="children">
+      <input type="hidden" name="parentElement">
+      <input type="hidden" name="parentNode">
+      <input type="hidden" name="previousElementSibling">
+      <input type="hidden" name="shadowRoot">
+      <input type="hidden" name="assignedSlot">
+      <input type="hidden" name="getAttribute">
+      <input type="hidden" name="hasAttribute">
+      <input type="hidden" name="matches">
+      <input type="hidden" name="closest">
+      <input type="hidden" name="contains">
+      <input type="hidden" name="checkVisibility">
+      <input type="hidden" name="getBoundingClientRect">
+      <input type="hidden" name="getClientRects">
+      <input type="hidden" name="clientLeft">
+      <input type="hidden" name="clientTop">
+      <input type="hidden" name="clientWidth">
+      <input type="hidden" name="clientHeight">
+      <input type="hidden" name="scrollWidth">
+      <input type="hidden" name="scrollHeight">
+      <input type="hidden" name="scrollLeft">
+      <input type="hidden" name="scrollTop">
+      <input type="hidden" name="innerText">
+      <input type="hidden" name="hidden">
+      <input type="hidden" name="attributes">
+      <input type="hidden" name="isConnected">
+      <input type="hidden" name="elements">
+      <input type="hidden" name="method">
+      <input type="hidden" name="action">
+      <input type="hidden" name="target">
+      <input type="hidden" name="enctype">
+        <span>Zero size form text</span>
+      </form>
+      <form id="login-form" method="post" action="/login">
+        <input id="login-username" type="text" name="username">
+        <input id="login-password" type="password" name="password">
+        <button id="login-submit" type="submit">Log in</button>
+      </form>
+    </main>
+    <img name="forms" alt="">
+    <img name="body" alt="">
+    <img name="documentElement" alt="">
+    <img name="scrollingElement" alt="">
+    <img name="querySelector" alt="">
+    <img name="querySelectorAll" alt="">
+    <img name="createTreeWalker" alt="">
+    <form name="title"></form>
+    <form name="images"></form>
+    <form name="getElementById"></form>
+    <form name="createRange"></form>
+    <form name="readyState"></form>
+    <div class="filler">Filler text below the forms</div>
+  </body>
+</html>

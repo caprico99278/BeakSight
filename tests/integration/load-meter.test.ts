@@ -1,7 +1,6 @@
 // L4（サイトへの負荷の制御の設計書 4.5、第7章）: factory が渡す要求の終わりの事象で、LoadMeter が数えた要求の数を、
 // fixture のサーバが実際に受け取った要求の数と比べる。Page Auditor が作るすべての Context（Passive の Desktop と Mobile、幅の走査、
 // Interaction）を通す。Guard が止めた要求は、サーバに届かず、数えない。ブラウザ自身のキャッシュの扱いも、ここで確かめる。
-import { createServer, type Server } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +18,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 import { createRunLauncher, expectOnlyReadRequests, runWithCoordinator } from '../helpers/run-harness.js';
@@ -149,7 +149,7 @@ describe('LoadMeter through the BrowserContextFactory and the Page Auditor (L4)'
 /** 長く使える（`Cache-Control: max-age`）画像を返す、この試験だけのサーバ（ループバック）。受け取った要求のパスを記録する。 */
 async function startCacheableServer(): Promise<{ readonly origin: string; readonly received: string[]; close(): Promise<void> }> {
   const received: string[] = [];
-  const server: Server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split('?', 1)[0] ?? '/';
     received.push(pathname);
     if (pathname === '/cacheable.html') {
@@ -166,19 +166,7 @@ async function startCacheableServer(): Promise<{ readonly origin: string; readon
     response.statusCode = 404;
     response.end();
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
-  const address = server.address();
-  if (address === null || typeof address === 'string') {
-    throw new Error('cacheable server did not bind to a TCP port');
-  }
-  return {
-    origin: `http://127.0.0.1:${address.port}`,
-    received,
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
+  return { origin: server.origin, received, close: server.close };
 }
 
 describe('LoadMeter and the browser cache in one Context (L4)', () => {

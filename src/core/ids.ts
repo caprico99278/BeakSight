@@ -100,16 +100,26 @@ export const createRequestId = (sequence: number): string => `REQ-${formatSequen
 const SHA256_FINGERPRINT_PREFIX = 'sha256:';
 const sha256FingerprintPattern = /^sha256:[a-f0-9]{64}$/u;
 
+/** SHA-256 の方式の名前（`node:crypto` の `createHash`）。 */
+const SHA256_ALGORITHM = 'sha256';
+
+/**
+ * バイト列（`bytes` の view の範囲）の SHA-256 を、前置きのない小文字の 16 進 64 桁で返す（CC-059。ターゲット JSON の内容の要約など）。
+ * 入力は変えない。
+ */
+export const sha256HexOfBytes = (bytes: Uint8Array): string => createHash(SHA256_ALGORITHM).update(bytes).digest('hex');
+
+/** 文字列を UTF-8 として SHA-256 でハッシュし、前置きのない小文字の 16 進 64 桁で返す（CC-059。認証の設定の要約など）。 */
+export const sha256HexOfText = (value: string): string => createHash(SHA256_ALGORITHM).update(value, 'utf8').digest('hex');
+
 /** `value` を UTF-8 として SHA-256 でハッシュし、`sha256:<小文字の16進64桁>` の形式で返す。 */
-export const createSha256Fingerprint = (value: string): string =>
-  `${SHA256_FINGERPRINT_PREFIX}${createHash('sha256').update(value).digest('hex')}`;
+export const createSha256Fingerprint = (value: string): string => `${SHA256_FINGERPRINT_PREFIX}${sha256HexOfText(value)}`;
 
 /**
  * バイト列（`bytes` の view の範囲）を、そのまま SHA-256 でハッシュし、`createSha256Fingerprint` と同じ
  * `sha256:<小文字の16進64桁>` の形式で返す（ChatGPT 用バンドルの manifest の `sha256`。CC-006）。入力は変えない。
  */
-export const createSha256FingerprintOfBytes = (bytes: Uint8Array): string =>
-  `${SHA256_FINGERPRINT_PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
+export const createSha256FingerprintOfBytes = (bytes: Uint8Array): string => `${SHA256_FINGERPRINT_PREFIX}${sha256HexOfBytes(bytes)}`;
 
 /** `sha256:<小文字の16進64桁>` の形式の文字列か。 */
 export const isSha256Fingerprint = (value: unknown): value is string =>

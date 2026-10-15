@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Clobbered links fixture</title>
+  </head>
+  <body>
+    <!--
+      Control page for dom-clobbered-links.html: the same structure with a harmless name (prefix "control-"), so nothing is clobbered.
+    -->
+    <nav>
+      <a href="/crawl/next-page?page=2">Next page</a>
+      <a href="relative-page">Relative page</a>
+    </nav>
+    <div id="shadow-host"></div>
+    <a href="/after-shadow-host">After shadow host</a>
+    <img name="control-baseURI" alt="">
+    <script>
+      const outer = document.getElementById('shadow-host').attachShadow({ mode: 'open' });
+      outer.innerHTML = '<a href="/shadow-page">Shadow page</a><span id="nested-shadow-host"></span>';
+      outer.getElementById('nested-shadow-host').attachShadow({ mode: 'open' }).innerHTML = '<a href="/nested-shadow-page">Nested shadow page</a>';
+    </script>
+  </body>
+</html>

@@ -19,6 +19,13 @@ export function isPlaywrightTimeoutError(error: unknown): boolean {
 }
 
 /**
+ * `route.abort('blockedbyclient')` で止めた文書の要求（main frame と iframe のナビゲーション）の失敗の理由。下の一覧
+ * `BLOCKED_BY_CLIENT_FAILURE_TEXTS` の先頭の値（CCX-2。CC-035）。Guard が自分で止めた文書の要求の失敗の照合は、この値を使う
+ * （Guard に文字列を直書きしない）。
+ */
+export const BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT = 'net::ERR_BLOCKED_BY_CLIENT';
+
+/**
  * `route.abort('blockedbyclient')` で止めた要求の、`requestfailed` の失敗の理由（`request.failure()?.errorText`）の閉じた一覧
  * （サイトへの負荷の制御の設計書 4.5。L4 の Blocker 2）。Guard と、リソースの届け方の部品が止めた要求は、ネットワークに送っていない。
  *
@@ -29,7 +36,7 @@ export function isPlaywrightTimeoutError(error: unknown): boolean {
  * 照合は完全一致で、前方一致にはしない（一覧にない理由は、止めた要求とみなさない。数える側、つまり多めに数える側に倒す）。
  */
 export const BLOCKED_BY_CLIENT_FAILURE_TEXTS = Object.freeze([
-  'net::ERR_BLOCKED_BY_CLIENT',
+  BLOCKED_BY_CLIENT_DOCUMENT_FAILURE_TEXT,
   'net::ERR_BLOCKED_BY_CLIENT.Inspector',
 ] as const);
 
@@ -63,6 +70,9 @@ export const INVALID_INTERCEPTION_ID_FAILURE_TEXTS = Object.freeze([
   // DEF-040（NP3 の発見事項 1）: Worker の script の応答に CSP のヘッダを加える `Fetch.continueResponse` が、ブラウザが先に取り消した
   // 応答に対して失敗した形。page の session の文言。末尾に加えた（前の 3 つの並びを変えない）。
   'cdpSession.send: Protocol error (Fetch.continueResponse): Invalid InterceptionId.',
+  // T30R-fix-1（M-1）: 書き込みの送り手の応答を返す `Fetch.fulfillRequest` が、ブラウザが先に取り消した要求に対して失敗した形（ページの JS の
+  // 二重の送信など。DEF-099 fix から使う命令）。page の session の文言。末尾に加えた。
+  'cdpSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId.',
 ] as const);
 
 const INVALID_INTERCEPTION_ID_FAILURE_TEXT_SET: ReadonlySet<string> = new Set(INVALID_INTERCEPTION_ID_FAILURE_TEXTS);

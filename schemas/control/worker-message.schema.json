@@ -1,0 +1,473 @@
+{
+  "$id": "urn:beaksight:schema:control:worker-message:1",
+  "description": "IPC messages between the local UI server (parent) and the audit worker (child) (Task 24 design 4.3). The value lists are owned by src/control/worker-protocol.ts. Path, run id and combination rules are checked again by the validation functions of worker-protocol.ts. Version 2 (Task 30 design 4, T30e): the write specification of a WRITE_CREATE START, the recheck request and result before sending, and the submission report; no credential, cookie, CSRF token or hidden value.",
+  "oneOf": [
+    { "$ref": "#/$defs/start" },
+    { "$ref": "#/$defs/stop" },
+    { "$ref": "#/$defs/writeRecheckResult" },
+    { "$ref": "#/$defs/ready" },
+    { "$ref": "#/$defs/runStarted" },
+    { "$ref": "#/$defs/progress" },
+    { "$ref": "#/$defs/notice" },
+    { "$ref": "#/$defs/authState" },
+    { "$ref": "#/$defs/heartbeat" },
+    { "$ref": "#/$defs/finished" },
+    { "$ref": "#/$defs/failed" },
+    { "$ref": "#/$defs/writeRecheckRequest" },
+    { "$ref": "#/$defs/writeSubmission" }
+  ],
+  "$defs": {
+    "protocol": { "const": "beaksight-worker-message/2" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
+    "start": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "jobId", "jobKind", "targetConfigPath", "startNew", "targetConfigSha256"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "START" },
+        "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "jobKind": { "enum": ["AUDIT", "LOGIN_CHECK", "DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE"] },
+        "targetConfigPath": { "$ref": "#/$defs/path" },
+        "startNew": { "type": "boolean" },
+        "targetConfigSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "authentication": { "$ref": "#/$defs/startAuthentication" },
+        "readChecks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/startReadCheck" }
+        },
+        "write": { "$ref": "#/$defs/startWrite" }
+      }
+    },
+    "startWrite": {
+      "description": "The write specification of a WRITE_CREATE START (Task 30 design 3, 4; T30e) and of a WRITE_UPDATE START (T31f; with the update block, required for WRITE_UPDATE only). The parent puts it after it consumed the execution grant, generated the values and recorded the attempt. Only the request shape, the candidate fields (name, type and states), the generated values of the fields to send, the verification spec and the bound READ verification; never a credential, a cookie, a CSRF token or a hidden value. For an update, the form page path and the request path are the concrete paths of the target record, the values are the new values of the changed fields only, and no value of a kept field and no prior value is sent. The approval facts (T32d; Task 32 design 4.1) are the facts at the start that the parent read after it consumed the grant; the worker copies them into approval-summary.json without judging. Their shape is the facts of the approval-summary artifact schema, referenced and not copied.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenarioId", "scenarioRevision", "grantId", "profileId", "seedRecord", "request", "formPage", "candidate", "candidateFields", "values", "verification", "readVerification", "approvalFacts"],
+      "properties": {
+        "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "scenarioRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "grantId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+        "seedRecord": {
+          "description": "The seed record of the generated data (T30f; the same value the parent recorded before START; no secret). Written into action-run.json by the worker.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seed", "seedInput", "baseDate", "attempt"],
+          "properties": {
+            "seed": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "seedInput": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["profileId", "scenarioId", "scenarioRevision", "ruleSetDigest", "executionGrantId"],
+              "properties": {
+                "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+                "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+                "scenarioRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                "ruleSetDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+                "executionGrantId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" }
+              }
+            },
+            "baseDate": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+            "attempt": { "type": "integer", "minimum": 0, "maximum": 32 }
+          }
+        },
+        "request": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/request" },
+        "formPage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "path"],
+          "properties": {
+            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          }
+        },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["identityDigest", "ruleDigest"],
+          "properties": {
+            "identityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "ruleDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+          }
+        },
+        "candidateFields": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type", "readonly", "hidden", "disabled"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 256 },
+              "type": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/field/properties/type" },
+              "readonly": { "type": "boolean" },
+              "hidden": { "type": "boolean" },
+              "disabled": { "type": "boolean" }
+            }
+          }
+        },
+        "values": {
+          "type": "object",
+          "maxProperties": 200,
+          "propertyNames": { "minLength": 1, "maxLength": 256 },
+          "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
+        },
+        "update": {
+          "description": "The update block of a WRITE_UPDATE START (T31f; Task 31 design 4 'IPC'): the id of the target record copied from the execution grant, the templated identity digest of the approved candidate, and the names of the changed and the kept fields. No value.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targetRecordId", "templatedIdentityDigest", "changedFieldNames", "keptFieldNames"],
+          "properties": {
+            "targetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 64 },
+            "templatedIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "changedFieldNames": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 200,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+            },
+            "keptFieldNames": {
+              "type": "array",
+              "maxItems": 200,
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+            }
+          }
+        },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["successCondition", "inputErrorCondition", "recordId"],
+          "properties": {
+            "successCondition": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/resultCondition" },
+            "inputErrorCondition": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/resultCondition" },
+            "recordId": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/recordId" }
+          }
+        },
+        "readVerification": { "$ref": "#/$defs/startReadCheck" },
+        "approvalFacts": { "$ref": "urn:beaksight:schema:approval-summary:1.0#/$defs/facts" }
+      }
+    },
+    "startReadCheck": {
+      "description": "One READ check definition of START (Task 27 design 4.5; T27e). The definition content is the read-check-definition schema, referenced and not copied. The worker never reads the control data, so the parent puts the definitions here. Secret-like parameter names are rejected by worker-protocol.ts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "readCheckRevision", "targetPage", "definition"],
+      "properties": {
+        "readCheckId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "readCheckRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "targetPage": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["origin", "path"],
+              "properties": {
+                "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+                "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+              }
+            },
+            { "type": "null" }
+          ]
+        },
+        "definition": { "$ref": "urn:beaksight:schema:control:read-check-definition:1" }
+      }
+    },
+    "startAuthentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["setup", "approvedTestOrigins", "authenticationSha256"],
+      "properties": {
+        "setup": { "$ref": "urn:beaksight:schema:control:auth-setup:2" },
+        "approvedTestOrigins": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "authenticationSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "automatedLogin": { "$ref": "#/$defs/startAutomatedLogin" }
+      }
+    },
+    "startAutomatedLogin": {
+      "description": "The automated login of START (Task 26 design 4.5). Only the credential revision and the root of the credential directory; never the credential values, the cipher texts or the user name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credentialRevision", "credentialRoot"],
+      "properties": {
+        "credentialRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "credentialRoot": { "$ref": "#/$defs/path" }
+      }
+    },
+    "stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "force"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "STOP" },
+        "force": { "type": "boolean" }
+      }
+    },
+    "writeRecheckResult": {
+      "description": "The result of the recheck before sending (parent to worker; T30e). Allowed without a reason, or rejected with a reason; the parent also sends STOP when it rejects.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "allowed", "reason"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "WRITE_RECHECK_RESULT" },
+        "allowed": { "type": "boolean" },
+        "reason": { "anyOf": [{ "enum": ["GRANT_INVALID", "FACTS_UNAVAILABLE", "RECHECK_REPEATED"] }, { "type": "null" }] }
+      }
+    },
+    "writeRecheckRequest": {
+      "description": "The request of the recheck before sending (worker to parent; T30e). Once per job.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "WRITE_RECHECK_REQUEST" }
+      }
+    },
+    "writeSubmission": {
+      "description": "The submission report (worker to parent; T30e). Once per job; only NOT_SENT has a block reason.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "submission", "blockReason"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "WRITE_SUBMISSION" },
+        "submission": { "enum": ["NOT_SENT", "SENT", "UNKNOWN"] },
+        "blockReason": { "anyOf": [{ "enum": ["PAYLOAD_MISMATCH", "PRECHECK_FAILED"] }, { "type": "null" }] }
+      }
+    },
+    "ready": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "READY" }
+      }
+    },
+    "runStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "runId", "runDirectory", "resumeDecision"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "RUN_STARTED" },
+        "runId": { "$ref": "#/$defs/runId" },
+        "runDirectory": { "$ref": "#/$defs/path" },
+        "resumeDecision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "completedPages"],
+          "properties": {
+            "kind": { "enum": ["NEW_RUN", "RESUME", "FINALIZE_ONLY"] },
+            "completedPages": { "anyOf": [{ "$ref": "#/$defs/count" }, { "type": "null" }] }
+          }
+        }
+      }
+    },
+    "originRequests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "peakPerMinute"],
+      "properties": {
+        "count": { "$ref": "#/$defs/count" },
+        "peakPerMinute": { "$ref": "#/$defs/count" }
+      }
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "report"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "PROGRESS" },
+        "report": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "pagesFinished",
+            "pagesDiscovered",
+            "maxPages",
+            "elapsedMs",
+            "navigationCount",
+            "pacingWaitMs",
+            "requests",
+            "recentPerMinute"
+          ],
+          "properties": {
+            "pagesFinished": { "$ref": "#/$defs/count" },
+            "pagesDiscovered": { "$ref": "#/$defs/count" },
+            "maxPages": { "$ref": "#/$defs/count" },
+            "elapsedMs": { "$ref": "#/$defs/count" },
+            "navigationCount": { "$ref": "#/$defs/count" },
+            "pacingWaitMs": { "$ref": "#/$defs/count" },
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["allowedOrigins", "otherOrigins", "servedFromCache", "withheldOtherOrigins"],
+              "properties": {
+                "allowedOrigins": { "$ref": "#/$defs/originRequests" },
+                "otherOrigins": { "$ref": "#/$defs/originRequests" },
+                "servedFromCache": { "$ref": "#/$defs/count" },
+                "withheldOtherOrigins": { "$ref": "#/$defs/count" }
+              }
+            },
+            "recentPerMinute": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["allowedOrigins", "otherOrigins"],
+              "properties": {
+                "allowedOrigins": { "$ref": "#/$defs/count" },
+                "otherOrigins": { "$ref": "#/$defs/count" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "siteUnavailableRecheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "url", "delayMs", "attempt", "maxAttempts"],
+      "properties": {
+        "kind": { "const": "SITE_UNAVAILABLE_RECHECK" },
+        "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "delayMs": { "$ref": "#/$defs/count" },
+        "attempt": { "$ref": "#/$defs/count" },
+        "maxAttempts": { "$ref": "#/$defs/count" }
+      }
+    },
+    "siteUnavailableSlowdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "minIntervalMs"],
+      "properties": {
+        "kind": { "const": "SITE_UNAVAILABLE_SLOWDOWN" },
+        "minIntervalMs": { "$ref": "#/$defs/count" }
+      }
+    },
+    "notice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "notice"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "NOTICE" },
+        "notice": {
+          "oneOf": [{ "$ref": "#/$defs/siteUnavailableRecheck" }, { "$ref": "#/$defs/siteUnavailableSlowdown" }]
+        }
+      }
+    },
+    "authState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "state", "sessionLostUrl"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "AUTH_STATE" },
+        "state": {
+          "enum": ["AWAITING_LOGIN", "AUTHENTICATED", "AUTH_SETUP_REQUIRED", "UNSUPPORTED_AUTH_STATE", "SESSION_LOST", "LOGIN_TIMEOUT", "LOGIN_ATTEMPTS_EXCEEDED", "AUTOMATED_LOGIN_FAILED"]
+        },
+        "sessionLostUrl": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
+        "automatedLogin": { "$ref": "#/$defs/automatedLoginReport" }
+      }
+    },
+    "automatedLoginReport": {
+      "description": "The result of the automated login stage (Task 26 design 4.5). Closed lists and a time only; never a value, an error text or a URL.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "submitted", "retryAfterUntil", "formInvalidReason"],
+      "properties": {
+        "result": {
+          "enum": ["SUCCEEDED", "INVALID_CREDENTIALS", "ACCOUNT_LOCKED", "MFA_REQUIRED", "CREDENTIAL_EXPIRED", "RATE_LIMITED", "AUTH_RESULT_UNKNOWN", "LOGIN_FORM_INVALID", "LOGIN_FORM_INPUT_FAILED", "CREDENTIAL_CHANGED", "CREDENTIAL_UNAVAILABLE", "UNEXPECTED_LOGIN_REQUEST"]
+        },
+        "submitted": { "enum": ["YES", "NO", "UNKNOWN"] },
+        "retryAfterUntil": { "anyOf": [{ "type": "string", "pattern": "^[0-9]{14}$" }, { "type": "null" }] },
+        "formInvalidReason": {
+          "anyOf": [
+            { "enum": ["SELECTOR_NOT_UNIQUE", "USERNAME_FIELD_INVALID", "PASSWORD_FIELD_INVALID", "SUBMIT_BUTTON_INVALID", "NOT_SAME_FORM", "METHOD_NOT_POST", "ACTION_NOT_ALLOWED", "FORM_TARGET_NOT_SELF", "FORM_UNREADABLE"] },
+            { "type": "null" }
+          ]
+        },
+        "responseAfterSubmission": { "type": "boolean" }
+      }
+    },
+    "heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "HEARTBEAT" }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "exitCode", "runId", "runDirectory", "runStatus"],
+      "properties": {
+        "kind": { "enum": ["RAN", "RUN_ACTIVE", "VERSION_MISMATCH", "RUN_DIRECTORY_UNAVAILABLE", "RESUME_UNAVAILABLE"] },
+        "exitCode": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "runId": { "anyOf": [{ "$ref": "#/$defs/runId" }, { "type": "null" }] },
+        "runDirectory": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "runStatus": { "anyOf": [{ "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] }, { "type": "null" }] }
+      }
+    },
+    "finished": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "outcome"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "FINISHED" },
+        "outcome": { "$ref": "#/$defs/outcome" },
+        "discovery": { "$ref": "#/$defs/discoverySummary" },
+        "readCheck": { "$ref": "#/$defs/readCheckSummary" }
+      }
+    },
+    "readCheckSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checks", "executed"],
+      "properties": {
+        "checks": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "executed": { "type": "integer", "minimum": 0, "maximum": 20 }
+      }
+    },
+    "discoverySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pagesRead", "pagesNotRead", "candidates"],
+      "properties": {
+        "pagesRead": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "pagesNotRead": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "candidates": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "failed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "reason", "detail"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "FAILED" },
+        "reason": { "enum": ["CONFIG_ERROR", "ARTIFACT_WRITE_FAILED", "UNEXPECTED_FAILURE", "PROTOCOL_VIOLATION", "START_TIMEOUT", "CONFIG_CHANGED", "AUTH_SETUP_CHANGED", "AUTH_SETUP_REQUIRED", "UNSUPPORTED_AUTH_STATE", "LOGIN_TIMEOUT", "LOGIN_ATTEMPTS_EXCEEDED", "INVALID_CREDENTIALS", "ACCOUNT_LOCKED", "MFA_REQUIRED", "CREDENTIAL_EXPIRED", "RATE_LIMITED", "AUTH_RESULT_UNKNOWN", "LOGIN_FORM_INVALID", "LOGIN_FORM_INPUT_FAILED", "CREDENTIAL_CHANGED", "CREDENTIAL_UNAVAILABLE", "UNEXPECTED_LOGIN_REQUEST", "JOB_KIND_NOT_SUPPORTED"] },
+        "detail": { "type": "string", "maxLength": 1024 }
+      }
+    }
+  }
+}

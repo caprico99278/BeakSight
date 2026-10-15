@@ -2,10 +2,11 @@
  * テストの見本の保存（チェックポイント。中断した Run の再開の設計書 4.1）の組み立て（CC-037）。
  * R1 の frontier と採番器、L2 の pacer、L4 の meter、Safety Ledger の snapshot を、実際の部品を動かして作り、R2 の
  * `createRunCheckpoint`・`createRunCheckpointPage` に渡す。値は、`checkpoint`・`checkpoint-page` のスキーマと、R2 の整合の確かめに合う。
- * 既存の2か所（`tests/unit/run-checkpoint.test.ts` の `sampleRunState`、`tests/unit/artifact-writer.test.ts` の `sampleCheckpoint`）は、
- * まだ置き換えていない（R4a の指示書）。
+ * 見本の巡回の記録（`sampleCrawl`）、待ちのない負荷の記録（`sampleIdleLoad`）、何も起きていない進み具合（`sampleQuietProgress`）は、
+ * `tests/unit/run-checkpoint.test.ts` と `tests/unit/artifact-writer.test.ts` の見本も使う。
  */
 import type { RunCheckpointState, RunExecutionEndReason } from '../../src/core/contracts.js';
+import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { createNavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { CrawlFrontier, type CrawlUrlEntry } from '../../src/orchestration/crawl-frontier.js';
@@ -14,11 +15,69 @@ import {
   createRunCheckpoint,
   createRunCheckpointPage,
   type RunCheckpoint,
+  type RunCheckpointInput,
   type RunCheckpointPage,
 } from '../../src/orchestration/run-checkpoint.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { dom, FIXTURE_ORIGIN, FIXTURE_RUN_ID, fixtureUrl, page, PAGE_1, runSummary } from './audit-run-fixture.js';
 import { createTestConfig } from './test-config.js';
+
+/** 見本の巡回の、1 ページの監査の終わり方（`sampleCrawl`）。 */
+export interface SampleCrawlStep {
+  readonly status: 'AUDITED' | 'FAILED';
+  /** そのページで見つけた URL（見つけた順。深さは、そのページの深さ + 1）。省略すると、見つけない。 */
+  readonly links?: readonly NormalizedHttpUrlEvidence[];
+}
+
+/** 見本の巡回の記録（`sampleCrawl` の結果）。 */
+export interface SampleCrawl {
+  readonly config: ReturnType<typeof createTestConfig>;
+  readonly allocator: IdAllocator;
+  readonly frontier: CrawlFrontier;
+}
+
+/**
+ * 見本の巡回の記録（R1 の frontier と採番器を、実際に動かして作る）。設定は `createTestConfig(FIXTURE_ORIGIN)`。開始の URL
+ * （`fixtureUrl('/')`）を深さ 0 で見つけ、`steps` の順に、frontier の次の URL を監査して終え、そのページで見つけた URL を足す。
+ */
+export function sampleCrawl(steps: readonly SampleCrawlStep[]): SampleCrawl {
+  const config = createTestConfig(FIXTURE_ORIGIN);
+  const allocator = new IdAllocator();
+  const frontier = new CrawlFrontier(config.crawl.maxDepth, allocator);
+  frontier.discover(fixtureUrl('/'), 0);
+  for (const step of steps) {
+    const entry = frontier.next() as CrawlUrlEntry;
+    frontier.markAuditing(entry.url);
+    frontier.markFinished(entry.url, step.status);
+    for (const link of step.links ?? []) {
+      frontier.discover(link, entry.depth + 1);
+    }
+  }
+  return { config, allocator, frontier };
+}
+
+/** 見本の、まだ1回も待っていない pacer（間隔は 0）と、何も数えていない meter の記録（L2、L4）。時刻は 1_000 ms で止める。 */
+export function sampleIdleLoad(): RunCheckpointInput['load'] {
+  const nowMs = (): number => 1_000;
+  return {
+    pacer: createNavigationPacer({ minIntervalMs: 0, now: nowMs, sleep: async () => undefined }).snapshot(),
+    meter: createLoadMeter({ allowedOrigins: [FIXTURE_ORIGIN], now: nowMs }).snapshot(),
+  };
+}
+
+/** 見本の、理由も再試行も違反もない Run の進み具合（Guard は有効）。始めたページの数は `pagesStarted`。 */
+export function sampleQuietProgress(pagesStarted: number): RunCheckpointInput['progress'] {
+  return {
+    reasons: [],
+    retries: [],
+    safetyViolationDetected: false,
+    stoppedBySafetyViolation: false,
+    unhandledFailures: 0,
+    guardEnabled: true,
+    preflightFailed: false,
+    pagesStarted,
+  };
+}
 
 /** `sampleRunCheckpoint` の指定。 */
 export interface SampleRunCheckpointOptions {
@@ -44,18 +103,11 @@ const SAMPLE_EXECUTION_END_REASONS = Object.freeze({
  * 実行の開始の5分後。
  */
 export function sampleRunCheckpoint(options: SampleRunCheckpointOptions = {}): RunCheckpoint {
-  const config = createTestConfig(FIXTURE_ORIGIN);
-  const allocator = new IdAllocator();
-  const frontier = new CrawlFrontier(config.crawl.maxDepth, allocator);
-  frontier.discover(fixtureUrl('/'), 0);
   const startPageFinished = options.startPageFinished === true;
+  const { config, allocator, frontier } = sampleCrawl(startPageFinished ? [{ status: 'AUDITED' }] : []);
   if (startPageFinished) {
-    const entry = frontier.next() as CrawlUrlEntry;
-    frontier.markAuditing(entry.url);
-    frontier.markFinished(entry.url, 'AUDITED');
     allocator.allocateEvidenceId('dom');
   }
-  const nowMs = (): number => 1_000;
   const startedAt = '2026-10-01T00:00:00.000Z';
   const savedAt = '2026-10-01T00:05:00.000Z';
   const state = options.state ?? 'IN_PROGRESS';
@@ -70,22 +122,10 @@ export function sampleRunCheckpoint(options: SampleRunCheckpointOptions = {}): R
     executions: [{ startedAt, finishedAt: endReason === null ? null : savedAt, endReason, environment: runSummary().environment }],
     frontier: frontier.snapshot(),
     allocator: allocator.snapshot(),
-    progress: {
-      reasons: [],
-      retries: [],
-      safetyViolationDetected: false,
-      stoppedBySafetyViolation: false,
-      unhandledFailures: 0,
-      guardEnabled: true,
-      preflightFailed: false,
-      pagesStarted: startPageFinished ? 1 : 0,
-    },
+    progress: sampleQuietProgress(startPageFinished ? 1 : 0),
     safetyLedgerSnapshots: [new SafetyLedger().snapshot()],
     siteMetadata: null,
-    load: {
-      pacer: createNavigationPacer({ minIntervalMs: 0, now: nowMs, sleep: async () => undefined }).snapshot(),
-      meter: createLoadMeter({ allowedOrigins: [FIXTURE_ORIGIN], now: nowMs }).snapshot(),
-    },
+    load: sampleIdleLoad(),
     completedPageIds: startPageFinished ? [PAGE_1] : [],
   });
 }

@@ -1,0 +1,325 @@
+{
+  "$id": "urn:beaksight:schema:control:candidate:1",
+  "description": "One candidate of the side-effect-free discovery (an item of discovery.json; Task 27 design 4.1). The value lists and limits are owned by src/discovery/candidate-contracts.ts. No property holds an input value, a token, an option label or the text of a submit button (only the classification words that the text hit; T27R-fix-1, DEF-086).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "page",
+    "kind",
+    "formMethod",
+    "methodOverride",
+    "action",
+    "enctype",
+    "target",
+    "fields",
+    "submitterWords",
+    "jsBinding",
+    "incompleteReasons",
+    "classification",
+    "reasonCode",
+    "hasStateField",
+    "identityDigest",
+    "ruleDigest"
+  ],
+  "properties": {
+    "page": { "$ref": "#/$defs/location" },
+    "kind": { "enum": ["FORM", "BUTTON"] },
+    "formMethod": { "anyOf": [{ "enum": ["GET", "POST", "DIALOG"] }, { "type": "null" }] },
+    "methodOverride": { "anyOf": [{ "enum": ["PUT", "PATCH", "DELETE"] }, { "type": "null" }] },
+    "action": { "anyOf": [{ "$ref": "#/$defs/action" }, { "type": "null" }] },
+    "enctype": {
+      "anyOf": [
+        { "enum": ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"] },
+        { "type": "null" }
+      ]
+    },
+    "target": { "anyOf": [{ "type": "string", "maxLength": 256 }, { "type": "null" }] },
+    "fields": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/field" } },
+    "submitterWords": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 68,
+      "items": {
+        "enum": [
+          "logout",
+          "signout",
+          "sign-out",
+          "log-out",
+          "delete",
+          "remove",
+          "destroy",
+          "cancel",
+          "archive",
+          "deactivate",
+          "disable",
+          "revoke",
+          "purge",
+          "withdraw",
+          "unsubscribe",
+          "terminate",
+          "suspend",
+          "discard",
+          "erase",
+          "wipe",
+          "truncate",
+          "bulk",
+          "batch",
+          "reset",
+          "削除",
+          "取り消",
+          "取消",
+          "一括",
+          "無効",
+          "解約",
+          "退会",
+          "アーカイブ",
+          "廃止",
+          "停止",
+          "キャンセル",
+          "破棄",
+          "消去",
+          "抹消",
+          "中止",
+          "ログアウト",
+          "search",
+          "filter",
+          "find",
+          "query",
+          "lookup",
+          "検索",
+          "絞り込",
+          "絞込",
+          "探す",
+          "update",
+          "save",
+          "edit",
+          "change",
+          "modify",
+          "更新",
+          "保存",
+          "編集",
+          "変更",
+          "修正",
+          "create",
+          "add",
+          "new",
+          "register",
+          "insert",
+          "登録",
+          "追加",
+          "作成",
+          "新規"
+        ]
+      }
+    },
+    "jsBinding": { "$ref": "#/$defs/jsBinding" },
+    "incompleteReasons": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "INCOMPLETE_SETTLE_TIMEOUT",
+          "INCOMPLETE_FRAME_OR_CLOSED_SHADOW",
+          "INCOMPLETE_FREEZE_UNAVAILABLE",
+          "INCOMPLETE_READ_FAILED",
+          "INCOMPLETE_LIMIT_REACHED"
+        ]
+      }
+    },
+    "classification": {
+      "enum": [
+        "READ",
+        "CREATE",
+        "UPDATE",
+        "NOT_EXECUTABLE",
+        "NEEDS_BINDING",
+        "UNSUPPORTED_READ_TRANSPORT",
+        "BLOCKED_EXTERNAL",
+        "DISPLAY_ONLY"
+      ]
+    },
+    "reasonCode": {
+      "enum": [
+        "ACTION_OUTSIDE_ALLOWED_ORIGINS",
+        "DESTRUCTIVE",
+        "READ_GET_FORM",
+        "GET_WITH_PASSWORD_FIELD",
+        "GET_WITH_MULTIPART",
+        "POST_SEARCH",
+        "GRAPHQL_ENDPOINT",
+        "JS_BOUND",
+        "JS_DELEGATED",
+        "NO_KNOWN_ACTION",
+        "DIALOG_METHOD",
+        "METHOD_OVERRIDE_UNRECOGNIZED",
+        "UPDATE_METHOD",
+        "UPDATE_WORD",
+        "CREATE_WORD",
+        "UNCLASSIFIED",
+        "DUPLICATE_IDENTITY_CONFLICT"
+      ]
+    },
+    "hasStateField": { "type": "boolean" },
+    "identityDigest": { "$ref": "#/$defs/digest" },
+    "ruleDigest": { "$ref": "#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "type": "object", "properties": { "kind": { "const": "FORM" } }, "required": ["kind"] },
+      "then": {
+        "type": "object",
+        "properties": {
+          "formMethod": { "type": "string" },
+          "action": { "type": "object" },
+          "enctype": { "type": "string" }
+        }
+      }
+    },
+    {
+      "if": { "type": "object", "properties": { "kind": { "const": "BUTTON" } }, "required": ["kind"] },
+      "then": {
+        "type": "object",
+        "properties": {
+          "formMethod": { "type": "null" },
+          "methodOverride": { "type": "null" },
+          "action": { "type": "null" },
+          "enctype": { "type": "null" },
+          "target": { "type": "null" },
+          "fields": { "type": "array", "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "path"],
+      "properties": {
+        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "path", "queryNames"],
+      "properties": {
+        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "path": { "type": "string", "pattern": "^/", "maxLength": 2048 },
+        "queryNames": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 256 } }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern", "min", "max", "step", "minlength", "maxlength", "autocomplete"],
+      "properties": {
+        "pattern": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "min": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "max": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "step": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "minlength": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "maxlength": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] },
+        "autocomplete": { "anyOf": [{ "type": "string", "maxLength": 512 }, { "type": "null" }] }
+      }
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "tag",
+        "type",
+        "required",
+        "readonly",
+        "disabled",
+        "hidden",
+        "constraints",
+        "options",
+        "omittedOptionCount",
+        "hasValue"
+      ],
+      "properties": {
+        "name": { "type": "string", "maxLength": 256 },
+        "tag": { "enum": ["input", "select", "textarea"] },
+        "type": {
+          "enum": [
+            "text",
+            "search",
+            "email",
+            "url",
+            "tel",
+            "password",
+            "number",
+            "range",
+            "date",
+            "month",
+            "week",
+            "time",
+            "datetime-local",
+            "color",
+            "checkbox",
+            "radio",
+            "file",
+            "hidden",
+            "select-one",
+            "select-multiple",
+            "textarea"
+          ]
+        },
+        "required": { "type": "boolean" },
+        "readonly": { "type": "boolean" },
+        "disabled": { "type": "boolean" },
+        "hidden": { "type": "boolean" },
+        "constraints": { "$ref": "#/$defs/constraints" },
+        "options": {
+          "anyOf": [
+            { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 256 } },
+            { "type": "null" }
+          ]
+        },
+        "omittedOptionCount": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "hasValue": { "type": "boolean" }
+      }
+    },
+    "listenerKinds": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "click",
+          "dblclick",
+          "auxclick",
+          "submit",
+          "formdata",
+          "keydown",
+          "keyup",
+          "keypress",
+          "pointerdown",
+          "pointerup",
+          "mousedown",
+          "mouseup",
+          "touchstart",
+          "touchend",
+          "change",
+          "input"
+        ]
+      }
+    },
+    "jsBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["form", "submitter", "ancestor", "document", "window", "inlineHandler"],
+      "properties": {
+        "form": { "$ref": "#/$defs/listenerKinds" },
+        "submitter": { "$ref": "#/$defs/listenerKinds" },
+        "ancestor": { "$ref": "#/$defs/listenerKinds" },
+        "document": { "$ref": "#/$defs/listenerKinds" },
+        "window": { "$ref": "#/$defs/listenerKinds" },
+        "inlineHandler": { "type": "boolean" }
+      }
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+  }
+}

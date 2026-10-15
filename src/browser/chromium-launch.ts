@@ -1,6 +1,6 @@
 /**
  * CLI の Chromium の起動の設定（`chromium.launch` に渡す値）の置き場所（中断した Run の再開の設計書 4.10、サイトへの負荷の制御の設計書 4.9）。
- * CLI の本番の起動（`src/cli/run-command.ts` の `PRODUCTION_RUN_DEPENDENCIES.launchBrowser`）は、`chromiumLaunchOptions` の値で
+ * CLI の本番の起動（`src/cli/audit-run.ts` の `PRODUCTION_RUN_DEPENDENCIES.launchBrowser`）は、`chromiumLaunchOptions` の値で
  * `chromium.launch` を呼ぶ。channel、起動の引数、シグナルの扱いは、ここだけに書く。
  * テストの中で直接 Chromium を起動するもの（`tests/helpers/chromium.ts` など）は、この設定を使わない。ただし、Shared Worker を無効にする
  * 引数（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`。DEF-044）は、テストの起動の補助も既定で使う（外すのは、テストの明示の選択だけ）。
@@ -53,8 +53,9 @@ export const CHROMIUM_PRELOADING_DISABLED_FEATURES = Object.freeze([
  * `PLAYWRIGHT_LEGACY_SCREENSHOT` がない場合。DEF-023）。
  * Chromium は、`--enable-features` が複数あると、最後の1つだけを使う（DEF-023 で確かめた）。先読みを止める引数も `--enable-features` で、
  * Playwright の既定の後に並ぶので、Playwright の既定の値を、先読みを止める引数の値に含めて引き継ぐ。含めないと、Playwright の既定の
- * 振る舞い（スクリーンショットの取り方）が変わる。先読みを止める引数は `--disable-features` を使わないので、Playwright の既定の
- * `--disable-features` は、そのまま使われる。Playwright の版が変わって既定が変わったら、
+ * 振る舞い（スクリーンショットの取り方）が変わる。`--disable-features` も同じく最後の1つだけが使われるので、Google への接続を止める
+ * 引数（`CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS`。DEF-070）は、Playwright の既定の `--disable-features` の値
+ * （`PLAYWRIGHT_DEFAULT_DISABLED_FEATURES`）を含めて引き継ぐ。Playwright の版が変わって既定が変わったら、
  * `tests/integration/preloading-disabled.test.ts` で気づく。
  */
 export const PLAYWRIGHT_DEFAULT_ENABLED_FEATURES = Object.freeze(['CDPScreenshotNewSurface'] as const);
@@ -65,6 +66,97 @@ export const PLAYWRIGHT_DEFAULT_ENABLED_FEATURES = Object.freeze(['CDPScreenshot
  */
 export const CHROMIUM_PRELOADING_DISABLED_ARGS = Object.freeze([
   `--enable-features=${[...PLAYWRIGHT_DEFAULT_ENABLED_FEATURES, ...CHROMIUM_PRELOADING_DISABLED_FEATURES].join(',')}`,
+] as const);
+
+/**
+ * Playwright（1.62.1）が、Chromium の起動の引数に自分で加える `--disable-features` の値（Playwright の既定。DEF-070）。並びも同じにする。
+ * 写した元: `node_modules/playwright-core/lib/coreBundle.js` の `packages/playwright-core/src/server/chromium/chromiumSwitches.ts` の部分の
+ * `disabledFeatures`（条件で変わる値はない）。
+ * Chromium は、`--disable-features` が複数あると、最後の1つだけを使う。Google への接続を止める引数（`CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS`）
+ * は Playwright の既定の後に並ぶので、この値を含めないと、Playwright が止めている feature（`HttpsUpgrades` など）が効き出し、監査の
+ * 振る舞いが変わる（DEF-070-research で、`HttpsUpgrades` が効き出して `http://` の名前を `:443` で開こうとすることを確かめた）。
+ *
+ * Playwright の版を上げるときに確かめ直す手順:
+ * 1. 新しい版の `node_modules/playwright-core/lib/coreBundle.js`（または `lib/server/chromium/chromiumSwitches.js`）で、
+ *    `disabledFeatures` の配列を読み、この値を同じ並びに直す。`--enable-features` の既定（`PLAYWRIGHT_DEFAULT_ENABLED_FEATURES`）も同じく
+ *    確かめる。
+ * 2. `tests/integration/preloading-disabled.test.ts`（実際に渡った `--disable-features` を、Playwright の既定の起動と比べる）と、
+ *    `tests/integration/chromium-google-connections.test.ts`（Google への接続の試みと、`HttpsUpgrades` が効き出していないこと）を実行する。
+ *    この値が古いと、前者が失敗して気づく。
+ */
+export const PLAYWRIGHT_DEFAULT_DISABLED_FEATURES = Object.freeze([
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'BoundaryEventDispatchTracksNodeRemoval',
+  'DestroyProfileOnBrowserClose',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'HttpsUpgrades',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'ThirdPartyStoragePartitioning',
+  'BlockOriginHeaderModificationOnRedirect',
+  'Translate',
+  'AutoDeElevate',
+  'OptimizationHints',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+] as const);
+
+/**
+ * Chromium 自身が Google へ接続することを止める、Chromium の feature の閉じた一覧（DEF-070。`--disable-features` の値として渡す）。
+ * CLI の起動の設定（`channel: 'chromium'` の `chrome.exe`）は、Playwright の既定の起動の引数（`--disable-background-networking` など）の
+ * ままでは、監査と関係なく、自分で Google へ接続しようとする（テストの既定の headless shell は、接続しない）。監査対象のサイトへの要求では
+ * ないが、第三者への送信になりうるので止める。Chromium 151（Playwright 1.62.1）で、インターネットへは出さない実験（記録用の中継と DNS の
+ * 規則）で確かめて選んだ（DEF-070-research。確かめは `tests/integration/chromium-google-connections.test.ts`）:
+ * - `AutofillServerCommunication`: form のあるページのたびの autofill の問い合わせ（`content-autofill.googleapis.com`。form の署名と
+ *   欄の署名を含む）を止める。Passive・Interaction・ログインの段のどの Context でも起きていた。
+ * - `NetworkTimeServiceQuerying`: 起動のたびの時刻の問い合わせ（`clients2.google.com` の `/time/`）を止める。
+ * - `PreconnectToSearch`: 既定の検索エンジン（`www.google.com`）への先回りの接続（preconnect）を止める。
+ * - `AimEnabled`: AI Mode の可否の問い合わせ（`www.google.com`）を止める。
+ * 起動のときの ListAccounts（`accounts.google.com`）と GCM の checkin（`android.clients.google.com`）は、feature では止まらないので、
+ * 向け先を変える引数（`CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS`）で止める。
+ * BeakSight は、これらの機能の結果を監査に使わないので、止めても監査の結果（スクリーンショット、DOM、Guard の判定）は変わらない。
+ */
+export const CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES = Object.freeze([
+  'AutofillServerCommunication',
+  'NetworkTimeServiceQuerying',
+  'PreconnectToSearch',
+  'AimEnabled',
+] as const);
+
+/**
+ * Chromium 自身の Google への接続を止める、Chromium の起動の引数の閉じた一覧（DEF-070）。`--disable-features` の1つだけで、値は、
+ * Playwright の既定の値（`PLAYWRIGHT_DEFAULT_DISABLED_FEATURES`）と、Google への接続を止める feature
+ * （`CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES`）である。
+ */
+export const CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS = Object.freeze([
+  `--disable-features=${[...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES, ...CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES].join(',')}`,
+] as const);
+
+/**
+ * Chromium 自身の Google のアカウントと GCM への接続の向け先にする、使われないローカルの宛先（DEF-070。ユーザーの判断で止める）。
+ * 127.0.0.1（この PC の中）の 9 番のポート（discard。ふつうは何も待ち受けていない）。外へは出ない。DEF-070-fix の実験（テストには
+ * していない）で、9 番のポートで待ち受けても、起動と form のあるページで 15 秒の間に何も届かなかった（Chromium が 9 番のポートを危ない
+ * ポートとして扱い、接続しないためと推測。Chromium の資料では確かめていない）。万一、この PC の 9 番のポートで何かが待ち受けていて
+ * 届いた場合も、届くのは Chromium 自身の問い合わせで、監査対象のサイトへの要求ではない。外へ接続しないことの確かめは
+ * `tests/integration/chromium-google-connections.test.ts`。
+ */
+export const CHROMIUM_UNUSED_LOCAL_ENDPOINT = 'http://127.0.0.1:9';
+
+/**
+ * Chromium 自身の Google への接続のうち、feature では止まらないものの向け先を、使われないローカルの宛先（`CHROMIUM_UNUSED_LOCAL_ENDPOINT`）
+ * に変える、Chromium の起動の引数の閉じた一覧（DEF-070）。Chromium 151（Playwright 1.62.1）で、インターネットへは出さない実験で確かめた:
+ * - `--gaia-url`: Google のアカウントの基の URL。起動のたびの ListAccounts（`accounts.google.com`。Google のアカウントの一覧の問い合わせ）
+ *   の向け先。BeakSight は Chromium に Google のアカウントでログインしないので、使わない。ページが読み込む `accounts.google.com` の
+ *   要求（「Google でログイン」のボタンなど）は、この引数で変わらない（同じテストで、引数の前後でスクリーンショット、DOM の Evidence、
+ *   Guard の記録が変わらないことを確かめる）。
+ * - `--gcm-checkin-url`: GCM（プッシュの通知の仕組み）の checkin（`android.clients.google.com`）の向け先。BeakSight はプッシュの通知を
+ *   使わない。
+ */
+export const CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS = Object.freeze([
+  `--gaia-url=${CHROMIUM_UNUSED_LOCAL_ENDPOINT}`,
+  `--gcm-checkin-url=${CHROMIUM_UNUSED_LOCAL_ENDPOINT}`,
 ] as const);
 
 /**
@@ -93,8 +185,10 @@ export interface ChromiumLaunchSettings {
 /**
  * CLI の `chromium.launch` に渡す値を作る（呼ぶたびに新しい値）。
  * - `channel`: `CHROMIUM_CHANNEL`（Ctrl+C で Chromium が終わらないため）。
- * - `args`: `CHROMIUM_PRELOADING_DISABLED_ARGS`（ページの先読みを止めるため）と、`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`（Shared Worker を
- *   無効にするため。DEF-044）。
+ * - `args`: `CHROMIUM_PRELOADING_DISABLED_ARGS`（ページの先読みを止めるため）と、`CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS`（Chromium 自身の
+ *   Google への接続を止めるため。DEF-070）と、`CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS`（起動のときの ListAccounts と GCM の checkin の
+ *   向け先を、使われないローカルの宛先に変えるため。DEF-070）と、`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`（Shared Worker を無効にするため。
+ *   DEF-044）。
  * - `handleSIGINT`・`handleSIGTERM`・`handleSIGHUP`: `false`。Playwright の既定のシグナルの処理（SIGINT・SIGTERM・SIGHUP で Browser を
  *   閉じてプロセスを終える）を止める（中断した Run の再開の設計書 4.7）。Playwright がプロセスを終えると、最後の処理（出力の書き出し）が
  *   行われないためである。シグナルは、BeakSight が受ける（R5b）。
@@ -103,7 +197,12 @@ export function chromiumLaunchOptions(settings: ChromiumLaunchSettings): LaunchO
   return {
     headless: settings.headless,
     channel: CHROMIUM_CHANNEL,
-    args: [...CHROMIUM_PRELOADING_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS],
+    args: [
+      ...CHROMIUM_PRELOADING_DISABLED_ARGS,
+      ...CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
+      ...CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
+      ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
+    ],
     handleSIGINT: false,
     handleSIGTERM: false,
     handleSIGHUP: false,
