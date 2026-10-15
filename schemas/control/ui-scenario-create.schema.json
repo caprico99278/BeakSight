@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-create:1",
+  "description": "Local UI Server Function input: create one write scenario (Task 28 design 4.6). The draft itself (the profile, the candidate, the fields to send, the READ checks, the side effect confirmations, the limits and the approval TTL) is validated by validateScenarioDraft against the candidate of the latest discovery, so that the reasons are returned by item.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["draft"],
+  "properties": {
+    "draft": { "type": "object" }
+  }
+}

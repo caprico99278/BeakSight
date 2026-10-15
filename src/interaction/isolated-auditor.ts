@@ -2,6 +2,7 @@ import type { Page } from 'playwright';
 import type { InteractionGuardedSession } from '../browser/context-factory.js';
 import {
   observeMainFrameLoad,
+  settleMainFrameLoad,
   trackMainFrameDocument,
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
@@ -10,7 +11,7 @@ import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js
 import { isPlaywrightTimeoutError } from '../browser/playwright-errors.js';
 import type { Viewport } from '../config/types.js';
 import type { InteractionStatus, NavigationDiagnostics } from '../core/contracts.js';
-import { awaitBeforeDeadline, wait, yieldMacrotask } from '../core/deadline.js';
+import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, wait, yieldMacrotask } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   CONTEXT_CLOSE_TIMEOUT_MS,
@@ -29,7 +30,13 @@ import type {
   InteractionWorkOutcome,
 } from '../core/evidence-types.js';
 import { isPositiveSafeInteger, isNonNegativeSafeInteger } from '../core/guards.js';
-import { normalizeWhitespace, truncateText } from '../core/text.js';
+import {
+  normalizeWhitespace,
+  removeBidiControls,
+  removeLoneSurrogates,
+  replaceControlCharacters,
+  truncateText,
+} from '../core/text.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
 import {
   collectInteractionChangeEvidence,
@@ -58,6 +65,7 @@ import {
   inspectInteractionCandidateHandle,
   resolveInteractionCandidateHandle,
   type InteractionAttributeRecord,
+  type InteractionCandidateReference,
   type InteractionHandleResolution,
   type InteractionScrollComparison,
 } from './discover-candidates.js';
@@ -316,15 +324,8 @@ const HANDLE_DISPOSE_FAILURE_FALLBACK_MESSAGE = 'Interaction handle dispose fail
  */
 const ANSI_ESCAPE_SEQUENCE_PATTERN =
   /(?:\u001b[PX\]^_]|[\u0090\u0098\u009d-\u009f])[^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?|(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]?|\u001b[@-Z\\-_]/gu;
-/** エスケープシーケンスを除いた後に残る、C0・C1 の制御文字。 */
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/gu;
-/**
- * 表示の向きを変える、双方向の制御文字。埋め込み・上書き（U+202A〜U+202E）、分離（U+2066〜U+2069）、
- * 向きの印の LRM（U+200E）・RLM（U+200F）・ALM（U+061C）（R6 の M-3）。
- */
-const BIDI_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-/** 対になっていないサロゲート（孤立した上位・下位サロゲート）。`u` フラグでは、対になったサロゲートには一致しない（R6 の M-3）。 */
-const LONE_SURROGATE_PATTERN = /[\ud800-\udfff]/gu;
+/** エスケープシーケンスを除いた後に残る、C0・C1 の制御文字（Cc）の置き換え。判定は `src/core/text.ts` の `replaceControlCharacters`（CCX-3）。 */
+const CONTROL_CHARACTER_REPLACEMENT = ' ';
 /** Playwright がエラーの文言の後ろに付ける、操作の記録（`Call log:` の行から後ろ）。 */
 const PLAYWRIGHT_CALL_LOG_PATTERN = /(?:^|\n)[ \t]*Call log:/u;
 
@@ -513,7 +514,8 @@ function interactionFailureDetail(error: unknown): string | null {
   const callLogAt = withoutAnsi.search(PLAYWRIGHT_CALL_LOG_PATTERN);
   const summary = callLogAt === -1 ? withoutAnsi : withoutAnsi.slice(0, callLogAt);
   const cleaned = normalizeWhitespace(
-    summary.replace(BIDI_CONTROL_PATTERN, '').replace(LONE_SURROGATE_PATTERN, '').replace(CONTROL_CHARACTER_PATTERN, ' '),
+    // 双方向の制御文字（ALM・LRM・RLM、埋め込み・上書き、分離）と、孤立したサロゲートを除く（R6 の M-3）。残った Cc は空白にする。
+    replaceControlCharacters(removeLoneSurrogates(removeBidiControls(summary)), CONTROL_CHARACTER_REPLACEMENT),
   );
   return cleaned === '' ? null : boundedReason(cleaned);
 }
@@ -732,7 +734,7 @@ function disposeLateResolvedHandle(
       return;
     }
     try {
-      await resolution.handle.dispose();
+      await resolution.reference.handle.dispose();
     } catch (error) {
       recordHandleDisposeFailure(session, error);
     }
@@ -944,7 +946,7 @@ async function prepareTargetScroll(
     // 凍結の後の探し直しの目印にするので、探索と解決の間に別の要素が差し込まれた場合に、別の要素を目印にしないためである。
     // 同じ要素でなければ、下準備をせずに（SKIPPED）、凍結の後のこれまでと同じ判定に任せる。
     const identity = await observePreparedTarget(
-      resolution.handle,
+      resolution.reference,
       prepared.ordinal,
       effectiveDeadlineAtMs,
       domWork,
@@ -963,7 +965,7 @@ async function prepareTargetScroll(
     }
     try {
       const scrollWork = await awaitBrowserWork(
-        () => resolution.handle.scrollIntoViewIfNeeded({ timeout: scrollBudgetMs }),
+        () => resolution.reference.handle.scrollIntoViewIfNeeded({ timeout: scrollBudgetMs }),
         effectiveDeadlineAtMs,
       );
       if (scrollWork.status === 'PENDING_AT_DEADLINE') {
@@ -983,7 +985,7 @@ async function prepareTargetScroll(
     }
     try {
       const hoverWork = await awaitBrowserWork(
-        () => resolution.handle.hover({ timeout: hoverBudgetMs }),
+        () => resolution.reference.handle.hover({ timeout: hoverBudgetMs }),
         effectiveDeadlineAtMs,
       );
       if (hoverWork.status === 'PENDING_AT_DEADLINE') {
@@ -999,7 +1001,7 @@ async function prepareTargetScroll(
     // focus をしない（R8 の Important-2）。自動で切り替わるタブは、focus だけで切り替わるためである。
     if (!hasExplicitTabRole(identity.candidate.role)) {
       const focusFailure = await focusPreparedTarget(
-        resolution.handle,
+        resolution.reference,
         prepared.ordinal,
         effectiveDeadlineAtMs,
         domWork,
@@ -1019,14 +1021,14 @@ async function prepareTargetScroll(
     // 安定性の確認は、下準備の handle で観測する。同じ要素の、hover と focus の後の状態を得るためである（R5 の N-4）。
     // そのため、handle の破棄は、安定性の確認の後に行う。
     return await observePreparedStability(
-      resolution.handle,
+      resolution.reference,
       prepared.ordinal,
       effectiveDeadlineAtMs,
       domWork,
       stop,
     );
   } finally {
-    await disposeRetainedHandleUntil(session, resolution.handle, effectiveDeadlineAtMs);
+    await disposeRetainedHandleUntil(session, resolution.reference.handle, effectiveDeadlineAtMs);
   }
 }
 
@@ -1038,7 +1040,7 @@ async function prepareTargetScroll(
  * Playwright の focus は期限を受け取らないので、作業フェーズのブラウザ内の処理と同じく、実効の期限で待つ。
  */
 async function focusPreparedTarget(
-  handle: Parameters<typeof inspectInteractionCandidateHandle>[0],
+  handle: InteractionCandidateReference,
   ordinal: number,
   effectiveDeadlineAtMs: number,
   domWork: SharedDomWork,
@@ -1057,7 +1059,7 @@ async function focusPreparedTarget(
     return beforeFocus;
   }
   try {
-    const focusWork = await awaitBrowserWork(() => handle.focus(), effectiveDeadlineAtMs);
+    const focusWork = await awaitBrowserWork(() => handle.handle.focus(), effectiveDeadlineAtMs);
     if (focusWork.status === 'PENDING_AT_DEADLINE') {
       return stop('FOCUS_PREPARATION_DEADLINE');
     }
@@ -1150,7 +1152,7 @@ async function observePreparedStability(
     return previous;
   }
   while (Date.now() < windowEndsAtMs) {
-    const nextObservationAtMs = Math.min(Date.now() + STABILITY_SAMPLE_INTERVAL_MS, windowEndsAtMs);
+    const nextObservationAtMs = deadlineWithinTimeoutAtMs(windowEndsAtMs, STABILITY_SAMPLE_INTERVAL_MS);
     await wait(Math.max(0, nextObservationAtMs - Date.now()));
     const current = await observe();
     if ('outcome' in current) {
@@ -1189,7 +1191,7 @@ async function loadInteractionTarget(
   const recorder = afterTargetLoad === undefined
     ? null
     : await startNavigationDiagnostics(session.page, {
-      deadlineAtMs: Math.min(navigationDeadlineAtMs, Date.now() + sessionOpenTimeoutMs),
+      deadlineAtMs: deadlineWithinTimeoutAtMs(navigationDeadlineAtMs, sessionOpenTimeoutMs),
     });
   // 観察を始める処理が使った時間の分だけ、読み込みの予算を減らす（読み込みの期限は変えない）。予算は 0 にしない（Playwright の `timeout: 0`
   // は期限なしのため）。観察を始めない場合（受け口なし）の予算は、今までどおりである。
@@ -1198,15 +1200,7 @@ async function loadInteractionTarget(
   try {
     let diagnostics: NavigationDiagnostics | null = null;
     try {
-      loaded = Object.freeze({
-        status: 'FULFILLED',
-        value: await session.page.goto(targetUrl, {
-          waitUntil: 'load',
-          timeout: remainingBudgetMs,
-        }),
-      });
-    } catch (error) {
-      loaded = Object.freeze({ status: 'REJECTED', reason: error });
+      loaded = await settleMainFrameLoad(session.page, targetUrl, { waitUntil: 'load', timeoutMs: remainingBudgetMs });
     } finally {
       diagnostics = recorder === null ? null : await recorder.finish();
     }
@@ -1251,7 +1245,7 @@ async function executeInteraction(
   }
   // Interaction の期限は、読み込みと初期描画が終わったここから数える（設計書 2026-09-23 4.4.1、R6 の I-2）。
   // 読み込みの遅いページで、読み込みの時間が、下準備・安定性の確認・click・持続の確認の時間を削らないようにするためである。
-  const effectiveDeadlineAtMs = Math.min(input.deadlineAtMs, Date.now() + input.timeoutMs);
+  const effectiveDeadlineAtMs = deadlineWithinTimeoutAtMs(input.deadlineAtMs, input.timeoutMs);
   const remaining = (): number => Math.max(0, effectiveDeadlineAtMs - Date.now());
   let domWorkRemaining = INTERACTION_CANDIDATE_LIMITS.maxDomWork;
   const debitDomWork = (domWorkUsed: number): boolean => {
@@ -1333,7 +1327,7 @@ async function executeInteraction(
       emptyEvidence(before, 'UNESTABLISHED'),
     );
   }
-  const targetHandle = resolution.handle;
+  const targetReference = resolution.reference;
 
   try {
     if (resolutionExhaustedInteractionBudget) {
@@ -1343,7 +1337,7 @@ async function executeInteraction(
       return notVerifiable('DEADLINE_DURING_TARGET_HANDLE_ACQUISITION', emptyEvidence(before));
     }
     const resolvedSnapshotWork = await awaitBrowserWork(
-      () => inspectInteractionCandidateHandle(targetHandle, before.ordinal, domWorkRemaining),
+      () => inspectInteractionCandidateHandle(targetReference, before.ordinal, domWorkRemaining),
       effectiveDeadlineAtMs,
     );
     if (resolvedSnapshotWork.status === 'PENDING_AT_DEADLINE') {
@@ -1429,7 +1423,7 @@ async function executeInteraction(
     let clickFailed = false;
     let clickError: unknown;
     try {
-      await targetHandle.click({ timeout: clickBudgetMs });
+      await targetReference.handle.click({ timeout: clickBudgetMs });
     } catch (error) {
       clickFailed = true;
       clickError = error;
@@ -1471,7 +1465,7 @@ async function executeInteraction(
       }
       try {
         const retainedSnapshotWork = await awaitBrowserWork(
-          () => inspectInteractionCandidateHandle(targetHandle, resolvedCandidate.ordinal, domWorkRemaining),
+          () => inspectInteractionCandidateHandle(targetReference, resolvedCandidate.ordinal, domWorkRemaining),
           effectiveDeadlineAtMs,
         );
         if (retainedSnapshotWork.status === 'PENDING_AT_DEADLINE') {
@@ -1584,7 +1578,7 @@ async function executeInteraction(
       }
     }
   } finally {
-    await disposeRetainedHandleUntil(session, targetHandle, effectiveDeadlineAtMs);
+    await disposeRetainedHandleUntil(session, targetReference.handle, effectiveDeadlineAtMs);
   }
 }
 
@@ -1619,7 +1613,7 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   const candidate = freezeInteractionCandidate(input.candidate);
   const viewport = immutableViewport(input.viewport);
   // 読み込みの期限。Interaction の期限（`timeoutMs`）は、読み込みと初期描画の後に数え始める（R6 の I-2）。
-  const navigationDeadlineAtMs = Math.min(input.deadlineAtMs, Date.now() + input.navigationTimeoutMs);
+  const navigationDeadlineAtMs = deadlineWithinTimeoutAtMs(input.deadlineAtMs, input.navigationTimeoutMs);
   if (navigationDeadlineAtMs <= Date.now()) {
     throw new Error('Interaction deadline has already expired');
   }
@@ -1627,7 +1621,7 @@ export async function auditInteraction(input: InteractionAuditInput): Promise<In
   // session の作成は、候補の予算の中（読み込みの期限と、今から `sessionOpenTimeoutMs` 後の早い方）で待つ（DEF-008）。
   // 期限の中の失敗は、今までどおり、そのまま投げる。期限を過ぎた場合は NOT_VERIFIABLE を返し、遅れて届いた session は閉じ、
   // 遅れて届いた失敗は受け取る口に渡す（Context を持つ失敗の Context は、呼び出し側が閉じる）。
-  const sessionOpenDeadlineAtMs = Math.min(navigationDeadlineAtMs, Date.now() + sessionOpenTimeoutMs);
+  const sessionOpenDeadlineAtMs = deadlineWithinTimeoutAtMs(navigationDeadlineAtMs, sessionOpenTimeoutMs);
   const opened = await awaitBrowserWork(
     () => input.sessionFactory(viewport),
     sessionOpenDeadlineAtMs,

@@ -1,0 +1,85 @@
+{
+  "notes": [
+    "テスト環境の監査（TEST_AUTH_PASSIVE）と承認された書き込み（TEST_APPROVED_WRITE）の、匿名の設定の例です。値はすべて例で、admin.example.test は予約された名前（.test）です。",
+    "このファイルは、拡張子が .json でないので、CLI と管理画面は読みません（config/targets/ の *.json は自動で選ばれるため）。",
+    "targetConfig は、local/targets/example-test.json に写して使います（Git の管理の外）。実際の値に直してから使ってください。",
+    "profiles と authSetups は、管理画面の「新しいプロファイル」と「認証の設定」の画面で入れる値の例です。ファイルとしては読みません。",
+    "説明は doc/spec/end-to-end-usage.md と doc/spec/real-test-environment.md にあります。秘密（パスワード、Cookie、トークン）は、どこにも書きません。"
+  ],
+  "targetConfig": {
+    "target": { "id": "example-test" },
+    "site": {
+      "startUrl": "https://admin.example.test/admin/",
+      "allowedOrigins": ["https://admin.example.test"]
+    },
+    "crawl": {
+      "maxPages": 3,
+      "minNavigationIntervalMs": 10000
+    },
+    "output": { "directory": "artifacts" }
+  },
+  "profiles": [
+    {
+      "schemaVersion": "beaksight-profile/1",
+      "profileId": "example-test-auth",
+      "revision": 1,
+      "targetConfigPath": "local/targets/example-test.json",
+      "environment": "TEST",
+      "mode": "TEST_AUTH_PASSIVE",
+      "auth": "MANUAL_SESSION",
+      "approvedTestOrigins": ["https://admin.example.test"],
+      "environmentEvidenceRef": "isolation-check-example-001"
+    },
+    {
+      "schemaVersion": "beaksight-profile/1",
+      "profileId": "example-test-write",
+      "revision": 1,
+      "targetConfigPath": "local/targets/example-test.json",
+      "environment": "TEST",
+      "mode": "TEST_APPROVED_WRITE",
+      "auth": "AUTOMATED_LOGIN",
+      "approvedTestOrigins": ["https://admin.example.test"],
+      "environmentEvidenceRef": "isolation-check-example-001"
+    }
+  ],
+  "authSetups": [
+    {
+      "schemaVersion": "beaksight-auth-setup/2",
+      "profileId": "example-test-auth",
+      "profileRevision": 1,
+      "loginStartUrl": "https://admin.example.test/login",
+      "loginPostEndpoints": [{ "origin": "https://admin.example.test", "path": "/login" }],
+      "successCondition": { "pathPrefix": "/admin", "selector": null },
+      "sessionLostCondition": { "pathPrefix": null },
+      "excludedPaths": ["/logout"],
+      "auditPathPrefixes": ["/admin"],
+      "maxLoginAttempts": 1,
+      "allowedIdpOrigins": [],
+      "automatedLogin": null
+    },
+    {
+      "schemaVersion": "beaksight-auth-setup/2",
+      "profileId": "example-test-write",
+      "profileRevision": 1,
+      "loginStartUrl": "https://admin.example.test/login",
+      "loginPostEndpoints": [{ "origin": "https://admin.example.test", "path": "/login" }],
+      "successCondition": { "pathPrefix": "/admin", "selector": null },
+      "sessionLostCondition": { "pathPrefix": null },
+      "excludedPaths": ["/logout"],
+      "auditPathPrefixes": ["/admin"],
+      "maxLoginAttempts": 1,
+      "allowedIdpOrigins": [],
+      "automatedLogin": {
+        "usernameSelector": "#username",
+        "passwordSelector": "#password",
+        "submitSelector": "form#login-form button[type=\"submit\"]",
+        "failureConditions": {
+          "invalidCredentials": { "pathPrefix": "/login", "selector": ".login-error-invalid" },
+          "accountLocked": { "pathPrefix": "/login", "selector": ".login-error-locked" },
+          "mfaRequired": null,
+          "credentialExpired": { "pathPrefix": "/password/expired", "selector": null }
+        }
+      }
+    }
+  ]
+}

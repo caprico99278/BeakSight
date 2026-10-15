@@ -1,4 +1,4 @@
-import { isNonNegativeSafeInteger } from './guards.js';
+import { isNonNegativeSafeInteger, isRecord } from './guards.js';
 
 /** エラーの値から文字列を安全に取り出せなかったときの代替文言。 */
 export const ERROR_MESSAGE_FALLBACK = 'Error could not be safely normalized';
@@ -48,3 +48,9 @@ function describeError(error: unknown, fallback: string): string {
   }
   return fallback;
 }
+
+/**
+ * 入出力などの例外の `code`（`ENOENT` など。文字列のときだけ）。なければ `null`（CC-062。CCX-11。成果物の書き出し、資格情報のファイル、
+ * 管理データの準備、成果物のファイルの読み込みが共用する）。配列とプリミティブの値は、`code` を持たないとみなす（`isRecord`）。
+ */
+export const errorCodeOf = (error: unknown): string | null => (isRecord(error) && typeof error.code === 'string' ? error.code : null);

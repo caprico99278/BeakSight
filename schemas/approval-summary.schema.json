@@ -1,0 +1,159 @@
+{
+  "$id": "urn:beaksight:schema:approval-summary:1.0",
+  "description": "The approval summary of one write job for the write report (approval-summary.json in the Run directory; Task 32 design 4.1; T32c, T32d). The parent reads the facts at the start of the job and passes them to the worker in START (write.approvalFacts; the IPC schema refers to $defs/facts), which copies them without judging and adds the schema version, the job id and the run id: the scenario and its revision and kind, the approval record (with the bound facts and the approver LOCAL_OPERATOR only), whether it was revoked at the start, the input rule reference, the limits, the approval TTL, the side effect confirmations, the execution grant, the reservation and the cumulative count at the start, and the closed lists of what a person decided and what BeakSight does automatically. Every value is the value at the start (no settled value of the reservation or of the cumulative count). The facts are defined once in $defs/facts; the document refers to each of them. The approval record, the bound facts and the input rule reference are those of control/approval-receipt; the kind, the limits, the TTL and the side effect confirmations are those of control/scenario, referenced and not copied; the contract is src/control/actions/action-contracts.ts. No property holds a secret or the name of a person.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "jobId",
+    "runId",
+    "profileId",
+    "scenario",
+    "approval",
+    "revokedAtStart",
+    "inputRuleReference",
+    "limits",
+    "approvalTtlDays",
+    "sideEffectConfirmations",
+    "grantAtStart",
+    "reservationAtStart",
+    "cumulativeAtStart",
+    "humanDecisions",
+    "automatedActions",
+    "capturedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "approval-summary-schema/1.0" },
+    "jobId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "profileId": { "$ref": "#/$defs/facts/properties/profileId" },
+    "scenario": { "$ref": "#/$defs/facts/properties/scenario" },
+    "approval": { "$ref": "#/$defs/facts/properties/approval" },
+    "revokedAtStart": { "$ref": "#/$defs/facts/properties/revokedAtStart" },
+    "inputRuleReference": { "$ref": "#/$defs/facts/properties/inputRuleReference" },
+    "limits": { "$ref": "#/$defs/facts/properties/limits" },
+    "approvalTtlDays": { "$ref": "#/$defs/facts/properties/approvalTtlDays" },
+    "sideEffectConfirmations": { "$ref": "#/$defs/facts/properties/sideEffectConfirmations" },
+    "grantAtStart": { "$ref": "#/$defs/facts/properties/grantAtStart" },
+    "reservationAtStart": { "$ref": "#/$defs/facts/properties/reservationAtStart" },
+    "cumulativeAtStart": { "$ref": "#/$defs/facts/properties/cumulativeAtStart" },
+    "humanDecisions": { "$ref": "#/$defs/facts/properties/humanDecisions" },
+    "automatedActions": { "$ref": "#/$defs/facts/properties/automatedActions" },
+    "capturedAt": { "$ref": "#/$defs/facts/properties/capturedAt" }
+  },
+  "allOf": [{ "$ref": "#/$defs/kindLists" }],
+  "$defs": {
+    "facts": {
+      "description": "The facts at the start that the parent passes in START (write.approvalFacts) and the worker copies into the document.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId",
+        "scenario",
+        "approval",
+        "revokedAtStart",
+        "inputRuleReference",
+        "limits",
+        "approvalTtlDays",
+        "sideEffectConfirmations",
+        "grantAtStart",
+        "reservationAtStart",
+        "cumulativeAtStart",
+        "humanDecisions",
+        "automatedActions",
+        "capturedAt"
+      ],
+      "properties": {
+        "profileId": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/profileId" },
+        "scenario": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scenarioId", "revision", "kind"],
+          "properties": {
+            "scenarioId": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/scenarioId" },
+            "revision": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/scenarioRevision" },
+            "kind": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/kind" }
+          }
+        },
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["receiptId", "approvalDigest", "bound", "approvedAt", "expiresAt", "approver"],
+          "properties": {
+            "receiptId": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/receiptId" },
+            "approvalDigest": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/approvalDigest" },
+            "bound": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/bound" },
+            "approvedAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/approvedAt" },
+            "expiresAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/expiresAt" },
+            "approver": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/approval/properties/approver" }
+          }
+        },
+        "revokedAtStart": { "type": "boolean" },
+        "inputRuleReference": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/bound/properties/inputRuleReference" },
+        "limits": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/limits" },
+        "approvalTtlDays": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/approvalTtlDays" },
+        "sideEffectConfirmations": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/sideEffectConfirmations" },
+        "grantAtStart": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["grantId", "issuedAt", "expiresAt", "consumedAt"],
+          "properties": {
+            "grantId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
+            "issuedAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/timestamp" },
+            "expiresAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/timestamp" },
+            "consumedAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/timestamp" }
+          }
+        },
+        "reservationAtStart": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "reservedAt"],
+          "properties": {
+            "count": { "type": "integer", "minimum": 1, "maximum": 1 },
+            "reservedAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/timestamp" }
+          }
+        },
+        "cumulativeAtStart": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["used", "limit"],
+          "properties": {
+            "used": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "limit": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/limits/properties/maxCumulativeCreates" }
+          }
+        },
+        "humanDecisions": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 5,
+          "items": { "enum": ["SCENARIO_APPROVAL", "INPUT_RULES", "LIMITS", "SIDE_EFFECT_CONFIRMATIONS", "UPDATE_FIELD_ROLES"] }
+        },
+        "automatedActions": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 5,
+          "items": { "enum": ["VALUE_GENERATION", "TARGET_RECORD_SELECTION", "SUBMISSION", "RESULT_JUDGEMENT", "READ_VERIFICATION"] }
+        },
+        "capturedAt": { "$ref": "urn:beaksight:schema:control:approval-receipt:1#/$defs/timestamp" }
+      },
+      "allOf": [{ "$ref": "#/$defs/kindLists" }]
+    },
+    "kindLists": {
+      "description": "A CREATE lists every item but the UPDATE-only ones; an UPDATE lists every item.",
+      "type": "object",
+      "if": { "properties": { "scenario": { "type": "object", "properties": { "kind": { "const": "CREATE" } } } } },
+      "then": {
+        "properties": {
+          "humanDecisions": { "type": "array", "minItems": 4, "items": { "not": { "enum": ["UPDATE_FIELD_ROLES"] } } },
+          "automatedActions": { "type": "array", "minItems": 4, "items": { "not": { "enum": ["TARGET_RECORD_SELECTION"] } } }
+        }
+      },
+      "else": {
+        "properties": {
+          "humanDecisions": { "type": "array", "minItems": 5 },
+          "automatedActions": { "type": "array", "minItems": 5 }
+        }
+      }
+    }
+  }
+}

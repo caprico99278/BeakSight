@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-form:1",
+  "description": "Local UI Server Function input: the values of the form that makes a write scenario from one candidate of the latest discovery (Task 28 design 4.6). The candidate is named by its identity digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "candidateIdentityDigest"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "candidateIdentityDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" }
+  }
+}

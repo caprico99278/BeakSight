@@ -1,8 +1,19 @@
-import type { ElementHandle, JSHandle, Page } from 'playwright';
+import type { ElementHandle, Page } from 'playwright';
 import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
 import { createSha256Fingerprint } from '../core/ids.js';
 import { compareCodeUnits, truncateText } from '../core/text.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
+import {
+  elementHandleOf,
+  readElementInIsolatedWorld,
+  readElementsInIsolatedWorld,
+  readInIsolatedWorld,
+  type InPageElementsResult,
+  type IsolatedElementReference,
+  type IsolatedElementsOutcome,
+  type IsolatedReadOutcome,
+} from '../discovery/isolated-read.js';
+import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
 import { isHttpProtocol } from '../crawl/normalize-url.js';
 import { CLASS_ATTRIBUTE_NAME } from '../evidence/interaction-collector.js';
 import {
@@ -23,8 +34,67 @@ export const INTERACTION_CANDIDATE_SELECTOR = [
   'details > summary',
 ].join(',');
 
+/**
+ * Interaction の候補の要素の参照（T32j-4。Task 32 の設計書 4.4 の「CC-068 の設計」の 2。調査 T32j-3 の Ri・Ii・Bx）。読み取りは、isolated world
+ * で `backendNodeId` の要素を解決して行う（ページの JS は結果を偽れず、読む間に走らない）。操作（scroll、hover、focus、click）は `handle`
+ * （要素の橋渡しの部品 `elementHandleOf` で得た、同じ要素の ElementHandle）で行う。使い終わったら `handle` を手放す。
+ */
+export interface InteractionCandidateReference {
+  readonly page: Page;
+  readonly backendNodeId: number;
+  readonly handle: ElementHandle<Element>;
+}
+
+/**
+ * 候補の読み取り（発見・解決・保持した要素の読み取り）の、isolated world の CDP の命令の期限（ms。呼ぶ側が期限を渡さないとき）。呼ぶ側の
+ * 期限（Interaction の作業の期限、collector の期限）は、今までどおり外側で効く。
+ */
+export const INTERACTION_CANDIDATE_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * 候補の読み取りの口（T32j-4 fix round 1。依存の注入）。発見（`DISCOVER`）・解決（`RESOLVE`）と操作の handle の取り直し・保持した要素の読み取り
+ * （`INSPECT`）の 3 つを、この 1 か所で受け持つ。既定（`ISOLATED_INTERACTION_CANDIDATE_READS`）は、isolated world の読み取り（要素の橋渡しの
+ * 部品 `src/discovery/isolated-read.ts`）。本番の呼び出し側（`isolated-auditor.ts`、`page-auditor.ts`）は既定のまま使い、page ごとに差し替える
+ * `withInteractionCandidateReads` はテストだけが使う（Gate `discovery-boundary` の (e3)）。差し替えた読み取りが投げた例外は、そのまま呼ぶ側に
+ * 届く（今までの evaluate の例外と同じ扱い）。
+ */
+export interface InteractionCandidateReads {
+  /** 発見（`DISCOVER` の入力。値は関数の戻り値）。 */
+  readonly discover: (page: Page, input: PageInteractionProbeInput, deadlineAtMs: number) => Promise<IsolatedReadOutcome>;
+  /** 解決（`RESOLVE` の入力。値は `{ status, domWorkUsed }`、要素は見つかった要素の参照 1 つか 0）。 */
+  readonly resolve: (page: Page, input: PageInteractionProbeInput, deadlineAtMs: number) => Promise<IsolatedElementsOutcome>;
+  /** 解決した要素の、操作に使う handle（同じ要素を指すと確かめられなければ null）。 */
+  readonly handleOf: (page: Page, reference: IsolatedElementReference, deadlineAtMs: number) => Promise<ElementHandle<Element> | null>;
+  /** 保持した要素の読み取り（`INSPECT` の入力。値は関数の戻り値）。 */
+  readonly inspect: (page: Page, backendNodeId: number, input: HandleInteractionProbeInput, deadlineAtMs: number) => Promise<IsolatedReadOutcome>;
+}
+
+/** 既定の読み取り（isolated world。ページの JS は結果を偽れず、読む間に走らない）。 */
+export const ISOLATED_INTERACTION_CANDIDATE_READS: InteractionCandidateReads = Object.freeze({
+  discover: (page: Page, input: PageInteractionProbeInput, deadlineAtMs: number) =>
+    readInIsolatedWorld(page, pageInteractionCandidateProbe, input, deadlineAtMs),
+  resolve: (page: Page, input: PageInteractionProbeInput, deadlineAtMs: number) =>
+    readElementsInIsolatedWorld(page, resolveInteractionCandidateProbe, input, deadlineAtMs),
+  handleOf: (page: Page, reference: IsolatedElementReference, deadlineAtMs: number) => elementHandleOf(page, reference, deadlineAtMs),
+  inspect: (page: Page, backendNodeId: number, input: HandleInteractionProbeInput, deadlineAtMs: number) =>
+    readElementInIsolatedWorld(page, backendNodeId, handleInteractionCandidateProbe, input, deadlineAtMs),
+});
+
+/** page ごとに差し替えた読み取り（テストだけが登録する。本番の page は登録しない）。 */
+const injectedCandidateReads = new WeakMap<object, InteractionCandidateReads>();
+
+/** テストのための差し替え: `page` の候補の読み取りを `reads` にする（`page` を返す）。本番のコードからは呼ばない（Gate `discovery-boundary` の (e3)）。 */
+export function withInteractionCandidateReads<P extends object>(page: P, reads: InteractionCandidateReads): P {
+  injectedCandidateReads.set(page, reads);
+  return page;
+}
+
+/** `page` の候補の読み取り（差し替えがなければ既定の isolated world の読み取り）。 */
+export const interactionCandidateReadsOf = (page: Page): InteractionCandidateReads =>
+  injectedCandidateReads.get(page) ?? ISOLATED_INTERACTION_CANDIDATE_READS;
+
 export type InteractionHandleResolution =
-  | { readonly status: 'FOUND'; readonly handle: ElementHandle<Element>; readonly domWorkUsed: number }
+  | { readonly status: 'FOUND'; readonly reference: InteractionCandidateReference; readonly domWorkUsed: number }
   | { readonly status: 'MISSING'; readonly domWorkUsed: number }
   | { readonly status: 'DOM_WORK_BUDGET_REACHED'; readonly domWorkUsed: number };
 
@@ -66,19 +136,6 @@ function validDomWorkCount(value: unknown, maxDomWork: number = INTERACTION_CAND
   return isNonNegativeSafeInteger(value) && value <= maxDomWork;
 }
 
-function resolutionFailure(
-  primaryPresent: boolean,
-  primary: unknown,
-  cleanupErrors: readonly unknown[],
-): never {
-  if (primaryPresent && cleanupErrors.length === 0) throw primary;
-  if (!primaryPresent && cleanupErrors.length === 1) throw cleanupErrors[0];
-  throw new AggregateError(
-    primaryPresent ? [primary, ...cleanupErrors] : cleanupErrors,
-    'Bounded interaction handle resolution failed with cleanup errors',
-  );
-}
-
 /** ブラウザの中の処理に渡す上限。`maxDomWork` だけを、呼び出しごとの残りの作業量に置き換える。 */
 type InteractionProbeLimits = { readonly [K in keyof typeof INTERACTION_CANDIDATE_LIMITS]: number };
 
@@ -113,14 +170,49 @@ type InteractionProbeInput =
  * Interaction の候補を扱う、ブラウザの中の唯一の処理（CC-008）。作業量のカウンタ、要素の走査、テキストの切り詰め、可視判定、
  * アクセシブルネーム、候補の組み立てを、探索・handle の解決・保持した handle の読み取りで共有する。
  * `page.evaluate` などに関数の本体の文字列として渡るので、この関数の外の値（定数・関数）を参照してはいけない。必要な値は入力で渡す。
- * `page.evaluate`・`page.evaluateHandle` は（入力）で呼び、`ElementHandle.evaluate` は（保持した要素, 入力）で呼ぶ。
+ * T32j-4: isolated world で動く。`DISCOVER` は `readInIsolatedWorld` で（入力）、`RESOLVE` は `readElementsInIsolatedWorld` で（入力）、`INSPECT` は
+ * `readElementInIsolatedWorld` で（保持した要素, 入力）で呼ぶ（`src/discovery/isolated-read.ts`）。部品（`R`）は `composeInPage` で組み込む
+ * （`src/browser/in-page-readers.ts`。CC-068。渡すのは `pageInteractionCandidateProbe`・`resolveInteractionCandidateProbe`・
+ * `handleInteractionCandidateProbe`）。
  */
 const interactionCandidateProbe = (
+  R: StandardReaders,
   retainedOrInput: Element | InteractionProbeInput,
   handleInput?: InteractionProbeInput,
 ) => {
   const input = handleInput ?? (retainedOrInput as InteractionProbeInput);
   const { selector, limits } = input;
+  // DOM clobbering（DEF-069）: form の中の名前つきの入力の欄は、form の同じ名前のプロパティとメソッドを隠す（`<input name="method">` で
+  // `form.method` が入力の欄になる）。form になりうる要素（走査するすべての要素、候補、制御される要素、祖先、関連する form）の標準のプロパティと
+  // メソッドは、標準の prototype の getter とメソッドで読む（`src/browser/login-form-submitter.ts` の `readLoginFormFactsInPage` と同じ読み方）。
+  // ボタンと入力の欄（`formControl`）、details は、名前つきの子でプロパティが隠れないので、そのまま読む。
+  // getter は部品の `standardGetter`（`src/browser/in-page-readers.ts`。CC-068。`dom-collector.ts` の `collectDomEvidence` も同じ部品を使う）。
+  const { standardGetter } = R;
+  const nodeTypeOf = standardGetter<number>(Node.prototype, 'nodeType');
+  const isConnectedOf = standardGetter<boolean>(Node.prototype, 'isConnected');
+  const parentElementOf = standardGetter<HTMLElement | null>(Node.prototype, 'parentElement');
+  const parentNodeOf = standardGetter<ParentNode | null>(Node.prototype, 'parentNode');
+  const tagNameOf = standardGetter<string>(Element.prototype, 'tagName');
+  const assignedSlotOf = standardGetter<HTMLSlotElement | null>(Element.prototype, 'assignedSlot');
+  const attributesOf = standardGetter<NamedNodeMap>(Element.prototype, 'attributes');
+  const scrollLeftOf = standardGetter<number>(Element.prototype, 'scrollLeft');
+  const scrollTopOf = standardGetter<number>(Element.prototype, 'scrollTop');
+  const formMethodOf = standardGetter<string>(HTMLFormElement.prototype, 'method');
+  const formActionOf = standardGetter<string>(HTMLFormElement.prototype, 'action');
+  const getAttributeOf = (element: Element, name: string): string | null => Element.prototype.getAttribute.call(element, name);
+  const hasAttributeOf = (element: Element, name: string): boolean => Element.prototype.hasAttribute.call(element, name);
+  const matchesOf = (element: Element, selectors: string): boolean => Element.prototype.matches.call(element, selectors);
+  const checkVisibilityOf = (element: Element, options: CheckVisibilityOptions): boolean => (
+    Element.prototype.checkVisibility.call(element, options)
+  );
+  const boundingClientRectOf = (element: Element): DOMRect => Element.prototype.getBoundingClientRect.call(element);
+  // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="createTreeWalker">` など）は、`document` の同じ名前のプロパティと
+  // メソッドを隠す。`document` の標準のプロパティとメソッドも、`Document.prototype` の getter とメソッドで読む。
+  const documentElementOf = standardGetter<HTMLElement>(Document.prototype, 'documentElement');
+  const createTreeWalker = (root: Node, whatToShow: number): TreeWalker => (
+    Document.prototype.createTreeWalker.call(document, root, whatToShow)
+  );
+  const elementById = (id: string): HTMLElement | null => Document.prototype.getElementById.call(document, id);
   const domWork = {
     used: 0,
     consume(): boolean {
@@ -136,8 +228,9 @@ const interactionCandidateProbe = (
   let walker: TreeWalker | null = null;
   const nextElement = (): Element | null => {
     if (walker === null) {
-      walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
-      return document.documentElement;
+      const documentElement = documentElementOf(document);
+      walker = createTreeWalker(documentElement, NodeFilter.SHOW_ELEMENT);
+      return documentElement;
     }
     return walker.nextNode() as Element | null;
   };
@@ -150,7 +243,7 @@ const interactionCandidateProbe = (
       const element = nextElement();
       if (element === null) return 'END';
       if (!domWork.consume()) return 'DOM_WORK_BUDGET_REACHED';
-      if (!element.matches(selector)) continue;
+      if (!matchesOf(element, selector)) continue;
       if (!domWork.consume()) return 'DOM_WORK_BUDGET_REACHED';
       return element;
     }
@@ -160,14 +253,15 @@ const interactionCandidateProbe = (
     let candidateOrdinal = 0;
     while (true) {
       const element = nextCandidateElement();
+      // 要素の参照は、要素の橋渡しの部品の形（`{ value, elements }`）で返す（T32j-4）。
       if (element === 'DOM_WORK_BUDGET_REACHED') {
-        return { status: 'DOM_WORK_BUDGET_REACHED' as const, domWorkUsed: domWork.used };
+        return { value: { status: 'DOM_WORK_BUDGET_REACHED' as const, domWorkUsed: domWork.used }, elements: [] };
       }
       if (element === 'END') {
-        return { status: 'MISSING' as const, domWorkUsed: domWork.used };
+        return { value: { status: 'MISSING' as const, domWorkUsed: domWork.used }, elements: [] };
       }
       if (candidateOrdinal === input.targetOrdinal) {
-        return { status: 'FOUND' as const, element, domWorkUsed: domWork.used };
+        return { value: { status: 'FOUND' as const, domWorkUsed: domWork.used }, elements: [element] };
       }
       candidateOrdinal += 1;
     }
@@ -189,7 +283,7 @@ const interactionCandidateProbe = (
       if (domWork.used >= limits.maxDomWork) {
         return null;
       }
-      const textWalker = document.createTreeWalker(root, NodeFilter.SHOW_ALL);
+      const textWalker = createTreeWalker(root, NodeFilter.SHOW_ALL);
       while (result.length < maxCharacters) {
         if (textWork.used >= limits.maxTextNodes) {
           textWork.limitReached = true;
@@ -202,7 +296,7 @@ const interactionCandidateProbe = (
         if (node === null) break;
         if (!domWork.consume()) return null;
         textWork.used += 1;
-        if (node.nodeType !== Node.TEXT_NODE) continue;
+        if (nodeTypeOf(node) !== Node.TEXT_NODE) continue;
         const textNode = node as Text;
         const remainingCharacters = maxCharacters - result.length;
         result += textNode.substringData(0, Math.min(textNode.length, remainingCharacters));
@@ -215,22 +309,22 @@ const interactionCandidateProbe = (
   // 祖先をたどらないので、呼び出し1回につき作業量1を消費する。大きさが0の要素は、見えないものとして扱う。
   const visibility = (subject: Element): boolean | null => {
     if (!domWork.consume()) return null;
-    if (!subject.checkVisibility(visibilityOptions)) return false;
+    if (!checkVisibilityOf(subject, visibilityOptions)) return false;
     if (domWork.used >= limits.maxDomWork) {
       return null;
     }
-    const rect = subject.getBoundingClientRect();
+    const rect = boundingClientRectOf(subject);
     return rect.width > 0 && rect.height > 0;
   };
   const accessibleName = (subject: Element): string | null => {
-    const ariaLabel = subject.getAttribute('aria-label');
+    const ariaLabel = getAttributeOf(subject, 'aria-label');
     if (ariaLabel !== null) return normalizeBounded(ariaLabel, limits.maxTextLength);
-    const labelledBy = subject.getAttribute('aria-labelledby');
+    const labelledBy = getAttributeOf(subject, 'aria-labelledby');
     if (labelledBy !== null) {
       const labelRoots: Element[] = [];
       for (const id of labelledBy.slice(0, limits.maxAttributeLength).split(/\s+/u).slice(0, 16)) {
         if (!domWork.consume()) return null;
-        const labelRoot = document.getElementById(id);
+        const labelRoot = elementById(id);
         if (labelRoot !== null) labelRoots.push(labelRoot);
       }
       const labels = boundedDescendantText(labelRoots, limits.maxTextLength * 4);
@@ -238,7 +332,7 @@ const interactionCandidateProbe = (
       const normalized = normalizeBounded(labels, limits.maxTextLength);
       if (normalized.length > 0) return normalized;
     }
-    const title = subject.getAttribute('title');
+    const title = getAttributeOf(subject, 'title');
     if (title !== null) return normalizeBounded(title, limits.maxTextLength);
     const text = boundedDescendantText([subject], limits.maxTextLength * 4);
     return text === null ? null : normalizeBounded(text, limits.maxTextLength);
@@ -254,11 +348,13 @@ const interactionCandidateProbe = (
       ? element
       : null;
     const form = formControl?.form ?? null;
-    const ariaControls = bounded(element.getAttribute('aria-controls'), limits.maxAttributeLength);
+    // 候補の要素の属性を、標準のメソッドで読む（候補が form の場合に、名前つきの子に隠されない）。
+    const getAttribute = (name: string): string | null => getAttributeOf(element, name);
+    const ariaControls = bounded(getAttribute('aria-controls'), limits.maxAttributeLength);
     let controlled: Element | null = null;
     if (ariaControls !== null) {
       if (!domWork.consume()) return null;
-      controlled = document.getElementById(ariaControls);
+      controlled = elementById(ariaControls);
     }
     const controlledVisible = controlled === null ? null : visibility(controlled);
     if (controlledVisible === null && controlled !== null) return null;
@@ -280,29 +376,29 @@ const interactionCandidateProbe = (
     if (domWork.used >= limits.maxDomWork) {
       return null;
     }
-    const rect = element.getBoundingClientRect();
+    const rect = boundingClientRectOf(element);
     const pageOffsetX = window.scrollX;
     const pageOffsetY = window.scrollY;
     return {
       ordinal,
-      tagName: element.tagName.toLowerCase().slice(0, limits.maxAttributeLength),
-      role: bounded(element.getAttribute('role'), limits.maxAttributeLength),
+      tagName: tagNameOf(element).toLowerCase().slice(0, limits.maxAttributeLength),
+      role: bounded(getAttribute('role'), limits.maxAttributeLength),
       accessibleName: name,
       normalizedText: normalizeBounded(text, limits.maxTextLength),
-      ariaExpanded: bounded(element.getAttribute('aria-expanded'), limits.maxAttributeLength),
+      ariaExpanded: bounded(getAttribute('aria-expanded'), limits.maxAttributeLength),
       ariaControls,
-      ariaSelected: bounded(element.getAttribute('aria-selected'), limits.maxAttributeLength),
+      ariaSelected: bounded(getAttribute('aria-selected'), limits.maxAttributeLength),
       controlledVisible,
       controlledHidden: controlled === null ? null : !controlledVisible,
       formAssociated: form !== null,
-      formMethod: form === null ? null : form.method.slice(0, limits.maxAttributeLength),
-      formAction: form === null ? null : form.action.slice(0, limits.maxUrlLength),
-      rawHref: bounded(element.getAttribute('href'), limits.maxUrlLength + 1),
+      formMethod: form === null ? null : formMethodOf(form).slice(0, limits.maxAttributeLength),
+      formAction: form === null ? null : formActionOf(form).slice(0, limits.maxUrlLength),
+      rawHref: bounded(getAttribute('href'), limits.maxUrlLength + 1),
       documentUrl: location.href.slice(0, limits.maxUrlLength),
       documentOrigin: location.origin.slice(0, limits.maxUrlLength),
-      download: element.hasAttribute('download'),
-      type: bounded(formControl?.type ?? htmlElement?.getAttribute('type') ?? null, limits.maxAttributeLength),
-      disabled: (formControl?.disabled ?? false) || element.getAttribute('aria-disabled') === 'true',
+      download: hasAttributeOf(element, 'download'),
+      type: bounded(formControl?.type ?? (htmlElement === null ? null : getAttribute('type')), limits.maxAttributeLength),
+      disabled: (formControl?.disabled ?? false) || getAttribute('aria-disabled') === 'true',
       visible,
       boundingBox: {
         x: rect.x + pageOffsetX,
@@ -343,7 +439,7 @@ const interactionCandidateProbe = (
   // INSPECT: 保持した要素が、今の文書で何番目の候補かを数えてから、その要素の値を読む。
   const { classAttributeName } = input;
   const element = retainedOrInput as Element;
-  if (!element.isConnected) return { status: 'DISCONNECTED' as const, domWorkUsed: domWork.used };
+  if (!isConnectedOf(element)) return { status: 'DISCONNECTED' as const, domWorkUsed: domWork.used };
   let liveOrdinal = 0;
   let found = false;
   while (true) {
@@ -372,9 +468,11 @@ const interactionCandidateProbe = (
   // スクロールする祖先の位置を記録する（設計書 2026-09-23 4.4 の追記）。祖先1つにつき作業量1を消費し、
   // 上限に達したら、判定できない記録（complete: false）にする。open な shadow root と slot をまたいでたどる。
   const layoutParent = (node: Element): Element | null => {
-    if (node.assignedSlot !== null) return node.assignedSlot;
-    if (node.parentElement !== null) return node.parentElement;
-    const parentNode = node.parentNode;
+    const assignedSlot = assignedSlotOf(node);
+    if (assignedSlot !== null) return assignedSlot;
+    const parentElement = parentElementOf(node);
+    if (parentElement !== null) return parentElement;
+    const parentNode = parentNodeOf(node);
     return parentNode instanceof ShadowRoot ? parentNode.host : null;
   };
   const scrollsContent = (overflow: string): boolean => overflow !== 'visible' && overflow !== 'clip';
@@ -387,7 +485,7 @@ const interactionCandidateProbe = (
     }
     const style = window.getComputedStyle(ancestor);
     if (scrollsContent(style.overflowX) || scrollsContent(style.overflowY)) {
-      scrollOffsets.push(ancestor.scrollLeft, ancestor.scrollTop);
+      scrollOffsets.push(scrollLeftOf(ancestor), scrollTopOf(ancestor));
     }
   }
   scrollOffsets.push(window.scrollX, window.scrollY);
@@ -397,7 +495,7 @@ const interactionCandidateProbe = (
   // Node 側の attributeValueLengthLimit と同じ決まり）。
   const attributeEntries: string[] = [];
   let attributesComplete = true;
-  const ownAttributes = element.attributes;
+  const ownAttributes = attributesOf(element);
   for (let index = 0; index < ownAttributes.length; index += 1) {
     if (!domWork.consume()) {
       attributesComplete = false;
@@ -410,8 +508,8 @@ const interactionCandidateProbe = (
     attributeEntries.push(attributeName, attribute.value.slice(0, valueLimit));
   }
   // 対象が details の子の summary なら、親の details の開閉の状態を記録する（設計書 2026-09-23 4.4.1）。
-  const parentDetails = element.parentElement;
-  const detailsOpen = element.tagName === 'SUMMARY' && parentDetails instanceof HTMLDetailsElement
+  const parentDetails = parentElementOf(element);
+  const detailsOpen = tagNameOf(element) === 'SUMMARY' && parentDetails instanceof HTMLDetailsElement
     ? parentDetails.open
     : null;
   return {
@@ -425,22 +523,27 @@ const interactionCandidateProbe = (
 };
 
 /**
- * `page.evaluate`・`page.evaluateHandle` で渡す入力（`DISCOVER` と `RESOLVE` だけ）。保持した要素がないので、`INSPECT` を受け取ると
+ * 要素を渡さずに動かすときの入力（`DISCOVER` と `RESOLVE` だけ）。保持した要素がないので、`INSPECT` を受け取ると
  * 例外にならずに誤った結果を返す。そのため、型で受け取れなくする（RC18 の M3）。
  */
 export type PageInteractionProbeInput = Extract<InteractionProbeInput, { readonly mode: 'DISCOVER' | 'RESOLVE' }>;
-/** `ElementHandle.evaluate` で渡す入力（`INSPECT` だけ）。 */
+/** 保持した要素で動かすときの入力（`INSPECT` だけ）。 */
 export type HandleInteractionProbeInput = Extract<InteractionProbeInput, { readonly mode: 'INSPECT' }>;
 
-/** `page.evaluate`・`page.evaluateHandle` に渡す形（入力だけを受け取る）。関数そのものは `interactionCandidateProbe` と同じ。 */
-const pageInteractionCandidateProbe = interactionCandidateProbe as (input: PageInteractionProbeInput) => unknown;
-/** `ElementHandle.evaluate` に渡す形（保持した要素と入力を受け取る）。関数そのものは `interactionCandidateProbe` と同じ。 */
-const handleInteractionCandidateProbe = interactionCandidateProbe as (element: Element, input: HandleInteractionProbeInput) => unknown;
+/** `interactionCandidateProbe` に部品を組み込んだ、ページの中で動く関数（モジュールの読み込みのときに 1 回だけ組み立てる）。 */
+const composedInteractionCandidateProbe = composeInPage(interactionCandidateProbe);
+/** `readInIsolatedWorld` に渡す形（`DISCOVER` の入力だけを受け取る）。関数そのものは `composedInteractionCandidateProbe` と同じ。 */
+const pageInteractionCandidateProbe = composedInteractionCandidateProbe as (input: PageInteractionProbeInput) => unknown;
+/** `readElementsInIsolatedWorld` に渡す形（`RESOLVE` の入力だけを受け取り、要素の参照を返す）。関数そのものは `composedInteractionCandidateProbe` と同じ。 */
+const resolveInteractionCandidateProbe = composedInteractionCandidateProbe as unknown as (input: PageInteractionProbeInput) => InPageElementsResult;
+/** `readElementInIsolatedWorld` に渡す形（保持した要素と入力を受け取る）。関数そのものは `composedInteractionCandidateProbe` と同じ。 */
+const handleInteractionCandidateProbe = composedInteractionCandidateProbe as (element: Element, input: HandleInteractionProbeInput) => unknown;
 
 export async function resolveInteractionCandidateHandle(
   page: Page,
   ordinal: number,
   maxDomWork: number = INTERACTION_CANDIDATE_LIMITS.maxDomWork,
+  deadlineAtMs: number = Date.now() + INTERACTION_CANDIDATE_READ_TIMEOUT_MS,
 ): Promise<InteractionHandleResolution> {
   if (!isNonNegativeSafeInteger(ordinal) || ordinal > INTERACTION_CANDIDATE_LIMITS.maxOrdinal) {
     throw new Error('Interaction candidate ordinal is outside the bounded contract');
@@ -449,92 +552,40 @@ export async function resolveInteractionCandidateHandle(
   if (boundedMaxDomWork === 0) {
     return Object.freeze({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 0 });
   }
-  const envelope = await page.evaluateHandle<unknown, PageInteractionProbeInput>(pageInteractionCandidateProbe, {
+  // T32j-4: isolated world で探し、要素は backendNodeId と位置で受け取る（ページの JS は偽れない）。操作に使う handle は、位置の Locator
+  // （自前の selector engine）で得て、同じ backendNodeId を指すことを確かめ直す（`elementHandleOf`）。読めない・確かめられないときは、今の evaluate の失敗と
+  // 同じく例外にする。
+  const reads = interactionCandidateReadsOf(page);
+  const outcome = await reads.resolve(page, {
     mode: 'RESOLVE',
     selector: INTERACTION_CANDIDATE_SELECTOR,
     limits: { ...INTERACTION_CANDIDATE_LIMITS, maxDomWork: boundedMaxDomWork },
     targetOrdinal: ordinal,
-  });
-
-  let properties: Map<string, JSHandle> | undefined;
-  let primaryErrorPresent = false;
-  let primaryError: unknown;
-  let status: InteractionHandleResolution['status'] | undefined;
-  let domWorkUsed: number | undefined;
-  let elementProperty: JSHandle | undefined;
-  let elementHandle: ElementHandle<Element> | null = null;
-  try {
-    properties = await envelope.getProperties();
-    if (!(properties instanceof Map)) {
-      throw new Error('Invalid bounded interaction handle resolution envelope');
-    }
-    const statusHandle = properties.get('status');
-    const domWorkHandle = properties.get('domWorkUsed');
-    if (statusHandle === undefined || domWorkHandle === undefined) {
-      throw new Error('Invalid bounded interaction handle resolution envelope');
-    }
-    const rawStatus = await statusHandle.jsonValue();
-    const rawDomWorkUsed = await domWorkHandle.jsonValue();
-    if (rawStatus !== 'FOUND' && rawStatus !== 'MISSING' && rawStatus !== 'DOM_WORK_BUDGET_REACHED') {
-      throw new Error('Invalid bounded interaction handle resolution envelope');
-    }
-    if (!validDomWorkCount(rawDomWorkUsed, boundedMaxDomWork)) {
-      throw new Error('Invalid bounded interaction handle resolution envelope');
-    }
-    status = rawStatus;
-    domWorkUsed = rawDomWorkUsed;
-    const hasElement = properties.has('element');
-    elementProperty = properties.get('element');
-    if (status === 'FOUND') {
-      if (!hasElement || elementProperty === undefined) {
-        throw new Error('Invalid bounded interaction handle resolution envelope');
-      }
-      elementHandle = elementProperty.asElement() as ElementHandle<Element> | null;
-      if (elementHandle === null) {
-        throw new Error('Invalid bounded interaction handle resolution envelope');
-      }
-    } else if (hasElement) {
-      throw new Error('Invalid bounded interaction handle resolution envelope');
-    }
-  } catch (error) {
-    primaryErrorPresent = true;
-    primaryError = error;
+  }, deadlineAtMs);
+  if (outcome.status !== 'READ') {
+    throw new Error('Interaction candidate isolated read failed');
   }
-
-  const prospectiveTransfer = !primaryErrorPresent && status === 'FOUND' && elementHandle !== null;
-  const cleanupErrors: unknown[] = [];
-  if (properties !== undefined) {
-    for (const propertyHandle of properties.values()) {
-      if (prospectiveTransfer && propertyHandle === elementProperty) continue;
-      try {
-        await propertyHandle.dispose();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
+  const { value, elements } = outcome;
+  const status = isRecord(value) ? value['status'] : undefined;
+  const domWorkUsed = isRecord(value) ? value['domWorkUsed'] : undefined;
+  if ((status !== 'FOUND' && status !== 'MISSING' && status !== 'DOM_WORK_BUDGET_REACHED')
+    || !validDomWorkCount(domWorkUsed, boundedMaxDomWork)
+    || elements.length !== (status === 'FOUND' ? 1 : 0)) {
+    throw new Error('Invalid bounded interaction handle resolution envelope');
   }
-  try {
-    await envelope.dispose();
-  } catch (error) {
-    cleanupErrors.push(error);
-  }
-  if (primaryErrorPresent || cleanupErrors.length > 0) {
-    if (prospectiveTransfer && elementProperty !== undefined) {
-      try {
-        await elementProperty.dispose();
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
-    resolutionFailure(primaryErrorPresent, primaryError, cleanupErrors);
-  }
-  if (status === 'FOUND' && elementHandle !== null && domWorkUsed !== undefined) {
-    return Object.freeze({ status, handle: elementHandle, domWorkUsed });
-  }
-  if ((status === 'MISSING' || status === 'DOM_WORK_BUDGET_REACHED') && domWorkUsed !== undefined) {
+  if (status !== 'FOUND') {
     return Object.freeze({ status, domWorkUsed });
   }
-  throw new Error('Invalid bounded interaction handle resolution envelope');
+  const element = elements[0];
+  if (element === undefined) {
+    throw new Error('Invalid bounded interaction handle resolution envelope');
+  }
+  const handle = await reads.handleOf(page, element, deadlineAtMs);
+  if (handle === null) {
+    throw new Error('Interaction candidate handle is unavailable');
+  }
+  const reference: InteractionCandidateReference = Object.freeze({ page, backendNodeId: element.backendNodeId, handle });
+  return Object.freeze({ status: 'FOUND', reference, domWorkUsed });
 }
 
 interface RawInteractionCandidate {
@@ -738,6 +789,7 @@ function candidateFromRaw(candidate: unknown, label: string): InteractionCandida
 export async function discoverInteractionCandidates(
   page: Page,
   maxDomWork: number = INTERACTION_CANDIDATE_LIMITS.maxDomWork,
+  deadlineAtMs: number = Date.now() + INTERACTION_CANDIDATE_READ_TIMEOUT_MS,
 ): Promise<InteractionCandidateDiscoveryResult> {
   const boundedMaxDomWork = validatedDomWorkLimit(maxDomWork);
   if (boundedMaxDomWork === 0) {
@@ -747,12 +799,17 @@ export async function discoverInteractionCandidates(
       domWorkUsed: 0,
     });
   }
-  const raw: unknown = await page.evaluate<unknown, PageInteractionProbeInput>(pageInteractionCandidateProbe, {
+  // T32j-4: isolated world で読む（ページの JS は結果を偽れず、読む間に走らない）。読めなければ、今の evaluate の失敗と同じく例外にする。
+  const outcome = await interactionCandidateReadsOf(page).discover(page, {
     mode: 'DISCOVER',
     selector: INTERACTION_CANDIDATE_SELECTOR,
     limits: { ...INTERACTION_CANDIDATE_LIMITS, maxDomWork: boundedMaxDomWork },
     visibilityOptions: VISIBILITY_CHECK_OPTIONS,
-  });
+  }, deadlineAtMs);
+  if (outcome.status !== 'READ') {
+    throw new Error('Interaction candidate isolated read failed');
+  }
+  const raw: unknown = outcome.value;
 
   if (!isRecord(raw) || !Array.isArray(raw.candidates)) {
     throw new Error('Invalid browser interaction candidate container');
@@ -1145,11 +1202,15 @@ export type InteractionHandleSnapshot =
   | { readonly status: 'DOM_WORK_BUDGET_REACHED'; readonly domWorkUsed: number }
   | { readonly status: 'TEXT_NODE_LIMIT_REACHED'; readonly domWorkUsed: number };
 
-/** 他のノードを解決することなく、保持している単一のブラウザノードから候補の情報を読み取る。 */
+/**
+ * 他のノードを解決することなく、保持している単一のブラウザノード（参照の backendNodeId の要素を isolated world で解決したもの。T32j-4）から
+ * 候補の情報を読み取る。読めなければ（ページが移った後など）、今の evaluate の失敗と同じく例外にする。
+ */
 export async function inspectInteractionCandidateHandle(
-  handle: ElementHandle<Element>,
+  reference: Pick<InteractionCandidateReference, 'page' | 'backendNodeId'>,
   ordinalHint: number,
   maxDomWork: number = INTERACTION_CANDIDATE_LIMITS.maxDomWork,
+  deadlineAtMs: number = Date.now() + INTERACTION_CANDIDATE_READ_TIMEOUT_MS,
 ): Promise<InteractionHandleSnapshot> {
   if (!isNonNegativeSafeInteger(ordinalHint) || ordinalHint > INTERACTION_CANDIDATE_LIMITS.maxOrdinal) {
     throw new Error('Interaction candidate ordinal hint is outside the bounded contract');
@@ -1158,13 +1219,18 @@ export async function inspectInteractionCandidateHandle(
   if (boundedMaxDomWork === 0) {
     return Object.freeze({ status: 'DOM_WORK_BUDGET_REACHED', domWorkUsed: 0 });
   }
-  const snapshot: unknown = await handle.evaluate<unknown, HandleInteractionProbeInput>(handleInteractionCandidateProbe, {
+  const input: HandleInteractionProbeInput = {
     mode: 'INSPECT',
     selector: INTERACTION_CANDIDATE_SELECTOR,
     limits: { ...INTERACTION_CANDIDATE_LIMITS, maxDomWork: boundedMaxDomWork },
     visibilityOptions: VISIBILITY_CHECK_OPTIONS,
     classAttributeName: CLASS_ATTRIBUTE_NAME,
-  });
+  };
+  const outcome = await interactionCandidateReadsOf(reference.page).inspect(reference.page, reference.backendNodeId, input, deadlineAtMs);
+  if (outcome.status !== 'READ') {
+    throw new Error('Interaction candidate isolated read failed');
+  }
+  const snapshot: unknown = outcome.value;
   if (!isRecord(snapshot)) {
     throw new Error('Invalid bounded interaction handle snapshot');
   }

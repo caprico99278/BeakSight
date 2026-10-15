@@ -8,8 +8,7 @@
 //   対照として、ふつうに成功した応答は今のとおりキャッシュに入り、2つ目ではサーバに届かない。
 // - Chromium は、テストの既定（headless shell）と、CLI と同じ起動の設定（`chromiumLaunchOptions`。headless）の両方で確かめる
 //   （DEF-030。本文の切断の扱いが、Chromium の種類で違わないことを確かめるため）。
-import { createServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
@@ -20,6 +19,7 @@ import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import type { NETWORK_LAYER_FAILURE_CODES } from '../../src/safety/network-layer-failure.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -100,7 +100,7 @@ interface TruncatingServer {
 /** `cutHeaders` は、1回目の（本文を途中で切る）応答の header。 */
 async function startTruncatingServer(cutHeaders: CutCase['headers']): Promise<TruncatingServer> {
   const received: string[] = [];
-  const server = createServer((request, response: ServerResponse) => {
+  const server = await startLoopbackHttpServer((request, response: ServerResponse) => {
     const pathname = (request.url ?? '/').split('?', 1)[0] ?? '/';
     received.push(pathname);
     switch (pathname) {
@@ -127,15 +127,10 @@ async function startTruncatingServer(cutHeaders: CutCase['headers']): Promise<Tr
         response.end();
     }
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
-  const { port } = server.address() as AddressInfo;
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     received: (pathname) => received.filter((path) => path === pathname).length,
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: server.close,
   };
 }
 

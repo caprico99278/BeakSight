@@ -85,6 +85,7 @@ import {
   safety,
   screenshot,
 } from '../helpers/audit-run-fixture.js';
+import { sampleCrawl } from '../helpers/run-checkpoint-samples.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const START_URL = fixtureUrl('/');
@@ -140,20 +141,7 @@ const siteMetadataRecords = () => [
  * 作った順に並べる（設計書 4.1）。ページの中で作った Ledger の snapshot は、ページの保存（`samplePages`）に入れる。
  */
 async function sampleRunState(): Promise<RunCheckpointInput> {
-  const config = createTestConfig(FIXTURE_ORIGIN);
-  const allocator = new IdAllocator();
-  const frontier = new CrawlFrontier(config.crawl.maxDepth, allocator);
-  frontier.discover(START_URL, 0);
-  const audit = (status: 'AUDITED' | 'FAILED', links: readonly typeof START_URL[]): void => {
-    const entry = frontier.next() as CrawlUrlEntry;
-    frontier.markAuditing(entry.url);
-    frontier.markFinished(entry.url, status);
-    for (const link of links) {
-      frontier.discover(link, entry.depth + 1);
-    }
-  };
-  audit('AUDITED', [SECOND_URL, THIRD_URL]);
-  audit('FAILED', []);
+  const { config, allocator, frontier } = sampleCrawl([{ status: 'AUDITED', links: [SECOND_URL, THIRD_URL] }, { status: 'FAILED' }]);
   for (let index = 0; index < 9; index += 1) {
     allocator.allocateEvidenceId('dom');
   }
@@ -337,10 +325,7 @@ describe('R2: the checkpoint content (state.json and the page checkpoint, design
   });
 
   it('accepts a checkpoint before robots.txt and sitemap.xml were fetched (no metadata, no completed page)', async () => {
-    const config = createTestConfig(FIXTURE_ORIGIN);
-    const allocator = new IdAllocator();
-    const frontier = new CrawlFrontier(config.crawl.maxDepth, allocator);
-    frontier.discover(START_URL, 0);
+    const { allocator, frontier } = sampleCrawl([]);
     const input = await sampleRunState();
     const checkpoint = createRunCheckpoint({
       ...input,
@@ -947,7 +932,8 @@ describe('R2: whether a run can be resumed (design 3.2)', () => {
   // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調で始めなかったページと、不調を検知したページ
   // （理由 `SITE_UNAVAILABLE`）も、再開のときに待ち行列に戻す。
   it('requeues the URLs skipped by the runtime limit of one execution, by a stop signal (R4b1) and by site unavailability (SU1)', () => {
-    expect(RESUME_REQUEUE_SKIP_REASON_CODES).toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE']);
+    // T25c（Task 25 の設計書 4.3）: 認証つきの Run でセッションの切れで止めた URL（理由 `AUTH_SESSION_LOST`）も戻す。
+    expect(RESUME_REQUEUE_SKIP_REASON_CODES).toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE', 'AUTH_SESSION_LOST']);
     expect(Object.isFrozen(RESUME_REQUEUE_SKIP_REASON_CODES)).toBe(true);
   });
 
@@ -1740,6 +1726,8 @@ describe('R2: closed lists used by the checkpoint', () => {
       'STOPPED_BY_SAFETY_VIOLATION',
       'STOPPED_BY_SITE_UNAVAILABLE',
       'INTERRUPTED_ABNORMALLY',
+      // T25c（Task 25 の設計書 4.3）: 認証つきの Run で、セッションの切れで止まった終わり方（既存の表示の順を変えないよう、最後に加えた）。
+      'STOPPED_BY_AUTH_SESSION_LOST',
     ]);
     expect(Object.isFrozen(RUN_EXECUTION_END_REASONS)).toBe(true);
     expect(Object.isFrozen(RUN_CHECKPOINT_STATES)).toBe(true);

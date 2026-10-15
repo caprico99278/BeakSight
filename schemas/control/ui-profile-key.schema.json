@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-key:1",
+  "description": "Local UI Server Function input: one profile by its profileId (Task 23 design 4.4).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" }
+  }
+}

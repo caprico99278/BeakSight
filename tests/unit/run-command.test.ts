@@ -11,7 +11,12 @@ import { join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { chromium, type Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { CHROMIUM_PRELOADING_DISABLED_ARGS, CHROMIUM_SHARED_WORKERS_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
+import {
+  CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
+  CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
+  CHROMIUM_PRELOADING_DISABLED_ARGS,
+  CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
+} from '../../src/browser/chromium-launch.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { runNoticeLines } from '../../src/cli/output.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
@@ -260,12 +265,16 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 // `src/browser/chromium-launch.ts` の1か所にあり、先読みが止まることは tests/integration/preloading-disabled.test.ts で確かめる。
 // DEF-044（NP5）: Shared Worker を無効にする起動の引数（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`）も渡す。効くことは、
 // tests/integration/safety-gates.test.ts の GATE-S01 の Shared Worker の場面で確かめる。
+// DEF-070: Chromium 自身の Google への接続を止める起動の引数（`CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS`。Playwright の既定の
+// `--disable-features` の値を含む1つの引数）と、起動のときの ListAccounts と GCM の checkin の向け先を、使われないローカルの宛先に変える
+// 引数（`CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS`）も渡す。効くことは、tests/integration/chromium-google-connections.test.ts で、実際に渡った値は
+// tests/integration/preloading-disabled.test.ts で確かめる。
 describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading and disable Shared Workers, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, stop the Google connections of Chromium itself and disable Shared Workers, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
     const browser = { marker: 'the fake browser' } as unknown as Browser;
     const launch = vi.spyOn(chromium, 'launch').mockResolvedValue(browser);
 
@@ -275,7 +284,12 @@ describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwrigh
     expect(launch).toHaveBeenCalledWith({
       headless,
       channel: 'chromium',
-      args: [...CHROMIUM_PRELOADING_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS],
+      args: [
+        ...CHROMIUM_PRELOADING_DISABLED_ARGS,
+        ...CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
+        ...CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
+        ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
+      ],
       handleSIGINT: false,
       handleSIGTERM: false,
       handleSIGHUP: false,

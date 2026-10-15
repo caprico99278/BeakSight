@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-target-config:1",
+  "description": "Local UI Server Function input: one target configuration path to check. The path itself is checked by isAcceptedTargetConfigPath.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["targetConfigPath"],
+  "properties": {
+    "targetConfigPath": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/targetConfigPath" }
+  }
+}

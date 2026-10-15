@@ -7,6 +7,7 @@
  *   `browser-opening-page.ts` に置いたまま、ここの `overrideBrowser` を使う。
  */
 import type { Browser, BrowserContext } from 'playwright';
+import { wait } from '../../src/core/deadline.js';
 import { createDeferred, type Deferred } from './deferred.js';
 
 /** 決して終わらない Promise（止まったままの処理を表す）。 */
@@ -109,6 +110,23 @@ export function browserStallingContextClose(
     async release(): Promise<void> {
       gate.resolve(undefined);
       await Promise.all(created.map(({ close }) => close().catch(() => undefined)));
+    },
+  });
+}
+
+/**
+ * `newContext` の前に、`delayMsOf` が返す時間（ms）だけ実際に待つ Browser の Proxy（DEF-100 fix。Context の作成が遅い・揺れる環境を作る）。
+ * `delayMsOf` には、`newContext` に渡された指定（省略なら `undefined`）を渡す。待った後に、元の `newContext` に同じ指定を渡す。
+ */
+export function browserDelayingNewContext(
+  real: Browser,
+  delayMsOf: (options: Parameters<Browser['newContext']>[0]) => number,
+): Browser {
+  return overrideBrowser(real, {
+    newContext: async (...args: Parameters<Browser['newContext']>) => {
+      const delayMs = delayMsOf(args[0]);
+      await wait(delayMs);
+      return await real.newContext(...args);
     },
   });
 }

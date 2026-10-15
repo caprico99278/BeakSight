@@ -1,0 +1,69 @@
+{
+  "$id": "urn:beaksight:schema:control:read-check-definition:1",
+  "description": "The content of one READ check definition (Task 27 design 4.5): the target READ candidate, the values to send (field name to value, test values of the test environment only) and the expectations. The value lists and limits are owned by src/discovery/read-check-contracts.ts. The rules against the candidate (visible, editable fields only; no secret-like names; the candidate is READ) are checked by src/control/read-check-policy.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["targetIdentityDigest", "parameters", "expectations"],
+  "properties": {
+    "targetIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "parameters": {
+      "type": "object",
+      "maxProperties": 50,
+      "propertyNames": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "additionalProperties": { "type": "string", "maxLength": 256 }
+    },
+    "expectations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/rowCountEquals" },
+          { "$ref": "#/$defs/rowCountAtLeast" },
+          { "$ref": "#/$defs/textContains" },
+          { "$ref": "#/$defs/detailFieldEquals" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "rowCount": { "type": "integer", "minimum": 0, "maximum": 100000 },
+    "rowCountEquals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "count"],
+      "properties": {
+        "kind": { "const": "ROW_COUNT_EQUALS" },
+        "count": { "$ref": "#/$defs/rowCount" }
+      }
+    },
+    "rowCountAtLeast": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "count"],
+      "properties": {
+        "kind": { "const": "ROW_COUNT_AT_LEAST" },
+        "count": { "$ref": "#/$defs/rowCount" }
+      }
+    },
+    "textContains": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "TEXT_CONTAINS" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "detailFieldEquals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "field", "value"],
+      "properties": {
+        "kind": { "const": "DETAIL_FIELD_EQUALS" },
+        "field": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "value": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}

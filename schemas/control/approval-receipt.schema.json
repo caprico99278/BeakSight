@@ -1,0 +1,77 @@
+{
+  "$id": "urn:beaksight:schema:control:approval-receipt:1",
+  "description": "One append-only record of the approval of a scenario revision or of its revocation (Task 28 design 4.1). An approval fixes the approval digest, the bound facts (the profile revision, the auth setup digest, the target config digest, the candidate digests and the input rule reference), the approval time, the expiry and the approver LOCAL_OPERATOR. A revocation names the approval receipt it revokes. The value lists are owned by src/control/approval/scenario-contracts.ts; the validity is judged by src/control/approval/approval-validity.ts.",
+  "oneOf": [{ "$ref": "#/$defs/approval" }, { "$ref": "#/$defs/revocation" }],
+  "$defs": {
+    "timestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "bound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileRevision",
+        "authSetupDigest",
+        "targetConfigDigest",
+        "candidateIdentityDigest",
+        "candidateRuleDigest",
+        "inputRuleReference"
+      ],
+      "properties": {
+        "profileRevision": { "type": "integer", "minimum": 1 },
+        "authSetupDigest": { "anyOf": [{ "$ref": "#/$defs/fingerprint" }, { "type": "null" }] },
+        "targetConfigDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "candidateIdentityDigest": { "$ref": "#/$defs/fingerprint" },
+        "candidateRuleDigest": { "$ref": "#/$defs/fingerprint" },
+        "inputRuleReference": {
+          "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/inputRuleReference" }, { "type": "null" }]
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "receiptId",
+        "profileId",
+        "scenarioId",
+        "scenarioRevision",
+        "approvalDigest",
+        "bound",
+        "approvedAt",
+        "expiresAt",
+        "approver"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "beaksight-approval-receipt/1" },
+        "kind": { "const": "APPROVAL" },
+        "receiptId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "profileId": { "$ref": "#/$defs/profileId" },
+        "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "scenarioRevision": { "type": "integer", "minimum": 1 },
+        "approvalDigest": { "$ref": "#/$defs/fingerprint" },
+        "bound": { "$ref": "#/$defs/bound" },
+        "approvedAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "approver": { "const": "LOCAL_OPERATOR" }
+      }
+    },
+    "revocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "receiptId", "profileId", "scenarioId", "targetReceiptId", "revokedAt", "reason"],
+      "properties": {
+        "schemaVersion": { "const": "beaksight-approval-receipt/1" },
+        "kind": { "const": "REVOCATION" },
+        "receiptId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "profileId": { "$ref": "#/$defs/profileId" },
+        "scenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "targetReceiptId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "revokedAt": { "$ref": "#/$defs/timestamp" },
+        "reason": { "enum": ["OPERATOR_REQUEST"] }
+      }
+    }
+  }
+}

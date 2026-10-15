@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-audit-job-start:1",
+  "description": "Local UI Server Function input: start an audit job for one profile (Task 24 design 4.4, 4.8). The job manager checks the profile, the revision and the executable mode again.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision", "startNew"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" },
+    "startNew": { "type": "boolean" }
+  }
+}

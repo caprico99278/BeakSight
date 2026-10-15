@@ -1,6 +1,7 @@
 import {
   CRAWL_URL_STATES,
-  INCOMPLETE_REASON_CODES,
+  isIncompleteReasonCode,
+  isIncompleteReasonDetail,
   type CrawlUrlState,
   type IncompleteReason,
   type IncompleteReasonCode,
@@ -85,9 +86,6 @@ interface MutableEntry {
 const isCrawlUrlState = (value: unknown): value is CrawlUrlState =>
   typeof value === 'string' && (CRAWL_URL_STATES as readonly string[]).includes(value);
 
-const isIncompleteReasonCode = (value: unknown): value is IncompleteReasonCode =>
-  typeof value === 'string' && (INCOMPLETE_REASON_CODES as readonly string[]).includes(value);
-
 /** 深さの上限による `SKIPPED` か（`discover` は、この URL を待ち行列に入れない）。 */
 const isSkippedByDepthLimit = (entry: MutableEntry): boolean =>
   entry.state === 'SKIPPED' && entry.skipReason?.code === MAX_DEPTH_REACHED_REASON.code;
@@ -127,7 +125,7 @@ const restoreEntry = (stored: StoredCrawlUrlEntry, index: number, options: Crawl
     if (!isIncompleteReasonCode(skipReason.code)) {
       throw invalid(`unsupported skip reason code: ${String(skipReason.code)}`);
     }
-    if (skipReason.detail !== null && typeof skipReason.detail !== 'string') {
+    if (!isIncompleteReasonDetail(skipReason.detail)) {
       throw invalid('skip reason detail must be a string or null');
     }
     reason = Object.freeze({ code: skipReason.code, detail: skipReason.detail });

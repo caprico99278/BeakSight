@@ -103,13 +103,16 @@ describe('isInvalidInterceptionIdFailure (DEF-026)', () => {
    * （NP3 の発見事項 1。ブラウザが先に取り消した応答に対して失敗する）。
    */
   const PAGE_CONTINUE_RESPONSE_TEXT = 'cdpSession.send: Protocol error (Fetch.continueResponse): Invalid InterceptionId.';
+  /** T30R-fix-1（M-1）: page の session の、書き込みの送り手の応答を返す命令（`Fetch.fulfillRequest`）の失敗の文言。 */
+  const PAGE_FULFILL_TEXT = 'cdpSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId.';
 
   it('lists exactly the page session texts of the three commands and the OOPIF session text', () => {
-    expect([...INVALID_INTERCEPTION_ID_FAILURE_TEXTS]).toEqual([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT, PAGE_CONTINUE_RESPONSE_TEXT]);
+    expect([...INVALID_INTERCEPTION_ID_FAILURE_TEXTS])
+      .toEqual([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT, PAGE_CONTINUE_RESPONSE_TEXT, PAGE_FULFILL_TEXT]);
     expect(Object.isFrozen(INVALID_INTERCEPTION_ID_FAILURE_TEXTS)).toBe(true);
   });
 
-  it.each([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT, PAGE_CONTINUE_RESPONSE_TEXT])('reports %s as an invalid interception id failure', (text) => {
+  it.each([PAGE_CONTINUE_TEXT, PAGE_FAIL_TEXT, OOPIF_TEXT, PAGE_CONTINUE_RESPONSE_TEXT, PAGE_FULFILL_TEXT])('reports %s as an invalid interception id failure', (text) => {
     expect(isInvalidInterceptionIdFailure(text)).toBe(true);
   });
 
@@ -118,7 +121,8 @@ describe('isInvalidInterceptionIdFailure (DEF-026)', () => {
     ['the page text without the final period', 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId'],
     ['the page text without the cdpSession.send prefix', 'Protocol error (Fetch.continueRequest): Invalid InterceptionId.'],
     ['the continueResponse text without the final period', 'cdpSession.send: Protocol error (Fetch.continueResponse): Invalid InterceptionId'],
-    ['the same failure of another command', 'cdpSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId.'],
+    ['the same failure of another command', 'cdpSession.send: Protocol error (Fetch.continueWithAuth): Invalid InterceptionId.'],
+    ['the fulfillRequest text without the final period', 'cdpSession.send: Protocol error (Fetch.fulfillRequest): Invalid InterceptionId'],
     ['the same failure of another domain', 'cdpSession.send: Protocol error (Network.continueInterceptedRequest): Invalid InterceptionId.'],
     ['a longer text that contains the OOPIF text', 'Protocol error: Invalid InterceptionId.'],
     ['a longer text with the same prefix', 'Invalid InterceptionId. (retry)'],

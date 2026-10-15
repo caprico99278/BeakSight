@@ -45,6 +45,7 @@ import { validateArtifact } from '../../src/core/schema-validator.js';
 import { derivePageAuditStatus, deriveRunStatus } from '../../src/core/status.js';
 import { classifyUrl } from '../../src/crawl/admission-policy.js';
 import { LOAD_PEAK_WINDOW_MS, type LoadMeter } from '../../src/crawl/load-meter.js';
+import { createNavigationPacer, type NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import type { collectSiteMetadata, SiteMetadataResult } from '../../src/crawl/site-metadata.js';
 import { sitemapEvidenceFromMetadata } from '../../src/crawl/sitemap-evidence.js';
@@ -500,8 +501,8 @@ interface HarnessOptions {
   readonly environmentViolations?: number;
   /** metadata の取得の Ledger に記録する、不変条件の違反の数。 */
   readonly metadataViolations?: number;
-  /** metadata の取得に使った page を閉じる処理が失敗する。 */
-  readonly metadataPageCloseFails?: boolean;
+  /** metadata の取得に使った Context を閉じる処理が失敗する（page は個別に閉じない。DEF-038。CCX-23 で page から Context に変えた）。 */
+  readonly metadataContextCloseFails?: boolean;
   readonly browserCloseFails?: boolean;
   /** Browser を閉じる処理が終わらない（R15 の Minor-2）。 */
   readonly browserCloseHangs?: boolean;
@@ -552,6 +553,8 @@ interface HarnessOptions {
   readonly metadataObservations?: readonly [MainFrameLoadObservation, MainFrameLoadObservation];
   /** Run Coordinator に注入する、診断の記録の書き出しの口（D2。診断の記録の設計書 2.3）。省略すると、渡さない。 */
   readonly writeSiteUnavailableDiagnostic?: RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'];
+  /** Run Coordinator に注入する、外から渡す pacer（CCX-22）。省略すると、渡さない（Run Coordinator が自分で作る）。 */
+  readonly navigationPacer?: RunCoordinatorDependencies['navigationPacer'];
 }
 
 interface Harness {
@@ -642,7 +645,7 @@ function createHarness(options: HarnessOptions): Harness {
         unnormalizableSitemapUrlCount: 0,
         failures: [],
         ledgerSnapshot: ledger.snapshot(),
-        closeFailures: options.metadataPageCloseFails === true ? [{ step: 'page', error: new Error('metadata page close failed') }] : [],
+        closeFailures: options.metadataContextCloseFails === true ? [{ step: 'context', error: new Error('metadata Context close failed') }] : [],
       };
     }
     if (options.paceNavigations === true) {
@@ -694,7 +697,7 @@ function createHarness(options: HarnessOptions): Harness {
       unnormalizableSitemapUrlCount: 0,
       failures: [],
       ledgerSnapshot: ledger.snapshot(),
-      closeFailures: options.metadataPageCloseFails === true ? [{ step: 'page', error: new Error('metadata page close failed') }] : [],
+      closeFailures: options.metadataContextCloseFails === true ? [{ step: 'context', error: new Error('metadata Context close failed') }] : [],
     };
   });
   const dependencies: RunCoordinatorDependencies = {
@@ -720,6 +723,7 @@ function createHarness(options: HarnessOptions): Harness {
     ...(options.resumeFrom === undefined ? {} : { resumeFrom: options.resumeFrom }),
     ...(options.stopSignal === undefined ? {} : { stopSignal: options.stopSignal }),
     ...(options.writeSiteUnavailableDiagnostic === undefined ? {} : { writeSiteUnavailableDiagnostic: options.writeSiteUnavailableDiagnostic }),
+    ...(options.navigationPacer === undefined ? {} : { navigationPacer: options.navigationPacer }),
   };
   return {
     coordinator: new RunCoordinator(dependencies),
@@ -1206,11 +1210,11 @@ describe('RunCoordinator: PREFLIGHT and Run Status inputs (design 5.6.6)', () =>
     ]);
   });
 
-  it('adds a failure to close the metadata page to the Run reasons', async () => {
-    const result = await createHarness({ site: { [START_PATH]: {} }, metadataPageCloseFails: true }).coordinator.run();
+  it('adds a failure to close the metadata Context to the Run reasons', async () => {
+    const result = await createHarness({ site: { [START_PATH]: {} }, metadataContextCloseFails: true }).coordinator.run();
     expect(result.run.runStatus).toBe('PARTIAL');
     expect(result.run.incompleteReasons).toEqual([
-      { code: 'UNHANDLED_FAILURE', detail: expect.stringMatching(/^site-metadata-page-close:.*metadata page close failed/u) },
+      { code: 'UNHANDLED_FAILURE', detail: expect.stringMatching(/^site-metadata-context-close:.*metadata Context close failed/u) },
     ]);
   });
 
@@ -1494,18 +1498,20 @@ const TIMER_TOLERANCE_MS = 20;
 // RP18 の指摘1: 環境の読み取りの、閉じる処理の失敗（期限切れを含む）は、捨てずに Run の理由にする（Run は COMPLETE にならない）。
 // RP18 の指摘2: Run Coordinator は、期限の注入口（`deadlines`）を、PREFLIGHT、環境、サイトの metadata、Page Auditor へ渡す。
 describe('RunCoordinator: close failures of the environment and the injected deadlines (RP18 findings 1 and 2)', () => {
-  it('adds the environment page and Context close failures to the Run reasons, so the Run is not COMPLETE', async () => {
+  // CCX-23: page は個別に閉じない（DEF-038）ので、閉じる処理の失敗は Context のものだけ。page の失敗の代わりに、期限切れでない Context の失敗を
+  // 渡す。
+  it('adds the environment Context close failures to the Run reasons, so the Run is not COMPLETE', async () => {
     const result = await createHarness({
       site: { [START_PATH]: {} },
       environmentCloseFailures: [
-        { step: 'page', error: new Error('environment page close failed') },
+        { step: 'context', error: new Error('environment Context close failed') },
         { step: 'context', error: new PassiveContextCloseDeadlineError() },
       ],
     }).coordinator.run();
 
     expect(result.run.runStatus).toBe('PARTIAL');
     expect(result.run.incompleteReasons).toEqual([
-      { code: 'UNHANDLED_FAILURE', detail: 'environment-page-close:environment page close failed' },
+      { code: 'UNHANDLED_FAILURE', detail: 'environment-context-close:environment Context close failed' },
       { code: 'UNHANDLED_FAILURE', detail: `environment-context-close:${PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE}` },
     ]);
     expect(deriveRunStatus(result.statusInput)).toBe(result.run.runStatus);
@@ -1515,7 +1521,6 @@ describe('RunCoordinator: close failures of the environment and the injected dea
   it('passes the injected deadlines down to PREFLIGHT, the environment, the site metadata and the Page Auditor', async () => {
     const deadlines = {
       sessionOpenTimeoutMs: 1_234,
-      pageCloseTimeoutMs: 2_345,
       contextCloseTimeoutMs: 3_456,
     } as const satisfies PassiveSessionDeadlineOptions;
     const harness = createHarness({ site: { [START_PATH]: {} }, deadlines, browserCloseTimeoutMs: 4_567 });
@@ -1926,7 +1931,9 @@ describe('RunCoordinator: the load record of the Run (load control design 4.5)',
 
     expect(received).toHaveLength(1);
     // L5b: Run 全体のキャッシュも、同じ経路で渡す（`run cache` の describe で確かめる）。
-    expect(Object.keys(received[0]?.contextFactoryOptions ?? {})).toEqual(['loadMeter', 'resourceCache']);
+    // DEF-100 fix: Run の pacer も、同じ経路で factory に渡す（Guard が送った時刻を記録する）。Page Auditor に渡すものと同じ部品である。
+    expect(Object.keys(received[0]?.contextFactoryOptions ?? {})).toEqual(['loadMeter', 'resourceCache', 'navigationPacer']);
+    expect(received[0]?.contextFactoryOptions?.navigationPacer).toBe(current.world.createdAuditors[0]?.navigationPacer);
     const pacer = current.world.createdAuditors[0]?.navigationPacer.snapshot();
     expect(result.run.load).toEqual({
       minNavigationIntervalMs: INTERVAL_MS,
@@ -2792,10 +2799,10 @@ describe('RunCoordinator: resuming a Run from its checkpoint (resumable run desi
   });
 
   it('restores the Run reasons, the page limit and the failure count from the saved progress', async () => {
-    const options = { site: CHECKPOINT_SITE, metadataPageCloseFails: true, config: { crawl: { maxPages: 2 } } };
+    const options = { site: CHECKPOINT_SITE, metadataContextCloseFails: true, config: { crawl: { maxPages: 2 } } };
     const uninterrupted = await recordedRun(options);
     expect(codesOf(uninterrupted.result.run.incompleteReasons)).toEqual(['MAX_PAGES_REACHED', 'UNHANDLED_FAILURE']);
-    const { harness } = resumedHarness({ ...options, metadataPageCloseFails: false }, resumeInputAfter(uninterrupted, 1));
+    const { harness } = resumedHarness({ ...options, metadataContextCloseFails: false }, resumeInputAfter(uninterrupted, 1));
 
     const result = await harness.coordinator.run();
 
@@ -3517,7 +3524,7 @@ describe('RunCoordinator: the stop signal (resumable run design 4.6.1, R4b2)', (
       '/a.html': { links: ['/deep.html'], duringAudit: () => controller.abort() },
       '/b.html': {},
     };
-    const harness = createHarness({ site, config: { crawl: { maxDepth: 1 } }, metadataPageCloseFails: true, stopSignal: controller.signal });
+    const harness = createHarness({ site, config: { crawl: { maxDepth: 1 } }, metadataContextCloseFails: true, stopSignal: controller.signal });
 
     const result = await harness.coordinator.run();
 
@@ -4703,11 +4710,11 @@ describe('RunCoordinator: stopping the Run on site unavailability in robots.txt 
     expect(decideRunResumption(checkpoint)).toBe('NOT_RESUMABLE');
   });
 
-  it('stops in the same way when robots.txt is available and sitemap.xml returns 503, keeping the reason of the failure to close the page', async () => {
+  it('stops in the same way when robots.txt is available and sitemap.xml returns 503, keeping the reason of the failure to close the Context', async () => {
     const { harness, recorder } = checkpointHarness({
       site: UNAVAILABILITY_SITE,
       metadataObservations: [OK_200, OK_503],
-      metadataPageCloseFails: true,
+      metadataContextCloseFails: true,
     });
 
     const concluded = await concludedRun(harness);
@@ -4720,7 +4727,7 @@ describe('RunCoordinator: stopping the Run on site unavailability in robots.txt 
     expect(pageStates(result)).toEqual([[START_PATH, 'SKIPPED', [SITE_UNAVAILABLE_SKIP_REASON]]]);
     expect(result.pages[0]?.evidence).toEqual([]);
     // 閉じる処理の失敗の理由は、今のとおり記録する（保存の理由にも入る）。
-    const closeFailure = { code: 'UNHANDLED_FAILURE', detail: expect.stringMatching(/^site-metadata-page-close:.*metadata page close failed/u) };
+    const closeFailure = { code: 'UNHANDLED_FAILURE', detail: expect.stringMatching(/^site-metadata-context-close:.*metadata Context close failed/u) };
     expect(result.run.incompleteReasons).toEqual([siteUnavailableTrigger(SITE_METADATA_HTTP_503), closeFailure]);
     expect(result.run.executions.map(({ endReason }) => endReason)).toEqual(['STOPPED_BY_SITE_UNAVAILABLE']);
     expect(recorder.states()[0]?.siteMetadata).toBeNull();
@@ -5633,5 +5640,81 @@ describe('RunCoordinator: checking an unavailable page again in stages, and slow
   it('rejects a notice receiver that is not a function with TypeError', () => {
     expect(() => createHarness({ site: UNAVAILABILITY_SITE, onNotice: 'notice' as unknown as RunCoordinatorDependencies['onNotice'] }))
       .toThrow(TypeError);
+  });
+});
+
+// CCX-22（CC-085。DEF-102 の続き）: 外から渡す pacer。新しい Run はその pacer で待ち（記録は、`run()` を始めた時点からの差だけを数える）、再開の
+// ときは使わずに、保存の記録から自分で作る。CLI（渡さない）は、今と同じ。
+describe('RunCoordinator: the navigation pacer given from outside (CCX-22)', () => {
+  const INTERVAL_MS = 5_000;
+  /** 偽の時計の時刻を、`sleep` の分だけ進める pacer（`createHarness` の後に `bind` で時計をつなぐ）。 */
+  const externalPacer = (): { readonly pacer: NavigationPacer; bind(world: FakeWorld): void } => {
+    let bound: FakeWorld | null = null;
+    let nowMs = 1_000_000;
+    const pacer = createNavigationPacer({
+      minIntervalMs: INTERVAL_MS,
+      now: () => bound?.nowMs ?? nowMs,
+      sleep: async (ms) => {
+        if (bound === null) {
+          nowMs += ms;
+        } else {
+          bound.nowMs += ms;
+        }
+      },
+    });
+    return { pacer, bind: (world) => { bound = world; } };
+  };
+
+  it('waits through the given pacer in a new Run, and records only the navigations of the Run', async () => {
+    const external = externalPacer();
+    // 呼ぶ側が先に行った読み込み（ログインの段）を 1 回、送った時刻の記録を 1 回。
+    await external.pacer.beforeNavigation();
+    external.pacer.recordDocumentRequestSent();
+    let harness: Harness | undefined;
+    harness = createHarness({
+      site: { [START_PATH]: {} },
+      config: { crawl: { minNavigationIntervalMs: INTERVAL_MS } },
+      paceNavigations: true,
+      navigationPacer: external.pacer,
+      sleep: async (ms) => {
+        if (harness !== undefined) {
+          harness.world.nowMs += ms;
+        }
+      },
+    });
+    external.bind(harness.world);
+
+    const result = await harness.coordinator.run();
+
+    // robots.txt、sitemap.xml、Desktop、Mobile の 4 回。Run の記録には、呼ぶ側の 1 回を入れない。
+    expect(result.run.load.navigationCount).toBe(4);
+    expect(external.pacer.snapshot().navigationCount).toBe(5);
+    // Run の最初の読み込み（robots.txt）も、呼ぶ側の読み込みから間隔を空けたので、待ちがある。
+    expect(result.run.load.pacingWaitMs).toBe(external.pacer.snapshot().totalWaitMs);
+    expect(result.run.load.pacingWaitMs).toBeGreaterThanOrEqual(INTERVAL_MS);
+    // Page Auditor と factory に渡す pacer は、同じ部品（Run の記録だけを返す包み）。
+    expect(harness.world.createdAuditors[0]?.navigationPacer.snapshot().navigationCount).toBe(4);
+    await expectValidRun(result);
+  });
+
+  it('does not use the given pacer when it resumes a Run (the resumed record of its own pacer keeps the interval)', async () => {
+    const options = { site: { [START_PATH]: { links: ['/a.html'] }, '/a.html': {} } };
+    const uninterrupted = await recordedRun(options);
+    const external = externalPacer();
+    const { harness } = resumedHarness({ ...options, navigationPacer: external.pacer }, resumeInputAfter(uninterrupted, 1));
+    external.bind(harness.world);
+
+    const result = await harness.coordinator.run();
+
+    expect(result.pages.map((page) => page.status)).toEqual(['AUDITED', 'AUDITED']);
+    expect(external.pacer.snapshot().navigationCount).toBe(0);
+  });
+
+  it('rejects a given pacer without the operations with TypeError', () => {
+    const { beforeNavigation, snapshot, raiseMinimumInterval } = externalPacer().pacer;
+    expect(() => createHarness({
+      site: { [START_PATH]: {} },
+      navigationPacer: { beforeNavigation, snapshot, raiseMinimumInterval } as unknown as NavigationPacer,
+    })).toThrow(TypeError);
   });
 });

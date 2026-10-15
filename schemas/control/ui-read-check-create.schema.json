@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-read-check-create:1",
+  "description": "Local UI Server Function input: create one READ check definition of a profile (Task 27 design 4.5, 4.7). The definition itself is validated by validateReadCheckDefinition against the candidate of the latest discovery (read-check-definition), so that the reasons are returned by item.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "definition"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "definition": { "type": "object" }
+  }
+}

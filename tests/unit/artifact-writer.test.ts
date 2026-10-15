@@ -15,14 +15,9 @@ import {
   siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
 import type { AuditRunResult, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
-import type { NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { createRunId } from '../../src/core/ids.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { deriveRunStatus, type RunStatusInput } from '../../src/core/status.js';
-import { createLoadMeter } from '../../src/crawl/load-meter.js';
-import { createNavigationPacer } from '../../src/crawl/navigation-pacer.js';
-import { CrawlFrontier, type CrawlUrlEntry } from '../../src/orchestration/crawl-frontier.js';
-import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
@@ -42,12 +37,10 @@ import {
 import {
   ArtifactWriteError,
   ArtifactWriter,
-  RENAME_MAX_ATTEMPTS,
-  RENAME_RETRY_DELAY_MS,
-  RENAME_RETRY_ERROR_CODES,
   type CheckpointFileHandle,
   type CheckpointFileOperations,
 } from '../../src/report/artifact-writer.js';
+import { RENAME_MAX_ATTEMPTS, RENAME_RETRY_DELAY_MS, RENAME_RETRY_ERROR_CODES } from '../../src/core/rename-retry.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
   FIXTURE_OBSERVED_AT,
@@ -65,7 +58,7 @@ import {
   runSummary,
   screenshot,
 } from '../helpers/audit-run-fixture.js';
-import { createTestConfig } from '../helpers/test-config.js';
+import { sampleCrawl, sampleIdleLoad, sampleQuietProgress } from '../helpers/run-checkpoint-samples.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // スキーマに合う Run の見本（組み立ては `tests/helpers/audit-run-fixture.ts`）
@@ -692,23 +685,10 @@ const CHECKS = Object.freeze({ checkState: checkRunCheckpointConsistency, checkP
  * L4 の meter、Safety Ledger の snapshot を、実際の部品を動かして作る。
  */
 function sampleCheckpoint(finishedPages: 1 | 2): RunCheckpoint {
-  const config = createTestConfig(FIXTURE_ORIGIN);
-  const allocator = new IdAllocator();
-  const frontier = new CrawlFrontier(config.crawl.maxDepth, allocator);
-  frontier.discover(START_URL, 0);
-  const finish = (status: 'AUDITED' | 'FAILED', links: readonly NormalizedHttpUrlEvidence[]): void => {
-    const entry = frontier.next() as CrawlUrlEntry;
-    frontier.markAuditing(entry.url);
-    frontier.markFinished(entry.url, status);
-    for (const link of links) {
-      frontier.discover(link, entry.depth + 1);
-    }
-  };
-  finish('AUDITED', [SECOND_URL, THIRD_URL]);
-  if (finishedPages === 2) {
-    finish('FAILED', []);
-  }
-  const nowMs = (): number => 1_000;
+  const { config, allocator, frontier } = sampleCrawl([
+    { status: 'AUDITED', links: [SECOND_URL, THIRD_URL] },
+    ...(finishedPages === 2 ? [{ status: 'FAILED' } as const] : []),
+  ]);
   return createRunCheckpoint({
     state: 'IN_PROGRESS',
     runId: RUN_ID,
@@ -719,22 +699,10 @@ function sampleCheckpoint(finishedPages: 1 | 2): RunCheckpoint {
     executions: [{ startedAt: '2026-10-01T00:00:00.000Z', finishedAt: null, endReason: null, environment: runSummary().environment }],
     frontier: frontier.snapshot(),
     allocator: allocator.snapshot(),
-    progress: {
-      reasons: [],
-      retries: [],
-      safetyViolationDetected: false,
-      stoppedBySafetyViolation: false,
-      unhandledFailures: 0,
-      guardEnabled: true,
-      preflightFailed: false,
-      pagesStarted: finishedPages,
-    },
+    progress: sampleQuietProgress(finishedPages),
     safetyLedgerSnapshots: [new SafetyLedger().snapshot()],
     siteMetadata: null,
-    load: {
-      pacer: createNavigationPacer({ minIntervalMs: 0, now: nowMs, sleep: async () => undefined }).snapshot(),
-      meter: createLoadMeter({ allowedOrigins: [FIXTURE_ORIGIN], now: nowMs }).snapshot(),
-    },
+    load: sampleIdleLoad(),
     completedPageIds: finishedPages === 2 ? [PAGE_1, PAGE_2] : [PAGE_1],
   });
 }

@@ -308,7 +308,7 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         { label: text.allowedOrigins, value: renderReferenceList(summary.allowedOrigins.map((origin) => renderCode(origin))) },
         { label: text.startedAt, value: formatDateTime(summary.startedAt) },
         { label: text.finishedAt, value: formatDateTime(summary.finishedAt) },
-        { label: text.toolVersion, value: renderCode(summary.toolVersion) },
+        { label: RUN_SUMMARY_TEXT.toolVersion, value: renderCode(summary.toolVersion) },
       ]),
     ]),
     subsection(level, RUN_SUMMARY_TEXT.coverageHeading, SUMMARY_ANCHORS.coverage, [
@@ -385,7 +385,7 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         { label: text.environment.platform, value: renderCode(environment.platform) },
         { label: text.environment.osRelease, value: renderCode(environment.osRelease) },
         { label: text.environment.arch, value: renderCode(environment.arch) },
-        { label: text.environment.playwrightVersion, value: renderCode(environment.playwrightVersion) },
+        { label: RUN_SUMMARY_TEXT.playwrightVersion, value: renderCode(environment.playwrightVersion) },
         { label: text.environment.chromiumVersion, value: observedCode(environment.chromiumVersion) },
         ...viewports.map((viewport) => ({
           label: userAgentLabelText(VIEWPORT_PROFILE_CATALOG[viewport].label),

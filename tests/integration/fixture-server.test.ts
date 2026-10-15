@@ -179,6 +179,40 @@ describe('fixture server', () => {
     expect(server.getCounters()).not.toBe(counters);
   });
 
+  // DEF-068: Node の HTTP サーバは、upgrade と CONNECT のソケットを渡すときに、自分の `error` の受け手を外す。ブラウザ（またはクライアント）が
+  // 応答の後に接続を切る（RST）と、サーバのソケットの `read ECONNRESET` が処理されない誤りになり、Vitest の Unhandled Errors として残った。
+  // クライアントが切っても誤りが残らず、数えた値（upgrade は webSocketUpgrade、CONNECT は other に 1 回）は変わらず、サーバが応答し続ける
+  // ことを確かめる（直す前は、この 2 件で Unhandled Errors が 2 件出た）。
+  it.each([
+    ['WebSocket upgrade', (_host: string): string => 'GET /socket HTTP/1.1', ['Connection: Upgrade', 'Upgrade: websocket'], 'HTTP/1.1 426 ', { webSocketUpgrade: 1 }],
+    // CONNECT の宛先は、このサーバ自身（サーバは宛先へ接続せず、405 を返す）。
+    ['CONNECT', (host: string): string => `CONNECT ${host} HTTP/1.1`, [], 'HTTP/1.1 405 ', { other: 1 }],
+  ] as const)('handles a client that resets the %s socket after the response, without an unhandled error (DEF-068)', async (_name, requestLineFor, headers, statusLine, counted) => {
+    const server = await startServer();
+    const endpoint = new URL(server.origin);
+    const requestLine = requestLineFor(endpoint.host);
+
+    const received = await new Promise<string>((resolve, reject) => {
+      let text = '';
+      const socket = connect({ host: endpoint.hostname, port: Number(endpoint.port) });
+      socket.once('connect', () => {
+        socket.write([requestLine, `Host: ${endpoint.host}`, ...headers, '', ''].join('\r\n'));
+      });
+      socket.on('data', (chunk: Buffer) => {
+        text += chunk.toString('utf8');
+        // 応答を受けたら、終わりの合図（FIN）を送らずに切る（RST）。サーバのソケットは、読む側が開いたままなので、ECONNRESET を受ける。
+        socket.resetAndDestroy();
+      });
+      socket.once('close', () => resolve(text));
+      socket.once('error', reject);
+    });
+    // サーバが切られたことを処理するまで、ほかの要求を 1 回往復させる（サーバは応答し続ける）。
+    await expect(requestStatus(server.origin, '/index.html')).resolves.toBe(200);
+
+    expect(received).toContain(statusLine);
+    expect(server.getCounters()).toMatchObject(counted);
+  });
+
   it('resets counters explicitly and deterministically', async () => {
     const server = await startServer();
     await fetch(`${server.origin}/__mutation`, { method: 'PATCH' });

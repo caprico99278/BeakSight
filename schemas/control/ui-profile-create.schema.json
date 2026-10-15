@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-create:1",
+  "description": "Local UI Server Function input: create a profile. The profile document itself is validated by validateSiteProfile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profile"],
+  "properties": {
+    "profile": { "type": "object" }
+  }
+}

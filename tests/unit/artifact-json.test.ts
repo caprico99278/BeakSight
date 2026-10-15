@@ -2,7 +2,7 @@
 // `ArtifactWriter`（run.json、audit.json、page.json）と ChatGPT 用バンドル（ZIP の中の JSON）が、どちらもここを使う。
 // 書式は、字下げ2文字、末尾に LF を1つ、CR なし、UTF-8（BOM なし）である。
 import { describe, expect, it } from 'vitest';
-import { artifactJsonBytes, serializeArtifactJson } from '../../src/report/artifact-json.js';
+import { artifactJsonBytes, serializeArtifactJson } from '../../src/core/artifact-json.js';
 
 const SAMPLE = Object.freeze({
   runId: 'RUN-000001',

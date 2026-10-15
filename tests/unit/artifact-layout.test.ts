@@ -1,12 +1,18 @@
 // C16a（Task 14〜17 の設計書 6.1.2、6.1.8。CC-023）: artifact の配置（パスの組み立て）の唯一の owner。
 // Page Auditor、Run Coordinator、ArtifactWriter、表示用モデルが、どれもここから取る。移す前と同じパスを返すことを確かめる。
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { VIEWPORT_PROFILES } from '../../src/core/contracts.js';
 import { SCREENSHOT_CAPTURE_TYPES } from '../../src/core/evidence-types.js';
 import { createPageId, createRunId } from '../../src/core/ids.js';
 import {
+  ACTION_EVIDENCE_ARTIFACT_FILE_NAME,
+  ACTION_REPORT_ARTIFACT_FILE_NAME,
+  ACTION_RUN_ARTIFACT_FILE_NAME,
+  APPROVAL_SUMMARY_ARTIFACT_FILE_NAME,
   CHECKPOINT_ARTIFACT_DIRECTORY,
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
@@ -19,12 +25,15 @@ import {
   RETRY_ARTIFACT_DIRECTORY_PREFIX,
   RUN_ARTIFACT_FILE_NAMES,
   SCREENSHOT_FILE_NAMES,
+  WINDOWS_RESERVED_DEVICE_NAMES,
+  actionBundleFileName,
   artifactFilePath,
   bundleFileName,
   checkpointArtifactRelativePath,
   checkpointPageArtifactRelativePath,
   checkpointPageIdOfFileName,
   createRunArtifactDirectory,
+  isActionBundleFileName,
   isBundleFileName,
   isPortableArtifactPathSegment,
   isPortableRelativeArtifactPath,
@@ -138,6 +147,58 @@ describe('artifact layout: the file name of the ChatGPT bundle (bundle file name
   it('gives bundle names that are portable path segments', () => {
     expect(isPortableArtifactPathSegment(bundleFileName('2026-10-08T03:09:30.000Z'))).toBe(true);
     expect(isPortableArtifactPathSegment(LEGACY_BUNDLE_FILE_NAME)).toBe(true);
+  });
+});
+
+// T32c（Task 32 の設計書 4.1 の成果物の表）: 書き込みのジョブの報告の成果物の名前と、書き込みのバンドルの名前
+// （`beaksight-action-bundle_YYYYMMDDHHmmss.zip`）。日時は `action-run.json` の `finishedAt`（UTC の 14 桁）をそのまま使う。監査のバンドルの
+// 名前と判定は変えない（書き込みのバンドルを監査のバンドルと見分けない・見分けさせない）。
+describe('artifact layout: the write report files and the write bundle name (Task 32 design 4.1)', () => {
+  it('names the write report files', () => {
+    expect(ACTION_EVIDENCE_ARTIFACT_FILE_NAME).toBe('action-evidence.json');
+    expect(APPROVAL_SUMMARY_ARTIFACT_FILE_NAME).toBe('approval-summary.json');
+    expect(ACTION_REPORT_ARTIFACT_FILE_NAME).toBe('action-report.html');
+    for (const name of [ACTION_RUN_ARTIFACT_FILE_NAME, ACTION_EVIDENCE_ARTIFACT_FILE_NAME, APPROVAL_SUMMARY_ARTIFACT_FILE_NAME, ACTION_REPORT_ARTIFACT_FILE_NAME]) {
+      expect(isPortableArtifactPathSegment(name), name).toBe(true);
+      expect(isBundleFileName(name), name).toBe(false);
+    }
+  });
+
+  it('names the write bundle with the finish time of action-run.json (14 digits, UTC)', () => {
+    expect(actionBundleFileName('20261015030930')).toBe('beaksight-action-bundle_20261015030930.zip');
+    expect(actionBundleFileName('20270102030405')).toBe('beaksight-action-bundle_20270102030405.zip');
+    expect(isPortableArtifactPathSegment(actionBundleFileName('20261015030930'))).toBe(true);
+  });
+
+  it('rejects a time that is not a 14-digit UTC timestamp of a real instant', () => {
+    for (const invalid of ['', '2026-10-15T03:09:30.000Z', '2026101503093', '202610150309301', '2026101503093a', '20261315030930', '20261015250000']) {
+      expect(() => actionBundleFileName(invalid), invalid).toThrow(RangeError);
+    }
+    expect(() => actionBundleFileName(20261015030930 as unknown as string)).toThrow(RangeError);
+    expect(() => actionBundleFileName(null as unknown as string)).toThrow(RangeError);
+  });
+
+  it('recognizes only write bundle names, and keeps them apart from the audit bundle names', () => {
+    expect(isActionBundleFileName(actionBundleFileName('20261015030930'))).toBe(true);
+    expect(isActionBundleFileName('beaksight-action-bundle_00000000000000.zip')).toBe(true);
+    for (const similar of [
+      'beaksight-action-bundle_20261015030930.zi',
+      'beaksight-action-bundle_20261015030930.zip.tmp',
+      'beaksight-action-bundle_20261015030930.ZIP',
+      'beaksight-action-bundle.zip',
+      'beaksight-action-bundle_2026101503093.zip',
+      'beaksight-action-bundle_202610150309301.zip',
+      'beaksight-action-bundle-20261015030930.zip',
+      'Beaksight-action-bundle_20261015030930.zip',
+      'copy of beaksight-action-bundle_20261015030930.zip',
+      'beaksight-audit-bundle_20261015030930.zip',
+      LEGACY_BUNDLE_FILE_NAME,
+      'action-report.html',
+      '',
+    ]) {
+      expect(isActionBundleFileName(similar), similar).toBe(false);
+    }
+    expect(isBundleFileName(actionBundleFileName('20261015030930'))).toBe(false);
   });
 });
 
@@ -506,5 +567,152 @@ describe('artifact layout: listing the run directories (resumable run design 4.7
 
     expect(all.map(({ runId }) => runId)).toEqual([withCheckpoint, withoutCheckpoint]);
     expect(withState).toEqual(all.filter(({ runId }) => runId === withCheckpoint));
+  });
+});
+
+// DEF-056（Task 24 の設計書 4.7）: Windows で別の意味になる名前（代替データストリームの `:`、区切りの末尾の点と空白、デバイス名）を、
+// 相対パスの検証（`isPortableRelativeArtifactPath`。区切り1つの検証もこれを通す）で拒む。BeakSight が書く名前は、どれも当たらない。
+describe('artifact layout: names that mean something else on Windows (DEF-056)', () => {
+  /** 上付きの数字 1、2、3（U+00B9、U+00B2、U+00B3）。 */
+  const SUPERSCRIPT_DIGITS = [0x00b9, 0x00b2, 0x00b3].map((codePoint) => String.fromCodePoint(codePoint));
+
+  it('names the Windows device names in one frozen constant', () => {
+    expect(WINDOWS_RESERVED_DEVICE_NAMES).toEqual([
+      'CON', 'PRN', 'AUX', 'NUL',
+      'COM0', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+      'LPT0', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+      'CONIN$', 'CONOUT$',
+      ...SUPERSCRIPT_DIGITS.map((digit) => `COM${digit}`),
+      ...SUPERSCRIPT_DIGITS.map((digit) => `LPT${digit}`),
+    ]);
+    expect(Object.isFrozen(WINDOWS_RESERVED_DEVICE_NAMES)).toBe(true);
+  });
+
+  // 上付きの数字（U+00B9、U+00B2、U+00B3）のポートの名前と、コンソールの入出力の名前も、Windows ではデバイスを指す。
+  it('rejects the console names and the ports with a superscript digit, in any case and with an extension', () => {
+    const names = [
+      'CONIN$', 'conin$', 'CONOUT$', 'ConOut$', 'CONIN$.txt', 'pages/conout$/page.json',
+      ...SUPERSCRIPT_DIGITS.flatMap((digit) => [`COM${digit}`, `com${digit}`, `LPT${digit}.zip`, `pages/lpt${digit}/page.json`]),
+    ];
+    for (const name of names) {
+      expect(isPortableRelativeArtifactPath(name), name).toBe(false);
+    }
+    for (const segment of ['CONIN$', 'conout$.json', ...SUPERSCRIPT_DIGITS.map((digit) => `COM${digit}.png`)]) {
+      expect(isPortableArtifactPathSegment(segment), segment).toBe(false);
+    }
+  });
+
+  it('accepts names that only look like the console names or the superscript ports', () => {
+    const SUPERSCRIPT_FOUR = String.fromCodePoint(0x2074);
+    for (const path of ['CONIN', 'CONOUT', 'CONIN$X', 'xCONOUT$', `COM${SUPERSCRIPT_FOUR}`, `COM${SUPERSCRIPT_DIGITS.join('')}`, `${SUPERSCRIPT_DIGITS[0] ?? ''}COM`]) {
+      expect(isPortableRelativeArtifactPath(path), path).toBe(true);
+    }
+  });
+
+  it.each([
+    ['an alternate data stream', 'pages/p/x:stream'],
+    ['an alternate data stream of a fixed file', 'run.json:Zone.Identifier'],
+    ['the default data stream', 'pages/PAGE-000001/viewport.png::$DATA'],
+    ['a colon in a directory segment', 'pages/a:b/page.json'],
+    ['a trailing dot', 'run.json.'],
+    ['trailing dots', 'run.json...'],
+    ['a trailing space', 'run.json '],
+    ['a trailing dot and space', 'run.json. '],
+    ['a trailing dot in a directory segment', 'pages./PAGE-000001/page.json'],
+    ['a trailing space in a directory segment', 'pages /PAGE-000001/page.json'],
+    ['a device name', 'CON'],
+    ['a device name in lower case', 'con'],
+    ['a device name in mixed case', 'Con'],
+    ['a device name as the last segment', 'pages/NUL'],
+    ['a device name as a directory segment', 'pages/AUX/page.json'],
+    ['a device name with an extension', 'NUL.txt'],
+    ['a device name with two extensions', 'nul.tar.gz'],
+    ['a device name with an extension in lower case', 'pages/PAGE-000001/prn.png'],
+    ['a device name with a space before the extension', 'CON .txt'],
+    ['a serial port with an extension', 'com1.json'],
+    ['a parallel port with an extension', 'LPT9.zip'],
+  ])('rejects a path with %s', (_name, path) => {
+    expect(isPortableRelativeArtifactPath(path), JSON.stringify(path)).toBe(false);
+  });
+
+  it('rejects every device name, in upper and lower case, alone and with an extension, as a path and as one segment', () => {
+    for (const device of WINDOWS_RESERVED_DEVICE_NAMES) {
+      for (const name of [device, device.toLowerCase(), `${device}.txt`, `${device.toLowerCase()}.json`, `pages/${device}/page.json`]) {
+        expect(isPortableRelativeArtifactPath(name), name).toBe(false);
+      }
+      expect(isPortableArtifactPathSegment(device), device).toBe(false);
+      expect(isPortableArtifactPathSegment(`${device}.png`), device).toBe(false);
+    }
+  });
+
+  it('rejects the same names as one segment', () => {
+    for (const segment of ['x:stream', 'run.json.', 'run.json ', 'CON', 'nul.txt', 'COM0', 'lpt0.zip']) {
+      expect(isPortableArtifactPathSegment(segment), JSON.stringify(segment)).toBe(false);
+    }
+  });
+
+  it('accepts names that only look like a device name, and dots and spaces that are not at the end', () => {
+    for (const path of [
+      'CONSOLE', 'CON-1', 'COMMIT', 'COM', 'LPT', 'COM10', 'LPT10', 'NULL', 'AUXILIARY', 'xCON', 'PRN_', 'pages/console.png',
+      'pages/PAGE-000001/file.name.with.dots.png', '.hidden', 'pages/.config/a.json', 'pages/PAGE-000001/a b.png', ' leading-space.png',
+    ]) {
+      expect(isPortableRelativeArtifactPath(path), JSON.stringify(path)).toBe(true);
+    }
+  });
+
+  it('accepts every name that BeakSight writes, made by the functions that make them', () => {
+    const runIds = [
+      createRunIdFromTime(new Date('1000-01-01T00:00:00.000Z')),
+      createRunIdFromTime(new Date('2026-10-09T12:34:56.000Z')),
+      createRunIdFromTime(new Date('9999-12-31T23:59:59.999Z')),
+      createRunIdFromTime(new Date()),
+      createRunId(0),
+      createRunId(Number.MAX_SAFE_INTEGER),
+    ];
+    const pageIds = [createPageId(0), createPageId(1), createPageId(999_999), createPageId(1_000_000), createPageId(Number.MAX_SAFE_INTEGER)];
+    const numbers = [1, Number.MAX_SAFE_INTEGER];
+    const segments = [
+      ...runIds,
+      ...pageIds,
+      ...Object.values(RUN_ARTIFACT_FILE_NAMES),
+      ...Object.values(PAGE_ARTIFACT_FILE_NAMES),
+      ...Object.values(SCREENSHOT_FILE_NAMES),
+      ...Object.values(CHECKPOINT_ARTIFACT_FILE_NAMES),
+      ...VIEWPORT_PROFILES,
+      PAGES_ARTIFACT_DIRECTORY,
+      CHECKPOINT_ARTIFACT_DIRECTORY,
+      DIAGNOSTICS_ARTIFACT_DIRECTORY,
+      ...numbers.map((attempt) => `${RETRY_ARTIFACT_DIRECTORY_PREFIX}${attempt}`),
+      bundleFileName('1000-01-01T00:00:00.000Z'),
+      bundleFileName('2026-10-08T03:09:30.000Z'),
+      bundleFileName('9999-12-31T23:59:59.999Z'),
+      bundleFileName(new Date().toISOString()),
+      LEGACY_BUNDLE_FILE_NAME,
+      `${PREFLIGHT_TEMPORARY_FILE_PREFIX}${randomUUID()}${PREFLIGHT_TEMPORARY_FILE_SUFFIX}`,
+    ];
+    const checkpointFiles = Object.keys(CHECKPOINT_ARTIFACT_FILE_NAMES) as (keyof typeof CHECKPOINT_ARTIFACT_FILE_NAMES)[];
+    const pageFiles = Object.keys(PAGE_ARTIFACT_FILE_NAMES) as (keyof typeof PAGE_ARTIFACT_FILE_NAMES)[];
+    const paths = [
+      ...segments,
+      CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
+      ...checkpointFiles.map((file) => checkpointArtifactRelativePath(file)),
+      ...pageIds.flatMap((pageId) => [
+        ...pageFiles.map((file) => pageArtifactRelativePath(pageId, file)),
+        checkpointPageArtifactRelativePath(pageId),
+        ...VIEWPORT_PROFILES.flatMap((viewport) => SCREENSHOT_CAPTURE_TYPES.flatMap((captureType) =>
+          [null, ...numbers].map((retryAttempt) => screenshotRelativePath(pageId, viewport, captureType, retryAttempt)))),
+        ...numbers.flatMap((executionNumber) => numbers.map((attemptNumber) =>
+          siteUnavailableDiagnosticRelativePath(pageId, executionNumber, attemptNumber))),
+      ]),
+    ];
+    for (const segment of segments) {
+      expect(isPortableArtifactPathSegment(segment), segment).toBe(true);
+    }
+    for (const path of paths) {
+      expect(isPortableRelativeArtifactPath(path), path).toBe(true);
+      for (const segment of path.split('/')) {
+        expect(isPortableArtifactPathSegment(segment), `${segment} in ${path}`).toBe(true);
+      }
+    }
   });
 });

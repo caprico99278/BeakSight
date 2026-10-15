@@ -8,8 +8,7 @@
 // D1（サイトの不調で止めたときの診断の記録の設計書 2.1、2.2）: Passive の各ビューポートの読み込みの観察（`navigationDiagnostics`）を、
 // ページの結果（`PageAuditResult`）と Evidence の外に持つ。始めなかったビューポートは `null`。
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createServer, type ServerResponse } from 'node:http';
-import type { Socket } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser } from 'playwright';
@@ -35,6 +34,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { LOOPBACK_HOST, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -54,9 +54,6 @@ const STALL_AFTER_HEADERS_NAVIGATION_TIMEOUT_MS = 2_000;
 const SHORT_OVERALL_PAGE_TIMEOUT_MS = 8_000;
 /** 監査するページのパス。サーバは、このパスへの GET の回数ごとに振る舞いを変える。 */
 const PAGE_PATH = '/site-unavailability.html';
-
-/** テストの中のサーバの address（観察の結果の接続先の IP の確かめにも使う）。 */
-const LOOPBACK_ADDRESS = '127.0.0.1';
 
 const OK_STATUS = 200;
 const NOT_FOUND_STATUS = 404;
@@ -197,8 +194,7 @@ async function startSiteServer(responses: readonly PageResponse[]): Promise<Site
     throw new Error('the site server needs at least one page response');
   }
   let pageGets = 0;
-  const sockets = new Set<Socket>();
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0];
     if (request.method === 'GET' && pathname === PAGE_PATH) {
       pageGets += 1;
@@ -208,34 +204,10 @@ async function startSiteServer(responses: readonly PageResponse[]): Promise<Site
     response.writeHead(NOT_FOUND_STATUS, { 'Content-Type': 'text/plain; charset=utf-8' });
     response.end('not found');
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  const port = await new Promise<number>((resolvePort, reject) => {
-    server.once('error', reject);
-    server.listen({ host: LOOPBACK_ADDRESS, port: 0 }, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('site server did not bind to a TCP port'));
-        return;
-      }
-      resolvePort(address.port);
-    });
-  });
-  let closing: Promise<void> | undefined;
   const siteServer: SiteServer = {
-    origin: `http://${LOOPBACK_ADDRESS}:${port}`,
+    origin: server.origin,
     pageGets: () => pageGets,
-    close: () => {
-      closing ??= new Promise<void>((resolveClose, reject) => {
-        for (const socket of sockets) {
-          socket.destroy();
-        }
-        server.close((error) => (error === undefined ? resolveClose() : reject(error)));
-      });
-      return closing;
-    },
+    close: server.close,
   };
   servers.push(siteServer);
   return siteServer;
@@ -384,7 +356,7 @@ function expectHeadersSentAndResponse(request: NavigationDocumentRequestDiagnost
     expect(request.loadingFinishedAtMs).toBeNull();
   } else {
     expect(hop?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
-    expect(hop?.remoteIpAddress).toBe(LOOPBACK_ADDRESS);
+    expect(hop?.remoteIpAddress).toBe(LOOPBACK_HOST);
   }
 }
 
@@ -557,7 +529,7 @@ describe('PageAuditor records the navigation diagnostics of the Passive loads (s
       expect(result.viewports[viewport]).toMatchObject({ navigationOutcome: 'OK', httpStatus: OK_STATUS });
       expect(result.viewports[viewport].status).not.toBe('FAILED');
       const request = onlyObservedDocumentRequest(outcome, viewport);
-      expect(request.hops[0]).toMatchObject({ url: pageUrl, method: 'GET', httpStatus: OK_STATUS, remoteIpAddress: LOOPBACK_ADDRESS });
+      expect(request.hops[0]).toMatchObject({ url: pageUrl, method: 'GET', httpStatus: OK_STATUS, remoteIpAddress: LOOPBACK_HOST });
       expect(request.hops[0]?.requestHeadersSentAtMs).toEqual(expect.any(Number));
       expect(request.hops[0]?.responseHeadersReceivedAtMs).toEqual(expect.any(Number));
       expect(request.loadingFinishedAtMs).toEqual(expect.any(Number));

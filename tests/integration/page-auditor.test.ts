@@ -37,11 +37,11 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import {
   PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE,
-  PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE,
   PassiveContextCloseDeadlineError,
-  PassivePageCloseDeadlineError,
 } from '../../src/orchestration/passive-session-close.js';
+import { chromiumNetErrorCode } from '../../src/orchestration/page-navigation.js';
 import { PassiveSessionOpenDeadlineError } from '../../src/orchestration/passive-session-open.js';
+import { isNetworkLayerFailure } from '../../src/safety/network-layer-failure.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
@@ -414,6 +414,17 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
     await expect(validateArtifact('page', JSON.parse(JSON.stringify(result)) as unknown)).resolves.toEqual({ ok: true });
   }, AUDIT_TEST_TIMEOUT_MS);
 
+  /**
+   * 理由が `NAVIGATION_FAILED` で、`detail` が `FAILED:<Chromium のエラーのコード>` の形、かつ、そのコードが網の層の失敗の一覧
+   * （`isNetworkLayerFailure`）にあること（DEF-085 fix round 1。中継なしの `net::ERR_CONNECTION_REFUSED` と同じ扱いのコード）。
+   */
+  const expectNetworkLayerFailureReason = (reason: { readonly code: string; readonly detail: string | null } | undefined): void => {
+    expect(reason?.code).toBe('NAVIGATION_FAILED');
+    const code = chromiumNetErrorCode(reason?.detail ?? null);
+    expect(reason?.detail).toBe(`FAILED:${code ?? ''}`);
+    expect(code !== null && isNetworkLayerFailure(code), String(reason?.detail)).toBe(true);
+  };
+
   // R15a（設計書 5.6.4）: そのほかの失敗の detail は `FAILED:<Chromium のエラーのコード>`。Run Coordinator は、これで再試行を判断する。
   // SU2a（サイトが応答しないときに Run を止める設計書 3.1）: 接続の拒否はサイトの不調なので、Mobile は始めない（SKIPPED）。
   it('writes FAILED:<Chromium error code> as the detail when nothing listens on the port', async () => {
@@ -430,8 +441,9 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
       httpStatus: null,
     });
     // ナビゲーションの失敗の理由は、最初に記録する。ほかの理由（閉じる処理の失敗など）は、この変更の対象ではないので確かめない。
-    expect(result.viewports.desktop.incompleteReasons[0])
-      .toEqual({ code: 'NAVIGATION_FAILED', detail: 'FAILED:net::ERR_CONNECTION_REFUSED' });
+    // DEF-085 fix round 1: Passive の Context は出口の中継を通るので、接続の拒否の Chromium のエラーのコードは、中継が接続を切った
+    // コード（`net::ERR_CONNECTION_RESET`）になる。コードの文字列だけを「網の層の失敗の一覧のどれか」で確かめる（形と扱いは変えない）。
+    expectNetworkLayerFailureReason(result.viewports.desktop.incompleteReasons[0]);
     expect(evidenceOf(outcome, 'network', 'desktop')).toHaveLength(1);
     expect(result.viewports.mobile).toMatchObject({
       status: 'SKIPPED',
@@ -439,7 +451,8 @@ describe('PageAuditor navigation failures (4.3.0, 4.5.4)', () => {
       httpStatus: null,
       incompleteReasons: [{ code: 'SITE_UNAVAILABLE', detail: null }],
     });
-    expect(result.incompleteReasons[0]).toEqual({ code: 'NAVIGATION_FAILED', detail: 'FAILED:net::ERR_CONNECTION_REFUSED' });
+    expectNetworkLayerFailureReason(result.incompleteReasons[0]);
+    expect(result.incompleteReasons[0]).toEqual(result.viewports.desktop.incompleteReasons[0]);
     // DEF-004: 許可した GET のネットワークの層の失敗は、Guard の違反にならない。閉じる処理の失敗の理由も加わらない。
     expect(outcome.safety.invariantViolationCount).toBe(0);
     for (const viewport of ['desktop', 'mobile'] as const) {
@@ -679,7 +692,8 @@ describe('PageAuditor attempt argument (DEF-007)', () => {
 });
 
 // DEF-038（決まりの変更）: page は個別に閉じず、Context と一緒に閉じる。以前は DEF-006 として、page を閉じる処理が終わらない場合は
-// 期限（`PAGE_CLOSE_TIMEOUT_MS`）で見切り、場面 `passive-page-close` の理由として記録してから Context を閉じることを確かめていた。
+// 期限（以前の `PAGE_CLOSE_TIMEOUT_MS`）で見切り、場面 `passive-page-close` の理由として記録してから Context を閉じることを確かめていた。
+// CCX-21（CC-049）で、page を閉じる処理の期限と、その場面の名前を消した（期限は注入しない）。
 // 今は、page を閉じる処理（止まる場合も）を呼ばないので、その理由は記録されず、待たずに Context を閉じることを確かめる。
 describe('PageAuditor page close deadline (DEF-006, DEF-038)', () => {
   it('does not close the page by itself, so a page close that does not finish is never waited for, and closes the Context', async () => {
@@ -701,7 +715,6 @@ describe('PageAuditor page close deadline (DEF-006, DEF-038)', () => {
     const { outcome, remainingContextCount } = await auditFixture(server, '/index.html', {
       overrides: { ...NO_STRESS_SWEEP, audit: { interactions: false, screenshots: false } },
       createFactory: (config) => new HangingPageCloseFactory(browser, config, () => new SafetyLedger()),
-      deadlines: { pageCloseTimeoutMs: SHORT_CLOSE_DEADLINE_MS },
     });
     const elapsedMs = performance.now() - startedAt;
 
@@ -710,7 +723,7 @@ describe('PageAuditor page close deadline (DEF-006, DEF-038)', () => {
       expect(outcome.result.viewports[viewport].status).toBe('AUDITED');
       // 場面 `passive-page-close` の理由（以前の DEF-006 の記録）は、もう出ない。
       expect(outcome.result.viewports[viewport].incompleteReasons).toEqual([]);
-      expect(JSON.stringify(outcome.result.viewports[viewport].incompleteReasons)).not.toContain(PASSIVE_PAGE_CLOSE_DEADLINE_MESSAGE);
+      expect(JSON.stringify(outcome.result.viewports[viewport].incompleteReasons)).not.toContain('passive-page-close');
     }
     expect(outcome.safety.invariantViolationCount).toBe(0);
     // 2つのビューポートで、page を閉じる処理を呼ばずに、Context を閉じる。止まり続けない。
@@ -728,6 +741,57 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
   const DEADLINE_AUDIT_TEST_TIMEOUT_MS = 60_000;
   /** session の作成の期限切れの理由のコード（C18n）。詳細はない。 */
   const SESSION_OPEN_DEADLINE_REASON = 'SESSION_OPEN_DEADLINE';
+  /** Passive の Context と page の作成の期限切れの理由（ビューポートの失敗）。 */
+  const PASSIVE_OPEN_DEADLINE_REASON = { code: 'DEADLINE_EXCEEDED', detail: 'passive-context' } as const;
+
+  /**
+   * Passive の Context と page を、監査の前に作っておく factory（DEF-035）。
+   * Interaction の session の作成の期限を短くする（`SHORT_OPEN_DEADLINE_MS`）ために注入する `sessionOpenTimeoutMs` は、Page Auditor の
+   * Passive の Context と page の作成の期限にも使われる。CPU が混雑すると、Desktop の Passive の作成がこの期限を過ぎ（ビューポートの
+   * `DEADLINE_EXCEEDED`、場面 `passive-context`）、Interaction の段階まで進まない（Interaction の session を1つも作らない）。
+   * そこで、Passive の Context と page は、監査の前に（期限の外で）本物の部品で作っておき、監査の中の作成の求めには、作っておいたものを
+   * 求めの順に返す。監査の中の Passive の作成の期限の判定は、終わった作成を受け取るだけになり、時間に左右されない。
+   * Interaction の session の作成（期限を短くして確かめる対象）は変えない。作っておいたものを使い切った後の求めは、本物の部品で作る。
+   */
+  class PreparedPassiveSessionFactory extends BrowserContextFactory {
+    readonly #preparedContexts: { readonly viewport: Viewport; readonly context: BrowserContext }[] = [];
+    readonly #preparedPages = new Map<BrowserContext, Page>();
+
+    /** `viewports` の順に、Passive の Context と page を作っておく。Page Auditor は、Desktop、Mobile の順に作成を求める。 */
+    async preparePassiveSessions(viewports: readonly Viewport[]): Promise<void> {
+      for (const viewport of viewports) {
+        const context = await super.createPassiveContext(viewport);
+        this.#preparedPages.set(context, await super.createPassivePage(context));
+        this.#preparedContexts.push({ viewport, context });
+      }
+    }
+
+    override async createPassiveContext(
+      viewport: Viewport,
+      role?: Parameters<BrowserContextFactory['createPassiveContext']>[1],
+    ): Promise<BrowserContext> {
+      const prepared = this.#preparedContexts.shift();
+      if (prepared === undefined) {
+        return super.createPassiveContext(viewport, role);
+      }
+      // 作っておいたものと違う求め（大きさか役割の違い）は、テストの前提の誤りなので、失敗にする（黙って別の Context を使わない）。
+      if ((role !== undefined && role !== 'PRIMARY')
+        || prepared.viewport.width !== viewport.width
+        || prepared.viewport.height !== viewport.height) {
+        throw new Error(`the prepared Passive Context (${prepared.viewport.width}x${prepared.viewport.height}) does not match the request`);
+      }
+      return prepared.context;
+    }
+
+    override async createPassivePage(context: BrowserContext): Promise<Page> {
+      const page = this.#preparedPages.get(context);
+      if (page === undefined) {
+        return super.createPassivePage(context);
+      }
+      this.#preparedPages.delete(context);
+      return page;
+    }
+  }
 
   it('marks both viewports FAILED with DEADLINE_EXCEEDED when the Passive Context is not created before the deadline', async () => {
     const server = await startServer();
@@ -977,7 +1041,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     });
 
     const cases: readonly (readonly [unknown, string])[] = [
-      [new PassivePageCloseDeadlineError(), 'stress-layout:CLOSE_DEADLINE_EXCEEDED'],
+      [new PassiveContextCloseDeadlineError(), 'stress-layout:CLOSE_DEADLINE_EXCEEDED'],
       [
         new AggregateError(
           [new Error('work failed'), new AggregateError([new Error('page close failed'), new PassiveContextCloseDeadlineError()])],
@@ -1001,24 +1065,34 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     const gate = createDeferred<undefined>();
     let sessionCalls = 0;
     let lateSessions = 0;
+    const overrides: TestConfigOverrides = { ...NO_STRESS_SWEEP, audit: { screenshots: false } };
+    const config = createTestConfig(server.origin, '/', overrides);
+    const factory = new (class extends PreparedPassiveSessionFactory {
+      override async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
+        sessionCalls += 1;
+        await gate.promise;
+        const session = await super.createInteractionSession(viewport);
+        lateSessions += 1;
+        return session;
+      }
+    })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+    // Passive の Context と page は、期限の外で作っておく（DEF-035。混雑で Interaction の段階まで進まないことを防ぐ）。
+    await factory.preparePassiveSessions([config.viewports.primaryDesktop, config.viewports.primaryMobile]);
     const startedAt = performance.now();
     const { outcome } = await auditFixture(server, '/accordion.html', {
-      overrides: { ...NO_STRESS_SWEEP, audit: { screenshots: false } },
-      createFactory: (config) => new (class extends BrowserContextFactory {
-        override async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
-          sessionCalls += 1;
-          await gate.promise;
-          const session = await super.createInteractionSession(viewport);
-          lateSessions += 1;
-          return session;
-        }
-      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
+      overrides,
+      createFactory: (auditConfig) => {
+        expect(auditConfig).toEqual(config);
+        return factory;
+      },
       deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
     });
     const elapsedMs = performance.now() - startedAt;
 
     // 候補ごとに、注入した期限で見切る（実際の期限 `SESSION_OPEN_TIMEOUT_MS` を待たない）。
     expect(elapsedMs).toBeLessThan(SESSION_OPEN_TIMEOUT_MS);
+    // Desktop の Passive の作成が期限を過ぎていない（過ぎると、Interaction の段階まで進まない。DEF-035）。
+    expect(outcome.result.viewports.desktop.incompleteReasons).not.toContainEqual(PASSIVE_OPEN_DEADLINE_REASON);
     const interactions = evidenceOf(outcome, 'interaction', 'desktop');
     expect(sessionCalls).toBeGreaterThan(0);
     expect(interactions).toHaveLength(sessionCalls);
@@ -1054,19 +1128,30 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     };
     process.on('unhandledRejection', onUnhandledRejection);
     try {
+      const overrides: TestConfigOverrides = { ...NO_STRESS_SWEEP, audit: { screenshots: false } };
+      const config = createTestConfig(server.origin, '/', overrides);
+      const factory = new (class extends PreparedPassiveSessionFactory {
+        override async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
+          sessionCalls += 1;
+          await gate.promise;
+          // 作っておいた Passive の Context は、監査の中で使い切っている。ここでは本物の部品で、遅れた Context を作る。
+          const context = await this.createPassiveContext(viewport);
+          lateFailures += 1;
+          throw new ContextConstructionError(context, this.getSafetyLedger(context), new Error('late guard failure'));
+        }
+      })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
+      // Passive の Context と page は、期限の外で作っておく（DEF-035。混雑で Interaction の段階まで進まないことを防ぐ）。
+      await factory.preparePassiveSessions([config.viewports.primaryDesktop, config.viewports.primaryMobile]);
       const { outcome } = await auditFixture(server, '/accordion.html', {
-        overrides: { ...NO_STRESS_SWEEP, audit: { screenshots: false } },
-        createFactory: (config) => new (class extends BrowserContextFactory {
-          override async createInteractionSession(viewport: Viewport): Promise<InteractionGuardedSession> {
-            sessionCalls += 1;
-            await gate.promise;
-            const context = await this.createPassiveContext(viewport);
-            lateFailures += 1;
-            throw new ContextConstructionError(context, this.getSafetyLedger(context), new Error('late guard failure'));
-          }
-        })(browser, config, () => new SafetyLedger(), TEST_FACTORY_OPTIONS),
+        overrides,
+        createFactory: (auditConfig) => {
+          expect(auditConfig).toEqual(config);
+          return factory;
+        },
         deadlines: { sessionOpenTimeoutMs: SHORT_OPEN_DEADLINE_MS },
       });
+      // Desktop の Passive の作成が期限を過ぎていない（過ぎると、Interaction の段階まで進まない。DEF-035）。
+      expect(outcome.result.viewports.desktop.incompleteReasons).not.toContainEqual(PASSIVE_OPEN_DEADLINE_REASON);
       expect(sessionCalls).toBeGreaterThan(0);
       expect(evidenceOf(outcome, 'interaction', 'desktop')
         .map(({ payload }) => ({ reason: payload.reason, reasonDetail: payload.reasonDetail })))

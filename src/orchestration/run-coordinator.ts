@@ -27,7 +27,7 @@ import type {
   ViewportAuditResult,
 } from '../core/contracts.js';
 import { resolveTimeoutMs, wait } from '../core/deadline.js';
-import type { NormalizedHttpUrlEvidence, SitemapEvidence } from '../core/evidence-types.js';
+import type { LinkEvidence, NormalizedHttpUrlEvidence, SitemapEvidence } from '../core/evidence-types.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
@@ -45,7 +45,18 @@ import { createNavigationPacer, type NavigationPacer, type NavigationPacerSnapsh
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import { collectSiteMetadata as collectSiteMetadataDefault, type SiteMetadataResult } from '../crawl/site-metadata.js';
 import { sitemapEvidenceFromMetadata } from '../crawl/sitemap-evidence.js';
+import { redactUrlSecrets } from '../safety/redact.js';
 import type { SafetyLedger, SafetyLedgerSnapshot } from '../safety/safety-ledger.js';
+import {
+  assertRunAuthentication,
+  AUTH_SESSION_LOST_SKIP_REASON,
+  authenticatedContextOptions,
+  authenticatedRunConfig,
+  authSessionLostReason,
+  isExcludedCrawlCandidate,
+  runCheckpointAuthenticationOf,
+  type RunAuthentication,
+} from './authenticated-run.js';
 import { CrawlFrontier, type CrawlUrlEntry } from './crawl-frontier.js';
 import {
   collectRunEnvironment as collectRunEnvironmentDefault,
@@ -72,8 +83,9 @@ import {
   decideRunCheckpointConclusion,
   decideRunExecutionEndReason,
   decideRunResumption,
-  RESUME_REQUEUE_SKIP_REASON_CODES,
+  restoreRunCheckpointCrawl,
   type RunCheckpoint,
+  type RunCheckpointAuthentication,
   type RunCheckpointConclusion,
   type RunCheckpointConclusionAction,
   type RunCheckpointExecution,
@@ -182,6 +194,8 @@ const SITE_UNAVAILABLE_FIRST_ATTEMPT = 1;
  * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページ（`url`）を捨てた後、`delayMs` だけ待ってから、同じページを確かめ直す（`attempt` 回目。
  *   最大 `maxAttempts` 回）。
  * - `SITE_UNAVAILABLE_SLOWDOWN`: 確かめ直しで通ったので、ページの読み込みの最小の間隔を `minIntervalMs` に上げて続ける。
+ * - `AUTH_SESSION_LOST`: 認証つきの Run で、セッションの切れを検知して、そのページ（`url`）を捨て、Run を止める（Task 25 の設計書 4.3、4.4 と、
+ *   変更履歴の 2026-10-10 の T25d の Blocker の行の (2)。T25d）。ワーカーが、画面に「このページを読まないパスに足す」を案内するために使う。
  */
 export type RunNotice =
   | {
@@ -199,6 +213,14 @@ export type RunNotice =
     readonly kind: 'SITE_UNAVAILABLE_SLOWDOWN';
     /** 新しい最小の間隔（ms）。 */
     readonly minIntervalMs: number;
+  }
+  | {
+    readonly kind: 'AUTH_SESSION_LOST';
+    /**
+     * 捨てたページの URL（巡回の記録の、正規化した URL）。認証つきの Run の知らせなので、`#notify` が、URL の秘密の伏せ字
+     * （`redactUrlSecrets`。userinfo と秘密に見える query の値。T25f）にかけてから渡す。
+     */
+    readonly url: string;
   };
 
 /**
@@ -264,7 +286,7 @@ export interface RunCoordinatorDependencies {
   /**
    * Context と page の作成・終了の期限の注入口（RP18 の指摘2。DEF-008、R15r-4）。PREFLIGHT、環境の事実、サイトの metadata、
    * Page Auditor に、そのまま渡す（PREFLIGHT には、Browser を閉じる期限 `browserCloseTimeoutMs` も加えて渡す）。
-   * 省略した項目は、`limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
+   * 省略した項目は、`limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
    * 期限が正の安全な整数でない場合は `RangeError`、形が不正な場合は `TypeError` を、コンストラクタが投げる。
    */
   readonly deadlines?: PassiveSessionDeadlineOptions | undefined;
@@ -333,7 +355,33 @@ export interface RunCoordinatorDependencies {
   readonly writeSiteUnavailableDiagnostic?:
     | ((runDirectory: string, record: SiteUnavailableDiagnosticRecord, attemptNumber: number) => Promise<void>)
     | undefined;
+  /**
+   * 認証つきの Run の指定（Task 25 の設計書 3 章、4.3、4.7。T25c。`src/orchestration/authenticated-run.ts`）。省略すると、今と完全に同じ
+   * （公開監査）。呼び出し側（ワーカー。T25d）が、ログインの段の後に渡す。渡すと、次のとおりにする。
+   * - 有効な設定の `audit.interactions` を false にする（Interaction を行わない。`run.json` の `effectiveConfig` に記録する。4.7）。
+   * - PREFLIGHT に、factory の認証の指定（状態の注入、世代つきの受け継ぎ、Guard の監査の段の除外）を渡す（4.3）。
+   * - Page Auditor に、セッションの切れの path を渡す。セッションの切れを検知したページは捨て（理由 `AUTH_SESSION_LOST` の SKIPPED。再試行しない）、
+   *   次のページを始めず、残りの URL を同じ理由（`detail` は `null`）の SKIPPED にする。Run の理由にも1件残す（Run Status は PARTIAL）。
+   * - 巡回の候補に、監査の段の除外に当たる URL と、セッションの切れの path の URL を入れない（`isExcludedCrawlCandidate`）。
+   * 形が正しくない値と、`approvedTestOrigins` が設定の `site.allowedOrigins` に含まれない値は、コンストラクタが `TypeError` を投げる。
+   * 状態（秘密）は、ログ、誤りの文、成果物、Evidence、保存に入れない。
+   */
+  readonly authentication?: RunAuthentication | undefined;
+  /**
+   * 外から渡す、ページの読み込みの間隔を守る部品（CCX-22。CC-085。DEF-102 の続き）。省略すると、今と完全に同じ（Run Coordinator が、設定の
+   * `crawl.minNavigationIntervalMs` で自分で作る。CLI は渡さない）。ワーカーは、自動ログインの段と同じ部品を渡す（ログインの段の最後の要求から、
+   * Run の最初の読み込みまで、設定の間隔以上空ける）。渡す側は、同じ設定の間隔で作る。
+   * - 新しい Run: この部品で待ち、factory の Guard の送った時刻の記録もこの部品に入れる。`run.json` の負荷の記録と保存の記録（回数と待ちの合計）は、
+   *   `run()` を始めた時点の記録からの差だけを数える（ログインの段の読み込みは、Run の記録に入れない）。
+   * - 再開（`resumeFrom`）: 使わない。今どおり、保存の記録から自分で作る（最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻の遅い方。
+   *   この実行の開始は、呼ぶ側が先に終えたログインの段の後なので、ログインの段の最後の要求からも、設定の間隔以上空く）。
+   * `beforeNavigation`・`snapshot`・`raiseMinimumInterval`・`recordDocumentRequestSent` の関数を持たない値は、コンストラクタが `TypeError` を投げる。
+   */
+  readonly navigationPacer?: NavigationPacer | undefined;
 }
+
+/** 外から渡す pacer が持つべき操作の名前（CCX-22）。 */
+const NAVIGATION_PACER_OPERATION_NAMES = Object.freeze(['beforeNavigation', 'snapshot', 'raiseMinimumInterval', 'recordDocumentRequestSent'] as const);
 
 /**
  * 再試行の対象の、Desktop の `NAVIGATION_FAILED` の理由の `detail` の一覧（Task 14〜17 の設計書 5.2、5.6.4）。
@@ -477,12 +525,8 @@ const RUN_FAILURE_LABELS = Object.freeze({
   validation: 'run-validation',
   /** Browser を閉じる処理の失敗と、期限切れ。 */
   browserClose: 'browser-close',
-  /** metadata の取得に使った page を閉じる処理の失敗。 */
-  metadataPageClose: 'site-metadata-page-close',
   /** metadata の取得に使った Context を閉じる処理の失敗。 */
   metadataContextClose: 'site-metadata-context-close',
-  /** 環境の事実（User-Agent）の読み取りに使った page を閉じる処理の失敗と、期限切れ（RP18 の指摘1）。 */
-  environmentPageClose: 'environment-page-close',
   /** 環境の事実（User-Agent）の読み取りに使った Context を閉じる処理の失敗と、期限切れ（RP18 の指摘1）。 */
   environmentContextClose: 'environment-context-close',
 } as const);
@@ -529,8 +573,6 @@ const CHECKPOINT_SESSION_OPERATION_NAMES = Object.freeze([
   'saveState',
 ] as const satisfies readonly (keyof RunCoordinatorCheckpointSession)[]);
 
-/** 再開のときに、待ち行列に戻す SKIPPED の理由のコード（`CrawlFrontier.restore` に渡す。中断した Run の再開の設計書 3.2）。 */
-const RESUME_REQUEUE_SKIP_REASON_CODE_SET: ReadonlySet<IncompleteReasonCode> = new Set(RESUME_REQUEUE_SKIP_REASON_CODES);
 
 /** 保存に使う、Run の値（`run()` が組み立てて `#crawl` に渡す）。 */
 interface RunCheckpointContext {
@@ -544,6 +586,8 @@ interface RunCheckpointContext {
    * 閉じたもの）に続けて、この実行の分を最後に1件加えたもの。この実行の分の終わりの時刻と終わり方は `null`（実行の途中）。
    */
   readonly executions: readonly [RunCheckpointExecution, ...RunCheckpointExecution[]];
+  /** 保存に記録する Run の種類（T25g-2。認証つきの Run だけ。公開監査では `null` で、保存に項目を書かない）。 */
+  readonly authentication: RunCheckpointAuthentication | null;
 }
 
 /**
@@ -601,7 +645,7 @@ type RunSiteMetadata = Pick<SiteMetadataResult, 'records' | 'sitemap'>;
  * サイトが応答しないときに Run を止める設計書 3.2、3.3）と、その試行のページ本体の要求の観察の結果（診断の記録に使う。サイトの不調で
  * 止めたときの診断の記録の設計書 2.2、2.3）。
  */
-type RunPageAudit = Pick<PageAuditOutcome, 'result' | 'siteUnavailableDetail' | 'navigationDiagnostics'>;
+type RunPageAudit = Pick<PageAuditOutcome, 'result' | 'siteUnavailableDetail' | 'navigationDiagnostics' | 'authSessionLostDetail'>;
 
 /** 診断の記録に入れる、この実行の値（`#crawl` に渡す。サイトの不調で止めたときの診断の記録の設計書 2.3）。 */
 interface RunDiagnosticIdentity {
@@ -671,6 +715,12 @@ interface RunProgress {
    * 加える。保存しない（この実行だけの値。再開した実行で不調を検知しなければ、Run の理由は残らない）。
    */
   siteUnavailableDetail: string | null;
+  /**
+   * 認証つきの Run で、この実行で最初に検知したセッションの切れの場所（`<ビューポート>:<段階>`。T25c）。検知していなければ `null`。`#crawl` だけが、
+   * セッションの切れのページを捨てるときに入れる（そのページに違反もあれば入れない。違反の優先）。`null` でなければ、次のページを始めない。
+   * 保存しない（この実行だけの値。再開のときは、もう一度ログインする（T25d））。
+   */
+  authSessionLostDetail: string | null;
   unhandledFailures: number;
   executionComplete: boolean;
   preflightFailed: boolean;
@@ -706,6 +756,12 @@ export class RunCoordinator {
   readonly #resumeFrom: RunCoordinatorResumeInput | undefined;
   readonly #stopSignal: AbortSignal | undefined;
   readonly #diagnosticWriter: RunCoordinatorDependencies['writeSiteUnavailableDiagnostic'];
+  /** 認証つきの Run の指定（T25c）。公開監査では `null`。 */
+  readonly #authentication: RunAuthentication | null;
+  /** 外から渡した pacer（CCX-22）。渡さなければ `null`（自分で作る）。 */
+  readonly #externalNavigationPacer: NavigationPacer | null;
+  /** 保存に記録する Run の種類（T25g-2。`runCheckpointAuthenticationOf`）。公開監査では `null`。 */
+  readonly #checkpointAuthentication: RunCheckpointAuthentication | null;
   /** 最後に終わった `run()` の後の保存の終わり方（`run()` が終わるまでは `null`）。 */
   #checkpointConclusion: RunCoordinatorCheckpointConclusion | null = null;
 
@@ -772,7 +828,23 @@ export class RunCoordinator {
     if (stopSignal !== undefined && !(stopSignal instanceof AbortSignal)) {
       throw new TypeError('RunCoordinator stopSignal must be an AbortSignal when given');
     }
-    this.#config = config;
+    const authentication: unknown = dependencies.authentication;
+    if (authentication !== undefined) {
+      assertRunAuthentication(authentication, config);
+    }
+    const externalNavigationPacer: unknown = dependencies.navigationPacer;
+    if (
+      externalNavigationPacer !== undefined
+      && (!isRecord(externalNavigationPacer)
+        || !NAVIGATION_PACER_OPERATION_NAMES.every((name) => typeof externalNavigationPacer[name] === 'function'))
+    ) {
+      throw new TypeError(`RunCoordinator navigationPacer must have ${NAVIGATION_PACER_OPERATION_NAMES.join(', ')} when given`);
+    }
+    this.#externalNavigationPacer = dependencies.navigationPacer ?? null;
+    this.#authentication = authentication ?? null;
+    this.#checkpointAuthentication = authentication === undefined ? null : runCheckpointAuthenticationOf(authentication);
+    // T25c: 認証つきの Run では、Interaction を行わないことを、有効な設定で記録する（Task 25 の設計書 4.7）。公開監査は、設定のまま。
+    this.#config = authentication === undefined ? config : authenticatedRunConfig(config);
     this.#launchBrowser = launchBrowser;
     this.#createSafetyLedger = createSafetyLedger;
     this.#clock = clock;
@@ -831,7 +903,8 @@ export class RunCoordinator {
    *
    * ページの読み込みの間隔を守る部品（`NavigationPacer`。サイトへの負荷の制御の設計書 4.1）は、Run の初めに1つだけ作る。間隔は設定の
    * `crawl.minNavigationIntervalMs`、時刻は注入した `now`、待ちは注入した `sleep`（省略すると本番の待ち）である。robots.txt と
-   * sitemap.xml の取得と、Page Auditor に、同じものを渡す。
+   * sitemap.xml の取得と、Page Auditor に、同じものを渡す。PREFLIGHT にも `contextFactoryOptions: { navigationPacer }` で渡し、factory が、
+   * すべての Context の Guard に、main frame の文書の要求を送った時刻を記録させる（間隔は、開始と送った時刻の遅い方から数える。DEF-100 fix）。
    *
    * 要求の実績を数える部品（`LoadMeter`。設計書 4.5）も、Run の初めに1つだけ作る。許可 Origin は設定の `site.allowedOrigins`、時刻は
    * 注入した `now` である。PREFLIGHT に `contextFactoryOptions: { loadMeter }` で渡し、PREFLIGHT が、Run のすべての Context を作る
@@ -933,12 +1006,17 @@ export class RunCoordinator {
     // 設定の間隔が不正なら、ここで `RangeError` を投げる（Run のディレクトリを作る前、Browser を起動する前）。再開のときは、pacer と meter を
     // 保存の負荷の記録から続ける（中断した Run の再開の設計書 4.9）。pacer の最後の読み込みの開始の時刻は、保存の値と、この実行の開始の時刻の
     // 遅い方にする（再開の直後の最初の読み込みも、前の回の実際の最後の読み込みから、最小の間隔以上空ける。RR の Minor-1。R7b）。
-    const navigationPacer = createNavigationPacer({
+    // CCX-22: 外から pacer を渡された新しい Run は、その pacer を使う（記録は、ここからの差だけを数える）。自分の pacer も作るのは、設定の間隔の
+    // 確かめ（`RangeError`）を、外から渡したときも同じ時点で行うため。再開のときは、外の pacer を使わない（`navigationPacer` の依存の説明）。
+    const ownNavigationPacer = createNavigationPacer({
       minIntervalMs: config.crawl.minNavigationIntervalMs,
       now: this.#now,
       sleep: this.#sleep,
       ...(saved === undefined ? {} : { initial: resumedNavigationPacerRecord(saved.load.pacer, startedAtMs) }),
     });
+    const navigationPacer = this.#externalNavigationPacer !== null && saved === undefined
+      ? runScopedNavigationPacer(this.#externalNavigationPacer)
+      : ownNavigationPacer;
     const loadMeter = createLoadMeter({
       allowedOrigins: config.site.allowedOrigins,
       now: this.#now,
@@ -963,6 +1041,7 @@ export class RunCoordinator {
       loadMeter,
       maxRuntimeExceeded: false,
       siteUnavailableDetail: null,
+      authSessionLostDetail: null,
       executionComplete: false,
       preflightFailed: false,
       guardEnabled: false,
@@ -1011,7 +1090,14 @@ export class RunCoordinator {
         deadlines: { ...this.#deadlines, browserCloseTimeoutMs: this.#browserCloseTimeoutMs },
         // Run のすべての Context の要求の終わりの事象を、この Run の meter に渡させる（設計書 4.5。PREFLIGHT は中身を見ない）。
         // 応答は、この Run のキャッシュに渡させ、読み込み直しの Context では、キャッシュから返させる（設計書 4.6、4.7）。
-        contextFactoryOptions: { loadMeter, resourceCache },
+        contextFactoryOptions: {
+          loadMeter,
+          resourceCache,
+          // DEF-100 fix: Run の pacer に、Guard が main frame の文書の要求を送った時刻を記録させる（サイトに届く間隔を設定以上にする）。
+          navigationPacer,
+          // T25c: 認証つきの Run だけ、状態の注入と Guard の監査の段の除外を、factory に渡す（Task 25 の設計書 4.3）。
+          ...(this.#authentication === null ? {} : { authentication: authenticatedContextOptions(this.#authentication) }),
+        },
       })
       : null;
     const browser: Browser | null = preflight?.ok === true ? preflight.browser : null;
@@ -1045,11 +1131,9 @@ export class RunCoordinator {
         onSafetyLedger: () => undefined,
         // 閉じる処理の失敗（期限切れを含む）は、Run の理由にする（RP18 の指摘1。Context が閉じたことを確かめられていないため、
         // Run は `COMPLETE` にならない。Task 18 の前の整理の設計書 4.2）。
-        onCloseFailure: ({ step, error }) => {
-          progress.reasons.push(unhandledFailureReason(
-            step === 'page' ? RUN_FAILURE_LABELS.environmentPageClose : RUN_FAILURE_LABELS.environmentContextClose,
-            error,
-          ));
+        // 失敗は Context を閉じる処理のものだけ（page は個別に閉じない。DEF-038。CCX-23 で page の場面の名前を消した）。
+        onCloseFailure: ({ error }) => {
+          progress.reasons.push(unhandledFailureReason(RUN_FAILURE_LABELS.environmentContextClose, error));
         },
         deadlines: this.#deadlines,
       });
@@ -1067,6 +1151,7 @@ export class RunCoordinator {
             toolVersion,
             startedAt: runStartedAt,
             executions: executionsEndingWith(previousExecutions, execution),
+            authentication: this.#checkpointAuthentication,
           };
         // 診断の記録の実行の番号は、前の回までの実行の数 + 1（`run.json` の実行の記録の、この実行の位置。サイトの不調で止めたときの
         // 診断の記録の設計書 2.3）。
@@ -1099,7 +1184,7 @@ export class RunCoordinator {
           // robots.txt と sitemap.xml はなし、ページの外の Ledger は、この実行のすべての Ledger にした中身。
           crawlEndContent = runCheckpointContent({
             config,
-            identity: { runId, toolVersion, startedAt: runStartedAt },
+            identity: { runId, toolVersion, startedAt: runStartedAt, authentication: this.#checkpointAuthentication },
             progress,
             crawl: restoredCrawl,
           });
@@ -1187,6 +1272,13 @@ export class RunCoordinator {
   ): Promise<RunCrawlOutcome> {
     const config = this.#config;
     const runtimeLimitReached = (): boolean => this.#now() - startedAtMs >= config.crawl.maxRuntimeMs;
+    // 巡回の候補から外す URL の判定（T25c。認証つきの Run だけ。公開監査では `null`）。Link の候補と、robots.txt と sitemap.xml の取得の
+    // 両方に、同じ判定を使う（T25c round 3）。
+    const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
+    const runAuthentication = this.#authentication;
+    const excludedCrawlCandidate = runAuthentication === null
+      ? null
+      : (url: string): boolean => isExcludedCrawlCandidate(url, crawlAllowedOrigins, runAuthentication);
     // 保存（中断した Run の再開の設計書 4.1、4.3）。保存のセッションがなければ、何もしない。保存に1回失敗したら、それより後は
     // 保存しない（新しいページも始めない）。終わったページの ID は、終わった順に並べる。ページの中で作った Ledger の snapshot は、
     // そのページの保存に入れ、状態の保存には、ページの外で作った Ledger の snapshot だけを入れる。
@@ -1255,6 +1347,8 @@ export class RunCoordinator {
           // 各ファイルの読み込みの前に、Run で1つの pacer で間隔を守る（サイトへの負荷の制御の設計書 4.1）。不調を残した後は、待たない。
           beforeNavigation: hooks.beforeNavigation,
           afterNavigation: hooks.afterNavigation,
+          // T25c round 3: 認証つきの Run では、巡回の候補と同じ判定で除外に当たるファイルを取りに行かない（Evidence は `EXCLUDED`）。
+          ...(excludedCrawlCandidate === null ? {} : { isExcludedUrl: excludedCrawlCandidate }),
         });
         // metadata の取得の Ledger は、Context の factory が作ったもので、すでに登録にある（`ledgerSnapshot` は集計に使わない）。
         // サイトの不調を検知し、Run の初めからの Ledger に違反がなければ、この実行の不調の詳細を残す（次のページを始めない。設計書 3.2）。
@@ -1270,11 +1364,9 @@ export class RunCoordinator {
         } else {
           progress.metadata = metadata;
         }
-        for (const { step, error } of metadata.closeFailures) {
-          progress.reasons.push(unhandledFailureReason(
-            step === 'page' ? RUN_FAILURE_LABELS.metadataPageClose : RUN_FAILURE_LABELS.metadataContextClose,
-            error,
-          ));
+        // 失敗は Context を閉じる処理のものだけ（page は個別に閉じない。DEF-038。CCX-23 で page の場面の名前を消した）。
+        for (const { error } of metadata.closeFailures) {
+          progress.reasons.push(unhandledFailureReason(RUN_FAILURE_LABELS.metadataContextClose, error));
         }
       }
 
@@ -1317,6 +1409,8 @@ export class RunCoordinator {
         // ページの中（次のビューポート、幅の走査の次の幅、Interaction の次の候補の前）の確かめ。今のページで作った Ledger を調べる
         // （それより前の Ledger は、ページを始める前に調べた）。
         safetyViolationRecorded: () => this.#safetyViolationRecorded(progress, progress.pageLedgerStart),
+        // T25c: 認証つきの Run だけ、セッションの切れを確かめさせる（Task 25 の設計書 4.3）。
+        ...(this.#authentication === null ? {} : { sessionLostPathPrefix: this.#authentication.sessionLostPathPrefix }),
       });
       // 新しいページを始めない理由（保存の失敗、サイトの不調、ページ数の上限、実行時間の上限、止める印）。決まった後の URL は、すべてこの
       // 理由の SKIPPED にする。
@@ -1371,6 +1465,8 @@ export class RunCoordinator {
             stopReason = CHECKPOINT_WRITE_FAILED_SKIP_REASON;
           } else if (progress.siteUnavailableDetail !== null) {
             stopReason = SITE_UNAVAILABLE_SKIP_REASON;
+          } else if (progress.authSessionLostDetail !== null) {
+            stopReason = AUTH_SESSION_LOST_SKIP_REASON;
           } else if (pagesStarted >= config.crawl.maxPages) {
             stopReason = crawlLimitReason('MAX_PAGES_REACHED');
           } else if (runtimeLimitReached()) {
@@ -1389,7 +1485,33 @@ export class RunCoordinator {
         if (!rechecking) {
           frontier.markAuditing(entry.url);
         }
-        const { result, siteUnavailableDetail, navigationDiagnostics } = await this.#auditWithRetry(auditor, entry, progress);
+        const { result, siteUnavailableDetail, navigationDiagnostics, authSessionLostDetail } = await this.#auditWithRetry(
+          auditor,
+          entry,
+          progress,
+        );
+        // T25c: 認証つきの Run で、セッションの切れを検知した（Task 25 の設計書 4.3）。そのページの Ledger に違反がなければ、ページを捨てる
+        // （ログインの画面を管理画面として監査しない。結果、ページの保存、Link、進み具合には入れない。監査を始めたページの数からも外す）。巡回の
+        // 記録で、理由 `AUTH_SESSION_LOST`（`detail` は当たった場所）の SKIPPED にし（再開のときに待ち行列に戻す）、この実行の印を残して、
+        // 次のページを始めない。そのページの Ledger は `pageLedgers` に入れないので、ページの外の Ledger として、保存と Run の集計に入る。
+        // 違反があれば、今のとおり普通の結果として保存し、違反で止める（違反の優先）。サイトの不調より先に確かめる。
+        if (
+          authSessionLostDetail !== undefined
+          && authSessionLostDetail !== null
+          && !this.#detectSafetyViolation(progress, progress.pageLedgerStart)
+        ) {
+          progress.authSessionLostDetail ??= authSessionLostDetail;
+          pagesStarted -= 1;
+          frontier.markSkipped(entry.url, authSessionLostReason(authSessionLostDetail));
+          // T25d: 止まったページを、観測の口に知らせる（URL の伏せ字は `#notify` が 1 か所で通す。T25f）。
+          this.#notify(Object.freeze({ kind: 'AUTH_SESSION_LOST', url: entry.url }));
+          removeRetryRecordsOf(progress.retries, entry.url);
+          progress.retryEvidence.delete(entry.url);
+          if (checkpoint !== null && !checkpointFailed) {
+            await saveState(checkpoint);
+          }
+          continue;
+        }
         // 診断の記録（サイトの不調で止めたときの診断の記録の設計書 2.3）。不調で止めたページ（捨てたページと、普通の結果として保存した
         // 前の実行のきっかけのページ）だけに、そのページの保存の後に渡す。違反でページを捨てなかった場合は、渡さない。試行の番号は、
         // 1 回目が 1、n 回目の確かめ直しが 1 + n（ファイルの名前に使う。設計書 3.5.2、3.6.2）。
@@ -1454,7 +1576,11 @@ export class RunCoordinator {
         progress.results.set(entry.url, result);
         frontier.markFinished(entry.url, result.status);
         // Link は、Desktop の `link` の Evidence から取り、`INTERNAL_NAVIGABLE` のものだけをキューに入れる（ARCH03）。
+        // T25c: 認証つきの Run では、監査の段の除外に当たる URL と、セッションの切れの path の URL を入れない（Task 25 の設計書 4.2、4.7）。
         for (const url of internalNavigableLinks(result)) {
+          if (excludedCrawlCandidate !== null && excludedCrawlCandidate(url)) {
+            continue;
+          }
           frontier.discover(url, entry.depth + 1);
         }
         // そのページの保存（先）と、状態の保存（後）。状態の `completedPageIds` には、そのページを含める（設計書 4.3）。そのページの
@@ -1658,14 +1784,19 @@ export class RunCoordinator {
   /**
    * 知らせ（`RunNotice`）を、注入された受け手に渡す（サイトが応答しないときに Run を止める設計書 3.5.4）。受け手がなければ、何もしない。
    * 受け手の例外と、受け手が返した Promise の reject は、握りつぶす（`#reportProgress` と同じ。表示の失敗で監査を止めないため）。
+   * 認証つきの Run（T25f。Task 25 の設計書 4.6）では、URL を持つ知らせの URL を、伏せ字の owner の `redactUrlSecrets` にかけてから渡す（知らせの
+   * URL の伏せ字は、ここだけで通す。ワーカーは、この値を IPC の `AUTH_STATE` と `NOTICE`、ジョブの行へ渡す）。公開監査では、今のまま渡す。
    */
   #notify(notice: RunNotice): void {
     const onNotice = this.#onNotice;
     if (onNotice === undefined) {
       return;
     }
+    const outgoing = this.#authentication !== null && 'url' in notice
+      ? Object.freeze({ ...notice, url: redactUrlSecrets(notice.url) })
+      : notice;
     try {
-      const returned: unknown = onNotice(notice);
+      const returned: unknown = onNotice(outgoing);
       if (returned instanceof Promise) {
         returned.catch(() => undefined);
       }
@@ -1808,7 +1939,8 @@ export class RunCoordinator {
         precedesRetry: (desktop) => retryAfter(desktop) !== null,
       });
       // サイトの不調の印があれば、再試行しない（設計書 3.3）。再試行の判断（`retryAfter`）より先に確かめ、判断を呼ばない。
-      if (outcome.siteUnavailableDetail !== null) {
+      // T25c: セッションの切れの印があっても、再試行しない（ページを捨てて Run を止める）。
+      if (outcome.siteUnavailableDetail !== null || (outcome.authSessionLostDetail ?? null) !== null) {
         break;
       }
       const retryable = retryAfter(outcome.result.viewports.desktop);
@@ -1919,10 +2051,20 @@ export class RunCoordinator {
     // 入れない（再開した実行で不調を検知しなければ、残らない）。Run Status は、SKIPPED のページなどから `deriveRunStatus` が導く（この理由
     // では決めない）。
     const siteUnavailableReasons = progress.siteUnavailableDetail === null ? [] : [siteUnavailableReason(progress.siteUnavailableDetail)];
+    // 認証つきの Run で、セッションの切れのため監査しなかった URL があれば、Run の理由に1件だけ残す（T25c。`detail` は `null`。止める印と同じく、
+    // SKIPPED のページから導く。再開で URL を待ち行列に戻すと、理由も消える）。Run Status は、SKIPPED のページから `deriveRunStatus` が導く。
+    const authSessionLostReasons = skipCodes.has(AUTH_SESSION_LOST_SKIP_REASON.code) ? [AUTH_SESSION_LOST_SKIP_REASON] : [];
     // 違反を検出したため、監査を始めなかったものがあれば、止めたことを Run の理由に1件だけ残す（Task 19 の前の整理の設計書 4.5）。
     // Run Status は、違反の件数から `deriveRunStatus` が `ABORTED_BY_SAFETY` と導く（この理由では決めない）。
     const safetyAbortReasons = progress.stoppedBySafetyViolation ? [SAFETY_VIOLATION_ABORT_REASON] : [];
-    const reasons = [...limitReasons, ...interruptedReasons, ...siteUnavailableReasons, ...safetyAbortReasons, ...progress.reasons];
+    const reasons = [
+      ...limitReasons,
+      ...interruptedReasons,
+      ...siteUnavailableReasons,
+      ...authSessionLostReasons,
+      ...safetyAbortReasons,
+      ...progress.reasons,
+    ];
 
     // Safety の集計（設計書 5.6.5）。この Run で作ったすべての Ledger の、Browser を閉じた後の snapshot からだけ集計する。再開した Run では、
     // 保存した snapshot（前の回までの Ledger）と、この実行の Ledger の snapshot を、この順に渡す（Ledger を作った順と同じ。
@@ -2172,7 +2314,8 @@ function normalizedStartUrl(config: AuditConfig): NormalizedHttpUrlEvidence {
  * 再開の入力の保存から、`RunProgress` のうち巡回の値（採番器、巡回の記録、開始の URL、robots.txt と sitemap.xml の取得の結果）を作り直す
  * （中断した Run の再開の設計書 4.2、4.10 の DEF-022。R7b）。Run Coordinator は、再開した実行の初め（PREFLIGHT の前）に、PREFLIGHT の結果に
  * よらず呼ぶ。PREFLIGHT に失敗して巡回を行わない実行でも、その出力と最後の状態の保存に、前の回までのページが入るようにするためである。
- * - 採番器は `IdAllocator.restore`、巡回の記録は `CrawlFrontier.restore` で作り直す。監査の途中だった URL と、待ち行列に戻す理由
+ * - 採番器と巡回の記録は、保存の整合の確かめと同じ `restoreRunCheckpointCrawl`（`run-checkpoint.ts`。CC-040）で作り直す。設定は、保存の
+ *   実効の設定から取る（今の設定とは、再開する Run の選び方で、同じことを確かめ済み）。監査の途中だった URL と、待ち行列に戻す理由
  *   （`RESUME_REQUEUE_SKIP_REASON_CODES`）の SKIPPED の URL は、`QUEUED` に戻る（設計書 3.2、4.2）。
  * - 開始の URL は、新しい Run と同じく、設定の開始の URL を正規化したもの（`normalizedStartUrl`）。
  * - robots.txt と sitemap.xml は、保存に Evidence があれば、そこから作り直す（`restoredSiteMetadata`。取得し直さない）。なければ `null`。
@@ -2185,13 +2328,7 @@ function restoredCrawlProgress(
   if (saved === undefined) {
     return { frontier: null, allocator: null, startUrl: null, metadata: null };
   }
-  const allocator = IdAllocator.restore(saved.allocator);
-  const frontier = CrawlFrontier.restore(saved.frontier, {
-    maxDepth: config.crawl.maxDepth,
-    allocator,
-    allowedQueryParameters: new Set(config.crawl.allowedQueryParameters),
-    requeueSkipReasonCodes: RESUME_REQUEUE_SKIP_REASON_CODE_SET,
-  });
+  const { allocator, frontier } = restoreRunCheckpointCrawl(saved);
   return {
     frontier,
     allocator,
@@ -2218,6 +2355,28 @@ function resumedNavigationPacerRecord(saved: NavigationPacerSnapshot, executionS
       ? executionStartedAtMs
       : Math.max(lastNavigationStartedAtMs, executionStartedAtMs),
   };
+}
+
+/**
+ * 外から渡した pacer を、この Run の記録だけを返す形に包む（CCX-22）。待ち・間隔の引き上げ・送った時刻の記録は、そのまま渡す（待ちの owner は
+ * pacer のまま）。記録（`snapshot`）の回数と待ちの合計は、包んだ時点の記録からの差にする（呼ぶ側が先に行った読み込み（ログインの段）を、Run の
+ * 負荷の記録と保存に入れない）。最後の読み込みの開始の時刻は、そのまま返す（再開の起点は、遅い方が安全な側）。
+ */
+function runScopedNavigationPacer(pacer: NavigationPacer): NavigationPacer {
+  const baseline = pacer.snapshot();
+  return Object.freeze({
+    beforeNavigation: () => pacer.beforeNavigation(),
+    snapshot: (): NavigationPacerSnapshot => {
+      const current = pacer.snapshot();
+      return Object.freeze({
+        navigationCount: current.navigationCount - baseline.navigationCount,
+        totalWaitMs: current.totalWaitMs - baseline.totalWaitMs,
+        lastNavigationStartedAtMs: current.lastNavigationStartedAtMs,
+      });
+    },
+    raiseMinimumInterval: (minIntervalMs: number) => pacer.raiseMinimumInterval(minIntervalMs),
+    recordDocumentRequestSent: () => pacer.recordDocumentRequestSent(),
+  });
 }
 
 /**
@@ -2274,7 +2433,7 @@ function runCheckpointState(input: {
  */
 function runCheckpointContent(input: {
   readonly config: AuditConfig;
-  readonly identity: Pick<RunCheckpointContext, 'runId' | 'toolVersion' | 'startedAt'>;
+  readonly identity: Pick<RunCheckpointContext, 'runId' | 'toolVersion' | 'startedAt' | 'authentication'>;
   readonly progress: RunProgress;
   readonly crawl: RunCrawlRecord | null;
 }): RunCheckpointContentValues {
@@ -2306,6 +2465,8 @@ function runCheckpointContent(input: {
     siteMetadata: crawl === null || progress.metadata === null ? null : { records: progress.metadata.records },
     load: { pacer: progress.navigationPacer.snapshot(), meter: progress.loadMeter.snapshot() },
     completedPageIds: crawl === null ? [] : [...crawl.completedPageIds],
+    // T25g-2: 認証つきの Run だけ、Run の種類を記録する（公開監査の保存の形は変えない）。
+    ...(identity.authentication === null ? {} : { authentication: identity.authentication }),
   };
 }
 
@@ -2432,11 +2593,18 @@ function retryableNavigationFailure(
   return reason === undefined ? null : { navigationOutcome: desktop.navigationOutcome, detail: reason.detail };
 }
 
-/** ページの Desktop の `link` の Evidence のうち、`INTERNAL_NAVIGABLE` のリンクの正規化した URL（文書の順）。 */
+/** ページの Desktop の `link` の Evidence のうち、`INTERNAL_NAVIGABLE` のリンクの正規化した URL（文書の順。`internalNavigableUrlsOf`）。 */
 function internalNavigableLinks(result: PageAuditResult): NormalizedHttpUrlEvidence[] {
-  return viewportEvidenceOfType(result, 'link', ['desktop']).flatMap(({ payload }) =>
-    payload.links.flatMap((link) =>
-      (link.admission.kind === 'INTERNAL_NAVIGABLE' && link.normalized.ok ? [link.normalized.url] : [])));
+  return viewportEvidenceOfType(result, 'link', ['desktop']).flatMap(({ payload }) => internalNavigableUrlsOf(payload.links));
+}
+
+/**
+ * Link の Evidence のうち、巡回の候補にするもの（受け入れの判定が `INTERNAL_NAVIGABLE` で、正規化が `ok`）の正規化した URL（文書の順。重なりは
+ * 取り除かない。巡回の待ち行列が扱う）。Run Coordinator と、発見のワーカーの流れ（`src/worker/discovery-run.ts`。`discoverLinks` の結果）が
+ * 使う（CCX-6。共通化の台帳の CC-070）。
+ */
+export function internalNavigableUrlsOf(links: readonly LinkEvidence[]): NormalizedHttpUrlEvidence[] {
+  return links.flatMap((link) => (link.admission.kind === 'INTERNAL_NAVIGABLE' && link.normalized.ok ? [link.normalized.url] : []));
 }
 
 /**

@@ -9,6 +9,7 @@
  * - 要求の件数と1分あたりの最大の組み立て（`formatRequestsWithPeak`。L7）は、ここだけで行う。
  */
 import type { RunLoadOriginRequests } from '../core/contracts.js';
+import { MILLISECONDS_PER_SECOND, MINUTES_PER_HOUR, SECONDS_PER_MINUTE } from '../core/time-units.js';
 import {
   FORMAT_UNIT_TEXT,
   NOT_OBSERVED_TEXT,
@@ -58,15 +59,6 @@ export const DISPLAY_TIME_ZONE = 'Asia/Tokyo';
 
 /** 表示の時間帯の略称。`Asia/Tokyo` には夏時間がないので、固定の文字列でよい。 */
 const DISPLAY_TIME_ZONE_ABBREVIATION = 'JST';
-
-/** 1秒のミリ秒。 */
-const MILLISECONDS_PER_SECOND = 1000;
-
-/** 1分の秒数（経過時間の書式）。 */
-const SECONDS_PER_MINUTE = 60;
-
-/** 1時間の分数（経過時間の書式）。 */
-const MINUTES_PER_HOUR = 60;
 
 /** 秒で書くときの、小数の最大の桁数。 */
 const SECONDS_MAX_FRACTION_DIGITS = 1;

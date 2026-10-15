@@ -110,6 +110,44 @@ export const canonicalizeAllowedOrigins = (allowedOrigins: Iterable<string>): Re
 /** URLが認証情報（ユーザー名またはパスワード）を含むか。 */
 export const hasUrlCredentials = (url: URL): boolean => url.username.length > 0 || url.password.length > 0;
 
+/**
+ * ループバックのアドレスの host（`URL.hostname` の値）。並びは、設定の誤りの文に示す順。
+ * サイトへの負荷の制御の設計書 3.2、4.2（設定の検証）と、Task 22 の設計書 4.3（テスト環境の `http:` の Origin）が使う。
+ * 凍結した配列（書き換えられない。T22d、T22R の M2）。判定（`isLoopbackUrl`）は、公開しない集合 `loopbackHostnameSet` で行う。
+ */
+export const LOOPBACK_HOSTNAMES: readonly string[] = Object.freeze(['127.0.0.1', '[::1]', 'localhost']);
+
+/** `LOOPBACK_HOSTNAMES` の集合（このファイルの外へ公開しない。公開した値を書き換えようとしても、判定は変わらない）。 */
+const loopbackHostnameSet: ReadonlySet<string> = new Set(LOOPBACK_HOSTNAMES);
+
+/** URL の host が、ループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）か。 */
+export const isLoopbackUrl = (url: URL): boolean => loopbackHostnameSet.has(url.hostname);
+
+/**
+ * 値が、認証情報を含まない HTTP(S) の Origin の正規の直列化（`new URL(value).origin` と同じ文字列）であれば、その値を返す。
+ * 解析できない値、HTTP(S) 以外、認証情報を含む値、正規の直列化と違う書き方（末尾の `/`、パス、大文字、既定のポートなど）は `undefined`
+ * （Task 22 の設計書 4.3 の `approvedTestOrigins`）。
+ */
+export const canonicalHttpOriginOf = (value: string): string | undefined => {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  if (!isHttpProtocol(url.protocol) || hasUrlCredentials(url) || url.origin !== value) {
+    return undefined;
+  }
+  return url.origin;
+};
+
+/**
+ * Origin の直列化 `origin` が、許可Originの設定値に含まれるか。設定値は `canonicalizeAllowedOrigins` の意味で正規化して比べる。
+ * `origin` は書き換えずに比べるので、正規の直列化でない値は含まれない（`false`）。
+ */
+export const isOriginInAllowedOrigins = (allowedOrigins: Iterable<string>, origin: string): boolean =>
+  canonicalizeAllowedOrigins(allowedOrigins).has(origin);
+
 /** 伏せ字の表記を、URLの解析器がユーザー名として直列化した値。 */
 const REDACTED_USERNAME = new URL(`http://${REDACTED}@redacted.invalid/`).username;
 

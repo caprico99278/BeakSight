@@ -77,13 +77,13 @@ import {
   type SafetyLedger,
   type SafetyLedgerSnapshot,
 } from '../safety/safety-ledger.js';
+import { AUTH_SESSION_LOST_SKIP_REASON, authSessionLostReason, sessionLostUrlOf } from './authenticated-run.js';
 import { createEvidenceRecord } from './evidence-builder.js';
 import type { IdAllocator } from './id-allocator.js';
 import { navigatePage, navigationFailureDetail, type PageNavigationResult } from './page-navigation.js';
 import {
   closePassivePageAndContext,
   PassiveContextCloseDeadlineError,
-  PassivePageCloseDeadlineError,
   type PassiveSessionCloseFailure,
 } from './passive-session-close.js';
 import {
@@ -155,7 +155,7 @@ export interface PageAuditorDependencies {
   readonly collectors?: Partial<PageAuditCollectors>;
   /**
    * Context と page の作成・終了の期限の注入口（DEF-008、R15r-4。Task 18 の前の整理の設計書 4.2、4.4）。省略した項目は、
-   * `limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
+   * `limits.ts` の定数（`SESSION_OPEN_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を使う。
    * Passive の Context と page、幅の走査のセッション、Interaction の session の作成と終了に使う。
    */
   readonly deadlines?: PassiveSessionDeadlineOptions | undefined;
@@ -181,6 +181,13 @@ export interface PageAuditorDependencies {
    * 値と、渡さなかった場合は `TypeError`。
    */
   readonly navigationPacer: NavigationPacer;
+  /**
+   * 認証つきの Run のセッションの切れの path の前方一致（Task 25 の設計書 4.3。T25c）。省略すると、セッションの切れを確かめない（公開監査。
+   * 今のまま）。渡すと、Passive の各ビューポートと、幅の走査の各幅の読み込みの後に、main frame の最後の URL（と、Guard が監査の段の除外で
+   * 止めた main frame の移動の先）の path が、これで始まるかを確かめる。当たったら、そのビューポートの収集をせず、同じページの残りの
+   * ビューポートと幅を始めず、結果の `authSessionLostDetail` に当たった場所を返す（ページを捨てて Run を止めるのは Run Coordinator）。
+   */
+  readonly sessionLostPathPrefix?: string | undefined;
 }
 
 /**
@@ -229,6 +236,25 @@ class SiteUnavailableAbortError extends Error {
 }
 
 /**
+ * 認証つきの Run で、セッションの切れを検知したため、幅の走査の次の幅のセッションを作らなかったことを、段階の例外として伝える（T25c。
+ * `SiteUnavailableAbortError` と同じ形）。
+ */
+class AuthSessionLostAbortError extends Error {
+  constructor() {
+    super('the authenticated session was lost; the next stress sweep session was not started');
+    this.name = 'AuthSessionLostAbortError';
+  }
+}
+
+/** セッションの切れを検知した理由のコード（`AUTH_SESSION_LOST_SKIP_REASON` のコード。幅の走査の段階の理由の `detail` にも使う）。 */
+const AUTH_SESSION_LOST_CODE = AUTH_SESSION_LOST_SKIP_REASON.code;
+
+/** 1 つのビューポートで、セッションの切れを検知した段階（T25c）。最初の 1 つだけを持つ。 */
+interface ViewportAuthSessionLoss {
+  stage: Extract<SiteUnavailabilityStage, 'passive' | 'stress-layout'> | null;
+}
+
+/**
  * 再試行を区別する情報（DEF-007、Task 14〜17 の設計書 5.6.4）。Run Coordinator が `audit` に渡す。
  * 省略すると、再試行を考えない（スクリーンショットは、いつもの場所に置く）。
  */
@@ -249,7 +275,6 @@ export interface PageAuditAttempt {
 /** 閉じる処理と、Context を作る処理の失敗を、理由の `detail`（`<場面>:<メッセージ>`）で区別するための場面の名前（設計書 4.5.5）。 */
 const SESSION_FAILURE_LABELS = Object.freeze({
   open: 'passive-context',
-  pageClose: 'passive-page-close',
   contextClose: 'passive-context-close',
   /** 構築に失敗した Interaction の session の Context を閉じる処理（R14r の Minor-3）。 */
   interactionContextClose: 'interaction-context-close',
@@ -299,6 +324,8 @@ interface ViewportAuditOutcome {
    * ビューポートは、`passive` が `null` で、幅と候補は空。
    */
   readonly navigationDiagnostics: ViewportNavigationDiagnostics | null;
+  /** このビューポートで、セッションの切れを検知した段階（T25c）。検知しなかった場合と、始めなかったビューポートは `null`。 */
+  readonly authSessionLostStage: ViewportAuthSessionLoss['stage'];
 }
 
 /**
@@ -393,6 +420,8 @@ export class PageAuditor {
   readonly #deadlines: ResolvedPassiveSessionDeadlines;
   readonly #safetyViolationRecorded: () => boolean;
   readonly #pacer: NavigationPacer;
+  /** 認証つきの Run のセッションの切れの path の前方一致（T25c）。公開監査では `null`。 */
+  readonly #sessionLostPathPrefix: string | null;
 
   /** 注入した期限（`dependencies.deadlines`）が不正なら、`RangeError` か `TypeError` を投げる。 */
   constructor(dependencies: PageAuditorDependencies) {
@@ -417,6 +446,11 @@ export class PageAuditor {
       throw new TypeError('PageAuditor requires a navigation pacer');
     }
     this.#pacer = navigationPacer;
+    const { sessionLostPathPrefix } = dependencies;
+    if (sessionLostPathPrefix !== undefined && typeof sessionLostPathPrefix !== 'string') {
+      throw new TypeError('PageAuditor sessionLostPathPrefix must be a string when given');
+    }
+    this.#sessionLostPathPrefix = sessionLostPathPrefix ?? null;
     this.#deadlines = resolvePassiveSessionDeadlines(dependencies.deadlines);
     this.#factory = contextFactory;
     this.#config = config;
@@ -463,6 +497,8 @@ export class PageAuditor {
     let screenshotRetryAttempt: number | null = null;
     // 最初に検知したサイトの不調の詳細（設計書 3.1）。検知しなければ `null`。
     let firstSiteUnavailableDetail: string | null = null;
+    // 認証つきの Run で、最初にセッションの切れを検知した場所（`<ビューポート>:<段階>`。T25c）。検知しなければ `null`。
+    let authSessionLostDetail: string | null = null;
     for (const profile of VIEWPORT_PROFILES) {
       // 違反を検出した後は、同じページの次のビューポートを始めない（Task 19 の前の整理の設計書 4.5）。最初のビューポートの前には
       // 確かめない（ページを始めるかは、Run Coordinator が決める）。
@@ -476,9 +512,17 @@ export class PageAuditor {
         outcomes.push(skippedViewportOutcome(url, pageId, profile, SITE_UNAVAILABLE_SKIP_REASON));
         continue;
       }
+      // T25c: セッションの切れを検知した後は、次のビューポートを始めない（ログインの画面を管理画面として監査しない）。
+      if (authSessionLostDetail !== null) {
+        outcomes.push(skippedViewportOutcome(url, pageId, profile, AUTH_SESSION_LOST_SKIP_REASON));
+        continue;
+      }
       const outcome = await this.#auditViewport(url, pageId, profile, screenshotRetryAttempt);
       outcomes.push(outcome);
-      if (outcome.siteUnavailability !== null) {
+      if (outcome.authSessionLostStage !== null) {
+        // セッションの切れを検知したので、次のビューポートを始めない。再試行の判断（`precedesRetry`）も呼ばない。
+        authSessionLostDetail = `${profile}:${outcome.authSessionLostStage}`;
+      } else if (outcome.siteUnavailability !== null) {
         // 不調を検知したので、次のビューポートを始めない。そのため、Desktop でも、再試行の判断（`precedesRetry`）を呼ばない。
         const { stage, unavailability } = outcome.siteUnavailability;
         firstSiteUnavailableDetail = siteUnavailableDetail(profile, stage, unavailability);
@@ -508,7 +552,14 @@ export class PageAuditor {
       ...sources.interactionSnapshots,
       ...sources.stressLedgers.map((ledger) => ledger.snapshot()),
     ]));
-    return deepFreeze({ result, safety, siteUnavailableDetail: firstSiteUnavailableDetail, navigationDiagnostics });
+    return deepFreeze({
+      result,
+      safety,
+      siteUnavailableDetail: firstSiteUnavailableDetail,
+      // T25c: 認証つきの Run だけ、セッションの切れの場所を返す（公開監査の結果の形は変えない）。
+      ...(this.#sessionLostPathPrefix === null ? {} : { authSessionLostDetail }),
+      navigationDiagnostics,
+    });
   }
 
   /** 1つのビューポートの監査（設計書 4.5.2 の 1〜8）。 */
@@ -545,6 +596,8 @@ export class PageAuditor {
     const navigationDiagnostics: ViewportNavigationDiagnosticsSink = { stressWidths: [], interactionCandidates: [] };
     // このビューポートで最初に検知したサイトの不調（Passive、幅の走査、Interaction のどこで検知しても1つだけ。設計書 3.1）。
     const siteUnavailability = new ViewportSiteUnavailability(reasons);
+    // このビューポートで最初に検知したセッションの切れ（T25c。Passive か、幅の走査のどこかで 1 つだけ）。
+    const authSessionLoss: ViewportAuthSessionLoss = { stage: null };
     let failed = false;
     let stages: StageRunner | undefined;
     let context: BrowserContext | undefined;
@@ -642,14 +695,21 @@ export class PageAuditor {
           failed = true;
           reasons.push(Object.freeze({ code: 'NAVIGATION_FAILED', detail: navigationFailureDetail(navigation) }));
         }
-        // 読み込みの観測で、サイトの不調を判定する（サイトが応答しないときに Run を止める設計書 3.1）。不調なら、読み込みが `OK`
-        // （503 など）でも FAILED にし、理由 `SITE_UNAVAILABLE`（`<段階>:<判定の詳細>`）を加える。読み込みの失敗の理由は、そのまま残す。
-        if (siteUnavailability.observe(PASSIVE_STAGE, navigation.loadObservation)) {
+        // T25c: 認証つきの Run では、main frame の最後の URL がセッションの切れの path に当たったら（Guard が除外で止めた移動の先を含む）、
+        // FAILED にし、理由 `AUTH_SESSION_LOST`（`detail` は段階）を加え、収集をしない（ログインの画面を管理画面として監査しない）。
+        // サイトの不調の判定より先に確かめる（除外で止めたログインの画面への移動の失敗を、サイトの不調と取り違えないため）。
+        if (this.#authSessionLostAfterNavigation(activePage, factory.getSafetyLedger(passiveContext))) {
+          failed = true;
+          authSessionLoss.stage = PASSIVE_STAGE;
+          reasons.push(authSessionLostReason(PASSIVE_STAGE));
+        } else if (siteUnavailability.observe(PASSIVE_STAGE, navigation.loadObservation)) {
+          // 読み込みの観測で、サイトの不調を判定する（サイトが応答しないときに Run を止める設計書 3.1）。不調なら、読み込みが `OK`
+          // （503 など）でも FAILED にし、理由 `SITE_UNAVAILABLE`（`<段階>:<判定の詳細>`）を加える。読み込みの失敗の理由は、そのまま残す。
           failed = true;
         }
-        // 読み込みが失敗した場合と、不調を検知した場合は、収集（4. と 5.）をしない（不調では、scroll などでページの部品の読み込みが
-        // さらに起きるのを避ける。設計書 3.1）。
-        if (navigation.navigationOutcome === 'OK' && siteUnavailability.detected === null) {
+        // 読み込みが失敗した場合と、不調を検知した場合と、セッションの切れを検知した場合は、収集（4. と 5.）をしない（不調では、scroll
+        // などでページの部品の読み込みがさらに起きるのを避ける。設計書 3.1）。
+        if (navigation.navigationOutcome === 'OK' && siteUnavailability.detected === null && authSessionLoss.stage === null) {
           // 4. DOM の準備を待ち、controlled scroll を行う。
           const settling = await attempt('settling', () => waitForPageSettled(activePage, {
             deadlineAtMs: this.#stageDeadline(deadlines.collectorAtMs, config.crawl.resourceSettlingTimeoutMs),
@@ -685,6 +745,7 @@ export class PageAuditor {
             reasons,
             safety,
             siteUnavailability,
+            authSessionLoss,
             navigationDiagnostics,
             record,
             attempt,
@@ -747,12 +808,29 @@ export class PageAuditor {
       findings,
       safety,
       siteUnavailability: siteUnavailability.detected,
+      authSessionLostStage: authSessionLoss.stage,
       navigationDiagnostics: {
         passive: passiveDiagnostics,
         stressWidths: navigationDiagnostics.stressWidths,
         interactionCandidates: navigationDiagnostics.interactionCandidates,
       },
     };
+  }
+
+  /**
+   * 認証つきの Run で、読み込みの後に、セッションが切れたか（T25c。Task 25 の設計書 4.3）。公開監査（前方一致の指定なし）では、いつも偽。
+   * - main frame の最後の URL（`page.url()`）の path が、セッションの切れの path の前方一致に当たる。
+   * - または、その Context の Guard が、監査の段の除外で止めた main frame の移動の先（Safety Ledger の `blockedAuditExclusions` の、
+   *   `mainFrameNavigation` が真の記録の URL）の path が当たる（ログインの画面が読む範囲の外で、Guard がリダイレクトを止めた場合）。
+   * 判定は、ワーカーの 1 画面の読み込みと同じ部品（`authenticated-run.ts` の `sessionLostUrlOf`。CCX-6）。
+   * URL や値は記録しない（当たったかどうかだけを返す）。
+   */
+  #authSessionLostAfterNavigation(page: Page, ledger: SafetyLedger): boolean {
+    const prefix = this.#sessionLostPathPrefix;
+    if (prefix === null) {
+      return false;
+    }
+    return sessionLostUrlOf(page, ledger, prefix) !== null;
   }
 
   /** 設計書 4.5.2 の 5。設定で無効な段階は実行しない（4.5.5）。 */
@@ -793,6 +871,8 @@ export class PageAuditor {
         // afterNavigation` を直列に行う（次の幅のセッションを、前の幅の受け口を呼ぶ前に作らない）ことを前提にしている（D3R の Minor-2）。
         // 幅を並行に読み込む形に変えるときは、幅の値を受け口の引数で渡す形に改める。
         let loadingStressWidth: number | null = null;
+        // T25c: 読み込み中の幅のセッションの page（読み込みの後に、セッションの切れを確かめるため）。
+        let loadingStressPage: Page | null = null;
         const createSession: StressSessionFactory['createSession'] = async (viewport) => {
           if (this.#safetyViolationRecorded()) {
             throw new SafetyViolationAbortError();
@@ -800,7 +880,11 @@ export class PageAuditor {
           if (siteUnavailability.detected !== null) {
             throw new SiteUnavailableAbortError();
           }
+          if (state.authSessionLoss.stage !== null) {
+            throw new AuthSessionLostAbortError();
+          }
           loadingStressWidth = viewport.width;
+          loadingStressPage = null;
           // 幅の走査の Context は、ページの読み込み直しなので、役割は `REVISIT` である（負荷の制御の設計書 4.7）。
           const sessions = createStressSessionFactory(this.#factory, {
             deadlines: this.#deadlines,
@@ -808,7 +892,9 @@ export class PageAuditor {
             role: 'REVISIT',
           });
           try {
-            return await sessions.createSession(viewport);
+            const session = await sessions.createSession(viewport);
+            loadingStressPage = session.page;
+            return session;
           } finally {
             safety.stressLedgers.push(...sessions.ledgers());
           }
@@ -829,7 +915,16 @@ export class PageAuditor {
             deadlineAtMs: deadlineAtMs(),
             beforeNavigation: () => this.#pacer.beforeNavigation(),
             afterNavigation: (observation, diagnostics) => {
-              siteUnavailability.observe(STRESS_LAYOUT_STAGE, observation);
+              // T25c: セッションの切れを先に確かめる（当たれば、次の幅を始めない。サイトの不調とは取り違えない）。
+              if (loadingStressPage !== null && state.authSessionLoss.stage === null && this.#authSessionLostAfterNavigation(
+                loadingStressPage,
+                this.#factory.getSafetyLedger(loadingStressPage.context()),
+              )) {
+                state.authSessionLoss.stage = STRESS_LAYOUT_STAGE;
+                reasons.push(authSessionLostReason(STRESS_LAYOUT_STAGE));
+              } else {
+                siteUnavailability.observe(STRESS_LAYOUT_STAGE, observation);
+              }
               const { stressWidths } = state.navigationDiagnostics;
               if (loadingStressWidth !== null && stressWidths.length < MAX_STRESS_WIDTH_NAVIGATION_DIAGNOSTICS) {
                 stressWidths.push({ width: loadingStressWidth, diagnostics });
@@ -1139,6 +1234,8 @@ interface CollectionState {
   readonly safety: ViewportSafetySources;
   /** このビューポートで最初に検知したサイトの不調。幅の走査と Interaction の読み込みの観測も、ここで判定して記録する（設計書 3.1）。 */
   readonly siteUnavailability: ViewportSiteUnavailability;
+  /** このビューポートで最初に検知したセッションの切れ（T25c）。幅の走査の各幅の読み込みの後にも確かめて記録する。 */
+  readonly authSessionLoss: ViewportAuthSessionLoss;
   /** 幅の走査の幅ごとと、Interaction の候補ごとの、ページ本体の要求の観察の結果の集め先（診断の記録の設計書 2.2）。 */
   readonly navigationDiagnostics: ViewportNavigationDiagnosticsSink;
   readonly record: <TType extends EvidenceType>(type: TType, payload: EvidencePayloadByType[TType]) => EvidenceRecord;
@@ -1175,9 +1272,9 @@ type StageFailureReason = (error: unknown) => string | null;
  */
 const CLOSE_DEADLINE_EXCEEDED_REASON = 'CLOSE_DEADLINE_EXCEEDED';
 
-/** 閉じる処理の期限切れ（page か Context）を、例外そのものか、`AggregateError` の中（入れ子を含む）に含むか。 */
+/** 閉じる処理の期限切れ（Context）を、例外そのものか、`AggregateError` の中（入れ子を含む）に含むか。 */
 function includesCloseDeadline(error: unknown): boolean {
-  if (error instanceof PassivePageCloseDeadlineError || error instanceof PassiveContextCloseDeadlineError) {
+  if (error instanceof PassiveContextCloseDeadlineError) {
     return true;
   }
   return error instanceof AggregateError && Array.isArray(error.errors) && error.errors.some(includesCloseDeadline);
@@ -1187,6 +1284,7 @@ function includesCloseDeadline(error: unknown): boolean {
  * 幅の走査の段階の例外から、理由を決める（RP18r の Minor-2、C18f）。
  * - 違反を検出したため、次の幅のセッションを作らなかった: `SAFETY_VIOLATION_ABORT`
  * - サイトの不調を検知したため、次の幅のセッションを作らなかった: `SITE_UNAVAILABLE`（サイトが応答しないときに Run を止める設計書 3.1）
+ * - 認証つきの Run で、セッションの切れを検知したため、次の幅のセッションを作らなかった: `AUTH_SESSION_LOST`（T25c）
  * - セッションを閉じる処理の期限切れを含む: `CLOSE_DEADLINE_EXCEEDED`
  * - そのほか: `null`（既定の `pageFailureReason(page)`）
  */
@@ -1196,6 +1294,9 @@ const stressSweepFailureReason: StageFailureReason = (error) => {
   }
   if (error instanceof SiteUnavailableAbortError) {
     return SITE_UNAVAILABLE_CODE;
+  }
+  if (error instanceof AuthSessionLostAbortError) {
+    return AUTH_SESSION_LOST_CODE;
   }
   return includesCloseDeadline(error) ? CLOSE_DEADLINE_EXCEEDED_REASON : null;
 };
@@ -1425,6 +1526,7 @@ function skippedViewportOutcome(
     safety: { passiveLedgers: [], interactionSnapshots: [], stressLedgers: [] },
     siteUnavailability: null,
     navigationDiagnostics: null,
+    authSessionLostStage: null,
   };
 }
 
@@ -1470,13 +1572,15 @@ async function closePassiveSession(
   return closeFailureReasons(await closePassivePageAndContext(factory, context, deadlines), contextCloseLabel);
 }
 
-/** 閉じる処理の失敗を、場面（page は `passive-page-close`、Context は `contextCloseLabel`）の `UNHANDLED_FAILURE` の理由にする。 */
+/**
+ * 閉じる処理の失敗を、場面（`contextCloseLabel`）の `UNHANDLED_FAILURE` の理由にする。失敗は Context を閉じる処理のものだけ（page は個別に
+ * 閉じない。DEF-038。CCX-21 で page の場面の名前を消した）。
+ */
 function closeFailureReasons(
   failures: readonly PassiveSessionCloseFailure[],
   contextCloseLabel: ContextCloseLabel = SESSION_FAILURE_LABELS.contextClose,
 ): IncompleteReason[] {
-  return failures.map(({ step, error }) =>
-    sessionFailureReason(step === 'page' ? SESSION_FAILURE_LABELS.pageClose : contextCloseLabel, error));
+  return failures.map(({ error }) => sessionFailureReason(contextCloseLabel, error));
 }
 
 /**

@@ -9,7 +9,7 @@ import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js
 import { pageFailureReason } from '../browser/page-failure.js';
 import type { Viewport } from '../config/types.js';
 import type { NavigationDiagnostics } from '../core/contracts.js';
-import { awaitBeforeDeadline, resolveTimeoutMs } from '../core/deadline.js';
+import { awaitBeforeDeadline, deadlineWithinTimeoutAtMs, resolveTimeoutMs } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import {
   FIXED_ELEMENT_POSITIONS,
@@ -46,6 +46,7 @@ import {
   SESSION_OPEN_TIMEOUT_MS,
 } from '../core/limits.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
+import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
 
 export const LAYOUT_THRESHOLDS = Object.freeze({
   stressViewportHeight: 900,
@@ -527,8 +528,9 @@ interface LayoutEvaluationArgument {
  * ブラウザ内で、上限付きのジオメトリの事実を1回の走査で集める。
  * 候補の件数は上限を確かめてから selector を作り、兄弟の順番は親ごとに1回だけ数える（要素数に比例する作業量）。
  * 期限を過ぎたら走査を止め、それまでに集めた事実と理由を返す。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function collectLayoutInPage({
+function collectLayoutReader(R: StandardReaders, {
   thresholds,
   visibilityOptions,
   kindSelectors,
@@ -536,10 +538,44 @@ function collectLayoutInPage({
   horizontalClipByOverflow,
   scanDeadlineAtMs,
 }: LayoutEvaluationArgument): RawLayoutEvidence {
+  // DOM clobbering（DEF-072・DEF-073）: form の中の名前つきの入力の欄は form の、名前つきの img・form などは `document` の、同じ名前の
+  // プロパティとメソッドを隠す（`<input name="matches">`、`<img name="body">` など）。form になりうる要素（文書のすべての要素と、その祖先・子孫・
+  // 兄弟）と `document` の標準のプロパティとメソッドは、標準の prototype の getter とメソッドで読む（`src/evidence/dom-collector.ts` の
+  // `collectDomEvidence` と同じ読み方。getter は部品の `standardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
+  // html・body は、名前つきの子でプロパティが隠れないので、そのまま読む。
+  const { standardGetter } = R;
+  const parentElementOf = standardGetter<HTMLElement | null>(Node.prototype, 'parentElement');
+  const childrenOf = standardGetter<HTMLCollection>(Element.prototype, 'children');
+  const tagNameOf = standardGetter<string>(Element.prototype, 'tagName');
+  const idOf = standardGetter<string>(Element.prototype, 'id');
+  const clientLeftOf = standardGetter<number>(Element.prototype, 'clientLeft');
+  const clientTopOf = standardGetter<number>(Element.prototype, 'clientTop');
+  const clientWidthOf = standardGetter<number>(Element.prototype, 'clientWidth');
+  const clientHeightOf = standardGetter<number>(Element.prototype, 'clientHeight');
+  const scrollWidthOf = standardGetter<number>(Element.prototype, 'scrollWidth');
+  const scrollHeightOf = standardGetter<number>(Element.prototype, 'scrollHeight');
+  const hiddenOf = standardGetter<boolean | string>(HTMLElement.prototype, 'hidden');
+  const innerTextOf = standardGetter<string>(HTMLElement.prototype, 'innerText');
+  const getAttributeOf = (element: Element, name: string): string | null => Element.prototype.getAttribute.call(element, name);
+  const matchesOf = (element: Element, selectors: string): boolean => Element.prototype.matches.call(element, selectors);
+  const containsOf = (node: Node, other: Node): boolean => Node.prototype.contains.call(node, other);
+  const checkVisibilityOf = (element: Element, options: CheckVisibilityOptions): boolean => (
+    Element.prototype.checkVisibility.call(element, options)
+  );
+  const boundingClientRectOf = (element: Element): DOMRect => Element.prototype.getBoundingClientRect.call(element);
+  const clientRectsOf = (element: Element): DOMRectList => Element.prototype.getClientRects.call(element);
+  const documentElement = standardGetter<HTMLElement>(Document.prototype, 'documentElement')(document);
+  const documentBody = standardGetter<HTMLElement | null>(Document.prototype, 'body')(document);
+  const scrollingElement = standardGetter<Element | null>(Document.prototype, 'scrollingElement')(document);
+  const createTreeWalker = (root: Node, whatToShow: number): TreeWalker => (
+    Document.prototype.createTreeWalker.call(document, root, whatToShow)
+  );
+  const createRange = (): Range => Document.prototype.createRange.call(document);
+
   const actualViewport = { width: window.innerWidth, height: window.innerHeight };
   // 文書のスクロール位置（`ScrollPosition` の定義）。`scrollingElement` ではない body のスクロール量を含める。
-  const scrollingRoot = document.scrollingElement ?? document.documentElement;
-  const separateScrollBody = document.body !== null && document.body !== scrollingRoot ? document.body : null;
+  const scrollingRoot = scrollingElement ?? documentElement;
+  const separateScrollBody = documentBody !== null && documentBody !== scrollingRoot ? documentBody : null;
   const scrollPosition = {
     scrollX: window.scrollX + (separateScrollBody?.scrollLeft ?? 0),
     scrollY: window.scrollY + (separateScrollBody?.scrollTop ?? 0),
@@ -559,32 +595,34 @@ function collectLayoutInPage({
     if (known !== undefined) {
       return known;
     }
-    const parent = element.parentElement;
+    const parent = parentElementOf(element);
     if (parent === null) {
       return 1;
     }
     const counts = new Map<string, number>();
-    for (const child of parent.children) {
-      const next = (counts.get(child.tagName) ?? 0) + 1;
-      counts.set(child.tagName, next);
+    for (const child of childrenOf(parent)) {
+      const childTagName = tagNameOf(child);
+      const next = (counts.get(childTagName) ?? 0) + 1;
+      counts.set(childTagName, next);
       nthOfTypeIndexes.set(child, next);
     }
     return nthOfTypeIndexes.get(element) ?? 1;
   };
   const selectorFor = (element: Element): { selector: string; truncated: boolean } => {
     let selector: string;
-    if (element.id.length > 0) {
-      selector = `#${CSS.escape(element.id)}`;
+    const id = idOf(element);
+    if (id.length > 0) {
+      selector = `#${CSS.escape(id)}`;
     } else {
       const segments: string[] = [];
       let current: Element | null = element;
       while (
         current !== null
-        && current !== document.documentElement
+        && current !== documentElement
         && segments.length < thresholds.maxSelectorDepth
       ) {
-        segments.unshift(`${current.tagName.toLowerCase()}:nth-of-type(${nthOfType(current)})`);
-        current = current.parentElement;
+        segments.unshift(`${tagNameOf(current).toLowerCase()}:nth-of-type(${nthOfType(current)})`);
+        current = parentElementOf(current);
       }
       selector = segments.join(' > ');
     }
@@ -593,7 +631,7 @@ function collectLayoutInPage({
       : { selector, truncated: false };
   };
   const rectFor = (element: Element): RectangleEvidence => {
-    const rect = element.getBoundingClientRect();
+    const rect = boundingClientRectOf(element);
     return {
       x: rect.x,
       y: rect.y,
@@ -612,13 +650,13 @@ function collectLayoutInPage({
     display: style.display,
     visibility: style.visibility,
     opacity: Number.parseFloat(style.opacity),
-    hiddenAttribute: element instanceof HTMLElement ? element.hidden !== false : false,
-    ariaHidden: element.getAttribute('aria-hidden') === 'true',
-    clientRectCount: element.getClientRects().length,
+    hiddenAttribute: element instanceof HTMLElement ? hiddenOf(element) !== false : false,
+    ariaHidden: getAttributeOf(element, 'aria-hidden') === 'true',
+    clientRectCount: clientRectsOf(element).length,
   });
   const kindOf = (element: Element): LayoutElementKind => {
     for (const [kind, selector] of kindSelectors) {
-      if (element.matches(selector)) {
+      if (matchesOf(element, selector)) {
         return kind;
       }
     }
@@ -659,12 +697,12 @@ function collectLayoutInPage({
       : undefined
   );
   const clippingOverflows = new Set<string>(Object.keys(horizontalClipByOverflow));
-  const documentScrollers = new Set<Element>([document.documentElement]);
-  if (document.body !== null) {
-    documentScrollers.add(document.body);
+  const documentScrollers = new Set<Element>([documentElement]);
+  if (documentBody !== null) {
+    documentScrollers.add(documentBody);
   }
-  if (document.scrollingElement !== null) {
-    documentScrollers.add(document.scrollingElement);
+  if (scrollingElement !== null) {
+    documentScrollers.add(scrollingElement);
   }
   /** 要素を overflow で切り取りうる祖先と、その計算値を、近い順に返す（上の決まりに従う）。`fixed` の祖先は、返した後で止める。 */
   function* clippingAncestorsOf(
@@ -675,11 +713,11 @@ function collectLayoutInPage({
       return;
     }
     let waitForContainingBlock = style.position === 'absolute';
-    let ancestor = element.parentElement;
+    let ancestor = parentElementOf(element);
     for (
       let depth = 0;
       ancestor !== null && depth < thresholds.maxSelectorDepth && !documentScrollers.has(ancestor);
-      depth += 1, ancestor = ancestor.parentElement
+      depth += 1, ancestor = parentElementOf(ancestor)
     ) {
       const ancestorStyle = window.getComputedStyle(ancestor);
       const establishesContainingBlock = ancestorStyle.position !== 'static' || ancestorStyle.transform !== 'none';
@@ -702,16 +740,16 @@ function collectLayoutInPage({
       right - left > thresholds.maxZeroSizeDimensionPx && bottom - top > thresholds.maxZeroSizeDimensionPx
     );
     for (const [ancestor, ancestorStyle] of clippingAncestorsOf(element, style)) {
-      const box = ancestor.getBoundingClientRect();
-      const boxLeft = box.left + ancestor.clientLeft;
-      const boxTop = box.top + ancestor.clientTop;
+      const box = boundingClientRectOf(ancestor);
+      const boxLeft = box.left + clientLeftOf(ancestor);
+      const boxTop = box.top + clientTopOf(ancestor);
       if (clippingOverflows.has(ancestorStyle.overflowX)) {
         left = Math.max(left, boxLeft);
-        right = Math.min(right, boxLeft + ancestor.clientWidth);
+        right = Math.min(right, boxLeft + clientWidthOf(ancestor));
       }
       if (clippingOverflows.has(ancestorStyle.overflowY)) {
         top = Math.max(top, boxTop);
-        bottom = Math.min(bottom, boxTop + ancestor.clientHeight);
+        bottom = Math.min(bottom, boxTop + clientHeightOf(ancestor));
       }
       if (!remains()) {
         return false;
@@ -721,8 +759,8 @@ function collectLayoutInPage({
   };
   // ビューポートの横方向の overflow（設計書 5.1.2、RT12c）。CSS Overflow の仕様に従い、html の `overflow` が両方向とも
   // `visible` なら body の値が、そうでなければ html の値が、ビューポートに伝わる。`visible` は `NONE` にする。
-  const rootStyle = window.getComputedStyle(document.documentElement);
-  const bodyStyle = document.body instanceof HTMLBodyElement ? window.getComputedStyle(document.body) : null;
+  const rootStyle = window.getComputedStyle(documentElement);
+  const bodyStyle = documentBody instanceof HTMLBodyElement ? window.getComputedStyle(documentBody) : null;
   const bodyPropagatesToViewport = bodyStyle !== null
     && rootStyle.overflowX === 'visible'
     && rootStyle.overflowY === 'visible';
@@ -764,10 +802,10 @@ function collectLayoutInPage({
     widthClipped: boolean,
     heightClipped: boolean,
   ): { readonly clipped: boolean; readonly limitReached: boolean } => {
-    const left = rect.left + element.clientLeft;
-    const top = rect.top + element.clientTop;
-    const right = left + element.clientWidth;
-    const bottom = top + element.clientHeight;
+    const left = rect.left + clientLeftOf(element);
+    const top = rect.top + clientTopOf(element);
+    const right = left + clientWidthOf(element);
+    const bottom = top + clientHeightOf(element);
     const epsilon = thresholds.geometryEpsilonPx;
     const minOutsideRatio = thresholds.clippedTextLineMinOutsideRatio;
     const maxIgnoredHorizontalOverflow = thresholds.clippedTextLineMaxIgnoredHorizontalOverflowPx;
@@ -775,8 +813,8 @@ function collectLayoutInPage({
     const sticksOutBeyond = (start: number, end: number, boxStart: number, boxEnd: number, limit: number): boolean => (
       boxStart - start > limit || end - boxEnd > limit
     );
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-    const range = document.createRange();
+    const walker = createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    const range = createRange();
     let scanned = 0;
     // 箱の中に見える行があったか。箱の上か下に丸ごと出た行があったか（見える行が見つかるまで、判定を保留する）。
     let visibleLineFound = false;
@@ -786,7 +824,8 @@ function collectLayoutInPage({
         return { clipped: false, limitReached: true };
       }
       scanned += 1;
-      if (!hasText(node.nodeValue) || node.parentElement?.checkVisibility(visibilityOptions) === false) {
+      const textParent = parentElementOf(node);
+      if (!hasText(node.nodeValue) || (textParent !== null && !checkVisibilityOf(textParent, visibilityOptions))) {
         continue;
       }
       range.selectNodeContents(node);
@@ -835,7 +874,7 @@ function collectLayoutInPage({
     ) || (
       rect.top + scrollPosition.scrollY < 0 && rect.bottom + scrollPosition.scrollY <= 0
     );
-    const walker = document.createTreeWalker(element, NodeFilter.SHOW_ELEMENT);
+    const walker = createTreeWalker(element, NodeFilter.SHOW_ELEMENT);
     let scanned = 0;
     for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
       if (scanned >= thresholds.maxRenderedDescendantScan) {
@@ -843,10 +882,10 @@ function collectLayoutInPage({
       }
       scanned += 1;
       const descendant = node as Element;
-      if (!descendant.checkVisibility(visibilityOptions)) {
+      if (!checkVisibilityOf(descendant, visibilityOptions)) {
         continue;
       }
-      const box = descendant.getBoundingClientRect();
+      const box = boundingClientRectOf(descendant);
       if (
         box.width > thresholds.maxUnrenderedDescendantDimensionPx
         && box.height > thresholds.maxUnrenderedDescendantDimensionPx
@@ -879,7 +918,7 @@ function collectLayoutInPage({
     readonly evidence: Omit<OutsideViewportEvidence, 'nearestListedAncestorIndex'>;
   }
 
-  const allElements = document.body === null ? [] : [...document.body.querySelectorAll('*')];
+  const allElements = documentBody === null ? [] : [...documentBody.querySelectorAll('*')];
   // はみ出しの候補は、次の順に優先して、件数の上限まで残す（どの組も文書の順に集める）。
   // 1. 横にはみ出すか固定の要素で、横方向に切り取る祖先もスクロールできる祖先もない（`horizontalClipAncestor` が `NONE`）もの（RT12r の N4）
   // 2. 横にはみ出すか固定の要素で、それ以外のもの（カルーセルの中のスライドなど）
@@ -899,8 +938,8 @@ function collectLayoutInPage({
   let renderedDescendantScanLimitReachedCount = 0;
   // 要素（とその祖先）に `position: fixed | sticky` があるか。親は子より先に走査されるので、親の値を引き継ぐ。
   const withinFixedOrSticky = new Map<Element, boolean>();
-  if (document.body !== null) {
-    withinFixedOrSticky.set(document.body, isFixedOrSticky(window.getComputedStyle(document.body).position));
+  if (documentBody !== null) {
+    withinFixedOrSticky.set(documentBody, isFixedOrSticky(window.getComputedStyle(documentBody).position));
   }
 
   for (const [order, element] of allElements.entries()) {
@@ -909,10 +948,10 @@ function collectLayoutInPage({
     }
     const style = window.getComputedStyle(element);
     const fixed = isFixedOrSticky(style.position);
-    const parent = element.parentElement;
+    const parent = parentElementOf(element);
     const fixedOrStickyAncestor = parent !== null && (withinFixedOrSticky.get(parent) ?? false);
     withinFixedOrSticky.set(element, fixed || fixedOrStickyAncestor);
-    const visible = element.checkVisibility(visibilityOptions);
+    const visible = checkVisibilityOf(element, visibilityOptions);
     if (!visible) {
       continue;
     }
@@ -964,7 +1003,7 @@ function collectLayoutInPage({
 
     if (
       (rect.width <= thresholds.maxZeroSizeDimensionPx || rect.height <= thresholds.maxZeroSizeDimensionPx)
-      && element.matches('a[href], button, input, select, textarea, [role="button"], [role="link"]')
+      && matchesOf(element, 'a[href], button, input, select, textarea, [role="button"], [role="link"]')
     ) {
       zeroSizeInteractiveCount += 1;
       if (zeroSizeInteractive.length < thresholds.maxZeroSizeInteractiveCandidates) {
@@ -975,8 +1014,8 @@ function collectLayoutInPage({
         }
         zeroSizeInteractive.push({
           selector,
-          tagName: element.tagName.toLowerCase(),
-          role: element.getAttribute('role'),
+          tagName: tagNameOf(element).toLowerCase(),
+          role: getAttributeOf(element, 'role'),
           rect,
           visibility,
           position: style.position,
@@ -991,11 +1030,11 @@ function collectLayoutInPage({
 
     if (element instanceof HTMLElement) {
       const widthClipped = clippingOverflows.has(style.overflowX)
-        && element.scrollWidth > element.clientWidth + thresholds.geometryEpsilonPx;
+        && scrollWidthOf(element) > clientWidthOf(element) + thresholds.geometryEpsilonPx;
       const heightClipped = clippingOverflows.has(style.overflowY)
-        && element.scrollHeight > element.clientHeight + thresholds.geometryEpsilonPx;
+        && scrollHeightOf(element) > clientHeightOf(element) + thresholds.geometryEpsilonPx;
       if (widthClipped || heightClipped) {
-        const text = normalize(element.innerText);
+        const text = normalize(innerTextOf(element));
         if (text.length > 0) {
           clippedTextCount += 1;
           if (clippedText.length < thresholds.maxClippedTextCandidates) {
@@ -1013,10 +1052,10 @@ function collectLayoutInPage({
               overflowY: style.overflowY,
               position: style.position,
               zIndex: style.zIndex,
-              clientWidth: element.clientWidth,
-              clientHeight: element.clientHeight,
-              scrollWidth: element.scrollWidth,
-              scrollHeight: element.scrollHeight,
+              clientWidth: clientWidthOf(element),
+              clientHeight: clientHeightOf(element),
+              scrollWidth: scrollWidthOf(element),
+              scrollHeight: scrollHeightOf(element),
               widthClipped,
               heightClipped,
               partiallyClippedText: lineCheck.clipped,
@@ -1037,7 +1076,7 @@ function collectLayoutInPage({
       fixed,
       fixedOrStickyAncestor,
     };
-    const heading = element.matches('h1, h2, h3, h4, h5, h6');
+    const heading = matchesOf(element, 'h1, h2, h3, h4, h5, h6');
     const primary = (kind !== 'other' || fixed)
       && rect.width > thresholds.maxZeroSizeDimensionPx
       && rect.height > thresholds.maxZeroSizeDimensionPx;
@@ -1070,7 +1109,7 @@ function collectLayoutInPage({
     };
   };
   const related = (first: Element, second: Element): boolean => (
-    first === second || first.contains(second) || second.contains(first)
+    first === second || containsOf(first, second) || containsOf(second, first)
   );
 
   const fixedHeadingOverlaps: FixedHeadingOverlapEvidence[] = [];
@@ -1216,16 +1255,16 @@ function collectLayoutInPage({
   const boxesOutsideViewport: OutsideViewportEvidence[] = retainedOutsideViewport.map(({ element, evidence }) => {
     let nearestListedAncestorIndex: number | null = null;
     for (
-      let ancestor = element.parentElement;
+      let ancestor = parentElementOf(element);
       ancestor !== null && nearestListedAncestorIndex === null;
-      ancestor = ancestor.parentElement
+      ancestor = parentElementOf(ancestor)
     ) {
       nearestListedAncestorIndex = listedIndexes.get(ancestor) ?? null;
     }
     return { ...evidence, nearestListedAncestorIndex };
   });
-  const root = document.documentElement;
-  const body = document.body;
+  const root = documentElement;
+  const body = documentBody;
   const documentElementScrollWidth = root?.scrollWidth ?? 0;
   const bodyScrollWidth = body?.scrollWidth ?? 0;
   return {
@@ -1267,6 +1306,7 @@ function collectLayoutInPage({
     incompleteReason,
   };
 }
+const collectLayoutInPage = composeInPage(collectLayoutReader);
 
 const DEADLINE_EXCEEDED_WITHOUT_LAYOUT: LayoutCollectionResult = Object.freeze({
   status: 'PARTIAL',
@@ -1408,7 +1448,7 @@ export async function collectStressLayout(
       const tracker = afterNavigation === undefined ? null : trackMainFrameDocument(session.page);
       const recorder = afterNavigation === undefined
         ? null
-        : await startNavigationDiagnostics(session.page, { deadlineAtMs: Math.min(deadlineAtMs, Date.now() + sessionOpenTimeoutMs) });
+        : await startNavigationDiagnostics(session.page, { deadlineAtMs: deadlineWithinTimeoutAtMs(deadlineAtMs, sessionOpenTimeoutMs) });
       let navigated: MainFrameLoadSettlement;
       try {
         let diagnostics: NavigationDiagnostics | null = null;

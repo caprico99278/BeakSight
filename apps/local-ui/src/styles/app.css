@@ -1,0 +1,484 @@
+/*
+ * ローカルの管理画面の配置と部品の見た目（Task 23 設計書 4.7）。色と余白は tokens.css の変数だけを使う。
+ * tokens.css の後に読み込む（画面の head で 2 つの link を並べる）。
+ * CSP（style-src 'self'）のため、要素の style 属性や inline の style 要素は使わない（このファイルのクラスだけ）。
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-family);
+  font-size: var(--font-size-body);
+  line-height: var(--line-height);
+}
+
+a {
+  color: var(--color-accent-strong);
+}
+
+:focus-visible {
+  outline: var(--focus-ring-width) solid var(--color-focus);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.skip-link {
+  position: absolute;
+  left: var(--space-4);
+  top: calc(-1 * var(--space-6) * 2);
+  padding: var(--space-2) var(--space-4);
+  background: var(--color-accent);
+  color: var(--color-text-on-accent);
+  border-radius: var(--radius-small);
+  z-index: 10;
+}
+
+.skip-link:focus {
+  top: var(--space-4);
+}
+
+/* 全体の配置: 左のメニュー、右に上の帯と本文 */
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: var(--color-sidebar);
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-5) var(--space-4);
+}
+
+.brand {
+  margin: 0 0 var(--space-6);
+}
+
+.brand-name {
+  display: block;
+  font-size: var(--font-size-brand);
+  font-weight: 700;
+  color: var(--color-accent);
+  letter-spacing: var(--letter-spacing-brand);
+}
+
+.brand-tagline {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-muted);
+}
+
+.nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.nav-link {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-small);
+  color: var(--color-text);
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  background: var(--color-panel);
+}
+
+.nav-link[aria-current='page'] {
+  background: var(--color-panel-raised);
+  color: var(--color-accent-strong);
+  font-weight: 700;
+  box-shadow: inset var(--nav-bar-width) 0 0 var(--color-accent);
+}
+
+.main-column {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-sidebar);
+}
+
+.page-title {
+  margin: 0;
+  font-size: var(--font-size-title);
+}
+
+.content {
+  padding: var(--space-6);
+  width: 100%;
+  max-width: var(--content-max-width);
+}
+
+/* パネル */
+.panel {
+  background: var(--color-panel);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.panel-heading {
+  margin: 0 0 var(--space-4);
+  font-size: var(--font-size-heading);
+}
+
+.toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-4);
+}
+
+/* 表 */
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+caption {
+  text-align: left;
+  color: var(--color-text-muted);
+  padding-bottom: var(--space-2);
+}
+
+th,
+td {
+  text-align: left;
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  vertical-align: top;
+}
+
+th {
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: var(--font-size-small);
+}
+
+/*
+ * 一覧の表: 短い値の列（名前、環境、認証の方式、状態、改訂、日時）は折り返さない。少し長い値の列（監査モード）は、語の途中では折り返さず、
+ * 空白と括弧の前でだけ折り返す（keep-all）。長い説明の列（最後の Run）は、ふつうの文として折り返し、狭くなりすぎない幅を持つ。
+ */
+.data-table th,
+.data-table td {
+  white-space: nowrap;
+}
+
+.data-table .cell-break {
+  white-space: normal;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+
+.data-table .cell-wrap {
+  white-space: normal;
+  min-width: var(--table-wrap-column-min-width);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+/* バッジ（色だけに頼らず、文字を示す） */
+.badge {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-small);
+  border: 1px solid currentcolor;
+  font-size: var(--font-size-small);
+  white-space: nowrap;
+}
+
+.badge--positive {
+  color: var(--color-positive);
+}
+
+.badge--caution {
+  color: var(--color-caution);
+}
+
+.badge--critical {
+  color: var(--color-critical);
+}
+
+.badge--notice {
+  color: var(--color-notice);
+}
+
+.badge--shield {
+  color: var(--color-notice);
+}
+
+.badge--neutral {
+  color: var(--color-neutral);
+}
+
+/* ボタン */
+.button {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-small);
+  border: 1px solid var(--color-border);
+  background: var(--color-panel-raised);
+  color: var(--color-text);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.button--primary {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-text-on-accent);
+  font-weight: 700;
+}
+
+.button--danger {
+  border-color: var(--color-critical);
+  color: var(--color-critical);
+}
+
+.button:disabled {
+  opacity: var(--opacity-disabled);
+  cursor: not-allowed;
+}
+
+.button-row {
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-top: var(--space-5);
+}
+
+/* フォーム */
+.form-grid {
+  display: grid;
+  gap: var(--space-5);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.field-label {
+  font-weight: 600;
+}
+
+.field-hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.field-error {
+  color: var(--color-critical);
+  font-size: var(--font-size-small);
+}
+
+.input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-small);
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.input[aria-invalid='true'] {
+  border-color: var(--color-critical);
+}
+
+textarea.input {
+  min-height: var(--textarea-min-height);
+}
+
+/* お知らせ */
+.notice {
+  border-radius: var(--radius-small);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-left-width: var(--notice-bar-width);
+  background: var(--color-panel-raised);
+  margin-bottom: var(--space-4);
+}
+
+.notice--caution {
+  border-left-color: var(--color-caution);
+}
+
+.notice--critical {
+  border-left-color: var(--color-critical);
+}
+
+.notice--positive {
+  border-left-color: var(--color-positive);
+}
+
+.notice-heading {
+  margin: 0 0 var(--space-1);
+  font-weight: 700;
+}
+
+.notice p {
+  margin: 0;
+}
+
+/* 一覧の項目（定義の一覧） */
+.facts {
+  display: grid;
+  grid-template-columns: minmax(var(--facts-label-min-width), max-content) 1fr;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--color-text-muted);
+}
+
+.facts dd {
+  margin: 0;
+}
+
+/* 確認のダイアログ */
+.dialog {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-panel);
+  color: var(--color-text);
+  padding: var(--space-5);
+  max-width: var(--dialog-max-width);
+}
+
+.dialog::backdrop {
+  background: var(--color-overlay);
+}
+
+.dialog-title {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-size-heading);
+}
+
+/* シナリオの承認の確認のダイアログ（Task 28 の設計書 4.6。T28e）: 確かめる内容（差分・副作用の確認・期限・上限）は、長いときに枠の中で送る。 */
+.dialog-details {
+  max-height: var(--dialog-details-max-height);
+  overflow: auto;
+  margin-bottom: var(--space-4);
+}
+
+/* 監査のジョブ（Task 24 の設計書 4.8。T24f） */
+.badge-row {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cell-action {
+  margin: var(--space-2) 0 0;
+  white-space: nowrap;
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+fieldset.field {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-small);
+  padding: var(--space-3) var(--space-4);
+  margin: 0;
+}
+
+.progress {
+  display: block;
+  width: 100%;
+  height: var(--progress-height);
+  margin-bottom: var(--space-4);
+  accent-color: var(--color-accent);
+}
+
+.link-list {
+  margin: 0;
+  padding-left: var(--space-5);
+  line-height: var(--line-height);
+}
+
+/* 認証の設定（Task 25 の設計書 4.5。T25e）: 短い語や Origin を、印なしで横に並べる一覧。 */
+.word-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 自動ログイン（Task 26 の設計書 4.2、4.3、4.6。T26e）: 認証の設定の自動ログインの欄のまとまりと、資格情報の画面の部品。 */
+.field-group {
+  display: grid;
+  gap: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-small);
+  padding: var(--space-3) var(--space-4);
+  margin: 0;
+}
+
+.field-group-heading {
+  font-weight: 700;
+  padding: 0 var(--space-1);
+}
+
+.field-group-subheading {
+  margin: var(--space-2) 0 0;
+  font-weight: 600;
+}
+
+.field-group .field-hint {
+  margin: 0;
+}
+
+.field-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--facts-label-min-width), 1fr));
+  gap: var(--space-3);
+}
+
+.field-value {
+  display: block;
+  padding: var(--space-2) 0;
+}
+
+.section-gap {
+  margin-top: var(--space-5);
+}

@@ -17,7 +17,6 @@ import {
   MAX_SELECTOR_LENGTH,
   MAX_URL_LENGTH,
   MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
-  PAGE_CLOSE_TIMEOUT_MS,
   PAGE_SETTLING_PACING,
   SCROLL_STAGE_BUDGET_SETTLING_MULTIPLIER,
   SESSION_OPEN_TIMEOUT_MS,
@@ -97,9 +96,9 @@ describe('page audit timing limits', () => {
 
 // P18a（DEF-008。Task 18 の前の整理の設計書 4.2）: Context の終了と、Context と page の作成を待つ上限。
 describe('passive session open and close deadlines', () => {
-  it('owns the Context close deadline, equal to the page close deadline', () => {
+  // CCX-21（CC-049）: page を閉じる処理の期限（同じ 5 秒）は、DEF-038 で使わなくなったので消した。
+  it('owns the Context close deadline', () => {
     expect(CONTEXT_CLOSE_TIMEOUT_MS).toBe(5_000);
-    expect(CONTEXT_CLOSE_TIMEOUT_MS).toBe(PAGE_CLOSE_TIMEOUT_MS);
   });
 
   it('owns the session open deadline', () => {

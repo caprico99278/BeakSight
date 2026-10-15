@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-read-check-update:1",
+  "description": "Local UI Server Function input: change one READ check definition (Task 27 design 4.5, 4.7). expectedRevision is the revision the screen read. The definition itself is validated by validateReadCheckDefinition against the candidate of the latest discovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["readCheckId", "expectedRevision", "definition"],
+  "properties": {
+    "readCheckId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" },
+    "expectedRevision": { "type": "integer", "minimum": 1 },
+    "definition": { "type": "object" }
+  }
+}

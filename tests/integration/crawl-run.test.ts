@@ -1,7 +1,6 @@
 // R15d（Task 14〜17 の設計書 5.6、実装計画 Task 15）: fixture の /crawl/ を、実際の Chromium で Run Coordinator がクロールする。
 // 実行時間を抑えるため、幅の走査（`stressWidths`）とスクリーンショットは行わない設定にする（Interaction の段階は既定のまま有効）。
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -18,6 +17,7 @@ import { buildReportViewModel } from '../../src/report/view-model.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserStallingContextClose } from '../helpers/browser-proxies.js';
 import { EXTERNAL_SCHEME_TARGETS } from '../helpers/external-scheme-fixture.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import {
   createRunLauncher,
   expectOnlyReadRequests,
@@ -300,7 +300,7 @@ describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', 
    */
   async function startFlakyServer(): Promise<{ readonly origin: string; readonly close: () => Promise<void> }> {
     let flakyRequests = 0;
-    const flaky = createServer((request, response) => {
+    return startLoopbackHttpServer((request, response) => {
       const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0];
       if (pathname !== FLAKY_PATH) {
         response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -316,24 +316,6 @@ describe('RunCoordinator: screenshots of the attempt before a retry (DEF-007)', 
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', Connection: 'close' });
       response.end(pageWithBackground(flakyRequests === 2 ? '#ff0000' : '#0000ff'));
     });
-    const port = await new Promise<number>((resolvePort, reject) => {
-      flaky.once('error', reject);
-      flaky.listen({ host: '127.0.0.1', port: 0 }, () => {
-        const address = flaky.address();
-        if (address === null || typeof address === 'string') {
-          reject(new Error('flaky server did not bind to a TCP port'));
-          return;
-        }
-        resolvePort(address.port);
-      });
-    });
-    return {
-      origin: `http://127.0.0.1:${port}`,
-      close: async () => {
-        flaky.closeAllConnections();
-        await new Promise<void>((resolveClose) => flaky.close(() => resolveClose()));
-      },
-    };
   }
 
   it('keeps the screenshots of the first attempt under retry-1 and the final ones in the usual place', async () => {
@@ -414,7 +396,7 @@ describe('RunCoordinator: no new page or viewport after a safety invariant viola
   async function startViolatingSite(): Promise<ViolatingSite> {
     const gets: string[] = [];
     const nonGets: string[] = [];
-    const site = createServer((request, response) => {
+    const site = await startLoopbackHttpServer((request, response) => {
       const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
       if (request.method === 'GET') {
         gets.push(pathname);
@@ -437,26 +419,7 @@ describe('RunCoordinator: no new page or viewport after a safety invariant viola
       response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       response.end('not found');
     });
-    const port = await new Promise<number>((resolvePort, reject) => {
-      site.once('error', reject);
-      site.listen({ host: '127.0.0.1', port: 0 }, () => {
-        const address = site.address();
-        if (address === null || typeof address === 'string') {
-          reject(new Error('violating site did not bind to a TCP port'));
-          return;
-        }
-        resolvePort(address.port);
-      });
-    });
-    return {
-      origin: `http://127.0.0.1:${port}`,
-      gets,
-      nonGets,
-      close: async () => {
-        site.closeAllConnections();
-        await new Promise<void>((resolveClose) => site.close(() => resolveClose()));
-      },
-    };
+    return { origin: site.origin, gets, nonGets, close: site.close };
   }
 
   it('records the violation only once, skips the rest with SAFETY_VIOLATION_ABORT, and writes schema-valid artifacts', async () => {

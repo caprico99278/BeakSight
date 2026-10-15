@@ -18,6 +18,8 @@
 //   （`STRESS_WIDTHS`。不調の後に幅の走査の読み込みが届かないことを確かめるため）を加えたもの。`/crawl/` のページには Interaction の候補が
 //   ないので、Interaction の読み込みは、不調がなくても起きない（Interaction の段階で止めることは、`page-auditor-site-unavailability.test.ts`
 //   で確かめる）。
+// - 混雑の下でも、比べる相手の Run と各場面の Run の片方だけが期限切れで PARTIAL にならないよう、サイトの不調の判定に使わない 2 つの期限
+//   （DOM の準備と、Browser を閉じる処理）を、どの Run でも長めにする（DEF-063。`LOADED_DEADLINE_FACTOR`）。
 //
 // 空振りでないこと（機能を外した場合に失敗する形）:
 // - 不調で止めなければ、切り替えた後に、そのページの幅の走査と Mobile と、次のページの読み込みが中継のサーバに届く（中断しない Run の
@@ -75,6 +77,7 @@ import {
   type RunSummary,
   type ViewportProfile,
 } from '../../src/core/contracts.js';
+import { BROWSER_CLOSE_TIMEOUT_MS } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
@@ -90,7 +93,7 @@ import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { formatDuration } from '../../src/presentation/format.js';
 import { CLI_TEXT, siteUnavailableRecheckText, siteUnavailableSlowdownText, siteUnavailableStopText } from '../../src/presentation/messages.js';
 import { BROWSER_DEFAULT_FAVICON_PATH } from '../helpers/chromium.js';
-import { captureCliOutput, fastRunConfig, readJson, readRunAudit } from '../helpers/run-harness.js';
+import { captureCliOutput, fastRunConfig, readJson, readRunAudit, RUN_IDENTITY_AUDIT_OVERRIDES } from '../helpers/run-harness.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
 const START_PATH = '/crawl/index.html';
@@ -102,6 +105,26 @@ const PAGES_BEFORE_SWITCH = 2;
  * この期限の中で読み込める。
  */
 const UNRESPONSIVE_NAVIGATION_TIMEOUT_MS = 3_000;
+/**
+ * 混雑の下で切れた本番の期限（DOM の準備と、Browser を閉じる処理）を、この結合テストの Run（比べる相手の中断しない Run と、各場面の Run）で
+ * 延ばす倍率（DEF-063）。2026-10-10 の観測（CPU のループ 8 本と `tests/integration` の並行の実行 2 本の混雑）で、どちらの期限も既定の値で
+ * 切れ、Run が PARTIAL になった。比べる相手と各場面の Run の片方だけが混雑で PARTIAL になると、比べる確かめが食い違うので、両方に同じ
+ * 長めの期限を入れる。観測した止まり（下の各定数）に余裕を取って 6 倍にする。サイトの不調の判定に関わる値（読み込みの期限
+ * `UNRESPONSIVE_NAVIGATION_TIMEOUT_MS`、確かめ直しの待ち）と、ページの期限（`overallPageTimeoutMs`）は変えない。
+ */
+const LOADED_DEADLINE_FACTOR = 6;
+/**
+ * DOM の準備を待つ期限（ms。`crawl.resourceSettlingTimeoutMs`。既定は 5,000）。観測: 既定の 5 秒が切れ、ページが
+ * `DOM_READINESS_FAILED: DEADLINE_EXCEEDED` の PARTIAL になった回がある（その回は、前のページの読み込みから次の読み込みまで約 19 秒
+ * 止まった）。30,000。
+ */
+const LOADED_RESOURCE_SETTLING_TIMEOUT_MS = DEFAULT_CONFIG.crawl.resourceSettlingTimeoutMs * LOADED_DEADLINE_FACTOR;
+/**
+ * Browser を閉じる処理を待つ期限（ms。Run Coordinator の `browserCloseTimeoutMs`。既定は `BROWSER_CLOSE_TIMEOUT_MS` の 10,000）。
+ * 観測: 強い混雑の下の SU6 の Run 4 回すべてと、比べる相手の Run 2 回のうち 1 回で、既定の 10 秒が切れ、Run の理由
+ * `UNHANDLED_FAILURE: browser-close:...` で Run が PARTIAL になった（ふだんは 1 秒未満で終わる）。60,000。
+ */
+const LOADED_BROWSER_CLOSE_TIMEOUT_MS = BROWSER_CLOSE_TIMEOUT_MS * LOADED_DEADLINE_FACTOR;
 /** `EMPTY_503` で返す status（503 Service Unavailable。`SITE_UNAVAILABLE_HTTP_STATUSES` の1つ）。 */
 const SERVICE_UNAVAILABLE_STATUS = 503;
 /** BeakSight が取得する robots.txt と sitemap.xml の、Origin からのパス（`src/crawl/site-metadata.ts` の取得の順）。 */
@@ -329,18 +352,21 @@ afterAll(async () => {
 /**
  * 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（中継のサーバの `/crawl/` のページ）。
  * `minNavigationIntervalMs` を渡すと、ページの読み込みの間隔をその値にする（既定は `createTestConfig` の 0。減速（SU6）を確かめる場面で使う。
- * 待ちは差し替えるので、実際には待たない）。
+ * 待ちは差し替えるので、実際には待たない）。DOM の準備の期限は、混雑の下でも切れないように長めにする（`LOADED_RESOURCE_SETTLING_TIMEOUT_MS`。
+ * DEF-063）。中断しない Run と Finding を比べるので、性能の指標は集めない（`RUN_IDENTITY_AUDIT_OVERRIDES`。DEF-079）。
  */
 const configFor = (name: string, minNavigationIntervalMs = 0): AuditConfig =>
   fastRunConfig(relay.origin, START_PATH, {
     target: { id: 'cli-site-unavailable' },
     output: { directory: join(workDirectory, name) },
-    crawl: { navigationTimeoutMs: UNRESPONSIVE_NAVIGATION_TIMEOUT_MS, minNavigationIntervalMs },
+    audit: RUN_IDENTITY_AUDIT_OVERRIDES,
+    crawl: { navigationTimeoutMs: UNRESPONSIVE_NAVIGATION_TIMEOUT_MS, resourceSettlingTimeoutMs: LOADED_RESOURCE_SETTLING_TIMEOUT_MS, minNavigationIntervalMs },
     viewports: { stressWidths: [...STRESS_WIDTHS] },
   });
 
 /**
- * Run Coordinator に加える、テストの差し替え（`createRunCoordinator` で、CLI が渡すものに加えて `new RunCoordinator` に渡す）。
+ * Run Coordinator に加える、テストの差し替え（`createRunCoordinator` で、CLI が渡すものに加えて `new RunCoordinator` に渡す。どの Run でも、
+ * Browser を閉じる期限を `LOADED_BROWSER_CLOSE_TIMEOUT_MS` にする。DEF-063）。
  * - `switchAfterPages`: そのページ数の監査が終わったとき（`onProgress`）に、中継のサーバのモードを切り替える。
  * - `onRecheckWait`: 確かめ直しの前の待ち（`SITE_UNAVAILABLE_RECHECK_DELAYS_MS` のどれかの `sleep`。SU5、SU6）のときに呼ぶ（引数は、その
  *   待ちの長さと、この実行で何回目の確かめ直しの待ちか（0 から））。
@@ -367,6 +393,8 @@ interface CommandOutcome {
   readonly recheckSleeps: readonly number[];
   /** 確かめ直しの前の待ちのたびに、その時点までに中継のサーバが受けた要求の数（待っている間に何も送らないことの確かめ）。 */
   readonly requestCountsAtRecheckWait: readonly number[];
+  /** Run Coordinator に渡した、Browser を閉じる期限（ms。DEF-063。Run Coordinator を作らなかったら `undefined`）。 */
+  readonly browserCloseTimeoutMs: number | undefined;
 }
 
 /**
@@ -380,12 +408,15 @@ async function runCommand(config: AuditConfig, mode: RelayMode, hooks: Coordinat
   const stderr = captureCliOutput();
   const sleeps: number[] = [];
   const requestCountsAtRecheckWait: number[] = [];
+  let browserCloseTimeoutMs: number | undefined;
   const dependencies: RunCommandDependencies = {
     launchBrowser: launchCliChromium,
     clock: () => new Date(),
     now: () => Date.now(),
     createRunCoordinator: (coordinatorDependencies) => new RunCoordinator({
       ...coordinatorDependencies,
+      // Browser を閉じる期限は、混雑の下でも切れないように長めにする（DEF-063）。
+      browserCloseTimeoutMs: (browserCloseTimeoutMs = LOADED_BROWSER_CLOSE_TIMEOUT_MS),
       onProgress: (report) => {
         coordinatorDependencies.onProgress?.(report);
         if (report.pagesFinished === hooks.switchAfterPages?.pages) {
@@ -410,6 +441,7 @@ async function runCommand(config: AuditConfig, mode: RelayMode, hooks: Coordinat
     sleeps,
     recheckSleeps: sleeps.filter(isRecheckDelay),
     requestCountsAtRecheckWait,
+    browserCloseTimeoutMs,
   };
 }
 
@@ -598,6 +630,12 @@ describe('SU3c: the configuration of the Runs', () => {
     expect(validateConfig(config)).toMatchObject({ ok: true });
     expect(config.site).toEqual({ startUrl: `${relay.origin}${START_PATH}`, allowedOrigins: [relay.origin] });
     expect(config.crawl.navigationTimeoutMs).toBe(UNRESPONSIVE_NAVIGATION_TIMEOUT_MS);
+    // DEF-063: DOM の準備の期限だけを長めにし、ページの期限は既定のまま。比べる相手の Run も、Browser を閉じる期限を長めにして実行した。
+    expect(config.crawl.resourceSettlingTimeoutMs).toBe(LOADED_RESOURCE_SETTLING_TIMEOUT_MS);
+    expect(LOADED_RESOURCE_SETTLING_TIMEOUT_MS).toBeGreaterThan(DEFAULT_CONFIG.crawl.resourceSettlingTimeoutMs);
+    expect(config.crawl.overallPageTimeoutMs).toBe(DEFAULT_CONFIG.crawl.overallPageTimeoutMs);
+    expect(uninterrupted.outcome.browserCloseTimeoutMs).toBe(LOADED_BROWSER_CLOSE_TIMEOUT_MS);
+    expect(LOADED_BROWSER_CLOSE_TIMEOUT_MS).toBeGreaterThan(BROWSER_CLOSE_TIMEOUT_MS);
   });
 
   it('control: without the stop, the relay server gets the GETs of every viewport and stress width of the k+1-th page and of the next page', () => {
@@ -884,6 +922,18 @@ describe('SU6: the site is back before the second recheck of the k+1-th page: th
     expect(await comparableRunIn(runDirectory)).toEqual(uninterrupted.comparable);
     // 設定の間隔は、`run.json` の `load` に設定の値のまま残る（減速は保存しない）。
     expect(run.load.minNavigationIntervalMs).toBe(BASE_INTERVAL_MS);
+  });
+
+  it('runs with the longer deadlines of the DOM readiness and the browser close only, keeping the navigation timeout of the judgment (DEF-063)', () => {
+    // 長めにしたのは、サイトの不調の判定に使わない 2 つの期限だけ。判定の読み込みの期限（3 秒）と確かめ直しの待ちは変えていない。
+    expect(run.effectiveConfig.crawl.navigationTimeoutMs).toBe(UNRESPONSIVE_NAVIGATION_TIMEOUT_MS);
+    expect(run.effectiveConfig.crawl.resourceSettlingTimeoutMs).toBe(LOADED_RESOURCE_SETTLING_TIMEOUT_MS);
+    expect(run.effectiveConfig.crawl.overallPageTimeoutMs).toBe(DEFAULT_CONFIG.crawl.overallPageTimeoutMs);
+    expect(outcome.browserCloseTimeoutMs).toBe(LOADED_BROWSER_CLOSE_TIMEOUT_MS);
+    // 長めの期限の下でも、SU6 の流れ（応答のない時間切れで 2 回捨て、待ち 2 回の後に通り、減速の知らせ 1 回）は同じ。
+    expect(outcome.recheckSleeps).toEqual(SITE_UNAVAILABLE_RECHECK_DELAYS_MS.slice(0, 2));
+    expect(diagnostics.map((diagnostic) => diagnostic?.siteUnavailableDetail)).toEqual([DESKTOP_PASSIVE_TIMEOUT, DESKTOP_PASSIVE_TIMEOUT]);
+    expect(slowdownLinesIn(outcome.stdout)).toBe(1);
   });
 
   it('waits twice (60 s, then 2 min), sends nothing while waiting, and then loads the same page again before going on', () => {

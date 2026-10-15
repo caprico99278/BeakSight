@@ -17,6 +17,8 @@ BeakSight は、サイトの不調（メンテナンス中で応答しない、�
 | ネットワークの層の失敗 | `net::ERR_CONNECTION_REFUSED`、`net::ERR_CONNECTION_RESET`、`net::ERR_NAME_NOT_RESOLVED`、証明書の失敗（`net::ERR_CERT_` で始まるもの）、本文の途中の切断（`net::ERR_CONTENT_LENGTH_MISMATCH`） |
 | HTTP の status が 429、502、503、504 の応答 | メンテナンス中の 503。読み込みが終わった場合も、時間切れの場合も同じです |
 
+ページを観測する環境の通信は、BeakSight の出口の中継を通ります。そのため、接続の拒否は、`net::ERR_CONNECTION_REFUSED` ではなく `net::ERR_CONNECTION_RESET` として記録されます。どちらもネットワークの層の失敗なので、判定は同じです（「[出口の中継と計測値](safety.md#出口の中継と計測値)」）。
+
 次の失敗は、サイトの不調とみなしません。今までどおり、そのページの失敗として記録し、監査を続けます。
 
 - 応答（ヘッダ）を受けた後の時間切れ（status が 429、502、503、504 の場合を除きます）。本文や部品の読み込みが遅いなど、そのページの重さによるものです。
@@ -73,7 +75,8 @@ BeakSight は、サイトの不調（メンテナンス中で応答しない、�
 | なし | あり | ネットワークを通らずに応答を得ました（キャッシュなど）。 |
 | あり | あり | 応答を受けました。`httpStatus` は、その応答の status です（例: メンテナンス中の 503）。 |
 
+- 接続先の IP アドレスと port は、BeakSight の出口の中継が覚えた、サイトの相手のアドレスです。中継が覚えていなければ、空（`null`）です。Interaction の各候補の読み込みの記録には、中継の待ち受けのアドレス（127.0.0.1）が出ます（「[出口の中継と計測値](safety.md#出口の中継と計測値)」）。
 - 診断の記録は、結果のファイルではありません。原因を調べるための、付けたしの情報です。Run Status、件数、HTML レポート、ChatGPT 用のバンドルには入りません。書けなかった場合も、監査は今までどおり続けます。
 - Run を最後まで終えたときの片付け（`checkpoint/` の中だけを消します）では、消えません。要らなくなったら、手で消してかまいません。
-- ページ本体の要求の観察（`navigationDiagnostics`）には、要求と応答の header の中身（Cookie など）と、本文を記録しません。記録するのは、上の時刻、`httpStatus`、接続先の IP アドレスと port などです。
+- ページ本体の要求の観察（`navigationDiagnostics`）には、要求と応答の header の中身（Cookie など）と、本文を記録しません。記録するのは、上の時刻、`httpStatus`、接続先の IP アドレスと port（`remoteIpAddress`、`remotePort`）などです。
 - そのページの監査の結果（`page`）には、出力のページの結果（`page.json`）と同じ network の Evidence が入ります。決まった一部の header の値を含みます。Cookie、`Set-Cookie`、`Authorization` などの機微な header の値は、`[REDACTED]` に置き換えます。

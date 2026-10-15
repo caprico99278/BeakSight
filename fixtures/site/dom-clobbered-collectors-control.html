@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Clobbered collectors fixture</title>
+    <base target="_self">
+    <style>
+      .scroller { height: 60px; overflow-y: auto; }
+      .tall { height: 200px; margin: 0; }
+      .clipper { width: 80px; height: 20px; overflow: hidden; white-space: nowrap; }
+      .zero { display: block; width: 0; height: 0; overflow: hidden; }
+      .filler { height: 1800px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Control page for dom-clobbered-collectors.html: the same structure with harmless names (prefix "control-"), so nothing is clobbered.
+    -->
+    <main>
+      <h1>Clobbered collectors fixture</h1>
+      <form class="scroller" method="post" action="/submit" aria-label="Scrolling form">
+      <input type="hidden" name="control-id">
+      <input type="hidden" name="control-tagName">
+      <input type="hidden" name="control-nodeType">
+      <input type="hidden" name="control-childNodes">
+      <input type="hidden" name="control-children">
+      <input type="hidden" name="control-parentElement">
+      <input type="hidden" name="control-parentNode">
+      <input type="hidden" name="control-previousElementSibling">
+      <input type="hidden" name="control-shadowRoot">
+      <input type="hidden" name="control-assignedSlot">
+      <input type="hidden" name="control-getAttribute">
+      <input type="hidden" name="control-hasAttribute">
+      <input type="hidden" name="control-matches">
+      <input type="hidden" name="control-closest">
+      <input type="hidden" name="control-contains">
+      <input type="hidden" name="control-checkVisibility">
+      <input type="hidden" name="control-getBoundingClientRect">
+      <input type="hidden" name="control-getClientRects">
+      <input type="hidden" name="control-clientLeft">
+      <input type="hidden" name="control-clientTop">
+      <input type="hidden" name="control-clientWidth">
+      <input type="hidden" name="control-clientHeight">
+      <input type="hidden" name="control-scrollWidth">
+      <input type="hidden" name="control-scrollHeight">
+      <input type="hidden" name="control-scrollLeft">
+      <input type="hidden" name="control-scrollTop">
+      <input type="hidden" name="control-innerText">
+      <input type="hidden" name="control-hidden">
+      <input type="hidden" name="control-attributes">
+      <input type="hidden" name="control-isConnected">
+      <input type="hidden" name="control-elements">
+      <input type="hidden" name="control-method">
+      <input type="hidden" name="control-action">
+      <input type="hidden" name="control-target">
+      <input type="hidden" name="control-enctype">
+        <p class="tall">Tall text inside the scrolling form</p>
+        <button type="submit">Send scrolling form</button>
+      </form>
+      <form class="clipper" method="get" action="/search" aria-label="Clipping form">
+      <input type="hidden" name="control-id">
+      <input type="hidden" name="control-tagName">
+      <input type="hidden" name="control-nodeType">
+      <input type="hidden" name="control-childNodes">
+      <input type="hidden" name="control-children">
+      <input type="hidden" name="control-parentElement">
+      <input type="hidden" name="control-parentNode">
+      <input type="hidden" name="control-previousElementSibling">
+      <input type="hidden" name="control-shadowRoot">
+      <input type="hidden" name="control-assignedSlot">
+      <input type="hidden" name="control-getAttribute">
+      <input type="hidden" name="control-hasAttribute">
+      <input type="hidden" name="control-matches">
+      <input type="hidden" name="control-closest">
+      <input type="hidden" name="control-contains">
+      <input type="hidden" name="control-checkVisibility">
+      <input type="hidden" name="control-getBoundingClientRect">
+      <input type="hidden" name="control-getClientRects">
+      <input type="hidden" name="control-clientLeft">
+      <input type="hidden" name="control-clientTop">
+      <input type="hidden" name="control-clientWidth">
+      <input type="hidden" name="control-clientHeight">
+      <input type="hidden" name="control-scrollWidth">
+      <input type="hidden" name="control-scrollHeight">
+      <input type="hidden" name="control-scrollLeft">
+      <input type="hidden" name="control-scrollTop">
+      <input type="hidden" name="control-innerText">
+      <input type="hidden" name="control-hidden">
+      <input type="hidden" name="control-attributes">
+      <input type="hidden" name="control-isConnected">
+      <input type="hidden" name="control-elements">
+      <input type="hidden" name="control-method">
+      <input type="hidden" name="control-action">
+      <input type="hidden" name="control-target">
+      <input type="hidden" name="control-enctype">
+        Clipped text that is wider than the clipping form box
+      </form>
+      <form class="zero" role="button" aria-label="Zero size form">
+      <input type="hidden" name="control-id">
+      <input type="hidden" name="control-tagName">
+      <input type="hidden" name="control-nodeType">
+      <input type="hidden" name="control-childNodes">
+      <input type="hidden" name="control-children">
+      <input type="hidden" name="control-parentElement">
+      <input type="hidden" name="control-parentNode">
+      <input type="hidden" name="control-previousElementSibling">
+      <input type="hidden" name="control-shadowRoot">
+      <input type="hidden" name="control-assignedSlot">
+      <input type="hidden" name="control-getAttribute">
+      <input type="hidden" name="control-hasAttribute">
+      <input type="hidden" name="control-matches">
+      <input type="hidden" name="control-closest">
+      <input type="hidden" name="control-contains">
+      <input type="hidden" name="control-checkVisibility">
+      <input type="hidden" name="control-getBoundingClientRect">
+      <input type="hidden" name="control-getClientRects">
+      <input type="hidden" name="control-clientLeft">
+      <input type="hidden" name="control-clientTop">
+      <input type="hidden" name="control-clientWidth">
+      <input type="hidden" name="control-clientHeight">
+      <input type="hidden" name="control-scrollWidth">
+      <input type="hidden" name="control-scrollHeight">
+      <input type="hidden" name="control-scrollLeft">
+      <input type="hidden" name="control-scrollTop">
+      <input type="hidden" name="control-innerText">
+      <input type="hidden" name="control-hidden">
+      <input type="hidden" name="control-attributes">
+      <input type="hidden" name="control-isConnected">
+      <input type="hidden" name="control-elements">
+      <input type="hidden" name="control-method">
+      <input type="hidden" name="control-action">
+      <input type="hidden" name="control-target">
+      <input type="hidden" name="control-enctype">
+        <span>Zero size form text</span>
+      </form>
+      <form id="login-form" method="post" action="/login">
+        <input id="login-username" type="text" name="username">
+        <input id="login-password" type="password" name="password">
+        <button id="login-submit" type="submit">Log in</button>
+      </form>
+    </main>
+    <img name="control-forms" alt="">
+    <img name="control-body" alt="">
+    <img name="control-documentElement" alt="">
+    <img name="control-scrollingElement" alt="">
+    <img name="control-querySelector" alt="">
+    <img name="control-querySelectorAll" alt="">
+    <img name="control-createTreeWalker" alt="">
+    <form name="control-title"></form>
+    <form name="control-images"></form>
+    <form name="control-getElementById"></form>
+    <form name="control-createRange"></form>
+    <form name="control-readyState"></form>
+    <div class="filler">Filler text below the forms</div>
+  </body>
+</html>

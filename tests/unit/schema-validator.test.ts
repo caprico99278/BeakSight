@@ -71,6 +71,8 @@ import {
   MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
 } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
+import { escapeJsonPointerSegment } from '../../src/core/json-pointer.js';
+import { createSchemaValidatorRegistry, describeSchemaError, schemaIssuePointerOf } from '../../src/core/schema-validator.js';
 import { discoverLinks } from '../../src/crawl/discover-links.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { collectColorEvidence } from '../../src/evidence/color-collector.js';
@@ -89,6 +91,7 @@ import {
 import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { sampleRunCheckpoint } from '../helpers/run-checkpoint-samples.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory } from '../helpers/temporary-build.js';
@@ -1571,6 +1574,8 @@ describe('I15a: the NOT_VERIFIABLE kind in Interaction Evidence', () => {
     await expect(validateArtifact('page', pageWithOutcome('NOT_VERIFIABLE', null))).resolves.toEqual({
       ok: false,
       errors: expect.arrayContaining([expect.stringContaining('must match "then" schema')]),
+      // CCX-24: 誤りの位置も、同じ誤りを構造で返す。
+      issues: expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('must match "then" schema'), missingProperty: null })]),
     });
   });
 
@@ -1580,6 +1585,8 @@ describe('I15a: the NOT_VERIFIABLE kind in Interaction Evidence', () => {
       await expect(validateArtifact('page', pageWithOutcome(status, 'OBSERVED_NO_CHANGE'))).resolves.toEqual({
         ok: false,
         errors: expect.arrayContaining([expect.stringContaining('must match "else" schema')]),
+        // CCX-24: 誤りの位置も、同じ誤りを構造で返す。
+        issues: expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('must match "else" schema'), missingProperty: null })]),
       });
     },
   );
@@ -1592,6 +1599,8 @@ describe('I15a: the NOT_VERIFIABLE kind in Interaction Evidence', () => {
     })).resolves.toEqual({
       ok: false,
       errors: expect.arrayContaining([expect.stringContaining('must include notVerifiableKind')]),
+      // CCX-24: 誤りの位置も、同じ誤りを構造で返す。
+      issues: expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('must include notVerifiableKind'), missingProperty: 'notVerifiableKind' })]),
     });
   });
 });
@@ -1656,6 +1665,8 @@ describe('C18n: Interaction reason codes and reason details', () => {
     await expect(validateArtifact('page', pageWithInteraction(withoutKey(interactionPayload, 'reasonDetail')))).resolves.toEqual({
       ok: false,
       errors: expect.arrayContaining([expect.stringContaining('must include reasonDetail')]),
+      // CCX-24: 誤りの位置も、同じ誤りを構造で返す。
+      issues: expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('must include reasonDetail'), missingProperty: 'reasonDetail' })]),
     });
     await expect(validateArtifact('page', pageWithInteraction({
       ...interactionPayload,
@@ -1663,6 +1674,8 @@ describe('C18n: Interaction reason codes and reason details', () => {
     }))).resolves.toEqual({
       ok: false,
       errors: expect.arrayContaining([expect.stringContaining('must include reasonDetail')]),
+      // CCX-24: 誤りの位置も、同じ誤りを構造で返す。
+      issues: expect.arrayContaining([expect.objectContaining({ message: expect.stringContaining('must include reasonDetail'), missingProperty: 'reasonDetail' })]),
     });
     await expect(validateArtifact('page', pageWithInteraction({ ...interactionPayload, reasonDetail: 1 })))
       .resolves.toMatchObject({ ok: false });
@@ -2309,11 +2322,11 @@ describe('C8: real collector output from local fixtures', () => {
         return {
           page: stressPage,
           close: async () => {
-            await factory.closePassivePage(stressPage);
+            // page は個別に閉じず、Context と一緒に閉じる（DEF-038。CCX-21）。
             await factory.closePassiveContext(stressContext);
           },
         };
-      }, url, [320], { deadlineAtMs, beforeNavigation: async () => 0 });
+      }, url, [320], { deadlineAtMs, beforeNavigation: NO_PACING_WAIT });
       const color = await collectColorEvidence(page);
       const networkEvidence = await network.snapshot();
       const performance = await performanceCollector.collect(page, networkEvidence, { deadlineAtMs });
@@ -2992,5 +3005,114 @@ describe('D2: the schema of the site-unavailable diagnostic (site-unavailable di
     expect(schemaAt(schema, ['properties', 'url'])).toEqual({ $ref: 'urn:beaksight:schema:page:1.0#/properties/pageUrl' });
     expect(schemaAt(schema, ['properties', 'runId'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/runId' });
     expect(schemaAt(schema, ['properties', 'writtenAt'])).toEqual({ $ref: 'urn:beaksight:schema:run:1.0#/properties/startedAt' });
+  });
+});
+
+// T22a-fix-round-1（Task 22 の設計書 6 の 2026-10-09 の改訂）: Ajv の扱いをこのファイルの owner の 1 か所に残したまま、
+// Control のスキーマ（`schemas/control/`）も検証できるように公開した部品（`createSchemaValidatorRegistry`、`describeSchemaError`）。
+describe('createSchemaValidatorRegistry and describeSchemaError', () => {
+  const ARTIFACT_SCHEMA_FILES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic'];
+  const readArtifactSchemas = async (): Promise<readonly object[]> => Promise.all(ARTIFACT_SCHEMA_FILES.map(readSchema));
+  const TEST_SCHEMA_ID = 'urn:beaksight:test:registry:1';
+  const twoRequiredSchema = Object.freeze({
+    $id: TEST_SCHEMA_ID,
+    type: 'object',
+    additionalProperties: false,
+    required: ['first', 'second'],
+    properties: { first: { type: 'string' }, second: { type: 'integer', minimum: 1 } },
+  });
+
+  it('returns the same results as validateArtifact for the artifact schemas, resolving $ref within the list', async () => {
+    const registry = createSchemaValidatorRegistry(await readArtifactSchemas());
+    const validateFinding = registry.validatorFor('urn:beaksight:schema:finding:1.0');
+    const { evidenceRefs: _evidenceRefs, ...missingEvidenceRefs } = validFinding;
+
+    expect(validateFinding(validFinding)).toEqual({ ok: true });
+    expect(validateFinding(missingEvidenceRefs)).toEqual(await validateArtifact('finding', missingEvidenceRefs));
+    expect(registry.validatorFor('urn:beaksight:schema:audit:1.0')(validAudit)).toEqual({ ok: true });
+    expect(registry.validatorFor('urn:beaksight:schema:audit:1.0')({ ...validAudit, run: {} })).toMatchObject({ ok: false });
+  });
+
+  it('reports every error (allErrors) in the describeSchemaError form', () => {
+    const validate = createSchemaValidatorRegistry([twoRequiredSchema]).validatorFor(TEST_SCHEMA_ID);
+
+    expect(validate({ first: 'a', second: 2 })).toEqual({ ok: true });
+    expect(validate({})).toEqual({
+      ok: false,
+      errors: ['/ must include first', '/ must include second'],
+      issues: [
+        { message: '/ must include first', instancePath: '', missingProperty: 'first' },
+        { message: '/ must include second', instancePath: '', missingProperty: 'second' },
+      ],
+    });
+    expect(validate({ first: 1, second: 0, extra: true })).toEqual({
+      ok: false,
+      errors: ['/ must NOT have additional properties', '/first must be string', '/second must be >= 1'],
+      issues: [
+        { message: '/ must NOT have additional properties', instancePath: '', missingProperty: null },
+        { message: '/first must be string', instancePath: '/first', missingProperty: null },
+        { message: '/second must be >= 1', instancePath: '/second', missingProperty: null },
+      ],
+    });
+  });
+
+  // CCX-24（CC-086）: 誤りの位置を、文から読み取らずに使えるように、構造で返す。文（`errors`）は変えない。
+  it('returns the location of each error in the same order as the messages, and the pointer of the field', () => {
+    const nestedSchema = {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      $id: 'urn:beaksight:schema:test:nested',
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        'a/b~c': {
+          type: 'array',
+          items: { type: 'object', additionalProperties: false, required: ['x~/y'], properties: { 'x~/y': { type: 'string' } } },
+        },
+      },
+    };
+    const validate = createSchemaValidatorRegistry([nestedSchema]).validatorFor('urn:beaksight:schema:test:nested');
+    const result = validate({ 'a/b~c': [{ 'x~/y': 'v' }, {}, { 'x~/y': 1 }] });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.issues.map(({ message }) => message)).toEqual(result.errors);
+    expect(result.issues.map(schemaIssuePointerOf)).toEqual(['/a~1b~0c/1/x~0~1y', '/a~1b~0c/2/x~0~1y']);
+    expect(result.issues.map(({ instancePath, missingProperty }) => [instancePath, missingProperty])).toEqual([
+      ['/a~1b~0c/1', 'x~/y'],
+      ['/a~1b~0c/2/x~0~1y', null],
+    ]);
+    expect(escapeJsonPointerSegment('~/~1')).toBe('~0~1~01');
+  });
+
+  it('uses the strict mode (an unknown keyword is a schema error)', () => {
+    expect(() => createSchemaValidatorRegistry([{ ...twoRequiredSchema, unknownKeyword: true }])).toThrow(/unknown keyword/u);
+  });
+
+  it('throws a RangeError for a schema id that was not registered', () => {
+    const registry = createSchemaValidatorRegistry([twoRequiredSchema]);
+
+    expect(() => registry.validatorFor('urn:beaksight:test:registry:2')).toThrow(RangeError);
+    expect(() => registry.validatorFor('constructor')).toThrow(RangeError);
+    expect(() => registry.validatorFor('__proto__')).toThrow(RangeError);
+  });
+
+  it('requires a string $id for every registered schema', () => {
+    const { $id: _id, ...withoutId } = twoRequiredSchema;
+
+    expect(() => createSchemaValidatorRegistry([withoutId])).toThrow(TypeError);
+  });
+
+  it('describes a required error with the missing property and other errors with the instance path', () => {
+    const base = { schemaPath: '#/required', data: {}, message: 'must have required property' } as const;
+
+    expect(describeSchemaError({ ...base, keyword: 'required', instancePath: '', params: { missingProperty: 'mode' } })).toBe(
+      '/ must include mode',
+    );
+    expect(describeSchemaError({ ...base, keyword: 'minimum', instancePath: '/revision', params: {}, message: 'must be >= 1' }))
+      .toBe('/revision must be >= 1');
+    const { message: _message, ...withoutMessage } = { ...base, keyword: 'enum', instancePath: '/mode', params: {} };
+    expect(describeSchemaError(withoutMessage)).toBe('/mode enum');
   });
 });

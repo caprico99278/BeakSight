@@ -131,6 +131,11 @@ export interface RunExecutionsView {
    * 表示カタログで引くだけにし、`summary.json` には、コードのまま出る。
    */
   readonly lastEndReason: RunExecutionEndReason;
+  /**
+   * 最後の実行の終わりの時刻（`items` の最後の実行の `finishedAt`。CCX-19。CC-048）。ChatGPT 用バンドルの名前を決める時刻で、CLI の結果の
+   * バンドルの行と、バンドルを書くときの名前の両方が、この値を使う（どの実行かは、`lastEndReason` と同じく、ここで 1 回だけ決める）。
+   */
+  readonly lastFinishedAt: string;
   /** 実行の記録の値の写し（`RunSummary.executions` の順のまま）。終わり方のラベルと説明は、描画する側がカタログで引く。 */
   readonly items: readonly [RunExecution, ...RunExecution[]];
 }
@@ -427,7 +432,8 @@ const copyFinding = (finding: Finding): Finding => ({ ...finding, evidenceRefs: 
 
 /**
  * 実行の記録の表示（R6）。実行の回数と再開の回数を数えるのは、ここだけである。最初の実行の後の実行が、再開である。
- * この起動の終わり方（最後の実行の終わり方。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補。R9）を決めるのも、ここだけである。
+ * この起動の終わり方（最後の実行の終わり方。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補。R9）と、最後の実行の終わりの時刻
+ * （CCX-19。CC-048）を決めるのも、ここだけである。
  * 記録の値は、写して持つ（入力を凍結しない）。
  */
 const executionsView = (executions: RunSummary['executions']): RunExecutionsView => {
@@ -437,6 +443,7 @@ const executionsView = (executions: RunSummary['executions']): RunExecutionsView
     count: executions.length,
     resumeCount: resumedExecutions.length,
     lastEndReason: lastExecution.endReason,
+    lastFinishedAt: lastExecution.finishedAt,
     items: structuredClone(executions),
   };
 };

@@ -20,6 +20,7 @@ import { wait } from '../../src/core/deadline.js';
 import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { canceledEvidenceViolation } from '../helpers/canceled-evidence-diagnostic.js';
 import { oopifTargetUrls } from '../helpers/chromium.js';
 import { crossSiteFramePath, crossSiteOriginOf } from '../helpers/external-scheme-fixture.js';
 import { NO_NON_READ_REQUESTS, openServerWindow, type ServerWindow } from '../helpers/gate-harness.js';
@@ -377,10 +378,14 @@ describe('DEF-026: a document request that the browser canceled while the Guard 
     }
     if (attempt === undefined) throw new Error('no attempt was made');
     expect(raceObserved('SAME_ORIGIN', attempt), `Guard commands: ${JSON.stringify(attempt.log.entries)}`).toBe(true);
-    expect(attempt.invariantViolations).toContainEqual({
-      code: 'CDP_CONTINUE_REQUEST_FAILED',
-      message: 'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.',
-    });
+    // DEF-052（設計書 `2026-10-09-beaksight-def-052-guard-evidence-wait-design.md` 2.2）: 元の文言で始まり、証拠が届かなかった理由の
+    // 診断（理由の語は製品の側の閉じた一覧、待った時間は証拠の待ちの時間、経った時間と覚えなかった数は 0 以上の整数）が続く。
+    const { CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON, CANCELED_DOCUMENT_EVIDENCE_WAIT_MS } = await import('../../src/safety/passive-request-guard.js');
+    expect(attempt.invariantViolations).toContainEqual(canceledEvidenceViolation(
+      'CDP_CONTINUE_REQUEST_FAILED',
+      'cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.',
+      { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED, waitedMs: CANCELED_DOCUMENT_EVIDENCE_WAIT_MS },
+    ));
     expect(attempt.closed).toBe(true);
   }, RACE_TEST_TIMEOUT_MS);
 });

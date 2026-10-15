@@ -3,8 +3,7 @@
 // BLOCKED_EXTERNAL_REDIRECT、それ以外は FAILED。最終URLは normalizeUrl で正規化する。
 // SU2a（サイトが応答しないときに Run を止める設計書 2.1）: 結果は、main frame の読み込みの観測（`loadObservation`）も持つ。
 // 今の項目（`navigationOutcome`・`httpStatus`・`failureDetail`）は、観測から導き、意味を変えない。
-import { createServer as createHttpServer, type ServerResponse } from 'node:http';
-import { createServer, type Socket } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
@@ -16,6 +15,7 @@ import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-gu
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { closedLoopbackOrigin, startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -44,17 +44,11 @@ const OBSERVATION_PATHS = Object.freeze({
   stallAfterHeaders: '/stall-after-headers.html',
 });
 
-interface ObservationServer {
-  readonly origin: string;
-  /** 残った接続（本文を止めた接続を含む）を切ってから、サーバを閉じる。何度呼んでもよい。 */
-  close(): Promise<void>;
-}
-
 let browser: Browser;
 let factory: BrowserContextFactory | undefined;
 let context: BrowserContext | undefined;
 const servers: FixtureServer[] = [];
-const observationServers: ObservationServer[] = [];
+const observationServers: LoopbackHttpServer[] = [];
 const plainContexts: BrowserContext[] = [];
 
 useHeadlessChromium((launched) => {
@@ -110,57 +104,10 @@ function respondForObservation(path: string, response: ServerResponse): void {
 }
 
 /** 本文のある 503 と、ヘッダの後に本文を止める 200 を返す、テストの中のサーバ（127.0.0.1）を起動する。 */
-async function startObservationServer(): Promise<ObservationServer> {
-  const sockets = new Set<Socket>();
-  const server = createHttpServer((request, response) => respondForObservation(request.url ?? '/', response));
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  const port = await new Promise<number>((resolvePort, reject) => {
-    server.once('error', reject);
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('observation server did not bind to a TCP port'));
-        return;
-      }
-      resolvePort(address.port);
-    });
-  });
-  let closing: Promise<void> | undefined;
-  const observationServer: ObservationServer = {
-    origin: `http://127.0.0.1:${port}`,
-    close: () => {
-      closing ??= new Promise<void>((resolveClose, reject) => {
-        for (const socket of sockets) {
-          socket.destroy();
-        }
-        server.close((error) => (error === undefined ? resolveClose() : reject(error)));
-      });
-      return closing;
-    },
-  };
+async function startObservationServer(): Promise<LoopbackHttpServer> {
+  const observationServer = await startLoopbackHttpServer((request, response) => respondForObservation(request.url ?? '/', response));
   observationServers.push(observationServer);
   return observationServer;
-}
-
-/** 127.0.0.1 の、いま使われていないポートの Origin（ポートを一度確保して、すぐに解放する）。 */
-async function unusedLoopbackOrigin(): Promise<string> {
-  const probe = createServer();
-  const port = await new Promise<number>((resolvePort, reject) => {
-    probe.once('error', reject);
-    probe.listen({ host: '127.0.0.1', port: 0 }, () => {
-      const address = probe.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('probe server did not bind to a TCP port'));
-        return;
-      }
-      resolvePort(address.port);
-    });
-  });
-  await new Promise<void>((resolveClose) => probe.close(() => resolveClose()));
-  return `http://127.0.0.1:${port}`;
 }
 
 async function openGuardedPage(config: AuditConfig): Promise<{ readonly page: Page; readonly ledger: SafetyLedger }> {
@@ -310,7 +257,7 @@ describe('navigatePage', () => {
 
   it('returns FAILED for a port that refuses connections', async () => {
     const server = await startServer();
-    const unreachableOrigin = await unusedLoopbackOrigin();
+    const unreachableOrigin = await closedLoopbackOrigin();
     const config = createTestConfig(server.origin);
     const { page: guardedPage, ledger } = await openGuardedPage({
       ...config,
@@ -329,7 +276,7 @@ describe('navigatePage', () => {
   it('judges BLOCKED_EXTERNAL_REDIRECT by the increase during this navigation, not by earlier blocked navigations', async () => {
     const external = await startServer();
     const primary = await startServer({ externalRedirectUrl: `${external.origin}/external-link.html` });
-    const unreachableOrigin = await unusedLoopbackOrigin();
+    const unreachableOrigin = await closedLoopbackOrigin();
     const config = createTestConfig(primary.origin);
     const { page: guardedPage, ledger } = await openGuardedPage({
       ...config,
@@ -391,7 +338,7 @@ describe('closing the guarded page and Context right after a failed navigation',
   ] as const)('finishes within the close budget after %s', async (_label, expectedOutcome) => {
     const external = await startServer();
     const primary = await startServer({ externalRedirectUrl: `${external.origin}/external-link.html` });
-    const unreachableOrigin = await unusedLoopbackOrigin();
+    const unreachableOrigin = await closedLoopbackOrigin();
     const config = createTestConfig(primary.origin);
     const { page: guardedPage, ledger } = await openGuardedPage({
       ...config,

@@ -5,7 +5,7 @@ import type { BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { ContextConstructionError, type BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
-import { CONTEXT_CLOSE_TIMEOUT_MS, PAGE_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../../src/core/limits.js';
+import { CONTEXT_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../../src/core/limits.js';
 import { PassiveContextCloseDeadlineError } from '../../src/orchestration/passive-session-close.js';
 import {
   openPassiveContextBeforeDeadline,
@@ -441,7 +441,6 @@ describe('resolvePassiveSessionDeadlines (DEF-008, R15r-4)', () => {
 
     expect(resolved).toEqual({
       sessionOpenTimeoutMs: SESSION_OPEN_TIMEOUT_MS,
-      pageCloseTimeoutMs: PAGE_CLOSE_TIMEOUT_MS,
       contextCloseTimeoutMs: CONTEXT_CLOSE_TIMEOUT_MS,
       onLateContextRelease: undefined,
     });
@@ -453,10 +452,9 @@ describe('resolvePassiveSessionDeadlines (DEF-008, R15r-4)', () => {
 
     expect(resolvePassiveSessionDeadlines({
       sessionOpenTimeoutMs: 1,
-      pageCloseTimeoutMs: 2,
       contextCloseTimeoutMs: 3,
       onLateContextRelease,
-    })).toEqual({ sessionOpenTimeoutMs: 1, pageCloseTimeoutMs: 2, contextCloseTimeoutMs: 3, onLateContextRelease });
+    })).toEqual({ sessionOpenTimeoutMs: 1, contextCloseTimeoutMs: 3, onLateContextRelease });
   });
 
   // RL-fix（RL の 7-2）: Context の役割（`role`）は、作成の部品の引数（`PassiveSessionOpenOptions`）で、作るたびに呼び出し側が選ぶ。
@@ -473,7 +471,7 @@ describe('resolvePassiveSessionDeadlines (DEF-008, R15r-4)', () => {
 
   it('rejects invalid deadlines and receivers', () => {
     expect(() => resolvePassiveSessionDeadlines({ sessionOpenTimeoutMs: 0 })).toThrow(RangeError);
-    expect(() => resolvePassiveSessionDeadlines({ pageCloseTimeoutMs: -1 })).toThrow(RangeError);
+    expect(() => resolvePassiveSessionDeadlines({ contextCloseTimeoutMs: -1 })).toThrow(RangeError);
     expect(() => resolvePassiveSessionDeadlines({ contextCloseTimeoutMs: 1.5 })).toThrow(RangeError);
     expect(() => resolvePassiveSessionDeadlines({ onLateContextRelease: 'receiver' as never })).toThrow(TypeError);
     expect(() => resolvePassiveSessionDeadlines(null as never)).toThrow(TypeError);

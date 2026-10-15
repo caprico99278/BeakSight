@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-audit-job-stop:1",
+  "description": "Local UI Server Function input: stop one audit job (force is the second, forced stop) (Task 24 design 4.4, 4.8).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jobId", "force"],
+  "properties": {
+    "jobId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" },
+    "force": { "type": "boolean" }
+  }
+}

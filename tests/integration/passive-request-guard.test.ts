@@ -1,5 +1,6 @@
-import { createServer, type ServerResponse } from 'node:http';
+import type { ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { connect as connectNet, createServer as createNetServer, type Socket } from 'node:net';
 import type { Browser, BrowserContext, CDPSession, Download, Page, Request, Route, WebSocketRoute } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
@@ -9,33 +10,55 @@ import type { CachedResource } from '../../src/browser/resource-delivery.js';
 import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
 import { MAX_PENDING_GUARD_REQUEST_TASKS, MAX_URL_LENGTH } from '../../src/core/limits.js';
+import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { discoverInteractionCandidates } from '../../src/interaction/discover-candidates.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
 import { closePassivePageAndContext } from '../../src/orchestration/passive-session-close.js';
 import {
   awaitPassiveRequestGuardReady,
+  CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON,
+  CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS,
+  MAX_DROPPED_CANCELED_DOCUMENT_IDS,
   assertPassiveRequestGuardActive,
   activateInteractionFreeze,
   closePassiveGuardedContext,
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
-  SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT,
   WORKER_CONNECT_POLICY,
-  WORKER_CONNECT_POLICY_INIT_SCRIPT,
   workerConnectPolicyViolationUrl,
   type GuardResourceDelivery,
   type PassiveRequestGuardOptions,
 } from '../../src/safety/passive-request-guard.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import {
+  canceledEvidenceDiagnosticText,
+  canceledEvidenceViolation,
+  DIAGNOSTIC_REASON_PATTERN,
+  parseCanceledEvidenceMessage,
+} from '../helpers/canceled-evidence-diagnostic.js';
 import { launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS, NO_NON_READ_REQUESTS, openServerWindow } from '../helpers/gate-harness.js';
+import { adaptFakePage } from '../helpers/interaction-candidate-reads.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
+import {
+  createGuardHarness,
+  createHarnessPage,
+  guardContextListenerEvents,
+  readyHarnessPage,
+  type FakeCdpLoadingFailedEvent,
+  type FakeCdpPausedEvent,
+  type GuardHarness,
+} from '../helpers/passive-guard-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
 
 /** Chromium がナビゲーションの失敗の後に表示するエラーのページの URL。 */
 const CHROMIUM_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
+/** Playwright の Context の close の事象の名前（DEF-110: Guard は、ほかの何より先にこれを聞き始める）。 */
+const CONTEXT_CLOSE_EVENT = 'close';
 const servers: FixtureServer[] = [];
 const contexts: BrowserContext[] = [];
 let browser: Browser;
@@ -83,7 +106,7 @@ async function startHangingServer(): Promise<HangingServer> {
   });
   const pendingHangs: ServerResponse[] = [];
   let cut = false;
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     if (request.url === '/hang') {
       if (cut) {
         response.socket?.destroy();
@@ -101,19 +124,14 @@ async function startHangingServer(): Promise<HangingServer> {
     response.writeHead(404, { connection: 'close' });
     response.end();
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address() as AddressInfo;
   const hanging: HangingServer = {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     hangReceived,
     cutHang: () => {
       cut = true;
       for (const response of pendingHangs.splice(0)) response.socket?.destroy();
     },
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: server.close,
   };
   hangingServers.push(hanging);
   return hanging;
@@ -139,30 +157,6 @@ async function createGuardedPage(context: BrowserContext): Promise<Page> {
   return page;
 }
 
-interface GuardHarness {
-  readonly context: BrowserContext;
-  readonly calls: string[];
-  readonly cdpCommands: string[];
-  readonly cdpCommandLog: ReadonlyArray<{ readonly method: string; readonly params: unknown }>;
-  readonly removedListeners: readonly string[];
-  readonly closeCount: number;
-  readonly httpHandler: ((route: Route) => Promise<unknown> | unknown) | undefined;
-  readonly webSocketHandler: ((route: WebSocketRoute) => Promise<unknown> | unknown) | undefined;
-  readonly requestFailedHandler: ((request: Request) => Promise<unknown> | unknown) | undefined;
-  /** Guard の `request` の事象の listener（C18a。外部スキームへの移動の検出）。 */
-  readonly requestHandler: ((request: Request) => unknown) | undefined;
-  readonly pageHandler: ((page: Page) => void) | undefined;
-  readonly cdpRequestPausedHandler: ((event: FakeCdpPausedEvent) => void) | undefined;
-  readonly cdpCloseHandler: (() => void) | undefined;
-  /** Guard の page の session の `Network.loadingFailed` の listener（DEF-026。取り消しの証拠）。 */
-  readonly cdpLoadingFailedHandler: ((event: FakeCdpLoadingFailedEvent) => void) | undefined;
-  /** Guard の page の session の `Network.requestWillBeSent` の listener（DEF-027、DEF-042 の CORS の事前確認の判定）。 */
-  readonly cdpRequestWillBeSentHandler: ((event: unknown) => void) | undefined;
-  /** Guard の page の session の `Log.entryAdded` の listener（DEF-040。Worker の中の CSP の違反の観察）。 */
-  readonly cdpLogEntryAddedHandler: ((event: unknown) => void) | undefined;
-  registerPage(page: Page): void;
-}
-
 function createHostileGuardError(): object {
   return new Proxy(Object.create(null) as object, {
     get(_target, property): never {
@@ -175,293 +169,6 @@ function createHostileGuardError(): object {
       throw new Error('hostile error prototype access');
     },
   });
-}
-
-interface FakeCdpPausedEvent {
-  readonly requestId: string;
-  readonly redirectedRequestId?: string;
-  /** Network の domain の要求の ID（DEF-026。取り消しの証拠の `Network.loadingFailed` の `requestId` と対応付ける）。 */
-  readonly networkId?: string;
-  readonly frameId: string;
-  readonly request: { readonly method: string; readonly url: string; readonly headers?: Readonly<Record<string, string>> };
-  /**
-   * 要求の種類（DEF-042）。偽の harness の `cdpRequestPausedHandler` は、指定のない事象を `Document` の事象として Guard に渡す
-   * （DEF-042 より前のテストは、Document の事象だけを送っていた）。Document でない要求のテストは、明示して渡す。
-   */
-  readonly resourceType?: string;
-  /** 応答の段階（Response stage）の事象だけが持つ項目（C18g）。 */
-  readonly responseStatusCode?: number;
-  /** 応答の status の文言（DEF-040。`Fetch.continueResponse` の `responsePhrase` に使う）。 */
-  readonly responseStatusText?: string;
-  readonly responseErrorReason?: string;
-  readonly responseHeaders?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
-}
-
-/** 偽の `Network.loadingFailed` の事象（DEF-026）。 */
-interface FakeCdpLoadingFailedEvent {
-  readonly requestId: string;
-  readonly canceled?: boolean;
-  /** 要求の種類（Network の domain の ResourceType。取り消しの証拠になるのは `Document` だけ）。 */
-  readonly type?: string;
-  readonly errorText?: string;
-}
-
-/** 偽の harness の `calls` に残す、Guard の初期化のスクリプトの名前（DEF-040、DEF-049）。 */
-function initScriptName(content: string | undefined): string {
-  if (content === WORKER_CONNECT_POLICY_INIT_SCRIPT) return 'WORKER_CONNECT_POLICY';
-  if (content === SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT) return 'SERVICE_WORKER_REGISTRATION_BLOCK';
-  return 'UNKNOWN';
-}
-
-function createGuardHarness(options: {
-  readonly hasPage?: boolean;
-  readonly webSocketInstallError?: Error;
-  readonly httpInstallError?: Error;
-  readonly httpInstallGate?: Promise<void>;
-  readonly newCdpSessionError?: Error;
-  readonly cdpOnErrorEvent?: string;
-  readonly cdpSendErrorMethod?: string;
-  readonly cdpSendGate?: { readonly method: string; readonly promise: Promise<void> };
-  /**
-   * 偽の page の session の `send` の差し替え（DEF-026）。Promise を返した命令は、その Promise を応答にする（失敗の注入、応答の保留）。
-   * `undefined` を返した命令は、ほかの指定のとおりに扱う。
-   */
-  readonly cdpSendOverride?: (method: string, params: unknown) => Promise<unknown> | undefined;
-  readonly contextCloseError?: Error;
-  readonly contextCloseRejection?: { readonly value: unknown };
-  readonly contextCloseAttempts?: readonly (
-    | { readonly outcome: 'RESOLVE' }
-    | { readonly outcome: 'REJECT'; readonly error: unknown }
-  )[];
-  readonly contextCloseGate?: Promise<void>;
-  readonly onContextClose?: () => void;
-} = {}): GuardHarness {
-  const calls: string[] = [];
-  const cdpCommands: string[] = [];
-  const cdpCommandLog: Array<{ readonly method: string; readonly params: unknown }> = [];
-  const removedListeners: string[] = [];
-  let closeCount = 0;
-  let httpHandler: GuardHarness['httpHandler'];
-  let webSocketHandler: GuardHarness['webSocketHandler'];
-  let requestFailedHandler: GuardHarness['requestFailedHandler'];
-  let requestHandler: GuardHarness['requestHandler'];
-  let pageHandler: GuardHarness['pageHandler'];
-  let cdpRequestPausedHandler: GuardHarness['cdpRequestPausedHandler'];
-  let cdpCloseHandler: GuardHarness['cdpCloseHandler'];
-  let cdpLoadingFailedHandler: GuardHarness['cdpLoadingFailedHandler'];
-  let cdpRequestWillBeSentHandler: GuardHarness['cdpRequestWillBeSentHandler'];
-  let cdpLogEntryAddedHandler: GuardHarness['cdpLogEntryAddedHandler'];
-  const registeredPages: Page[] = [];
-  const rawContext = {
-    pages(): object[] {
-      return options.hasPage === true ? [{}] : registeredPages;
-    },
-    // DEF-040: Guard は、ページを作る前に、Worker の中の WebSocket を止める CSP の初期化のスクリプトを Context に付ける。
-    // DEF-049: Service Worker の登録の入口を塞ぐ初期化のスクリプトも付ける。どのスクリプトかを `calls` に残す。
-    async addInitScript(script?: { readonly content?: string }): Promise<void> {
-      calls.push(`INIT_SCRIPT:${initScriptName(script?.content)}`);
-    },
-    on(event: string, handler: (value: unknown) => void): void {
-      calls.push(`ON:${event}`);
-      if (event === 'requestfailed') {
-        requestFailedHandler = handler as GuardHarness['requestFailedHandler'];
-      } else if (event === 'request') {
-        requestHandler = handler as GuardHarness['requestHandler'];
-      } else if (event === 'page') {
-        pageHandler = handler as (page: Page) => void;
-      }
-    },
-    off(event: string, handler: (value: unknown) => void): void {
-      removedListeners.push(`CONTEXT:${event}`);
-      if (event === 'page' && pageHandler === handler) pageHandler = undefined;
-      if (event === 'requestfailed' && requestFailedHandler === handler) requestFailedHandler = undefined;
-      if (event === 'request' && requestHandler === handler) requestHandler = undefined;
-    },
-    async newCDPSession(): Promise<CDPSession> {
-      calls.push('CDP');
-      if (options.newCdpSessionError !== undefined) {
-        throw options.newCdpSessionError;
-      }
-      const session = {
-        on(event: string, handler: (value?: FakeCdpPausedEvent) => void): void {
-          if (event === options.cdpOnErrorEvent) {
-            throw new Error(`${event} listener setup failed`);
-          }
-          if (event === 'Fetch.requestPaused') {
-            cdpRequestPausedHandler = handler as (event: FakeCdpPausedEvent) => void;
-          } else if (event === 'close') {
-            cdpCloseHandler = handler;
-          } else if (event === 'Network.loadingFailed') {
-            cdpLoadingFailedHandler = handler as (event: FakeCdpLoadingFailedEvent) => void;
-          } else if (event === 'Network.requestWillBeSent') {
-            cdpRequestWillBeSentHandler = handler as (event: unknown) => void;
-          } else if (event === 'Log.entryAdded') {
-            cdpLogEntryAddedHandler = handler as (event: unknown) => void;
-          }
-        },
-        off(event: string, handler: (value?: FakeCdpPausedEvent) => void): void {
-          removedListeners.push(`CDP:${event}`);
-          if (event === 'Fetch.requestPaused' && cdpRequestPausedHandler === handler) {
-            cdpRequestPausedHandler = undefined;
-          }
-          if (event === 'close' && cdpCloseHandler === handler) cdpCloseHandler = undefined;
-          if (event === 'Network.loadingFailed' && cdpLoadingFailedHandler === handler) cdpLoadingFailedHandler = undefined;
-          if (event === 'Log.entryAdded' && cdpLogEntryAddedHandler === handler) cdpLogEntryAddedHandler = undefined;
-        },
-        async send(method: string, params?: unknown): Promise<unknown> {
-          cdpCommands.push(method);
-          cdpCommandLog.push({ method, params });
-          const overridden = options.cdpSendOverride?.(method, params);
-          if (overridden !== undefined) {
-            return overridden;
-          }
-          if (method === options.cdpSendErrorMethod) {
-            throw new Error(`${method} failed`);
-          }
-          if (method === options.cdpSendGate?.method) {
-            await options.cdpSendGate.promise;
-          }
-          if (method === 'Page.getFrameTree') {
-            return { frameTree: { frame: { id: 'root-frame' } } };
-          }
-          return undefined;
-        },
-      };
-      return session as unknown as CDPSession;
-    },
-    async routeWebSocket(
-      _pattern: unknown,
-      handler: (route: WebSocketRoute) => Promise<unknown> | unknown,
-    ): Promise<void> {
-      calls.push('WEBSOCKET');
-      if (options.webSocketInstallError !== undefined) {
-        throw options.webSocketInstallError;
-      }
-      webSocketHandler = handler;
-    },
-    async route(_pattern: unknown, handler: (route: Route) => Promise<unknown> | unknown): Promise<void> {
-      calls.push('HTTP');
-      if (options.httpInstallError !== undefined) {
-        throw options.httpInstallError;
-      }
-      httpHandler = handler;
-      await options.httpInstallGate;
-    },
-    async close(): Promise<void> {
-      calls.push('CLOSE');
-      const attemptIndex = closeCount;
-      closeCount += 1;
-      options.onContextClose?.();
-      const attempt = options.contextCloseAttempts?.[attemptIndex];
-      if (attempt?.outcome === 'REJECT') return Promise.reject(attempt.error);
-      await options.contextCloseGate;
-      if (attempt?.outcome === 'RESOLVE') return;
-      if (options.contextCloseRejection !== undefined) {
-        return Promise.reject(options.contextCloseRejection.value);
-      }
-      if (options.contextCloseError !== undefined) {
-        throw options.contextCloseError;
-      }
-    },
-  };
-  return {
-    context: rawContext as unknown as BrowserContext,
-    calls,
-    cdpCommands,
-    cdpCommandLog,
-    removedListeners,
-    get closeCount(): number {
-      return closeCount;
-    },
-    get httpHandler(): GuardHarness['httpHandler'] {
-      return httpHandler;
-    },
-    get webSocketHandler(): GuardHarness['webSocketHandler'] {
-      return webSocketHandler;
-    },
-    get requestFailedHandler(): GuardHarness['requestFailedHandler'] {
-      return requestFailedHandler;
-    },
-    get requestHandler(): GuardHarness['requestHandler'] {
-      return requestHandler;
-    },
-    get pageHandler(): GuardHarness['pageHandler'] {
-      return pageHandler;
-    },
-    get cdpRequestPausedHandler(): GuardHarness['cdpRequestPausedHandler'] {
-      // DEF-042: `resourceType` の指定のない偽の事象は、Document の事象として渡す（`FakeCdpPausedEvent.resourceType`）。
-      const handler = cdpRequestPausedHandler;
-      return handler === undefined ? undefined : (event) => handler({ resourceType: 'Document', ...event });
-    },
-    get cdpCloseHandler(): GuardHarness['cdpCloseHandler'] {
-      return cdpCloseHandler;
-    },
-    get cdpLoadingFailedHandler(): GuardHarness['cdpLoadingFailedHandler'] {
-      return cdpLoadingFailedHandler;
-    },
-    get cdpRequestWillBeSentHandler(): GuardHarness['cdpRequestWillBeSentHandler'] {
-      return cdpRequestWillBeSentHandler;
-    },
-    get cdpLogEntryAddedHandler(): GuardHarness['cdpLogEntryAddedHandler'] {
-      return cdpLogEntryAddedHandler;
-    },
-    registerPage(page: Page): void {
-      registeredPages.push(page);
-    },
-  };
-}
-
-function createHarnessPage(harness: GuardHarness, options: {
-  readonly closeError?: Error;
-  readonly closeGate?: Promise<void>;
-  readonly url?: string;
-  readonly onEvent?: (event: string, handler: (...arguments_: unknown[]) => void) => void;
-  readonly onOffEvent?: (event: string, handler: (...arguments_: unknown[]) => void) => void;
-} = {}): Page {
-  let closed = false;
-  const closeHandlers = new Set<() => void>();
-  const page = {
-    context: () => harness.context,
-    isClosed: () => closed,
-    url: () => options.url ?? 'about:blank',
-    on(event: string, handler: (...arguments_: unknown[]) => void): Page {
-      options.onEvent?.(event, handler);
-      return page as unknown as Page;
-    },
-    once(event: string, handler: () => void): Page {
-      if (event === 'close') {
-        closeHandlers.add(handler);
-      }
-      return page as unknown as Page;
-    },
-    off(event: string, handler: (...arguments_: unknown[]) => void): Page {
-      options.onOffEvent?.(event, handler);
-      if (event === 'close') {
-        closeHandlers.delete(handler as () => void);
-      }
-      return page as unknown as Page;
-    },
-    async close(): Promise<void> {
-      await options.closeGate;
-      if (options.closeError !== undefined) {
-        throw options.closeError;
-      }
-      closed = true;
-      for (const handler of closeHandlers) {
-        handler();
-      }
-      closeHandlers.clear();
-    },
-  } as unknown as Page;
-  harness.registerPage(page);
-  harness.pageHandler?.(page);
-  return page;
-}
-
-async function readyHarnessPage(harness: GuardHarness): Promise<Page> {
-  const page = createHarnessPage(harness);
-  await awaitPassiveRequestGuardReady(page);
-  return page;
 }
 
 function emitFailedMainFrameRequest(
@@ -1293,17 +1000,22 @@ describe('installPassiveRequestGuard installation', () => {
 
   it('installs the connect policy and the Service Worker registration block init scripts, then WebSocket and HTTP interception before resolving', async () => {
     const harness = createGuardHarness();
+    // T32k: Guard が Context に付ける listener の一覧（付ける順）は、Guard のコードから導く（数と名前をここに書き写さない）。
+    const listenerEvents = await guardContextListenerEvents();
+    const [firstListenerEvent, ...laterListenerEvents] = listenerEvents;
 
     await installPassiveRequestGuard(harness.context, new SafetyLedger(), new Set(['https://example.test']));
 
     // DEF-040: 初期化のスクリプト（meta の CSP）は、ページの事象を受け始める前（ページを作る前）に付ける。
     // DEF-049: Service Worker の登録の入口を塞ぐ初期化のスクリプトも、同じく、ページを作る前に付ける。
+    // DEF-110 fix: Context の close の事象は、ほかの何より先に聞き始める（close の reject の後に、Context がもう存在しないことの証し）。
+    expect(firstListenerEvent).toBe(CONTEXT_CLOSE_EVENT);
+    expect(laterListenerEvents.length).toBeGreaterThan(0);
     expect(harness.calls).toEqual([
+      `ON:${firstListenerEvent}`,
       'INIT_SCRIPT:WORKER_CONNECT_POLICY',
       'INIT_SCRIPT:SERVICE_WORKER_REGISTRATION_BLOCK',
-      'ON:page',
-      'ON:requestfailed',
-      'ON:request',
+      ...laterListenerEvents.map((event) => `ON:${event}`),
       'WEBSOCKET',
       'HTTP',
     ]);
@@ -1322,10 +1034,9 @@ describe('installPassiveRequestGuard installation', () => {
     await closePassiveGuardedContext(harness.context);
     const snapshotAtClose = ledger.snapshot();
 
+    // T32k: Context の listener の一覧は Guard のコードから導く（`guardContextListenerEvents`）。
     expect(harness.removedListeners).toEqual(expect.arrayContaining([
-      'CONTEXT:page',
-      'CONTEXT:requestfailed',
-      'CONTEXT:request',
+      ...(await guardContextListenerEvents()).map((event) => `CONTEXT:${event}`),
       'CDP:Fetch.requestPaused',
       'CDP:close',
     ]));
@@ -1396,11 +1107,10 @@ describe('installPassiveRequestGuard installation', () => {
     const pageRemovalsBeforeContextClose = pageRemoved.length;
     await closePassiveGuardedContext(harness.context);
 
-    expect(harness.removedListeners.slice(removalsBeforeContextClose)).toEqual([
-      'CONTEXT:page',
-      'CONTEXT:requestfailed',
-      'CONTEXT:request',
-    ]);
+    // T32k: Context を閉じるときに外す listener は、Guard が付けた一覧と同じ順（Guard のコードから導く）。
+    expect(harness.removedListeners.slice(removalsBeforeContextClose)).toEqual(
+      (await guardContextListenerEvents()).map((event) => `CONTEXT:${event}`),
+    );
     expect(pageRemoved).toHaveLength(pageRemovalsBeforeContextClose);
     expect(pageRemoved).toHaveLength(70 * 3);
     expect(ledger.snapshot().invariantViolations).not.toEqual(expect.arrayContaining([
@@ -2051,7 +1761,10 @@ describe('installPassiveRequestGuard installation', () => {
         dispose: async () => undefined,
         asElement: () => value === elementHandle ? elementHandle : null,
       });
-      page = {
+      // DEF-118: T32j-4 で、候補の発見・解決・読み取りは isolated world（CDP の session）で行うようになった。この偽の page は、今までの差し込みの口
+      // （`evaluate`・`evaluateHandle`、封筒の要素の偽の handle の `evaluate`）で結果を返すので、ほかの偽の page と同じく、その口を製品の
+      // 読み取りの口（`InteractionCandidateReads`）に写して登録する（`adaptFakePage`。期待は変えない）。
+      page = adaptFakePage({
         context: () => harness.context,
         isClosed: () => false,
         url: () => 'https://example.test/fixture',
@@ -2104,7 +1817,7 @@ describe('installPassiveRequestGuard installation', () => {
             }),
           }),
         }),
-      } as unknown as Page;
+      } as unknown as Page);
       await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       harness.registerPage(page);
       harness.pageHandler?.(page);
@@ -3702,7 +3415,10 @@ describe('installPassiveRequestGuard installation', () => {
     }]);
   });
 
-  it('aborts and invalidates when the route handler cannot look up the CDP page', async () => {
+  // DEF-113（T32j-1）: route の層で page を引けないナビゲーションは、Guard が CDP の session を付けた印のない page の要求として、明示の理由
+  // （`PASSIVE_GUARD_PAGE_NOT_READY`）で止めて記録し、Context を無効にする（以前は `CDP_PAGE_LOOKUP_FAILED` を記録して投げた。止める・無効にする・
+  // 違反 1 件は同じ）。
+  it('aborts and invalidates with the explicit reason when the route handler cannot look up the page of a navigation', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
@@ -3726,13 +3442,14 @@ describe('installPassiveRequestGuard installation', () => {
       },
     } as unknown as Route;
 
-    await expect(Promise.resolve(harness.httpHandler?.(route))).rejects.toThrow('route page unavailable');
+    await expect(Promise.resolve(harness.httpHandler?.(route))).resolves.toBeUndefined();
 
     expect(abortCount).toBe(1);
     expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'CDP_PAGE_LOOKUP_FAILED',
-      message: 'route page unavailable',
+      code: 'PASSIVE_GUARD_PAGE_NOT_READY',
+      message: 'Navigation started before explicit page readiness: GET https://example.test/catalog '
+        + '(no page is available for the request: route page unavailable)',
     }]);
   });
 
@@ -3762,7 +3479,9 @@ describe('installPassiveRequestGuard installation', () => {
     }]);
   });
 
-  it('invalidates the context when navigation frame classification fails', async () => {
+  // DEF-113（T32j-1）: frame のないナビゲーション（ポップアップの最初の要求の形）は、frame の判定の失敗（`FRAME_CLASSIFICATION_FAILED`）に
+  // 頼らず、CDP の session を付けた印のない page の要求として、明示の理由（`PASSIVE_GUARD_PAGE_NOT_READY`）で止めて記録し、Context を無効にする。
+  it('invalidates the context with the explicit reason when a navigation has no frame yet', async () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
@@ -3787,8 +3506,9 @@ describe('installPassiveRequestGuard installation', () => {
     expect(abortCount).toBe(1);
     expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'FRAME_CLASSIFICATION_FAILED',
-      message: 'frame unavailable',
+      code: 'PASSIVE_GUARD_PAGE_NOT_READY',
+      message: 'Navigation started before explicit page readiness: GET https://example.test/catalog '
+        + '(no page is available for the request: frame unavailable)',
     }]);
   });
 
@@ -5429,6 +5149,7 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
     expectNoSafetyRecords(served.ledger);
   });
 });
+// DEF-052: 違反の文の後ろに付く、取り消しの証拠の診断の組み立てと照合の部品は、`tests/helpers/canceled-evidence-diagnostic.ts`（CC-055）。
 
 // DEF-026（設計書 `2026-10-05-beaksight-def-026-guard-canceled-document-design.md`）: Guard の CDP の層の命令（`Fetch.continueRequest`、
 // `Fetch.failRequest`）の失敗のうち、文言が一時停止の ID が無効の形で、同じ session の取り消しの証拠（`Network.loadingFailed` の canceled で、
@@ -5579,7 +5300,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(requestEvent());
 
     await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED, waitedMs: EVIDENCE_WAIT_MS })]);
   });
 
   it('continue: a paused event without networkId cannot be matched to the evidence, so the failure is a violation', async () => {
@@ -5589,7 +5310,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(withoutNetworkId);
 
     await expect.poll(() => harness.closeCount).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.NETWORK_ID_MISSING, waitedMs: 0 })]);
   });
 
   it.each([
@@ -5617,7 +5338,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(requestEvent());
 
     await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED, waitedMs: EVIDENCE_WAIT_MS })]);
   });
 
   // 実際の Chromium では、取り消しの証拠は、一時停止の通知より先に届く（DEF-026-fix の実験。282件のすべてで、3〜55ms 前）。
@@ -5648,7 +5369,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(requestEvent());
 
     await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED, waitedMs: EVIDENCE_WAIT_MS })]);
   }, EVIDENCE_RETENTION_TEST_TIMEOUT_MS);
 
   it('fail (blocked main frame navigation): with the evidence, the block is recorded as when the command succeeds, without a violation', async () => {
@@ -5671,7 +5392,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(requestEvent({ frameId: 'root-frame', request: { method: 'GET', url: 'https://outside.example.test/' } }));
 
     await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_FAIL_REQUEST_FAILED', message: PAGE_FAIL_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_FAIL_REQUEST_FAILED', PAGE_FAIL_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED, waitedMs: EVIDENCE_WAIT_MS })]);
     expect(ledger.snapshot().blockedNavigations).toEqual([]);
   });
 
@@ -5749,7 +5470,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     harness.cdpRequestPausedHandler?.(requestEvent());
     // 閉じる処理の途中は、証拠を待たない（待ちの時間より前に記録される）。
     await expect.poll(() => ledger.snapshot().invariantViolations, { timeout: EVIDENCE_WAIT_MS / 2 }).toEqual([
-      { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: PAGE_FAIL_INVALID },
+      canceledEvidenceViolation('CDP_LIFECYCLE_FAIL_REQUEST_FAILED', PAGE_FAIL_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.CLOSING_NOT_WAITED, waitedMs: 0 }),
     ]);
     closeGate.resolve();
     await closing;
@@ -5765,14 +5486,14 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     await expect(closePassiveGuardedContext(harness.context)).rejects.toThrow(/invalidated/i);
 
     expect(Date.now() - startedAt).toBeLessThan(EVIDENCE_WAIT_MS);
-    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID }]);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.SESSION_CLEARED, waitedMs: EVIDENCE_WAIT_MS })]);
     expect(isPassiveRequestGuardClosed(harness.context)).toBe(true);
   });
 
   it.each([
     [`${EVIDENCE_LIMIT - 1} earlier cancellations: the ${EVIDENCE_LIMIT}th evidence is kept, and the canceled command is not a violation`, EVIDENCE_LIMIT - 1, []],
     [`${EVIDENCE_LIMIT} earlier cancellations: the ${EVIDENCE_LIMIT + 1}th evidence is not kept, and the canceled command is a violation`, EVIDENCE_LIMIT, [
-      { code: 'CDP_CONTINUE_REQUEST_FAILED', message: PAGE_CONTINUE_INVALID },
+      canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, { reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_DROPPED_AT_CAPACITY, waitedMs: EVIDENCE_WAIT_MS, droppedAtCapacity: 1 }),
     ]],
   ] as const)('the number of kept evidence is bounded: %s', async (_name, earlierCount, expectedViolations) => {
     const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
@@ -5787,6 +5508,182 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     await settleGuard();
 
     expect(ledger.snapshot().invariantViolations).toEqual(expectedViolations);
+  });
+
+  // DEF-052（設計書 `2026-10-09-beaksight-def-052-guard-evidence-wait-design.md` 2.1）: 証拠の待ちのタイマーが切れたら、Node がすでに受け
+  // 取っている CDP の事象を処理し終えてから、もう一度だけ証拠を見て決める。ここでは、本物の受信（127.0.0.1 の TCP の接続）と、
+  // Playwright 1.62.1 の受け渡しの段数（受信の後に `setImmediate` で 2 回。PipeTransport と in-process の接続）で、証拠を受信の待ち行列に
+  // 積み、待ちの間に Node の処理を同期的に止める。
+  /** 受信の後、事象の処理に届くまでの `setImmediate` の段数（PipeTransport の 1 段と、in-process の接続の 1 段）。 */
+  const RECEIVED_EVENT_DELIVERY_HOPS = 2;
+  /** Node の処理を同期的に止める時間（ms）。証拠の待ちの時間を確実に過ぎる長さ。 */
+  const NODE_STALL_MS = EVIDENCE_WAIT_MS + EVIDENCE_DELAY_WITHIN_WAIT_MS;
+  /** 待ちの終わりに譲る回数の上限を、確実に超える段数にするための余り。 */
+  const HOPS_BEYOND_YIELD_LIMIT = 8;
+
+  /** Node の処理を、`ms` の間、同期的に止める（CPU の取り合いや GC で Node が止まった状態の代わり）。 */
+  const stallNode = (ms: number): void => {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      // 同期的に止める。
+    }
+  };
+
+  /**
+   * 127.0.0.1 の TCP の接続で、受信の待ち行列を作る。`push` で 1 バイトを送ると、受け手は受信の後に `hops` 段の `setImmediate` を経て
+   * `deliver` を呼ぶ（Playwright の受け渡しの段数に合わせる）。
+   */
+  async function openReceiveQueue(deliver: () => void, hops: number): Promise<{ push(): void; close(): Promise<void> }> {
+    const accepted: Socket[] = [];
+    const server = createNetServer((socket) => {
+      accepted.push(socket);
+      socket.on('data', () => {
+        let remaining = hops;
+        const step = (): void => {
+          if (remaining === 0) {
+            deliver();
+            return;
+          }
+          remaining -= 1;
+          setImmediate(step);
+        };
+        step();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    const client = connectNet(port, '127.0.0.1');
+    await new Promise<void>((resolve) => client.once('connect', () => resolve()));
+    await expect.poll(() => accepted.length).toBe(1);
+    return {
+      push: () => {
+        client.write('e');
+      },
+      close: async () => {
+        client.destroy();
+        for (const socket of accepted) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+  }
+
+  /** 命令が失敗して、Guard が証拠を待ち始めた状態にする。 */
+  async function startWaitingForEvidence(): Promise<{ readonly harness: GuardHarness; readonly ledger: SafetyLedger }> {
+    const guard = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+    guard.harness.cdpRequestPausedHandler?.(requestEvent());
+    await expect.poll(() => commandsOf(guard.harness, 'Fetch.continueRequest')).toHaveLength(1);
+    await flushGuardProtocolCallbacks();
+    return guard;
+  }
+
+  it('DEF-052: evidence received while Node was stalled past the wait, still in the receive queue, is read before the decision: no violation', async () => {
+    const { harness, ledger } = await startWaitingForEvidence();
+    const queue = await openReceiveQueue(() => harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE), RECEIVED_EVENT_DELIVERY_HOPS);
+    try {
+      queue.push();
+      stallNode(NODE_STALL_MS);
+      await settleGuard();
+
+      expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(harness.closeCount).toBe(0);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it('DEF-052: the reading at the end of the wait is bounded: evidence that needs more hops than the yield limit stays a violation (evidence-not-received)', async () => {
+    const { harness, ledger } = await startWaitingForEvidence();
+    const queue = await openReceiveQueue(
+      () => harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE),
+      CANCELED_DOCUMENT_EVIDENCE_RECEIVED_EVENT_YIELDS + HOPS_BEYOND_YIELD_LIMIT,
+    );
+    try {
+      queue.push();
+      stallNode(NODE_STALL_MS);
+
+      await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+      expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, {
+        reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED,
+        waitedMs: EVIDENCE_WAIT_MS,
+        droppedAtCapacity: 0,
+      })]);
+    } finally {
+      await queue.close();
+    }
+  });
+
+  it('DEF-052: without the evidence, the failure is still a violation, decided within the wait plus the bounded reading, and the diagnostic carries no URL', async () => {
+    const { harness, ledger } = await startWaitingForEvidence();
+    const waitingFrom = Date.now();
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    const decidedAfterMs = Date.now() - waitingFrom;
+    const [violation] = ledger.snapshot().invariantViolations;
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, {
+      reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED,
+      waitedMs: EVIDENCE_WAIT_MS,
+      droppedAtCapacity: 0,
+    })]);
+    const diagnostic = parseCanceledEvidenceMessage(violation?.message ?? '');
+    expect(diagnostic?.original).toBe(PAGE_CONTINUE_INVALID);
+    // 下限は、待つ時間から時刻の単位の違い（`TIMER_CLOCK_GRANULARITY_MS`）だけを引いたもの（DEF-064。Guard が待つ時間を許容より多く縮めたら落ちる）。
+    expect(diagnostic?.elapsedMs).toBeGreaterThanOrEqual(EVIDENCE_WAIT_MS - TIMER_CLOCK_GRANULARITY_MS);
+    expect(diagnostic?.elapsedMs).toBeLessThan(PAST_EVIDENCE_WAIT_POLL_MS);
+    expect(decidedAfterMs).toBeLessThan(PAST_EVIDENCE_WAIT_POLL_MS);
+    expect(violation?.message).not.toContain(requestEvent().request.url);
+    expect(violation?.message).not.toContain(NETWORK_ID);
+  });
+
+  it('DEF-052: every reason word is in the closed list, and the closed list has exactly the reasons of the design', () => {
+    expect(Object.isFrozen(CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON)).toBe(true);
+    expect(Object.values(CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON)).toEqual([
+      'network-id-missing',
+      'closing-not-waited',
+      'session-cleared',
+      'evidence-not-received',
+      'evidence-dropped-at-capacity',
+    ]);
+    for (const reason of Object.values(CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON)) {
+      expect(reason).toMatch(new RegExp(`^${DIAGNOSTIC_REASON_PATTERN}$`));
+    }
+  });
+
+  it('DEF-052: the IDs dropped at capacity are kept only up to their limit; beyond it the reason falls back to evidence-not-received, and the count keeps growing', async () => {
+    const { harness, ledger } = await readyGuard(failCommand('Fetch.continueRequest', PAGE_CONTINUE_INVALID, 'NONE'));
+
+    for (let index = 0; index < EVIDENCE_LIMIT; index += 1) {
+      harness.cdpLoadingFailedHandler?.({ ...CANCELED_EVIDENCE, requestId: `network-kept-${index}` });
+    }
+    for (let index = 0; index < MAX_DROPPED_CANCELED_DOCUMENT_IDS; index += 1) {
+      harness.cdpLoadingFailedHandler?.({ ...CANCELED_EVIDENCE, requestId: `network-dropped-${index}` });
+    }
+    harness.cdpLoadingFailedHandler?.(CANCELED_EVIDENCE);
+    harness.cdpRequestPausedHandler?.(requestEvent());
+
+    await expect.poll(() => harness.closeCount, { timeout: PAST_EVIDENCE_WAIT_POLL_MS }).toBe(1);
+    expect(ledger.snapshot().invariantViolations).toEqual([canceledEvidenceViolation('CDP_CONTINUE_REQUEST_FAILED', PAGE_CONTINUE_INVALID, {
+      reason: CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON.EVIDENCE_NOT_RECEIVED,
+      waitedMs: EVIDENCE_WAIT_MS,
+      droppedAtCapacity: MAX_DROPPED_CANCELED_DOCUMENT_IDS + 1,
+    })]);
+  });
+
+  it('DEF-052: the diagnostic fits the Safety Ledger text limit even with the longest original text, the longest reason and the largest numbers', () => {
+    const longestOriginal = [...INVALID_INTERCEPTION_ID_FAILURE_TEXTS].sort((a, b) => b.length - a.length)[0] ?? '';
+    const longestReason = Object.values(CANCELED_DOCUMENT_EVIDENCE_MISSING_REASON).sort((a, b) => b.length - a.length)[0] ?? '';
+    const largest = String(Number.MAX_SAFE_INTEGER);
+    const worst = `${longestOriginal}${canceledEvidenceDiagnosticText({
+      reason: longestReason,
+      waitedMs: largest,
+      elapsedMs: largest,
+      droppedAtCapacity: largest,
+    })}`;
+    expect(parseCanceledEvidenceMessage(worst)?.original).toBe(longestOriginal);
+    const ledger = new SafetyLedger();
+    ledger.recordInvariantViolation({ code: 'CDP_CONTINUE_REQUEST_FAILED', message: worst });
+
+    expect(ledger.snapshot().invariantViolations).toEqual([{ code: 'CDP_CONTINUE_REQUEST_FAILED', message: worst }]);
+    expect(worst.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
   });
 });
 

@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 dist/
+/apps/local-ui/src/routeTree.gen.ts
 
 # Runtime audit output (may contain screenshots/data from real crawl targets)
 artifacts/
@@ -12,6 +13,9 @@ beaksight-output/
 # Never commit customer-identifying configuration here.
 /local/*
 !/local/README.md
+
+# Local control data of the local UI (SQLite). Machine-specific; never commit.
+/local-data/
 
 # Leftover sandboxed git history / internal agent work history — not part of this repo.
 .git-sandbox-backup/

@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-write-update-start:1",
+  "description": "Local UI Server Function input: start an approved UPDATE write after the confirmation dialog (Task 31 design 3 'how the target is chosen', 10; T31h-2). scenarioId is the UPDATE scenario, expectedRevision is the scenario revision the screen read, and expectedTargetRecordId is the planned target record the screen showed (a usable record id); the server issues the execution grant with it (the issue chooses the target again and rejects a different one) and starts the update job at once. No property holds a credential, a cookie, a token or an input value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision", "expectedTargetRecordId"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/revision" },
+    "expectedTargetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 64 }
+  }
+}

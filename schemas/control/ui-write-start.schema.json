@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-write-start:1",
+  "description": "Local UI Server Function input: start an approved CREATE write after the confirmation dialog (Task 30 design 3, 10; T30g fix round 1). scenarioId is the write scenario and expectedRevision is the scenario revision the screen read; the server checks the start conditions, issues the execution grant and starts the write job at once. No property holds a credential, a cookie, a token or an input value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/revision" }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-login-check-start:1",
+  "description": "Local UI Server Function input: start a login check (LOGIN_CHECK) for one AUTOMATED_LOGIN profile (Task 26 design 4.5, 4.6). The job manager checks the profile, the revision, the credential and the limits again.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+  }
+}

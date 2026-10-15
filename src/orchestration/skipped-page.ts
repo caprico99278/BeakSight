@@ -1,6 +1,6 @@
 import {
-  INCOMPLETE_REASON_CODES,
   VIEWPORT_PROFILES,
+  isIncompleteReason,
   type IncompleteReason,
   type PageAuditResult,
   type PageId,
@@ -9,7 +9,6 @@ import {
   type ViewportProfile,
 } from '../core/contracts.js';
 import type { NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
-import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import { derivePageAuditStatus } from '../core/status.js';
 
@@ -33,12 +32,7 @@ export function skippedPageResult(url: NormalizedHttpUrlEvidence, pageId: PageId
   if (typeof pageId !== 'string' || pageId.length === 0) {
     throw new TypeError('skipped page ID must be a non-empty string');
   }
-  if (
-    !isRecord(reason)
-    || !(INCOMPLETE_REASON_CODES as readonly unknown[]).includes(reason.code)
-    || !Object.hasOwn(reason, 'detail')
-    || (reason.detail !== null && typeof reason.detail !== 'string')
-  ) {
+  if (!isIncompleteReason(reason)) {
     throw new TypeError('skipped page reason must be an incomplete reason with a known code and a detail');
   }
 

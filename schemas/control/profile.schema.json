@@ -1,0 +1,27 @@
+{
+  "$id": "urn:beaksight:schema:control:profile:1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "profileId",
+    "revision",
+    "targetConfigPath",
+    "environment",
+    "mode",
+    "auth",
+    "approvedTestOrigins",
+    "environmentEvidenceRef"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "beaksight-profile/1" },
+    "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "targetConfigPath": { "type": "string" },
+    "environment": { "enum": ["PUBLIC", "TEST"] },
+    "mode": { "enum": ["PUBLIC_PASSIVE", "TEST_AUTH_PASSIVE", "TEST_APPROVED_WRITE"] },
+    "auth": { "enum": ["NONE", "MANUAL_SESSION", "AUTOMATED_LOGIN"] },
+    "approvedTestOrigins": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "environmentEvidenceRef": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 }
+  }
+}

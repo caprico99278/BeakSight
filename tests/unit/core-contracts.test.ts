@@ -430,6 +430,8 @@ describe('C8: incomplete reason codes', () => {
     'RUN_INTERRUPTED',
     // SU1（サイトが応答しないときに Run を止める設計書 3.2）: サイトの不調を検知したため、その後の監査を始めなかった。
     'SITE_UNAVAILABLE',
+    // T25c（Task 25 の設計書 4.3）: 認証つきの Run で、セッションの切れを検知したため、そのページを監査せず、その後の監査を始めなかった。
+    'AUTH_SESSION_LOST',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -939,13 +941,17 @@ describe('F12: types derived from the core value arrays', () => {
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_NAVIGATION_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_WEBSOCKET_REASONS>>();
+    // T25b round 1（Task 25 の設計書 4.2）: 監査の段の除外で遮断した要求の理由は、この記録の中だけの閉じた一覧。
+    expectTypeOf<CoreEvidence.BlockedAuditExclusionEvent['reason']>()
+      .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_AUDIT_EXCLUSION_REASONS>>();
     // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた理由は、Passive と凍結の後の両方の一覧にある。
     expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>().toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY'>();
     // DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、Guard の遮断と出口の中継の拒否を区別する閉じた一覧。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_REQUEST_REASONS>>();
+    // DEF-085: Guard を通らずに出ようとした要求を、すべての Guard の Context の中継が拒んだ理由（`GUARD_BYPASS_EGRESS`）を加えた。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
-      .toEqualTypeOf<'INTERACTION_FROZEN' | 'INTERACTION_FROZEN_EGRESS' | 'EGRESS_UPSTREAM_DENIED'>();
+      .toEqualTypeOf<'INTERACTION_FROZEN' | 'INTERACTION_FROZEN_EGRESS' | 'EGRESS_UPSTREAM_DENIED' | 'GUARD_BYPASS_EGRESS'>();
     expectTypeOf<CoreEvidence.BlockedInteractionNavigationEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.INTERACTION_FROZEN_REASONS>>();
     expectTypeOf<CoreEvidence.BlockedPopupEvent['reason']>()
@@ -968,10 +974,13 @@ describe('F12: types derived from the core value arrays', () => {
     const reasonLists = {
       BLOCKED_REQUEST_REASONS: ['NON_READ_METHOD'],
       BLOCKED_NAVIGATION_REASONS: ['EXTERNAL_MAIN_FRAME_NAVIGATION'],
+      // T25b round 1: 監査の段の除外で遮断した要求の理由（`blockedAuditExclusions` の中だけで使う）。
+      BLOCKED_AUDIT_EXCLUSION_REASONS: ['AUDIT_EXCLUDED_URL'],
       // DEF-040（NP3）: `WORKER_CONNECT_POLICY` は、Worker の中の WebSocket を CSP で止めた理由。
       BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY'],
       INTERACTION_FROZEN_REASONS: ['INTERACTION_FROZEN'],
-      BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED'],
+      // DEF-085: `GUARD_BYPASS_EGRESS` は、Guard を通らずに出ようとした要求を、すべての Guard の Context の中継が拒んだ理由。
+      BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED', 'GUARD_BYPASS_EGRESS'],
       BLOCKED_INTERACTION_WEBSOCKET_REASONS: ['INTERACTION_FROZEN', 'WORKER_CONNECT_POLICY'],
       BLOCKED_DOWNLOAD_REASONS: ['PASSIVE_DOWNLOAD', 'INTERACTION_FROZEN'],
       // CC-014（P14a）: 外部への作用のため実行しなかった Interaction の候補の理由。
@@ -1042,7 +1051,7 @@ describe('P14a: page audit contracts', () => {
   it('carries the detail of the first site unavailability outside the page result (site unavailability design 3.1, 3.2)', () => {
     expectTypeOf<PageAuditOutcome['siteUnavailableDetail']>().toEqualTypeOf<string | null>();
     expectTypeOf<keyof PageAuditOutcome>()
-      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'navigationDiagnostics'>();
+      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'navigationDiagnostics'>();
     expectTypeOf<PageAuditResult>().not.toHaveProperty('siteUnavailableDetail');
   });
 
@@ -1125,7 +1134,8 @@ describe('R15a: run result, site metadata, and run summary contracts', () => {
   it('defines the closed lists of site metadata kinds and outcomes once, as frozen constants (5.6.2)', () => {
     expect(CoreEvidenceValues.SITE_METADATA_KINDS).toEqual(['ROBOTS_TXT', 'SITEMAP_XML']);
     expect(Object.isFrozen(CoreEvidenceValues.SITE_METADATA_KINDS)).toBe(true);
-    expect(CoreEvidenceValues.SITE_METADATA_OUTCOMES).toEqual(['OK', 'NOT_FOUND', 'FAILED']);
+    // T25c round 3（Task 25 の設計書 4.7）: 認証つきの Run で、除外に当たるので取りに行かなかった `EXCLUDED`。
+    expect(CoreEvidenceValues.SITE_METADATA_OUTCOMES).toEqual(['OK', 'NOT_FOUND', 'FAILED', 'EXCLUDED']);
     expect(Object.isFrozen(CoreEvidenceValues.SITE_METADATA_OUTCOMES)).toBe(true);
     expectTypeOf<CoreEvidence.SiteMetadataKind>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidenceValues.SITE_METADATA_KINDS>>();

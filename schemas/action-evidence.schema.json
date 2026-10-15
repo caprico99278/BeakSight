@@ -1,0 +1,222 @@
+{
+  "$id": "urn:beaksight:schema:action-evidence:1.0",
+  "description": "The evidence of one write job for the write report (action-evidence.json in the Run directory; Task 32 design 4.1; T32c), written by the worker for every run it finishes (BLOCKED included). It is built from the same facts as action-run.json: the check before sending (the candidate digest match and the block reason), the submission (the submitted values, synthetic test data in plain text, and the action path), the response, the record id, the before and after values of an UPDATE, the whole evidence of the READ verification (or a mark that it was not executed), the counts of the request guard, the ActionResult and its reason. A run that was not sent has no submitted value, no response, no record id and no executed READ. Values entered by people (the prior value of a changed field, the value read by the READ verification) are kept and marked by containsHumanEnteredValues. The value lists and limits are those of action-run, read-evidence, run and control/scenario, referenced and not copied; the contract is src/control/actions/action-contracts.ts. No property holds a credential, a cookie, a CSRF token, a hidden, readonly or kept value, a lock version or an authenticated state.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "jobId",
+    "runId",
+    "profileId",
+    "scenarioId",
+    "scenarioRevision",
+    "kind",
+    "containsHumanEnteredValues",
+    "precheck",
+    "submission",
+    "response",
+    "recordId",
+    "update",
+    "readVerification",
+    "guard",
+    "result",
+    "reason",
+    "startedAt",
+    "finishedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "action-evidence-schema/1.0" },
+    "jobId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "profileId": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/profileId" },
+    "scenarioId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
+    "scenarioRevision": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/revision" },
+    "kind": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/kind" },
+    "containsHumanEnteredValues": { "type": "boolean" },
+    "precheck": { "$ref": "#/$defs/precheck" },
+    "submission": { "$ref": "#/$defs/submission" },
+    "response": { "anyOf": [{ "$ref": "#/$defs/response" }, { "type": "null" }] },
+    "recordId": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/recordId" },
+    "update": { "anyOf": [{ "$ref": "urn:beaksight:schema:action-run:1.0#/properties/update" }, { "type": "null" }] },
+    "readVerification": {
+      "oneOf": [{ "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/executed" }, { "$ref": "#/$defs/readVerificationNotExecuted" }]
+    },
+    "guard": { "anyOf": [{ "$ref": "#/$defs/guardSummary" }, { "type": "null" }] },
+    "result": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/result" },
+    "reason": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/reason" },
+    "startedAt": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" },
+    "finishedAt": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" }
+  },
+  "allOf": [
+    {
+      "description": "A run that was not sent is BLOCKED with a block reason, and has no submitted value, no action path, no response, no record id and no executed READ. A sent run has no block reason, a matched candidate, an action path and a response item, and is not BLOCKED.",
+      "if": { "properties": { "submission": { "type": "object", "properties": { "state": { "const": "NOT_SENT" } } } } },
+      "then": {
+        "properties": {
+          "precheck": { "type": "object", "properties": { "blockReason": { "type": "string" } } },
+          "submission": {
+            "type": "object",
+            "properties": {
+              "submittedValues": { "type": "object", "maxProperties": 0 },
+              "actionPath": { "type": "null" },
+              "submittedAt": { "type": "null" }
+            }
+          },
+          "response": { "type": "null" },
+          "recordId": { "type": "null" },
+          "readVerification": { "type": "object", "properties": { "state": { "const": "NOT_EXECUTED" } } },
+          "result": { "const": "BLOCKED" }
+        }
+      },
+      "else": {
+        "properties": {
+          "precheck": { "type": "object", "properties": { "candidateDigestMatched": { "const": true }, "blockReason": { "type": "null" } } },
+          "submission": { "type": "object", "properties": { "actionPath": { "type": "string" } } },
+          "response": { "type": "object" },
+          "result": { "not": { "const": "BLOCKED" } }
+        }
+      }
+    },
+    {
+      "description": "Only an UPDATE has the update block.",
+      "if": { "properties": { "kind": { "const": "CREATE" } } },
+      "then": { "properties": { "update": { "type": "null" } } },
+      "else": { "properties": { "update": { "type": "object" } } }
+    },
+    {
+      "description": "A prior value of a changed field is a value entered by people: the mark is true.",
+      "if": {
+        "required": ["update"],
+        "properties": {
+          "update": {
+            "type": "object",
+            "required": ["updateEvidence"],
+            "properties": {
+              "updateEvidence": {
+                "type": "object",
+                "required": ["fields"],
+                "properties": { "fields": { "type": "array", "contains": { "type": "object", "properties": { "role": { "const": "CHANGED" } } } } }
+              }
+            }
+          }
+        }
+      },
+      "then": { "properties": { "containsHumanEnteredValues": { "const": true } } }
+    },
+    {
+      "description": "A value read by the READ verification is a value entered by people: the mark is true.",
+      "if": {
+        "required": ["readVerification"],
+        "properties": {
+          "readVerification": {
+            "type": "object",
+            "required": ["expectations"],
+            "properties": {
+              "expectations": {
+                "type": "array",
+                "contains": { "type": "object", "required": ["observedValue"], "properties": { "observedValue": { "type": "string" } } }
+              }
+            }
+          }
+        }
+      },
+      "then": { "properties": { "containsHumanEnteredValues": { "const": true } } }
+    }
+  ],
+  "$defs": {
+    "precheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidateDigestMatched", "blockReason"],
+      "properties": {
+        "candidateDigestMatched": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] },
+        "blockReason": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/blockReason" }
+      }
+    },
+    "submission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "submittedValues", "actionPath", "submittedAt"],
+      "properties": {
+        "state": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/submission" },
+        "submittedValues": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/submittedValues" },
+        "actionPath": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/request/properties/path" }, { "type": "null" }] },
+        "submittedAt": { "anyOf": [{ "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" }, { "type": "null" }] }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["httpStatus", "judgement", "judgedAt"],
+      "properties": {
+        "httpStatus": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/httpStatus" },
+        "judgement": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/responseJudgement" },
+        "judgedAt": { "anyOf": [{ "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" }, { "type": "null" }] }
+      }
+    },
+    "readVerificationNotExecuted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "readCheckRevision", "state"],
+      "properties": {
+        "readCheckId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
+        "readCheckRevision": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/revision" },
+        "state": { "const": "NOT_EXECUTED" }
+      }
+    },
+    "guardSummary": {
+      "description": "The counts and marks of the write stage of the request guard (the names of WriteStageMonitorSnapshot in src/safety/passive-request-guard.ts). No URL, value or body.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "blockedByReason",
+        "blockedByOtherRulesInWindow",
+        "submissionWindowOpen",
+        "blockedByPayloadReason",
+        "documentCharsetRead",
+        "responseDeliveryCanceled"
+      ],
+      "properties": {
+        "blockedByReason": {
+          "type": "object",
+          "propertyNames": { "enum": ["OUTSIDE_ALLOWED_ORIGINS", "SUBMISSION_WINDOW", "SUBMISSION_WINDOW_BROWSER_FAVICON"] },
+          "additionalProperties": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/count" }
+        },
+        "blockedByOtherRulesInWindow": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/count" },
+        "submissionWindowOpen": { "type": "boolean" },
+        "blockedByPayloadReason": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "EXPECTATION_INVALID",
+              "NOT_POST",
+              "NOT_MAIN_FRAME_NAVIGATION",
+              "QUERY_OR_FRAGMENT_PRESENT",
+              "ENDPOINT_MISMATCH",
+              "DOCUMENT_CHARSET_UNKNOWN",
+              "DOCUMENT_CHARSET_NOT_UTF8",
+              "ENCTYPE_NOT_ALLOWED",
+              "ENCTYPE_MISMATCH",
+              "BODY_UNAVAILABLE",
+              "BODY_INCOMPLETE",
+              "BODY_TOO_LARGE",
+              "BODY_MALFORMED",
+              "UNKNOWN_FIELD",
+              "DUPLICATE_FIELD",
+              "SUBMITTED_FIELD_MISSING",
+              "VALUE_MISMATCH",
+              "FILE_NOT_EMPTY",
+              "METHOD_OVERRIDE_MISMATCH",
+              "UNEXPECTED_FIELD_PRESENT",
+              "PASSTHROUGH_VALUE_MISMATCH",
+              "CHECKBOX_PAIR_MISMATCH"
+            ]
+          },
+          "additionalProperties": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/count" }
+        },
+        "documentCharsetRead": { "type": "boolean" },
+        "responseDeliveryCanceled": { "type": "boolean" }
+      }
+    }
+  }
+}

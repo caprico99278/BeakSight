@@ -176,6 +176,14 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     expect(summary).toContain(escapeHtml(RUN_STATUS_CATALOG.PARTIAL.label));
   });
 
+  // CCX-29（CC-039）: BeakSight の版と Playwright の版のラベル（CLI の版の違いの知らせと共用）を、文字のまま固定する。
+  it('shows the BeakSight version and the Playwright version with their labels as before', () => {
+    const html = render(auditRun({ run: { toolVersion: '9.8.7', environment: { ...runSummary().environment, playwrightVersion: '6.5.4' } } }));
+    const code = (value: string): string => `<code class="${REPORT_CLASS_NAMES.identifier}">${value}</code>`;
+    expect(sliceBetween(html, 'summary', 'critical-findings')).toContain(keyValue('BeakSight の版', code('9.8.7')));
+    expect(html).toContain(keyValue('Playwright', code('6.5.4')));
+  });
+
   it('shows the page coverage from the view model', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
     const summary = sliceBetween(renderHtmlReport(viewModel), 'summary', 'critical-findings');
@@ -630,7 +638,9 @@ describe('renderHtmlReport: the executions in the summary (R6)', () => {
       ...viewModel,
       summary: {
         ...viewModel.summary,
-        executions: { count: 9, resumeCount: 4, lastEndReason: executions.lastEndReason, items: [executions.items[0]] },
+        executions: {
+          count: 9, resumeCount: 4, lastEndReason: executions.lastEndReason, lastFinishedAt: executions.lastFinishedAt, items: [executions.items[0]],
+        },
       },
     };
     const part = executionsPart(renderHtmlReport(altered));

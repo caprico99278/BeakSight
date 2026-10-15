@@ -5,9 +5,11 @@ import { isPageId } from '../core/ids.js';
 import {
   createRunLock,
   currentProcessRunLockHost,
+  isOwnRunLock,
   isProcessRunning,
   judgeRunLock,
   renewRunLock,
+  takeOverStaleLock,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
   type RunCheckpoint,
   type RunCheckpointPage,
@@ -141,10 +143,6 @@ const TIMER_OPERATION_NAMES = Object.freeze(['setInterval', 'clearInterval'] as 
 const hasFunctions = (value: unknown, names: readonly string[]): boolean =>
   isRecord(value) && names.every((name) => typeof value[name] === 'function');
 
-/** 読み直したロックの中身が、`lock`（自分が書いたロック）と同じプロセスの ID とロックを取った時刻を持つか（設計書 4.4）。 */
-const isOwnRunLock = (value: unknown, lock: RunLock): boolean =>
-  isRecord(value) && value.processId === lock.processId && value.acquiredAtMs === lock.acquiredAtMs;
-
 /** 再開の始め方の、終わったページの ID の一覧を確かめる（配列でなければ `TypeError`、ページの ID の形でない項目があれば `RangeError`）。 */
 function assertCompletedPageIds(value: unknown): asserts value is readonly PageId[] {
   if (!Array.isArray(value)) {
@@ -227,9 +225,10 @@ export class RunCheckpointSession {
    * 1. ロックを作れたら、3 へ。
    * 2. ロックのファイルがすでにあれば、その中身を `judgeRunLock` で判定する（今の時刻と今の OS の起動の時刻は `createLockHost` の値、
    *    プロセスが動いているかは `isProcessRunning`）。`ACTIVE` なら、`{ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock }`
-   *    を返す。`STALE` なら、自分のロックの中身で `rewriteRunLock` で作り直し、`readRunLock` で読み直す。読み直した中身が自分のもの
-   *    （プロセスの ID とロックを取った時刻が同じ）でなければ、ロックに触れずに（相手のロックのまま）、
-   *    `{ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: <読み直した中身> }` を返す。
+   *    を返す。`STALE` なら、書き手の `takeOverRunLock` で原子的に取り直す（DEF-060。`#takeOverStaleLock`。判定し直しを含む）。ほかの起動が
+   *    同時に取り直したら、`{ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: <読み直した中身> }` を返す。
+   *    `takeOverRunLock` のない書き手では、自分のロックの中身で `rewriteRunLock` で作り直し、`readRunLock` で読み直す。読み直した中身が自分の
+   *    もの（プロセスの ID とロックを取った時刻が同じ）でなければ、ロックに触れずに（相手のロックのまま）、同じ結果を返す。
    * 3. 書き手の `cleanUpForResume` で後始末を行う（ハートビートと保存の書き出しの前。書き出しの途中の一時ファイルを消すため）。
    * 4. ハートビートのタイマーを始めて `unref` し、`{ ok: true, removedPaths }`（後始末で消したもの）を返す。
    *
@@ -338,8 +337,12 @@ export class RunCheckpointSession {
   }
 
   /**
-   * 再開のときに、すでにあったロック（`existing`）を判定し、古ければ自分のロック（`lock`）で作り直して読み直す（設計書 4.4）。
-   * 作り直して自分のものになったら `null` を返す。始めない場合は、その結果（`ok` が偽）を返す。
+   * 再開のときに、すでにあったロック（`existing`）を判定し、古ければ自分のロック（`lock`）で取り直す（設計書 4.4）。取り直して自分のものに
+   * なったら `null` を返す。始めない場合は、その結果（`ok` が偽）を返す。
+   * - 書き手が `takeOverRunLock` を持てば（本番の `ArtifactWriter`）、原子的な取り直し（`takeOverStaleLock`。古いファイルを一意の名前へ動かして
+   *   から `wx` で作る。DEF-060）を使う。動いている Run のロックなら `LOCK_HELD_BY_ACTIVE_RUN`、ほかの起動が同時に取り直したら
+   *   `LOCK_TAKEN_OVER_CONCURRENTLY`（`existingLock` は、読み直した今の中身）。
+   * - 持たなければ（テストの偽の書き手）、前の方式（`rewriteRunLock` で書き換え、`readRunLock` で読み直して自分のものか確かめる）で取り直す。
    */
   async #takeOverStaleLock(
     runDirectory: string,
@@ -347,7 +350,28 @@ export class RunCheckpointSession {
     lock: RunLock,
     existing: unknown,
   ): Promise<RunCheckpointSessionResumeStart | null> {
-    const state = judgeRunLock(existing, { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning: this.#isProcessRunning });
+    const judgement = { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning: this.#isProcessRunning };
+    const store = this.#store;
+    if (typeof store.takeOverRunLock === 'function') {
+      const takeOverRunLock = store.takeOverRunLock.bind(store);
+      const result = await takeOverStaleLock({
+        acquire: async (value) => await store.acquireRunLock(runDirectory, value),
+        takeOver: async (judged, value) => await takeOverRunLock(runDirectory, judged, value),
+      }, existing, lock, judgement);
+      switch (result.kind) {
+        case 'ACQUIRED':
+          return null;
+        case 'HELD':
+          return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: result.existing });
+        case 'CONTENDED':
+          return Object.freeze<RunCheckpointSessionResumeStart>({
+            ok: false,
+            reason: 'LOCK_TAKEN_OVER_CONCURRENTLY',
+            existingLock: await store.readRunLock(runDirectory),
+          });
+      }
+    }
+    const state = judgeRunLock(existing, judgement);
     if (state === 'ACTIVE') {
       return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: existing });
     }

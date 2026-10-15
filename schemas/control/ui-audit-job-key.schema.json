@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-audit-job-key:1",
+  "description": "Local UI Server Function input: one audit job by its jobId (Task 24 design 4.8).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jobId"],
+  "properties": {
+    "jobId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" }
+  }
+}

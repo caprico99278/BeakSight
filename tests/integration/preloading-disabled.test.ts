@@ -7,10 +7,16 @@
 // （Guard に見えている）ことと、Run と同じ作りの Context（Guard と LoadMeter の付いた factory の Context）で、負荷の記録（LoadMeter）の
 // 許可 Origin への要求の数に入ることを確かめる（R8）。
 // 先読みを止める引数は `--enable-features` なので、CLI の起動が、Playwright の既定の feature の指定を変えないことも確かめる（最後の describe）。
+// DEF-070: Google への接続を止める引数は `--disable-features` なので、Playwright の既定の値をすべて含むことも、最後の describe で確かめる。
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { CHROMIUM_CHANNEL, CHROMIUM_PRELOADING_DISABLED_FEATURES } from '../../src/browser/chromium-launch.js';
+import {
+  CHROMIUM_CHANNEL,
+  CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES,
+  CHROMIUM_PRELOADING_DISABLED_FEATURES,
+  PLAYWRIGHT_DEFAULT_DISABLED_FEATURES,
+} from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { PRODUCTION_RUN_DEPENDENCIES } from '../../src/cli/run-command.js';
 import { wait } from '../../src/core/deadline.js';
@@ -193,22 +199,33 @@ function effectiveSwitchValue(occurrences: readonly string[][]): readonly string
 // DEF-023: 先読みを止める引数は `--enable-features` なので、Playwright が自分で加える `--enable-features` を上書きする（Chromium は最後の
 // 1つだけを使う）。CLI の起動が、Playwright の既定の feature の指定（`--enable-features` と `--disable-features`）を変えないことを、
 // 引数を渡さない起動（Playwright の既定）と比べて確かめる。Playwright の版が変わって既定が変わったら、ここで気づく。
-describe('the CLI launch of Chromium keeps the features Playwright enables and disables by default (DEF-023)', () => {
-  it('enables the default features of Playwright and the preloading ones, and disables the default ones of Playwright', async () => {
+// DEF-070: Google への接続を止める引数は `--disable-features` なので、同じく Playwright が自分で加える `--disable-features` を上書きする。
+// CLI の起動の `--disable-features` は、Playwright の既定の1つと、その後の CLI の1つ（Playwright の既定の値すべてと、Google への接続を
+// 止める feature）だけで、ほかの `--disable-features` の引数がないことを確かめる。Playwright の既定の値を写した定数
+// （`PLAYWRIGHT_DEFAULT_DISABLED_FEATURES`）が、実際の既定と同じであることも確かめる（版が変わって既定が変わったら、ここで気づく）。
+describe('the CLI launch of Chromium keeps the features Playwright enables and disables by default (DEF-023, DEF-070)', () => {
+  it('enables the default features of Playwright and the preloading ones, and disables the default ones of Playwright and the Google services ones', async () => {
     const playwrightDefault = await chromium.launch({ headless: true, channel: CHROMIUM_CHANNEL });
     let defaultEnabled: readonly string[];
-    let defaultDisabled: readonly string[];
+    let defaultDisabledOccurrences: readonly string[][];
     try {
       defaultEnabled = effectiveSwitchValue(await featureSwitchValues(playwrightDefault, 'enable-features'));
-      defaultDisabled = effectiveSwitchValue(await featureSwitchValues(playwrightDefault, 'disable-features'));
+      defaultDisabledOccurrences = await featureSwitchValues(playwrightDefault, 'disable-features');
     } finally {
       await playwrightDefault.close();
     }
 
     const cliEnabled = effectiveSwitchValue(await featureSwitchValues(browser, 'enable-features'));
-    const cliDisabled = effectiveSwitchValue(await featureSwitchValues(browser, 'disable-features'));
+    const cliDisabledOccurrences = await featureSwitchValues(browser, 'disable-features');
 
     expect([...cliEnabled].sort()).toEqual([...defaultEnabled, ...CHROMIUM_PRELOADING_DISABLED_FEATURES].sort());
-    expect(cliDisabled).toEqual(defaultDisabled);
+    // Playwright の既定の `--disable-features` は1つだけで、値は定数と同じ（並びも同じ）。
+    expect(defaultDisabledOccurrences).toEqual([[...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES]]);
+    // CLI の起動の `--disable-features` は、Playwright の既定の1つと、最後の CLI の1つだけ。最後の1つ（Chromium が使う値）は、
+    // Playwright の既定の値すべてと、Google への接続を止める feature。
+    expect(cliDisabledOccurrences).toEqual([
+      ...defaultDisabledOccurrences,
+      [...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES, ...CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES],
+    ]);
   });
 });

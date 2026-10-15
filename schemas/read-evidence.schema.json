@@ -1,0 +1,150 @@
+{
+  "$id": "urn:beaksight:schema:read-evidence:1.0",
+  "description": "The result of one READ check job (read-evidence.json in the Run directory; Task 27 design 4.5, 4.8; T27e). The value lists and limits are owned by src/discovery/read-check-evaluation.ts. The expectations are the read-check-definition schema (schemas/control/read-check-definition.schema.json), referenced and not copied. Only counts and the checked items are kept: never the whole table, a cookie, a token or a hidden value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "jobId", "runId", "startedAt", "finishedAt", "runStatus", "endReason", "checks"],
+  "properties": {
+    "schemaVersion": { "const": "read-evidence-schema/1.0" },
+    "jobId": { "$ref": "#/$defs/id" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "finishedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
+    "endReason": {
+      "enum": ["COMPLETED", "MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"]
+    },
+    "checks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/check" } }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "expectationResult": { "enum": ["MATCHED", "NOT_MATCHED", "UNDETERMINED"] },
+    "undeterminedReason": {
+      "anyOf": [{ "enum": ["STRUCTURE_NOT_FOUND", "STRUCTURE_AMBIGUOUS", "STRUCTURE_LIMIT_REACHED", "PAGE_NOT_SETTLED"] }, { "type": "null" }]
+    },
+    "check": { "oneOf": [{ "$ref": "#/$defs/executed" }, { "$ref": "#/$defs/notExecuted" }] },
+    "executed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readCheckId",
+        "readCheckRevision",
+        "targetIdentityDigest",
+        "state",
+        "result",
+        "detail",
+        "url",
+        "httpStatus",
+        "blockedRequests",
+        "structure",
+        "expectations"
+      ],
+      "properties": {
+        "readCheckId": { "$ref": "#/$defs/id" },
+        "readCheckRevision": { "$ref": "#/$defs/revision" },
+        "targetIdentityDigest": { "$ref": "#/$defs/digest" },
+        "state": { "const": "EXECUTED" },
+        "result": {
+          "enum": ["MATCHED", "NOT_MATCHED", "UNDETERMINED", "READ_BLOCKED_BY_POLICY", "READ_CANDIDATE_DRIFTED", "READ_CANDIDATE_NOT_READ"]
+        },
+        "detail": {
+          "enum": [
+            "EXPECTATIONS_EVALUATED",
+            "TARGET_PAGE_UNKNOWN",
+            "TARGET_PAGE_UNREADABLE",
+            "CANDIDATE_NOT_FOUND",
+            "CANDIDATE_NOT_READ",
+            "SECRET_LIKE_PARAMETER",
+            "PARAMETER_DANGEROUS_WORD",
+            "PARAMETER_NOT_SENDABLE",
+            "URL_NOT_BUILT",
+            "REQUEST_POLICY",
+            "NAVIGATION_FAILED",
+            "HTTP_ERROR_STATUS",
+            "RESULT_PAGE_UNREADABLE",
+            "SESSION_LOST"
+          ]
+        },
+        "url": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
+        "httpStatus": { "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 599 }, { "type": "null" }] },
+        "blockedRequests": { "$ref": "#/$defs/count" },
+        "structure": { "anyOf": [{ "$ref": "#/$defs/structure" }, { "type": "null" }] },
+        "expectations": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/expectationEvidence" } }
+      }
+    },
+    "notExecuted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "readCheckRevision", "targetIdentityDigest", "state", "reason"],
+      "properties": {
+        "readCheckId": { "$ref": "#/$defs/id" },
+        "readCheckRevision": { "$ref": "#/$defs/revision" },
+        "targetIdentityDigest": { "$ref": "#/$defs/digest" },
+        "state": { "const": "NOT_EXECUTED" },
+        "reason": { "enum": ["MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"] }
+      }
+    },
+    "structure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region", "tables", "tableRowCounts", "lists", "listItemCounts", "detailFields", "textLength", "limitReached", "settled"],
+      "properties": {
+        "region": { "enum": ["MAIN", "BODY"] },
+        "tables": { "$ref": "#/$defs/count" },
+        "tableRowCounts": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/count" } },
+        "lists": { "$ref": "#/$defs/count" },
+        "listItemCounts": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/count" } },
+        "detailFields": { "$ref": "#/$defs/count" },
+        "textLength": { "$ref": "#/$defs/count" },
+        "limitReached": { "type": "boolean" },
+        "settled": { "type": "boolean" }
+      }
+    },
+    "expectationEvidence": {
+      "oneOf": [{ "$ref": "#/$defs/rowCountEvidence" }, { "$ref": "#/$defs/textEvidence" }, { "$ref": "#/$defs/detailEvidence" }]
+    },
+    "rowCountEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectation", "result", "undeterminedReason", "rowSource", "observedRowCount"],
+      "properties": {
+        "expectation": {
+          "oneOf": [
+            { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/$defs/rowCountEquals" },
+            { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/$defs/rowCountAtLeast" }
+          ]
+        },
+        "result": { "$ref": "#/$defs/expectationResult" },
+        "undeterminedReason": { "$ref": "#/$defs/undeterminedReason" },
+        "rowSource": { "anyOf": [{ "enum": ["TABLE", "LIST"] }, { "type": "null" }] },
+        "observedRowCount": { "anyOf": [{ "$ref": "#/$defs/count" }, { "type": "null" }] }
+      }
+    },
+    "textEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectation", "result", "undeterminedReason", "found"],
+      "properties": {
+        "expectation": { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/$defs/textContains" },
+        "result": { "$ref": "#/$defs/expectationResult" },
+        "undeterminedReason": { "$ref": "#/$defs/undeterminedReason" },
+        "found": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] }
+      }
+    },
+    "detailEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expectation", "result", "undeterminedReason", "observedValue"],
+      "properties": {
+        "expectation": { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/$defs/detailFieldEquals" },
+        "result": { "$ref": "#/$defs/expectationResult" },
+        "undeterminedReason": { "$ref": "#/$defs/undeterminedReason" },
+        "observedValue": { "anyOf": [{ "type": "string", "maxLength": 256 }, { "type": "null" }] }
+      }
+    }
+  }
+}

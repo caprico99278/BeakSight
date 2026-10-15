@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import { safeErrorMessage } from '../core/errors.js';
+import { errorCodeOf, safeErrorMessage } from '../core/errors.js';
 import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
@@ -43,7 +43,7 @@ const deepMerge = (base: unknown, addition: unknown): unknown => {
 /** 例外の文（技術的な詳細）。 */
 const errorDetail = (error: unknown): string => safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH);
 
-const isFileNotFound = (error: unknown): boolean => isRecord(error) && error.code === 'ENOENT';
+const isFileNotFound = (error: unknown): boolean => errorCodeOf(error) === 'ENOENT';
 
 /**
  * 設定のファイルかディレクトリの入出力の失敗を、`ConfigError` にする。ない場合は `CONFIG_FILE_NOT_FOUND`、ほかの失敗

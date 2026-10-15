@@ -31,7 +31,7 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
-import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
+import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
 
 const AUDIT_TEST_TIMEOUT_MS = 180_000;
@@ -678,14 +678,10 @@ describe('PageAuditor Interaction candidate limit per page (load control design 
       overrides: { ...INTERACTION_ONLY, crawl: { maxInteractionsPerPage: SMALL_INTERACTION_LIMIT } },
       createNavigationPacer: (config) => {
         const pacer = createTestNavigationPacer(config);
-        return {
-          beforeNavigation: async () => {
-            calls.push(PACER_CALL);
-            return pacer.beforeNavigation();
-          },
-          snapshot: () => pacer.snapshot(),
-          raiseMinimumInterval: (minIntervalMs) => pacer.raiseMinimumInterval(minIntervalMs),
-        };
+        return forwardingNavigationPacer(pacer, async () => {
+          calls.push(PACER_CALL);
+          return pacer.beforeNavigation();
+        });
       },
       wrapSession: (session) => {
         calls.push(INTERACTION_SESSION);

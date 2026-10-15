@@ -2,6 +2,7 @@ import type { BrowserContext, Page } from 'playwright';
 import type { BrowserContextFactory } from '../browser/context-factory.js';
 import {
   observeMainFrameLoad,
+  settleMainFrameLoad,
   trackMainFrameDocument,
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
@@ -99,6 +100,14 @@ export interface SiteMetadataOptions {
    * そのまま reject する（呼び出し側の誤り）。
    */
   readonly afterNavigation?: ((observation: MainFrameLoadObservation) => void) | undefined;
+  /**
+   * 取りに行かない URL の判定（Task 25 の設計書 4.2、4.7。T25c round 3）。省略すると、今のまま両方のファイルを取得する（公開監査）。
+   * 渡すと、真を返した URL のファイルは、読み込みも、間隔の待ち（`beforeNavigation`）も、観測の受け口（`afterNavigation`）の呼び出しもせず、
+   * 結果 `EXCLUDED`（応答も本文もない。`failures` にも入れない）の Evidence にする。すべてのファイルが当たれば、Passive Context も作らない
+   * （`ledgerSnapshot` は `null`）。判定の意味の owner は呼び出し側（Run Coordinator は、巡回の候補の判定 `isExcludedCrawlCandidate` を渡す）。
+   * 関数でない値は、Context を作らずに `TypeError` を投げる。判定が投げた例外は、そのまま reject する（呼び出し側の誤り）。
+   */
+  readonly isExcludedUrl?: ((url: string) => boolean) | undefined;
 }
 
 /**
@@ -140,6 +149,11 @@ const SITE_METADATA_PATHS = Object.freeze([
   Object.freeze({ kind: 'SITEMAP_XML', path: '/sitemap.xml' }),
 ] as const satisfies readonly { readonly kind: SiteMetadataKind; readonly path: string }[]);
 
+/**
+ * 取りに行かなかったファイルの取得の結果（T25c round 3）。応答も本文もなく、失敗でもない（`failures` に入れない）。
+ */
+const EXCLUDED_FETCH_OUTCOME: FetchOutcome = Object.freeze({ outcome: 'EXCLUDED', httpStatus: null, body: null, failure: null });
+
 /** `NOT_FOUND` とする HTTP ステータス（ファイルがない）。 */
 const NOT_FOUND_HTTP_STATUSES: ReadonlySet<number> = new Set([404, 410]);
 const MIN_SUCCESS_HTTP_STATUS = 200;
@@ -168,6 +182,9 @@ interface OpenedContext {
   readonly ledger: SafetyLedger | null;
   readonly failure: Omit<SiteMetadataFetchFailure, 'kind'> | null;
 }
+
+/** すべてのファイルを取りに行かないので、Context を作らなかった（T25c round 3）。使われないので、失敗も持たない。 */
+const NO_CONTEXT_NEEDED: OpenedContext = Object.freeze({ context: undefined, ledger: null, failure: null });
 
 /**
  * page を開いた結果。開けなかった場合は、`page` が `undefined` で、`failure` を持つ。
@@ -221,8 +238,14 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
   const validated = validateOptions(options);
   const { contextFactory, limits, timeoutMs, allowedQueryParameters, targets, deadlines, beforeNavigation, afterNavigation } = validated;
   const evidenceContext: EvidenceRecordContext = { allocator: options.allocator, clock: options.clock };
-
-  const session = await openContext(contextFactory, options.config.viewports.primaryDesktop, deadlines);
+  // T25c round 3: 取りに行かないファイル（判定がなければ、なし）。すべてが当たれば、Context を作らない。
+  const { isExcludedUrl } = validated;
+  const excludedUrls: ReadonlySet<string> = new Set(
+    isExcludedUrl === undefined ? [] : targets.filter(({ url }) => isExcludedUrl(url)).map(({ url }) => url),
+  );
+  const session: OpenedContext = targets.every(({ url }) => excludedUrls.has(url))
+    ? NO_CONTEXT_NEEDED
+    : await openContext(contextFactory, options.config.viewports.primaryDesktop, deadlines);
   const records: EvidenceRecordFor<'metadata'>[] = [];
   const failures: SiteMetadataFetchFailure[] = [];
   let unnormalizableSitemapUrlCount = 0;
@@ -234,7 +257,9 @@ export async function collectSiteMetadata(options: SiteMetadataOptions): Promise
   try {
     for (const { kind, url } of targets) {
       let fetched: FetchOutcome;
-      if (session.context === undefined || session.failure !== null) {
+      if (excludedUrls.has(url)) {
+        fetched = EXCLUDED_FETCH_OUTCOME;
+      } else if (session.context === undefined || session.failure !== null) {
         fetched = { outcome: 'FAILED', httpStatus: null, body: null, failure: session.failure };
       } else {
         // ファイルごとに新しい page で開く。期限切れなどで終わらなかったナビゲーションを、次のナビゲーションで中断させないためである
@@ -316,6 +341,7 @@ interface ValidatedOptions {
   readonly deadlines: ResolvedPassiveSessionDeadlines;
   readonly beforeNavigation: () => Promise<number>;
   readonly afterNavigation: SiteMetadataOptions['afterNavigation'];
+  readonly isExcludedUrl: SiteMetadataOptions['isExcludedUrl'];
 }
 
 function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
@@ -343,6 +369,10 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
   if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
     throw new TypeError('site metadata afterNavigation must be a function when given');
   }
+  const { isExcludedUrl } = options;
+  if (isExcludedUrl !== undefined && typeof isExcludedUrl !== 'function') {
+    throw new TypeError('site metadata isExcludedUrl must be a function when given');
+  }
   if (!isRecord(config) || !isRecord(config.site) || !isRecord(config.crawl) || !isRecord(config.viewports)) {
     throw new TypeError('site metadata requires the audit config');
   }
@@ -367,6 +397,7 @@ function validateOptions(options: SiteMetadataOptions): ValidatedOptions {
     deadlines: resolvePassiveSessionDeadlines(options.deadlines),
     beforeNavigation,
     afterNavigation,
+    isExcludedUrl,
   };
 }
 
@@ -481,11 +512,7 @@ async function fetchMetadata(
   let navigated: GotoSettlement;
   let observation: MainFrameLoadObservation;
   try {
-    try {
-      navigated = { status: 'FULFILLED', value: await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }) };
-    } catch (error) {
-      navigated = { status: 'REJECTED', reason: error };
-    }
+    navigated = await settleMainFrameLoad(page, url, { waitUntil: 'domcontentloaded', timeoutMs });
     observation = observeMainFrameLoad(tracker, navigated);
     hooks.afterNavigation?.(observation);
   } finally {

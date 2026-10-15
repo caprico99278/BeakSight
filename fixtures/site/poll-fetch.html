@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Poll Fetch</title></head>
+  <body>
+    <!--
+      DEF-085 fix round 3（T27R2 の C1）: 5 ms ごとに、同じ Origin への fetch と、別の Origin（同じ port の localhost の https）への fetch を
+      続けるページ。Guard が許す普通の要求が、Context を閉じるときに、遮断したリクエストとして数えられないことを確かめる。
+      別の Origin の https は、相手が http のサーバなので TLS で失敗する（CONNECT は中継を通る）。どちらも、失敗しても止めない。
+    -->
+    <h1>Fixture Poll Fetch</h1>
+    <p>This page keeps fetching while it is open.</p>
+    <script>
+      (() => {
+        const POLL_INTERVAL_MS = 5;
+        const sameOrigin = '/poll-target.txt';
+        const otherOrigin = `https://localhost:${location.port}/poll-target.txt`;
+        let count = 0;
+        setInterval(() => {
+          count += 1;
+          fetch(`${sameOrigin}?n=${count}`, { cache: 'no-store' }).catch(() => undefined);
+          fetch(`${otherOrigin}?n=${count}`, { cache: 'no-store', mode: 'no-cors' }).catch(() => undefined);
+        }, POLL_INTERVAL_MS);
+      })();
+    </script>
+  </body>
+</html>

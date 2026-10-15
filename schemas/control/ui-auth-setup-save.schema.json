@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-auth-setup-save:1",
+  "description": "Local UI Server Function input: save the auth setup of one TEST_AUTH_PASSIVE or TEST_APPROVED_WRITE profile (Task 25 design 4.5; Task 28 design 4.5). The auth setup document itself is validated by saveAuthSetup (validateAuthSetup).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["setup"],
+  "properties": {
+    "setup": { "type": "object" }
+  }
+}

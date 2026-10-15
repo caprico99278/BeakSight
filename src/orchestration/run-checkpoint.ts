@@ -1,4 +1,3 @@
-import { uptime } from 'node:os';
 import type {
   CrawlUrlState,
   EvidenceRecord,
@@ -16,9 +15,10 @@ import type {
 } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { EffectiveAuditConfig, NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
-import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import { isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import type { LockFileAcquisition, RunLock, RunLockTakeover } from '../core/process-lock.js';
 import { REDACTED } from '../core/redaction.js';
 import type { ArtifactValidationResult } from '../core/schema-validator.js';
 import { compareCodeUnits } from '../core/text.js';
@@ -29,7 +29,9 @@ import { CrawlFrontier, type CrawlFrontierSnapshot, type CrawlUrlEntry } from '.
 import { IdAllocator, type IdAllocatorSnapshot } from './id-allocator.js';
 
 // 中断した Run の再開のための保存（チェックポイント）の内容の作成、整合の確かめ、再開できるかの判定、設定と版の比べ、再開する Run の選び方、
-// ロックの判定、実行の終わり方と保存の終わり方の判定（中断した Run の再開の設計書 3.2、4.1、4.2、4.3.2、4.4、4.7、4.7.1、4.8、5章。この意味の owner）。
+// 実行の終わり方と保存の終わり方の判定（中断した Run の再開の設計書 3.2、4.1、4.2、4.3.2、4.7、4.7.1、4.8、5章。この意味の owner）。
+// - ロックの中身と判定、古いロックの取り直し（設計書 4.4）の owner は `src/core/process-lock.ts`（T24h-3 で移した）。ここは、今の名前で
+//   export し直すだけである。
 // - ファイルは読み書きしない。保存のファイルの読み書き、ロックのファイルの作成・更新・削除は `ArtifactWriter` が行う（ARCH08）。
 // - スキーマの検証（`validateArtifact('checkpoint' | 'checkpoint-page', …)`）も、保存のファイルを読み書きする `ArtifactWriter` が行う
 //   （ARCH08 の Gate で、`validateArtifact` を呼べる場所は限られているため。R2 の Blocker B1）。ここでは、スキーマの検証の済んだ値の、
@@ -111,7 +113,26 @@ export interface RunCheckpoint {
   readonly load: RunCheckpointLoad;
   /** 監査を終えたページの ID（`checkpoint/pages/<pageId>.json` と対応する）。 */
   readonly completedPageIds: readonly PageId[];
+  /**
+   * Run の種類（T25g-2。独立レビュー T25R の Important I1）。認証つきの Run だけが持つ（認証の設定を区別する値。秘密を含まない）。
+   * ない保存（公開監査の Run と、この項目より前の古い保存）は、公開監査の Run とみなす。再開する Run を選ぶ比べ（`selectRunToResume`）で比べ、
+   * 今回の Run の種類と違えば再開しない。
+   */
+  readonly authentication?: RunCheckpointAuthentication;
 }
+
+/**
+ * 認証つきの Run の、保存に記録する種類の値（T25g-2）。`settingsDigest` は、認証の設定のうち、秘密を含まない値（許可 Origin、監査の段の除外、
+ * セッションの切れの path）の SHA-256（`sha256:<16進64桁>`）。作るのは `runCheckpointAuthenticationOf`（`src/orchestration/authenticated-run.ts`）。
+ */
+export interface RunCheckpointAuthentication {
+  readonly settingsDigest: string;
+}
+
+/**
+ * 再開する Run を選ぶ比べで、Run の種類が違うときの、違う項目のパス（T25g-2）。実効の設定の違う項目のパスの後に加える。
+ */
+export const RUN_KIND_DIFFERENCE_PATH = 'authentication';
 
 /** `createRunCheckpoint` の入力（`state.json` の値から `schemaVersion` を除いたもの）。 */
 export type RunCheckpointInput = Omit<RunCheckpoint, 'schemaVersion'>;
@@ -160,6 +181,8 @@ export function createRunCheckpoint(input: RunCheckpointInput): RunCheckpoint {
     siteMetadata: input.siteMetadata,
     load: input.load,
     completedPageIds: input.completedPageIds,
+    // T25g-2: 認証つきの Run だけ、Run の種類を記録する（公開監査の保存の形は変えない）。
+    ...(input.authentication === undefined ? {} : { authentication: { settingsDigest: input.authentication.settingsDigest } }),
   }));
 }
 
@@ -239,12 +262,41 @@ const restorationFailureMessage = (error: unknown, checkpoint: RunCheckpoint): s
   return safeErrorMessage(message, MAX_ERROR_MESSAGE_LENGTH);
 };
 
+/** 保存から作り直した採番器と巡回の記録（`restoreRunCheckpointCrawl` の結果）。 */
+export interface RestoredRunCheckpointCrawl {
+  readonly allocator: IdAllocator;
+  readonly frontier: CrawlFrontier;
+}
+
+/**
+ * 保存の値から、採番器と巡回の記録を作り直す（中断した Run の再開の設計書 4.2、4.10 の DEF-022。CC-040。この作り直しの owner）。
+ * Run Coordinator の再開の初めの作り直しと、保存の整合の確かめ（`checkRunCheckpointConsistency`）の両方が、これを使う。
+ * - 採番器は、`allocator` が渡されなければ、保存の値から `IdAllocator.restore` で作り直す（作り直せなければ、その例外を投げる）。
+ * - 巡回の記録は、`CrawlFrontier.restore` で、その採番器と、保存の実効の設定（`effectiveConfig.crawl`）の深さの上限と URL の正規化で
+ *   残す query の引数、待ち行列に戻す理由（`RESUME_REQUEUE_SKIP_REASON_CODES`）で作り直す（作り直せなければ、その例外を投げる）。
+ *   設定を保存の実効の設定から取るのは、それが Run の設定の正だからである（再開のときの今の設定とは、再開する Run の選び方
+ *   `selectRunToResume` で、同じことを確かめ済み。`CC-plan.md` の「設計者の判断」の 1）。
+ * 監査の途中だった URL と、待ち行列に戻す理由の SKIPPED の URL は、`QUEUED` に戻る（設計書 3.2、4.2）。
+ */
+export function restoreRunCheckpointCrawl(
+  checkpoint: Pick<RunCheckpoint, 'allocator' | 'frontier' | 'effectiveConfig'>,
+  allocator: IdAllocator = IdAllocator.restore(checkpoint.allocator),
+): RestoredRunCheckpointCrawl {
+  const { maxDepth, allowedQueryParameters } = checkpoint.effectiveConfig.crawl;
+  const frontier = CrawlFrontier.restore(checkpoint.frontier, {
+    maxDepth,
+    allocator,
+    allowedQueryParameters: new Set(allowedQueryParameters),
+    requeueSkipReasonCodes,
+  });
+  return { allocator, frontier };
+}
+
 /**
  * 保存の値から、採番器と巡回の記録を作り直せるかを確かめ、作り直せなければ、英語の技術的な詳細で `errors` に加える
- * （`checkRunCheckpointConsistency` の一部。設計書 4.2、4.10 の DEF-022。R8）。Run Coordinator が再開の初めに作り直すときと同じく、採番器は
- * `IdAllocator.restore`、巡回の記録は `CrawlFrontier.restore`（保存の実効の設定の深さの上限と、URL の正規化で残す query の引数、待ち行列に
- * 戻す理由 `RESUME_REQUEUE_SKIP_REASON_CODES`）で作り直す。作り直したものは使わない。採番器を作り直せない場合も、すべての食い違いを返すため、
- * 巡回の記録は、新しい採番器で確かめる。
+ * （`checkRunCheckpointConsistency` の一部。設計書 4.2、4.10 の DEF-022。R8）。Run Coordinator が再開の初めに作り直すときと同じ
+ * `restoreRunCheckpointCrawl` で作り直す。作り直したものは使わない。採番器を作り直せない場合も、すべての食い違いを返すため、
+ * 採番器は先に `IdAllocator.restore` で確かめ、作り直せなければ、巡回の記録は、新しい採番器で確かめる。
  */
 const collectRestorationInconsistencies = (checkpoint: RunCheckpoint, errors: string[]): void => {
   let allocator: IdAllocator;
@@ -254,14 +306,8 @@ const collectRestorationInconsistencies = (checkpoint: RunCheckpoint, errors: st
     errors.push(`/allocator cannot be restored: ${restorationFailureMessage(error, checkpoint)}`);
     allocator = new IdAllocator();
   }
-  const { maxDepth, allowedQueryParameters } = checkpoint.effectiveConfig.crawl;
   try {
-    CrawlFrontier.restore(checkpoint.frontier, {
-      maxDepth,
-      allocator,
-      allowedQueryParameters: new Set(allowedQueryParameters),
-      requeueSkipReasonCodes,
-    });
+    restoreRunCheckpointCrawl(checkpoint, allocator);
   } catch (error) {
     errors.push(`/frontier cannot be restored: ${restorationFailureMessage(error, checkpoint)}`);
   }
@@ -340,12 +386,14 @@ export function checkRunCheckpointPageConsistency(page: RunCheckpointPage, check
  * 再開のときに、待ち行列に戻す SKIPPED の理由のコード（設計書 3.2）。再開の流れ（R4a2）は、`CrawlFrontier.restore` の
  * `requeueSkipReasonCodes` に、この一覧を渡す。1回の実行の時間の上限（`MAX_RUNTIME_REACHED`）、止める印（Ctrl+C など）で
  * 止めた理由（`RUN_INTERRUPTED`。R4b1。設計書 4.6.1）、サイトの不調で止めた理由（`SITE_UNAVAILABLE`。不調を検知したページと、
- * 始めなかったページ。サイトが応答しないときに Run を止める設計書 3.2）の3つである。
+ * 始めなかったページ。サイトが応答しないときに Run を止める設計書 3.2）、認証つきの Run でセッションの切れで止めた理由
+ * （`AUTH_SESSION_LOST`。Task 25 の設計書 4.3。T25c。再開のときは、もう一度ログインする（T25d））の4つである。
  */
 export const RESUME_REQUEUE_SKIP_REASON_CODES = Object.freeze([
   'MAX_RUNTIME_REACHED',
   'RUN_INTERRUPTED',
   'SITE_UNAVAILABLE',
+  'AUTH_SESSION_LOST',
 ] as const satisfies readonly IncompleteReasonCode[]);
 
 /**
@@ -357,6 +405,10 @@ export const RESUME_REQUEUE_SKIP_REASON_CODES = Object.freeze([
 export const RUN_RESUMPTION_DECISIONS = Object.freeze(['RESUME', 'FINALIZE_ONLY', 'NOT_RESUMABLE'] as const);
 export type RunResumptionDecision = (typeof RUN_RESUMPTION_DECISIONS)[number];
 
+/**
+ * `RESUME_REQUEUE_SKIP_REASON_CODES` の Set（この意味の Set は、ここに1つだけ置く。CC-040）。再開できるかの判定（`isLeftToAudit`）と、
+ * 保存からの巡回の記録の作り直し（`restoreRunCheckpointCrawl`）が使う。
+ */
 const requeueSkipReasonCodes: ReadonlySet<IncompleteReasonCode> = new Set(RESUME_REQUEUE_SKIP_REASON_CODES);
 
 /** 再開したときに監査する URL か（`QUEUED`、`AUDITING`、待ち行列に戻す理由の `SKIPPED`）。 */
@@ -420,6 +472,7 @@ const isSafetyAbortedRun = (runStatus: RunStatus): boolean => runStatus === 'ABO
  */
 const STOPPING_SKIP_REASONS = Object.freeze([
   { skipReasonCode: 'SITE_UNAVAILABLE', endReason: 'STOPPED_BY_SITE_UNAVAILABLE' },
+  { skipReasonCode: 'AUTH_SESSION_LOST', endReason: 'STOPPED_BY_AUTH_SESSION_LOST' },
   { skipReasonCode: 'MAX_RUNTIME_REACHED', endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
   { skipReasonCode: 'RUN_INTERRUPTED', endReason: 'STOPPED_BY_SIGNAL' },
 ] as const satisfies readonly { readonly skipReasonCode: IncompleteReasonCode; readonly endReason: RunExecutionEndReason }[]);
@@ -515,6 +568,7 @@ const STOPPED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
  * この実行の終わり方を決める（設計書 4.8。サイトが応答しないときに Run を止める設計書 3.2）。上から順に、最初に当てはまるもの:
  * 1. Run Status が `ABORTED_BY_SAFETY` → `STOPPED_BY_SAFETY_VIOLATION`
  * 2. 理由 `SITE_UNAVAILABLE` の SKIPPED がある → `STOPPED_BY_SITE_UNAVAILABLE`
+ * 2a. 理由 `AUTH_SESSION_LOST` の SKIPPED がある → `STOPPED_BY_AUTH_SESSION_LOST`（認証つきの Run だけ。T25c）
  * 3. 理由 `MAX_RUNTIME_REACHED` の SKIPPED がある → `STOPPED_BY_RUNTIME_LIMIT`
  * 4. 理由 `RUN_INTERRUPTED` の SKIPPED がある → `STOPPED_BY_SIGNAL`
  * 5. それ以外 → `COMPLETED`
@@ -720,12 +774,18 @@ const isNewerRun = (left: RunResumeCandidate, right: RunResumeCandidate): boolea
  *    候補にする（同じ時刻なら、Run の ID がコード単位の順で後のもの）。ほかの対象の Run は無視する。候補がなければ `START_NEW`。
  * 2. 候補の `decideRunResumption` が `NOT_RESUMABLE` なら `START_NEW`（古い途中の Run を、後で思いがけず再開しないため）。
  * 3. 候補の実効の設定が違えば（`effectiveConfigDifferences` の結果から、比べない項目 `RESUME_CONFIG_IGNORED_PATHS` を除いたものが空で
- *    ない）、`CONFIG_DIFFERS`（違う項目のパスを持つ。比べない項目は含めない）。
+ *    ない）、`CONFIG_DIFFERS`（違う項目のパスを持つ。比べない項目は含めない）。Run の種類（保存の `authentication` と、今回の
+ *    `currentAuthentication`。どちらも、ないものは公開監査の Run）が違っても `CONFIG_DIFFERS` にし、違う項目のパスの最後に
+ *    `RUN_KIND_DIFFERENCE_PATH` を加える（T25g-2。認証つきの Run と公開監査の Run は、互いに再開しない）。
  * 4. それ以外は `RESUME`（`decision` は `RESUME` か `FINALIZE_ONLY`）。
  * 版の確かめと、ページの保存まで読むことは、呼び出し側（CLI）が、この後に行う。入力は変えない。凍結した結果を返す（`candidate` は
  * 入力の値そのもの）。
  */
-export function selectRunToResume(runs: readonly RunResumeCandidate[], current: EffectiveAuditConfig): RunResumeSelection {
+export function selectRunToResume(
+  runs: readonly RunResumeCandidate[],
+  current: EffectiveAuditConfig,
+  currentAuthentication: RunCheckpointAuthentication | null = null,
+): RunResumeSelection {
   let latest: RunResumeCandidate | null = null;
   for (const run of runs) {
     if (run.checkpoint.effectiveConfig.target.id === current.target.id && (latest === null || isNewerRun(run, latest))) {
@@ -739,177 +799,51 @@ export function selectRunToResume(runs: readonly RunResumeCandidate[], current: 
   if (decision === 'NOT_RESUMABLE') {
     return START_NEW_SELECTION;
   }
-  const differences = Object.freeze(effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current)
-    .filter((path) => !RESUME_CONFIG_IGNORED_PATH_SET.has(path)));
+  const savedKind = latest.checkpoint.authentication?.settingsDigest ?? null;
+  const currentKind = currentAuthentication?.settingsDigest ?? null;
+  const differences = Object.freeze([
+    ...effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current).filter((path) => !RESUME_CONFIG_IGNORED_PATH_SET.has(path)),
+    ...(savedKind === currentKind ? [] : [RUN_KIND_DIFFERENCE_PATH]),
+  ]);
   return differences.length > 0
     ? Object.freeze({ kind: 'CONFIG_DIFFERS', candidate: latest, differences })
     : Object.freeze({ kind: 'RESUME', candidate: latest, decision });
 }
 
-/**
- * ロックを「動いている Run のもの」とみなす、OS の起動の時刻の誤差の上限（ms。設計書 4.4 の 120秒）。端末を再起動した後は、
- * 起動の時刻がこれより大きく違うので、プロセスの ID が別のプロセスに使い回されていても、古いロックと分かる。
- */
-export const RUN_LOCK_BOOT_TIME_TOLERANCE_MS = 120_000;
-/** ロックを「動いている Run のもの」とみなす、最後の更新からの時間の上限（ms。設計書 4.4 の5分）。 */
-export const RUN_LOCK_STALE_AFTER_MS = 300_000;
-/**
- * Run の間に、ロックの最後の更新の時刻を書き換える間隔（ms。設計書 4.4 の1分）。タイマーは、保存のセッション
- * （`run-checkpoint-session.ts` の `RunCheckpointSession`）が持つ（設計書 4.3.1）。
- */
-export const RUN_LOCK_HEARTBEAT_INTERVAL_MS = 60_000;
-
-/** `os.uptime()`（秒）を ms にする倍数。 */
-const MILLISECONDS_PER_SECOND = 1_000;
-
-/** ロック（`checkpoint/run.lock`）の中身（設計書 4.4）。時刻は、エポックからの ms（0 以上の安全な整数）。 */
-export interface RunLock {
-  /** ロックを取ったプロセスの ID。 */
-  readonly processId: number;
-  /** ロックを取ったときの、OS の起動の時刻（`Date.now() - os.uptime() * 1000`）。 */
-  readonly bootedAtMs: number;
-  /** ロックを取った時刻。 */
-  readonly acquiredAtMs: number;
-  /** 最後に更新した時刻（ハートビート）。 */
-  readonly heartbeatAtMs: number;
-}
-
-/** 今のプロセスの値（ロックを作るときと、ロックを判定するときに使う）。 */
-export interface RunLockHost {
-  readonly processId: number;
-  /** 今の時刻（エポックからの ms）。 */
-  readonly nowMs: number;
-  /** 今の OS の起動の時刻（エポックからの ms）。 */
-  readonly bootedAtMs: number;
-}
-
-const RUN_LOCK_KEYS: readonly (keyof RunLock)[] = Object.freeze(['processId', 'bootedAtMs', 'acquiredAtMs', 'heartbeatAtMs']);
-
-/** ロックの中身の形か（ちょうど4つの項目。プロセスの ID は正、時刻は 0 以上の安全な整数）。 */
-const isRunLock = (value: unknown): value is RunLock => {
-  if (!isRecord(value)) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  return keys.length === RUN_LOCK_KEYS.length
-    && RUN_LOCK_KEYS.every((key) => Object.hasOwn(value, key))
-    && isPositiveSafeInteger(value.processId)
-    && isNonNegativeSafeInteger(value.bootedAtMs)
-    && isNonNegativeSafeInteger(value.acquiredAtMs)
-    && isNonNegativeSafeInteger(value.heartbeatAtMs);
-};
-
-const requireTimeMs = (name: string, value: number): void => {
-  if (!isNonNegativeSafeInteger(value)) {
-    throw new RangeError(`run lock ${name} must be a non-negative safe integer of milliseconds`);
-  }
-};
+// ロックの中身と判定、古いロックの原子的な取り直しの手順は、`src/core/process-lock.ts` に移した（T24h-3。画面のサーバのロックと共用するため）。
+// 利用者を変えないよう、今の名前で export し直す。
+export {
+  LOCK_TAKEOVER_MAX_ATTEMPTS,
+  LOCK_TAKEOVER_OUTCOMES,
+  LOCK_TAKEOVER_RESULT_KINDS,
+  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
+  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
+  RUN_LOCK_STALE_AFTER_MS,
+  RUN_LOCK_STATES,
+  acquireLockTakingOverStale,
+  createRunLock,
+  currentProcessRunLockHost,
+  isOwnRunLock,
+  isProcessRunning,
+  judgeRunLock,
+  renewRunLock,
+  takeOverStaleLock,
+  type LockFilePort,
+  type LockTakeoverOutcome,
+  type LockTakeoverResult,
+  type LockTakeoverResultKind,
+  type RunLock,
+  type RunLockHost,
+  type RunLockJudgementInput,
+  type RunLockState,
+  type RunLockTakeover,
+} from '../core/process-lock.js';
 
 /**
- * 今のプロセスの値を読む（設計書 4.4）。`nowMs` は `Date.now()` と同じ基準の今の時刻。OS の起動の時刻は
- * `nowMs - os.uptime() * 1000` を ms に丸めたもの（誤差は `RUN_LOCK_BOOT_TIME_TOLERANCE_MS` の中で許す）。
+ * `RunCheckpointStore.acquireRunLock` の結果（設計書 4.4）。形と意味は `src/core/process-lock.ts` の `LockFileAcquisition`（T24h-3 で移した）。
+ * `ArtifactWriter` の `RunLockAcquisition` と同じ形である。
  */
-export function currentProcessRunLockHost(nowMs: number): RunLockHost {
-  requireTimeMs('current time', nowMs);
-  return Object.freeze({
-    processId: process.pid,
-    nowMs,
-    bootedAtMs: Math.max(0, Math.round(nowMs - uptime() * MILLISECONDS_PER_SECOND)),
-  });
-}
-
-/**
- * 今のプロセスの値から、ロックの中身を作る（設計書 4.4）。ロックを取った時刻と最後に更新した時刻は、どちらも `host.nowMs`。
- * 凍結した、JSON にできる値を返す。プロセスの ID が正の安全な整数でない、時刻が 0 以上の安全な整数でないなら `RangeError`。
- */
-export function createRunLock(host: RunLockHost): RunLock {
-  if (!isPositiveSafeInteger(host.processId)) {
-    throw new RangeError('run lock process ID must be a positive safe integer');
-  }
-  requireTimeMs('boot time', host.bootedAtMs);
-  requireTimeMs('current time', host.nowMs);
-  return Object.freeze({
-    processId: host.processId,
-    bootedAtMs: host.bootedAtMs,
-    acquiredAtMs: host.nowMs,
-    heartbeatAtMs: host.nowMs,
-  });
-}
-
-/** ロックの最後に更新した時刻（ハートビート）だけを `nowMs` にした、新しいロックの中身を返す（設計書 4.4）。 */
-export function renewRunLock(lock: RunLock, nowMs: number): RunLock {
-  requireTimeMs('current time', nowMs);
-  return Object.freeze({ ...lock, heartbeatAtMs: nowMs });
-}
-
-/**
- * ロックの判定の結果の閉じた一覧（設計書 4.4）。
- * - `ACTIVE`: 動いている Run のもの（再開も、新しい Run もしない）。
- * - `STALE`: 動いている Run のものではない（前の回が途中で終わった印とみなし、ロックを作り直す）。
- */
-export const RUN_LOCK_STATES = Object.freeze(['ACTIVE', 'STALE'] as const);
-export type RunLockState = (typeof RUN_LOCK_STATES)[number];
-
-/** ロックの判定の入力（今の時刻、今の OS の起動の時刻、プロセスが動いているかを調べる関数）。 */
-export interface RunLockJudgementInput extends Pick<RunLockHost, 'nowMs' | 'bootedAtMs'> {
-  /** プロセスが動いているか。本番では `isProcessRunning`。 */
-  readonly isProcessRunning: (processId: number) => boolean;
-}
-
-/**
- * ロックの中身（ファイルから読んだ値）を判定する（設計書 4.4）。次のすべてを満たすときだけ `ACTIVE`、それ以外は `STALE` とする。
- * 1. ロックの中身の形が正しい（不正なロックは、動いている Run のものではないので、作り直す）。
- * 2. OS の起動の時刻の差が `RUN_LOCK_BOOT_TIME_TOLERANCE_MS` 以内である。
- * 3. ロックのプロセスが動いている（`current.isProcessRunning`）。
- * 4. 最後に更新した時刻から、`RUN_LOCK_STALE_AFTER_MS` 以内である。
- * この順に確かめ、満たさない条件があれば、後の条件は確かめない。今の時刻と起動の時刻が 0 以上の安全な整数でないなら `RangeError`、
- * `isProcessRunning` が関数でないなら `TypeError` を投げる。
- */
-export function judgeRunLock(lock: unknown, current: RunLockJudgementInput): RunLockState {
-  requireTimeMs('current time', current.nowMs);
-  requireTimeMs('current boot time', current.bootedAtMs);
-  if (typeof current.isProcessRunning !== 'function') {
-    throw new TypeError('run lock judgement requires a function that tells whether a process is running');
-  }
-  if (!isRunLock(lock)) {
-    return 'STALE';
-  }
-  if (Math.abs(lock.bootedAtMs - current.bootedAtMs) > RUN_LOCK_BOOT_TIME_TOLERANCE_MS) {
-    return 'STALE';
-  }
-  if (!current.isProcessRunning(lock.processId)) {
-    return 'STALE';
-  }
-  return current.nowMs - lock.heartbeatAtMs > RUN_LOCK_STALE_AFTER_MS ? 'STALE' : 'ACTIVE';
-}
-
-/**
- * プロセスが動いているかを調べる（設計書 4.4 の `process.kill(pid, 0)`）。シグナル 0 は、送らずに、プロセスがあるかだけを確かめる。
- * 権限がなくて送れない（`EPERM`）場合は、プロセスはあるので、動いているとみなす。正の安全な整数でない ID（0 と負の値は、
- * プロセスのグループを表す）は、シグナルを送らずに、動いていないとみなす。
- */
-export function isProcessRunning(processId: number): boolean {
-  if (!isPositiveSafeInteger(processId)) {
-    return false;
-  }
-  try {
-    process.kill(processId, 0);
-    return true;
-  } catch (error) {
-    return isRecord(error) && error.code === 'EPERM';
-  }
-}
-
-/**
- * `RunCheckpointStore.acquireRunLock` の結果（設計書 4.4）。
- * - `acquired` が真: この呼び出しで、ロックのファイルを新しく作った。
- * - `acquired` が偽: ロックのファイルがすでにあった。`existing` は、その中身を JSON として読んだ値（読めなければ `null`。判定は
- *   `judgeRunLock`）。
- * `ArtifactWriter` の `RunLockAcquisition` と同じ形である。orchestration は report を import しないので、ここにも置く（R4a の指示書）。
- */
-export type RunCheckpointLockAcquisition =
-  | { readonly acquired: true }
-  | { readonly acquired: false; readonly existing: unknown };
+export type RunCheckpointLockAcquisition = LockFileAcquisition;
 
 /**
  * 保存とロックのファイルの書き手（設計書 4.3.1）。`ArtifactWriter` が形の上で満たす（満たすことは、テストの型の確かめで確かめる）。
@@ -923,9 +857,13 @@ export type RunCheckpointLockAcquisition =
  * - `releaseRunLock`: `checkpoint/run.lock` を消す（なければ何もしない）。
  * - `cleanUpForResume`: 再開する前に、Run のディレクトリの中の、前の回の途中のもの（終わったページの一覧にないページのディレクトリ、
  *   書き出しの途中の一時ファイルなど）を消し、消したものの、Run のディレクトリからの相対パスを返す（設計書 4.5）。
+ * - `takeOverRunLock`（任意）: 判定した古い `checkpoint/run.lock` を、原子的に取り直す（DEF-060。`RunLockTakeover`）。あれば、保存の
+ *   セッションは、古いロックの取り直しにこれを使う（`takeOverStaleLock`）。ない書き手（テストの偽の書き手）では、前の方式（書き換えて
+ *   読み直す）で取り直す。本番の `ArtifactWriter` は持つ。
  * 書けなかった場合は、どれも reject する。
  */
 export interface RunCheckpointStore {
+  takeOverRunLock?(runDirectory: string, judged: unknown, lock: RunLock): Promise<RunLockTakeover>;
   writeCheckpointPage(runDirectory: string, page: RunCheckpointPage): Promise<string>;
   writeCheckpointState(runDirectory: string, state: RunCheckpoint): Promise<void>;
   acquireRunLock(runDirectory: string, lock: RunLock): Promise<RunCheckpointLockAcquisition>;

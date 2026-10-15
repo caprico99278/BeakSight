@@ -14,8 +14,9 @@ export const SITE_PER_PROCESS_ARGS = Object.freeze(['--site-per-process'] as con
  * ブラウザ（Chromium）自身が、ページのアイコンを取りに行くときの既定のパス（ページにアイコンの指定がない場合）。
  * Guard の付いた Context では、ふつうは Playwright が止めるが、まれにサーバに届く（DEF-024。サイトへの負荷の制御の設計書 4.9）。
  * サーバに届いた要求を確かめるテストは、このパスへの GET だけを、ブラウザ自身の要求として、期待する要求の一覧の確かめから除く。
+ * 値は製品の `src/safety/request-policy.ts` の定数そのもの（CC-067。テストの側に同じ値を書かない）。
  */
-export const BROWSER_DEFAULT_FAVICON_PATH = '/favicon.ico';
+export { BROWSER_DEFAULT_FAVICON_PATH } from '../../src/safety/request-policy.js';
 
 /**
  * テストの Chromium の Shared Worker の扱い（DEF-044。設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 1.2）。
@@ -45,13 +46,31 @@ function withSharedWorkerArgs(args: readonly string[], sharedWorkers: TestShared
  * （headed では、端末の外部のアプリ（電話、メールなど）が実際に起動するおそれがあるため）。Shared Worker は、既定で無効にする（DEF-044）。
  */
 export function launchHeadlessChromium(options: HeadlessChromiumOptions = {}): Promise<Browser> {
+  if (process.env[TEST_DEFAULT_CHROMIUM_ENVIRONMENT_VARIABLE] === CLI_CHROMIUM_SELECTION) {
+    const launchOptions = chromiumLaunchOptions({ headless: true });
+    return chromium.launch({
+      ...launchOptions,
+      args: withSharedWorkerArgs([...(launchOptions.args ?? []), ...(options.args ?? [])], options.sharedWorkers),
+    });
+  }
   return chromium.launch({ headless: true, args: withSharedWorkerArgs(options.args ?? [], options.sharedWorkers) });
 }
+
+/**
+ * DEF-085 fix round 1: テストの既定の Chromium（`launchHeadlessChromium`）を、CLI の起動の設定に切り替える環境変数（値が
+ * `CLI_CHROMIUM_SELECTION` のときだけ）。両方の Chromium で確かめる指示のある既存のテストを、テストを書き換えずに CLI の Chromium でも
+ * 実行するための口で、ふだん（省略）は今のまま headless shell を使う。どちらも headless で起動する。
+ */
+export const TEST_DEFAULT_CHROMIUM_ENVIRONMENT_VARIABLE = 'BEAKSIGHT_TEST_DEFAULT_CHROMIUM';
+/** `TEST_DEFAULT_CHROMIUM_ENVIRONMENT_VARIABLE` の、CLI の Chromium を選ぶ値。 */
+export const CLI_CHROMIUM_SELECTION = 'cli';
 
 /** `launchCliChromium` の指定。 */
 export interface CliChromiumOptions {
   /** Shared Worker の扱い（既定は `disabled`。CLI と同じ）。 */
   readonly sharedWorkers?: TestSharedWorkers;
+  /** 足す起動の引数（DEF-099 fix: https の fixture の証明書の誤りを無視する引数など。テストの中だけ）。 */
+  readonly args?: readonly string[];
 }
 
 /**
@@ -60,7 +79,10 @@ export interface CliChromiumOptions {
  */
 export function launchCliChromium(options: CliChromiumOptions = {}): Promise<Browser> {
   const launchOptions = chromiumLaunchOptions({ headless: true });
-  return chromium.launch({ ...launchOptions, args: withSharedWorkerArgs(launchOptions.args ?? [], options.sharedWorkers) });
+  return chromium.launch({
+    ...launchOptions,
+    args: withSharedWorkerArgs([...(launchOptions.args ?? []), ...(options.args ?? [])], options.sharedWorkers),
+  });
 }
 
 /**
