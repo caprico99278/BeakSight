@@ -66,7 +66,7 @@
 
 ### 3.1 方針
 
-1. **ページの読み込みの間隔を空ける。** BeakSight が始めるページの読み込み（トップレベルのナビゲーション）は、Run 全体で、前の読み込みの開始から設定の最小間隔（`crawl.minNavigationIntervalMs`）以上空けてから始める。Passive、幅の走査、Interaction、robots.txt と sitemap.xml、再試行の、すべての読み込みに適用する。
+1. **ページの読み込みの間隔を空ける。** BeakSight が始めるページの読み込み（トップレベルのナビゲーション）は、Run 全体で、前の読み込みの開始・その main frame の文書の要求を送った時刻・その応答を受けた時刻のうち最も遅い時刻から（DEF-100。サイトに届く間隔が設定以上になる）設定の最小間隔（`crawl.minNavigationIntervalMs`）以上空けてから始める。Passive、幅の走査、Interaction、robots.txt と sitemap.xml、再試行の、すべての読み込みに適用する。
 2. **読み込み直しでは、取ったことのあるものを取り直さない。** 主の読み込み（Passive の Desktop と Mobile）で取った画像、スタイルシート、スクリプト、フォントを、Run 全体のキャッシュに入れる。読み込み直しの Context（幅の走査と Interaction）では、キャッシュにあるものはキャッシュから返し、ネットワークに送らない。
 3. **読み込み直しの Context からは、外部のサービスに要求を送らない。** 幅の走査と Interaction の Context では、許可 Origin の外への要求（文書の読み込みを除く）は、キャッシュになければ送らない。
 4. **1つのページの読み込み直しの回数に上限を置く。** Interaction で監査する候補の数に、1ページあたりの上限（`crawl.maxInteractionsPerPage`）を置く。上限を超えた候補は監査せず、理由付きで PARTIAL にする。
@@ -116,7 +116,7 @@
 ```ts
 export interface NavigationPacer {
   /**
-   * 前の読み込みの開始から `minIntervalMs` 以上たつまで待ち、今回の読み込みの開始を記録する。
+   * 前の読み込みの開始・その main frame の文書の要求を送った時刻・その応答を受けた時刻のうち最も遅い時刻から（DEF-100。サイトに届く間隔が設定以上になる） `minIntervalMs` 以上たつまで待ち、今回の読み込みの開始を記録する。
    * 待った時間（ミリ秒。0 以上の整数）を返す。呼び出し側は、待った時間を期限から除く（4.4）。
    */
   beforeNavigation(): Promise<number>;
@@ -460,3 +460,4 @@ export function createNavigationPacer(options: {
 | 2026-10-06 | DEF-031（Task 21 の3回目の Run で、Passive が同じ画像・動画を取り直し、外部のストレージから約 1.1 GB 取った）とユーザーの判断「Run の中で使い回す」 | 4.10 を加えた（Passive も Run 全体のキャッシュを使う。`media` を入れる。1件の上限 16 MiB。Guard は変えない） | `resource-delivery.ts`、`context-factory.ts`、README、Task 21 |
 | 2026-10-06 | PC1 の実装者の発見（4.10 と食い違う古い記述） | 3.1 の5、3.3 の表、4.6、4.7 の表、7章に、4.10 の改訂の注を加えた | なし（記述） |
 | 2026-10-06 | 独立レビュー PCR-DR（Important 1、Minor 4） | 4.10.3 に「読み込みが成功して終わった応答だけを入れる」と「`media` の `bytes=0-` に 200 で全体を返した応答も入れる」を加えた。4.10.5 に、キャッシュから返した応答の Evidence の見え方を加えた | `context-factory.ts`、`resource-delivery.ts`、README |
+| 2026-10-13 | DEF-100（サイトに届く間隔が設定より短い。CLI の監査で最短 2,338ms／3,000ms。待った後の Context の作成などの揺れの分）とユーザーの判断「届く間隔も設定以上にする」 | 間隔の起点を、前の読み込みの開始・main frame の文書の要求を送った時刻・その応答を受けた時刻のうち最も遅い時刻にした（Guard の `onMainFrameDocumentSent` が pacer の `recordDocumentRequestSent` に記録。書き込みの承認の POST は送り手が書き始めた時刻と応答の時刻）。直した後の最短は CLI で 3,025ms、結合で 3,015ms。監査の時間は約 2% 長い。ログインの段は pacer を通らない（DEF-102） | 4.1、`navigation-pacer.ts`、`passive-request-guard.ts`、`context-factory.ts`、`doc/spec/site-load.md` |

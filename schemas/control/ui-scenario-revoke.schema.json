@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-revoke:1",
+  "description": "Local UI Server Function input: revoke the last approval of one write scenario after the confirmation dialog (Task 28 design 3, 4.6). expectedRevision is the revision the screen read.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "type": "integer", "minimum": 1 }
+  }
+}

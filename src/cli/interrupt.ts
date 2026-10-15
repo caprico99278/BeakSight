@@ -1,6 +1,6 @@
 /**
  * CLI のシグナルの受け方（中断した Run の再開の設計書 4.7 の「シグナル」、4.7.1。R5b）。
- * Playwright の既定のシグナルの処理は、Chromium の起動で止めてある（`run-command.ts` の `PRODUCTION_RUN_DEPENDENCIES`）。BeakSight が、
+ * Playwright の既定のシグナルの処理は、Chromium の起動で止めてある（`src/cli/audit-run.ts` の `PRODUCTION_RUN_DEPENDENCIES`）。BeakSight が、
  * 閉じた一覧（`INTERRUPT_SIGNALS`）のシグナルを受ける。どのシグナルも、同じ数え方にする（1回目が SIGINT、2回目が SIGTERM でも、2回目）。
  * - 1回目: 文言を標準エラーに書き、止める印（`AbortController`）を付ける。Run Coordinator は、今のページを（再試行を含めて）最後まで行い、
  *   新しいページを始めずに、最後の処理を行う（設計書 4.6.1）。終了コードは、その Run の Run Status のとおり。

@@ -473,6 +473,7 @@
 - 原因（設計者の推測）: pacer が保証するのは、読み込みの開始（`beforeNavigation` の戻り）の間隔。サーバに届く時刻は、その後の Context の作成（Interaction で中央 113 ms）や、D3 で加わった観察の開始（ふだん 2 ms、混雑時は数十 ms）の分だけずれ、連続する読み込みでずれの差が 50 ms を超えると失敗する。production の間隔の保証は変わらない。
 - 方針の案: 観察の開始を pacer の待ちの前に移す（待ちの中に吸収される）、または、許容を Context の作成の揺らぎに合わせて見直す。
 - 状態: 記録だけ（全体の検証はやり直して PASS を確かめる）。
+- 結果（2026-10-10）: DEF-034-fix で直した。テストの問題（混雑の下で pacer の側の開始の間隔は 207 回すべて設定以上）。pacer の側の間隔を許容なしで主に確かめ、サーバの側は測った遅れの最大（183 ms）に余裕を足した 250 ms の許容にした。最も重い混雑で直す前 3/75 失敗 → 直した後 60/60 PASS。状態: 完了。
 
 ## DEF-035 `page-auditor.test.ts` の DEF-008 の場面（Interaction の session を開く期限の後に `ContextConstructionError` が届く）が、全テストの同時の実行で、まれに失敗する（2026-10-08 R9 の後の全体の検証で登録）
 
@@ -624,3 +625,487 @@
 - Minor-1: `catalog.ts` の `blockedInteractionRequests` の説明は、中継の記録に Chromium 自身の通信が含まれることは書いたが、`INTERACTION_FROZEN`（Guard の記録）にも Chromium 自身の `GET /favicon.ico` が含まれうることと、「Guard を通らずに出た要求の証拠」の書き方の整合は、設計書 7 に「書かない」と記録（Chromium 自身の通信の正体は DEF-047 で調べてから直す）。
 - Minor-2: DEF-050 の「除いた回」と DEF-049 の自己検査の届いた要求の数は `console.info` で、`--reporter=verbose` のときだけ出る。DEF-051 の監視は verbose で実行する（台帳の DEF-051 に追記）。
 - Minor-3: GATE-S08 の回帰は top・同じ Origin の iframe・about:blank × 2 経路。ポップアップと OOPIF の経路は実験のみ（将来の候補）。
+
+## DEF-052 iframe の移動を繰り返すページで、Interaction の凍結の直後に閉じると、`CDP_CONTINUE_REQUEST_FAILED`（`Fetch.continueRequest` の `Invalid InterceptionId`）が違反になることがある（2026-10-09 DEF-035-fix の調査の途中で発見。誤検出。Guard）
+
+- 現象: `tests/integration/passive-request-guard.test.ts` の DEF-050 の「Interaction（the owner close right after the freeze）」の場面（headless shell）で、混雑の下（unit と integration の全体を並行で流した状態）、20 回中 1 回（19 回目）に、違反 `CDP_CONTINUE_REQUEST_FAILED: cdpSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId.` が 3 件記録され、閉じる処理が「invalidated」で失敗した。サーバに届いた POST は 0（安全の弱まりではない）。ログ: scratchpad の `def035/load2.log`。
+- 文言は `INVALID_INTERCEPTION_ID_FAILURE_TEXTS` の一覧と完全に一致する。推測: 文書（iframe）の要求の `continueRequest` の失敗は、DEF-026 の取り消しの証拠（`Network.loadingFailed` の canceled など）がそろったときだけ違反にしない決まりで、混雑で証拠が遅れると違反になる。または、凍結の直後の段階の判定の経路が `isInvalidInterceptionIdFailure` を見ていない。未調査。
+- 影響: iframe の移動を高頻度で繰り返すページで、Run が誤って `ABORTED_BY_SAFETY` になりうる（DEF-051 と同じ種類の偽の違反）。
+- 扱い: 調査と直しを依頼する（DEF-052-fix）。G22 の全体の検証の前に。
+- 結果（2026-10-09）: 約 6,000 ラウンドで再現せず、原因は未確定。元のログから、1 件目は閉じる処理の前に記録されたと分かった。対策と診断を入れた（設計書 `2026-10-09-beaksight-def-052-guard-evidence-wait-design.md`）: 待ちの終わりに Node が受信済みの事象を読んでから決める。違反の文に、証拠がなかった理由を付ける。決まり（500 ms、256 件と 5 秒、証拠を要する）は変えない。状態: 対策済み・監視（次に出たら、診断で原因を切り分けて改めて設計する）。
+
+## DEF-053 `navigation-diagnostics.test.ts` の「records a 302 redirect and its 200 target as two hops」が、混雑の下で時刻が `null` になって失敗することがある（2026-10-09 DEF-035-fix の調査の途中で発見。揺らぎ）
+
+- 現象: 205 行で時刻が `null`。混雑の下の全体の並行の実行で 1 回。単独では未確認。推測: 診断の観察（`Network.*ExtraInfo` の事象）の到着が混雑で遅れる。診断の記録の取りこぼしで、安全とは関係しない。
+- 扱い: 登録だけ。
+
+## DEF-054 既存の依存に、既知の脆弱性が 4 件ある（2026-10-09 T23b の install の出力で発見。依存の追加の前からあった）
+
+- `npm audit` の結果（設計者が実行。変更なし）: high 2 件、moderate 2 件。どれも T23 の依存の追加の前の lockfile にあった版（scratchpad の `t23b/package-lock.before.json` で確かめた）。
+  - `fast-uri` 3.1.6（`ajv` 8.20.0 の依存）: GHSA-qw65-cvwx-89v3、GHSA-58mr-gqgx-xq4g、GHSA-hrr3-gc8f-f4qj（URI の authority と host の解釈）。直った版 3.1.8。lockfile の更新だけで直る（ajv の範囲の中）。
+  - `source-map-js` 1.2.1（`vite` → `postcss` の依存）: GHSA-68fv-2mgg-jv7q（細工した source map で処理が止まる）。直った版 1.2.2。lockfile の更新だけで直る。
+  - `vitest` 4.1.10 と `@vitest/mocker` 4.1.10: GHSA-82fw-gwwq-j7x9（mock の転送でのパスの外への読み出し）。直った版 4.1.11（直接の依存の更新）。
+- 影響（推測）: BeakSight の監査の入力（ページの URL）を `fast-uri` で解釈しているかは未確認（URL の正規化の owner は WHATWG の `URL`）。`source-map-js` と `vitest` は開発の道具。
+- 扱い: 依存の更新なので、ユーザーの承認を求める。
+- 結果（2026-10-09）: ユーザーの承認（「3つとも上げてよい」）で、vitest 4.1.11、fast-uri 3.1.8、source-map-js 1.2.2 に更新。`npm audit` 0 件。vitest の更新で承認の外の chai 6.3.0、tinyrainbow 3.2.0 も上がり、ユーザーの判断で残した。状態: 完了。
+
+## DEF-055 全体の検証の途中で、Vitest の子のプロセス（forks の worker）が予期せず終わり、1 ファイルが走りきらない（2026-10-09 T23 の `npm run verify:all` で発見。揺らぎか未確定）
+
+- 現象: `npm run verify:all` の `vitest run` で、`Error: [vitest-pool]: Worker forks emitted error. Caused by: Error: Worker exited unexpectedly`。148 ファイル中 147 ファイル PASS、6,170 件中 6,112 件 PASS（58 件が走らず）、終了コード 1。失敗したテスト（assertion）はない。ログ: scratchpad の `verify-all-20261009-t23.log`。
+- 走りきらなかったファイル（推測。件数から）: 58 件のテストを持つファイルは `tests/component/context-factory.test.ts` だけ（流し直しの JSON で確かめた。Task 23 で変えていない既存のファイル。Guard の付いた Context を作る部分）。
+- 流し直し（同じ作業ツリー、ほかに何も動いていない）: 148 ファイル・6,170 件すべて PASS（428 秒）。
+- 過去の観測: DEF-052 の調査（強い混雑の下）でも `Worker exited unexpectedly` を 3 回観測している（progress.md の DEF-052-fix の行）。
+- 影響: 検証の結果が揺れる。worker が落ちた原因（Node の異常終了、メモリ、Chromium の子の扱い）は未確認。安全の部品のテストのファイルなので、原因を調べる。
+- 扱い: 調査を依頼する（DEF-055-investigation）。
+- 調査の結果（2026-10-09）: 原因は、Vitest の worker（node.exe）のネイティブの異常終了（Node 24.15.0、V8 13.6）。混雑の下で `context-factory.test.ts` を繰り返して 460 回中 4 回（`--single-threaded-gc` を含めると 5 回）、混雑なしで 0/30。終了コードは 0xC0000409（fast fail）3 回、0xC0000005（アクセス違反）1 回、0x80000003 と V8 の致命的エラー（`Check failed: !IsFreeSpaceOrFillerMap(map)`。GC の背景のスレッド）1 回。exit・kill・未処理の例外・IPC の誤り・メモリの不足はなし。worker はネイティブのアドオンを読み込まない。Vitest 4.1.10 のときにも 9 回起きていた（過去のログ）。落ちる場所は毎回違い、`isolated-interaction`、`passive-request-guard` でも起きている。T23 の 1 回の落ちたファイルは確定できない（Vitest は結果を約 100 ms ごとに送るので、58 件の欠けからは絞れない）。テストと製品のコードが原因の事実はない。
+- 状態: 道具（Node/V8）の側の問題として監視。直し方の候補: (1) Node 24 の新しい patch の版で同じ再現を比べる（開発環境の変更なのでユーザーの承認を待つ。後回しの項目）、(2) 全体の検証で走りきらなかったファイルを表示する reporter（開発の道具の改善。後で検討）。全体の検証で worker の異常終了が起きたら、毎回この番号で記録し、流し直しの結果と合わせて扱う。
+
+## DEF-056 `isPortableRelativeArtifactPath` が、Windows で別の意味になる名前を通す（2026-10-09 T24 調査で発見。既存）
+
+- 現象（調査担当の実験）: `pages/p/x:stream`（NTFS の代替データストリーム）、`run.json.`、`run.json `（末尾の点と空白）、`CON`、`pages/NUL`（デバイス名）が真になる。`..`、絶対パス、`\` は偽（外へは出ない）。
+- 影響: 今は BeakSight が書く名前の確かめに使われ、BeakSight が書く名前はこれらに当たらない（推測。T24b で確かめる）。Task 24 で、画面から成果物を取り出すときのパスの確かめに使うと、別名やデバイスを開く恐れがある。
+- 扱い: Task 24 の T24b で直す（設計書 `2026-10-09-beaksight-task-24-ui-public-audit-design.md` 4.7）。
+- 結果（2026-10-09）: T24b で直した（`:`、末尾の点と空白、デバイス名（`CONIN$`・`CONOUT$`・上付きの数字を含む）、制御文字を拒む）。BeakSight が書く名前はすべて通る。レポートで `:` を含むパスはリンクにせず文字で出す。状態: 完了。
+
+## DEF-057 `findActiveRun` の確かめから Run のディレクトリとロックの作成までの間に、2 つ目の Run が確かめを通れる（2026-10-09 T24 調査で発見。既存）
+
+- 現象（調査担当がコードで確かめた事実）: 同じ秒なら 2 つ目は `RunDirectoryUnavailableError`（FAILED、終了コード 1）、秒が違えば 2 つの Run が並んで動く。再開どうしは `wx` とロックの判定で止まる。
+- 影響: 同じ出力先で 2 つの監査が並ぶと、pacer が別々になり、監査対象への負荷が 2 倍になる（負荷の決まりに反する）。CLI を 2 つ同時に起動した場合と、Task 24 で CLI と画面のジョブが同時に始まった場合に起きうる。
+- 扱い: Task 24 の T24c で直す（設計書 4.6）。
+- 結果（2026-10-09）: T24c で直した（出力先ごとの開始のロック）。両方の Chromium で RED（Run が 2 つ）→ GREEN（1 つ）。残る稀な競争（古い開始のロックを 2 つの起動が同時に取り直す場合、作った空の出力先を消す瞬間）は、既存の Run のロックの取り直しと同じ程度として受け入れる。状態: 完了。
+
+
+## DEF-058 `context-factory.test.ts` の「passes requestfinished of the Passive and Interaction Contexts…」が、強い混雑の下で要求の終わりの順を決め打ちして失敗する（2026-10-09 DEF-055 の調査で発見。テストの揺らぎ）
+
+- 現象: 799 行の `expect.poll(...).toEqual([html, svg])` が順序を決め打ちしている。強い混雑の下で svg の requestfinished が html より先に届き、約 400 回中 2 回失敗した。
+- 扱い: 登録だけ。テストの直し（順を問わない比べ）は後で依頼する。
+- 結果（2026-10-09）: T24g で直した（Passive の文書と画像を順を問わずに比べる。同じテストの 2 か所）。強い混雑の下の繰り返しは未実行。状態: 完了（監視）。
+
+## DEF-059 テストの補助が、使い回された PID のために無関係なプロセスを子孫と数える（2026-10-09 G24 の全体の検証で発見。テストの不具合）
+
+- 現象: `npm run verify:all` の `test:ui` で、`apps/local-ui/tests/audit-job-functions.test.ts` の `afterAll`（138 行）が「残ったプロセス」として `OneDrive.Sync.Service.exe`（親の PID 16512）を挙げて失敗した。テスト 112 件はすべて PASS（ファイルの片付けの確かめだけが失敗）。ログ: scratchpad の `verify-all-20261009-t24.log`。
+- 原因（推測。コードと結果から）: `tests/helpers/process-tree.ts`（T24d）が、親の PID だけで子孫をたどるので、監査で起動したプロセスが終わった後に同じ PID を使い回した無関係なプロセスの子を、子孫と数える。
+- 影響: 検証が揺れる。製品の不具合ではない。
+- 扱い: 補助を直す（子孫の判定に、親のプロセスの起動の時刻が子より前であることと、プロセスの名前（node、Chromium）を加える）。
+- 結果（2026-10-09）: 直した（`AUDIT_PROCESS_NAMES`、起動の時刻が親以上のものだけ、時刻を読めないときは名前だけで数える（見逃さない側））。単体テスト 5 件、補助を使う 6 ファイル（結合 14 件、画面 32 件）が PASS。RED は未実行（前の形で流せなかった）。状態: 完了。
+
+## DEF-060 古いロックを取り直す方式（書き換えて読み直す）では、2 つの起動が同時に取り直すと両方が自分のものと読み、同じ Run を 2 つ同時に再開しうる（2026-10-09 T24R の I1。既存。Run のロックにも同じ方式）
+
+- 現象（レビュー担当の実機の確かめ。scratch の `t24r/e2`。2 つの CLI の process）: 中断した Run を 2 つの CLI でほぼ同時に再開すると、古い開始のロックがない場合は 3 回とも片方だけが再開した。死んだ PID の開始のロックを置くと、4 回中 1 回は両方が同じ Run を再開した（どちらも終了コード 0）。
+- 原因: 開始のロック（T24c）と Run のロック（保存のセッション）の、古いロックの取り直しが「自分のロックで書き換え → 読み直して自分のものか確かめる」方式で、2 つの process の手順が少しずれると両方が自分のものと読む。
+- 影響: 同じサイトに 2 つの監査が同時に要求を送る（負荷の決まりに反する）。古いロックは、開始の段の途中の強制終了などで残る。
+- 扱い: Task 24 の中で直す（T24h-2）。古いロックの取り直しを原子的にする（古いファイルを一意の名前へ rename してから `wx` で作り直す。rename に負けた側は判定し直す）。`cli.md` と `resume.md` の記述を実際の振る舞いに合わせる。
+- 結果（2026-10-09）: T24h-2 で直した（rename → 中身の確かめ → wx。2 つの CLI の process で 20 回ずつ、直す前 2/20 → 直した後 0/20）。状態: 完了。
+
+## DEF-061 画面のサーバを 2 つ動かすと、起動したサーバがほかのサーバのジョブも中断に書き換え、同時に 2 つの監査が動く（2026-10-09 T24R の C1。Critical）
+
+- 現象（レビュー担当の実機の確かめ。scratch の `t24r/e1`）: サーバ A がジョブを RUNNING にした後、サーバ B を起動すると、B は `recoverInterruptedJobs` で A のジョブを `INTERRUPTED`（`SERVER_RESTARTED`）に書き換え、B（または A）で新しいジョブを始められた。2 つのワーカーが同時に生きていた。2 つ目の `npm run ui` は port の使用中で止まるが、止まる前に 1 つ目のジョブを中断と記録する。`npm run ui` と `npm run ui:dev`、`--port` で、2 つのサーバが同じ `local-data` で動く。
+- 影響: 2 つのプロファイルが同じサイトを指していれば、そのサイトに 2 倍の負荷。出力先が別なので開始のロックでも止まらない。`local-ui.md` の「監査は画面全体で同時に 1 つだけ」と食い違う。
+- 扱い: Task 24 の中で直す（T24h-1）。画面のサーバを 1 つだけにするロック（`local-data` の中。持ち主の PID・OS の起動の時刻・ハートビート。`judgeRunLock` と同じ考え。取り直しは DEF-060 と同じ原子的な方式）を、管理データの準備の後、ジョブの中断への直しの**前**に取る。取れなければ日本語の説明で起動を止め、何も書き換えない。
+- 結果（2026-10-09）: T24h-4 で直した（管理データの表 `control_instance` の 1 行のロックを、ジョブの管理を作るときに原子的に取る）。レビュー担当の再現（`t24r/e1`）は直した後に再現しない。残る隙間: 持ち主のサーバが 5 分より長く止まった場合（スリープなど）。状態: 完了。
+
+## DEF-062 3 つ以上の起動が同時に開始のロックを取ろうとすると、2 つが同時にロックを持ちうる（2026-10-10 T24R2 の Minor m2。監視）
+
+- 現象（レビュー担当の確かめ。scratch の `t24r/e3`。時刻で揃えた 3 つの process）: 古いロックありで 40 回中 2 回、古いロックなしでも 40 回中 1 回、2 つが同時にロックを持った。2 つの process では 40 回中 0 回。
+- 原因（コードから）: 他人のロックを動かしてしまった後の戻し（`#restoreMovedLock`）は、3 つ目が先にロックを作ると戻さずに消す。`wx` で作った直後の空のファイルは `null` と読まれ、古いと判定される。
+- 影響: 同じ出力先で 3 つ以上の監査をほぼ同時に始めた場合だけ。現実の利用ではまず起きない（推測）。
+- 扱い: 監視。直すなら、中身を書いた一時ファイルを `link` で置く（作成と中身を 1 回で入れる）方式にする。
+
+## DEF-063 `cli-site-unavailable.test.ts` の SU6（2 回目の確かめ直しの前にサイトが戻る）が、全体の検証の混雑の下で PARTIAL（終了コード 2）になって失敗する（2026-10-10 G24 の全体の検証で発見。揺らぎか未確定）
+
+- 現象: `npm run verify:all` の 3 回目で、「SU6: the site is back before the second recheck of the k+1-th page … finishes the Run in the one execution …」が `expected 2 to be +0`（878 行。中断なしの Run は 0、この Run は 2）で失敗。標準エラーの中身はログに出ていない。ログ: scratchpad の `verify-all-20261010-t24-3.log`。
+- 単独の実行: 3 回とも 40 件 PASS（各 約 153 秒）。
+- 推測: 確かめ直しの時刻（サイトを戻す時刻）とテストの待ちの順が、混雑で入れ替わり、2 回目の確かめ直しも失敗して Run が `STOPPED_BY_SITE_UNAVAILABLE` になった。Task 24 の変更（開始のロック、ロックの取り直し）との関係は未確認。
+- 扱い: 混雑の下で再現して原因を確かめる（DEF-063-investigation）。
+- 結果（2026-10-10）: 原因は、強い混雑で本番の期限（DOM の準備 5 秒、Browser を閉じる 10 秒）が切れて Run が PARTIAL になり、別々に走る比べる相手の Run と片方だけに起きると食い違うこと（製品は設計どおり。Task 24 の変更とは関係しない）。テストの中で、両方の Run に名前つきの長めの期限を入れた（判定の値は変えない）。強い混雑の下で 20/20 PASS。状態: 完了。
+
+## DEF-064 Guard の診断の経過時間が、待つ時間より 1 ms 短く出ることがあり、テストの下限の確かめが揺れる（2026-10-11 Task 26 の全体の検証で発見。テストの揺らぎ。安全への影響なし）
+
+- 現象: `npm run verify:all`（Node 24.21.0、強い混雑の下）で、`tests/integration/passive-request-guard.test.ts` の「DEF-052: without the evidence, the failure is still a violation, ...」が 1 回失敗した（`expected 499 to be greater than or equal to 500`。`diagnostic.elapsedMs` が `EVIDENCE_WAIT_MS`（500）より 1 ms 短い）。単独での再実行は 3 回とも PASS。
+- 原因（コードを読んだ結果）: Guard（`src/safety/passive-request-guard.ts` の `settlePausedDocumentCommand`）は、待つのを `setTimeout` で行い、経過時間を `Date.now()` の差で記録する。Node のタイマーはイベントループの時刻（ms の単位）で発火するため、`Date.now()` の差で測ると、待つ時間より 1 ms 短く見えることがある（推測。Node と libuv の時刻の丸めの違い）。
+- 影響: 安全の判定は変わらない（違反として記録し、Context を閉じる。テストのほかの確かめは通った）。診断の数値の下限の確かめだけが揺れる。
+- 扱い: DEF-064-fix で、テストの下限に、時刻の単位の違いを名前つきの許容（1 ms）として入れる（製品の振る舞いは変えない）。直した後に全体の検証を通しで 1 回 PASS させる。
+- DEF-064-fix（2026-10-11）: 直した。原因を実験で確かめた（Node 24.21.0 の `setTimeout(500)` を Guard と同じ形で 12,000 回測り、128 回が `Date.now()` の差で 499 ms、499 未満は 0 回、`performance.now()` の差の最小は 499.018 ms。タイマーは ms に切り捨てたループの時刻で決まり 1 ms 未満早く発火しうる）。テストの下限を `EVIDENCE_WAIT_MS - TIMER_CLOCK_GRANULARITY_MS`（1）にした（ほかの確かめは変えない。製品のコードは変えない）。単独 3 回、該当の確かめ 20 回 PASS。全体の検証の通しは、T26R の後にまとめて行う。
+
+## DEF-065 待つ時間の下限を許容なしで確かめるテストがほかにもある（2026-10-11 DEF-064-fix の報告で発見。揺らぎの可能性。推測）
+
+- 場所: `tests/component/layout-collector.test.ts` の 741 行あたり、`tests/integration/isolated-interaction.test.ts` の 7358 行と 8755 行あたり、`tests/integration/fixture-server.test.ts` の 254 行あたり。
+- 内容: DEF-064 と同じく、タイマーで待った時間を、許容なしの下限で確かめている。タイマーが 1 ms 未満早く発火するので、揺れうる（まだ失敗は観測していない）。
+- 扱い: DEF-065-fix で、各箇所が本当に同じ形かを確かめ、同じなら DEF-064 と同じ名前つきの許容を入れる（共通の定数はテストの補助に 1 つ置く）。
+- DEF-065-fix（2026-10-11）: 直した。4 か所のうち同じ形は `tests/component/layout-collector.test.ts` の 1 か所だけ（`awaitBeforeDeadline` の `setTimeout` を `Date.now()` の差の下限で確かめる）→ 1 ms の許容を入れた。ほかの 3 か所は、測る区間に本物の Chromium の読み込みや 100 ms の余裕が入るので同じ形でない（触らない）。許容の定数 `TIMER_CLOCK_GRANULARITY_MS` は `tests/helpers/timer-clock.ts` の 1 か所にし、DEF-064 の定数もそれを使う形にした。直した 2 ファイルを単独で各 2 回 PASS。`fixture-server.test.ts` の数値の直書き（`1_400`）は記録だけ。
+
+## DEF-066 画面のサーバの関数のファイルから普通の関数を公開すると、サーバの部品がブラウザのバンドルに入ってページが壊れうるのに、Gate が捕まえない（2026-10-11 T26g-2 round 1 の報告で発見。潜在の不具合）
+
+- 現象: `apps/local-ui/src/server/credential-functions.ts` の部品の組み立てを普通の関数のまま公開したところ、ブラウザの組み立てで管理データと資格情報のファイルの部品が残り、ページの読み込みで `TypeError: Cannot read properties of undefined (reading 'O_RDONLY')`。画面の検査で見つけ、`createServerOnlyFn` で包んで直した（今は起きていない）。
+- 影響: 画面の検査が通れば見つかるが、Gate（`local-ui-boundary`）は形を捕まえない。サーバの部品（資格情報のファイルの部品を含む）がブラウザのバンドルに入ること自体が望ましくない。
+- 扱い: Gate の候補。`apps/local-ui/src/server/` のファイルが公開する値が、Server Function か `createServerOnlyFn` で包んだものか型だけであることを確かめる規則を、`local-ui-boundary` に足す（fs と正規表現の近似。1 秒以内）。T26R2 の後の片付けにまとめる。
+
+## DEF-067 認証つきの Run の目印の検査のテストが、強い混雑の下で 30 秒の時間切れになる（2026-10-11 T26g の後の全体の検証で発見。テストの揺らぎ）
+
+- 現象: `npm run verify:all`（Node 24.21.0）で、`tests/integration/authenticated-run.test.ts` の「T25c: the authenticated Run (the CLI launch settings) > writes none of the secret markers to any file of the Run directory ...」が `Test timed out in 30000ms`。単独での実行では 13〜15 秒で PASS（2 回）。
+- 原因（推測）: 回転するサーバで認証つきの Run を最後まで行い、すべてのファイル（ZIP の中を含む）を調べるので、単独でも 15 秒かかる。全体の検証の混雑で 2 倍を超えた。製品の不具合ではない（目印の検査の結果の誤りではなく、時間切れ）。
+- 扱い: DEF-067-fix で、このテスト（と同じファイルの同じ重さのテスト）の時間の上限を、名前つきの値で広げる（DEF-063 と同じやり方）。
+
+## DEF-068 Safety Gate の GATE-S07 の間に、テストのサーバのソケットの `ECONNRESET` が処理されずに残る（2026-10-11 T26g の後の全体の検証で発見）
+
+- 現象: 同じ全体の検証で、Vitest が「Unhandled Errors: Error: read ECONNRESET（`TCP.onStreamRead`）」を 1 件報告した。発生した場所は `tests/integration/safety-gates.test.ts` の実行中で、最後のテストは「GATE-S07 Interaction: the WebSocket upgrade from inside a Worker never reaches the server, and is recorded as WORKER_CONNECT_POLICY (DEF-040)」。テストそのものは PASS。単独での実行では 2 回とも出なかった。
+- 原因（推測）: ブラウザが止められた接続を切ったときに、テストのサーバ（fixture）のソケットに `error` の受け手がない。安全の判定への影響はない（GATE-S07 は PASS。サーバに upgrade は届いていない）。ただし、処理されない誤りは全体の検証を失敗させ、ほかの誤りを隠しうる。
+- 扱い: DEF-068-fix で、どのサーバのどのソケットかを確かめ、テストのサーバのソケットに `error` の受け手を付ける（製品のコードは変えない）。GATE-S07 の確かめ（サーバに届かない）は弱めない。
+- DEF-067-fix（2026-10-11）: 直した。`authenticated-run.test.ts` の 10 秒を超える 4 つのテスト（回転するサーバ、robots.txt と sitemap.xml、秘密の目印。単独で最大 約 16 秒）に `FULL_RUN_TEST_TIMEOUT_MS = 120_000`（ほかのファイルの `RUN_TEST_TIMEOUT_MS` とそろえた）。確かめる内容と Run の期限は変えない。単独 2 回 PASS。
+- DEF-068-fix（2026-10-11）: 直した。原因は `fixtures/server.ts` の upgrade と CONNECT のソケット（Node が `error` の受け手を外して渡す。応答の後にクライアントが RST で切ると処理されない `ECONNRESET`）。何もしない `error` の受け手を付けた（数え方と応答と GATE-S07 の確かめは変えない）。`fixture-server.test.ts` に再現のテスト 2 件（直す前は毎回 Unhandled Errors 2 件、後は 0 件）。ブラウザを使う GATE-S07 の経路では、直す前の混雑の下でも再現しなかった。ほかの fixture は受け取ってすぐ `destroy()` するので同じ形でない。
+
+## DEF-069 form の中に `name="method"`（や `name="action"`）の入力の欄があると、DOM の Evidence の収集と Interaction の候補の発見が例外で落ちる（2026-10-11 T27 調査で発見。公開監査に影響。修正の前からある）
+
+- 現象: form の中に `<input name="method">` があると、`src/evidence/dom-collector.ts` の `collectDomEvidence` が `normalizeWhitespace(form.method)` で「value?.replace is not a function」、`src/interaction/discover-candidates.ts` の `discoverInteractionCandidates` が `form.method.slice` で落ちる（T27 調査の実験で確かめた）。`name="action"` でも `form.action` で同じく落ちると推測（未実験）。DOM clobbering（form の名前つきの子が、form のプロパティを隠す）による。
+- 影響: WordPress などに多い書き方で、公開監査の DOM の Evidence と Interaction の候補が取れない（Run の結果への影響の程度は未確認）。安全の判定（Guard）への影響はない（推測）。
+- 扱い: DEF-069-fix で、form のプロパティを標準の prototype の getter で読む（`src/browser/login-form-submitter.ts` と同じやり方。共通の部品にできるか確かめる）。再現のテスト（`name="method"`、`name="action"`、`name="target"`、`name="elements"` など）を RED にしてから直す。公開監査の golden に影響する場合は報告する。
+
+## DEF-070 CLI の起動の設定の Chromium が、自分で Google（`www.google.com`、`content-autofill.googleapis.com`）へ接続しようとする（2026-10-11 T27 調査で発見。調査中）
+
+- 現象: T27 調査の実験で、CLI の起動の設定の Chromium（`chromiumLaunchOptions({ headless: true })`）の Interaction の Context で、出口の中継が `CONNECT www.google.com:443` と `content-autofill.googleapis.com:443` を受けて拒否した（`EGRESS_UPSTREAM_DENIED`、`INTERACTION_FROZEN_EGRESS`）。headless shell では出なかった。
+- 影響（推測）: Passive の Context には出口の中継がないので、実サイトの監査の間に Chromium が Google へ直接接続している可能性がある。autofill の通信は、ページの form の構造の情報を Google へ送る機能の可能性がある。監査対象のサイトへの要求ではないが、第三者への送信になりうる。
+- 扱い: DEF-070-research（読み取り専用の調査。インターネットへは出さず、Chromium の `--proxy-server` を 127.0.0.1 の記録用の中継に向けて、どの Context の種類・どの起動の設定で、どこへ接続しようとするかを数える。止める起動の引数（Playwright の既定の `--disable-features` を上書きしない方法を含む）の候補を実機で比べる）。
+
+## DEF-071 資格情報の画面のテストで、削除の知らせの直後に読む `credential-saved` が揺れる（2026-10-11 T26g-3 の `verify:ui` で発見。テストの揺らぎ）
+
+- 現象: `apps/local-ui/tests/credential-ui-flows.test.ts` の「asks to replace both values ... deletes the credential after the dialog」で、削除の知らせ（`data-notice="removed"`）が出た直後の `credential-saved` が `no` でなく `yes`。単独の再実行では 16 件すべて PASS。
+- 原因（推測）: 知らせを待った直後に、画面の値の読み直しが揃う前に読む。
+- 扱い: T26g-3 round 1 で、待つ対象を `credential-saved` が `no` になるまでにする（期待は弱めない）。
+- DEF-066-fix（2026-10-11、T26g-3 round 1）: 直した。`local-ui-boundary` の (i)（ブラウザ側のコードが値を import する `server/` のファイルが公開する関数は、`createServerFn` か `createServerOnlyFn` で包んだものだけ。例外は理由つきで `auth-setup-errors.ts`（たどった先に `node:` がないことも確かめる）と `artifact-files.ts` のサーバの route の受け手）。今の違反は `listJobArtifacts` の 1 件 → `createServerOnlyFn` で包んだ。0.6〜0.7 秒。近似で捕まえない形（名前だけの再公開、型の注記に `=`、最上位の値での呼び出し）は記録。
+- DEF-071-fix（2026-10-11、T26g-3 round 1）: 直した。削除の知らせの後に `credential-saved` が `no` になるまで待ってから確かめる（同じ形の残ったファイルの検査も）。期待は変えない。
+- DEF-070-research（2026-10-11）: 完了。CLI の起動の設定（chrome.exe、Chromium 151）は、Chromium 自身が Google へ 5 種類の接続を試みる（headless shell は 0）: 起動のたびに `clients2.google.com/time`、`accounts.google.com`（ListAccounts）、`android.clients.google.com`（GCM の checkin）、`www.google.com`（AI Mode の可否の問い合わせと preconnect）、form のあるページのたびに `content-autofill.googleapis.com`（form の署名と欄の署名を含む問い合わせ。入力の値と URL の平文は入っていない）。Passive・Interaction・ログインの段のどれでも。外へは出さない実験（記録用の中継、DNS の規則、TLS を中で終える実験 1 回）で確かめた。本番（中継なし）でも同じと推す根拠あり。過去の CLI の実サイトの Run（R7a 以降）でも出ていた可能性が高い（推測）。止める方法: Playwright の既定の `--disable-features` の 16 個に `AutofillServerCommunication`・`NetworkTimeServiceQuerying`・`PreconnectToSearch`・`AimEnabled` を合わせた 1 つの引数で、Context から出る接続は 0（スクリーンショットと DOM の hash と Ledger は同じ）。起動のときの ListAccounts と checkin は残り、`--gaia-url`・`--gcm-checkin-url` を 127.0.0.1:9 に向けると 0（ユーザーの判断）。`--disable-features` を単独で足すと Playwright の既定を上書きして HttpsUpgrades が効き出すので使えない。すべての Context を中継に通す案は、ブラウザの水準の要求が通らないので止まらない。→ DEF-070-fix で (i-b) を入れる（設計者の判断。離席中の承認の下。安全と第三者への送信を止める直し）。(i-c) と、過去の Run で第三者へ送っていた可能性の扱いは、ユーザーに判断を求める。実験のフォルダ（scratchpad の `def070\`。自己署名の証明書と秘密鍵を含む）は、削除が権限で止められたので残っている（ユーザーに伝える）。
+- DEF-069-fix（2026-10-11）: 直した。`dom-collector.ts` と `discover-candidates.ts` のブラウザの中の関数で、form になりうる要素の標準のプロパティとメソッドを、prototype の getter とメソッドの `.call` で読む（それぞれの関数の中に置く。`page.evaluate` の関数は外を参照できないので共通にしない → CC-068）。RED: 両方の Chromium で新しいテスト 8 件中 6 件 FAIL（`method`、`action`、`elements`、`getAttribute`、`tagName`、`childNodes`、`checkVisibility` などの名前で例外や誤った値）→ GREEN。公開監査の golden と `cli-output-parity` は前後とも PASS。
+
+## DEF-072 ほかの collector とスクロールも、form の名前つきの子で落ちる・誤った値になる（2026-10-11 DEF-069-fix の報告で発見。公開監査に影響。修正の前からある）
+
+- 場所と現象（両方の Chromium で確かめた）: `src/evidence/color-collector.ts`（`tagName`・`childNodes`・`getBoundingClientRect` で例外、`parentElement` で文字の標本が減る）、`src/evidence/layout-collector.ts`（`getAttribute`・`matches`・`checkVisibility`・`getBoundingClientRect`・`getClientRects` で例外）。`src/browser/controlled-scroll.ts` は今回の形では問題が出なかったが、同じく直接読む（未確認）。
+- 扱い: DEF-072-fix で、DEF-069 と同じ読み方にする。
+
+## DEF-073 `document` の名前つきの要素による上書きで、DOM の Evidence・候補の発見・色の標本・スクロールが落ちる・誤った値になる（2026-10-11 DEF-069-fix の報告で発見。公開監査に影響。修正の前からある）
+
+- 現象: `<img name="forms">`、`<form name="querySelector">` などで `document` のプロパティが隠れる。`collectDomEvidence` は `forms`・`images`・`title`・`querySelector`・`querySelectorAll` で例外、`discoverInteractionCandidates` は `createTreeWalker` で例外、`documentElement` で候補が 0 件、`body`・`scrollingElement` で色の標本が 0 件、`scrollingElement` で controlled scroll が `PARTIAL:SCROLL_TARGET_UNRESOLVED`。
+- 扱い: DEF-073-fix で、ブラウザの中の関数の `document` の読み取りを `Document.prototype` の getter とメソッドで行う。
+- DEF-070-fix（2026-10-11）: 直した。`chromium-launch.ts` に `PLAYWRIGHT_DEFAULT_DISABLED_FEATURES`（Playwright 1.62.1 の 16 個の写し）と `CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES`（4 個）を合わせた `--disable-features` 1 つ、ユーザーの判断で `--gaia-url`・`--gcm-checkin-url` を `http://127.0.0.1:9` へ。RED: 4 つの場面で time・www・autofill・accounts・android への試み（Interaction の出口の中継に 9 件）→ GREEN: 記録用の中継の記録も出口の中継の記録も 0 件（対照で記録の仕組みが働くことも確かめる）。既定の値のテストは `preloading-disabled.test.ts` に寄せ、`chrome://version` で完全一致（Playwright の版が変われば失敗する）。HttpsUpgrades は効き出していない。「Google でログイン」の fixture でスクリーンショット・DOM・Ledger・ページの要求は同じ。DEF-046 も解消。`doc/spec/safety.md` に章を足した。新しいテストは記録用の中継と DNS の規則つきで、インターネットへは出していない。scratchpad の `def070-fix\`（証明書なし）の削除が権限で止められた。
+- DEF-072-fix・DEF-073-fix（2026-10-11）: 直した。7 ファイルと `discover-links.ts` の `baseURI`（`<img name="baseURI">` で巡回の候補が 0 件になっていた）。テストは案 A（`Document.prototype` の差し替え、偽の環境に `Document`。期待は変えない）。両方の Chromium で新しいテスト 18 件、結合 17 ファイル 850 件、巡回 33 件、golden と `cli-output-parity` PASS。
+
+## DEF-074 ページの `document.querySelectorAll` が上書きされていると、Playwright の `locator.evaluateAll` が落ち、リンクの抽出が失敗する（2026-10-11 DEF-072・073-fix の報告で発見。公開監査に影響）
+
+- 現象: `<img name="querySelectorAll">` のあるページで、`discoverLinks` が `locator.evaluateAll: TypeError: root.querySelectorAll is not a function ...`（両方の Chromium）。Playwright がページの側で要素を集めるときに `document.querySelectorAll` を使うため。ほかの `locator.evaluateAll`・`$$eval` の使い方も同じ影響を受けうる（推測）。
+- 扱い: DEF-074-fix で、リンクの抽出の唯一の入口（ARCH03 の owner）を、`page.evaluate` の中で標準のメソッド（`Document.prototype.querySelectorAll.call`）で集める形に変える。ほかの `evaluateAll`・`$$eval` の使い方を一覧にし、同じ形なら直す。GATE-ARCH03 の検出の形を保つ。
+
+## DEF-075 Interaction のテストの一部の計測が、DEF-069 の直しの後に空振りしている（2026-10-11 DEF-072・073-fix の報告で発見。テストの弱まり。Important 相当）
+
+- 現象: `tests/integration/isolated-interaction.test.ts` の `installGeometryReadCounter`（要素のインスタンスの `getBoundingClientRect` の差し替え）、700・705 行目付近の `document.documentElement.matches` と `target.getAttribute` のインスタンスでの差し替えが、prototype の `.call` で読む今のコードでは呼ばれない。期待（読み取り 0 回など）は満たすが、何も測っていない。
+- 扱い: DEF-075-fix で、`Element.prototype` などを差し替えて元に戻す形に直し、計測が実際に働くこと（差し替えが呼ばれる回数が 0 より大きい場面がある、または計測の対照）を確かめる。同じ形の空振りがほかのテストにないかも探す。
+- DEF-074-fix・DEF-075-fix（2026-10-11）: 直した。DEF-074: `discoverLinks` を `page.evaluate` の中で `Document.prototype.querySelectorAll.call` と `shadowRoot` の getter で集める形に（Playwright の CSS のエンジンと同じ順。open な shadow root を貫く）。DEF-075: `Element.prototype` を差し替える計測に直し、対照のテスト 3 件（直す前は FAIL）を足し、境界のテストの期待を強めた（空振りの間は狙った境界を確かめていなかった）。結合 19 ファイル 888 件、golden、`cli-output-parity` PASS。
+
+## DEF-076 ログインの成功・失敗の条件のセレクタの判定が、上書きされた form で落ちる（2026-10-11 DEF-074 の報告で発見。fail-closed。記録だけ）
+
+- 現象: `loginStageLocator(page, selector).count()` が、form の `matches` が上書きされたページで `TypeError: element.matches is not a function`。呼ぶ側は「当たらない」として扱う（成功を誤って認めない向き）。
+- 扱い: 安全の側に倒れるので、今は記録だけ。設定のセレクタは Playwright の CSS のエンジン（shadow root を貫く、独自の文法）で評価しており、標準の `querySelectorAll` に置き換えると意味が変わるので、直すなら設計の判断が要る。
+
+## DEF-077 axe（`@axe-core/playwright`）のアクセシビリティの Evidence が、DOM clobbering のあるページで `PARTIAL:EVALUATION_FAILED` になる（2026-10-11 DEF-074 の報告で発見。依存のライブラリの中。記録だけ）
+
+- 現象: 上書きのある fixture で `collectAccessibilityEvidence` が `PARTIAL:EVALUATION_FAILED`（対照は `COMPLETE`）。axe-core の中の読み取りによる。
+- 扱い: 依存のライブラリの中なので直さない。PARTIAL として正直に記録されることは保たれている。手順書に「DOM clobbering のあるページでは、アクセシビリティの Evidence が取れないことがある」と書くかは、後で判断する。
+
+## DEF-078 資格情報の変更の記録の順が、時刻によって逆になり、画面のサーバのテスト 4 件が決まって失敗する（2026-10-11 全体の検証で発見）
+
+- 現象: `npm run verify:all`（2026-10-11 夜）で、`apps/local-ui/tests/credential-service.test.ts` の 3 件と `credential-retire.test.ts` の 1 件が FAIL（`expected [ 'DELETED', 'CREATED' ] to deeply equal [ 'CREATED', 'DELETED' ]`、`HOLD_CLEARED` も同じ）。単独での再実行でも同じく 4 件 FAIL（揺らぎではなく、決まって失敗する）。同じテストは、同じ日の昼の `verify:ui` では PASS していた。
+- 原因（推測）: 記録の読み出しは `recorded_at DESC, event_id DESC` の順。後の記録（DELETED など）の `recorded_at` が、前の記録（CREATED）より早い。登録と削除・解除で、記録の時刻を別の時計（テストの固定の時刻と、実際の時刻など）から取っている可能性がある。製品のコードで時計が混ざっているなら、製品の不具合。
+- 扱い: DEF-078-fix で原因を確かめる（どの記録がどの時計の時刻を使うか）。製品で時計が混ざっていれば、1 つの時計に揃える（記録の順の正しさは、監査の記録として大事）。テストだけの問題なら、テストの時計を揃える。
+- DEF-078-fix（2026-10-11）: 直した。原因は製品のコードの時計の混ざり（`credential-service.ts` の `recordChange` が資格情報のファイルの `updatedAt`（ファイルの部品の時計）、削除と解除の操作が依存の時計 `deps.now` から時刻を取っていた。テストではファイルの部品が実際の時刻、依存が固定の 09:00 UTC だったので、09:00 UTC を過ぎると順が逆になった）。`recordChange` も依存の時計に揃えた。時刻によらず決まって RED になる検査（2030 年に固定）を足した。`auto_login_attempts`・`auto_login_holds` はジョブの管理の時計 1 つで混ざりなし。
+
+## DEF-079 再開の同一性のテストで、強い混雑の下で一方の Run にだけ `POOR_TTFB` の Finding が出て、比べが揺れる（2026-10-11 全体の検証で発見。テストの揺らぎ）
+
+- 現象: `npm run verify:all`（2026-10-11 夜）で、`tests/integration/resume-run.test.ts` の「R4a2b: ... gives the same pages, IDs, Evidence, Findings, Run Status, ...」が FAIL。中断のない Run にだけ `POOR_TTFB`（FIND-000010）があり、以降の Finding の ID が 1 つずれた。単独での再実行は 2 回とも 15 件 PASS。
+- 原因（推測）: fixture のサーバの応答の時間（TTFB）は、全体の検証の CPU の混雑で伸びる。性能の指標に基づく Rule の結果は、2 つの Run の間で同じとは限らない。製品の不具合ではない（再開の同一性は、性能の指標によらない部分で確かめるべき）。
+- 扱い: DEF-079-fix で、このテスト（と同じ形の再開・同一性のテスト）の比べ方を確かめ、時間に左右される Finding（`POOR_TTFB` など、性能の指標の Rule）を、名前つきの一覧で比べの対象から外すか、テストの設定で閾値を混雑でも超えない値にする（どちらが今の設計に合うかを確かめて決め、報告する）。期待をほかに弱めない。
+- DEF-079-fix（2026-10-11）: 直した。原因を計測で確かめた（127.0.0.1 の TTFB は混雑なしで最大 9 ms、CPU の 8 倍の Worker の混雑で最大 2,166 ms、30 回中 3 回が `POOR_WEB_VITAL_THRESHOLDS.TTFB`（1,800）を超える。閾値は製品の定数で設定では変えられない）。案 (a): 再開の同一性を比べるテストの設定に `RUN_IDENTITY_AUDIT_OVERRIDES`（`audit.performance: false`）を 1 か所に置き、`resume-run`（R4a2b・R4b2）、`cli-resume`、`cli-site-unavailable` に使った（Finding の ID の比べは保つ。案 (b) は ID のずれが残るので不可）。製品のコードは変えない。元の失敗の形は R4a2b そのものでは再現できなかった。発見: 極端な混雑（CPU の 8 倍）で R4a2b の beforeAll が checkpoint なしで失敗（中断する Run が最初のページの保存の前に終わったと推測。全体の検証より重い条件。未確認）→ 全体の検証で再び出たら調べる（記録だけ）。
+
+## DEF-080 `control-discovery-jobs` の `other-summary` が、強い混雑の下で `FAILED` でなく `INTERRUPTED`（`WORKER_EXITED`）になることがある（2026-10-12 T27e の報告で発見。テストの揺らぎ。推測）
+
+- 現象: T27e の結合の通しの実行で 1 回 FAIL。単独で 3 回 PASS。
+- 原因（推測）: 偽のワーカーの `exit` が `FINISHED` のメッセージより先に処理される。
+- 扱い: 記録だけ（2026-10-11 のユーザーの判断「揺らぎの追跡は後回し」による）。揺らぎの片付けのときにまとめて調べる。
+
+## DEF-081 CLI の監査が、出力先の開始のロックの取り直しの途中で作り直した出力先を覚えず、Run を始めずに終わると空の出力先を残すことがある（2026-10-12 CCX-6 の調べで発見。推測。狭い競争の場面）
+
+- 内容: `src/cli/audit-run.ts` は、最初の `acquireOutputStartLock` で作れたときだけ `createdDirectory` を覚え、`takeOverStaleLock` の中の作り直し（`CHANGED` の後の `port.acquire`）で作った出力先を覚えない。前の持ち主が空の出力先を消した後に作り直し、Run を始めずに終わると、空の出力先が残る。ワーカーの Run（`worker-run-session.ts`）は作れるたびに覚えるので残さない。`tests/unit/output-start-lock.test.ts` の「Run を始めないときは、開始のロックのために作った出力先を残さない」の意図にはワーカーの側が合う。
+- 扱い: CCX-6 で、ワーカーの側（作れるたびに覚える）に揃えて直す。この場面を再現するテストで RED（CLI が空の出力先を残す）→ GREEN を確かめる。
+- DEF-081-fix（2026-10-12、CCX-6 の中）: 直した。出力先の開始のロックの取り直しを `src/orchestration/output-start-lock.ts` にまとめ、作れるたびに `createdDirectory` を覚える形（ワーカーの側）に揃えた。再現のテスト（取り直しの途中で作り直し、Run を始めずに終わる）で RED（空の出力先が残る）→ GREEN。
+
+## DEF-082 `startWorkerRun` が `clock()` を try の外で呼び、時計が例外を投げると開始のロックと作った出力先が残る（2026-10-12 CCX-6 の報告で発見。推測。本番の時計は `new Date()` なので起きにくい）
+
+- 扱い: 記録だけ。ワーカーの Run の次の変更のときに、`clock()` を try の中に入れる。
+
+## DEF-083 `discovery-job-fork` の読み込みの間隔の確かめが、間隔を守らない変化でも PASS する見込み（2026-10-12 T27g の報告で発見。推測）
+
+- 現象（推測）: `tests/integration/discovery-job-fork.test.ts` は、間隔を 400 ms にして、サーバに届いた時刻の最初から最後までの長さで間隔を確かめる。1 画面の発見に約 1.1 秒かかるため、間隔を 0 にしても長さの条件を満たしてしまう。T27g の端から端のテストでは、400 ms で同じ形の確かめが間隔 0 の変異でも PASS した（その後 3,000 ms に上げて、変異で FAIL することを確かめた）。
+- 影響: テストの検出力だけ（製品の不具合ではない）。間隔そのものは `discovery-run.test.ts` の pacer の記録と、T27g の `discovery-secret-markers`（3,000 ms、変異で FAIL を確認）が確かめている。
+- 扱い: 記録だけ。テストの整理のときに、間隔を発見の所要時間より十分長くするか、pacer の記録で確かめる形に直す。
+
+## DEF-084 ワーカーが結果を送ってから終わっても、混雑の下でジョブが `INTERRUPTED`（`WORKER_EXITED`）になることがある（2026-10-12 Task 27 の全体の検証で発見。DEF-080 と同じ原因の見込み。推測）
+
+- 現象: `npm run verify:all`（T27R のレビュー担当の実験と並行の混雑の下）で、`tests/integration/control-audit-jobs-auth.test.ts` の「sends the validated setup, the approved origins and their digest in START, and records the auth states and the lost page」が 1 回 FAIL。期待は `FINISHED`・`PARTIAL`・`SESSION_LOST` だが、`INTERRUPTED`・`WORKER_EXITED`・`AUTHENTICATED` になった（ワーカーの最後の `AUTH_STATE` と `FINISHED` のメッセージが処理される前に、終わりとして扱われた）。単独で 3 回 PASS。
+- 原因（推測）: `src/control/job/audit-job-manager.ts` は、ワーカーの終わりを子 process の `exit` の事象で扱う。Node.js では、`exit` の後にまだ届いていない IPC のメッセージ（`message` の事象）が残ることがあり、`exit` を先に処理すると、最後のメッセージを読まずにジョブを終わらせる。DEF-080（発見のジョブの `other-summary`）も同じ形の見込み。
+- 影響（推測）: テストだけでなく、本番でも、混雑の下で、終わった Run のジョブを「中断」と記録しうる（Run の成果物は残る。安全の問題ではない。結果の記録の正しさの問題）。
+- 扱い: テストの揺らぎでなく製品の不具合の見込みなので、T27R の後に直し方を調べる（`exit` ではなく `close`、または `disconnect` の後に終わりとして扱う、など。直す前に、混雑を作って再現するテストで RED を確かめる）。T27R の間は、レビューの対象のコードを変えないため着手しない。
+- DEF-084 の調査（2026-10-12）: 推測が実験で確かめられた。Node.js 24.21.0 の `fork`（stdio は本番と同じ ignore と IPC）で、子が最後のメッセージを送ってから終わると、混雑の下で親の `exit` が最後の `message` より先に来る（200 回中 74〜134 回）。`disconnect` と `close` は、どの条件でも最後の `message` より後（逆転 0 回）。メッセージは失われない（順序の問題）。ワーカーが `send` のコールバックを待ってから終わる形はすでに入っているが効かない（コールバックは「パイプに書けた」の意味）。本物の管理と偽のワーカーで、START の直後に子が終わるまで親をふさぐ fork（追加 100 ms）を使うと、公開・認証つき・発見の 3 つの形で 20/20 回 `INTERRUPTED`・`WORKER_EXITED` になる（決定的な RED）。DEF-080 も同じ形で再現した（同じ原因の可能性が高い。偽のワーカーの書き込みの失敗の可能性は残る）。
+- DEF-084 の修正の設計（2026-10-12、設計者）: 調査の (b) を採る。ジョブの管理は、`exit` を受けたら「process は終わった」の印を付け、IPC が切れる（`disconnect`）か、名前つきの期限（`AUDIT_JOB_IPC_DRAIN_WAIT_MS`。`job-records.ts`。3,000 ms。`exit` から `close` までの観測の最大は 768 ms）の早い方まで待つ（`child.connected` が false なら待たない）。待つ間は、合図の見張り（`#checkHeartbeats`）と `readyTimer` でジョブを終わらせない。待ち終わったら、`job.ending === null` のときに `WORKER_EXITED` を同期で決め（それ以後に届いたメッセージは捨てる）、その後に `#readJobResult` を呼び、`#exited` で記録する（成果物を読む間に `FINISHED` が割り込んで、確かめずに記録されることを防ぐ）。期限は `AuditJobTiming` から渡せるようにする（テストで短くする）。ワーカーの側は変えない。受け入れ条件: 親をふさぐ fork のテスト（公開・認証つき・発見、`tests/helpers/` の共通の部品）が修正の前に RED、後に GREEN。`exit` だけ来て `disconnect` が来ない偽の子で、期限の後に `WORKER_EXITED` で終わり枠が空く。既存のジョブのテスト（`control-*`、画面のジョブのテスト）が変わらない。T27R の後に実装する（レビューの対象のコードを変えないため）。
+
+## DEF-085 同じタスクの中で開いた 2 つ目のポップアップの GET が、読まない URL や別の Origin へ届く（2026-10-12 T27R の C1。Critical。修正の前からある Guard の経路）
+
+- 現象: ページの JS が `target=_blank` の form の `requestSubmit()`（または `a[target=_blank].click()`）の同じタスクの中で、続けて `window.open('<読まないパス>')` を呼ぶと、2 つ目のポップアップの GET がサーバに届く。Ledger には `FRAME_CLASSIFICATION_FAILED` が残り Run は `ABORTED_BY_SAFETY` になるが、要求は届いた後。
+- 再現（T27R の実機。CLI の起動の設定）: 読み込みの直後に 11/12 回、300 ms 後に 4/5 回（混雑の下で 2/10 回）、発見のジョブの端から端で 2/4 回、認証なしの factory（公開監査と同じ）で別の Origin へ 1/5 回。headless shell では 0/10 回。凍結の後は 0/5 回。2 つ目を 5 ms 以上遅らせると届かない。ポップアップが 1 つだけ、POST のポップアップは 0/40 回。
+- 影響: 発見の落ち着きの待ち、READ の結果の画面、認証つきの監査、公開監査のすべて（PASSIVE の段のポップアップの最初のナビゲーション）。
+- 扱い: 直し方を調査担当の実験で決める（推測で設計しない）。
+
+## DEF-086 表の行の中身が、送信ボタンの文言として `discovery.json` と画面に出る（2026-10-12 T27R の C2。Critical）
+
+- 現象: `src/discovery/probe.ts` の `submitterTextOf` が、ボタンの文字・`aria-label`・`title` をつなげて `submitterText` にする。表の各行のボタンに行の名前を含むラベル（例「<行の名前> を編集」）があると、行の中身が `discovery.json` の `submitterText` と、`/discovery/$profileId`・`/read-checks/...` の画面に出る（両方の Chromium）。`submitterText` は候補の識別の digest（`fingerprint.ts`）にも入る。
+- 原因: 設計書 4.1 が「送信ボタンの文言を成果物に持つ」と決め、4.8 の「表の行の中身を写さない」とぶつかっていた（設計の誤り）。
+- 修正の設計: 下の「T27R の修正の設計」の 1。
+
+## DEF-087 ページの JS が probe と構造の読み取りを偽れる（メインの world で動く）（2026-10-12 T27R の C3。Critical の字義。実際の害は小さい）
+
+- 現象: ページが `Function.prototype.call` を上書きして標準の getter の結果を偽ると、`method=post`・`_method=DELETE`・ボタン「削除」の form が `GET`・`READ_GET_FORM`・ボタン「検索」・別の送信先の候補になり、READ の確かめで偽の送信先へ GET を送って `MATCHED` になった（CLI の Chromium）。READ の結果の行の数なども同じく偽れる。
+- 害の範囲: 送るのは Guard と事前の判定を通る GET だけ（同じ GET はページ自身も送れる）。書き込みは起きない。
+- 扱い: isolated world（CDP の `Page.createIsolatedWorld`）で読む案を、調査担当の実験で確かめてから決める。
+
+## DEF-088 発見の分類と READ の事前の判定の抜け（2026-10-12 T27R の M2・M5。Minor）
+
+- GET の form の欄の名前と、READ で送る query の名前と値が、発見の分類の危険な語（日本語を含む）の判定の対象になっていない（`name="削除"` の GET の form が `READ`。日本語の語は Guard の既定の語にないので、READ の事前の判定でも止まらない）。
+- 見える（hidden でない）`_method` の欄を持つ GET の form が `READ` になり、`_method=PUT` を送れる。
+- 別の言語の語（中国語、ドイツ語）、似た形の文字（キリル文字の е、`İ`）、アイコンだけのボタンは、閉じた一覧の限界（手順書に書く）。
+- 修正の設計: 下の「T27R の修正の設計」の 2・3。
+
+## T27R の修正の設計（2026-10-12、設計者）
+
+1. **DEF-086**: 候補は、送信ボタンの文言そのものを持たない。probe が読んだ文言は、Node の側で、分類の閉じた一覧の語のうちその文言に当たるもの（分類の owner `classify.ts` が公開する 1 つの関数で求める。分類の判定と同じ当たり方）だけに変え、文言は捨てる。契約の `submitterText` を `submitterWords`（並べた語の一覧。0 件もありうる）に変え、分類・識別の digest（`CANDIDATE_IDENTITY_DIGEST_FORMAT` の版を上げる）・`discovery.json` のスキーマ・`candidate.schema.json`・画面（語の一覧、0 件なら「分類の語なし」）がそれを使う。`aria-label`・`title` も、語を求めるためだけに読み、持たない。同じ form の中で同じ語の組のボタンが 2 つあるときは、今の `DUPLICATE_IDENTITY_CONFLICT` の扱いに任せる。選択肢の `value` は、READ の定義に要るので今のまま持つ（設計どおり。手順書に、個人情報になりうることを書く）。
+2. **DEF-088（語の判定）**: (a) 発見の分類で、GET の form の欄の名前も危険な語の判定の対象に加える（当たれば `NOT_EXECUTABLE`）。(b) READ の実行の前の確かめで、送る query の名前と値に、発見の分類の危険な語の判定（日本語を含む。owner は `classify.ts`）をかけ、当たれば読まずに `READ_BLOCKED_BY_POLICY`（`detail` は新しい閉じた値）。定義の保存のときも同じ判定で拒む（理由のコードを足す）。
+3. **DEF-088（`_method`）**: GET の form に、型を問わず `_method`（畳み込みで比べる）の欄があれば `NOT_EXECUTABLE`。
+4. **M3**: Gate `discovery-boundary` の (w)（入力の操作を呼ばない）の対象に、page を受け取る `src/worker/discovery-run.ts`・`read-check-run.ts`・`worker-run-session.ts` を加える。
+5. **M4**: 設計書 11 章の「READ の送る値が出てよい場所」に、ワーカーから親への `AUTH_STATE`（セッションの切れの URL。管理データに記録される）を加える（ワーカーが送る値を含む URL で切れを知らせるため。秘密の目印は出ない）。
+6. **M1（`İ`）**: 現実の経路になる見込みは低い（T27R の判断）。守りを重ねる案（NFKD の後に結合文字を除いた形でも比べる）は、公開監査の除外の比べを変えるので、Task 27 の後に別に判断する（記録だけ）。手順書の「確かめていないこと」に、閉じた一覧の語の限界として書く。
+7. **I1・I2**: 手順書を実際に合わせて直す（凍結の前の落ち着きの待ちの間の繰り返しの probe、閉じた一覧の語の限界、メインの world の読み取りの限界（DEF-087 の結論しだい）、ポップアップ（DEF-085 の結論しだい））。T27g の目印の fixture に、ボタンの文字・`aria-label`・`title` に行の目印を置いた形を足す（DEF-086 の修正の前に RED）。
+- DEF-084 の状態（2026-10-12）: 修正済み。`audit-job-manager.ts` は、`exit` を受けたら `processExited` の印を付け、`child.connected` なら `disconnect` か `AUDIT_JOB_IPC_DRAIN_WAIT_MS`（3,000 ms）の早い方まで待つ。待つ間は合図の見張り・`readyTimer`・`killTimer` で終わらせず、`STOP` も送らない。待ち終わったら `WORKER_EXITED` を同期で決めてから成果物を読み、記録する。親をふさぐ fork（`tests/helpers/worker-fork.ts`）のテスト 4 つ（公開・認証つき・発見・READ）が修正の前に 3〜4 回とも FAIL、後に 3 回とも PASS。期限のテスト 6 件（偽の子）も前に FAIL、後に PASS。DEF-080 も同じ原因として直った見込み（`other-summary` の形が RED → GREEN）。設計者の確かめ: ジョブのテスト 5 ファイル 93 件 PASS、`audit-job-manager.ts`・`job-records.ts` の改行は CRLF のまま（実装者の Edit ツールで一度 LF に変わり、実装者が戻した）。
+- DEF-087 の調査（2026-10-12）: isolated world で読む案が効くことを実機で確かめた。probe と構造の読み取りを、CDP の `Page.getFrameTree` → `Page.createIsolatedWorld`（main frame）→ `Runtime.callFunctionOn`（`returnByValue`）で動かすと、試した 6 種類の偽り（`Function.prototype.call`、`Object.getOwnPropertyDescriptor`、prototype の getter の書き換え、要素の own property、組み込みのメソッドの上書き、Proxy）をすべて防ぎ、読み取りの間にページの JS が走った回数は 0 回（main world では発見 1 回で 912 回）。両方の Chromium で同じ。DOM clobbering は prototype の getter で読めば正しい。open な shadow root も正しい。凍結の前後どちらでも動き、読み込み直しの後の古い world の id は失敗（fail-closed）。大きな画面の probe は main 320 ms → iso 73 ms。listener の取得（`DOMDebugger.getEventListeners`）は objectId の world の listener しか返さないので、今のまま main world の objectId を使う（CDP の読み取りでページの JS は走らない）。
+- DEF-087 の修正の設計（2026-10-12、設計者）: 調査の (a) を採る。新しい部品（例 `src/discovery/isolated-read.ts`。送る CDP の命令の閉じた一覧、期限、例外の詳細があれば読めなかったとして扱う、session を切る）を置き、`probe.ts` と `read-executor.ts` の 2 か所の読み取りをそれに移す。`listeners.ts` は main world のまま（理由を説明に書く）。Gate: `src/discovery/` で `page.evaluate` を使わない（入口は isolated world の部品だけ）。受け入れ条件: 調査の再現のテスト 8 件（`forgedCall`・`forgedPrototype`・`forgedShadow` の発見と、構造の読み取りの偽り。両方の Chromium）が修正の前に RED、後に GREEN。今の発見と READ のテストが変わらない。T27R-fix-1 の後に行う（`probe.ts`・`read-executor.ts` が重なるため）。
+
+## DEF-089 ほかにも main world の `page.evaluate` で読む部品がある（2026-10-12 DEF-087 の調査で登録。未確認）
+
+- `src/interaction/discover-candidates.ts`、`src/browser/login-form-submitter.ts`（ログインの form の事前の確かめ）、evidence の収集、`src/crawl/discover-links.ts` も、main world の `page.evaluate` で読む。ページの JS が結果を偽れる型。公開監査の Evidence はページ自身が中身を決めるので、偽れることは安全の問題ではない見込み（推測）。ログインの form の事前の確かめは、偽られても、ログインの段の Origin の制限と送信の窓が要求を止める（T26R の確かめ）が、資格情報を入れる form を取り違える経路になりうるか（推測）は確かめていない。
+- 扱い: Task 27 の後に、どれを isolated world へ移すかを判断する（ログインの form の事前の確かめを優先）。
+- DEF-085 の調査（2026-10-12）: 原因を実機で特定した。1 つ目のポップアップが route で `FRAME_CLASSIFICATION_FAILED` になり、Guard が Context を無効化して閉じる（`Target.disposeBrowserContext`）。その破棄の途中で始まった 2 つ目のポップアップの最初のナビゲーションには、有効にした `Fetch` が効かず、ネットワークに出る（CLI の `chrome.exe`。headless shell では起きない。内部の理由は推測）。持ち主が閉じるとき（凍結の後を含む）も、初期化の途中のポップアップがあれば届きうる（中継なしの凍結の後の storm で 4/20 回。製品の Interaction は出口の中継があるので 0/15 回、拒否 504 件）。選択肢の実機の比較（各 20 回）: (e5) すべての Guard の Context に出口の中継を付け、close の前に中継を凍結する → 全条件で 0/20、拒否として記録できる。ただし公開監査の通信が中継を通る（監査の結果への影響は未測定）。(e) close の前にページの JS を止めて 200 ms 待つ → 試した全条件で 0/20、通信は変わらない。OOPIF の iframe と凍結の段のポップアップは未検証。(a) PASSIVE の段のポップアップを止めて記録し無効化しない → burst は 0/20、storm で 3〜5/20 届く（単独では不十分）。結果が変わる（ポップアップを開くページが中止されない）。(q) 待つだけ・(c) 初期化のスクリプト・(d) popup blocker・(b) 一時停止を保つ、は効かないか迂回がある。似た経路: `requestSubmit`・`a.click()`・`form.submit()` と `window.open` の組で 8〜17/20 回届く。除外の path（同じ Origin。認証つきの監査の `/logout`）でも 8/20 回届く。
+- DEF-086・DEF-088 の状態（2026-10-12）: 修正済み（T27R-fix-1）。`submitterWordsOf`・`DISCOVERY_SUBMITTER_WORDS`（68 語）、識別の digest の版 2、画面は「ボタンの分類の語」（0 件は「分類の語なし」）。GET の form の欄の名前と `_method` の欄は `DESTRUCTIVE`。READ の送る名前と値の危険な語は、保存で `READ_PARAMETER_DANGEROUS_WORD`、実行の前で `PARAMETER_DANGEROUS_WORD`（修正の前は READ の GET が 3 件届き、後は 0 件。両方の Chromium）。I2 の fixture（行のボタンの文字・`aria-label`・`title` の目印）で `discovery-secret-markers` が修正の前に 4 種類の場所で RED、後に GREEN。M3 済み。M4 はテストには加えない（場面で `SESSION_LOST` が起きないため。設計書には加えた）。残り: 欄の名前の英語の語を語の単位で比べる（設計書 11 章の 2026-10-12 の (4)。T27R-fix-2）。
+- DEF-085 の扱い（2026-10-12、ユーザーの判断「A 中継を全部に（推奨）」）: すべての Guard の Context に出口の中継を付け、閉じる前に中継を凍結する。実装の前に、公開監査の結果への影響を fixture で測る。
+- DEF-087 の状態（2026-10-12）: 修正済み。`src/discovery/isolated-read.ts`（`readInIsolatedWorld`。命令は `Page.getFrameTree`・`Page.createIsolatedWorld`・`Runtime.callFunctionOn` の 3 つ、失敗はすべて読めなかった扱い）と `src/discovery/cdp-session.ts`（session の開け閉め。`listeners.ts` と共通）。probe と構造の読み取りを移した。listener は main world の objectId のまま。Gate `discovery-boundary` の (e)（`src/discovery/` で evaluate を使わない）と (c)（CDP の命令は閉じた一覧だけ）。偽りの 3 画面・構造・ページの JS の回数・古い world の 12 件（両方の Chromium）が修正の前に RED（ページの JS は発見 1 回で 1,779 回）、後に GREEN（0 回）。本番のビルドでも確かめた。大きな画面の probe は main 398〜452 ms → iso 111〜126 ms。設計者の確かめ: 3 ファイル 76 件 PASS。残り: `discover-page.ts`・`read-check-evaluation.ts` の説明の「1 回の `page.evaluate`」が古い（手順書の直しと一緒に直す）。
+- DEF-085 の状態（2026-10-12）: 修正済み（fix round 2 まで）。すべての Guard の Context に出口の中継を付け、Guard が閉じる前に中継を凍結する（`GUARD_BYPASS_EGRESS` で記録。中継が閉じた後の要求は届かないが記録は残らない）。Passive とログインの段の中継は `PASS_THROUGH`（上流の失敗を RST・応答なしの切断・途中の破棄で伝える。接続の拒否は `ERR_CONNECTION_RESET` になる。同じ扱いの網の層の失敗）。Interaction は `BAD_GATEWAY` のまま。`localhost` とその下の名前は OS に問い合わせずループバックへ。診断の記録の相手のアドレスは、中継が覚えた上流の相手のアドレス（上限 256、引けなければ null。中継の待ち受けのアドレスは記録しない）。名前解決は Chromium から中継（OS）に移る。`chromium-google-connections` は、Passive の中継が本番の方針で実在の外部へ接続しうる作りだったので、テストの方針（loopback だけ）を渡して直した（直す前には実行していない）。`guard-popup-close-race`（CLI の Chromium で修正の前に burst 11〜13/20・storm 7〜15/40 届いた → 0）。時間の計測値は中継の分だけ遅い（ユーザーの判断で受け入れ）。設計者の確かめ: 7 ファイル 219 件 PASS。残り（別の判断）: Interaction の Context の診断の記録には、今も中継の待ち受けのアドレスが出る。
+
+## DEF-090 `discovery.json` の画面ごとの安全の記録に、監査の段の除外で止めた件数と、中継の拒否の件数が出ない（2026-10-12 T27R2-fix-tests の再現の調べで登録。Minor）
+
+- `discovery.json` の画面ごとの `blockedRequests` は、Ledger の `blockedRequestsByMethod`（読み取り以外の遮断）だけを数える。`AUDIT_EXCLUDED_URL` の遮断（`blockedAuditExclusions`）と、中継の拒否（`blockedInteractionRequests` の `GUARD_BYPASS_EGRESS` など）は出ない。そのため、`discovery-polling-blocked-count` のテスト（C1 の形）は、中継の拒否の数え違いを `discovery.json` からは見つけられない（C1 は DEF-085 の fix round 3 の本物の CLI の `run.json` の確かめで見る）。
+- 扱い: 発見の成果物の安全の記録として足りるかを、Task 27 の後に判断する（記録だけ）。手順書の安全の記録の説明に、この範囲を書く。
+- DEF-085 の fix round 3（2026-10-12）: C1 は閉じる直前の凍結（`CONTEXT_CLOSE`）の後の中継の拒否を記録しない形で直した（本物の CLI のポーリングのページで `blockedActions.requests` 80 → 0。`egress-close-freeze-run`）。C2 は、指示書の「Node で読み直して寛容にする」ではなく、上流の bytes をそのまま流す作り（`#relayPassThrough`。要求は origin-form にし、`keep-alive`、要求を読む側は `insecureHTTPParser` と `MAX_EGRESS_HTTP_HEADER_BYTES` 256 KiB（Chromium の `kMaxHeaderBufSize`））にした。設計者の判断: 受け入れる（読み直す作りでは同じにできない形が残るため。25 種類と大きな Cookie の 52 件が中継あり・なしで一致、`egress-http-fidelity`）。I2 は Guard の `activateInteractionFreeze` で中継も凍結（`INTERACTION_FROZEN_EGRESS`）。M4 は `localhost.` も OS に問い合わせない。手順 0 の再測定で違うのは時間の値だけ。設計者の確かめ: 5 ファイル 127 件 PASS。
+
+## DEF-091 2 つの Origin へ高い頻度でポーリングするページが、中継の負荷で遅くなり `PARTIAL` になる（2026-10-12 DEF-085 の fix round 3 で発見。Minor）
+
+- 現象: 2 つの Origin へ 5 ms ごとに fetch するページを CLI で監査すると、中継なしは約 6 秒で `COMPLETE`、中継ありは約 10 秒で `PARTIAL`（`COLLECTOR_INCOMPLETE:performance:RESOURCE_LIMIT_REACHED`）。Finding・遮断の件数・違反は同じ。同じ Origin だけ、https だけでは違いなし。
+- 原因（推測）: 中継が CLI と同じ Node のプロセスで、毎秒数百の要求と失敗する CONNECT を処理するため CDP のやりとりが遅れる。
+- 扱い（2026-10-12 ユーザーの指示「1 つの不具合に時間をかけすぎない」による）: 既知の違いとして手順書に書き、直さない。中継を別のプロセスにする、上流の接続を使い回すなどは、必要になったときに別に判断する。
+
+## DEF-092 1 回だけの失敗（2026-10-12 DEF-085 の fix round 3 の検証で。再現しない）
+
+- `discovery-isolated-read` の「fails by the deadline when the session opens late」が 1 回 FAIL（単独で 3 回 PASS、2 回目の全体で PASS）。DEF-087 の部品の時間の揺らぎの見込み（推測）。
+- `page-auditor-site-unavailability` の「records the request, the response, and the end of the Passive load of both viewports for a normal page」が 1 回 FAIL（その後の 12 回で再現せず。記録なし）。中継の keep-alive の上流が閉じた瞬間の Chromium の送り直しで GET の数が合わなくなる可能性（推測）。
+- 扱い: 記録だけ（揺らぎの片付けのときにまとめて調べる）。
+
+## DEF-093 全体の検証で、時間の期限に関わるテストが 3 件失敗（2026-10-13 G27 のための `verify:all`。単独で 2 回とも PASS）
+
+- `isolated-interaction` の「does not verify an inert offscreen button whose viewport position changes only by click scrolling」（期待の理由の一覧に `STABILITY_CHECK_DEADLINE` がない）、「keeps verifying the attribute change of a target without a role (Plain open toggle)」（`PERSISTENCE_CHECK_DEADLINE` で `NOT_VERIFIABLE`）、`preflight` の「fails PASSIVE_GUARD within the close deadline when closing the guarded Context does not finish」（5,307 ms。上限 5,300 ms）。
+- 3 件とも混雑の下の時間の期限に関わる。`preflight` の 1 件は、DEF-085 で Passive の Context に中継を付け、閉じる処理に中継の凍結と停止が加わったことで、上限に近づいた可能性がある（推測）。
+- 扱い: 記録だけ（揺らぎの片付けのときに、中継を付けた後の閉じる処理の時間を測る）。`verify:all` を流し直す。
+
+## DEF-094 シナリオの送る欄に、名前が秘密に見えない password の欄を選べる（2026-10-13 T29 の調査で発見。Task 28 の穴）
+
+- `isSendableField`（`src/discovery/read-check-contracts.ts`）は欄の type を見ず、`scenario-policy.ts` の送る欄の確かめは名前だけで秘密を判定する。そのため、名前が秘密に見えない `type=password` の欄（と `type=file`）が、シナリオの送る欄に入りうる。書き込みは Task 30 からなので、今は値が送られることはない。
+- 修正の設計: シナリオの送る欄の確かめで、`type` が `password`・`file` の欄を拒む（理由のコードを足す）。READ の送れる欄でも同じ判定にするかを合わせて確かめる（READ は GET の form なので password は `UNSUPPORTED_READ_TRANSPORT` だが、二重に守る）。CCX-12 が `scenario-policy.ts` を触っているので、その後に小さな修正として行う（T28 の範囲）。
+
+## T29 の調査で分かった Task 28 の残り（2026-10-13）
+
+- `currentFactsIn` は「今の入力の規則の参照」としてシナリオ自身の参照を渡すので、`INPUT_RULES_CHANGED` は今は発火しない（コメントのとおり Task 29 まで）。Task 29 で規則の集まりの最新の版を読むように変える。
+- `attachInputRuleReference` に参照を外す口はない。送る欄を変えても規則の参照は引き継がれる（Task 29 で範囲を確かめ直す）。
+- DEF-094 の状態（2026-10-13）: 修正済み（シナリオの側）。`src/discovery/candidate-contracts.ts` の `UNSENDABLE_FIELD_TYPES`（`password`・`file`）と `isUnsendableFieldType`、`scenario-policy.ts` の新しい理由 `SCENARIO_FIELD_TYPE_NOT_SENDABLE`（同じ名前の欄のどれかが当たれば拒む）。RED 4 件 → GREEN。画面の文言は T28e に渡した。判断（2026-10-13、設計者）: READ の送れる欄（`isSendableField`）からも `file` の欄を外す（GET の form の file の欄に値を送る定義は意味がなく、止める側に寄せる。password の欄のある GET の form はもともと `UNSUPPORTED_READ_TRANSPORT`）。READ の定義の保存の結果と、画面の欄ごとの `sendable` の表示が変わるので、T28e の後に小さな修正として行う。
+
+## DEF-095 `guard-unload-requests` の experiment 7（CLI の Chromium、Passive）で、止めた証拠が残らない回がある（2026-10-13 G29 の `verify:all`。単独で PASS。T30b の検証でも 1 回）
+
+- 現象: 回の判定で `blockedRequests` が 0 件のため「失敗の回」になる。その回も、サーバに届いた数は 0、読み取りでない要求の数も 0、違反も 0（漏れではない）。画面は `chrome-error://chromewebdata/` で、ページが離れる POST を出す前にエラーの画面に移ったと見られる（推測）。
+- 影響: テストの揺らぎだけ（止めた証拠を毎回求める条件が、混雑の下で満たされない）。安全の問題ではない。
+- 扱い: 記録だけ（揺らぎの片付けのときに、証拠を「少なくとも 1 回」にする条件へ直すかを判断する。スキルの「競争のある安全のテストの条件」のとおり）。
+
+## DEF-096 書き込みの段の送る中身の照合が、`_method` などの hidden の欄の値を照らさない（2026-10-13 T31 の調査で発見。Task 30 の範囲）
+
+- 現象: `src/safety/write-payload-policy.ts` は passthrough（hidden・readonly）の欄の名前だけを照らす。`_method` を passthrough に入れた期待で、本文の `_method=DELETE` が `ALLOW` になる。`_method` が本文にない場合も `ALLOW`（scratchpad の `t31-investigation\method-override.mjs` で確かめた）。
+- 影響: CREATE の候補は `_method` を持てない（分類による）ので、主に UPDATE（Task 31）の穴。ページの JS が送信の前に hidden の `_method` の値を書き換えると、承認と違う method の上書きで送られうる。
+- 修正の設計: 照合の期待に「値を照らす passthrough」を足し、`_method` は承認した候補の上書きの値と完全に一致（候補に上書きがなければ本文に `_method` があれば止める）。T30b fix round 1 で直す。
+- 状態: 解決（2026-10-13 T30b fix round 1）。照合の期待に `methodOverride`（`PUT`・`PATCH`・null）を足し、項目 (h) `METHOD_OVERRIDE_MISMATCH` で、本文の `_method`（Task 27 の `isMethodOverrideFieldName` の畳み込みで当たる名前）がちょうど 1 つで値が一致すること（上書きがなければ本文にないこと）を照らす。`_method` を名前の一覧に入れた期待は `EXPECTATION_INVALID`。`writeFormFieldListsOf` が `methodOverride` を返す。値の比べは畳み込みだけで、前後の空白は落とさない（より厳しい側）。修正の前は、ページの JS が `DELETE` に書き換えた POST が両方の Chromium で 1/1 届いた。修正の後は届かない（止めた回 21、2 秒待って数え直し）。設計者の確かめ: 3 ファイル 213 件 PASS。保つ欄・状態の hidden の値を照らす広げ方は Task 31（T31c）。
+
+## DEF-097 関係するテストをまとめて流したときに、時間に左右される 2 件が 1 回 FAIL（2026-10-13 T30e の検証。単独と 2 回目は PASS）
+
+- 現象: `control-instance-lock.test.ts` の「stalled holder の引き継ぎで worker を 2 つ動かさない」と、`execution-grant-processes.test.ts` の「2 つの process の発行・消費・確定の競合」が、59 ファイルをまとめて流した 1 回目に FAIL。単独と、まとめた 2 回目（1,378 件）は PASS。
+- 影響: 推測では負荷による時間の揺れ。後者は T30e で子が `settleWriteForTest` を使う形に変わった。
+- 扱い: 記録だけ（ユーザーの指示: 揺らぎで全体の検証を流し直さない）。G30 の `verify:all` で再び出たら原因を調べる。
+
+## DEF-098 CREATE で、送る欄に選ばなかった見える欄があると、ブラウザが空の値で送るので照合が止める（2026-10-13 T30f の報告の発見事項 6 から設計者がコードで確かめた。Task 30 の範囲）
+
+- 現象: `src/browser/write-form-submitter.ts` の `writeFormFieldListsOf` は、送る欄でない欄のうち hidden・readonly・見えない欄と file の欄だけを照合の期待に入れる。見えていて編集できる text 系の欄（例: 任意の `email`）を送る欄に選ばないと、ブラウザがその欄を空の値で本文に入れ、照合が `UNKNOWN_FIELD` で止める（送らずに `BLOCKED`）。select はブラウザが既定の選択肢の値を送るので同じく止まる。
+- 影響: 任意の欄がある CREATE の画面は、すべての見える欄を送る欄に選ばないと実行できない。止める側なので安全の問題ではない。実際の管理画面では多くの CREATE が止まると推測。
+- 修正の設計: 照合の期待の作り手で、送る欄でない見える編集できる欄を、text 系は「空の値で送る欄」（送る欄に値 `""`）、checkbox・radio は「送らない欄」（T31c の `absentFieldNames`）、組の checkbox は hidden を名前だけ照らす、として入れる。select（と select-multiple）は既定の値が分からないので、送る欄に選ばなければ実行しない（下書きの確かめで受けない理由と、ワーカーの `SPEC_INVALID`）。T30f fix round 1 で直す。
+- 状態: 解決（2026-10-13 T30f fix round 1）。期待の作り手（`write-form-submitter.ts` の `unsubmittedFieldRoleOf`・`writePayloadFieldsOf`）で、選ばなかった text 系の欄は送る欄に値 `""`、組でない checkbox・radio は `absentFieldNames`、組の checkbox を選ばなかったものは hidden の名前を名前だけの一覧に。select・select-multiple・range・color を選ばなければ `SPEC_INVALID`、下書きの確かめで `SCENARIO_CREATE_SELECT_NOT_SENT`（fix round 2 で range・color にもそろえ、名前を変える）。両方の Chromium で、任意の欄のある画面で POST 1 回・`VERIFIED`、JS が選ばなかった欄に値を入れる・チェックする回は届かない。設計者の確かめ: 3 ファイル 66 件 PASS。
+
+## DEF-099 応答の前に接続が切れると、ブラウザが書き込みの POST を自動で送り直し、登録が 2 件になる（2026-10-13 T30h-1 で発見。Task 30 の範囲。安全: Critical 相当）
+
+- 現象: 書き込みの段で、サーバが登録の POST の本文を受けて登録した後、応答を返さずに接続を切ると、Chromium が同じ POST を新しい接続でもう一度送る。サーバに POST が 2 件届き、登録が 2 件できる（間は約 4〜5ms）。両方の Chromium（テストの既定と CLI の起動の設定）と、本物のワーカー（ジョブの管理から）で再現。製品の記録は送信 1 回（`SENT`、`httpStatus: null`、`UNKNOWN`（`NO_RESPONSE`）、予約 `UNKNOWN`）で、2 回目に気付けない。
+- 再現: `tests/helpers/write-site-fixture.ts` の形 `connection-drop`、`tests/integration/write-job-g30.test.ts`（今は RED）。
+- 原因（推測。未確認）: Chromium の通信の層は、使い回した keep-alive の接続が応答の前に閉じられると、要求を 1 回だけ送り直す。書き込みの画面の GET の接続が POST に使い回される。送り直しは CDP の `Fetch.requestPaused` より下で起き、Guard の照合も送信の報告も 1 回分しか見ない。
+- 影響: 承認した 1 件が 2 件の登録になりうる（「二重の登録 0」「上限の超過 0」に反する）。結果は `UNKNOWN` なので成功と偽ってはいない。ログインの段（Task 26 の自動ログインの POST）にも同じ形がありうる（未確認）。
+- 直し方: 推測で設計しない。調査（`DEF-099-research-brief.md`）で、中継（egress proxy）での数え・接続を使い回させない形・ほかの手を実機で比べてから決める。
+- G30 のテスト: 直すまで厳しい形（POST は 1 件）のまま RED で残す。5xx の予約が `COMMITTED`（応答あり）なのは決まりのとおり。
+- 修正の設計（2026-10-13、ユーザーの判断）: 書き込みは「BeakSight が 1 回だけ送る」（Guard が承認の POST を止め、照合した同じ bytes を Node の送り手が中継を通して 1 回だけ送り、`Fetch.fulfillRequest` で返す。http は中継でも 1 回に数える重ねの守り）。自動ログインは送り方を変えず、応答がない回の試しを 2 回と数える。Task 30 の設計書の 11 章の履歴。DEF-099 fix（指示書 `DEF-099-fix-brief.md`）で直す。
+
+## DEF-100 画面の監査の停止のテストで、サイトへの要求の間隔が設定より短い（2026-10-13 T30g の報告。設計者が単独で再現）
+
+- 現象: `apps/local-ui/tests/audit-ui-flows.test.ts` の「停止（PARTIAL）」で、要求 3（`/crawl/index.html`）の前の間隔が 2,423〜2,749ms（期待 2,950ms 以上）。単独で流しても FAIL（設計者の再現: 2,749ms）。
+- 影響: 本当に間隔が短くなっているなら、サイトへの負荷の決まり（`crawl.minNavigationIntervalMs`）に反する（ユーザーの決まり: 過負荷を与えない）。テストの測り方の変化（CCX-16 で `audit-ui-flows` を補助に寄せた）の可能性もある。
+- いつから: 未確認。最近の変更の候補は CCX-16（テストの補助）、CCX-19（時間の単位の定数）、T30f・DEF-098（`src/worker/`）。
+- 扱い: 原因を調べる（読み取りと再現。`DEF-100-research-brief.md`）。
+
+## DEF-101 書き込みの開始が、許可を発行した後・ジョブの行を作る前に拒まれると、予約が `RESERVED` のまま残る（2026-10-13 T30g の報告）
+
+- 現象: `audit-job-manager.ts` の `startWriteCreate` は、許可を先に確かめた後、プロファイル・認証の設定・ターゲット設定の確かめや `JOB_ALREADY_ACTIVE` で拒むと、許可を使わないまま、予約が期限（5 分）まで `RESERVED` で残る。
+- 影響: その間、同じシナリオの次の発行が同時実行の上限で拒まれうる。書き込みは起きない（止める側）。画面は発行の前に同じ確かめをして減らしたが、競合は残る。
+- 修正の設計: その段の拒否でも `closeWriteWithoutSending`（消費していない許可は無効にして予約を返す）を呼ぶ。T30g fix round 1 で直す。
+- 調査の結果（2026-10-13）: 製品の振る舞い。CLI の監査でも、サイトに届く間隔が最短 2,338ms（設定 3,000ms）。pacer は「読み込みの開始」の間隔を守っている（`navigation-pacing` は PASS）が、`page-auditor.ts` は待った後に Context を作って読み込むので、準備の時間の揺れの分だけ届く間隔が短くなる。待つ順は HEAD と同じ。揺れが大きくなったのは `context-factory.ts` の変更（DEF-085 の中継など）によると推測（未確認）。
+- 修正の設計（2026-10-13、ユーザーの判断「届く間隔も設定以上にする」）: pacer が、前の読み込みの main frame の文書の要求を実際に送った時刻（Guard が見る。送った時刻の記録を pacer に渡す）から数えて待つ。次の読み込みの開始は「前の開始 + 間隔」と「前に送った時刻 + 間隔」の遅い方以降。待った後の準備は遅らせる方にしか働かないので、届く間隔は設定以上になる。送った時刻が記録されない読み込み（止めた等）は今どおり開始の時刻で数える。書き込みの段（DEF-099 の送り手が送る）も、送り手が送った時刻を渡す。`doc/spec/site-load.md` と画面・結合のテストの確かめ（届く間隔を主に確かめる）を直す。DEF-099 fix の後に、Guard と重ならない順で直す（DEF-100 fix）。
+- DEF-101 の状態: 解決（2026-10-13 T30g fix round 1）。`startWriteCreate` が拒んだら `#releaseUnusedGrant`（依頼のシナリオとプロファイルの、消費していない・無効でない・予約 `RESERVED`・ジョブの行がない許可だけを `closeWriteWithoutSending` で返す）。3 つの拒む段で予約が `RELEASED`、次の発行ができる。残る形: 読む・確かめる・締めるが別のトランザクションなので、同じ許可の並ぶ開始が拒まれることがある（止める側。予約は残らない）。
+- DEF-097 の追記（2026-10-13 T30h-1b）: `execution-grant-processes` の「累積の上限を超えて予約しない」で `issued` が 6（期待 5）。原因の推測: 2 つの子が回ごとに注入した時刻で動き、片方が先の回に進むと、もう片方の消費していない許可が期限切れと見なされて予約が返り、発行がもう 1 回通る。予約の上限（`RELEASED` を除いた数）は守られているはず（未確認）。直し: 推測を確かめ、テストが予約の数を先に確かめ、時刻の作りを揺れない形にする（DEF-097 fix）。
+- DEF-097（`execution-grant-processes` の分）の状態: 解決（2026-10-13 DEF-097 fix）。推測を一時のテストで確かめた（回のずれで遅い子の許可が期限切れで無効、予約は `RELEASED` を除いて 1 件のまま。製品の上限は守られる）。テストは親が 2 つの子の回をそろえる形（`runInLockstep`、子 → 親の `ROUND`）にし、予約の数を先に確かめ、返した予約 0・`COMMITTED` 5 の確かめを足した。10 回続けて PASS。`control-instance-lock` の分は残り（記録だけ）。
+- DEF-099 の状態（2026-10-13 DEF-099 fix）: 書き込みは解決。`src/safety/write-submission-sender.ts` の `sendWriteSubmissionOnce`（中継だけにつなぐ、1 回だけ、redirect を追わない、30 秒・16 MiB の上限、Node 同梱と OS の証明書で確かめる、`RESPONDED`・`NOT_WRITTEN`・`NO_RESPONSE`）。Guard は照合した同じ bytes を送り手に渡し、応答を今の Document の応答の段の扱いに通して fulfill。中継は書き込みの段の http の承認の POST を 1 回に限る（`requestBudget`）。Gate `write-stage-boundary` (e)(f)。RED: 接続を切る回で 4 つの組み合わせ（既定・CLI × http・https）すべて POST 2 件。GREEN: すべて 1 件、`write-job-g30` 7/7。設計者の確かめ: typecheck のエラー 0、4 ファイル 97 件 PASS。自動ログインの数え方は未（応答がない回を親が区別できない）。判断: IPC の版 2（未公開）の `automatedLogin` に応答の有無の印を足し、応答がない送信の回は試しの行を 2 行書く（版 4 の表は変えない。2 行目も `submitted: YES`。手順書に書く）。送り手に止める口（`AbortSignal`）を足す。DEF-099 fix round 1。
+- DEF-099 の状態（2026-10-13 DEF-099 fix round 1）: 解決。自動ログインは、送った後に応答がなかった回（止めた回を含む）を、試しの行 2 行（2 行目の `job_id` は `-resent-` の印つき）で 2 回と数える。IPC の `responseAfterSubmission`。送り手に `AbortSignal`（Guard が閉じ始めるときに止める。`ABORTED`）。止めた回も 2 回と数える判断は、少なく数えない側として受ける。
+- DEF-100 の状態: 解決（2026-10-13 DEF-100 fix）。間隔の起点は、前の開始・main frame の文書の要求を送った時刻・その応答を受けた時刻のうち最も遅い時刻。CLI の監査の最短 3,025ms・3,029ms、結合の最短 3,015ms（Playwright の Chromium）・3,028ms（CLI）、設定 3,000ms。監査の時間は約 2% 長い。設計者の確かめ: `navigation-pacing`・`guard-document-sent`・`navigation-pacer` 60 件と `audit-ui-flows` 3 件 PASS。設計書 3 つ（負荷の制御、web 監査、台帳）の起点の記述を直した。
+
+## DEF-102 ログインの段の読み込みが pacer を通らない（2026-10-13 DEF-100 fix の報告）
+
+- 現象: 自動ログイン（`src/worker/automated-login.ts`、`login-stage-checks.ts`）のログインの画面の GET とログインの POST は、pacer を通らず、送った時刻も記録しない。ログインの段の factory に pacer がない。そのため、ログインの直後の最初の読み込み（発見・READ・書き込み・監査）が、ログインの POST の応答から間隔を空けずに始まりうる（推測。未測定）。
+- 影響: サイトに届く間隔が、ログインの前後で設定より短くなりうる（ユーザーの判断「届く間隔も設定以上にする」に反する）。前からある形。
+- 修正の設計: ログインの段の factory にも同じ pacer を渡し、Guard の `onMainFrameDocumentSent` で送った時刻を記録する。ログインの段の `page.goto` の前に `beforeNavigation()` を通す。手動のログイン（人が操作する画面）は対象の外。DEF-102 fix で直す。
+- DEF-102 の状態: 解決（2026-10-13 DEF-102 fix）。自動ログインの段の factory と、ログインの画面の GET・ログインの POST の前の待ちに、ジョブと同じ pacer を通した（POST の前の待ちは資格情報の復号の前）。AUDIT のジョブは、ワーカーの側でログインの段の pacer で待ってから始める（Run Coordinator が外から pacer を受け取る形は共通化の候補 CC-085）。結合の最短: ログインの GET → POST が 2,411ms・2,400ms、ログインの段の最後 → 次の読み込みが 2,026ms・2,032ms（設定 2,000ms）。許容 `SERVER_ARRIVAL_DELAY_TOLERANCE_MS` を 4 か所で 0 にした。手動のログインの段は対象の外。
+
+## DEF-103 送る直前の確かめ直しが通った後に撤回すると、登録の POST が届いて `VERIFIED` になる（2026-10-13 T30R の C-1。Critical）
+
+- 現象: `src/worker/write-create-run.ts` は、確かめ直しの後に、Context の作成 → pacer の待ち → 書き込みの画面の GET → 入力 → 300ms の待ち → 止める印の確かめ → もう一度 pacer の待ち → 押す、と進む。最後の待ちの後に止める印を確かめない。`revokeScenarioApproval` は管理データを変えるだけで、動いている書き込みのジョブに STOP を送らない。T30R の実験（本物のワーカー）で、確かめ直しの後に撤回すると、撤回の 525ms 後に POST が届き、`VERIFIED`・`COMMITTED`、シナリオは `REVOKED`。既定の間隔 5,000ms では、確かめ直しから押すまで 10 秒を超える窓がある（推測）。
+- 影響: 撤回した承認で書き込みが届く（承認の範囲の外の書き込み）。手順書 `approved-create.md` の「撤回のときは、親がジョブも止めます」と食い違う。
+- 修正の設計: (1) 確かめ直しを、最後の pacer の待ちと止める印の確かめの後、押す直前に移す（確かめ直しの結果を受けてから押すまでの間に待ちを入れない）。(2) 撤回・シナリオの変更・承認の無効化のときに、親が動いている書き込みのジョブに STOP を送る（画面のサーバの撤回の口からジョブの管理へ）。(3) ワーカーは最後の待ちの後にも止める印を確かめる。(4) G30 のテストに、確かめ直しの後に撤回する回を足す（両方の Chromium）。残る窓（確かめ直しの結果から押すまでの数 ms）は記録する。T30R-fix-1 で直す。
+
+## DEF-104 `authenticated-run` の「exceeds 256 events」（PARTIAL）が、まとめて流したときだけ落ちる（2026-10-14 CCX-22 の報告。DEF-100 fix の報告でも 1 回）
+
+- 現象: 結合のテストをまとめて流すと、`tests/integration/authenticated-run.test.ts` の「exceeds 256 events」が失敗することがある。単独では PASS。pacer を渡さない経路（CLI と同じ）。
+- 扱い: 記録だけ（ユーザーの指示: 揺らぎで流し直さない、1 つの不具合に時間をかけすぎない）。G30 の `verify:all` で再び出たら原因を調べる。
+- DEF-103 の状態: 解決（2026-10-14 T30R-fix-1）。確かめ直しを最後の pacer の待ちと止める印の確かめの後、押す直前に移した（答えから押すまでに待ち・読み込みなし）。撤回とシナリオの変更で、動いているそのシナリオの書き込みのジョブに STOP（`stopWriteJobsOfScenario`）。ほかの承認を無効にする操作は押す直前の確かめ直しで止まる。G30 に確かめ直しの後の撤回の回を 2 通り（POST 0、`NOT_SENT`・`BLOCKED`・`RELEASED`）。残る窓（答えから POST が届くまで）は 69〜277ms（手順書に記録）。
+
+## DEF-105 `guard-write-stage` の popup の回で、`page.click` が Guard の Context を閉じる処理と競合して「Target closed」になることがある（2026-10-14 T30R-fix-1 の報告。揺らぎ）
+
+- 単独で 4 回 PASS、まとめて流すと 2 回落ちた。届く POST は増えない（止める側）。DEF-1xx の popup の閉じる競合と同じ種類と推測。
+- 扱い: 記録だけ（ユーザーの指示）。G30 の `verify:all` で再び出たら原因を調べる。
+
+## DEF-106 ページの JS が約 30ms 後にもう一度送ると、303 の移り先の GET が取り消され、`HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反になる（2026-10-14 T30R-fix-1 の報告）
+
+- 止める側（届く POST は 1、Run は `ABORTED_BY_SAFETY`）。DEF-027 の限界の種類。M-1（遅い応答の間の二重送信）は直したが、この間合いは対象の外。
+- 扱い: 記録だけ。実害（サイトへの書き込み）はない。
+- DEF-106 の追記（2026-10-14 T30R2 の M-c）: CLI の Chromium で、ページの JS が送信の事象から送信を繰り返すと、止める側の `Fetch.failRequest` が `CDP_FAIL_REQUEST_FAILED` を記録して `ABORTED_BY_SAFETY` になる（DEF-026 の取り消しの証拠が間に合わない）。届く POST は 1。記録だけ。
+- DEF-105 の追記（2026-10-14 T30R2）: CLI の Chromium でまとめて流したときに 1 回再現。単独で 2/2 PASS。
+
+## DEF-107 Gate `control-store-boundary` が 1 秒を超える（2026-10-14 CCX-27 の報告）
+
+- 現象: 1,103〜1,444ms（前から）。Gate の速さの要件（1 ファイル 1 秒以内。スキル 6.3）に反する。
+- 扱い: T31e（このファイルの (m) を直すかもしれない）の後に、読み込みを 1 回にする・走査を共有するなどで直す（DEF-107 fix）。
+- DEF-107 の状態: 解決（2026-10-14 DEF-107 fix）。原因は (o) の `tests/` の全体（430 ファイル）の走査（約 355ms）と、(c)(f)(g)(n) の重い検出。`tests/` は 5 つの口の名前を含むファイルだけを走査し、重い検出に結果の変わらない前置きを足した。ファイルの中の処理は約 1.3 秒 → 約 0.8 秒、まとめての実行で 650〜700ms。34 件 PASS、`tests/architecture` 373 件 PASS。
+
+## DEF-108 状態の語でない hidden・readonly・見えない欄の値を照らさないので、ページの JS が送信の直前に `id`・`_destroy`・readonly の値を変えても書き込みが届く（2026-10-14 T31R の C-1。Critical）
+
+- 現象: 照合の期待で、状態の語に当たらない hidden・readonly・見えない欄は名前だけを照らす。T31R の実験 E6（本物の期待の作り手・Guard・送り手、両方の Chromium）で、hidden の `id` を別のレコードに、`member[_destroy]` を `1` に、readonly の `member_no` を変えた更新の POST が届いた。`lock_version` も同じ（楽観的な排他を外せる）。後の照合で `VERIFIED` にはならないが、書き込みは届く。登録（CREATE）にも同じ形がある（例 `user_id` を別の利用者に）。
+- 修正の設計（ユーザーの判断 2026-10-14「更新と登録の両方で値も照らす」）: 秘密に見える名前（CSRF のトークンなど）を除く hidden・readonly・見えない欄の値を、送る前の読み取りで読み、送る中身の照合で前の値と完全に一致することを照らす（値を照らす passthrough）。秘密に見える名前の欄は今どおり名前だけ。読んだ値は記録しない。更新の後の照合では、この欄（`lock_version` など、更新で変わってよい値）は比べない。Task 30 の 10 章の 2 と Task 31 のユーザーの判断 2 の「値を読まない」を、秘密に見えない欄について変える。T31R-fix-1 で直す。
+- DEF-108 の状態: 解決（2026-10-14 T31R-fix-1 C-1）。`isValueCheckedPassthrough`（秘密に見えない名前・disabled でない・値が 1 つの欄）を唯一の判定にし、登録は画面の確かめで `readWritePassthroughValues`、更新は前の読み取りで値を読み、`checkedPassthroughFields` で照らす。読んだ値は記録しない。更新の後の照合では比べない。RED: 両方の Chromium で登録 2 形・更新 4 形の書き換えが届いた。GREEN: すべて POST 0。CSRF（秘密に見える名前）の書き換えは届く（限界。手順書）。照合の部品は変えていない。
+- DEF-108 の残り（2026-10-14 T31R2 の C-1）: 値を照らす判定の外の形で、ページの JS が値を変えた更新が届く（両方の Chromium）。見えない checkbox（入れ子の `_destroy` をチェック）、見えない select（`owner_id`）、disabled の hidden を有効にして値を入れる（`parent_id`）、秘密に見える名前の一覧に当たる一般の名前（`code`・`key`）。修正の設計（設計者の判断。ユーザーの判断の範囲の中）: (1) 見えない checkbox・radio はチェックの状態と値を読み、チェックしていれば値を照らし、していなければ「送られない」（`absentFieldNames`）。見えない select は選んだ値を照らす（select-multiple は止める）。(2) disabled の欄は「送られない」として扱う（名前だけの一覧に入れない。同じ名前の欄と重なれば止める）。(3) 名前だけで照らす（値を読まない）のは、CSRF などページが読み込みごとに作る値の閉じた一覧の名前（`csrf`・`xsrf`・`authenticity_token`・`_token`・`token`・`nonce`・`__RequestVerificationToken` など。owner は `src/discovery/` の 1 つの判定）だけにする。それ以外の秘密に見える名前（`code`・`key`・`ticket` など）の hidden・readonly・見えない欄がある画面は、登録も更新も実行しない（値を読めず照らせないため。止める側。下書きの確かめと期待の作り手の両方）。T31R2-fix-1 で直す。
+
+## DEF-109 混雑の下で、ブラウザを閉じる処理が期限に間に合わず Run が `PARTIAL` になる（2026-10-15 G31 のための `verify:all`。単独で PASS）
+
+- 現象: `fixture-full-crawl` の 2 件が `UNHANDLED_FAILURE`（`browser-close:Browser close did not finish before its deadline`）で `PARTIAL`。`audit-worker-automated-login-fork` の「失ったセッションで止めた Run を再開すると、もう一度自動でログインする」（CLI の Chromium）も、再開した Run が `PARTIAL`（理由は記録に出ず未確認。同じ原因と推測）。
+- 単独の再実行: `fixture-full-crawl` 18/18、自動ログインの 1 件は両方の Chromium で 2/2 PASS。
+- 全体の検証は 797 秒の間にテストの時間の合計が 9,655 秒（約 12 倍の並行）で、閉じる処理の期限に近づいたと見られる（推測）。止める側（`PARTIAL`）で、サイトへの書き込みや漏れはない。
+- 扱い: 記録だけ（ユーザーの指示: 揺らぎで全体の検証を流し直さない）。揺らぎの片付けのときに、閉じる処理の時間を混雑の下で測る（DEF-093 と合わせて）。
+
+## DEF-110 `egress-close-freeze-run` の Run で、混雑の下で違反が 1 件記録される（2026-10-15 G31 のための `verify:all`。単独で PASS）
+
+- 現象: `run.json` の `safety.invariantViolationCount` が 1（`blockedActions.requests` は 0、`blockedRequestsByMethod` は空で、そこまでの確かめは通った）。違反の種類は全体の検証の出力に出ず、未確認。
+- 単独の再実行: 2/2 PASS。
+- 影響: 違反は記録された側（止める側）で、記録されない要求が届いたわけではない。ただし種類が分からないので、安全の問題でないとは言い切れない（未確認）。
+- 扱い: 記録だけ。再び出たら、テストが `run.json` の違反の一覧を出すようにして種類を確かめる。
+
+## DEF-111 `stale-lock-takeover-processes` の場面 1 で、20 回のうち 3 回、2 つの CLI がどちらも再開しない（2026-10-15 G31 のための `verify:all`。単独で PASS）
+
+- 現象: 古い開始のロックと古い Run のロックがある場面で、4・5・9 回目に両方が終了コード 4。二重の再開（`resumedTwice`）は 0。
+- 単独の再実行: PASS。
+- 影響: 止める側（どちらも再開しない）。二重の再開はない。混雑の下で、ロックの引き継ぎの待ちが期限を越えたと見られる（推測）。
+- 扱い: 記録だけ。
+- DEF-110 の調査の結果（2026-10-15 `DEF-110-research`）: 混雑（20 Run と CPU を使う 16 process）で 20 Run のうち 10 Run・8 Run で再現。違反はすべて `GUARDED_CONTEXT_CLOSE_FAILED`（`browserContext.close: Target page, context or browser has been closed`）。経路: 最後のビューポートの Passive の Context の close が 5 秒の期限（`CONTEXT_CLOSE_TIMEOUT_MS`）に間に合わず、`closePassiveContextBeforeDeadline` が待つのをやめて先へ進む（ページに `UNHANDLED_FAILURE: passive-context-close`）→ Run Coordinator の `finally` が Browser を閉じる → 裏で続いていた `context.close()` が reject → Guard の `ensureCloseAttempt` の catch（`passive-request-guard.ts` の `OWNER_CLOSE`）が違反に記録 → Run が `ABORTED_BY_SAFETY`（終了コード 3）。サーバに届いたのは GET だけ（読み取りでない要求 0、届いた数は `run.json` の数を超えない）。**安全の漏れではないが、製品の誤った判定**（混雑や重いページの本番の Run でも、監査を終えた後に偽の `ABORTED_BY_SAFETY` になる）。DEF-109 と同じ根（閉じる処理が混雑の下で 13〜21 秒）。重大度: Important。直し方: DEF-110-fix（Context がもう存在しないことを確かめられたときだけ、閉じたとみなして違反にしない）。
+- DEF-110 の状態: 解決（2026-10-15 DEF-110-fix）。Guard の `ensureCloseAttempt` は、close の reject の前にその Context の `close` の事象を見た場合だけ（`isGuardedContextGone`。`contextCloseObserved`。取り付けの最初に聞き始める）、閉じたとみなして違反にしない。文言では判定しない。見ていない reject は今のまま違反（持ち主の close と無効化の close の両方）。新しいテスト `guard-abandoned-context-close.test.ts` は修正の前 10 件中 4 件 FAIL、後は 10 件 PASS（両方の Chromium）。混雑の下の再実行（20 Run、16 process）で違反 0（DEF-110 の経路に入った Run は 4）。設計者の確かめ: 新しいテストと `passive-request-guard` で 323 件 PASS、CLI の Chromium で新しいテスト 10 件 PASS。
+
+## DEF-112 headless shell だけで、close の途中に Browser を閉じると `Target.disposeBrowserContext: Failed to find context` で reject され、その時点では close の事象がまだない（2026-10-15 DEF-110-fix の発見事項）
+
+- 現象: テストの既定の Chromium（headless shell）で、close の途中で Browser を閉じ始めると、40 回中 12 回この形で reject される。reject の時点では Context の `close` の事象がなく Browser もつながっているので、DEF-110 の直しでは確かめられず、違反のまま残る（事象はその後に出る）。
+- CLI の Chromium（本番の起動）では 80 回で 0 回。
+- 影響: テストの揺らぎの候補（止める側。偽の `ABORTED_BY_SAFETY`）。本番の Run で起きうるかは未確認。
+- 扱い: 記録だけ。出たら、reject の後に Context の `close` の事象を短い上限まで待つ形を考える（推測）。
+
+## DEF-113 PASSIVE のポップアップの最初の要求を止めているのが、route の `request.frame()` の失敗（`FRAME_CLASSIFICATION_FAILED`）だけで、明示の方針がない（2026-10-15 T32-research-3 で発見）
+
+- 事実: CDP の横取りが付く前のポップアップの最初の要求は、Playwright の route だけが見る。今は route の中で frame の判定が失敗して無効化される形で止まっている（両方の Chromium で届いた 0）。route を薄くした変種では、読み取りでない要求 6・GET 15・他 Origin の main frame 3 が記録なしで届いた。
+- 影響: 今は漏れていない。ただし止める理由が偶然に近く、Playwright の振る舞いが変わると記録なしで届く恐れがある（推測）。
+- あわせて: 今のテストは、凍結の段のポップアップの route の分岐を外しても検出しない（出口の中継が覆う）。テストの弱さ。
+- 扱い: Task 32 の CC-050 の作業で、明示の方針で止めること（ユーザーに諮る）と、回帰のテストを足す。
+
+## DEF-114 `write-form-submitter.ts` の要素の同一の確かめ（`sameElements`）が main world で動き、ページの JS が偽れる（2026-10-15 T32j-3 の報告。既存の不具合の候補）
+
+- 事実: `write-form-submitter.ts` の 1038 行あたりの `handle.evaluate((a, b) => a === b, other)` は main world で動く。`Object.prototype` に getter を足すと、別の要素を「同じ」と返した（両方の Chromium。単体の実験）。`Object.is` の書き換えでは undefined を返し、止める側になる。
+- 影響（推測）: 書き込みの段で、ページの JS が、入力や押す対象の要素の取り違えを「同じ」と見せられる。送る中身は Guard の照合（`write-payload-policy.ts`）が最後に照らすので、承認の外の中身の POST は止まる見込みだが、書き込みの流れの全体では試していない（未確認）。
+- 重大度: Important（安全の確かめの 1 つが偽れる）。
+- 扱い: Task 32 の T32j-4 で、要素の橋渡しを 1 か所（isolated world で backendNodeId を照らす形）にまとめるときに直す。独立レビュー T32R で、書き込みの流れの全体で確かめる。
+
+## DEF-115 監査の段で Guard が main frame の POST の移動を止めた画面の読み取りが、`PARTIAL`（`DOM_READINESS_FAILED`・`EVALUATION_FAILED`）になることがある（2026-10-15 T32i の報告。1 回だけ）
+
+- 現象: 読み込みの後にフォームを送る画面（`/admin/relogin`）で、Guard が送信を止めた後、その画面の読み取りが完全でないことがあった。ほかの回は `AUDITED`。
+- 影響: 止める側（読み取りの欠け）。漏れではない。止められた main frame の移動が評価の文脈を乱すと推測。
+- 扱い: 記録だけ。再び出たら原因を調べる。
+- DEF-113 の状態: 解決（2026-10-15 T32j-1）。印のない page のナビゲーションを、frame の判定の前に明示の違反 `PASSIVE_GUARD_PAGE_NOT_READY` で止めて Context を無効にする。届いた数は前後とも 0。回帰のテスト `guard-unguarded-popup.test.ts`（route の分岐を外した変種で落ちる）。凍結の段の route のテストの弱さも解消。
+- DEF-114 の状態: 解決（2026-10-15 T32j-4 と fix round 1）。書き込みの段の同じ要素の確かめは、main world の `a === b` をやめ、isolated world で読んだ位置の backendNodeId を `backendNodeIdsAtPaths`（`src/discovery/isolated-read.ts`）で照らし、操作は自前の selector engine（`beaksight-element-path`）の Locator で解決し直す形にした（候補の発見は `elementHandleOf`）。`write-form-same-element.test.ts`: 修正の前は取り違えを「同じ」と見た（POST は 0）、後は `FORM_CHANGED`（両方の Chromium 10 件）。書き込みの流れの全体での確かめは T32R で行う。
+
+## DEF-116 `controlled-scroll` の「switches once to the body when the body grows…（R'2 I-1）」が、単独でも 6 回中 2 回落ちる（2026-10-15 T32j-4 fix round 1 の報告。揺らぎ）
+
+- 両方の Chromium。fixture の 150 ms のタイマーと最初の測定の前後の順に左右されると推測。T32j-4 はこのテストの経路を変えていない。
+- 扱い: 記録だけ（ユーザーの判断 2）。
+- DEF-114 の追記（2026-10-15 T32R の I-1。Important）: 位置で照らす形なので、ページの JS が handle を得てから照らすまでの間に要素を A→B→A と入れ替えると、違う要素を「同じ」とみなす競争の窓が残る（`elementHandleOf` の実験で 300 回中 74・78 回。両方の Chromium）。書き込みの流れの全体では 50 回すべて `FORM_CHANGED`・`INPUT_FAILED` で止まり POST 0・違反 0。ユーザーの判断「直す（調査から）」により、handle そのものの身元を確かめる方式を調べる（2 回で区切る）。
+
+## DEF-117 `write-job-g30` の「no write outside the approval: a candidate changed on the page, and a candidate changed by a later discovery」が全体の検証で 1 回落ちる（2026-10-15 G32 の `verify:all`。単独で PASS）
+
+- 現象: 発見のジョブの結果の期待（`jobKind: 'DISCOVERY'` の一致）が合わなかった。単独の再実行で PASS。
+- 扱い: 記録だけ（ユーザーの判断 2）。
+
+## DEF-118 Task 32 の後退 2 種（2026-10-15 G32 の `verify:all` で発見。決まって落ちる）
+
+- `control-store-v5`・`control-store-v6` の移行のテストが、版 10 の `jobs.write_report_check` の列を数に入れていない（T32g）。
+- `passive-request-guard` の 2 件が、テストの偽の CDP の session に `detach` がないために落ちる（T32j-4 で `cdp-session.ts` が `session.detach()` を呼ぶようになった）。
+- どちらもテストの準備の古さで、製品の振る舞いの誤りではない見込み（推測。直す担当が確かめる）。
+- 扱い: DEF-118-fix で直し、単独で流し直して確かめる（全体の検証は流し直さない）。
+- DEF-118 の状態: 解決（2026-10-15 DEF-118-fix）。テストの準備だけの古さ（製品の誤りなし）。v5・v6 は `tests/helpers/control-upgrade-rows.ts` で前の版の列の写しを照らす形に、Guard の 2 件は偽の page を `adaptFakePage` で包んだ。単独で 348 件 PASS。

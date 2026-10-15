@@ -20,27 +20,18 @@ export const evidenceOfType = <TType extends EvidenceType>(
   input.evidence.filter((record): record is Extract<typeof record, EvidenceRecordFor<TType>> =>
     record.type === type && record.viewport === input.viewport) as readonly EvidenceRecordFor<TType>[];
 
-/** HTTP のステータスの範囲（両端を含む）。 */
-export interface HttpStatusRange {
-  readonly min: number;
-  readonly max: number;
-}
-
-/** 成功（2xx）の HTTP ステータスの範囲。 */
-export const SUCCESS_HTTP_STATUS_RANGE: HttpStatusRange = Object.freeze({ min: 200, max: 299 });
-/** クライアントエラー（4xx）の HTTP ステータスの範囲。 */
-export const CLIENT_ERROR_HTTP_STATUS_RANGE: HttpStatusRange = Object.freeze({ min: 400, max: 499 });
-/** サーバエラー（5xx）の HTTP ステータスの範囲。 */
-export const SERVER_ERROR_HTTP_STATUS_RANGE: HttpStatusRange = Object.freeze({ min: 500, max: 599 });
-/** エラー（4xx・5xx）の HTTP ステータスの範囲。4xx の下端から 5xx の上端まで。 */
-export const ERROR_HTTP_STATUS_RANGE: HttpStatusRange = Object.freeze({
-  min: CLIENT_ERROR_HTTP_STATUS_RANGE.min,
-  max: SERVER_ERROR_HTTP_STATUS_RANGE.max,
-});
-
-/** HTTP のステータスが範囲にあるか。観測できなかったステータス（`null`）は、どの範囲にも入らない。 */
-export const isHttpStatusInRange = (status: number | null, range: HttpStatusRange): boolean =>
-  status !== null && status >= range.min && status <= range.max;
+/**
+ * HTTP のステータスの範囲と、その判定。owner は `src/core/http-status.ts`（CCX-2。CC-042）。Rule の既存の import 元を保つため、
+ * 同じものを今の名前のまま公開し直す（ここで別の値を定義しない）。
+ */
+export {
+  CLIENT_ERROR_HTTP_STATUS_RANGE,
+  ERROR_HTTP_STATUS_RANGE,
+  SERVER_ERROR_HTTP_STATUS_RANGE,
+  SUCCESS_HTTP_STATUS_RANGE,
+  isHttpStatusInRange,
+  type HttpStatusRange,
+} from '../core/http-status.js';
 
 /** 重複を除き、コード単位の順（`compareCodeUnits`）に並べた新しい配列。入力の順序が出力に影響しないようにするために使う。 */
 export const distinctSorted = <T extends string>(values: Iterable<T>): T[] => [...new Set(values)].sort(compareCodeUnits);

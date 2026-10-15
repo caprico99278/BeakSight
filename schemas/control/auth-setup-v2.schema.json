@@ -1,0 +1,109 @@
+{
+  "$id": "urn:beaksight:schema:control:auth-setup:2",
+  "description": "Auth setup document version 2 bound to a TEST_AUTH_PASSIVE or TEST_APPROVED_WRITE profile (Task 26 design 4.3; Task 28 design 4.5; the accepted modes are decided by src/control/execution-policy.ts): the fields of version 1 (auth-setup.schema.json, Task 25 design 4.1) plus automatedLogin. Shape and limits only; the rules are in src/control/auth/auth-setup-policy.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "profileId",
+    "profileRevision",
+    "loginStartUrl",
+    "loginPostEndpoints",
+    "successCondition",
+    "sessionLostCondition",
+    "excludedPaths",
+    "auditPathPrefixes",
+    "maxLoginAttempts",
+    "allowedIdpOrigins",
+    "automatedLogin"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "beaksight-auth-setup/2" },
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "profileRevision": { "type": "integer", "minimum": 1 },
+    "loginStartUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "loginPostEndpoints": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "path"],
+        "properties": {
+          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "path": { "type": "string", "maxLength": 2048 }
+        }
+      }
+    },
+    "successCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "maxLength": 2048 },
+        "selector": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "sessionLostCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix"],
+      "properties": {
+        "pathPrefix": { "type": ["string", "null"], "maxLength": 2048 }
+      }
+    },
+    "excludedPaths": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "auditPathPrefixes": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "maxLoginAttempts": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "allowedIdpOrigins": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "automatedLogin": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["usernameSelector", "passwordSelector", "submitSelector", "failureConditions"],
+      "properties": {
+        "usernameSelector": { "type": "string", "maxLength": 256 },
+        "passwordSelector": { "type": "string", "maxLength": 256 },
+        "submitSelector": { "type": "string", "maxLength": 256 },
+        "failureConditions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["invalidCredentials", "accountLocked", "mfaRequired", "credentialExpired"],
+          "properties": {
+            "invalidCredentials": { "$ref": "#/$defs/failureCondition" },
+            "accountLocked": { "$ref": "#/$defs/failureCondition" },
+            "mfaRequired": { "$ref": "#/$defs/failureCondition" },
+            "credentialExpired": { "$ref": "#/$defs/failureCondition" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "failureCondition": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "maxLength": 2048 },
+        "selector": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    }
+  }
+}

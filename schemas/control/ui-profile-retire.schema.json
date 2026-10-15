@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-retire:1",
+  "description": "Local UI Server Function input: retire a profile.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+  }
+}

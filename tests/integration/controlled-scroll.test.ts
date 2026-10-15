@@ -24,6 +24,7 @@ useHeadlessChromium((launched) => {
   browser = launched;
 });
 
+// CCX-21（CC-049）: page は個別に閉じず、Context と一緒に閉じる（製品と同じ。DEF-038）。各テストの page は、ここで Context ごと閉じる。
 afterEach(async () => {
   vi.useRealTimers();
   await closePassiveResources({ factory, context }, { forceCloseContextOnFailure: true });
@@ -76,7 +77,6 @@ describe('page settling and controlled scrolling', () => {
     expect(Object.isFrozen(result.observations)).toBe(true);
     expect(Object.isFrozen(result.observations[0])).toBe(true);
 
-    await factory.closePassivePage(page);
   });
 
   it('observes repeated lazy height growth and reaches the final stable bottom', async () => {
@@ -112,8 +112,10 @@ describe('page settling and controlled scrolling', () => {
     expect(Object.isFrozen(result.observations)).toBe(true);
     expect(Object.isFrozen(result.restoration)).toBe(true);
 
-    await factory.closePassivePage(page);
-    expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+    // page は個別に閉じず、Context と一緒に閉じる（DEF-038。CCX-21）。閉じた後の Ledger にも違反がない。
+    const ledger = factory.getSafetyLedger(context);
+    await factory.closePassiveContext(context);
+    expect(ledger.snapshot().invariantViolations).toEqual([]);
   });
 
   it('tracks a scrolling body when the root element cannot scroll and returns it to the top', async () => {
@@ -137,7 +139,6 @@ describe('page settling and controlled scrolling', () => {
     expect(fixtureState).toMatchObject({ bodyScrollTop: 0, windowScrollY: 0 });
     expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
-    await factory.closePassivePage(page);
   });
 
   it('traverses the scrolling body to its bottom even when the document scrolls by the default body margin', async () => {
@@ -170,7 +171,6 @@ describe('page settling and controlled scrolling', () => {
     expect(fixtureState).toMatchObject({ bodyScrollTop: 0, windowScrollY: 0 });
     expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL when an inner container scrolls more than the document scrolls by the default body margin', async () => {
@@ -201,7 +201,6 @@ describe('page settling and controlled scrolling', () => {
     // 内側の領域はたどらない。
     expect(fixtureState.shellScrollTop).toBe(0);
 
-    await factory.closePassivePage(page);
   });
 
   it('switches once to the body when the body grows larger than the traversed document before completion (R\'2 I-1)', async () => {
@@ -234,7 +233,6 @@ describe('page settling and controlled scrolling', () => {
     expect(fixtureState).toMatchObject({ bodyScrollTop: 0, windowScrollY: 0 });
     expect(result.restoration).toEqual({ status: 'RESTORED', position: { scrollX: 0, scrollY: 0 } });
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL when an inner container inside an open shadow root scrolls more than the document (R\'2 I-3)', async () => {
@@ -263,7 +261,6 @@ describe('page settling and controlled scrolling', () => {
     });
     expect(fixtureState.shellScrollTop).toBe(0);
 
-    await factory.closePassivePage(page);
   });
 
   it('counts the elements inside open shadow roots toward the inner container scan limit (R\'2 I-3)', async () => {
@@ -278,7 +275,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.innerScrollScan?.scanLimitReached).toBe(true);
     expect(result.innerScrollScan?.scannedElementCount).toBeGreaterThan(lightElementCount);
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL when content is taller than the viewport but no document scroller exists', async () => {
@@ -291,7 +287,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.finalSnapshot?.scrollTarget).toBeNull();
     expect(result.finalSnapshot?.contentHeight).toBeGreaterThan(result.finalSnapshot?.viewportHeight ?? Infinity);
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL instead of waiting for the deadline when the document never advances', async () => {
@@ -306,7 +301,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.observations.every((observation) => !observation.atBottom)).toBe(true);
     expect(performance.now() - startedAt).toBeLessThan(2_500);
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL when only an inner container scrolls while html and body cannot scroll', async () => {
@@ -341,7 +335,6 @@ describe('page settling and controlled scrolling', () => {
     // 内側の領域を動かしていないので、遅延読み込みは起きていない。
     expect(fixtureState).toMatchObject({ batches: 0, shellScrollTop: 0 });
 
-    await factory.closePassivePage(page);
   });
 
   it('keeps COMPLETE for a page that fits in the viewport and ignores hidden, clipped, or fitting boxes', async () => {
@@ -355,7 +348,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.innerScrollScan).toMatchObject({ containerCount: 0, scanLimitReached: false, representative: null });
     expect(result.innerScrollScan?.scannedElementCount).toBeGreaterThan(0);
 
-    await factory.closePassivePage(page);
   });
 
   it('compares inner containers with the document even when the document itself scrolls', async () => {
@@ -368,7 +360,6 @@ describe('page settling and controlled scrolling', () => {
     expect(result.finalSnapshot?.scrollTarget).toBe('SCROLLING_ELEMENT');
     expect(result.innerScrollScan).toMatchObject({ containerCount: 0, scanLimitReached: false, representative: null });
 
-    await factory.closePassivePage(page);
   });
 
   it('returns PARTIAL with the recorded fact when the inner container scan reaches its limit', async () => {
@@ -831,7 +822,6 @@ describe('page settling and controlled scrolling', () => {
       expect(result.finalSnapshot.atBottom).toBe(false);
     }
 
-    await factory.closePassivePage(page);
   });
 
   it('never promotes a settling observation completed at the absolute deadline', async () => {
@@ -949,6 +939,16 @@ describe('page settling and controlled scrolling', () => {
     };
     const fakeRoot = { scrollTop: 0, clientHeight: 100, scrollHeight: 100, scrollTo: vi.fn() };
     const fakeDocument = { scrollingElement: fakeRoot, documentElement: fakeRoot, body: null };
+    // DEF-073: ブラウザの中の関数は、`document` のプロパティを `Document.prototype` の getter で読む。偽の `Document` の prototype に、
+    // 偽の `document` の値を返す getter（`scrollingElement`・`documentElement`・`body`）を置く。
+    const fakeDocumentConstructor = {
+      prototype: Object.defineProperties({}, Object.fromEntries(
+        (['scrollingElement', 'documentElement', 'body'] as const).map((name) => [
+          name,
+          { get(this: typeof fakeDocument): unknown { return this[name]; } },
+        ]),
+      )),
+    };
     const fakePage = {
       isClosed: () => false,
       evaluate: vi.fn(async (callback: (argument: unknown) => unknown, argument: unknown) => {
@@ -961,13 +961,20 @@ describe('page settling and controlled scrolling', () => {
         }
         const previousWindow = globalThis.window;
         const previousDocument = globalThis.document;
+        const previousDocumentConstructor = Object.getOwnPropertyDescriptor(globalThis, 'Document');
         Object.defineProperty(globalThis, 'window', { value: fakeWindow, configurable: true });
         Object.defineProperty(globalThis, 'document', { value: fakeDocument, configurable: true });
+        Object.defineProperty(globalThis, 'Document', { value: fakeDocumentConstructor, configurable: true });
         try {
           return callback(argument);
         } finally {
           Object.defineProperty(globalThis, 'window', { value: previousWindow, configurable: true });
           Object.defineProperty(globalThis, 'document', { value: previousDocument, configurable: true });
+          if (previousDocumentConstructor === undefined) {
+            Reflect.deleteProperty(globalThis, 'Document');
+          } else {
+            Object.defineProperty(globalThis, 'Document', previousDocumentConstructor);
+          }
         }
       }),
     } as unknown as Page;

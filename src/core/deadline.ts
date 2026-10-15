@@ -81,6 +81,17 @@ export function resolveTimeoutMs(value: number | undefined, defaultMs: number): 
   return value;
 }
 
+/**
+ * 期限 `deadlineAtMs`（`Date.now()` の絶対時刻。`undefined` なら期限なし）と、今から `timeoutMs` 後の、早い方の時刻を返す（CCX-7b。CC-047）。
+ * 呼び出し元のより長い期限の中で、ある処理（session の作成、観察の開始など）を長く待たないための期限に使う。この計算は、ここだけで行う。
+ * - 今の時刻は `Date.now()` を 1 回だけ読む。
+ * - 値は検証しない（呼び出し元が、期限と `timeoutMs` を検証する）。期限が有限でなければ、`Math.min` のとおりになる。
+ */
+export function deadlineWithinTimeoutAtMs(deadlineAtMs: number | undefined, timeoutMs: number): number {
+  const timeoutAtMs = Date.now() + timeoutMs;
+  return deadlineAtMs === undefined ? timeoutAtMs : Math.min(deadlineAtMs, timeoutAtMs);
+}
+
 /** `delayMs` ミリ秒の後に解決する。 */
 export function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, delayMs));

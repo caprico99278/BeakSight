@@ -3,6 +3,7 @@ import type { PageId } from '../core/contracts.js';
 import type { LinkAdmissionEvidence, LinkDiscoveryEvidence, LinkEvidence } from '../core/evidence-types.js';
 import { MAX_URL_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace, truncateText } from '../core/text.js';
+import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
 import { classifyUrl, type AdmissionPolicy, type UrlAdmission } from './admission-policy.js';
 import { normalizeUrl, redactUrlCredentials, type NormalizedUrlResult } from './normalize-url.js';
 
@@ -112,6 +113,54 @@ const toLinkEvidence = (anchor: ExtractedAnchor, sourcePageId: PageId, policy: L
   };
 };
 
+/** `extractAnchorsReader` の入力（集める要素のセレクタと、記録する最大件数）。 */
+interface AnchorExtractionInput {
+  readonly selector: string;
+  readonly maxLinks: number;
+}
+
+/**
+ * ページの中で、標準のメソッドで link を集める（DEF-074。集め方と順は `discoverLinks` の説明のとおり）。部品（`R`）を `composeInPage` で
+ * 組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ */
+function extractAnchorsReader(R: StandardReaders, { selector, maxLinks }: AnchorExtractionInput): ExtractedAnchors {
+  // DOM clobbering（DEF-073・DEF-074）: 名前つきの img・form など（`<img name="baseURI">`、`<img name="querySelectorAll">`）は、`document` の
+  // 同じ名前のプロパティとメソッドを、form の中の名前つきの入力の欄は form のそれを隠すので、`document` と要素（form になりうる）は、
+  // 標準の prototype の getter とメソッドで読む（getter は部品の `standardProperty`・`optionalStandardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
+  // a 要素と shadow root は、名前つきの子でプロパティが隠れないので、そのまま読む。
+  const baseUrl = R.standardProperty<string>(Node.prototype, 'baseURI', document);
+  const shadowRootGetterOf = R.optionalStandardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
+  const shadowRootOf = (element: Element): ShadowRoot | null => shadowRootGetterOf(element) ?? null;
+  const queryAll = (root: Document | ShadowRoot, selectors: string): NodeListOf<Element> => (
+    root instanceof Document ? Document.prototype.querySelectorAll.call(root, selectors) : root.querySelectorAll(selectors)
+  );
+  const elements: Element[] = [];
+  const collect = (root: Document | ShadowRoot): void => {
+    elements.push(...queryAll(root, selector));
+    for (const element of queryAll(root, '*')) {
+      const shadowRoot = shadowRootOf(element);
+      if (shadowRoot !== null) {
+        collect(shadowRoot);
+      }
+    }
+  };
+  collect(document);
+  return {
+    totalCount: elements.length,
+    anchors: elements.slice(0, maxLinks).map((element) => {
+      const anchor = element as HTMLAnchorElement;
+      return {
+        anchorText: anchor.textContent,
+        ariaLabel: anchor.getAttribute('aria-label'),
+        title: anchor.getAttribute('title'),
+        rawHref: anchor.getAttribute('href') ?? '',
+        baseUrl,
+      };
+    }),
+  };
+}
+const extractAnchorsInPage = composeInPage(extractAnchorsReader);
+
 /**
  * 本番で使用する唯一のアンカー抽出処理（link の Evidence の payload を返す）。証跡を返すのみであり、
  * INTERNAL_NAVIGABLEの許可を巡回候補にするかどうかは呼び出し側が判断する。
@@ -127,19 +176,11 @@ export const discoverLinks = async (
   if (typeof policy !== 'object' || policy === null) {
     throw new TypeError('discoverLinks requires an explicit link discovery policy');
   }
-  const extracted = await page.locator('a[href]').evaluateAll((elements, maxLinks): ExtractedAnchors => ({
-    totalCount: elements.length,
-    anchors: elements.slice(0, maxLinks).map((element) => {
-      const anchor = element as HTMLAnchorElement;
-      return {
-        anchorText: anchor.textContent,
-        ariaLabel: anchor.getAttribute('aria-label'),
-        title: anchor.getAttribute('title'),
-        rawHref: anchor.getAttribute('href') ?? '',
-        baseUrl: document.baseURI,
-      };
-    }),
-  }), LINK_LIMITS.maxLinks);
+  // ページの中で、標準のメソッドで link を集める（DEF-074）。Playwright の `locator(...).evaluateAll` は、ページの `document.querySelectorAll`
+  // と要素の `matches` を使うので、名前つきの要素（`<img name="querySelectorAll">` など）に隠されると失敗する。集め方と順は、Playwright の
+  // CSS のセレクタの集め方（open な shadow root を貫く）と同じにする: 文書の中の一致を文書の順に並べ、その後に、文書の中のすべての要素の
+  // open な shadow root を、要素の文書の順に、同じ集め方で（入れ子を含めて）たどる。
+  const extracted = await page.evaluate(extractAnchorsInPage, { selector: 'a[href]', maxLinks: LINK_LIMITS.maxLinks });
 
   return {
     links: extracted.anchors.map((anchor) => toLinkEvidence(anchor, sourcePageId, policy)),

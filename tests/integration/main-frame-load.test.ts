@@ -4,8 +4,7 @@
 // `httpStatus`、`failureDetail`）を作る。実際の headless の Chromium と、テストの中のローカルのサーバ（127.0.0.1）で確かめる。
 // 観測を `siteUnavailabilityOf` に渡し、応答（ヘッダ）のない時間切れだけが不調になることも確かめる（応答を受けた後の時間切れは不調でない）。
 import { EventEmitter } from 'node:events';
-import { createServer, type ServerResponse } from 'node:http';
-import type { Socket } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -18,6 +17,7 @@ import { awaitBeforeDeadline } from '../../src/core/deadline.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { SITE_UNAVAILABLE_HTTP_STATUSES, siteUnavailabilityOf } from '../../src/orchestration/site-availability.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { closedLoopbackOrigin, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 
 /** Playwright の読み込みの期限（ms）。実際に期限切れを起こすので、短くする。 */
 const LOAD_TIMEOUT_MS = 1_000;
@@ -131,40 +131,15 @@ function respond(path: string, response: ServerResponse): void {
 
 async function startTestServer(): Promise<TestServer> {
   const requestedPaths: string[] = [];
-  const sockets = new Set<Socket>();
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const path = request.url ?? '/';
     requestedPaths.push(path);
     respond(path, response);
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  const port = await new Promise<number>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
-      const address = server.address();
-      if (address === null || typeof address === 'string') {
-        reject(new Error('test server did not bind to a TCP port'));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-  let closing: Promise<void> | undefined;
   const testServer: TestServer = {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     requestedPaths: () => [...requestedPaths],
-    close: () => {
-      closing ??= new Promise<void>((resolve, reject) => {
-        for (const socket of sockets) {
-          socket.destroy();
-        }
-        server.close((error) => (error === undefined ? resolve() : reject(error)));
-      });
-      return closing;
-    },
+    close: server.close,
   };
   servers.push(testServer);
   return testServer;
@@ -338,13 +313,12 @@ describe('observeMainFrameLoad with a real Chromium and a local server (design 2
   });
 
   it('observes FAILED with net::ERR_CONNECTION_REFUSED and without an HTTP status for a closed port', async () => {
-    const closed = await startTestServer();
-    await closed.close();
+    const closedOrigin = await closedLoopbackOrigin();
     const page = await newPage();
 
     const { observation, elapsedMs } = await observeGoto(
       page,
-      `${closed.origin}${PATHS.ok}`,
+      `${closedOrigin}${PATHS.ok}`,
       'domcontentloaded',
       REFUSED_CONNECTION_TIMEOUT_MS,
     );

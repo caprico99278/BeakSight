@@ -735,8 +735,10 @@ describe('P18b: Safety Ledger types (CC-015, CC-028)', () => {
   });
 
   // CC-028: Ledger の記録の分類の名前は、事象の一覧の名前（core の `SafetyEventKind`）と `'invariantViolations'` に限る。
+  // T25b round 1（Task 25 の設計書 4.2）: 監査の段の除外の記録（`blockedAuditExclusions`。省略できる項目で、事象の種類の一覧には
+  // 含めない）も、記録の上限の分類の名前に加える。
   it('narrows the names of the Ledger record categories to the Safety event kinds and the invariant violations (CC-028)', () => {
-    expectTypeOf<SafetyLedgerRecordCategory>().toEqualTypeOf<SafetyEventKind | 'invariantViolations'>();
+    expectTypeOf<SafetyLedgerRecordCategory>().toEqualTypeOf<SafetyEventKind | 'blockedAuditExclusions' | 'invariantViolations'>();
 
     // @ts-expect-error 書き間違えた分類の名前は、型のエラーになる。
     const misspelled: SafetyLedgerRecordCategory = 'blockedRequest';

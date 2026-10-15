@@ -33,6 +33,15 @@ export const FAST_RUN_OVERRIDES: TestConfigOverrides = Object.freeze({
   audit: Object.freeze({ screenshots: false }),
 });
 
+/**
+ * DEF-079: 2 つの Run の結果が同じであること（再開しても中断しなかった場合と同じ、など）を Finding の ID まで比べるテストの、監査の設定。
+ * 性能の指標（Web Vitals）の収集をしない。性能の Rule（`POOR_TTFB` など）の結果は、計測の値で決まり、CPU の混雑で変わる（headless
+ * Chromium で 127.0.0.1 のページの TTFB を測ると、混雑なしで最大 9 ms、強い混雑の下で 30 回中 3 回が `POOR_TTFB` の境界 1,800 ms を超えた）。
+ * 片方の Run にだけ Finding が出ると、以降の Finding の ID がずれる。境界は製品の定数で、設定では変えられないので、収集の設定で外す。
+ * ほかの比べ（ページ、ID、Evidence、Finding の ID・ruleId・fingerprint、Run Status、SKIPPED の理由、Safety の集計）は変えない。
+ */
+export const RUN_IDENTITY_AUDIT_OVERRIDES: NonNullable<TestConfigOverrides['audit']> = Object.freeze({ performance: false });
+
 /** `FAST_RUN_OVERRIDES` に、`overrides` をセクションの項目ごとに重ねる（`overrides` の項目が優先する）。 */
 export function fastRunOverrides(overrides: TestConfigOverrides = {}): TestConfigOverrides {
   const merged: Record<string, unknown> = { ...FAST_RUN_OVERRIDES, ...overrides };

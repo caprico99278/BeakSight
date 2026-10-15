@@ -432,8 +432,10 @@ describe('createChatGptBundle', () => {
     const withoutDescription = (reasons: readonly { readonly code: string; readonly detail: string | null }[]): unknown =>
       reasons.map(({ code, detail }) => ({ code, detail }));
 
+    // CCX-19: 実行の記録の最後の実行の終わりの時刻（`lastFinishedAt`）は、`summary.json` に入れない（形を変えない）。
+    const { lastFinishedAt: _lastFinishedAt, ...executions } = model.summary.executions;
     expect(jsonOf(entries, 'summary.json')).toEqual(
-      JSON.parse(JSON.stringify({ ...model.summary, incompleteReasons: withoutDescription(model.summary.incompleteReasons) })),
+      JSON.parse(JSON.stringify({ ...model.summary, executions, incompleteReasons: withoutDescription(model.summary.incompleteReasons) })),
     );
     expect(jsonOf(entries, 'pages.json')).toEqual(
       JSON.parse(JSON.stringify(model.pages.map(({ findings, retryAttempts, incompleteReasons, viewports, ...rest }) => ({
@@ -464,7 +466,7 @@ describe('createChatGptBundle', () => {
 
   // R6（中断した Run の再開の設計書 4.8 の「表示」）: `summary.json` の `executions` は、表示用モデルの要約の `executions`（実行の回数、
   // 再開の回数、`run.json` の `executions` の写し）と同じ値である。バンドルの側で数え直さない。終わり方は、コードのまま入れる
-  // （日本語のラベルと説明は入れない）。
+  // （日本語のラベルと説明は入れない）。CCX-19（CC-048）: 表示用モデルの最後の実行の終わりの時刻（`lastFinishedAt`）は入れない（形を変えない）。
   it('puts the same executions as the view model summary (the counts and the copy of run.json executions) in summary.json', async () => {
     const base = edgeCaseAuditRun();
     const result: AuditRunResult = { ...base, run: { ...base.run, executions: executionsDisplaySample() } };
@@ -473,7 +475,8 @@ describe('createChatGptBundle', () => {
     const summary = jsonOf(entries, 'summary.json') as { readonly executions?: unknown };
 
     expect(summary.executions).toEqual({ count: 3, resumeCount: 2, lastEndReason: 'COMPLETED', items: executionsDisplaySample() });
-    expect(summary.executions).toEqual(JSON.parse(JSON.stringify(model.summary.executions)));
+    const { lastFinishedAt: _lastFinishedAt, ...withoutLastFinishedAt } = model.summary.executions;
+    expect(summary.executions).toEqual(JSON.parse(JSON.stringify(withoutLastFinishedAt)));
     const text = decodeUtf8(entries['summary.json'] ?? new Uint8Array());
     for (const spec of Object.values<DisplaySpec>(RUN_EXECUTION_END_REASON_CATALOG)) {
       expect(text).not.toContain(spec.label);
@@ -783,4 +786,15 @@ describe('createChatGptBundle: the budget of the screenshots (R16f, design 6.1.1
       expect(store.calls).toEqual([]);
     },
   );
+});
+
+// T32f（Task 32 の設計書 4.1 の「決定論の ZIP」）: ZIP の組み立て（時刻の固定、目録の sha256）を共通の部品 `deterministic-zip.ts`（T32R2 M-2 から `src/core/`）に
+// 出す前に、今のバンドルのバイト列を sha256 で固定する（移した後も、監査のバンドルは 1 バイトも変わらない）。
+describe('createChatGptBundle: the bytes stay the same when the ZIP is built by a shared part (T32f)', () => {
+  it.each<readonly [string, () => AuditRunResult, string]>([
+    ['the audit run sample', auditRun, 'sha256:efc9a609a2d96869c836813df02e5846215d82c1e54c1fe83befb78834f14a68'],
+    ['the edge case sample', edgeCaseAuditRun, 'sha256:9944d215969160c2c4f8ec4b43877381dbcbe983ce58b6a335b83665ddccf7fd'],
+  ])('keeps the SHA-256 of the bundle of %s', async (_label, sample, expected) => {
+    expect(sha256Of(await bundleOf(sample()))).toBe(expected);
+  });
 });

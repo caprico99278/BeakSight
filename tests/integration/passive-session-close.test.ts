@@ -1,8 +1,7 @@
 // CC-018: page と Context を閉じる手順（page を閉じてから Context を閉じる。Guard がすでに Context を閉じていれば、
 // Context は閉じ直さない）と、その失敗の一覧を返す部品。例外にするか理由にするかは、呼び出し側が決める。
-import { createServer } from 'node:http';
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
@@ -10,10 +9,9 @@ import { navigatePage } from '../../src/orchestration/page-navigation.js';
 import {
   closePassiveContextBeforeDeadline,
   closePassivePageAndContext,
-  closePassivePageBeforeDeadline,
   PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE,
   PassiveContextCloseDeadlineError,
-  PassivePageCloseDeadlineError,
+  type PassiveSessionCloseTimeouts,
 } from '../../src/orchestration/passive-session-close.js';
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
@@ -27,6 +25,7 @@ import {
   UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
   UNLOAD_BEACON_TARGET_PATH,
 } from '../helpers/gate-harness.js';
+import { closedLoopbackOrigin } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -46,7 +45,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-/** 注入する短い期限（ms）。実際の期限（`PAGE_CLOSE_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を待たない（R15r-4）。 */
+/** 注入する短い期限（ms）。実際の期限（`CONTEXT_CLOSE_TIMEOUT_MS`）を待たない（R15r-4）。 */
 const SHORT_CLOSE_TIMEOUT_MS = 200;
 /** 期限を過ぎてから戻るまでの余裕（偽の factory の場合）。 */
 const FAKE_CLOSE_MARGIN_MS = 1_000;
@@ -105,11 +104,12 @@ describe('closePassivePageAndContext (CC-018)', () => {
     expect(events).toEqual(['closeContext']);
   });
 
-  // DEF-038: page を閉じる処理の期限（`pageCloseTimeoutMs`）は、閉じる手順で読まない（整理は CC-049）。
-  it('does not read the page close deadline (DEF-038)', async () => {
+  // DEF-038: page を閉じる処理の期限は、閉じる手順で使わない。CCX-21（CC-049）で注入口からも消した（型にない）。型を外して渡しても読まない。
+  it('has no page close deadline, and does not read one (DEF-038, CCX-21)', async () => {
     const { factory, events } = fakeFactory();
 
-    await expect(closePassivePageAndContext(factory, fakeContext, { pageCloseTimeoutMs: 0 })).resolves.toEqual([]);
+    expectTypeOf<PassiveSessionCloseTimeouts>().not.toHaveProperty('pageCloseTimeoutMs');
+    await expect(closePassivePageAndContext(factory, fakeContext, { pageCloseTimeoutMs: 0 } as never)).resolves.toEqual([]);
     expect(events).toEqual(['closeContext']);
   });
 
@@ -182,33 +182,6 @@ describe('closePassivePageAndContext (CC-018)', () => {
     expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
     // factory は、閉じた Context の page を、もう持たない（DEF-038）。
     await expect(factory.closePassivePage(page)).rejects.toThrow(/owned/i);
-  });
-});
-
-// R15r-4: page を閉じる処理の期限は、注入できる。既定値は `PAGE_CLOSE_TIMEOUT_MS`。
-describe('closePassivePageBeforeDeadline with an injected deadline (R15r-4)', () => {
-  it('returns the page close deadline failure at the injected deadline', async () => {
-    const { factory, events } = fakeFactory({ pageHangs: true });
-
-    const startedAt = performance.now();
-    const failure = await closePassivePageBeforeDeadline(factory, fakePage, { timeoutMs: SHORT_CLOSE_TIMEOUT_MS });
-    const elapsedMs = performance.now() - startedAt;
-
-    expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
-    expect(failure?.step).toBe('page');
-    expect(failure?.error).toBeInstanceOf(PassivePageCloseDeadlineError);
-    expect(Object.isFrozen(failure)).toBe(true);
-    expect(events).toEqual(['closePage']);
-  }, SHORT_DEADLINE_TEST_TIMEOUT_MS);
-
-  it('rejects a deadline that is not a positive safe integer', async () => {
-    const { factory, events } = fakeFactory();
-
-    for (const timeoutMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-      await expect(closePassivePageBeforeDeadline(factory, fakePage, { timeoutMs })).rejects.toThrow(RangeError);
-    }
-    expect(events).toEqual([]);
   });
 });
 
@@ -333,7 +306,6 @@ describe('closePassivePageAndContext with deadlines (DEF-008)', () => {
 
     const startedAt = performance.now();
     const failures = await closePassivePageAndContext(factory, fakeContext, {
-      pageCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
       contextCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
     });
     const elapsedMs = performance.now() - startedAt;
@@ -350,31 +322,13 @@ describe('closePassivePageAndContext with deadlines (DEF-008)', () => {
 // `page.close()` が終わらない（DEF-005 の調査）。DEF-038 の後は、page を個別に閉じず、Context と一緒に閉じるので、page を閉じる処理を
 // 待たない。この条件でも、Context を閉じる処理が page を閉じ、止まらずに戻ることを確かめる。
 describe('closePassivePageAndContext with a page that Chromium does not close (DEF-006)', () => {
-  /** Context を閉じて戻るまでの余裕（ms）。既定の page を閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`）より短い。 */
+  /** Context を閉じて戻るまでの余裕（ms）。以前の既定の page を閉じる処理の期限（5 秒。CCX-21 で消した）より短い。 */
   const CLOSE_MARGIN_MS = 3_000;
   const TEST_TIMEOUT_MS = CLOSE_MARGIN_MS + 10_000;
 
-  /** 127.0.0.1 の、いま使われていないポートの Origin（ポートを一度確保して、すぐに解放する。接続を拒否する）。 */
-  async function unusedLoopbackOrigin(): Promise<string> {
-    const probe = createServer();
-    const port = await new Promise<number>((resolvePort, reject) => {
-      probe.once('error', reject);
-      probe.listen({ host: '127.0.0.1', port: 0 }, () => {
-        const address = probe.address();
-        if (address === null || typeof address === 'string') {
-          reject(new Error('probe server did not bind to a TCP port'));
-          return;
-        }
-        resolvePort(address.port);
-      });
-    });
-    await new Promise<void>((resolveClose) => probe.close(() => resolveClose()));
-    return `http://127.0.0.1:${port}`;
-  }
-
   /** Guard の付いた page で、接続を拒否する Origin へ2回続けてナビゲーションする（2回とも失敗する）。 */
   async function openPageShowingErrorAfterTwoFailures() {
-    const unreachableOrigin = await unusedLoopbackOrigin();
+    const unreachableOrigin = await closedLoopbackOrigin();
     const factory = new BrowserContextFactory(browser, createTestConfig(unreachableOrigin), () => new SafetyLedger());
     const context = await factory.createPassiveContext(VIEWPORT);
     const page = await factory.createPassivePage(context);
@@ -419,7 +373,7 @@ describe('closePassivePageAndContext with a page that Chromium does not close (D
     const failures = await closePassivePageAndContext(factory, context);
     const elapsedMs = performance.now() - startedAt;
 
-    // 既定の page を閉じる処理の期限（`PAGE_CLOSE_TIMEOUT_MS`）を待った場合は、ここで失敗する。
+    // 以前の page を閉じる処理の期限（5 秒）を待った場合は、ここで失敗する。
     expect(elapsedMs).toBeLessThan(CLOSE_MARGIN_MS);
     expect(failures).toEqual([]);
     expect(vi.mocked(factory.closePassivePage)).not.toHaveBeenCalled();

@@ -197,7 +197,7 @@ describe('runPreflight (R15c)', () => {
     await page.goto(`${server.origin}/index.html`, { waitUntil: 'load' });
     await expect.poll(() => loadMeter.snapshot().allowedOrigins.count).toBe(1);
     expect(server.getRequestObservations()).toHaveLength(1);
-    await result.factory.closePassivePage(page);
+    // page は個別に閉じず、Context と一緒に閉じる（DEF-038。CCX-21）。
     await result.factory.closePassiveContext(context);
   });
 

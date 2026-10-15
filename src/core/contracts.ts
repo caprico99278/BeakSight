@@ -18,6 +18,8 @@ import type {
 } from './evidence-types.js';
 // 型だけの import（実行時の依存はない。`status.ts` は、このファイルの型と値を使う）。
 import type { RunStatusInput } from './status.js';
+// 未完了の理由の確かめ（`isIncompleteReason`）が使う。`guards.ts` は何も import しない。
+import { isRecord } from './guards.js';
 
 export type RunId = string & { readonly __brand: 'RunId' };
 export type PageId = string & { readonly __brand: 'PageId' };
@@ -169,6 +171,17 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
    */
   'SITE_UNAVAILABLE',
+  /**
+   * 認証つきの Run（Task 25 の設計書 4.3、4.7。T25c）で、監査の段の main frame の最後の URL がセッションの切れ（ログインの画面）の path に
+   * 当たったため、そのページを監査せず、その後の監査を始めなかった。公開監査（認証の指定のない Run）では現れない。
+   * - 止まるきっかけのページ（捨てたページ）と、始めなかったページ（`SKIPPED`）の理由。きっかけのページの `detail` は、当たった場所
+   *   （`<ビューポート>:<段階>`。例: `desktop:passive`、`desktop:stress-layout`。URL は入れない）。始めなかったページの `detail` は `null`。
+   * - Run の理由にも1件残す（`detail` は `null`。SKIPPED のページから、最後の処理で導く）。
+   * - 当たったビューポートの理由としても使い（`FAILED`。`detail` は `<段階>`）、その後に始めなかったビューポートは `SKIPPED`（`detail` は `null`）。
+   * - 再開のときは、この理由の SKIPPED の URL を、待ち行列に戻す（`RESUME_REQUEUE_SKIP_REASON_CODES`）。再開のときのログインは T25d。
+   * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
+   */
+  'AUTH_SESSION_LOST',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -201,6 +214,27 @@ export interface IncompleteReason {
   readonly code: IncompleteReasonCode;
   readonly detail: string | null;
 }
+
+/**
+ * 未完了の理由のコード（`INCOMPLETE_REASON_CODES` の値）か（CC-034。理由のコードの閉じた一覧に入っているかの確かめは、ここに1つだけ置く）。
+ * 保存から読んだ値など、型の印のない値を確かめるのに使う。
+ */
+export const isIncompleteReasonCode = (value: unknown): value is IncompleteReasonCode =>
+  typeof value === 'string' && (INCOMPLETE_REASON_CODES as readonly string[]).includes(value);
+
+/** 未完了の理由の `detail`（文字列か `null`）か（CC-034）。 */
+export const isIncompleteReasonDetail = (value: unknown): value is IncompleteReason['detail'] =>
+  value === null || typeof value === 'string';
+
+/**
+ * 未完了の理由（`IncompleteReason`）か（CC-034）。配列でないオブジェクトで、コードが `isIncompleteReasonCode`、自分の項目の `detail` が
+ * `isIncompleteReasonDetail` を満たすものだけを受ける（受け継いだだけの `detail` は受けない）。
+ */
+export const isIncompleteReason = (value: unknown): value is IncompleteReason =>
+  isRecord(value)
+  && isIncompleteReasonCode(value.code)
+  && Object.hasOwn(value, 'detail')
+  && isIncompleteReasonDetail(value.detail);
 
 export const OBSERVATION_STATUSES = Object.freeze(['OBSERVED', 'NOT_OBSERVED', 'UNSUPPORTED'] as const);
 export type ObservationStatus = (typeof OBSERVATION_STATUSES)[number];
@@ -452,6 +486,12 @@ export interface PageAuditOutcome {
    * Page の結果（`PageAuditResult`）の JSON には含めない。
    */
   readonly siteUnavailableDetail: string | null;
+  /**
+   * 認証つきの Run（Task 25 の設計書 4.3。T25c）で、そのページの監査の段の main frame の最後の URL が、セッションの切れの path に当たった
+   * 場所（`<ビューポート>:<段階>`。例: `desktop:passive`）。当たらなければ `null`。省略は `null` と同じ（公開監査と、偽の Page Auditor）。
+   * Run Coordinator は、これが `null` でなければ、そのページを捨てて、理由 `AUTH_SESSION_LOST` で Run を止める。Page の結果の JSON には含めない。
+   */
+  readonly authSessionLostDetail?: string | null;
   /**
    * 各ビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の要求の観察の結果（サイトの不調で止めた
    * ときの診断の記録の設計書 2.1、2.2。2026-10-07 の改訂）。始めなかったビューポート（SKIPPED のビューポート）は `null`。
@@ -794,6 +834,8 @@ export type RunCheckpointState = (typeof RUN_CHECKPOINT_STATES)[number];
  * - `STOPPED_BY_SITE_UNAVAILABLE`: サイトの不調（時間切れ、ネットワークの層の失敗、429・502・503・504 の応答。判定は
  *   `src/orchestration/site-availability.ts`）を検知して止まった（サイトが応答しないときに Run を止める設計書 3.2）。再開できる。
  * - `INTERRUPTED_ABNORMALLY`: プロセスが途中で終わった（終わりの時刻は、最後の保存の時刻とする）。
+ * - `STOPPED_BY_AUTH_SESSION_LOST`: 認証つきの Run で、セッションの切れ（理由 `AUTH_SESSION_LOST`）を検知して止まった（Task 25 の設計書
+ *   4.3。T25c）。再開できる（再開のときは、もう一度ログインする。T25d）。既存の値の表示の順を変えないよう、一覧の最後に加えた。
  */
 export const RUN_EXECUTION_END_REASONS = Object.freeze([
   'COMPLETED',
@@ -802,6 +844,7 @@ export const RUN_EXECUTION_END_REASONS = Object.freeze([
   'STOPPED_BY_SAFETY_VIOLATION',
   'STOPPED_BY_SITE_UNAVAILABLE',
   'INTERRUPTED_ABNORMALLY',
+  'STOPPED_BY_AUTH_SESSION_LOST',
 ] as const);
 export type RunExecutionEndReason = (typeof RUN_EXECUTION_END_REASONS)[number];
 

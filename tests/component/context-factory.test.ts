@@ -1,5 +1,4 @@
-import { createServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { request as httpRequest, type ServerResponse } from 'node:http';
 import type { Browser, BrowserContext, CDPSession, Download, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory, ContextConstructionError, type BrowserContextFactoryOptions } from '../../src/browser/context-factory.js';
@@ -9,7 +8,7 @@ import { wait } from '../../src/core/deadline.js';
 import type { LoadMeter } from '../../src/crawl/load-meter.js';
 import { startFixtureServer } from '../../fixtures/server.js';
 import type { EgressProxy, EgressProxyOptions } from '../../src/safety/egress-proxy.js';
-import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
+import { activateInteractionFreeze, isPassiveRequestGuardClosed, WriteStageMonitor } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import {
@@ -28,6 +27,7 @@ import {
   SHARED_WORKER_DISABLED_FIXTURE_STATE,
   sharedWorkerPostsPath,
 } from '../helpers/gate-harness.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
@@ -69,6 +69,26 @@ function fakeBrowserCdpSession(): CDPSession {
     send: vi.fn(async () => ({})),
     detach: vi.fn(async () => undefined),
   } as unknown as CDPSession;
+}
+
+/** 中継に、絶対形の要求（`path` にそのまま URL を入れる）を送り、状態コードを返す（DEF-085。中継の拒否を直接確かめる）。 */
+function requestThroughEgressProxy(proxy: EgressProxy, method: string, url: string): Promise<{ readonly status: number }> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      host: '127.0.0.1',
+      port: proxy.port,
+      method,
+      path: url,
+      headers: { host: new URL(url).host },
+      agent: false,
+    }, (response) => {
+      response.resume();
+      response.on('end', () => resolve({ status: response.statusCode ?? 0 }));
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end();
+  });
 }
 
 function factoryFor(config = configFor(), options: BrowserContextFactoryOptions = {}): BrowserContextFactory {
@@ -795,17 +815,15 @@ describe('BrowserContextFactory', () => {
       const session = await factory.createInteractionSession(viewport);
       contexts.push(session.page.context());
       try {
+        // DEF-058: Passive の文書と画像の requestfinished は、強い混雑の下では順が入れ替わることがあるので、2 つの順は問わない
+        // （届いた URL の集合と数は、同じに確かめる）。Interaction の文書は、Passive の 2 つが届いた後に読み込むので、3 つ目に届く。
+        const passiveUrls = [`${server.origin}/unsized-svg-image.html`, `${server.origin}/unsized-image.svg`].sort();
+        const finishedUrls = (): readonly string[] => recording.finished.map(({ url }) => url);
         await page.goto(`${server.origin}/unsized-svg-image.html`, { waitUntil: 'load' });
-        await expect.poll(() => recording.finished.map(({ url }) => url)).toEqual([
-          `${server.origin}/unsized-svg-image.html`,
-          `${server.origin}/unsized-image.svg`,
-        ]);
+        await expect.poll(() => [...finishedUrls()].sort()).toEqual(passiveUrls);
         await session.page.goto(`${server.origin}/index.html`, { waitUntil: 'load' });
-        await expect.poll(() => recording.finished.map(({ url }) => url)).toEqual([
-          `${server.origin}/unsized-svg-image.html`,
-          `${server.origin}/unsized-image.svg`,
-          `${server.origin}/index.html`,
-        ]);
+        await expect.poll(() => [...[...finishedUrls().slice(0, passiveUrls.length)].sort(), ...finishedUrls().slice(passiveUrls.length)])
+          .toEqual([...passiveUrls, `${server.origin}/index.html`]);
         // 渡す鍵は、事象の Playwright の Request そのもの（キャッシュから返した印の照合に使う）。
         for (const { request, url } of recording.finished) {
           expect((request as { url(): string }).url()).toBe(url);
@@ -1064,18 +1082,9 @@ describe('BrowserContextFactory', () => {
     async function startBodyServer(
       handle: (pathname: string, response: ServerResponse) => void,
     ): Promise<{ readonly origin: string; close(): Promise<void> }> {
-      const server = createServer((request, response) => {
+      return startLoopbackHttpServer((request, response) => {
         handle((request.url ?? '/').split('?', 1)[0] ?? '/', response);
       });
-      await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, resolve));
-      const { port } = server.address() as AddressInfo;
-      return {
-        origin: `http://127.0.0.1:${port}`,
-        close: async () => {
-          server.closeAllConnections();
-          await new Promise<void>((resolve) => server.close(() => resolve()));
-        },
-      };
     }
 
     const SMALL_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"></svg>';
@@ -1229,24 +1238,32 @@ describe('BrowserContextFactory', () => {
       return last;
     };
 
-    it('passes the proxy of a fresh egress proxy to the Interaction Context only, never to the Passive Context', async () => {
+    // DEF-085: 以前は「Passive の Context には付けない」を確かめていた。すべての Guard の Context に、それぞれ新しい中継を付ける形に改めた。
+    it('passes the proxy of a fresh egress proxy to each Guard Context, the Passive and the Interaction Context alike (DEF-085)', async () => {
       const newContext = vi.spyOn(browser, 'newContext');
       const factory = factoryFor();
 
       const passive = await factory.createPassiveContext(viewport);
       contexts.push(passive);
+      const passiveProxy = lastEgressProxy().proxy;
       const session = await factory.createInteractionSession(viewport);
       contexts.push(session.page.context());
       try {
         const { proxy } = lastEgressProxy();
+        expect(egressProxyControl.created).toHaveLength(2);
+        expect(passiveProxy).not.toBe(proxy);
         expect(newContext).toHaveBeenCalledTimes(2);
-        expect(newContext.mock.calls[0]?.[0]).not.toHaveProperty('proxy');
+        expect(newContext.mock.calls[0]?.[0]).toMatchObject({ proxy: { server: passiveProxy.server } });
         expect(newContext.mock.calls[1]?.[0]).toMatchObject({ proxy: { server: proxy.server } });
         expect(proxy.server).toBe(`http://127.0.0.1:${proxy.port}`);
+        expect(passiveProxy.server).toBe(`http://127.0.0.1:${passiveProxy.port}`);
         expect(proxy.state).toBe('OPEN');
+        expect(passiveProxy.state).toBe('OPEN');
       } finally {
         await session.close();
+        await factory.closePassiveContext(passive);
       }
+      expect(passiveProxy.state).toBe('CLOSED');
     });
 
     it('routes the traffic of the Interaction Context through the proxy and consults the injected upstream policy', async () => {
@@ -1353,7 +1370,18 @@ describe('BrowserContextFactory', () => {
         await failing.page.goto(`${server.origin}/`, { waitUntil: 'load' });
         await factory.createPassivePage(failing.page.context());
         await expect(failing.activateInteractionFreeze()).rejects.toThrow(/exactly one current owner page/u);
-        expect(failingProxy.state).toBe('FROZEN');
+        // DEF-085: Guard の凍結の失敗は Context を無効化し、Guard は閉じる直前に中継を凍結し、中継は Context と一緒に閉じる。そのため、
+        // この時点の中継は、凍結したまま（FROZEN）か、すでに閉じた（CLOSED）かのどちらかである（どちらも、何も通さない）。
+        expect(['FROZEN', 'CLOSED']).toContain(failingProxy.state);
+        // DEF-085 fix round 1: 状態の名前だけでなく、どちらの状態でも中継が要求を通さないことを、要求を送って確かめる（FROZEN なら 403、
+        // CLOSED なら接続できない）。サーバには届かない。
+        const passedAfterFailedFreeze = await requestThroughEgressProxy(
+          failingProxy,
+          'GET',
+          `${server.origin}/after-failed-freeze`,
+        ).then(({ status }) => status, () => null);
+        expect(passedAfterFailedFreeze === null || passedAfterFailedFreeze === 403, String(passedAfterFailedFreeze)).toBe(true);
+        expect(server.getRequestObservations().some(({ pathname }) => pathname === '/after-failed-freeze')).toBe(false);
         expect(failing.ledger.snapshot().invariantViolations.map((violation) => violation.code))
           .toContain('INTERACTION_FREEZE_ACTIVATION_FAILED');
         await expect.poll(() => failing.isClosed()).toBe(true);
@@ -1409,6 +1437,290 @@ describe('BrowserContextFactory', () => {
       expect(session.isClosed()).toBe(true);
       expect(lastEgressProxy().proxy.state).toBe('CLOSED');
       expect(session.ledger.snapshot().invariantViolationCount).toBe(1);
+    });
+
+    // DEF-085 fix round 3（T27R2 の C1）: 閉じる直前の凍結の後の拒否は、記録しない（以前は `GUARD_BYPASS_EGRESS` を記録していた）。
+    it('rejects but does not record a request after the Guard froze the proxy right before closing, before any Interaction freeze (DEF-085 round 3)', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin));
+        const session = await factory.createInteractionSession(viewport);
+        const context = session.page.context();
+        contexts.push(context);
+        const { proxy } = lastEgressProxy();
+        const statesAtClose: string[] = [];
+        const rejectedDuringClose: number[] = [];
+        const originalClose = context.close.bind(context);
+        vi.spyOn(context, 'close').mockImplementation(async (...args) => {
+          statesAtClose.push(proxy.state);
+          rejectedDuringClose.push((await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/during-close`)).status);
+          await originalClose(...args);
+        });
+
+        await session.close();
+
+        expect(statesAtClose).toEqual(['FROZEN']);
+        expect(rejectedDuringClose).toEqual([403]);
+        expect(session.ledger.snapshot().blockedInteractionRequests).toEqual([]);
+        expect(server.getRequestObservations().some(({ pathname }) => pathname === '/during-close')).toBe(false);
+        expect(proxy.state).toBe('CLOSED');
+      } finally {
+        await server.close();
+      }
+    });
+  });
+
+  // DEF-085（Task 27 の設計書 11 章の 2026-10-12 の行の (2)）: Passive とログインの段の Context の出口の中継。
+  describe('egress proxy of the Passive and login stage Contexts (DEF-085)', () => {
+    const lastEgressProxy = (): { readonly proxy: EgressProxy; readonly options: EgressProxyOptions } => {
+      const last = egressProxyControl.created.at(-1);
+      if (last === undefined) {
+        throw new Error('no egress proxy was created');
+      }
+      return last;
+    };
+
+    it('routes the traffic of the Passive Context through its proxy with the injected upstream policy', async () => {
+      const server = await startFixtureServer();
+      const consulted: [string, number][] = [];
+      try {
+        const factory = factoryFor(configFor(server.origin), {
+          egressUpstreamPolicy: (host, port) => {
+            consulted.push([host, port]);
+            return host === '127.0.0.1';
+          },
+        });
+        const context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        const page = await factory.createPassivePage(context);
+        const { options } = lastEgressProxy();
+
+        const response = await page.goto(`${server.origin}/`, { waitUntil: 'load' });
+
+        expect(response?.status()).toBe(200);
+        expect(consulted).toContainEqual(['127.0.0.1', Number(new URL(server.origin).port)]);
+        expect(options.requestPolicy).toBeTypeOf('function');
+        // DEF-085 fix round 1: Passive の中継は、上流の失敗をそのまま伝える。Interaction の中継は、今のまま（指定なし。502 を返す）。
+        expect(options.upstreamFailureMode).toBe('PASS_THROUGH');
+        const session = await factory.createInteractionSession(viewport);
+        contexts.push(session.page.context());
+        expect(lastEgressProxy().options.upstreamFailureMode).toBeUndefined();
+        await session.close();
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([]);
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+        await factory.closePassiveContext(context);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('throws the egress proxy start failure as it is and creates no Passive or login stage Context (fail-closed)', async () => {
+      const failure = new Error('egress proxy listen failed');
+      egressProxyControl.failWith = failure;
+      const newContext = vi.spyOn(browser, 'newContext');
+      const factory = factoryFor();
+
+      await expect(factory.createPassiveContext(viewport)).rejects.toBe(failure);
+      await expect(factory.createLoginStageContext(viewport, {
+        loginPostEndpoints: [{ origin: 'https://example.test', path: '/login' }],
+        maxLoginPosts: 1,
+      })).rejects.toBe(failure);
+
+      expect(newContext).not.toHaveBeenCalled();
+      expect(browser.contexts()).toEqual([]);
+    });
+
+    it('closes the proxy when the Passive Context cannot be created', async () => {
+      const creationFailure = new Error('fixture newContext failure');
+      vi.spyOn(browser, 'newContext').mockRejectedValueOnce(creationFailure);
+      const factory = factoryFor();
+
+      await expect(factory.createPassiveContext(viewport)).rejects.toBe(creationFailure);
+
+      expect(lastEgressProxy().proxy.state).toBe('CLOSED');
+    });
+
+    // DEF-085 fix round 3（T27R2 の C1）: 閉じる直前の凍結の後の拒否は、記録しない（以前は `GUARD_BYPASS_EGRESS` を記録していた）。
+    it('freezes the proxy right before the owner close, closes it after, and rejects a request in between without recording it', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin));
+        const context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        const page = await factory.createPassivePage(context);
+        await page.goto(`${server.origin}/`, { waitUntil: 'load' });
+        const { proxy } = lastEgressProxy();
+        expect(proxy.state).toBe('OPEN');
+        const statesAtClose: string[] = [];
+        const rejectedDuringClose: number[] = [];
+        const originalClose = context.close.bind(context);
+        vi.spyOn(context, 'close').mockImplementation(async (...args) => {
+          statesAtClose.push(proxy.state);
+          rejectedDuringClose.push((await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/during-close`)).status);
+          await originalClose(...args);
+        });
+
+        await factory.closePassiveContext(context);
+
+        expect(statesAtClose).toEqual(['FROZEN']);
+        expect(rejectedDuringClose).toEqual([403]);
+        expect(proxy.state).toBe('CLOSED');
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([]);
+        expect(server.getRequestObservations().some(({ pathname }) => pathname === '/during-close')).toBe(false);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('freezes the Passive proxy when the Guard enters the freeze (discovery), and records what the proxy rejects then as INTERACTION_FROZEN_EGRESS (DEF-085 round 3 I2)', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin));
+        const context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        const page = await factory.createPassivePage(context);
+        await page.goto(`${server.origin}/`, { waitUntil: 'load' });
+        const { proxy } = lastEgressProxy();
+        expect(proxy.state).toBe('OPEN');
+
+        await activateInteractionFreeze(page);
+
+        expect(proxy.state).toBe('FROZEN');
+        const afterFreeze = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/after-freeze`);
+        expect(afterFreeze.status).toBe(403);
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'GET', url: `${server.origin}/after-freeze`, reason: 'INTERACTION_FROZEN_EGRESS' },
+        ]);
+        expect(server.getRequestObservations().some(({ pathname }) => pathname === '/after-freeze')).toBe(false);
+        await factory.closePassiveContext(context);
+        // 凍結の段の後の閉じる処理の間の拒否も、凍結の段の記録のまま（閉じる直前の凍結は、すでに凍結した中継を変えない）。
+        expect(proxy.state).toBe('CLOSED');
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('rejects at the proxy what the Guard of the Context would not allow (method, excluded path), as GUARD_BYPASS_EGRESS', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin), {
+          authentication: {
+            initialState: { cookies: [], origins: [] },
+            filterState: (state) => state,
+            auditExclusions: { excludedPathPrefixes: ['/excluded/'], auditPathPrefixes: [], dangerousTerms: [] },
+          },
+        });
+        const context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        const { proxy } = lastEgressProxy();
+        const window = openServerWindow(server);
+
+        const read = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/`);
+        // GET と HEAD は、Guard が許す読み取りなので、中継も通す。POST と除外のパスへの GET は、Guard が許さないので、中継も拒む。
+        const head = await requestThroughEgressProxy(proxy, 'HEAD', `${server.origin}/`);
+        const post = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
+        const excluded = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/logout`);
+
+        expect([read.status, head.status, post.status, excluded.status]).toEqual([200, 200, 403, 403]);
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'POST', url: `${server.origin}/__mutation`, reason: 'GUARD_BYPASS_EGRESS' },
+          { method: 'GET', url: `${server.origin}/excluded/logout`, reason: 'GUARD_BYPASS_EGRESS' },
+        ]);
+        expect(window.requestLines()).toEqual(['GET /', 'HEAD /']);
+        await factory.closePassiveContext(context);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('lets the login POST of the login stage Context through the proxy, and still rejects other POSTs', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin));
+        const context = await factory.createLoginStageContext(viewport, {
+          loginPostEndpoints: [{ origin: server.origin, path: '/__mutation' }],
+          maxLoginPosts: 1,
+        });
+        contexts.push(context);
+        const { proxy } = lastEgressProxy();
+        const window = openServerWindow(server);
+
+        const login = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
+        const other = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__other-mutation`);
+
+        expect(login.status).not.toBe(403);
+        expect(other.status).toBe(403);
+        expect(window.requestLines()).toEqual(['POST /__mutation']);
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'POST', url: `${server.origin}/__other-mutation`, reason: 'GUARD_BYPASS_EGRESS' },
+        ]);
+        await factory.closePassiveContext(context);
+      } finally {
+        await server.close();
+      }
+    });
+
+    // T30b（Task 30 の設計書 4 章）: 書き込みの段の Context の中継は、承認の要求の形の POST（query なし）だけを、Guard が許しうるものとして通す
+    // （回数と送る中身は Guard が数えて照合する。中継は本文を見ない）。ほかの POST、query つきの承認の POST、除外のパスへの GET は拒む。
+    it('lets only the approved POST of the write stage Context through the proxy, and rejects other POSTs, a query and an excluded path (T30b)', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin), {
+          authentication: {
+            initialState: { cookies: [], origins: [] },
+            filterState: (state) => state,
+            auditExclusions: { excludedPathPrefixes: ['/excluded/'], auditPathPrefixes: [], dangerousTerms: [] },
+          },
+        });
+        const context = await factory.createWriteStageContext(viewport, {
+          expectation: {
+            request: { origin: server.origin, path: '/__mutation', enctype: 'application/x-www-form-urlencoded' },
+            submittedFields: [{ name: 'name', value: 'v' }],
+            passthroughFieldNames: [],
+            emptyFileFieldNames: [],
+          },
+          monitor: new WriteStageMonitor(),
+        });
+        contexts.push(context);
+        const { proxy, options } = lastEgressProxy();
+        const window = openServerWindow(server);
+
+        const approved = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
+        const withQuery = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation?again=1`);
+        const other = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__other-mutation`);
+        const excluded = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/logout`);
+
+        expect(options.upstreamFailureMode).toBe('PASS_THROUGH');
+        expect(approved.status).not.toBe(403);
+        expect([withQuery.status, other.status, excluded.status]).toEqual([403, 403, 403]);
+        expect(window.requestLines()).toEqual(['POST /__mutation']);
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'POST', url: `${server.origin}/__mutation?again=1`, reason: 'GUARD_BYPASS_EGRESS' },
+          { method: 'POST', url: `${server.origin}/__other-mutation`, reason: 'GUARD_BYPASS_EGRESS' },
+          { method: 'GET', url: `${server.origin}/excluded/logout`, reason: 'GUARD_BYPASS_EGRESS' },
+        ]);
+        await factory.closePassiveContext(context);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it('records EGRESS_PROXY_FAILED and closes the Passive Context when its proxy fails after listening; the owner close joins (fail-closed)', async () => {
+      const factory = factoryFor();
+      const context = await factory.createPassiveContext(viewport);
+      contexts.push(context);
+      const { options, proxy } = lastEgressProxy();
+
+      options.onError(new Error('egress listener died'));
+
+      expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toContainEqual({
+        code: 'EGRESS_PROXY_FAILED',
+        message: 'egress listener died',
+      });
+      await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
+      await expect(factory.closePassiveContext(context)).resolves.toBeUndefined();
+      expect(proxy.state).toBe('CLOSED');
+      expect(factory.getSafetyLedger(context).snapshot().invariantViolationCount).toBe(1);
     });
   });
 });

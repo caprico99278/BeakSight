@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-approve:1",
+  "description": "Local UI Server Function input: approve the current revision of one write scenario after the confirmation dialog (Task 28 design 3, 4.6). expectedRevision and expectedApprovalDigest are the revision and the approval digest that the screen showed; the server computes the digest again from the current facts and rejects a different one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision", "expectedApprovalDigest"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "type": "integer", "minimum": 1 },
+    "expectedApprovalDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" }
+  }
+}
