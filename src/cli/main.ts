@@ -6,6 +6,7 @@
  * - 設定のエラー（`ConfigError`）は、日本語の文言と技術的な詳細の一覧を標準エラーに示し、終了コード 4 にする。
  * - artifact の書き出しの入出力の失敗（`ArtifactWriteError`）と予期しない例外は、日本語の短い文言と1行の技術的な詳細を示し、
  *   終了コード 1（FAILED と同じ）にする。スタックトレースは出さない。
+ *   例外の種類と終了コードは、`failure.ts` の `classifyCliFailure`（ワーカーと共用。Task 24 の設計書 4.1）が決める。
  * - Run のディレクトリを作れなかった Run（DEF-009）は、`run-command.ts` が、artifact を書かずに標準エラーに示し、その Run の
  *   Run Status（FAILED）の終了コード 1 を返す。
  * - `runCli` の外で起きた、扱われない例外と reject も、同じ形で示す（`reportUnhandledFailure`。`index.ts` が登録する。R17 の指摘1）。
@@ -13,12 +14,11 @@
  *   設計書 4.7 の「シグナル」）。2回目のシグナルで、すぐに終える処理は、`interrupt.ts` が行う。
  * - すべての書き込みが終わるのを待ってから、終了コードを返す。
  */
-import { isConfigError } from '../config/config-error.js';
 import { loadConfig } from '../config/load-config.js';
 import { CLI_TEXT } from '../presentation/messages.js';
-import { ArtifactWriteError } from '../report/artifact-writer.js';
 import { parseCliArguments } from './arguments.js';
-import { CONFIG_ERROR_EXIT_CODE, FAILURE_EXIT_CODE, SUCCESS_EXIT_CODE } from './exit-codes.js';
+import { CONFIG_ERROR_OUTCOME, FAILURE_EXIT_CODE, SUCCESS_EXIT_CODE } from './exit-codes.js';
+import { classifyCliFailure } from './failure.js';
 import { configErrorLines, failureLines, joinLines, usageLines, validConfigLines } from './output.js';
 import type { CliOutput } from './output-stream.js';
 import type { RunCommandDependencies } from './run-command.js';
@@ -79,19 +79,24 @@ export async function runCli(argv: readonly string[], streams: CliStreams, depen
       { startNew: invocation.startNew },
     );
   } catch (error) {
-    if (isConfigError(error)) {
-      await streams.stderr.write(joinLines(configErrorLines(error)));
-      return CONFIG_ERROR_EXIT_CODE;
+    // 例外から終了コードへの変換は、`classifyCliFailure`（ワーカーと共用。Task 24 の設計書 4.1）。ここでは、種類ごとの行を示すだけにする。
+    const failure = classifyCliFailure(error);
+    switch (failure.kind) {
+      case CONFIG_ERROR_OUTCOME:
+        await streams.stderr.write(joinLines(configErrorLines(failure.error)));
+        return failure.exitCode;
+      case 'ARTIFACT_WRITE_FAILED':
+        return reportFailure(CLI_TEXT.failure.artifactWriteFailed, failure.error, failure.exitCode, streams.stderr);
+      case 'UNEXPECTED_FAILURE':
+        return reportFailure(CLI_TEXT.failure.unexpected, failure.error, failure.exitCode, streams.stderr);
     }
-    const description = error instanceof ArtifactWriteError ? CLI_TEXT.failure.artifactWriteFailed : CLI_TEXT.failure.unexpected;
-    return reportFailure(description, error, streams.stderr);
   }
 }
 
-/** Run の外の失敗を、日本語の短い文言と1行の技術的な詳細で示し、終了コード 1（FAILED と同じ）を返す（reject しない）。 */
-async function reportFailure(description: string, error: unknown, stderr: CliOutput): Promise<number> {
+/** Run の外の失敗を、日本語の短い文言と1行の技術的な詳細で示し、`exitCode`（終了コード 1。FAILED と同じ）を返す（reject しない）。 */
+async function reportFailure(description: string, error: unknown, exitCode: number, stderr: CliOutput): Promise<number> {
   await stderr.write(joinLines(failureLines(description, error)));
-  return FAILURE_EXIT_CODE;
+  return exitCode;
 }
 
 /**
@@ -99,4 +104,4 @@ async function reportFailure(description: string, error: unknown, stderr: CliOut
  * （設計書 第7章、R17 の指摘1）。スタックトレースは出さない。出力先が閉じていても、reject しない。
  */
 export const reportUnhandledFailure = (error: unknown, stderr: CliOutput): Promise<number> =>
-  reportFailure(CLI_TEXT.failure.unexpected, error, stderr);
+  reportFailure(CLI_TEXT.failure.unexpected, error, FAILURE_EXIT_CODE, stderr);

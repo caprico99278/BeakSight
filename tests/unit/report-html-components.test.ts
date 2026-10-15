@@ -328,7 +328,8 @@ describe('relative links (R16f, design 6.1.11)', () => {
       ['a b', 'a%20b'],
       ['pages/100%/x.json', 'pages/100%25/x.json'],
       ['pages/a?b=1/c#d.png', 'pages/a%3Fb%3D1/c%23d.png'],
-      ['pages/a:b/c.json', 'pages/a%3Ab/c.json'],
+      // DEF-056 の後は `:` を含むパスがリンクにならない（下の節）ので、区切りの途中の `&`、`+`、`=` で確かめる。
+      ['pages/a&b/c+d=e.json', 'pages/a%26b/c%2Bd%3De.json'],
       ['pages/"q"/<x>.json', 'pages/%22q%22/%3Cx%3E.json'],
     ];
     for (const [path, href] of cases) {
@@ -355,6 +356,20 @@ describe('relative links (R16f, design 6.1.11)', () => {
       const screenshotLink = renderScreenshotRef({ evidenceId: 'e', relativePath: unsafe, viewport: 'desktop', captureType: 'VIEWPORT' }).html;
       expect(screenshotLink, JSON.stringify(unsafe)).not.toContain('href=');
     }
+  });
+
+  // DEF-056（Task 24 の設計書 4.7）: Windows で別の意味になる名前（`:`、区切りの末尾の点と空白、デバイス名）は、安全な相対パスでないので、
+  // リンクにせず、エスケープした文字として出す（より安全な側の変化）。
+  it('shows a path with a colon, a trailing dot or space, or a Windows device name as escaped text, not as a link (DEF-056)', () => {
+    for (const unsafe of ['pages/a:b/c.json', 'pages/<a>:b/c&d.json', 'pages/x.json.', 'pages/x.json ', 'pages/NUL/x.json', 'pages/con.png']) {
+      const fileLink = renderFileLink(unsafe).html;
+      expect(fileLink, JSON.stringify(unsafe)).not.toContain('href=');
+      expect(fileLink, JSON.stringify(unsafe)).toContain(escapeHtml(unsafe));
+      const screenshotLink = renderScreenshotRef({ evidenceId: 'e', relativePath: unsafe, viewport: 'desktop', captureType: 'VIEWPORT' }).html;
+      expect(screenshotLink, JSON.stringify(unsafe)).not.toContain('href=');
+      expect(renderEvidenceRef('e', unsafe).html, JSON.stringify(unsafe)).not.toContain('href=');
+    }
+    expect(renderFileLink('pages/<a>:b/c&d.json').html).toContain('pages/&lt;a&gt;:b/c&amp;d.json');
   });
 
   it('never lets an attribute or a tag out of the href, whatever the path', () => {

@@ -114,6 +114,9 @@ describe('Run summary text', () => {
       // L6（サイトへの負荷の制御の設計書 4.5）: 要約の小節の見出しと、CLI の1行にも出る項目の名前。
       loadHeading: 'サイトへの負荷',
       allowedOriginRequests: '許可 Origin への要求',
+      // CCX-29（CC-039）: HTML の要約と実行の環境の項目と、CLI の版の違いの知らせの項目の名前。
+      toolVersion: 'BeakSight の版',
+      playwrightVersion: 'Playwright',
     });
     expect(Object.isFrozen(RUN_SUMMARY_TEXT)).toBe(true);
     expect(Object.isFrozen(RUN_SUMMARY_TEXT.coverage)).toBe(true);

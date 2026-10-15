@@ -13,6 +13,7 @@ import {
 } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger, isPositiveFiniteNumber, isRecord } from '../core/guards.js';
 import { VISIBILITY_CHECK_OPTIONS } from '../core/visibility.js';
+import { composeInPage, type StandardReaders } from './in-page-readers.js';
 import { pageFailureReason } from './page-failure.js';
 
 export interface ControlledScrollOptions {
@@ -87,9 +88,9 @@ interface RawScrollMeasurement {
 
 /**
  * ブラウザ内で、文書のスクロール位置を先頭（0, 0）に戻し、戻した後の位置を返す。
- * `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-async function scrollDocumentToOriginInPage(argument: OriginArgument): Promise<ScrollPosition | 'DEADLINE_EXCEEDED'> {
+async function scrollDocumentToOriginReader(R: StandardReaders, argument: OriginArgument): Promise<ScrollPosition | 'DEADLINE_EXCEEDED'> {
   const pastDeadline = (): boolean => argument.absoluteDeadlineMs !== null && Date.now() >= argument.absoluteDeadlineMs;
   if (pastDeadline()) {
     return 'DEADLINE_EXCEEDED';
@@ -100,8 +101,11 @@ async function scrollDocumentToOriginInPage(argument: OriginArgument): Promise<S
   if (pastDeadline()) {
     return 'DEADLINE_EXCEEDED';
   }
-  const root = document.scrollingElement ?? document.documentElement;
-  const body = document.body;
+  // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="body">` など）は、`document` の同じ名前のプロパティを隠すので、
+  // `Document.prototype` の getter で読む（部品の `documentProperty`。`src/browser/in-page-readers.ts`。CC-068）。html・body は、名前つきの子で隠れない。
+  const { documentProperty } = R;
+  const root = documentProperty<Element | null>('scrollingElement') ?? documentProperty<HTMLElement>('documentElement');
+  const body = documentProperty<HTMLElement | null>('body');
   const separateBody = body !== null && body !== root ? body : null;
   window.scrollTo({ left: 0, top: 0, behavior: 'instant' });
   separateBody?.scrollTo({ left: 0, top: 0, behavior: 'instant' });
@@ -110,16 +114,20 @@ async function scrollDocumentToOriginInPage(argument: OriginArgument): Promise<S
     scrollY: window.scrollY + (separateBody?.scrollTop ?? 0),
   };
 }
+const scrollDocumentToOriginInPage = composeInPage(scrollDocumentToOriginReader);
 
 /**
  * ブラウザ内で、スクロールする要素を特定し（`lockedTarget` があればそれを使い）、その位置と高さを返す。
  * 文書と body のうち、スクロールできる量が大きいほうを選ぶ（同じなら文書）。どちらも `epsilonPx` 以下なら `null`。
  * 完了と判定する前に候補を比べ直すため、文書と body のスクロールできる量も毎回返す（R'2 の I-1）。
- * `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function measureScrollInPage(argument: MeasureArgument): RawScrollMeasurement {
-  const root = document.scrollingElement ?? document.documentElement;
-  const body = document.body;
+function measureScrollReader(R: StandardReaders, argument: MeasureArgument): RawScrollMeasurement {
+  // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="body">` など）は、`document` の同じ名前のプロパティを隠すので、
+  // `Document.prototype` の getter で読む（部品の `documentProperty`。`src/browser/in-page-readers.ts`。CC-068）。html・body は、名前つきの子で隠れない。
+  const { documentProperty } = R;
+  const root = documentProperty<Element | null>('scrollingElement') ?? documentProperty<HTMLElement>('documentElement');
+  const body = documentProperty<HTMLElement | null>('body');
   const separateBody = body !== null && body !== root ? body : null;
   const scrollRange = (element: Element): number => element.scrollHeight - element.clientHeight;
   const isScrollContainer = (element: Element): boolean => (
@@ -144,44 +152,63 @@ function measureScrollInPage(argument: MeasureArgument): RawScrollMeasurement {
     scrollHeight: element.scrollHeight,
     contentHeight: Math.max(
       root.scrollHeight,
-      document.documentElement.scrollHeight,
+      documentProperty<HTMLElement>('documentElement').scrollHeight,
       separateBody?.scrollHeight ?? 0,
     ),
     documentScrollRange: rootRange,
     bodyScrollRange: bodyRange,
   };
 }
+const measureScrollInPage = composeInPage(measureScrollReader);
 
 /**
  * ブラウザ内で、スクロールする要素を縦方向の位置 `top` へ移動する。
- * `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function stepScrollInPage(argument: StepArgument): 'MUTATED' | 'DEADLINE_EXCEEDED' {
+function stepScrollReader(R: StandardReaders, argument: StepArgument): 'MUTATED' | 'DEADLINE_EXCEEDED' {
   if (Date.now() >= argument.absoluteDeadlineMs) {
     return 'DEADLINE_EXCEEDED';
   }
-  const root = document.scrollingElement ?? document.documentElement;
-  const body = document.body;
+  // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="body">` など）は、`document` の同じ名前のプロパティを隠すので、
+  // `Document.prototype` の getter で読む（部品の `documentProperty`。`src/browser/in-page-readers.ts`。CC-068）。html・body は、名前つきの子で隠れない。
+  const { documentProperty } = R;
+  const root = documentProperty<Element | null>('scrollingElement') ?? documentProperty<HTMLElement>('documentElement');
+  const body = documentProperty<HTMLElement | null>('body');
   const element = argument.target === 'BODY' && body !== null && body !== root ? body : root;
   element.scrollTo({ top: argument.top, behavior: 'instant' });
   return 'MUTATED';
 }
+const stepScrollInPage = composeInPage(stepScrollReader);
 
 /**
  * ブラウザ内で、文書の要素を上限付きで走査し、内側のスクロール領域を数える（定義は `InnerScrollScan`）。
  * open な shadow root の中の要素もたどり、上限の数に含める（R'2 の I-3）。shadow root の中は、その host の直後にたどる。
- * `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function scanInnerScrollContainersInPage(argument: InnerScrollScanArgument): InnerScrollScan {
-  const documentScrollers = new Set<Element>([document.documentElement]);
-  if (document.scrollingElement !== null) {
-    documentScrollers.add(document.scrollingElement);
+function scanInnerScrollContainersReader(R: StandardReaders, argument: InnerScrollScanArgument): InnerScrollScan {
+  // DOM clobbering（DEF-072・DEF-073）: form の中の名前つきの入力の欄は form の、名前つきの img・form などは `document` の、同じ名前の
+  // プロパティとメソッドを隠す（`<input name="children">`、`<img name="documentElement">` など）。たどる要素（form になりうる）と `document` の
+  // 標準のプロパティとメソッドは、標準の prototype の getter とメソッドで読む（getter は部品の `standardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
+  const { standardGetter } = R;
+  const childrenOf = standardGetter<HTMLCollection>(Element.prototype, 'children');
+  const shadowRootOf = standardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
+  const clientHeightOf = standardGetter<number>(Element.prototype, 'clientHeight');
+  const scrollHeightOf = standardGetter<number>(Element.prototype, 'scrollHeight');
+  const checkVisibilityOf = (element: Element, options: CheckVisibilityOptions): boolean => (
+    Element.prototype.checkVisibility.call(element, options)
+  );
+  const documentElement = standardGetter<HTMLElement>(Document.prototype, 'documentElement')(document);
+  const scrollingElement = standardGetter<Element | null>(Document.prototype, 'scrollingElement')(document);
+  const documentBody = standardGetter<HTMLElement | null>(Document.prototype, 'body')(document);
+  const documentScrollers = new Set<Element>([documentElement]);
+  if (scrollingElement !== null) {
+    documentScrollers.add(scrollingElement);
   }
-  if (document.body !== null) {
-    documentScrollers.add(document.body);
+  if (documentBody !== null) {
+    documentScrollers.add(documentBody);
   }
   // 深さ優先で、文書の順にたどる。要素の子は、shadow root の中の子の後に、light DOM の子をたどる。
-  const pending: Element[] = [document.documentElement];
+  const pending: Element[] = [documentElement];
   const pushChildren = (children: HTMLCollection): void => {
     for (let index = children.length - 1; index >= 0; index -= 1) {
       pending.push(children[index] as Element);
@@ -198,15 +225,16 @@ function scanInnerScrollContainersInPage(argument: InnerScrollScanArgument): Inn
       break;
     }
     scannedElementCount += 1;
-    pushChildren(element.children);
-    if (element.shadowRoot !== null) {
-      pushChildren(element.shadowRoot.children);
+    pushChildren(childrenOf(element));
+    const shadowRoot = shadowRootOf(element);
+    if (shadowRoot !== null) {
+      pushChildren(shadowRoot.children);
     }
     if (documentScrollers.has(element)) {
       continue;
     }
-    const clientHeight = element.clientHeight;
-    const scrollHeight = element.scrollHeight;
+    const clientHeight = clientHeightOf(element);
+    const scrollHeight = scrollHeightOf(element);
     if (clientHeight <= 0 || scrollHeight <= clientHeight) {
       continue;
     }
@@ -214,7 +242,7 @@ function scanInnerScrollContainersInPage(argument: InnerScrollScanArgument): Inn
     if (overflowY !== 'auto' && overflowY !== 'scroll') {
       continue;
     }
-    if (!element.checkVisibility(argument.visibilityOptions)) {
+    if (!checkVisibilityOf(element, argument.visibilityOptions)) {
       continue;
     }
     containerCount += 1;
@@ -225,6 +253,7 @@ function scanInnerScrollContainersInPage(argument: InnerScrollScanArgument): Inn
   }
   return { scannedElementCount, scanLimitReached, containerCount, representative };
 }
+const scanInnerScrollContainersInPage = composeInPage(scanInnerScrollContainersReader);
 
 function validateOptions(options: ControlledScrollOptions): void {
   if (!Number.isFinite(options.deadlineAtMs)) {
@@ -437,17 +466,21 @@ export async function scrollDocumentToOrigin(page: Page): Promise<Readonly<Scrol
 
 /**
  * ブラウザ内で、文書のスクロール位置（`ScrollPosition` の定義）を読む。位置は変えない。
- * `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
+ * 部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、この関数の外にあるものを参照しない。
  */
-function readDocumentScrollPositionInPage(): ScrollPosition {
-  const root = document.scrollingElement ?? document.documentElement;
-  const body = document.body;
+function readDocumentScrollPositionReader(R: StandardReaders): ScrollPosition {
+  // DOM clobbering（DEF-073）: 名前つきの img・form など（`<img name="body">` など）は、`document` の同じ名前のプロパティを隠すので、
+  // `Document.prototype` の getter で読む（部品の `documentProperty`。`src/browser/in-page-readers.ts`。CC-068）。html・body は、名前つきの子で隠れない。
+  const { documentProperty } = R;
+  const root = documentProperty<Element | null>('scrollingElement') ?? documentProperty<HTMLElement>('documentElement');
+  const body = documentProperty<HTMLElement | null>('body');
   const separateBody = body !== null && body !== root ? body : null;
   return {
     scrollX: window.scrollX + (separateBody?.scrollLeft ?? 0),
     scrollY: window.scrollY + (separateBody?.scrollTop ?? 0),
   };
 }
+const readDocumentScrollPositionInPage = composeInPage(readDocumentScrollPositionReader);
 
 /**
  * 文書のスクロール位置を読む（位置は変えない）。collector が「収集した時点のスクロール位置」を記録するときに使う。
@@ -534,7 +567,7 @@ async function scanInnerScrollContainers(page: Page, deadlineAtMs: number): Prom
 
 /**
  * 文書と body のうち、測定の時点でたどっていない候補と、そのスクロールできる量。
- * 対象が決まっていない場合は、量の大きいほう（同じなら文書。`measureScrollInPage` の選び方と同じ）。
+ * 対象が決まっていない場合は、量の大きいほう（同じなら文書。`measureScrollReader` の選び方と同じ）。
  */
 function alternativeDocumentTarget(
   observation: ScrollObservation,

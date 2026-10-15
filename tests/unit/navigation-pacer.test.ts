@@ -498,3 +498,121 @@ describe('NavigationPacer.raiseMinimumInterval (site unavailability design 3.6.2
     expect(Object.isFrozen(snapshot)).toBe(true);
   });
 });
+
+// DEF-100 fix（サイトへの負荷の制御の設計書 4.1。手順書 `doc/spec/site-load.md`）: 間隔は、読み込みの開始と、main frame の文書の要求を
+// サイトに送った時刻（Guard が記録する）の遅い方から数える。送った時刻の記録のない読み込みは、開始の時刻だけで数える（今と同じ）。
+describe('NavigationPacer.recordDocumentRequestSent (DEF-100 fix)', () => {
+  it('waits for the interval from the time the previous document request was sent when it was sent after the start', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    // 開始の後、Context の作成などで 1,500 ms たってから送った。
+    time.advance(1_500);
+    pacer.recordDocumentRequestSent();
+    time.advance(2_000);
+
+    // 開始からは 3,500 ms、送った時刻からは 2,000 ms。送った時刻から間隔が空くまで待つ。
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS - 2_000);
+    expect(time.sleeps).toEqual([INTERVAL_MS - 2_000]);
+    expect(pacer.snapshot()).toEqual({
+      navigationCount: 2,
+      totalWaitMs: INTERVAL_MS - 2_000,
+      lastNavigationStartedAtMs: START_MS + 1_500 + INTERVAL_MS,
+    });
+  });
+
+  it('keeps the latest sent time (redirects and later documents of the same navigation)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(100);
+    pacer.recordDocumentRequestSent();
+    time.advance(400);
+    pacer.recordDocumentRequestSent();
+    time.advance(500);
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS - 500);
+    expect(pacer.snapshot().lastNavigationStartedAtMs).toBe(START_MS + 500 + INTERVAL_MS);
+  });
+
+  it('counts only from the start when nothing was sent after it (unchanged behavior)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    pacer.recordDocumentRequestSent();
+    time.advance(1_000);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(1_000);
+
+    // 送った時刻は前の開始より前なので、開始から数える。
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS - 1_000);
+  });
+
+  it('waits before the first navigation of the pacer when a document request was already sent', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    pacer.recordDocumentRequestSent();
+    time.advance(1_000);
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(INTERVAL_MS - 1_000);
+    expect(pacer.snapshot()).toEqual({ navigationCount: 1, totalWaitMs: INTERVAL_MS - 1_000, lastNavigationStartedAtMs: START_MS + INTERVAL_MS });
+  });
+
+  it('waits again for the interval from a send that is recorded while the next navigation waits', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(1_000);
+    const next = pacer.beforeNavigation();
+    await flush();
+    expect(time.sleeps).toEqual([INTERVAL_MS - 1_000]);
+    // 待っている途中（開始から 3,000 ms）で、前の読み込みの要求が送られた。
+    time.advance(2_000);
+    pacer.recordDocumentRequestSent();
+
+    await expect(time.settle(next)).resolves.toBe(2_000 + INTERVAL_MS);
+    // 1回目の待ちは前の開始から間隔のちょうど（開始から 5,000 ms）で終わり、送った時刻（開始から 3,000 ms）から間隔が空くまで待ち直す。
+    expect(time.sleeps).toEqual([INTERVAL_MS - 1_000, 3_000]);
+    expect(pacer.snapshot().lastNavigationStartedAtMs).toBe(START_MS + 3_000 + INTERVAL_MS);
+  });
+
+  it('never sleeps when the interval is 0', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time, 0);
+    await time.settle(pacer.beforeNavigation());
+    pacer.recordDocumentRequestSent();
+
+    await expect(time.settle(pacer.beforeNavigation())).resolves.toBe(0);
+    expect(time.sleeps).toEqual([]);
+  });
+
+  it('does not change the shape of the snapshot (the sent time is not recorded)', async () => {
+    const time = new FakeTime();
+    const pacer = pacerWith(time);
+    await time.settle(pacer.beforeNavigation());
+    time.advance(700);
+    pacer.recordDocumentRequestSent();
+
+    expect(pacer.snapshot()).toEqual({ navigationCount: 1, totalWaitMs: 0, lastNavigationStartedAtMs: START_MS });
+  });
+
+  it('throws RangeError when the clock returns a time that is not a non-negative safe integer, and keeps the record', async () => {
+    let nowMs = START_MS;
+    const sleeps: number[] = [];
+    const pacer = createNavigationPacer({
+      minIntervalMs: INTERVAL_MS,
+      now: () => nowMs,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        nowMs += ms;
+      },
+    });
+    await pacer.beforeNavigation();
+    nowMs = Number.NaN;
+    expect(() => pacer.recordDocumentRequestSent()).toThrow(RangeError);
+    nowMs = START_MS + 1_000;
+
+    // 送った時刻は記録されていないので、開始から数える。
+    await expect(pacer.beforeNavigation()).resolves.toBe(INTERVAL_MS - 1_000);
+    expect(sleeps).toEqual([INTERVAL_MS - 1_000]);
+  });
+});

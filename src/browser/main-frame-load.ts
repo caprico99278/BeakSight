@@ -46,6 +46,29 @@ export interface MainFrameLoadObservation {
 export type MainFrameLoadSettlement = DeadlineOutcome<Response | null>;
 
 /**
+ * `page.goto` を `waitUntil` と Playwright の期限 `timeoutMs` で待ち、読み込みの終わり方を返す（CCX-7a。CC-045）。Playwright の期限だけで
+ * 待つ読み込み（Passive のナビゲーション、Interaction の候補の読み込み、robots.txt と sitemap.xml の取得）が使う。`page.goto` を
+ * 終わり方で包む処理は、ここだけで行う。
+ * - 読み込みが終わったら `FULFILLED`（`value` は `page.goto` の応答。応答がなければ `null`）。
+ * - 例外（同期の例外を含む）なら `REJECTED`（`reason` は例外そのもの）。例外は投げない。期限の競争ではないので `DEADLINE_EXCEEDED` はない。
+ * - 結果は凍結する。
+ */
+export async function settleMainFrameLoad(
+  page: Page,
+  url: string,
+  options: { readonly waitUntil: 'load' | 'domcontentloaded'; readonly timeoutMs: number },
+): Promise<Exclude<MainFrameLoadSettlement, { readonly status: 'DEADLINE_EXCEEDED' }>> {
+  try {
+    return Object.freeze({
+      status: 'FULFILLED',
+      value: await page.goto(url, { waitUntil: options.waitUntil, timeout: options.timeoutMs }),
+    });
+  } catch (error) {
+    return Object.freeze({ status: 'REJECTED', reason: error });
+  }
+}
+
+/**
  * main frame の最後の文書の要求の応答の追跡。読み込みを始める前に付け、観測を作った後に外す。判定はしない。
  */
 export interface MainFrameDocumentTracker {

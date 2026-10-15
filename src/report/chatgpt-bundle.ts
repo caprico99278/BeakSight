@@ -20,24 +20,24 @@
  *   Finding と Evidence は、`findings.json` と `evidence-index.json` の1か所に置き、`pages.json` からは ID で参照する。
  * - 生のレスポンス本文は、入れない。`visible-text.txt` は読まない。このファイルが組み立てる JSON は、表示用モデルだけから作る。
  *   `page.json` は、記録した Evidence（一次の証拠）として、読んだバイト列のまま入れる（設計書 6.1.11）。
- * - 決定論: fflate の `zipSync` を使い、各項目の時刻を固定の値にする。同じ入力からは、同じバイト列を作る。
+ * - 決定論: ZIP の組み立て（各項目の時刻の固定）と目録の 1 件（バイト数と sha256）は、共通の部品 `src/core/deterministic-zip.ts`（T32f。T32R2 M-2 で `src/core/` に移した）で行う。同じ入力
+ *   からは、同じバイト列を作る（移す前と同じバイト列であることを `chatgpt-bundle.test.ts` の sha256 で固定）。
  * - ZIP の中のパスは、区切りを `/` にし、`..` や絶対パスを含めない。`page.json` とスクリーンショットのパスは、
  *   `assertPagesEntryPath` の1か所で確かめ（相対パスの規則は `isPortableRelativeArtifactPath`。CC-027）、不正なら、どのファイルも
  *   読む前に `RangeError` を投げる。
  */
-import { zipSync, type Zippable } from 'fflate';
 import { distinctSorted } from '../audit/rule-helpers.js';
 import {
   PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   isPortableRelativeArtifactPath,
 } from '../core/artifact-layout.js';
+import { artifactJsonBytes } from '../core/artifact-json.js';
 import type { AuditRunResult, EvidenceId, FindingId, IncompleteReasonCode, RunId, RunStatus } from '../core/contracts.js';
+import { deterministicZipOf, zipFileRecordsOf, type ZipFileRecord } from '../core/deterministic-zip.js';
 import type { ScreenshotCaptureType } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger } from '../core/guards.js';
-import { createSha256FingerprintOfBytes } from '../core/ids.js';
 import { CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES } from '../core/limits.js';
-import { artifactJsonBytes } from './artifact-json.js';
 import type { ReasonView, ReportViewModel, ScreenshotView } from './view-model.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -90,16 +90,10 @@ export interface ChatGptBundleManifest {
   /** スクリーンショットの合計の大きさの上限（バイト。設計書 6.1.11）。 */
   readonly screenshotBudgetBytes: number;
   /** `manifest.json` を除く、ZIP の中のすべてのファイル（ZIP の中の順）。 */
-  readonly files: readonly { readonly path: string; readonly byteLength: number; readonly sha256: string }[];
+  readonly files: readonly ZipFileRecord[];
   /** 入れられなかったファイル（ZIP の中の順）。 */
   readonly omittedFiles: readonly { readonly path: string; readonly reason: ChatGptBundleOmissionReason }[];
 }
-
-/**
- * ZIP の各項目の時刻（固定）。fflate は、時刻を実行環境の地方時で DOS の日時に変えるので、時差の表記のない日時の文字列
- * （地方時として解釈される）にして、どの時間帯でも同じバイト列にする。DOS の日時で表せる最も早い日時である。
- */
-const ZIP_ENTRY_MODIFIED_AT = '1980-01-01T00:00:00';
 
 // ---------------------------------------------------------------------------------------------------------------
 // パスの検証
@@ -128,11 +122,18 @@ const reasonCodes = (
 ): readonly { readonly code: IncompleteReasonCode; readonly detail: string | null }[] =>
   reasons.map(({ code, detail }) => ({ code, detail }));
 
-/** `summary.json`: 表示用モデルの `summary`（理由の説明を除く）。 */
-const summaryView = (model: ReportViewModel): object => ({
-  ...model.summary,
-  incompleteReasons: reasonCodes(model.summary.incompleteReasons),
-});
+/**
+ * `summary.json`: 表示用モデルの `summary`（理由の説明を除く）。実行の記録からは、最後の実行の終わりの時刻（`lastFinishedAt`。CLI とバンドルの
+ * 名前のための値。CCX-19）を除く（`items` に同じ値があり、`summary.json` の形を変えないため）。
+ */
+const summaryView = (model: ReportViewModel): object => {
+  const { lastFinishedAt: _lastFinishedAt, ...executions } = model.summary.executions;
+  return {
+    ...model.summary,
+    executions,
+    incompleteReasons: reasonCodes(model.summary.incompleteReasons),
+  };
+};
 
 /** `findings.json`: 各 Finding と、それが参照する Evidence の場所（どのページにもなければ `null`）と、関係するスクリーンショットのパス。 */
 const findingsView = (model: ReportViewModel): object =>
@@ -293,7 +294,7 @@ export async function createChatGptBundle(
     }
   }
 
-  // 3. manifest と ZIP（読み終えた後に、同期で作る）。
+  // 3. manifest と ZIP（読み終えた後に、同期で作る。T32f: ZIP の組み立てと目録の 1 件は、共通の部品 `src/core/deterministic-zip.ts`）。
   const manifest: ChatGptBundleManifest = {
     bundleSchemaVersion: CHATGPT_BUNDLE_SCHEMA_VERSION,
     runId: run.runId,
@@ -301,13 +302,8 @@ export async function createChatGptBundle(
     toolVersion: run.toolVersion,
     generatedAt: run.finishedAt,
     screenshotBudgetBytes,
-    files: files.map(({ path, bytes }) => ({ path, byteLength: bytes.byteLength, sha256: createSha256FingerprintOfBytes(bytes) })),
+    files: zipFileRecordsOf(files),
     omittedFiles,
   };
-  // fflate は、項目をオブジェクトの鍵の順に並べる。鍵は、固定の名前と `pages/` で始まるパスだけなので、挿入の順のままである。
-  const zippable: Zippable = { [CHATGPT_BUNDLE_FILE_NAMES.manifest]: artifactJsonBytes(manifest) };
-  for (const { path, bytes } of files) {
-    zippable[path] = bytes;
-  }
-  return zipSync(zippable, { mtime: ZIP_ENTRY_MODIFIED_AT });
+  return deterministicZipOf([{ path: CHATGPT_BUNDLE_FILE_NAMES.manifest, bytes: artifactJsonBytes(manifest) }, ...files]);
 }

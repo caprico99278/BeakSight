@@ -10,6 +10,7 @@
  */
 import { parseArgs } from 'node:util';
 import { ConfigError } from '../config/config-error.js';
+import { HEADLESS_CONFIG_OVERRIDES } from '../config/config-overrides.js';
 import type { AuditConfigOverrides } from '../config/types.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { safeErrorMessage } from '../core/errors.js';
@@ -134,7 +135,7 @@ export function parseCliArguments(argv: readonly string[]): CliInvocation | CliH
   }
 
   const overrides: AuditConfigOverrides = {
-    ...(values.headed === true ? { browser: { headed: true } } : values.headless === true ? { browser: { headed: false } } : {}),
+    ...(values.headed === true ? { browser: { headed: true } } : values.headless === true ? HEADLESS_CONFIG_OVERRIDES : {}),
     ...(values.output === undefined ? {} : { output: { directory: values.output } }),
   };
   return { kind: 'command', command, configPath: values.config, overrides, startNew };

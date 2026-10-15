@@ -561,13 +561,19 @@ export async function startFixtureServer(options: FixtureServerOptions = {}): Pr
       }
     });
   });
+  // DEF-068: Node の HTTP サーバは、upgrade と CONNECT のソケットを渡すときに、自分の `error` の受け手を外す。応答（426、400、405）の後に
+  // クライアントが接続を切る（RST）と、`read ECONNRESET` が処理されない誤りになるので、受け手を付ける。誤りの後、ソケットは Node が閉じる
+  // （`close` で一覧から外れる）。数える値は、応答の前に `handleUpgrade`・`handleConnect` が数えたものから変わらない。
+  const ignoreSocketErrorAfterResponse = (): void => undefined;
   server.on('upgrade', (request, socket) => {
     upgradedSockets.add(socket);
+    socket.on('error', ignoreSocketErrorAfterResponse);
     socket.once('close', () => upgradedSockets.delete(socket));
     handleUpgrade(request, socket, counters);
   });
   server.on('connect', (request, socket) => {
     upgradedSockets.add(socket);
+    socket.on('error', ignoreSocketErrorAfterResponse);
     socket.once('close', () => upgradedSockets.delete(socket));
     handleConnect(request, socket, counters);
   });

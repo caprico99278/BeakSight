@@ -1,0 +1,203 @@
+{
+  "$id": "urn:beaksight:schema:action-run:1.0",
+  "description": "The record of one write job (action-run.json in the Run directory; Task 30 design 3 'record'; T30a): the scenario and its revision, the consumed execution grant, the seed record of the generated data, the submitted values (synthetic test data, kept in plain text like the values of a READ check definition), the submission state, the response, the result conditions, the record id, the READ verification, the settled reservation, the ActionResult and its reason. The value lists and limits are owned by src/control/actions/action-contracts.ts; the decisions by src/control/actions/action-outcome.ts. No property holds a credential, a cookie, a CSRF token, a hidden value or an authenticated state. The public audit run.json schema is not changed (only its runId is referenced).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "jobId",
+    "runId",
+    "profileId",
+    "scenarioId",
+    "scenarioRevision",
+    "grantId",
+    "seedRecord",
+    "submittedValues",
+    "resultConditions",
+    "submission",
+    "blockReason",
+    "httpStatus",
+    "responseJudgement",
+    "recordId",
+    "readVerification",
+    "reservationState",
+    "result",
+    "reason",
+    "startedAt",
+    "submittedAt",
+    "finishedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "action-run-schema/1.0" },
+    "jobId": { "$ref": "#/$defs/id" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+    "scenarioId": { "$ref": "#/$defs/id" },
+    "scenarioRevision": { "$ref": "#/$defs/revision" },
+    "grantId": { "$ref": "#/$defs/id" },
+    "seedRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seed", "seedInput", "baseDate", "attempt"],
+      "properties": {
+        "seed": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "seedInput": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profileId", "scenarioId", "scenarioRevision", "ruleSetDigest", "executionGrantId"],
+          "properties": {
+            "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+            "scenarioId": { "$ref": "#/$defs/id" },
+            "scenarioRevision": { "$ref": "#/$defs/revision" },
+            "ruleSetDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+            "executionGrantId": { "$ref": "#/$defs/id" }
+          }
+        },
+        "baseDate": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "attempt": { "type": "integer", "minimum": 0, "maximum": 32 }
+      }
+    },
+    "submittedValues": {
+      "type": "object",
+      "maxProperties": 200,
+      "propertyNames": { "minLength": 1, "maxLength": 256 },
+      "additionalProperties": { "type": "string", "maxLength": 8192 }
+    },
+    "resultConditions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["successCondition", "inputErrorCondition"],
+      "properties": {
+        "successCondition": { "$ref": "#/$defs/condition" },
+        "inputErrorCondition": { "$ref": "#/$defs/condition" }
+      }
+    },
+    "submission": { "enum": ["NOT_SENT", "SENT", "UNKNOWN"] },
+    "blockReason": { "enum": ["PAYLOAD_MISMATCH", "PRECHECK_FAILED", null] },
+    "httpStatus": { "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 599 }, { "type": "null" }] },
+    "responseJudgement": {
+      "enum": [
+        "SUCCESS",
+        "INPUT_ERROR",
+        "RATE_LIMITED",
+        "SERVER_ERROR",
+        "NO_CONDITION_MATCHED",
+        "MULTIPLE_CONDITIONS_MATCHED",
+        "SESSION_LOST",
+        "REPOST_REDIRECT",
+        "RESPONSE_NOT_DELIVERED",
+        null
+      ]
+    },
+    "recordId": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+    "readVerification": { "anyOf": [{ "$ref": "#/$defs/readVerification" }, { "type": "null" }] },
+    "reservationState": { "enum": ["COMMITTED", "UNKNOWN", "RELEASED"] },
+    "result": { "enum": ["VERIFIED", "PARTIAL", "BLOCKED", "UNKNOWN", "FAILED"] },
+    "reason": {
+      "enum": [
+        "PAYLOAD_MISMATCH",
+        "PRECHECK_FAILED",
+        "NO_RESPONSE",
+        "INPUT_ERROR",
+        "RATE_LIMITED",
+        "SERVER_ERROR",
+        "NO_CONDITION_MATCHED",
+        "MULTIPLE_CONDITIONS_MATCHED",
+        "SESSION_LOST",
+        "REPOST_REDIRECT",
+        "RESPONSE_NOT_DELIVERED",
+        "RECORD_ID_NOT_FOUND",
+        "RECORD_ID_UNSAFE",
+        "READ_VERIFICATION_MATCHED",
+        "READ_VERIFICATION_NOT_MATCHED",
+        "READ_VERIFICATION_UNDETERMINED",
+        "RECORD_ID_MISMATCH",
+        "UNEXPECTED_FIELD_CHANGE",
+        "UPDATE_POSTCHECK_UNDETERMINED"
+      ]
+    },
+    "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "submittedAt": { "anyOf": [{ "$ref": "#/$defs/compactUtcTimestamp" }, { "type": "null" }] },
+    "finishedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "update": {
+      "description": "The record of an UPDATE write (T31f; Task 31 design 3 'evidence and record'; written by the worker of T31g-2): the id of the target record copied from the execution grant, and the evidence of the check after the update (null when the check was not reached). The obtained id is recordId. No value of a kept field, of a hidden field or of a CSRF token.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetRecordId", "updateEvidence"],
+      "properties": {
+        "targetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 64 },
+        "updateEvidence": { "anyOf": [{ "$ref": "#/$defs/updateEvidence" }, { "type": "null" }] }
+      }
+    }
+  },
+  "if": { "properties": { "submission": { "const": "NOT_SENT" } } },
+  "then": {
+    "properties": {
+      "blockReason": { "type": "string" },
+      "httpStatus": { "type": "null" },
+      "responseJudgement": { "type": "null" },
+      "recordId": { "type": "null" },
+      "readVerification": { "type": "null" },
+      "submittedAt": { "type": "null" },
+      "reservationState": { "const": "RELEASED" },
+      "result": { "const": "BLOCKED" }
+    }
+  },
+  "else": {
+    "properties": {
+      "blockReason": { "type": "null" },
+      "reservationState": { "not": { "const": "RELEASED" } },
+      "result": { "not": { "const": "BLOCKED" } }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "pattern": "^/", "maxLength": 2048 },
+        "selector": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] }
+      }
+    },
+    "updateEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "properties": {
+        "fields": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/updateEvidenceField" } }
+      }
+    },
+    "updateEvidenceField": {
+      "description": "One field of the update evidence: a CHANGED field has the value read before the update and the new value it sent; a KEPT field has neither (only whether it matched after the update).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fieldName", "role", "previousValue", "newValue", "matched"],
+      "properties": {
+        "fieldName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "role": { "enum": ["CHANGED", "KEPT"] },
+        "previousValue": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] },
+        "newValue": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] },
+        "matched": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] }
+      },
+      "if": { "properties": { "role": { "const": "CHANGED" } } },
+      "then": { "properties": { "previousValue": { "type": "string" }, "newValue": { "type": "string" } } },
+      "else": { "properties": { "previousValue": { "type": "null" }, "newValue": { "type": "null" } } }
+    },
+    "readVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readCheckId", "readCheckRevision", "result"],
+      "properties": {
+        "readCheckId": { "$ref": "#/$defs/id" },
+        "readCheckRevision": { "$ref": "#/$defs/revision" },
+        "result": {
+          "enum": ["MATCHED", "NOT_MATCHED", "UNDETERMINED", "READ_BLOCKED_BY_POLICY", "READ_CANDIDATE_DRIFTED", "READ_CANDIDATE_NOT_READ"]
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,13 @@
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../core/limits.js';
-import { canonicalizeAllowedOrigins, hasUrlCredentials, isHttpProtocol, normalizeUrl } from '../crawl/normalize-url.js';
+import {
+  LOOPBACK_HOSTNAMES,
+  canonicalizeAllowedOrigins,
+  hasUrlCredentials,
+  isHttpProtocol,
+  isLoopbackUrl,
+  normalizeUrl,
+} from '../crawl/normalize-url.js';
 import { INTERACTION_CANDIDATE_LIMITS } from '../safety/interaction-policy.js';
 import type { AuditConfig, ConfigValidationResult, Viewport } from './types.js';
 
@@ -43,12 +50,6 @@ const crawlIntegerKeys = [
  * 設定の誤りで、監査対象のサイトに短時間に大量の読み込みをしないようにする（サイトへの負荷の制御の設計書 3.2、4.2）。
  */
 const MIN_NAVIGATION_INTERVAL_MS = 1_000;
-
-/** ループバックのアドレスの host（`URL.hostname` の値）。サイトへの負荷の制御の設計書 3.2、4.2。 */
-const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set(['127.0.0.1', '[::1]', 'localhost']);
-
-/** URL の host が、ループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）か。 */
-const isLoopbackUrl = (url: URL): boolean => LOOPBACK_HOSTNAMES.has(url.hostname);
 
 /**
  * IANA の time zone の名前の書き方（例: `Asia/Tokyo`、`UTC`、`GMT`、`Etc/GMT+9`、`America/Port-au-Prince`）。

@@ -39,7 +39,7 @@ import {
   formatInteger,
   formatNotObserved,
 } from '../../src/presentation/format.js';
-import { findImportSpecifiers, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import { findModuleSpecifiers, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
 
 /** `src/**` の TypeScript のファイル（1回だけ列挙して読み込み、走査したもの）。 */
 const SOURCE_FILES: readonly SourceFile[] = loadSourceFiles();
@@ -147,12 +147,13 @@ const findListSeparatorJoins = (source: ScannedSource): readonly string[] =>
   [...source.code.matchAll(LIST_SEPARATOR_JOIN_PATTERN)].map((match) => match[0]);
 
 /**
- * `src/orchestration/**` を指す import の指定子（設計書 6.1.8: report は orchestration を import しない）の一覧。
- * import の指定子は、`source-scan.ts` の `findImportSpecifiers` で、コメントを除いた本文 `code` から取り出す。
+ * `src/orchestration/**` を指す参照の指定子（設計書 6.1.8: report は orchestration を import しない）の一覧。
+ * 指定子は、`source-scan.ts` の `findModuleSpecifiers` で、コメントを除いた本文 `code` から取り出す（CCX-27。CC-074: import の文だけでなく、
+ * `require`・`createRequire`・テンプレートの指定子・`new URL(…, import.meta.url)` も数える。禁じる検査なので、広げると強くなる側）。
  */
 const ORCHESTRATION_SPECIFIER_PATTERN = /(?:^|\/)orchestration\//u;
 const findOrchestrationImports = (source: ScannedSource): readonly string[] =>
-  findImportSpecifiers(source.code).filter((specifier) => ORCHESTRATION_SPECIFIER_PATTERN.test(specifier));
+  findModuleSpecifiers(source.code).filter((specifier) => ORCHESTRATION_SPECIFIER_PATTERN.test(specifier));
 
 // ---------------------------------------------------------------------------------------------------------------
 // 対象と除外
@@ -181,6 +182,12 @@ const UI01_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
 const UI06_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
   ['src/presentation/messages.ts', '利用者向けの文言の唯一のファイル'],
   ['src/presentation/catalog.ts', '表示用語彙の唯一のファイル'],
+  // T27a（Task 27 の設計書 4.3、10 章の 3）: 発見の候補の分類で、画面の文言と照らす日本語の語の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/discovery/classification-words.ts', '発見の分類で照らす語の一覧（表示の文言ではない）'],
+  // T29a（Task 29 の設計書 3 章、5 章）: 入力の規則で、欄の名前と照らす外部到達の日本語の語の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/control/data-rules/external-delivery-words.ts', '入力の規則で照らす外部到達の語の一覧（表示の文言ではない）'],
+  // T29c（Task 29 の設計書 3 章）: 業務テンプレートで、欄の名前と照らす日本語の語の閉じた一覧（利用者に見せる文言ではない）。
+  ['src/control/data-rules/business-templates.ts', '業務テンプレートの意味の推しで照らす語の一覧（表示の文言ではない）'],
 ]);
 
 /** GATE-UI06 の除外の、Rule の定義のファイル（Finding の `message` は Rule が持つ）。 */
@@ -390,6 +397,11 @@ describe('UI Gate detectors', () => {
       "import '../orchestration/side-effect.js';",
       "const m = await import('../orchestration/lazy.js');",
       "import {\n  a,\n  b,\n} from '../../src/orchestration/id-allocator.js';",
+      // CCX-27（CC-074）: import の文のほかの読み込み方も数える。
+      "const m = require('../orchestration/run-coordinator.js');",
+      "const m = createRequire(import.meta.url)('../orchestration/run-coordinator.js');",
+      'const m = await import(`../orchestration/${name}.js`);',
+      "const url = new URL('../orchestration/run-coordinator.js', import.meta.url);",
     ]) {
       expect(findOrchestrationImports(scanSource(line)), line).toHaveLength(1);
     }

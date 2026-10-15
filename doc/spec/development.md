@@ -14,6 +14,14 @@ BeakSight を開発する人のための、npm のスクリプト、ローカル
 | `npm run test:unit` | 単体のテストと、部品のテスト（`tests/unit`、`tests/component`）を実行します。 |
 | `npm run test:integration` | 結合のテスト（`tests/integration`）を実行します。 |
 | `npm run verify` | `typecheck`、`test`、`build` を順に実行します。 |
+| `npm run build:ui` | 管理画面をビルドします（`apps/local-ui/dist/`）。 |
+| `npm run typecheck:ui` | 管理画面のコードの型チェックを行います（`build:ui` の後）。 |
+| `npm run test:ui` | 管理画面とそのサーバのテスト（`apps/local-ui/tests/`）を実行します（`build:ui` と `build` の後。画面から動かす監査のテストは、監査の本体のビルドの出力 `dist/` を使います）。 |
+| `npm run verify:ui` | `build:ui`、`typecheck:ui`、`test:ui` を順に実行します。 |
+| `npm run verify:all` | `verify` と `verify:ui` を順に実行します。 |
+| `npm run ui` | 監査の本体（`build`。画面から動かす監査のワーカーが使う `dist/`）と管理画面（`build:ui`）を順にビルドしてから、管理画面を起動します（「[管理画面（ローカル）](local-ui.md)」）。`npm run ui -- --port 4400` で port を指定できます。 |
+| `npm run ui:dev` | 管理画面の開発のサーバを起動します。 |
+| `npm run setup:local` | ビルドしてから、管理データ（`local-data/beaksight-control.sqlite`）を準備します。何回実行してもよいです（「[管理データの準備](local-setup.md)」）。 |
 
 ## ローカルでの検証の手順
 

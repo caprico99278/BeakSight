@@ -1,9 +1,9 @@
 import type { Page } from 'playwright';
 import {
   observeMainFrameLoad,
+  settleMainFrameLoad,
   trackMainFrameDocument,
   type MainFrameLoadObservation,
-  type MainFrameLoadSettlement,
 } from '../browser/main-frame-load.js';
 import type { NavigationOutcomeKind, NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
 import { isPositiveSafeInteger } from '../core/guards.js';
@@ -70,7 +70,10 @@ export async function navigatePage(page: Page, url: string, options: PageNavigat
   const tracker = trackMainFrameDocument(page);
   let loadObservation: MainFrameLoadObservation;
   try {
-    loadObservation = observeMainFrameLoad(tracker, await settleNavigation(page, url, timeoutMs));
+    loadObservation = observeMainFrameLoad(
+      tracker,
+      await settleMainFrameLoad(page, url, { waitUntil: 'domcontentloaded', timeoutMs }),
+    );
   } finally {
     tracker.dispose();
   }
@@ -86,15 +89,6 @@ export async function navigatePage(page: Page, url: string, options: PageNavigat
     failureDetail: loadObservation.failureDetail,
     loadObservation,
   });
-}
-
-/** `page.goto` の終わり方（読み込みが終わったら応答、例外なら例外。Playwright の期限だけで待つ）。例外を投げない。 */
-async function settleNavigation(page: Page, url: string, timeoutMs: number): Promise<MainFrameLoadSettlement> {
-  try {
-    return { status: 'FULFILLED', value: await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }) };
-  } catch (error) {
-    return { status: 'REJECTED', reason: error };
-  }
 }
 
 /**

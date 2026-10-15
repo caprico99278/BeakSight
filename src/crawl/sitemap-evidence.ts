@@ -11,7 +11,7 @@ import type { SitemapEvidence } from '../core/evidence-types.js';
  *
  * 次の場合は、判定に使える sitemap がないので `null` を返す（Cross-page rule は sitemap の Rule を評価しない）。
  * - robots.txt の記録
- * - 取得の結果が `OK` でない（ない、または取得できなかった）
+ * - 取得の結果が `OK` でない（ない、取得できなかった、または認証つきの Run で除外に当たるので取りに行かなかった `EXCLUDED`）
  * - URL を取り出せなかった（`sitemapUrls` が `null`）
  *
  * 結果は凍結する。

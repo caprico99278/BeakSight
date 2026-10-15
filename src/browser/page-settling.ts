@@ -2,6 +2,7 @@ import type { Page } from 'playwright';
 import type { IncompleteReasonCode, PartialFailureReason } from '../core/contracts.js';
 import { awaitBeforeDeadline, wait } from '../core/deadline.js';
 import { isPositiveFiniteNumber } from '../core/guards.js';
+import { composeInPage, type StandardReaders } from './in-page-readers.js';
 import { pageFailureReason } from './page-failure.js';
 
 export interface PageSettlingPolicy {
@@ -67,6 +68,20 @@ function settledBeforeDeadline(
     : settled;
 }
 
+/**
+ * ブラウザ内で、文書の `readyState` と、文書の要素の高さを読む。部品（`R`）を `composeInPage` で組み込んで `page.evaluate` に渡すため、
+ * この関数の外にあるものを参照しない。
+ * DOM clobbering（DEF-073）: 名前つきの img・form など（`<form name="readyState">` など）は、`document` の同じ名前のプロパティを隠すので、
+ * `Document.prototype` の getter で読む（部品の `documentProperty`。`src/browser/in-page-readers.ts`。CC-068）。html は名前つきの子で隠れない。
+ */
+function readDocumentSettlingStateReader(R: StandardReaders): Pick<PageSettlingObservation, 'readyState' | 'scrollHeight'> {
+  return {
+    readyState: R.documentProperty<DocumentReadyState>('readyState'),
+    scrollHeight: R.documentProperty<HTMLElement>('documentElement').scrollHeight,
+  };
+}
+const readDocumentSettlingStateInPage = composeInPage(readDocumentSettlingStateReader);
+
 export async function waitForPageSettled(
   page: Page,
   policy: PageSettlingPolicy,
@@ -98,10 +113,7 @@ export async function waitForPageSettled(
     if (page.isClosed()) {
       return partial('PAGE_CLOSED', observations);
     }
-    const evaluated = await awaitBeforeDeadline(page.evaluate(() => ({
-      readyState: document.readyState,
-      scrollHeight: document.documentElement.scrollHeight,
-    })), deadlineAtMs);
+    const evaluated = await awaitBeforeDeadline(page.evaluate(readDocumentSettlingStateInPage), deadlineAtMs);
     if (evaluated.status === 'REJECTED') {
       return partial(pageFailureReason(page), observations);
     }

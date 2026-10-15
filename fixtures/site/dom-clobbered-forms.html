@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Clobbered form fixture</title>
+  </head>
+  <body>
+    <!--
+      DEF-069: each form has a named field that hides a standard property of the form (DOM clobbering).
+      The forms are also interaction candidates (aria-expanded) so that the candidate discovery reads the forms themselves.
+      The form of the field named "id" shares its id with the div below, so the duplicated id is recorded only when the id is read
+      through the standard getter.
+    -->
+    <div id="duplicated-form">Duplicated id holder</div>
+    <form id="form-method" method="post" action="/clobbered/method" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form method">
+      <label>Field method <input type="text" name="method"></label>
+      <button type="submit" name="send" value="method">Send method</button>
+    </form>
+    <form id="form-action" method="post" action="/clobbered/action" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form action">
+      <label>Field action <input type="text" name="action"></label>
+      <button type="submit" name="send" value="action">Send action</button>
+    </form>
+    <form id="form-target" method="post" action="/clobbered/target" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form target">
+      <label>Field target <input type="text" name="target"></label>
+      <button type="submit" name="send" value="target">Send target</button>
+    </form>
+    <form id="form-enctype" method="post" action="/clobbered/enctype" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form enctype">
+      <label>Field enctype <input type="text" name="enctype"></label>
+      <button type="submit" name="send" value="enctype">Send enctype</button>
+    </form>
+    <form id="form-elements" method="post" action="/clobbered/elements" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form elements">
+      <label>Field elements <input type="text" name="elements"></label>
+      <button type="submit" name="send" value="elements">Send elements</button>
+    </form>
+    <form id="duplicated-form" method="post" action="/clobbered/id" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form id">
+      <label>Field id <input type="text" name="id"></label>
+      <button type="submit" name="send" value="id">Send id</button>
+    </form>
+    <form id="form-getAttribute" method="post" action="/clobbered/getAttribute" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form getAttribute">
+      <label>Field getAttribute <input type="text" name="getAttribute"></label>
+      <button type="submit" name="send" value="getAttribute">Send getAttribute</button>
+    </form>
+    <form id="form-hasAttribute" method="post" action="/clobbered/hasAttribute" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form hasAttribute">
+      <label>Field hasAttribute <input type="text" name="hasAttribute"></label>
+      <button type="submit" name="send" value="hasAttribute">Send hasAttribute</button>
+    </form>
+    <form id="form-tagName" method="post" action="/clobbered/tagName" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form tagName">
+      <label>Field tagName <input type="text" name="tagName"></label>
+      <button type="submit" name="send" value="tagName">Send tagName</button>
+    </form>
+    <form id="form-nodeType" method="post" action="/clobbered/nodeType" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form nodeType">
+      <label>Field nodeType <input type="text" name="nodeType"></label>
+      <button type="submit" name="send" value="nodeType">Send nodeType</button>
+    </form>
+    <form id="form-childNodes" method="post" action="/clobbered/childNodes" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form childNodes">
+      <label>Field childNodes <input type="text" name="childNodes"></label>
+      <button type="submit" name="send" value="childNodes">Send childNodes</button>
+    </form>
+    <form id="form-shadowRoot" method="post" action="/clobbered/shadowRoot" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form shadowRoot">
+      <label>Field shadowRoot <input type="text" name="shadowRoot"></label>
+      <button type="submit" name="send" value="shadowRoot">Send shadowRoot</button>
+    </form>
+    <form id="form-parentElement" method="post" action="/clobbered/parentElement" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form parentElement">
+      <label>Field parentElement <input type="text" name="parentElement"></label>
+      <button type="submit" name="send" value="parentElement">Send parentElement</button>
+    </form>
+    <form id="form-parentNode" method="post" action="/clobbered/parentNode" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form parentNode">
+      <label>Field parentNode <input type="text" name="parentNode"></label>
+      <button type="submit" name="send" value="parentNode">Send parentNode</button>
+    </form>
+    <form id="form-assignedSlot" method="post" action="/clobbered/assignedSlot" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form assignedSlot">
+      <label>Field assignedSlot <input type="text" name="assignedSlot"></label>
+      <button type="submit" name="send" value="assignedSlot">Send assignedSlot</button>
+    </form>
+    <form id="form-closest" method="post" action="/clobbered/closest" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form closest">
+      <label>Field closest <input type="text" name="closest"></label>
+      <button type="submit" name="send" value="closest">Send closest</button>
+    </form>
+    <form id="form-matches" method="post" action="/clobbered/matches" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form matches">
+      <label>Field matches <input type="text" name="matches"></label>
+      <button type="submit" name="send" value="matches">Send matches</button>
+    </form>
+    <form id="form-checkVisibility" method="post" action="/clobbered/checkVisibility" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form checkVisibility">
+      <label>Field checkVisibility <input type="text" name="checkVisibility"></label>
+      <button type="submit" name="send" value="checkVisibility">Send checkVisibility</button>
+    </form>
+    <form id="form-getBoundingClientRect" method="post" action="/clobbered/getBoundingClientRect" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form getBoundingClientRect">
+      <label>Field getBoundingClientRect <input type="text" name="getBoundingClientRect"></label>
+      <button type="submit" name="send" value="getBoundingClientRect">Send getBoundingClientRect</button>
+    </form>
+    <form id="form-attributes" method="post" action="/clobbered/attributes" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form attributes">
+      <label>Field attributes <input type="text" name="attributes"></label>
+      <button type="submit" name="send" value="attributes">Send attributes</button>
+    </form>
+    <form id="form-isConnected" method="post" action="/clobbered/isConnected" target="_self" enctype="multipart/form-data" aria-expanded="false" aria-label="Form isConnected">
+      <label>Field isConnected <input type="text" name="isConnected"></label>
+      <button type="submit" name="send" value="isConnected">Send isConnected</button>
+    </form>
+  </body>
+</html>

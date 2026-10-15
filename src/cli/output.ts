@@ -12,7 +12,7 @@ import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath, bundleFileName } from '../co
 import { RUN_STATUSES, type RunProgressReport, type RunStatus } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
-import { normalizeWhitespace } from '../core/text.js';
+import { normalizeWhitespace, replaceControlCharacters } from '../core/text.js';
 import {
   RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
@@ -29,9 +29,9 @@ import {
   CLI_COMMAND_DESCRIPTIONS,
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
-  HTML_REPORT_TEXT,
   RUN_SUMMARY_TEXT,
   activeRunInOutputDirectoryText,
+  authSessionLostNoticeText,
   checkpointStoreFailedText,
   cliCountText,
   cliFieldText,
@@ -55,7 +55,7 @@ import {
   unreadableCheckpointText,
   versionDifferenceText,
 } from '../presentation/messages.js';
-import type { RunExecutionsView, RunSummaryView } from '../report/view-model.js';
+import type { RunSummaryView } from '../report/view-model.js';
 import { CLI_COMMANDS, CLI_OPTION_NAMES } from './arguments.js';
 import {
   CONFIG_ERROR_EXIT_CODE,
@@ -86,12 +86,12 @@ const USAGE_ERROR_KINDS: ReadonlySet<ConfigErrorKind> = new Set<ConfigErrorKind>
   'CONFLICTING_ARGUMENTS',
 ]);
 
-/** 制御文字（Unicode の一般カテゴリ Cc）。端末の表示を乱さないよう、空白にする。 */
-const CONTROL_CHARACTERS = /\p{Cc}/gu;
+/** 制御文字（Unicode の一般カテゴリ Cc）の置き換え。端末の表示を乱さないよう、空白にする。 */
+const CONTROL_CHARACTER_REPLACEMENT = ' ';
 
 /** 不明な値（例外、文字列）を、1行の技術的な詳細にする（上限付き。制御文字と改行は空白にする）。 */
 export const technicalDetailText = (value: unknown): string =>
-  normalizeWhitespace(safeErrorMessage(value, MAX_ERROR_MESSAGE_LENGTH).replace(CONTROL_CHARACTERS, ' '));
+  normalizeWhitespace(replaceControlCharacters(safeErrorMessage(value, MAX_ERROR_MESSAGE_LENGTH), CONTROL_CHARACTER_REPLACEMENT));
 
 /** 行の一覧を、LF で終わる1つの文字列にする。 */
 export const joinLines = (lines: readonly string[]): string => `${lines.join('\n')}\n`;
@@ -204,6 +204,9 @@ export function runNoticeLines(notice: RunNotice): readonly string[] {
       return [siteUnavailableRecheckText(notice.url, formatDuration(notice.delayMs), notice.attempt, notice.maxAttempts)];
     case 'SITE_UNAVAILABLE_SLOWDOWN':
       return [siteUnavailableSlowdownText(formatDuration(notice.minIntervalMs))];
+    case 'AUTH_SESSION_LOST':
+      // T25d: CLI は認証つきの Run を行わないが、知らせの種類を網羅する（同じ形の 1 行）。
+      return [authSessionLostNoticeText(notice.url)];
   }
 }
 
@@ -233,19 +236,11 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
 }
 
 /**
- * 最後の実行の終わりの時刻（表示用モデルの `executions.items` の最後の `finishedAt`）。ChatGPT 用バンドルの名前を決める時刻で、`run` の
- * 結果のバンドルの行と、`finishAuditRun` がバンドルを書くときの名前の両方が、これを使う（ChatGPT 用バンドルのファイル名の設計書 2.1、2.3）。
- */
-export function lastExecutionFinishedAt(executions: Pick<RunExecutionsView, 'items'>): string {
-  const [firstExecution, ...laterExecutions] = executions.items;
-  return (laterExecutions.at(-1) ?? firstExecution).finishedAt;
-}
-
-/**
  * `run` の結果の行（設計書 第7章）。値は、表示用モデルの `summary` から取る。
  * - Run Status の日本語のラベル（値そのものを添える）
  * - 出力先（Run のディレクトリ）と、HTML レポートとバンドルのパス。バンドルの名前は、最後の実行の終わりの時刻
- *   （`lastExecutionFinishedAt`）から `bundleFileName` で作る（ChatGPT 用バンドルのファイル名の設計書 2.3。日時の書式を作り直さない）
+ *   （表示用モデルの `executions.lastFinishedAt`。どの実行かは表示用モデルが決める。CCX-19）から `bundleFileName` で作る（ChatGPT 用
+ *   バンドルのファイル名の設計書 2.3。日時の書式を作り直さない）
  * - ページの網羅（発見、監査、一部未完了、失敗、スキップ）
  * - severity の区分（サイト品質、Safety）ごとの、severity ごとの件数
  * - サイトへの負荷（ページの読み込みの回数と、許可 Origin への要求の件数と1分あたりの最大。サイトへの負荷の制御の設計書 4.5）。
@@ -278,7 +273,7 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
     cliFieldText(RUN_SUMMARY_TEXT.runStatus, labelWithCodeText(RUN_STATUS_CATALOG[summary.runStatus].label, summary.runStatus)),
     cliFieldText(CLI_TEXT.run.outputDirectory, runDirectory),
     cliFieldText(CLI_TEXT.run.report, artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.report)),
-    cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, bundleFileName(lastExecutionFinishedAt(executions)))),
+    cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, bundleFileName(executions.lastFinishedAt))),
     cliFieldText(
       RUN_SUMMARY_TEXT.coverageHeading,
       listText([
@@ -320,10 +315,10 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
 /** 設定が違う途中の Run の知らせで、違う項目のパスを並べる上限（設計書 4.7.1。残りは、件数だけを示す）。 */
 export const MAX_LISTED_CONFIG_DIFFERENCES = 5;
 
-/** 違う版の項目の、表示の名前（HTML レポートの要約の、BeakSight の版と Playwright の版のラベル）。 */
+/** 違う版の項目の、表示の名前（HTML レポートと共通の、BeakSight の版と Playwright の版のラベル。CCX-29）。 */
 const RUN_VERSION_FIELD_LABELS = Object.freeze({
-  toolVersion: HTML_REPORT_TEXT.summary.toolVersion,
-  playwrightVersion: HTML_REPORT_TEXT.summary.environment.playwrightVersion,
+  toolVersion: RUN_SUMMARY_TEXT.toolVersion,
+  playwrightVersion: RUN_SUMMARY_TEXT.playwrightVersion,
 } as const satisfies Record<RunVersionField, string>);
 
 /** 再開を始められなかった理由（`RunResumeUnavailableError.reason`）ごとの文言。書き漏れは、型のエラーになる。 */

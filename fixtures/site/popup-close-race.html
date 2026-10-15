@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Popup Close Race</title></head>
+  <body>
+    <!--
+      DEF-085: 同じタスクの中で 2 つのポップアップを開く（burst）か、短い間隔でポップアップを開き続ける（storm）ページ。
+      - query の scenario: burst（target=_blank の form の requestSubmit と、続けて window.open(target)）、storm（3 ms ごとに window.open(target)）。
+        それ以外（省略を含む）は何もしない（1 つ目のポップアップの先として、このページ自身を使う）。
+      - query の target: 2 つ目以降のポップアップの先（別の Origin の禁止のパス、または除外のパス）。
+      - query の auto: 0 なら読み込みで始めない（凍結の段で、テストが window.__popupCloseRaceRun() を呼ぶ）。
+    -->
+    <form id="first-popup" action="/popup-close-race.html" method="get" target="_blank"><input name="first" value="1"></form>
+    <script>
+      (() => {
+        const params = new URLSearchParams(location.search);
+        const scenario = params.get('scenario');
+        const target = params.get('target');
+        const STORM_INTERVAL_MS = 3;
+        const STORM_LIMIT = 200;
+        const run = () => {
+          if (target === null) {
+            return;
+          }
+          if (scenario === 'burst') {
+            document.getElementById('first-popup').requestSubmit();
+            window.open(target);
+          } else if (scenario === 'storm') {
+            let opened = 0;
+            const timer = setInterval(() => {
+              window.open(target);
+              opened += 1;
+              if (opened >= STORM_LIMIT) {
+                clearInterval(timer);
+              }
+            }, STORM_INTERVAL_MS);
+          }
+        };
+        window.__popupCloseRaceRun = run;
+        if (params.get('auto') !== '0') {
+          addEventListener('load', run);
+        }
+      })();
+    </script>
+  </body>
+</html>

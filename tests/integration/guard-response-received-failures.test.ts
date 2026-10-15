@@ -8,8 +8,7 @@
 // - Guard の付いた Passive Context は、製品と同じ `BrowserContextFactory`（`createGateFactory`）で作る。
 // - サーバは、このテストの中の 127.0.0.1 の `node:http` のサーバだけを使う。
 import { mkdtemp, rm } from 'node:fs/promises';
-import { createServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { chromium, type Browser, type BrowserContext, type Page, type Request, type Response } from 'playwright';
@@ -27,6 +26,7 @@ import {
 import type { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGateFactory, QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { fastRunConfig, runWithCoordinator } from '../helpers/run-harness.js';
 
@@ -129,7 +129,7 @@ async function startResponseFailureServer(): Promise<ResponseFailureServer> {
   const held = createDeferred<void>();
   const heldResponses: ServerResponse[] = [];
   let released = false;
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
     requests.push({ method: request.method ?? '', pathname });
     switch (pathname) {
@@ -172,20 +172,15 @@ async function startResponseFailureServer(): Promise<ResponseFailureServer> {
         response.end('not found\n');
     }
   });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address() as AddressInfo;
   const started: ResponseFailureServer = {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     requests,
     heldReceived: held.promise,
     releaseHeld: () => {
       released = true;
       for (const response of heldResponses.splice(0)) sendEmpty(response, STATUS.serviceUnavailable);
     },
-    close: async () => {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: server.close,
   };
   servers.push(started);
   return started;

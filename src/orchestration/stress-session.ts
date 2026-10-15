@@ -60,9 +60,8 @@ export interface StressSessionOptions {
  *   投げる（閉じるのにも失敗したら `AggregateError`。RP18 の指摘3）。
  * - 作成が期限を過ぎた場合は、`PassiveSessionOpenDeadlineError` を投げる。page の作成が期限を過ぎた場合は、Context の Ledger を
  *   一覧に加え、部品が閉じた Context の閉じる処理の失敗があれば、`AggregateError` にまとめて投げる。
- * - `close()` は、page を閉じた後に Context を閉じる（`closePassivePageAndContext`）。page を閉じるのに失敗しても、Context を閉じる。
- *   Guard がすでに Context を閉じていれば、Context は閉じ直さない。失敗（期限切れを含む）は投げ、両方が失敗した場合は
- *   `AggregateError` にまとめる。2回目の `close()` は reject する。
+ * - `close()` は、Context を閉じる（`closePassivePageAndContext`。page は個別に閉じず、Context と一緒に閉じる。DEF-038）。
+ *   Guard がすでに Context を閉じていれば、Context は閉じ直さない。失敗（期限切れを含む）は投げる。2回目の `close()` は reject する。
  *
  * 例外を投げるのは、factory がない場合（`TypeError`）と、注入した期限が不正な場合（`RangeError`）だけである。
  */
@@ -129,13 +128,11 @@ function createSessionHandle(
         throw new Error('Stress sweep session was already closed');
       }
       closeStarted = true;
-      // Guard が Context を無効にして閉じた場合は、Context は閉じ直さず、page の失敗だけを投げる。
-      const errors = (await closePassivePageAndContext(factory, context, deadlines)).map((failure) => failure.error);
-      if (errors.length > 1) {
-        throw new AggregateError(errors, 'Stress sweep session page close and Context close both failed');
-      }
-      if (errors.length === 1) {
-        throw errors[0];
+      // 失敗は Context を閉じる処理のものだけ（0 件か 1 件。page は個別に閉じない。DEF-038）。Guard が Context を無効にして閉じた場合は、
+      // Context は閉じ直さない。
+      const [failure] = await closePassivePageAndContext(factory, context, deadlines);
+      if (failure !== undefined) {
+        throw failure.error;
       }
     },
   });

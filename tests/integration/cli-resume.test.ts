@@ -55,7 +55,7 @@ import {
 import { formatCount } from '../../src/presentation/format.js';
 import {
   CLI_TEXT,
-  HTML_REPORT_TEXT,
+  RUN_SUMMARY_TEXT,
   activeRunInOutputDirectoryText,
   checkpointStoreFailedText,
   cliCountText,
@@ -73,7 +73,14 @@ import { ArtifactWriteError, ArtifactWriter } from '../../src/report/artifact-wr
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { auditRun, FIXTURE_RUN_ID } from '../helpers/audit-run-fixture.js';
 import { sampleRunCheckpoint, sampleRunCheckpointPage } from '../helpers/run-checkpoint-samples.js';
-import { captureCliOutput, createRunLauncher, fastRunConfig, readJson, readRunAudit } from '../helpers/run-harness.js';
+import {
+  captureCliOutput,
+  createRunLauncher,
+  fastRunConfig,
+  readJson,
+  readRunAudit,
+  RUN_IDENTITY_AUDIT_OVERRIDES,
+} from '../helpers/run-harness.js';
 import type { TestConfigOverrides } from '../helpers/test-config.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
@@ -107,11 +114,15 @@ afterEach(() => {
 // 補助
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（`/crawl/` の5ページ）。 */
+/**
+ * 作業のディレクトリの下の、`name` の出力先に書く、実行時間を抑えた Run の設定（`/crawl/` の5ページ）。中断しない Run と Finding の ID まで
+ * 比べるので、性能の指標は集めない（`RUN_IDENTITY_AUDIT_OVERRIDES`。DEF-079）。
+ */
 const configFor = (name: string, overrides: TestConfigOverrides = {}): AuditConfig =>
   fastRunConfig(server.origin, START_PATH, {
     target: { id: 'cli-resume' },
     output: { directory: join(workDirectory, name) },
+    audit: RUN_IDENTITY_AUDIT_OVERRIDES,
     ...overrides,
   });
 
@@ -618,7 +629,7 @@ describe('R5a: an interrupted Run of another version is not resumed, and --new s
   it('exits with 4 and shows the saved and the current version, without starting a Run', async () => {
     const message = differentVersionRunText(
       stoppedRunId,
-      versionDifferenceText(HTML_REPORT_TEXT.summary.toolVersion, SAVED_TOOL_VERSION, await readToolVersion()),
+      versionDifferenceText(RUN_SUMMARY_TEXT.toolVersion, SAVED_TOOL_VERSION, await readToolVersion()),
     );
 
     expect(refused.code).toBe(RUN_UNAVAILABLE_EXIT_CODE);

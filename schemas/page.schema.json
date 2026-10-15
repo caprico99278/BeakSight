@@ -2463,7 +2463,7 @@
       "properties": {
         "kind": { "enum": ["ROBOTS_TXT", "SITEMAP_XML"] },
         "url": { "type": "string", "minLength": 1 },
-        "outcome": { "enum": ["OK", "NOT_FOUND", "FAILED"] },
+        "outcome": { "enum": ["OK", "NOT_FOUND", "FAILED", "EXCLUDED"] },
         "httpStatus": { "type": ["integer", "null"], "minimum": 0 },
         "text": { "type": ["string", "null"] },
         "textTruncated": { "type": "boolean" },
@@ -2556,7 +2556,7 @@
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
-        "reason": { "enum": ["INTERACTION_FROZEN", "INTERACTION_FROZEN_EGRESS", "EGRESS_UPSTREAM_DENIED"] }
+        "reason": { "enum": ["INTERACTION_FROZEN", "INTERACTION_FROZEN_EGRESS", "EGRESS_UPSTREAM_DENIED", "GUARD_BYPASS_EGRESS"] }
       }
     },
     "blockedInteractionNavigationEvent": {
@@ -2607,6 +2607,26 @@
         "frame": { "enum": ["MAIN", "SUB"] },
         "phase": { "enum": ["PASSIVE", "INTERACTION"] },
         "reason": { "enum": ["EXTERNAL_SCHEME_NAVIGATION", "EXTERNAL_SCHEME_REDIRECT_BLOCKED"] }
+      }
+    },
+    "blockedAuditExclusionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "url", "mainFrameNavigation", "reason"],
+      "properties": {
+        "method": { "type": "string" },
+        "url": { "type": "string" },
+        "mainFrameNavigation": { "type": "boolean" },
+        "reason": { "enum": ["AUDIT_EXCLUDED_URL"] }
+      }
+    },
+    "blockedAuditExclusions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "events"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/blockedAuditExclusionEvent" } }
       }
     },
     "safetyLedgerRecordLimits": {
@@ -2666,7 +2686,8 @@
           "type": "array",
           "items": { "$ref": "#/$defs/externalSchemeNavigationEvent" }
         },
-        "recordLimits": { "$ref": "#/$defs/safetyLedgerRecordLimits" }
+        "recordLimits": { "$ref": "#/$defs/safetyLedgerRecordLimits" },
+        "blockedAuditExclusions": { "$ref": "#/$defs/blockedAuditExclusions" }
       }
     }
   }

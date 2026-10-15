@@ -1,0 +1,10 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-key:1",
+  "description": "Local UI Server Function input: one write scenario by its scenarioId (Task 28 design 4.6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" }
+  }
+}

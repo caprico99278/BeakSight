@@ -35,7 +35,7 @@
 | `crawl.overallPageTimeoutMs` | `60000` | 1つのページの監査の期限 |
 | `crawl.resourceSettlingTimeoutMs` | `5000` | リソースの読み込みが落ち着くのを待つ期限 |
 | `crawl.interactionTimeoutMs` | `3000` | Interaction の1つの候補を確かめる期限 |
-| `crawl.minNavigationIntervalMs` | `5000`（5秒） | ページの読み込みの最小の間隔（ミリ秒）。前の読み込みの開始から、この時間以上空けて、次の読み込みを始めます。`1000` 以上にする必要があります。ただし、`site.allowedOrigins` がすべてループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）の場合は、`0` 以上にできます。方針と、監査にかかる時間への影響は「[サイトへの負荷](site-load.md#サイトへの負荷)」を見てください |
+| `crawl.minNavigationIntervalMs` | `5000`（5秒） | ページの読み込みの最小の間隔（ミリ秒）。ページの読み込みの要求がサイトに届く間隔が、この時間以上になるように、次の読み込みを始めます（前の読み込みの開始、その要求をサイトに送った時刻、その応答を受けた時刻のうち、最も遅い時刻から数えます。自動ログインの読み込みも含みます）。`1000` 以上にする必要があります。ただし、`site.allowedOrigins` がすべてループバックのアドレス（`127.0.0.1`、`[::1]`、`localhost`）の場合は、`0` 以上にできます。方針と、監査にかかる時間への影響は「[サイトへの負荷](site-load.md#サイトへの負荷)」を見てください |
 | `crawl.maxInteractionsPerPage` | `20` | 1つのページで、Interaction で確かめる候補の数の上限。`1` 以上 `100` 以下にする必要があります（`100` は、1つのページで見つける候補の数の上限です）。上限を超えた候補の扱いは「[サイトへの負荷](site-load.md#サイトへの負荷)」を見てください |
 | `crawl.allowedQueryParameters` | `[]` | URL の正規化で残すクエリの名前。一覧にないクエリは、URL から除きます |
 | `browser.headed` | `false` | ブラウザの画面を表示するか |
@@ -56,6 +56,7 @@
 ## `config/targets/` と `local/` の使い分け
 
 - `config/targets/` には、Git で公開してもよい設定だけを置きます。`config/targets/example.json` は、例の値（`https://example.com/`）だけを持つ見本です。
+- `config/targets/example-test-environment.json.example` は、テスト環境の監査と書き込みのための匿名の例です（予約された名前 `admin.example.test`）。設定のファイル（`targetConfig`）と、管理画面で入れるプロファイルと認証の設定の値の例を持ちます。拡張子が `.json` でないので、CLI と管理画面は読みません（下の「`--config` を省いたときの扱い」で選ばれません）。使い方は「[通しの使い方](end-to-end-usage.md)」にあります。
 - 顧客を特定できる実際の設定（実在のサイトの URL など）は、`config/targets/` に置かないでください。Git の管理の対象外の `local/` に置きます（例: `local/targets/<対象名>.json`）。
 - `local/` の設定は、自動では選ばれません。必ず `--config` で指定します。
 

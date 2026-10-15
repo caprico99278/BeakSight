@@ -61,7 +61,8 @@
               "STOPPED_BY_SIGNAL",
               "STOPPED_BY_SAFETY_VIOLATION",
               "STOPPED_BY_SITE_UNAVAILABLE",
-              "INTERRUPTED_ABNORMALLY"
+              "INTERRUPTED_ABNORMALLY",
+              "STOPPED_BY_AUTH_SESSION_LOST"
             ]
           }
         }
@@ -335,7 +336,8 @@
             "SAFETY_VIOLATION_ABORT",
             "CHECKPOINT_WRITE_FAILED",
             "RUN_INTERRUPTED",
-            "SITE_UNAVAILABLE"
+            "SITE_UNAVAILABLE",
+            "AUTH_SESSION_LOST"
           ]
         },
         "detail": { "type": ["string", "null"] }
