@@ -14,7 +14,11 @@ export const Route = createFileRoute('/scenarios/$profileId/$scenarioId/edit')({
     if (detail === null || detail.profile.profileId !== params.profileId) {
       throw notFound();
     }
-    const form = await scenarioFormPageFn({ data: { profileId: params.profileId, candidateIdentityDigest: detail.scenario.candidateIdentityDigest } });
+    // T38f: API のシナリオは、候補の行を型の digest で選ぶ（同じ識別で型が違う行が別に残る）。
+    const shapeDigest = detail.scenario.api?.shapeDigest;
+    const form = await scenarioFormPageFn({
+      data: { profileId: params.profileId, candidateIdentityDigest: detail.scenario.candidateIdentityDigest, ...(shapeDigest === undefined ? {} : { shapeDigest }) },
+    });
     if (form === null) {
       throw notFound();
     }
@@ -60,6 +64,7 @@ function EditScenarioPage() {
             readChecks={form.readChecks}
             rules={form.rules}
             update={form.update}
+            api={form.api}
             initial={{
               fieldNames: scenario.fieldNames,
               readChecks: scenario.readChecks,
@@ -69,6 +74,7 @@ function EditScenarioPage() {
               approvalTtlDays: scenario.approvalTtlDays,
               verification: scenario.verification,
               update: scenario.update,
+              api: scenario.api,
             }}
             onSave={(content) => update({ data: { scenarioId: scenario.scenarioId, expectedRevision: scenario.revision, draft: { ...content } } })}
             onSaved={() => {

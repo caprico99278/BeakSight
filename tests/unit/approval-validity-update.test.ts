@@ -3,7 +3,8 @@
 // - UPDATE は、候補の識別の digest の代わりに、型にした識別の digest で候補を確かめる: 最後の発見の索引に、同じ型にした識別の digest（候補ごとの
 //   一覧のどれか）と同じ規則の digest の、分類が UPDATE の候補があること。別のレコードの画面の候補でも有効。構造が変われば無効。
 // - 索引の一覧の事実がまだ集められない間（版 9 の前）は、UPDATE を止める側にする（`CANDIDATE_TEMPLATES_UNAVAILABLE`）。
-// - UPDATE の指定のない保存済みの版は、承認できない（`UPDATE_SPEC_MISSING`）。
+// - LG-3（2026-10-24 の設計 3.7.2）: UPDATE の指定のない版は、保存の部品が読まない（スキーマで誤り）。判定に渡されたら呼び出し側の誤り（`RangeError`）
+//   にする（理由 `UPDATE_SPEC_MISSING` は捨てた）。
 // - CREATE の判定は変えない。
 import { describe, expect, it } from 'vitest';
 import { computeApprovalDigest } from '../../src/control/approval/approval-digest.js';
@@ -41,12 +42,18 @@ const OTHER_RECORD: ApprovalTemplatedCandidateFact = Object.freeze({
 });
 
 const FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
-  profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE' },
+  profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE', approvedServiceOrigins: [] },
   authSetupDigest: AUTH_SETUP_DIGEST,
   targetConfigDigest: TARGET_CONFIG_DIGEST,
   // 承認した画面（レコード 1）の候補は、最後の発見の索引にない（別のレコードの画面だけを見た）。
   candidate: null,
   templatedCandidates: [OTHER_RECORD],
+  // T38c: 候補の型の digest の一覧（API のシナリオだけが使う）。
+  candidateShapeDigests: null,
+  // T38R-fix: API のシナリオだけが使う事実。
+  candidateKeyFieldDigests: null,
+  apiShapeOriginIndex: null,
+  latestDiscoveryProfileRevision: null,
   inputRuleReference: INPUT_RULES,
   readChecks: READ_CHECK_FACTS,
 });
@@ -81,9 +88,10 @@ const withTemplated = (templatedCandidates: ApprovalCurrentFacts['templatedCandi
   ({ facts: { ...FACTS, templatedCandidates } });
 
 describe('approval validity of an UPDATE scenario (T31b)', () => {
-  it('adds the two reasons after CANDIDATE_MISSING in the closed list', () => {
+  it('adds the reason of the templates after CANDIDATE_MISSING in the closed list (LG-3: no UPDATE_SPEC_MISSING)', () => {
     const index = APPROVAL_INVALIDITY_REASONS.indexOf('CANDIDATE_MISSING');
-    expect(APPROVAL_INVALIDITY_REASONS.slice(index, index + 3)).toEqual(['CANDIDATE_MISSING', 'UPDATE_SPEC_MISSING', 'CANDIDATE_TEMPLATES_UNAVAILABLE']);
+    expect(APPROVAL_INVALIDITY_REASONS.slice(index, index + 2)).toEqual(['CANDIDATE_MISSING', 'CANDIDATE_TEMPLATES_UNAVAILABLE']);
+    expect(APPROVAL_INVALIDITY_REASONS).not.toContain('UPDATE_SPEC_MISSING');
   });
 
   it('is approved with the page of another record in the latest discovery (same templated identity digest and rule digest)', () => {
@@ -112,9 +120,9 @@ describe('approval validity of an UPDATE scenario (T31b)', () => {
       .toEqual(['CANDIDATE_TEMPLATES_UNAVAILABLE', 'NOT_APPROVED']);
   });
 
-  it('never approves a stored UPDATE revision without the UPDATE spec', () => {
+  it('never approves an UPDATE revision without the UPDATE spec (a caller error, LG-3)', () => {
     const legacy = sampleUpdateScenario({ update: null });
-    expect(reasonsOf(evaluateApprovalValidity(input({ scenario: legacy, lastApproval: approvalOf(legacy) })))).toEqual(['UPDATE_SPEC_MISSING']);
+    expect(() => evaluateApprovalValidity(input({ scenario: legacy, lastApproval: approvalOf(legacy) }))).toThrow(RangeError);
   });
 
   it('compares the bound rule digest and the bound identity digest of the approval too', () => {

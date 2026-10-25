@@ -14,11 +14,14 @@ import { isExecutableAuditMode, isProfileOperationAllowed } from '../../../../sr
 import type { AutomatedLoginResult, AutomatedLoginSubmission } from '../../../../src/control/auth/automated-login-results.js';
 import type { CredentialChangeKind } from '../../../../src/control/credentials/credential-store.js';
 import type { AuthSetupFreshness } from '../../../../src/control/store/auth-setup-store.js';
+import type { LoginTransport } from '../../../../src/control/auth/auth-setup-contracts.js';
+import type { EntryCheckEndReason, EntryCheckFormPlacement } from '../../../../src/control/entry-check.js';
 import type { WorkerAuthState } from '../../../../src/control/worker-protocol.js';
 import type { AuditJobKind, AuditJobState, WriteReportCheck } from '../../../../src/control/job/job-records.js';
 import type { CredentialEnvironmentState } from '../server/credential-runtime';
 import type { WorkerOutcomeKind } from '../../../../src/control/worker-protocol.js';
-import type { RunStatus } from '../../../../src/core/contracts.js';
+import type { IncompleteReasonCode, RunExecutionEndReason, RunStatus } from '../../../../src/core/contracts.js';
+import { LOCAL_UI_JOB_NEXT_STEPS, nextStepOfIncompleteReason } from '../../../../src/presentation/messages.js';
 import type {
   CandidateClassification,
   CandidateKind,
@@ -26,6 +29,8 @@ import type {
   ReadCheckEndReason,
   ReadCheckExpectationKind,
   ReadCheckResult,
+  SubmissionProbeReason,
+  SubmissionProbeResult,
 } from '../../../../src/control/discovery-view.js';
 import type { DiscoveryIndexDrift } from '../../../../src/control/job/discovery-index-store.js';
 import type {
@@ -37,11 +42,15 @@ import type {
   SideEffectConfirmation,
 } from '../../../../src/control/approval-view.js';
 import type { ScenarioDisplayState } from './scenarios';
+import type { WriteChainState, WriteChainStopReason } from '../server/write-chain-policy';
+import type { ChainStageState, ChainState, ChainStopReason } from '../../../../src/control/job/stage-chain-policy.js';
+import type { NextStepState, ProfileNextStep } from './next-steps';
 import type {
   ExternalDeliveryKind,
   FieldRelationKind,
   FieldRuleStatus,
   GenerationMethod,
+  RuleOrigin,
   RuleSource,
   SemanticKind,
 } from '../../../../src/control/data-rules-view.js';
@@ -54,14 +63,20 @@ import type {
   SettledReservationState,
   SubmissionState,
 } from '../../../../src/control/actions/action-contracts.js';
-import type { RecordIdSource, ScenarioVerificationItem } from '../../../../src/control/approval-view.js';
+import type { DraftValueOrigin, RecordIdSource, ScenarioTransport, ScenarioVerificationItem } from '../../../../src/control/approval-view.js';
 import {
   ACTION_BLOCK_REASON_CATALOG,
   ACTION_OUTCOME_REASON_CATALOG,
   ACTION_RESULT_CATALOG,
   RECORD_ID_SOURCE_CATALOG,
   RESPONSE_JUDGEMENT_CATALOG,
+  SCENARIO_TRANSPORT_CATALOG,
   SCENARIO_VERIFICATION_ITEM_CATALOG,
+  WRITE_CHAIN_STATE_CATALOG,
+  WRITE_CHAIN_STOP_REASON_CATALOG,
+  STAGE_CHAIN_STATE_CATALOG,
+  STAGE_CHAIN_STAGE_STATE_CATALOG,
+  STAGE_CHAIN_STOP_REASON_CATALOG,
   SETTLED_RESERVATION_STATE_CATALOG,
   SUBMISSION_STATE_CATALOG,
   WRITE_REPORT_CHECK_CATALOG,
@@ -72,6 +87,8 @@ import {
   FIELD_RULE_STATUS_CATALOG,
   GENERATION_METHOD_CATALOG,
   INPUT_RULE_STATE_CATALOG,
+  RULE_ORIGIN_CATALOG,
+  DRAFT_VALUE_ORIGIN_CATALOG,
   RULE_SOURCE_CATALOG,
   SEMANTIC_KIND_CATALOG,
 } from '../../../../src/presentation/catalog.js';
@@ -88,6 +105,8 @@ import {
   CANDIDATE_KIND_CATALOG,
   DISCOVERY_DRIFT_CATALOG,
   DISCOVERY_END_REASON_CATALOG,
+  SUBMISSION_PROBE_REASON_CATALOG,
+  SUBMISSION_PROBE_RESULT_CATALOG,
   READ_CHECK_END_REASON_CATALOG,
   READ_CHECK_EXPECTATION_KIND_CATALOG,
   READ_CHECK_RESULT_CATALOG,
@@ -100,9 +119,15 @@ import {
   AUDIT_JOB_STATE_CATALOG,
   AUDIT_MODE_CATALOG,
   AUTH_SETUP_FRESHNESS_CATALOG,
+  LOGIN_TRANSPORT_CATALOG,
+  ENTRY_CHECK_END_REASON_CATALOG,
+  ENTRY_CHECK_FORM_PLACEMENT_CATALOG,
+  NEXT_STEP_STATE_CATALOG,
+  PROFILE_NEXT_STEP_CATALOG,
   AUTH_STRATEGY_CATALOG,
   ENVIRONMENT_KIND_CATALOG,
   PROFILE_STATUS_CATALOG,
+  RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   sortByDisplayOrder,
   type DisplayTone,
@@ -129,10 +154,22 @@ export const auditJobStateDisplay = (state: AuditJobState): DisplayValue => AUDI
 export const auditJobEndKindDisplay = (kind: WorkerOutcomeKind): DisplayValue => AUDIT_JOB_END_KIND_CATALOG[kind];
 /** Run の状態（既存の表示カタログ。HTML レポートと CLI と同じラベル。T24f）。 */
 export const runStatusDisplay = (status: RunStatus): DisplayValue => RUN_STATUS_CATALOG[status];
+/** T44e: 1 回の実行の終わり方（ジョブの画面の「終わり方と理由」）。 */
+export const runExecutionEndReasonDisplay = (reason: RunExecutionEndReason): DisplayValue => RUN_EXECUTION_END_REASON_CATALOG[reason];
 /** 監査のジョブの最後の認証の状態（T25e）。 */
 export const auditJobAuthStateDisplay = (state: WorkerAuthState): DisplayValue => AUDIT_JOB_AUTH_STATE_CATALOG[state];
 /** 保存した認証の設定の新しさ（T25e）。 */
 export const authSetupFreshnessDisplay = (freshness: AuthSetupFreshness): DisplayValue => AUTH_SETUP_FRESHNESS_CATALOG[freshness];
+
+/** T43a: プロファイルの「次にすること」の手順と、その状態（値の一覧は `next-steps.ts`）。 */
+export const profileNextStepDisplay = (step: ProfileNextStep): DisplayValue => PROFILE_NEXT_STEP_CATALOG[step];
+export const nextStepStateDisplay = (state: NextStepState): DisplayValue => NEXT_STEP_STATE_CATALOG[state];
+
+/** T34d: ログインの送り方（フォームの送信・スクリプトの送信）。 */
+export const loginTransportDisplay = (transport: LoginTransport): DisplayValue => LOGIN_TRANSPORT_CATALOG[transport];
+/** T43c: 入口の確かめの終わり方と、3 つの要素の form の中の置き方。 */
+export const entryCheckEndReasonDisplay = (reason: EntryCheckEndReason): DisplayValue => ENTRY_CHECK_END_REASON_CATALOG[reason];
+export const entryCheckFormPlacementDisplay = (placement: EntryCheckFormPlacement): DisplayValue => ENTRY_CHECK_FORM_PLACEMENT_CATALOG[placement];
 /** ジョブの種類（監査、ログインの確かめ。T26e）。 */
 export const auditJobKindDisplay = (kind: AuditJobKind): DisplayValue => AUDIT_JOB_KIND_CATALOG[kind];
 /** 自動ログインの結果（T26e）。 */
@@ -153,6 +190,9 @@ export const candidateKindDisplay = (kind: CandidateKind): DisplayValue => CANDI
 export const discoveryDriftDisplay = (drift: DiscoveryIndexDrift): DisplayValue => DISCOVERY_DRIFT_CATALOG[drift];
 /** 発見のジョブの終わり方（T27f）。 */
 export const discoveryEndReasonDisplay = (reason: DiscoveryEndReason): DisplayValue => DISCOVERY_END_REASON_CATALOG[reason];
+/** T37c: 送らずに観察する probe の結果と理由。 */
+export const submissionProbeResultDisplay = (result: SubmissionProbeResult): DisplayValue => SUBMISSION_PROBE_RESULT_CATALOG[result];
+export const submissionProbeReasonDisplay = (reason: SubmissionProbeReason): DisplayValue => SUBMISSION_PROBE_REASON_CATALOG[reason];
 /** READ の確かめの結果（期待 1 件の結果にも使う。T27f）。 */
 export const readCheckResultDisplay = (result: ReadCheckResult): DisplayValue => READ_CHECK_RESULT_CATALOG[result];
 /** READ の確かめの期待の種類（T27f）。 */
@@ -181,6 +221,10 @@ export const generationMethodDisplay = (method: GenerationMethod): DisplayValue 
 export const fieldRelationKindDisplay = (kind: FieldRelationKind): DisplayValue => FIELD_RELATION_KIND_CATALOG[kind];
 /** 入力の規則の、欄の規則の出どころ（T29e）。 */
 export const ruleSourceDisplay = (source: RuleSource): DisplayValue => RULE_SOURCE_CATALOG[source];
+/** 入力の規則の、保存した規則の出どころの印（FM2c）。 */
+export const ruleOriginDisplay = (origin: RuleOrigin): DisplayValue => RULE_ORIGIN_CATALOG[origin];
+/** 自動で作る下書きの案の出どころの印（FM2b。表示カタログの 1 か所）。 */
+export const draftValueOriginDisplay = (origin: DraftValueOrigin): DisplayValue => DRAFT_VALUE_ORIGIN_CATALOG[origin];
 /** 入力の規則の、欄ごとの判定の状態（T29e）。 */
 export const fieldRuleStatusDisplay = (status: FieldRuleStatus): DisplayValue => FIELD_RULE_STATUS_CATALOG[status];
 /** シナリオの入力の規則の状態（T29e。選び方は `data-rules.ts`）。 */
@@ -237,6 +281,12 @@ export const usesReadCheck = (mode: AuditMode, auth: AuthStrategy): boolean => i
 export const usesAutomatedLogin = (mode: AuditMode, auth: AuthStrategy): boolean => isProfileOperationAllowed('CREDENTIAL', mode, auth);
 
 /**
+ * FM-1（手動の操作を減らす設計書 2.3）: 「次から自動でログインする」を案内するプロファイルか（認証の設定を使い、自動ログインでない、つまり手動の
+ * ログインのプロファイル）。
+ */
+export const offersAutomatedLogin = (mode: AuditMode, auth: AuthStrategy): boolean => usesAuthSetup(mode, auth) && !usesAutomatedLogin(mode, auth);
+
+/**
  * 書き込みのシナリオ（作成・変更・承認）を使うプロファイルか（T28e。Task 28 の設計書 4.6。fix round 1 で `src/control/execution-policy.ts` の
  * `SCENARIO` の行の判定にした。承認した書き込みのモードの、手動のログインか自動ログイン）。プロファイルの詳細のシナリオへの案内、候補の画面の
  * 「シナリオを作る」、シナリオの画面の作成・変更・承認は、このプロファイルだけに出す（シナリオの保存の部品も、同じ行で `SCENARIO_MODE_NOT_WRITE`
@@ -264,5 +314,24 @@ export const scenarioVerificationItemDisplay = (item: ScenarioVerificationItem):
 
 export const recordIdSourceDisplay = (source: RecordIdSource): DisplayValue => RECORD_ID_SOURCE_CATALOG[source];
 
+/** T41g: 「登録してから更新する」の状態と、更新を始めなかった理由。 */
+export const writeChainStateDisplay = (state: WriteChainState): DisplayValue => WRITE_CHAIN_STATE_CATALOG[state];
+export const writeChainStopReasonDisplay = (reason: WriteChainStopReason): DisplayValue => WRITE_CHAIN_STOP_REASON_CATALOG[reason];
+
+/** FM2d・FM2R の Minor 3: まとめて実行の状態、段の状態、止めた理由。 */
+export const stageChainStateDisplay = (state: ChainState): DisplayValue => STAGE_CHAIN_STATE_CATALOG[state];
+export const stageChainStageStateDisplay = (state: ChainStageState): DisplayValue => STAGE_CHAIN_STAGE_STATE_CATALOG[state];
+export const stageChainStopReasonDisplay = (reason: ChainStopReason): DisplayValue => STAGE_CHAIN_STOP_REASON_CATALOG[reason];
+
+/** T40d: 書き込みの送り方（フォームの送信・API の要求）。 */
+export const scenarioTransportDisplay = (transport: ScenarioTransport): DisplayValue => SCENARIO_TRANSPORT_CATALOG[transport];
+
 /** T32g: 書き込みの報告の親の確かめの結果（`VALID` のときだけ報告を配る）。 */
 export const writeReportCheckDisplay = (check: WriteReportCheck): DisplayValue => WRITE_REPORT_CHECK_CATALOG[check];
+
+/**
+ * T44e（Task 44 の設計書 P2-7）: ジョブの画面の、Run の理由の次にできること。閉じた一覧の理由は画面の文（`LOCAL_UI_JOB_NEXT_STEPS.runReasons`。画面の操作を書く）、
+ * ほかは HTML レポートと同じ文（`nextStepOfIncompleteReason`）。T44h の判断 (1): レポートの文はすべての理由にあるので、どの理由にも文がある。
+ */
+export const runReasonNextStepOf = (code: IncompleteReasonCode): string =>
+  (LOCAL_UI_JOB_NEXT_STEPS.runReasons as Partial<Record<IncompleteReasonCode, string>>)[code] ?? nextStepOfIncompleteReason(code);

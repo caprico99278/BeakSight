@@ -19,7 +19,8 @@
 import { mkdirSync } from 'node:fs';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { expect } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS } from '../../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../../tests/helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS } from '../../../../src/control/auth/auth-setup-contracts.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../../../src/control/store/control-database.js';
 import { CONTROL_DATA_DIRECTORY_NAME, resolveControlDatabasePath } from '../../../../src/control/store/database-path.js';
 import { formatCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
@@ -36,7 +37,6 @@ import {
   DISCOVERY_SITE_PATHS,
   DISCOVERY_SITE_READ_CHECK_PATHS,
   type DiscoverySite,
-  type DiscoverySiteRequest,
 } from '../../../../tests/helpers/discovery-site-fixture.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../../tests/helpers/process-tree.js';
 import {
@@ -69,6 +69,7 @@ import {
   type SearchedPlace,
 } from './secret-markers.ts';
 import { callServerFunction, readServerFunctionIds, type ServerFunctionCall } from './server-functions.ts';
+import { waitForJobViaServerFunctions } from './server-function-job-wait.ts';
 import { createUiPageKit } from './ui-page.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
@@ -90,8 +91,6 @@ export const FIRST_REVISION = 1;
 const MANUAL_MAX_LOGIN_ATTEMPTS = 2;
 /** HTTP の状態。 */
 export const STATUS = Object.freeze({ OK: 200 });
-/** GET と HEAD。 */
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 /** 一時の root の検索で読まないフォルダ（リポジトリの `node_modules` への junction）。 */
 const SKIPPED_DIRECTORY_NAMES = Object.freeze(['node_modules']);
 /** 子プロセスの起動の記録（記録のフォルダの中）。 */
@@ -176,9 +175,8 @@ export interface ScenarioMarkerFlowOptions {
   readonly recordPages?: boolean;
 }
 
-/** 窓の中の、GET と HEAD 以外の要求（`<method> <path>`）。 */
-export const nonReadRequestsOf = (requests: readonly DiscoverySiteRequest[]): readonly string[] =>
-  requests.filter(({ method }) => !READ_METHODS.has(method)).map(({ method, path }) => `${method} ${path}`);
+/** 窓の中の、GET と HEAD 以外の要求（`<method> <path>`。CC-093: 定義は `tests/helpers/leak-places.ts` の 1 か所）。 */
+export { nonReadRequestsOf } from '../../../../tests/helpers/leak-places.js';
 
 /** ログインの POST を `count` 回（`<method> <path>`）。 */
 export const loginPosts = (count: number): readonly string[] => Array.from({ length: count }, () => `POST ${DISCOVERY_SITE_PATHS.login}`);
@@ -197,7 +195,7 @@ export const credentialsOf = async (site: DiscoverySite): Promise<RelayedCredent
 
 /** 認証の設定（自動ログインなら、自動ログインの項目つき）。 */
 const authSetupOf = (profileId: string, site: DiscoverySite, automated: boolean): Record<string, unknown> => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${site.origin}${DISCOVERY_SITE_PATHS.login}`,
@@ -358,15 +356,13 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
   /** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する）。 */
   const waitForJobEnd = async (jobId: string): Promise<JobDetail> => {
     descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    let job: JobDetail | null = null;
-    await expect.poll(async () => {
-      job = await valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-      return job?.active;
-    }, { timeout: JOB_TIMEOUT_MS, interval: POLL_MS }).toBe(false);
-    if (job === null) {
-      throw new Error('ジョブがない');
-    }
-    return job;
+    // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助 `waitForJobViaServerFunctions`（上限と間隔は前と同じ）。
+    return waitForJobViaServerFunctions(
+      (id) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId: id }),
+      jobId,
+      (job) => !job.active,
+      { limitMs: JOB_TIMEOUT_MS, stepMs: POLL_MS },
+    );
   };
 
   /** 候補の画面の開始のボタンで発見のジョブを始め、終わるまで待つ。ジョブの画面の HTML を集め、サイトへの要求の窓を記録する。 */

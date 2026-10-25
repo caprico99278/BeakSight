@@ -5,7 +5,8 @@
  * - Run のディレクトリからの相対パスは、区切りを `/` にする（artifact の中に書く値。環境によらない）。
  *   ファイルのパス（`runArtifactDirectory`、`artifactFilePath`）は、実行している環境の区切りにする（`node:path` の `join`）。
  * - 配置:
- *   - `<出力先>/<runId>/`: `run.json`、`audit.json`、`report.html`、`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`（ChatGPT 用バンドル。
+ *   - `<出力先>/<runId>/`: `run.json`、`audit.json`、`report.html`、`beaksight-audit-bundle_<プロファイルの名前>_YYYYMMDDHHmmss.zip`
+ *     （ChatGPT 用バンドル。画面のジョブはプロファイルの名前の部分つき、CLI は名前の部分なしの `beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。PRE42-BN。
  *     日時は、その Run の最後の実行の終わりの時刻。UTC。Run の ID と同じ書式。名前は `bundleFileName` で作り、`isBundleFileName` で
  *     見分ける。ChatGPT 用バンドルのファイル名の設計書 2.1）
  *   - 書き込みのジョブの `<runId>/`（T32c）: `action-run.json`、`action-evidence.json`、`approval-summary.json`、`action-report.html`、
@@ -38,8 +39,20 @@ import type { ScreenshotCaptureType } from './evidence-types.js';
 import { errorCodeOf } from './errors.js';
 import { isPositiveSafeInteger } from './guards.js';
 import { isPageId, isRunId } from './ids.js';
-import { compareCodeUnits, hasControlCharacter } from './text.js';
-import { formatCompactUtcTimestamp, isCompactUtcTimestamp, parseCompactUtcTimestamp } from './utc-timestamp.js';
+import {
+  compareCodeUnits,
+  hasControlCharacter,
+  removeBidiControls,
+  removeLoneSurrogates,
+  replaceControlOrLineSeparators,
+} from './text.js';
+import {
+  COMPACT_UTC_TIMESTAMP_LENGTH,
+  formatCompactUtcTimestamp,
+  isCompactUtcTimestamp,
+  parseCompactUtcTimestamp,
+} from './utc-timestamp.js';
+import { isWindowsReservedDeviceName } from './windows-reserved-names.js';
 
 /**
  * Run のディレクトリの直下のファイルの名前（ChatGPT 用バンドルを除く。バンドルの名前は日時を含むので、`bundleFileName` で作る）。
@@ -62,6 +75,12 @@ export const DISCOVERY_ARTIFACT_FILE_NAME = 'discovery.json';
 export const READ_EVIDENCE_ARTIFACT_FILE_NAME = 'read-evidence.json';
 
 /**
+ * 入口の確かめのジョブ（Task 43。T43c）の Run のディレクトリの直下の成果物の名前（`schemas/entry-check.schema.json`）。発見のジョブと同じく、監査の
+ * Run の成果物とは別に置く。
+ */
+export const ENTRY_CHECK_ARTIFACT_FILE_NAME = 'entry-check.json';
+
+/**
  * 書き込みのジョブ（Task 30。T30e）の Run のディレクトリの直下の成果物の名前（`schemas/action-run.schema.json`。ワーカーが書き、親が読む）。
  * T30f（CC-084）: `src/control/job/write-job-start.ts` から、成果物の名前の owner のここに移した。
  */
@@ -76,7 +95,10 @@ export const ACTION_EVIDENCE_ARTIFACT_FILE_NAME = 'action-evidence.json';
 export const APPROVAL_SUMMARY_ARTIFACT_FILE_NAME = 'approval-summary.json';
 export const ACTION_REPORT_ARTIFACT_FILE_NAME = 'action-report.html';
 
-/** ChatGPT 用バンドルのファイル名の部品（`<語幹><区切り><YYYYMMDDHHmmss><拡張子>`。ChatGPT 用バンドルのファイル名の設計書 2.1）。 */
+/**
+ * ChatGPT 用バンドルのファイル名の部品（`<語幹><区切り>[<名前の部分><区切り>]<YYYYMMDDHHmmss><拡張子>`。ChatGPT 用バンドルのファイル名の設計書 2.1。
+ * 名前の部分は PRE42-BN）。
+ */
 const BUNDLE_FILE_NAME_STEM = 'beaksight-audit-bundle';
 const BUNDLE_FILE_NAME_TIME_SEPARATOR = '_';
 const BUNDLE_FILE_NAME_EXTENSION = '.zip';
@@ -102,32 +124,113 @@ const isTimestampedBundleFileName = (prefix: string, name: string): boolean =>
   && isCompactUtcTimestamp(name.slice(prefix.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length));
 
 /**
- * 前の形の ChatGPT 用バンドルの名前（`beaksight-audit-bundle.zip`。日時を含まない）。今は書かない。前の版が書いたものを、
- * `ArtifactWriter.writePresentation` が片付けるときに見分けるため（`isBundleFileName`）に残す。
+ * ChatGPT 用バンドルの名前の、プロファイルの名前の部分の長さの上限（コードポイントの数。PRE42-BN）。名前の全体は
+ * `beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`（固定の部分は 43 文字）で、書き出しの一時ファイル（`.<名前>.<UUID>.tmp`）は、さらに
+ * 42 文字長い。名前の部分がすべて BMP の外の文字（UTF-16 で 2 単位）でも、一時ファイルの名前は 213 単位で、Windows の 1 区切りの上限（255）に
+ * 収まる。BMP の文字なら、一時ファイルの名前は 149 文字までで、Run のディレクトリのパスが 100 文字程度でも、パス全体が 260 文字に収まる。
+ * プロファイルの名前（profileId）の上限（63 文字）を切らない値にする。
  */
-export const LEGACY_BUNDLE_FILE_NAME = `${BUNDLE_FILE_NAME_STEM}${BUNDLE_FILE_NAME_EXTENSION}`;
+export const MAX_BUNDLE_FILE_NAME_LABEL_LENGTH = 64;
+
+/** 名前の部分で、Windows のファイル名に使えない文字（`<>:"/\|?*`。制御文字は `replaceControlOrLineSeparators` で置き換える）。 */
+const BUNDLE_LABEL_FORBIDDEN_CHARACTERS = /[<>:"/\\|?*]/gu;
+/** 名前の部分の、使えない文字を置き換える文字。 */
+const BUNDLE_LABEL_REPLACEMENT = '_';
+/** 名前の部分の、先頭の空白。 */
+const BUNDLE_LABEL_LEADING_SPACES = /^\s+/u;
+/** 名前の部分の、末尾の空白と `.`。 */
+const BUNDLE_LABEL_TRAILING_SPACES_AND_DOTS = /[\s.]+$/u;
+/** 予約の名前を避けるために、名前の部分の前に付ける文字。 */
+const BUNDLE_LABEL_RESERVED_NAME_ESCAPE = '_';
+
+/** 先頭の空白と、末尾の空白と `.` を外す。 */
+const trimBundleLabel = (label: string): string =>
+  label.replace(BUNDLE_LABEL_LEADING_SPACES, '').replace(BUNDLE_LABEL_TRAILING_SPACES_AND_DOTS, '');
+
+/** コードポイントの数で `maxLength` までに切り（サロゲートの対を分けない）、切った後の末尾の空白と `.` を外す。 */
+const truncateBundleLabel = (label: string, maxLength: number): string => {
+  const codePoints = [...label];
+  return codePoints.length <= maxLength ? label : trimBundleLabel(codePoints.slice(0, maxLength).join(''));
+};
 
 /**
- * ChatGPT 用バンドルのファイル名（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。ChatGPT 用バンドルのファイル名の設計書 2.1）。名前を作るのは、
- * ここだけである。`finishedAt` は、その Run の最後の実行の終わりの時刻（`RunSummary.executions` の最後の `finishedAt`。ISO 8601）。
- * 日時は UTC で、Run の ID と同じ書式（`formatCompactUtcTimestamp`）にする。同じ Run の結果からは、同じ名前になる（書き出しの時刻は
- * 使わない）。文字列でない値、時刻として読めない文字列、UTC の年が4桁でない時刻は、`RangeError` を投げる。
+ * プロファイルの名前から、ChatGPT 用バンドルの名前に入れる部分を作る（PRE42-BN。純粋な関数。名前の部分を作るのは、ここだけである）。
+ * 1. 表示の向きを変える文字と、対のないサロゲートを除く（ファイル名の見た目を偽らない。URL に符号化できない値を作らない）。
+ * 2. Windows で使えない文字（`<>:"/\|?*`）と、制御文字（Cc）と、行と段落の区切り（U+2028、U+2029）を `_` にする。
+ * 3. 先頭の空白と、末尾の空白と `.` を外す。
+ * 4. コードポイントの数で `MAX_BUNDLE_FILE_NAME_LABEL_LENGTH` までに切り、切った後の末尾の空白と `.` を外す。
+ * 5. Windows の予約の名前（最初の `.` より前の部分で判定。`isWindowsReservedDeviceSegment`）なら、前に `_` を付ける（上限を超えたら、もう一度切る）。
+ * 日本語などの文字は、そのまま使う。結果が空なら、空の文字列を返す（名前の部分を省く）。結果をもう一度渡すと、同じ値を返す（`isBundleFileName` が、
+ * この性質で名前の部分を確かめる）。文字列でない値は、`RangeError` を投げる。
  */
-export function bundleFileName(finishedAt: string): string {
+export function bundleFileNameLabelOf(profileName: string): string {
+  const given: unknown = profileName;
+  if (typeof given !== 'string') {
+    throw new RangeError('profile name for the bundle name must be a string');
+  }
+  const replaced = replaceControlOrLineSeparators(removeLoneSurrogates(removeBidiControls(given)), BUNDLE_LABEL_REPLACEMENT)
+    .replace(BUNDLE_LABEL_FORBIDDEN_CHARACTERS, () => BUNDLE_LABEL_REPLACEMENT);
+  const label = truncateBundleLabel(trimBundleLabel(replaced), MAX_BUNDLE_FILE_NAME_LABEL_LENGTH);
+  if (label.length === 0 || !isWindowsReservedDeviceSegment(label)) {
+    return label;
+  }
+  return truncateBundleLabel(`${BUNDLE_LABEL_RESERVED_NAME_ESCAPE}${label}`, MAX_BUNDLE_FILE_NAME_LABEL_LENGTH);
+}
+
+/**
+ * ChatGPT 用バンドルのファイル名（ChatGPT 用バンドルのファイル名の設計書 2.1。PRE42-BN）。名前を作るのは、ここだけである。
+ * - `profileName` があり、名前の部分（`bundleFileNameLabelOf`）が空でなければ、`beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`
+ *   （画面のジョブ。プロファイルの名前は、ファイル名だけに使う）。
+ * - `profileName` がない（CLI の実行）か、名前の部分が空なら、`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`（今の形）。
+ * `finishedAt` は、その Run の最後の実行の終わりの時刻（`RunSummary.executions` の最後の `finishedAt`。ISO 8601）。
+ * 日時は UTC で、Run の ID と同じ書式（`formatCompactUtcTimestamp`）にする。同じ Run の結果とプロファイルの名前からは、同じ名前になる
+ * （書き出しの時刻は使わない）。文字列でない値、時刻として読めない文字列、UTC の年が4桁でない時刻、文字列でないプロファイルの名前は、
+ * `RangeError` を投げる。
+ */
+export function bundleFileName(finishedAt: string, profileName?: string): string {
   const given: unknown = finishedAt;
   if (typeof given !== 'string') {
     throw new RangeError(`${BUNDLE_TIME_SUBJECT} must be an ISO 8601 string`);
   }
-  return timestampedBundleFileName(BUNDLE_FILE_NAME_PREFIX, formatCompactUtcTimestamp(new Date(given), BUNDLE_TIME_SUBJECT));
+  const label = profileName === undefined ? '' : bundleFileNameLabelOf(profileName);
+  const prefix = label.length === 0 ? BUNDLE_FILE_NAME_PREFIX : `${BUNDLE_FILE_NAME_PREFIX}${label}${BUNDLE_FILE_NAME_TIME_SEPARATOR}`;
+  return timestampedBundleFileName(prefix, formatCompactUtcTimestamp(new Date(given), BUNDLE_TIME_SUBJECT));
 }
 
 /**
- * ChatGPT 用バンドルの名前か。新しい形（`beaksight-audit-bundle_` と、ASCII の数字14桁と、`.zip`）と、前の形（`LEGACY_BUNDLE_FILE_NAME`）の
- * 両方を真にする。似た名前（拡張子の違い、桁の違い、前後に文字があるもの、大文字と小文字の違い）は偽にする。
- * `ArtifactWriter.writePresentation` が、Run のディレクトリの直下の古いバンドルを見分けるために使う。
+ * ChatGPT 用バンドルの名前の日時（ASCII の数字14桁）。名前の部分つきの形（`beaksight-audit-bundle_<名前の部分>_<14桁>.zip`）と、名前の部分のない形
+ * （`beaksight-audit-bundle_<14桁>.zip`）の、末尾の 14 桁を返す。日時は末尾の固定の長さで読むので、名前の部分に `_` や数字があっても取り違えない。
+ * 名前の部分は、`bundleFileNameLabelOf` が同じ値を返すもの（作り直しても変わらないもの）だけを受ける。日時のない名前と、バンドルの名前でない
+ * ものは `null`。
+ */
+export function bundleFileNameTimestampOf(name: string): string | null {
+  if (!name.startsWith(BUNDLE_FILE_NAME_PREFIX) || !name.endsWith(BUNDLE_FILE_NAME_EXTENSION)) {
+    return null;
+  }
+  const body = name.slice(BUNDLE_FILE_NAME_PREFIX.length, name.length - BUNDLE_FILE_NAME_EXTENSION.length);
+  if (isCompactUtcTimestamp(body)) {
+    return body;
+  }
+  const timestamp = body.slice(-COMPACT_UTC_TIMESTAMP_LENGTH);
+  const separatorIndex = body.length - COMPACT_UTC_TIMESTAMP_LENGTH - BUNDLE_FILE_NAME_TIME_SEPARATOR.length;
+  if (separatorIndex <= 0 || !isCompactUtcTimestamp(timestamp) || !body.startsWith(BUNDLE_FILE_NAME_TIME_SEPARATOR, separatorIndex)) {
+    return null;
+  }
+  const label = body.slice(0, separatorIndex);
+  return bundleFileNameLabelOf(label) === label ? timestamp : null;
+}
+
+/**
+ * ChatGPT 用バンドルの名前か。次の2つの形を真にする（PRE42-BN）。
+ * - 名前の部分つきの形（`beaksight-audit-bundle_<名前の部分>_<ASCII の数字14桁>.zip`。名前の部分は `bundleFileNameLabelOf` が作る形のもの）
+ * - 名前の部分のない形（`beaksight-audit-bundle_<ASCII の数字14桁>.zip`。CLI の今の形）
+ * 似た名前（拡張子の違い、桁の違い、前後に文字があるもの、大文字と小文字の違い、作り直すと変わる名前の部分、空の名前の部分）は偽にする。
+ * LG-4（テストの組の設計書 3.7.5）: 日時のない前の形（`beaksight-audit-bundle.zip`）は、もう見分けない（画面は配らず、書き手は片付けない）。
+ * `ArtifactWriter.writePresentation` が、Run のディレクトリの直下の古いバンドルを見分けるために使う（プロファイルの名前が変わった後の、前の名前の
+ * バンドルも見分ける）。
  */
 export function isBundleFileName(name: string): boolean {
-  return name === LEGACY_BUNDLE_FILE_NAME || isTimestampedBundleFileName(BUNDLE_FILE_NAME_PREFIX, name);
+  return bundleFileNameTimestampOf(name) !== null;
 }
 
 /**
@@ -409,24 +512,11 @@ export const artifactFilePath = (runDirectory: string, relativePath: string): st
   join(runDirectory, ...relativePath.split('/'));
 
 /**
- * Windows がポートの番号として扱う上付きの数字（1、2、3。U+00B9、U+00B2、U+00B3）。`COM¹` などもデバイスを指す（DEF-056。T24b round 1）。
- */
-const SUPERSCRIPT_PORT_DIGITS: readonly string[] = [0x00b9, 0x00b2, 0x00b3].map((codePoint) => String.fromCodePoint(codePoint));
-
-/**
  * Windows の予約されたデバイス名（DEF-056。Task 24 の設計書 4.7）。区切りの、最初の `.` より前の部分（その末尾の空白を除く）が、大文字と
  * 小文字を問わずこのどれかなら、その区切りを拒む（`NUL.txt`、`con`、`CON .txt` も、Windows ではデバイスを指すことがあるため）。
- * コンソールの入出力（`CONIN$`、`CONOUT$`）と、上付きの数字のポート（`COM¹`〜`COM³`、`LPT¹`〜`LPT³`）も含める（T24b round 1）。
+ * 一覧の owner は、`node:` の部品を読まない `windows-reserved-names.ts`（CC-101。画面のブラウザ側も読むため分けた）。ここは同じ一覧を公開し直す。
  */
-export const WINDOWS_RESERVED_DEVICE_NAMES: readonly string[] = Object.freeze([
-  'CON', 'PRN', 'AUX', 'NUL',
-  'COM0', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
-  'LPT0', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
-  'CONIN$', 'CONOUT$',
-  ...SUPERSCRIPT_PORT_DIGITS.map((digit) => `COM${digit}`),
-  ...SUPERSCRIPT_PORT_DIGITS.map((digit) => `LPT${digit}`),
-]);
-const WINDOWS_RESERVED_DEVICE_NAME_SET: ReadonlySet<string> = new Set(WINDOWS_RESERVED_DEVICE_NAMES);
+export { WINDOWS_RESERVED_DEVICE_NAMES } from './windows-reserved-names.js';
 
 /**
  * パスのどこにも含めない `:`（DEF-056）。NTFS の代替データストリーム（`run.json:stream`）、Windows のドライブ（`C:`）、URL のスキーム
@@ -442,7 +532,7 @@ const EXTENSION_SEPARATOR = '.';
 const isWindowsReservedDeviceSegment = (segment: string): boolean => {
   const extensionStart = segment.indexOf(EXTENSION_SEPARATOR);
   const stem = (extensionStart < 0 ? segment : segment.slice(0, extensionStart)).trimEnd();
-  return WINDOWS_RESERVED_DEVICE_NAME_SET.has(stem.toUpperCase());
+  return isWindowsReservedDeviceName(stem);
 };
 
 /** 区切り1つ（`/` を含まない）として安全か（空・`.`・`..` でなく、末尾が `.` か空白でなく、Windows のデバイス名でない）。 */

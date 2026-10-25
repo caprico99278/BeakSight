@@ -80,6 +80,19 @@ export const removeBidiControls = (value: string): string => value.replace(BIDI_
 export const removeLoneSurrogates = (value: string): string => value.replace(LONE_SURROGATES, '');
 
 /**
+ * 対になっていないサロゲートを、1 つずつ U+FFFD に置き換える（`value.toWellFormed()` と同じ。長さは変わらない）。PRE42-CC（CC-052・053 の残り）:
+ * `toWellFormed()` の呼び出しは、ここと `truncateWellFormed` だけに書く（`tests/architecture/text-character-classes.test.ts` の Gate）。
+ */
+export const replaceLoneSurrogates = (value: string): string => value.toWellFormed();
+
+/**
+ * `value` を UTF-16 のコード単位で `maxLength` 以内に切り、対になっていないサロゲート（切った位置で割れた対を含む）を U+FFFD に置き換える
+ * （`value.slice(0, maxLength).toWellFormed()` と同じ。`toWellFormed()` の後に切って、もう一度 `toWellFormed()` をかけた形とも同じになる）。
+ * 結果は `maxLength` 以内で、対になっていないサロゲートを含まない。
+ */
+export const truncateWellFormed = (value: string, maxLength: number): string => value.slice(0, maxLength).toWellFormed();
+
+/**
  * 比べるための畳み込み（CCX-15。共通化の台帳の CC-069）: Unicode の正規化（NFKC）の後に、`toUpperCase` の後に `toLowerCase` をかけた形。
  * `ſ`（U+017F）は `s` に、ケルビン記号（U+212A）は `k` に、全角の英字と記号（`／`、`；` を含む）は ASCII に、`ß` は `ss` に、合字（U+FB01）は
  * `fi` になる（順序は変えない。`toLowerCase` だけでは `ß` が残る）。ロケールに依存しない。要求の判定の owner の、除外のパスと危険な語の
@@ -87,6 +100,16 @@ export const removeLoneSurrogates = (value: string): string => value.replace(LON
  * （`tests/architecture/text-character-classes.test.ts` の Gate）。
  */
 export const foldNfkcCase = (value: string): string => value.normalize('NFKC').toUpperCase().toLowerCase();
+
+/** 結合文字（Unicode の一般カテゴリ M）。 */
+const COMBINING_MARKS = /\p{M}/gu;
+
+/**
+ * 結合文字を除いた形（T41a。Task 41 の設計書 3.1 の「秘密に見える名前の語」）: Unicode の正規化（NFD）の後に、結合文字（アクセント・濁点・重ね書きの記号
+ * など）を除く。`tóken` は `token` に、`ド` は `ト` になる。秘密に見える名前の方針 6 の比べ（`src/discovery/classify.ts` の `isApiWriteKeyNameSecretLike`）が、
+ * 名前と語の両方をこの形にしても比べる。正規化は、ここだけに書く（`foldNfkcCase` と同じ Gate）。
+ */
+export const stripCombiningMarks = (value: string): string => value.normalize('NFD').replace(COMBINING_MARKS, '');
 
 /** ロケールに依存せず、UTF-16 のコード単位の順で比べる。 */
 export const compareCodeUnits = (left: string, right: string): number => {

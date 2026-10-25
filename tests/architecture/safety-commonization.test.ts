@@ -4,12 +4,18 @@
  * - (a) `src/safety/` は `src/audit/` を import しない（HTTP の status の範囲は `src/core/http-status.ts` から取る。CC-042）。
  * - (b) `Number.MAX_SAFE_INTEGER` で止める件数の足し算（飽和の加算）と、`saturating…` の名前の関数の定義は、`src/core/saturating-count.ts`
  *   だけに書く（CC-055、CC-067）。
- * - (c) `net::ERR_` を含む文字列リテラル（Chromium のネットワークの失敗の理由）は、Playwright の失敗の一覧（`src/browser/playwright-errors.ts`）
+ * - (c) `net::ERR_` を含む文字列リテラル（Chromium のネットワークの失敗の理由）は、止めた要求の失敗の理由の一覧（`src/core/blocked-by-client-failures.ts`。
+ *   BN-c の fix で `src/browser/playwright-errors.ts` から移した）
  *   と、ネットワークの失敗の分類の owner（`src/safety/network-layer-failure.ts`）だけに書く（CC-035）。既存の正当な使い方は、
  *   ファイルと文字列の組で、理由を付けて除外する（同じファイルでも、新しい文字列は検出する）。コメントは数えない。
  * - (d) CCX-15（CC-064）: 認証の設定の送信先への POST かの判定（`isLoginEndpointPost`）と、それが使う定数（`LOGIN_POST_METHOD`、
  *   `ONE_REMAINING_POST`）の定義（`const …`・`let …`・`var …`・`function …`）は、要求の判定の owner（`src/safety/request-policy.ts`）だけに書く。
  *   ログインの段の部品（`src/worker/login-stage-checks.ts`、`src/worker/automated-login.ts`）は、owner から import する。
+ * - (e) PRE42-CC 組 5a（CC-042 (b)）と組 S2（CC-042 の Guard の 3xx）: HTTP の status の種類の範囲（2xx・3xx・4xx・5xx）の境は、
+ *   `src/core/http-status.ts` だけに書く。ほかの所は
+ *   `isHttpStatusInRange` と範囲の定数を使う。数えるのは、名前に `STATUS` と `MIN`・`MAX` を含む定数を範囲の境の数（200・299・300・399・400・499・500・599）で
+ *   定義する形と、名前に `status` を含む値（大文字小文字を問わない。`.status()` も）を 3 桁の数（100〜699）と大小で比べる形（`bare`）。
+ *   種類の範囲ではない既存の使い方と、ほかの組が寄せる所は、ファイルと形の組で、理由を付けて除外する（同じファイルでも、新しい所は検出する）。
  * - `src/**` の読み込みと走査は、このファイルの読み込み時に 1 回だけ。ファイル全体を 1 秒以内に終える。
  * - CCX-9（台帳の CC-054）: 指定子の取り出し（`findModuleSpecifiers`。(a)）、名前つきの import の一覧（`findNamedImports`。(d)）、相対の
  *   指定子の解決（`resolveRelativeSpecifier`）は、`source-scan.ts` の共通の部品を使う（指定子を取り出す正規表現は、このファイルに書かない）。
@@ -21,6 +27,9 @@ import {
   loadSourceFiles,
   resolveRelativeSpecifier,
   scanSource,
+  sourceFileOf,
+  unusedExclusionsOf,
+  violationsOf,
   type ScannedSource,
   type SourceFile,
 } from './source-scan.js';
@@ -31,7 +40,8 @@ const SAFETY_DIRECTORY = 'src/safety/';
 const AUDIT_DIRECTORY = 'src/audit/';
 const SATURATING_COUNT_OWNER = 'src/core/saturating-count.ts';
 const NET_ERROR_TEXT_OWNERS: ReadonlySet<string> = new Set([
-  'src/browser/playwright-errors.ts',
+  // BN-c の fix（発見事項 1）: 止めた要求の失敗の理由の一覧は、`src/browser/playwright-errors.ts` から Playwright を読まない core の置き場所に移した。
+  'src/core/blocked-by-client-failures.ts',
   'src/safety/network-layer-failure.ts',
 ]);
 
@@ -41,6 +51,11 @@ const NET_ERROR_TEXT_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
     'src/safety/passive-request-guard.ts: net::ERR_ABORTED',
     'Guard の `NAVIGATION_ABORTED_ERROR_TEXT`（ブラウザが文書の要求を取り消したときの理由）の、Guard の中のただ 1 つの定義。'
       + 'ネットワークの層の失敗の分類ではない（分類の一覧は、この理由を意図して載せない）',
+  ],
+  [
+    'src/browser/chromium-launch.ts: net::ERR_BLOCKED_BY_ADMINISTRATOR',
+    'EL-12: 起動の部品の自己検査の合格の印（`EXTERNAL_LAUNCH_BLOCKED_ERROR_TEXT`。一時のプロファイルの設定が外部スキームへの移動を止めたときの誤り）の、'
+      + 'ただ 1 つの定義。要求の失敗の分類ではない',
   ],
   ...[
     'net::ERR_CONNECTION_RESET',
@@ -100,12 +115,30 @@ const LOGIN_ENDPOINT_DEFINITION = new RegExp(
 const findLoginEndpointDefinitions = (source: ScannedSource): readonly string[] =>
   [...source.bare.matchAll(LOGIN_ENDPOINT_DEFINITION)].map((match) => match[0].replace(/\s+/gu, ' ').trim());
 
-const violationsOf = (
-  files: readonly SourceFile[],
-  find: (file: SourceFile) => readonly string[],
-): readonly string[] => files.flatMap((file) => find(file).map((match) => `${file.path}: ${match}`));
+/** (e) HTTP の status の種類の範囲の owner。 */
+const HTTP_STATUS_RANGE_OWNER = 'src/core/http-status.ts';
+/** (e) 範囲の境の定数の定義（名前に `STATUS` と `MIN`・`MAX` を含み、値が範囲の境の数。3xx は組 S2 で足した）。 */
+const HTTP_STATUS_RANGE_BOUND_DEFINITION =
+  /\b(?:const|let|var)\s+(?=[\w$]*STATUS)(?=[\w$]*(?:MIN|MAX))[\w$]+\s*(?::[^=;]*)?=\s*(?:200|299|300|399|400|499|500|599)\b/gu;
+/** (e) 名前に `status` を含む値と、3 桁の数（100〜699）との大小の比べ（どちらの向きも）。 */
+const HTTP_STATUS_LITERAL_COMPARISONS: readonly RegExp[] = [
+  /\b[\w$]*status[\w$]*\s*(?:\(\s*\))?\s*(?:<=?|>=?)\s*[1-6]\d{2}\b/giu,
+  /\b[1-6]\d{2}\s*(?:<=?|>=?)\s*(?:[\w$]+\s*\??\.\s*)*[\w$]*status[\w$]*\b/giu,
+];
+const findHttpStatusRangeBounds = (source: ScannedSource): readonly string[] => [
+  ...[...source.bare.matchAll(HTTP_STATUS_RANGE_BOUND_DEFINITION)],
+  ...HTTP_STATUS_LITERAL_COMPARISONS.flatMap((pattern) => [...source.bare.matchAll(pattern)]),
+].map((match) => match[0].replace(/\s+/gu, ' ').trim());
+/** (e) の除外（`<ファイル>: <形>` と理由）。除外の一覧は、このファイルの中の 1 か所だけ。 */
+const HTTP_STATUS_RANGE_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
+  [
+    'src/control/actions/action-contracts.ts: const MAX_HTTP_STATUS = 599',
+    '記録できる status の値の範囲（100〜599）の上端。種類の範囲ではない（下端は 100）',
+  ],
+]);
 
-const sample = (path: string, content: string): SourceFile => ({ path, content, ...scanSource(content) });
+// `violationsOf`（`<パス>: <見つけたもの>`）と、対照の例のファイル（`sourceFileOf`）は、`source-scan.ts` の共通の補助（PRE42-CC 組 G）。
+const sample = sourceFileOf;
 
 describe('CCX-2 detectors', () => {
   it('(a) detects imports of src/audit/ from src/safety/, and ignores other imports and comments', () => {
@@ -182,6 +215,38 @@ describe('CCX-2 detectors', () => {
       "import { isLoginEndpointPost, LOGIN_POST_METHOD } from './login-stage-checks.js';",
     ].join('\n')).code)).toEqual(['canonicalPassiveAllowedOrigins']);
   });
+
+  it('(e) detects HTTP status range bounds and literal comparisons (CC-042), and ignores other constants, comments and strings', () => {
+    const file = sample('src/crawl/sample.ts', [
+      'const MIN_SUCCESS_HTTP_STATUS = 200;',
+      'export const HTTP_ERROR_STATUS_MIN: number = 400;',
+      'const ok = httpStatus >= 200 && httpStatus <= 299;',
+      'const failed = response.status() >= 400;',
+      'const redirect = 300 <= response.status && 399 >= status;',
+      'const REDIRECT_STATUS_MIN = 300;',
+      'const MAX_REDIRECT_HTTP_STATUS: number = 399;',
+      'const MAX_HTTP_STATUS_LENGTH = 10;',
+      'const NOT_MODIFIED_HTTP_STATUS = 304;',
+      'const INFORMATIONAL_STATUS_MAX = 199;',
+      'const range = isHttpStatusInRange(httpStatus, SUCCESS_HTTP_STATUS_RANGE);',
+      'const same = status === 404;',
+      'const small = count >= 200;',
+      '// const ok = status >= 200;',
+      "const text = 'status < 300';",
+    ].join('\n'));
+
+    expect(findHttpStatusRangeBounds(file)).toEqual([
+      'const MIN_SUCCESS_HTTP_STATUS = 200',
+      'const HTTP_ERROR_STATUS_MIN: number = 400',
+      'const REDIRECT_STATUS_MIN = 300',
+      'const MAX_REDIRECT_HTTP_STATUS: number = 399',
+      'httpStatus >= 200',
+      'httpStatus <= 299',
+      'status() >= 400',
+      '300 <= response.status',
+      '399 >= status',
+    ]);
+  });
 });
 
 describe('CCX-2 Gate: Guard commonization', () => {
@@ -211,9 +276,7 @@ describe('CCX-2 Gate: Guard commonization', () => {
 
   it('(c) every exclusion is still used, so that stale exclusions do not hide new texts', () => {
     const others = SOURCE_FILES.filter((file) => !NET_ERROR_TEXT_OWNERS.has(file.path));
-    const found = new Set(violationsOf(others, findNetErrorTexts));
-
-    expect([...NET_ERROR_TEXT_EXCLUSIONS.keys()].filter((entry) => !found.has(entry))).toEqual([]);
+    expect(unusedExclusionsOf(NET_ERROR_TEXT_EXCLUSIONS.keys(), violationsOf(others, findNetErrorTexts))).toEqual([]);
   });
 
   it('(d) the login endpoint check and its constants are defined only in src/safety/request-policy.ts (CCX-15)', () => {
@@ -234,5 +297,18 @@ describe('CCX-2 Gate: Guard commonization', () => {
       expect(file, path).toBeDefined();
       expect(namesImportedFromOwner(file?.code ?? ''), path).toEqual(expect.arrayContaining([...names]));
     }
+  });
+
+  it('(e) the HTTP status range bounds are written only in src/core/http-status.ts (CC-042)', () => {
+    expect(SOURCE_FILES.some((file) => file.path === HTTP_STATUS_RANGE_OWNER)).toBe(true);
+    const others = SOURCE_FILES.filter((file) => file.path !== HTTP_STATUS_RANGE_OWNER);
+    const found = violationsOf(others, findHttpStatusRangeBounds);
+
+    expect(found.filter((entry) => !HTTP_STATUS_RANGE_EXCLUSIONS.has(entry))).toEqual([]);
+  });
+
+  it('(e) every exclusion of the HTTP status range bounds is still used, so that stale exclusions do not hide new ones', () => {
+    const others = SOURCE_FILES.filter((file) => file.path !== HTTP_STATUS_RANGE_OWNER);
+    expect(unusedExclusionsOf(HTTP_STATUS_RANGE_EXCLUSIONS.keys(), violationsOf(others, findHttpStatusRangeBounds))).toEqual([]);
   });
 });

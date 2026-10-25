@@ -16,7 +16,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { executeAuditRun, type AuditRunDependencies } from '../../src/cli/audit-run.js';
 import { CONFIG_ERROR_EXIT_CODE, EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { loadConfig } from '../../src/config/load-config.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import {
+  AUTH_SETUP_SCHEMA_VERSION_3,
+  type AuthSetup,
+  type AuthSetupV3,
+} from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {
   WORKER_PROTOCOL_VERSION,
   targetConfigDigestOf,
@@ -34,6 +39,7 @@ import {
   type AuthenticatedSiteOptions,
 } from '../helpers/authenticated-site-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { nonReadRequestsOf, READ_METHODS } from '../helpers/leak-places.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 
 const LAUNCHERS = [
@@ -44,6 +50,8 @@ const LAUNCHERS = [
 const SHORT_LOGIN_TIMEOUT_MS = 2_000;
 /** テストのログインを待つ時間（ms。テストの口が入力する場面。CPU の混雑に余裕をもつ）。 */
 const LONG_LOGIN_TIMEOUT_MS = 60_000;
+/** ML-a: 手動のログインの段で、上限を超えたログインの POST の後に時間切れを待つ時間（ms。3 回の送信に足りる長さ）。 */
+const MANUAL_ATTEMPTS_LOGIN_TIMEOUT_MS = 20_000;
 const POLL_INTERVAL_MS = 100;
 const TEST_TIMEOUT_MS = 180_000;
 const MAX_PAGES = 4;
@@ -89,8 +97,8 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
     return site;
   };
 
-  const setupFor = (started: AuthenticatedSite, overrides: Partial<AuthSetup> = {}): AuthSetup => ({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  const setupFor = (started: AuthenticatedSite, overrides: Partial<AuthSetupV3> = {}): AuthSetupV3 => ({
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: 'example-auth',
     profileRevision: 1,
     loginStartUrl: `${started.originA}${AUTH_SITE_PATHS.login}`,
@@ -209,8 +217,7 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
     run.messages.map(({ type }) => type).filter((type) => type !== 'HEARTBEAT' && type !== 'PROGRESS');
   const failedReasonOf = (run: WorkerRun): string | null =>
     run.messages.flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))[0] ?? null;
-  const postsOf = (started: AuthenticatedSite): readonly string[] =>
-    started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+  const postsOf = (started: AuthenticatedSite): readonly string[] => nonReadRequestsOf(started.requests);
 
   /** 人の操作の代わり: ログインの画面で、正しい資格情報を入れて送る。 */
   const typeCorrectCredentials = (started: AuthenticatedSite) => async (page: Page): Promise<void> => {
@@ -229,7 +236,10 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
     }
   };
 
-  it('logs in, sends AUTHENTICATED after closing the login Browser, audits the admin pages and completes; no other POST reaches the server', async () => {
+  // ML-a（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 2.1。ユーザーの判断で意図して直した期待）: 前は、手動のログインの段の Guard が、許して
+  // いない送信先への fetch の POST と beacon を止め、ログインの POST のほかは届かなかった。今は、手動のログインの段はページの送信を止めずに通し（人が普通の
+  // ブラウザで操作するのと同じ）、通した送信の形だけを `AUTH_STATE` の `passedRequests` に残す（値は残さない）。監査の段は今どおり読み取りだけ。
+  it('logs in, sends AUTHENTICATED after closing the login Browser, audits the admin pages and completes; the page POSTs of the manual login stage pass and are recorded by shape', async () => {
     const started = await startSite();
     const targetConfigPath = await writeTarget(started, `complete-${runCount}`);
     const run = await runWorker({
@@ -240,7 +250,7 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
       login: {
         loginTimeoutMs: LONG_LOGIN_TIMEOUT_MS,
         onLoginPageReady: async (page) => {
-          // ログインの段の Guard: 許していない送信先への fetch の POST と beacon は届かない。
+          // ML-a: 手動のログインの段の Guard は、許していない送信先への fetch の POST と beacon も通す（形だけを記録する）。
           await page.evaluate(([otherPath, beaconPath]) => {
             void fetch(otherPath, { method: 'POST', body: 'x' }).catch(() => undefined);
             navigator.sendBeacon(beaconPath, 'x');
@@ -252,17 +262,52 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
 
     expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
     expect(authStatesOf(run)).toEqual(['AWAITING_LOGIN', 'AUTHENTICATED']);
-    expect(typesOf(run)).toEqual(['READY', 'AUTH_STATE', 'AUTH_STATE', 'RUN_STARTED', 'FINISHED']);
+    // DEF-143: 「Run の終わり」の段に入る知らせ（`RUN_FINALIZING`）は、`FINISHED` の直前に 1 回。
+    expect(typesOf(run)).toEqual(['READY', 'AUTH_STATE', 'AUTH_STATE', 'RUN_STARTED', 'RUN_FINALIZING', 'FINISHED']);
     expect(run.loginBrowserConnectedAtAuthenticated).toBe(false);
     const finished = run.messages.find((message) => message.type === 'FINISHED');
     expect(finished?.type === 'FINISHED' ? finished.outcome.runStatus : null).toBe('COMPLETE');
     expect(started.successfulLogins).toBe(1);
-    expect(postsOf(started)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
+    expect([...postsOf(started)].sort()).toEqual([`POST ${AUTH_SITE_PATHS.login}`, `POST ${OTHER_POST_PATH}`, `POST ${BEACON_PATH}`].sort());
+    const authenticated = run.messages.find((message) => message.type === 'AUTH_STATE' && message.state === 'AUTHENTICATED');
+    expect(authenticated?.type === 'AUTH_STATE' ? authenticated.passedRequests?.requests.map(({ path, reason }) => `${path} ${reason}`).sort() : undefined)
+      .toEqual([`${OTHER_POST_PATH} NON_READ_METHOD`, `${BEACON_PATH} NON_READ_METHOD`].sort());
+    // 監査の段は今どおり読み取りだけ（ログインの後の読み取りでない要求は届かない）。
     const adminRequests = started.requests.filter(({ path }) => path.startsWith(`${AUTH_SITE_PATHS.admin}`));
-    expect(adminRequests.filter(({ authenticated }) => !authenticated)).toEqual([]);
-    expect(adminRequests.filter(({ authenticated }) => authenticated).length).toBeGreaterThan(0);
+    expect(adminRequests.filter(({ authenticated: signedIn }) => !signedIn).map(({ method, path }) => `${method} ${path}`)).toEqual([`POST ${OTHER_POST_PATH}`]);
+    expect(adminRequests.filter(({ authenticated: signedIn }) => signedIn).length).toBeGreaterThan(0);
+    expect(adminRequests.filter(({ authenticated: signedIn, method }) => signedIn && !READ_METHODS.has(method))).toEqual([]);
     expectNoSecrets(run, started);
     expect(browsers.every((browser) => !browser.isConnected())).toBe(true);
+  }, TEST_TIMEOUT_MS);
+
+  // T34c（T34d の申し送り）: 画面が新しく保存する、認証の設定の版 3 のフォームの送信（`FORM_NAVIGATION`）でも、手動のログインの段と監査が今どおり
+  // 動く（スクリプトで送るログインの数は送らない）。
+  it('logs in and completes with a version 3 form navigation setup as before, without the script login counts', async () => {
+    const started = await startSite();
+    const targetConfigPath = await writeTarget(started, `complete-v3-${runCount}`);
+    const { schemaVersion: _version2, ...fields } = setupFor(started);
+    const setup: AuthSetupV3 = {
+      ...fields,
+      schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+      loginTransport: 'FORM_NAVIGATION',
+      scriptLogin: null,
+      loginSideRequests: [],
+      successStorageKey: null,
+    };
+    const run = await runWorker({
+      started,
+      targetConfigPath,
+      setup,
+      startNew: true,
+      login: { loginTimeoutMs: LONG_LOGIN_TIMEOUT_MS, onLoginPageReady: typeCorrectCredentials(started) },
+    });
+    expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
+    expect(authStatesOf(run)).toEqual(['AWAITING_LOGIN', 'AUTHENTICATED']);
+    expect(run.messages.filter((message) => message.type === 'AUTH_STATE' && message.scriptLogin !== undefined)).toEqual([]);
+    expect(started.successfulLogins).toBe(1);
+    expect(postsOf(started)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
+    expectNoSecrets(run, started);
   }, TEST_TIMEOUT_MS);
 
   it('ends with LOGIN_TIMEOUT when the success condition is not met in time, without starting the audit', async () => {
@@ -280,7 +325,9 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
     expect(browsers.every((browser) => !browser.isConnected())).toBe(true);
   }, TEST_TIMEOUT_MS);
 
-  it('ends with LOGIN_ATTEMPTS_EXCEEDED after wrong credentials, and the server receives the login POST only up to the limit', async () => {
+  // ML-a（意図して直した期待）: 前は、手動のログインの段でも、ログインの POST を回数の上限で止めて `LOGIN_ATTEMPTS_EXCEEDED` で終えた。今は、回数の上限は自動ログインの
+  // 段だけに当てる（自動ログインの段は、人が見ていないので厳しさを変えない）。手動のログインの段は、上限を超えた POST も通し、成功しなければ時間切れで終える。
+  it('passes the login POST over the limit in the manual login stage, records it by shape, and ends with LOGIN_TIMEOUT after wrong credentials', async () => {
     const started = await startSite();
     const targetConfigPath = await writeTarget(started, `attempts-${runCount}`);
     const run = await runWorker({
@@ -289,7 +336,7 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
       setup: setupFor(started),
       startNew: true,
       login: {
-        loginTimeoutMs: LONG_LOGIN_TIMEOUT_MS,
+        loginTimeoutMs: MANUAL_ATTEMPTS_LOGIN_TIMEOUT_MS,
         onLoginPageReady: async (page) => {
           for (let attempt = 0; attempt <= MAX_LOGIN_ATTEMPTS; attempt += 1) {
             await page.goto(`${started.originA}${AUTH_SITE_PATHS.login}`);
@@ -306,10 +353,14 @@ describe.each(LAUNCHERS)('T25d: the authenticated worker flow in process (%s)', 
     });
 
     expect(run.exitCode).toBe(FAILURE_EXIT_CODE);
-    expect(authStatesOf(run)).toEqual(['AWAITING_LOGIN', 'LOGIN_ATTEMPTS_EXCEEDED']);
-    expect(failedReasonOf(run)).toBe('LOGIN_ATTEMPTS_EXCEEDED');
-    expect(postsOf(started)).toEqual(Array.from({ length: MAX_LOGIN_ATTEMPTS }, () => `POST ${AUTH_SITE_PATHS.login}`));
+    expect(authStatesOf(run)).toEqual(['AWAITING_LOGIN', 'LOGIN_TIMEOUT']);
+    expect(failedReasonOf(run)).toBe('LOGIN_TIMEOUT');
+    expect(postsOf(started)).toEqual(Array.from({ length: MAX_LOGIN_ATTEMPTS + 1 }, () => `POST ${AUTH_SITE_PATHS.login}`));
     expect(started.successfulLogins).toBe(0);
+    const ended = run.messages.find((message) => message.type === 'AUTH_STATE' && message.state === 'LOGIN_TIMEOUT');
+    expect(ended?.type === 'AUTH_STATE' ? ended.passedRequests?.requests.map(({ path, reason, count }) => `${path} ${reason} ${count}`) : undefined)
+      .toEqual([`${AUTH_SITE_PATHS.login} NON_READ_METHOD 1`]);
+    expectNoSecrets(run, started);
   }, TEST_TIMEOUT_MS);
 
   it.each([

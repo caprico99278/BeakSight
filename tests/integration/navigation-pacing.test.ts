@@ -37,7 +37,7 @@ import { PageAuditor, type PageAuditCollectors } from '../../src/orchestration/p
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserDelayingNewContext, overrideBrowser } from '../helpers/browser-proxies.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createRunLauncher } from '../helpers/run-harness.js';
@@ -71,7 +71,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }

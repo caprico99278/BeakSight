@@ -1,6 +1,6 @@
 /**
- * シナリオの表示の状態（Task 28 の設計書 4.6 の一覧の「状態」。T28e）。ブラウザでも動く純粋な部品（値は持たず、型だけを
- * `src/control/approval-view.ts` から読む）。
+ * シナリオの表示の状態（Task 28 の設計書 4.6 の一覧の「状態」。T28e）。ブラウザでも動く純粋な部品（型は `src/control/approval-view.ts` から、
+ * 理由の値は純粋な core の `src/core/approval-invalidity-reasons.ts` から読む）。
  * - 保存した状態（`SCENARIO_STATES`）と、再承認の判定（`evaluateApprovalValidity` の結果。判定の owner は `src/control/approval/approval-validity.ts`）
  *   から、画面に出す状態を 1 つ選ぶ。判定はやり直さない（理由の一覧を見るだけ）。
  * - 選び方（この順）: 判定が有効 → 承認済み、撤回の理由 → 撤回済み、期限切れの理由 → 期限切れ、承認の記録がない → 下書き、ほか → 要再承認。
@@ -8,15 +8,17 @@
  * - 表示（ラベル、色、説明）は `src/presentation/catalog.ts` の `SCENARIO_DISPLAY_STATE_CATALOG`。
  */
 import type { ApprovalInvalidityReason, ApprovalValidity } from '../../../../src/control/approval-view.js';
+// PRE42-CC 組 UI-K3（台帳の CC-113）: 状態を決める理由（撤回、期限切れ、承認の記録がない）の値は、管理データに触れない純粋な core の owner から読む
+// （書き写さない。判定の owner `approval-validity.ts` が同じ値を公開し直す）。
+import {
+  EXPIRED_INVALIDITY_REASON as EXPIRED_REASON,
+  NOT_APPROVED_INVALIDITY_REASON as NOT_APPROVED_REASON,
+  REVOKED_INVALIDITY_REASON as REVOKED_REASON,
+} from '../../../../src/core/approval-invalidity-reasons.js';
 
 /** 画面の表示の状態（閉じた一覧）。 */
 export const SCENARIO_DISPLAY_STATES = Object.freeze(['DRAFT', 'APPROVED', 'NEEDS_REAPPROVAL', 'EXPIRED', 'REVOKED'] as const);
 export type ScenarioDisplayState = (typeof SCENARIO_DISPLAY_STATES)[number];
-
-/** 状態を決める理由（撤回、期限切れ、承認の記録がない）。 */
-const REVOKED_REASON = 'REVOKED' satisfies ApprovalInvalidityReason;
-const EXPIRED_REASON = 'EXPIRED' satisfies ApprovalInvalidityReason;
-const NOT_APPROVED_REASON = 'NOT_APPROVED' satisfies ApprovalInvalidityReason;
 
 /** 再承認の判定から、画面の表示の状態を選ぶ。 */
 export const scenarioDisplayStateOf = (validity: ApprovalValidity): ScenarioDisplayState => {

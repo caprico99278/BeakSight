@@ -28,6 +28,8 @@ import {
   type LocalUiGuardOptions,
   type RejectionText,
 } from './request-guard.ts';
+import { errorMessageOrString } from './error-message.ts';
+import { handlePresenceRequest } from './presence.ts';
 import { createTwoStepShutdown } from './shutdown.ts';
 
 /** TanStack Start の SSR の環境の名前。 */
@@ -217,7 +219,12 @@ export function localUiGuardPlugin(pluginOptions: LocalUiGuardPluginOptions): Pl
         }));
       }
       server.middlewares.use((request, response, next) => {
-        if (guardNodeRequest(optionsOf(server), request, response)) {
+        const options = optionsOf(server);
+        if (!guardNodeRequest(options, request, response)) {
+          return;
+        }
+        // UI-close: 管理画面のページの知らせの口には応答する（開発のサーバは、ブラウザを閉じても止めない。Ctrl+C で止める）。
+        if (!handlePresenceRequest(null, `http://${LOCAL_UI_LISTEN_HOST}:${options.port}`, request, response)) {
           next();
         }
       });
@@ -275,7 +282,7 @@ export function localUiGuardPlugin(pluginOptions: LocalUiGuardPluginOptions): Pl
           server.config.logger.info(`\n  ${pluginOptions.consoleText.devTokenUrl(formatTokenUrl(listeningPort(server), token))}`);
           server.config.logger.info(`  ${pluginOptions.consoleText.tokenNotice}\n`);
         }, async (error: unknown) => {
-          server.config.logger.error(error instanceof Error ? error.message : String(error));
+          server.config.logger.error(errorMessageOrString(error));
           process.exitCode = PREPARATION_FAILED_EXIT_CODE;
           await server.close();
         });

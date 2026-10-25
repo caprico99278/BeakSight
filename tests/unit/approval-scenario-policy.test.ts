@@ -120,6 +120,30 @@ describe('scenario contracts and defaults (T28a)', () => {
       'SCENARIO_LIMIT_ABOVE_DEFAULT',
       'SCENARIO_LIMIT_INCONSISTENT',
       'SCENARIO_TTL_ABOVE_DEFAULT',
+      // T37d fix round 1: 照合の READ に、画面の path を読む定義を選んだ。
+      'SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET',
+      // T38b: API のシナリオの下書き（`scenario-api-draft.test.ts` で確かめる）。
+      'SCENARIO_API_CANDIDATE_NOT_API',
+      'SCENARIO_API_STATE_KEY',
+      'SCENARIO_API_METHOD_OVERRIDE',
+      'SCENARIO_API_HEADER_METHOD_OVERRIDE',
+      'SCENARIO_API_ORIGIN_NOT_APPROVED',
+      'SCENARIO_API_SHAPE_NOT_EXECUTABLE',
+      'SCENARIO_API_FIELD_KEY_MISMATCH',
+      'SCENARIO_API_FIELD_TYPE_MISMATCH',
+      'SCENARIO_API_KEY_NOT_ALLOWED',
+      'SCENARIO_API_PAGE_KEY_SECRET_LIKE',
+      'SCENARIO_API_FILTER_MISMATCH',
+      // T38c: 候補を見つけた発見のジョブのプロファイルの改訂が、今の改訂と違う（`scenario-api-draft.test.ts`）。
+      'SCENARIO_API_DISCOVERY_PROFILE_STALE',
+      // T38R-fix の I-2（`scenario-api-review-fixes.test.ts`）。
+      'SCENARIO_API_PAGE_KEY_NOT_SCALAR',
+      'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE',
+      // T40R-fix-B の I-2（`scenario-api-save-checks.test.ts`）。T40R2-fix: ID の型の理由は、注意に下げて一覧から外した。
+      'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
+      // T41a（`scenario-api-update-contract.test.ts`）: API の更新のページが決める鍵、台帳の ID と filter の結び付け。
+      'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE',
+      'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
     ]);
     expect(Object.isFrozen(SCENARIO_DRAFT_REJECTION_REASONS)).toBe(true);
   });

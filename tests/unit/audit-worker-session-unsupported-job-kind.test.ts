@@ -11,7 +11,8 @@ import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AuditRunOutcome } from '../../src/cli/audit-run.js';
 import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   WORKER_JOB_KIND_NOT_SUPPORTED_REASON,
   WORKER_JOB_KINDS,
@@ -48,7 +49,7 @@ const READ_CHECKS = Object.freeze([{
 }]);
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-kind',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -191,10 +192,11 @@ describe('worker job kinds (T27c)', () => {
   it('lists DISCOVERY and READ_CHECK after AUDIT and LOGIN_CHECK, and the worker implements all of them (T27d, T27e)', () => {
     // T30d: 書き込みのジョブ `WRITE_CREATE` を一覧に足した（ワーカーの対応は T30f。それまでは `JOB_KIND_NOT_SUPPORTED` で拒む。下の場合）。
     // T31e: 更新の書き込みのジョブ `WRITE_UPDATE` を一覧に足した（ワーカーの対応は T31g。それまでは `JOB_KIND_NOT_SUPPORTED` で拒む）。
-    expect(WORKER_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE']);
+    // T43c: 入口の確かめのジョブ `ENTRY_CHECK` を一覧の後ろに足した（ワーカーも対応する。流れが渡されていなければ拒む）。
+    expect(WORKER_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
     // T30f: ワーカーが書き込みのジョブに対応した（流れが渡されていなければ、下の場合のとおり `JOB_KIND_NOT_SUPPORTED` で拒む）。
     // T31g-2: 更新の書き込みのジョブにも対応した（同じ書き込みの流れ。流れが渡されていなければ、同じく拒む）。
-    expect(WORKER_IMPLEMENTED_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE']);
+    expect(WORKER_IMPLEMENTED_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
     expect(Object.isFrozen(WORKER_IMPLEMENTED_JOB_KINDS)).toBe(true);
   });
 
@@ -288,6 +290,17 @@ describe('audit worker session (T27c): a START of a job kind the worker does not
     const run = await runWorker({ protocol: WORKER_PROTOCOL_VERSION, type: 'WRITE_RECHECK_RESULT', allowed: true, reason: null });
 
     expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual(['PROTOCOL_VIOLATION']);
+    expect(run.exitCode).toBe(FAILURE_EXIT_CODE);
+    expect(run.calls).toEqual({ loadConfig: 0, readTargetConfig: 0, manualLogin: 0, automatedLogin: 0, audit: 0 });
+  });
+
+  // T43c: 入口の確かめのジョブも、流れ（`executeEntryCheck`）が渡されていなければ、設定を読まず、ログインも監査もせずに `JOB_KIND_NOT_SUPPORTED` で拒む。
+  it('rejects an ENTRY_CHECK START without its flow: FAILED with JOB_KIND_NOT_SUPPORTED, no config, no login, no audit (T43c)', async () => {
+    const start = baseStart('ENTRY_CHECK');
+    expect(validateParentToWorkerMessage(start).ok).toBe(true);
+    const run = await runWorker(start);
+
+    expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.reason] : []))).toEqual([WORKER_JOB_KIND_NOT_SUPPORTED_REASON]);
     expect(run.exitCode).toBe(FAILURE_EXIT_CODE);
     expect(run.calls).toEqual({ loadConfig: 0, readTargetConfig: 0, manualLogin: 0, automatedLogin: 0, audit: 0 });
   });

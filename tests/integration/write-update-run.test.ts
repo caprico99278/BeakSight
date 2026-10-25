@@ -21,7 +21,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { MAX_SUBMITTED_VALUE_LENGTH, type ActionRunDocument } from '../../src/control/actions/action-contracts.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { WorkerStartWrite } from '../../src/control/worker-protocol.js';
 import { ACTION_RUN_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';

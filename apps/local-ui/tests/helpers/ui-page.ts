@@ -41,12 +41,24 @@ export interface UiPageKitOptions {
   readonly afterOpen?: (page: Page) => Promise<void>;
 }
 
-/** CSP の違反を、ページの中の `window.__cspViolations` に集める init script（ページを開く前に入れる）。 */
-const recordCspViolations = (): void => {
+/**
+ * CSP の違反を、ページの中の `window.__cspViolations` に集める init script（ページを開く前に `page.addInitScript` で入れる）。
+ * 記録つきのページを開く補助（`recordPage`）のほか、ページの補助を使わない開発のサーバと起動の部品のテストも使う（CC-071）。
+ */
+export const recordCspViolations = (): void => {
   const violations: string[] = [];
   Object.defineProperty(window, '__cspViolations', { value: violations });
   document.addEventListener('securitypolicyviolation', (event) => violations.push(`${event.violatedDirective} ${event.blockedURI}`));
 };
+
+/**
+ * ページの中の CSP の違反の記録（`recordCspViolations` が集めたもの）。記録がないとき、`required` が真なら記録がないことを 1 つの違反として返し、
+ * 偽なら違反 0 と読む。
+ */
+export const cspViolationsOf = (page: Page, required: boolean): Promise<readonly string[]> => page.evaluate((isRequired) => {
+  const recorded = (window as unknown as { __cspViolations?: string[] }).__cspViolations;
+  return recorded ?? (isRequired ? ['the CSP violation record is missing'] : []);
+}, required);
 
 /** 画面のテストのページの補助を作る（状態はこの値の中だけに持つ）。 */
 export const createUiPageKit = (options: UiPageKitOptions) => {
@@ -95,14 +107,32 @@ export const createUiPageKit = (options: UiPageKitOptions) => {
       if (record.page.isClosed()) {
         continue;
       }
-      const violations = await record.page.evaluate((required) => {
-        const recorded = (window as unknown as { __cspViolations?: string[] }).__cspViolations;
-        return recorded ?? (required ? ['the CSP violation record is missing'] : []);
-      }, options.requireCspRecord === true);
-      expect(violations).toEqual([]);
+      expect(await cspViolationsOf(record.page, options.requireCspRecord === true)).toEqual([]);
     }
     expect(records.flatMap((record) => record.consoleErrors)).toEqual([]);
     expect(records.flatMap((record) => record.externalRequests)).toEqual([]);
+  };
+
+  /**
+   * FM-3: テストがわざと起こした誤り（止めた・差し替えた要求の「Failed to load resource」など）を、`page` の console の誤りの記録から取り出す。
+   * `pattern` に合うものだけを取り出し、取り出したものは記録の確かめに数えない（合わないものは残り、確かめで誤りになる）。
+   */
+  const takeConsoleErrors = (page: Page, pattern: RegExp): readonly string[] => {
+    const taken: string[] = [];
+    for (const record of records) {
+      if (record.page !== page) {
+        continue;
+      }
+      const kept = record.consoleErrors.filter((error) => {
+        const matched = pattern.test(error);
+        if (matched) {
+          taken.push(error);
+        }
+        return !matched;
+      });
+      record.consoleErrors.splice(0, record.consoleErrors.length, ...kept);
+    }
+    return taken;
   };
 
   /** 開いたページを閉じ、記録を捨てる（確かめない）。 */
@@ -143,7 +173,7 @@ export const createUiPageKit = (options: UiPageKitOptions) => {
     }
   };
 
-  return { records, recordPage, openPage, expectCleanPages, forgetPages, expectCleanAndClosePages, tabTo, screenshot };
+  return { records, recordPage, openPage, expectCleanPages, takeConsoleErrors, forgetPages, expectCleanAndClosePages, tabTo, screenshot };
 };
 
 export type UiPageKit = ReturnType<typeof createUiPageKit>;

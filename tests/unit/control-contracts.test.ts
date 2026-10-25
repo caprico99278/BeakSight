@@ -10,6 +10,7 @@ import {
   AUDIT_MODES,
   AUTH_STRATEGIES,
   ENVIRONMENT_KINDS,
+  MAX_APPROVED_SERVICE_ORIGINS,
   MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH,
   MIN_PROFILE_REVISION,
   PROFILE_ID_PATTERN,
@@ -89,6 +90,9 @@ describe('T22a: the closed lists of src/control/contracts.ts', () => {
         'PROFILE_TEST_ORIGIN_OUTSIDE_TARGET',
         'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
         'PROFILE_REVISION_NOT_ADVANCED',
+        // T34a（Task 34 の設計書 3.1）: 承認したサービスの Origin の形とモード、設定の許可 Origin との重なり。
+        'PROFILE_SERVICE_ORIGIN_INVALID',
+        'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
       ],
     ],
   ] as const)('defines %s as a frozen list of the designed values without duplicates', (_name, values, expected) => {
@@ -134,7 +138,10 @@ describe('T22a: schemas/control/profile.schema.json and the contracts', () => {
     expect(schema.type).toBe('object');
     expect(schema.additionalProperties).toBe(false);
     expect(schema.required).toEqual(PROFILE_KEYS);
-    expect(Object.keys(schema.properties as object)).toEqual(PROFILE_KEYS);
+    // T34a（Task 34 の設計書 3.1）: 任意の項目 `approvedServiceOrigins` を、版を上げずに足した（必須の項目は変えない）。
+    expect(Object.keys(schema.properties as object)).toEqual([...PROFILE_KEYS, 'approvedServiceOrigins']);
+    expect(propertyOf(schema, 'approvedServiceOrigins').maxItems).toBe(MAX_APPROVED_SERVICE_ORIGINS);
+    expect(propertyOf(schema, 'approvedServiceOrigins').uniqueItems).toBe(true);
   });
 
   it('matches the enums and the constants of src/control/contracts.ts', () => {
@@ -172,12 +179,12 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-audit-job-start',
       'ui-audit-job-stop',
       'ui-audit-job-key',
-      // T25a: 認証の設定（Task 25 の設計書 4.1）。
-      'auth-setup',
-      // T26b: 認証の設定の版 2（Task 26 の設計書 4.3）。
-      'auth-setup-v2',
+      // T34a: 認証の設定の版 3（Task 34 の設計書 3.2。LG-3b: 版 1 の `auth-setup` と版 2 の `auth-setup-v2` は捨てた）。
+      'auth-setup-v3',
       // T25e: 画面の認証の設定の保存の Server Function の入力（Task 25 の設計書 4.5）。
       'ui-auth-setup-save',
+      // T43d: 画面の認証の設定とプロファイルのまとめて保存の Server Function の入力（Task 43 の設計書 4.4）。
+      'ui-auth-setup-profile-save',
       // T26a: 資格情報のファイル（Task 26 の設計書 4.1）。
       'credential-file',
       // T26e: 画面の資格情報の登録・変更・入れ直しと、ログインの検証の開始の Server Function の入力（Task 26 の設計書 4.2、4.6）。
@@ -205,14 +212,30 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-scenario-update',
       'ui-scenario-approve',
       'ui-scenario-revoke',
-      // T29a: 入力の規則の集まりの版（Task 29 の設計書 4.1）。
-      'data-rule',
+      // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2）。
+      'ui-scenario-auto-draft',
+      'ui-scenario-auto-rules',
+      // T29a・FM2c: 入力の規則の集まりの版 2（手動の操作を減らす設計書 3A.3。LG-3: 版 1 の `data-rule` は捨てた）。
+      'data-rule-v2',
       // T29e: 画面の入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4）。
       'ui-data-rule-save',
       // T30g fix round 1: 画面の書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章）。
       'ui-write-start',
       // T31h-2: 画面の更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章）。
       'ui-write-update-start',
+      // T41g-3: 画面の「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1）。
+      'ui-write-chain-start',
+      // T43c: 画面の入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3）。
+      'ui-entry-check-start',
+      // FM-1: 画面のログインの段の表の 1 行の「登録する」の Server Function の入力（手動の操作を減らす設計書 2.1）。
+      'ui-login-stage-row-key',
+      'ui-login-stage-row-register',
+      // FM-1: 画面のプロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2）。
+      'ui-profile-display-settings',
+      // T44d: 画面のプロファイルの負荷の値の確かめと保存の Server Function の入力（Task 44 の設計書 P2-1）。
+      'ui-target-crawl-limits',
+      // FM2e: 画面の 1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4）。
+      'ui-automated-login-setup',
     ]);
     expect(Object.isFrozen(CONTROL_SCHEMA_NAMES)).toBe(true);
   });

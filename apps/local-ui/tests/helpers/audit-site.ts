@@ -7,10 +7,9 @@
  * - 外部には繋がない（サイトも画面のサーバも 127.0.0.1）。
  */
 import { readFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
 import { mkdirSync, writeFileSync } from 'node:fs';
-import type { Duplex } from 'node:stream';
-import { REPO_ROOT, LOOPBACK_HOST } from './local-server.ts';
+import { startLoopbackHttpServer } from '../../../../tests/helpers/loopback-server.js';
+import { REPO_ROOT } from './local-server.ts';
 
 /** fixture のサイトで配るページ（`fixtures/site/crawl/` の中）。 */
 const SITE_DIRECTORY = `${REPO_ROOT}/fixtures/site/crawl`;
@@ -42,8 +41,7 @@ export interface TimedSite {
 /** fixture のサイトを 127.0.0.1 の空きの port で起動する。 */
 export const startTimedSite = async (): Promise<TimedSite> => {
   const requests: SiteRequest[] = [];
-  const sockets = new Set<Duplex>();
-  const server: Server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
     requests.push({ method: request.method ?? '', pathname, atMs: Date.now() });
     const name = pathname.startsWith(CRAWL_PREFIX) ? pathname.slice(CRAWL_PREFIX.length) : '';
@@ -60,33 +58,18 @@ export const startTimedSite = async (): Promise<TimedSite> => {
       response.end('not found\n');
     });
   });
-  server.on('upgrade', (request, socket) => {
+  server.server.on('upgrade', (request, socket) => {
     requests.push({ method: 'UPGRADE', pathname: request.url ?? '', atMs: Date.now() });
-    sockets.add(socket);
     socket.destroy();
   });
-  server.on('connect', (request, socket) => {
+  server.server.on('connect', (request, socket) => {
     requests.push({ method: 'CONNECT', pathname: request.url ?? '', atMs: Date.now() });
-    sockets.add(socket);
     socket.destroy();
-  });
-  const port = await new Promise<number>((resolvePort, rejectPort) => {
-    server.once('error', rejectPort);
-    server.listen({ host: LOOPBACK_HOST, port: 0 }, () => {
-      const address = server.address();
-      resolvePort(typeof address === 'object' && address !== null ? address.port : 0);
-    });
   });
   return {
-    origin: `http://${LOOPBACK_HOST}:${port}`,
+    origin: server.origin,
     requests: () => [...requests],
-    close: () => new Promise<void>((resolveClose) => {
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      server.closeAllConnections();
-      server.close(() => resolveClose());
-    }),
+    close: () => server.close(),
   };
 };
 
@@ -98,6 +81,10 @@ export interface AuditTargetOptions {
   readonly screenshots: boolean;
   /** accessibility と Interaction の監査を行うか（既定は行わない。T24g の CLI と画面の比べで使う）。 */
   readonly accessibilityAndInteractions?: boolean;
+  /** T44e: ページの上限（省くと既定値。上限で止まる Run の理由を確かめるときに小さくする）。 */
+  readonly maxPages?: number;
+  /** T44g: URL の正規化で残す query の名前（省くと既定値。秘密に見える名前で始めない理由を確かめるときに渡す）。 */
+  readonly allowedQueryParameters?: readonly string[];
 }
 
 /** 一時の root の中の、出力先（一時の root からの相対）。 */
@@ -116,7 +103,11 @@ export const writeAuditTargetConfig = (root: string, name: string, origin: strin
   writeFileSync(`${root}/${path}`, `${JSON.stringify({
     target: { id: name },
     site: { startUrl: `${origin}${START_PATH}`, allowedOrigins: [origin] },
-    crawl: { minNavigationIntervalMs: options.minNavigationIntervalMs },
+    crawl: {
+      minNavigationIntervalMs: options.minNavigationIntervalMs,
+      ...(options.maxPages === undefined ? {} : { maxPages: options.maxPages }),
+      ...(options.allowedQueryParameters === undefined ? {} : { allowedQueryParameters: [...options.allowedQueryParameters] }),
+    },
     viewports: { stressWidths: [] },
     audit: {
       performance: false,

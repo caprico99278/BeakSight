@@ -13,7 +13,7 @@ import { wait } from '../../src/core/deadline.js';
 import { WriteStageMonitor, type GuardWriteStage } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import type { WritePayloadExpectation } from '../../src/safety/write-payload-policy.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { closeTestContexts, launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
 import { QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
 import { WRITE_FIXTURE_PATHS, startWriteFixtureServer, type WriteFixtureServer } from '../helpers/write-fixture-server.js';
@@ -41,7 +41,7 @@ describe.each(LAUNCHERS)('T30b: the write stage Context of the factory (%s)', (_
 
   afterEach(async () => {
     await Promise.all(factories.splice(0).map((factory) => factory.close()));
-    await Promise.all(browser.contexts().map((context) => context.close().catch(() => undefined)));
+    await closeTestContexts(browser);
     await server?.close();
   });
 
@@ -90,6 +90,8 @@ describe.each(LAUNCHERS)('T30b: the write stage Context of the factory (%s)', (_
     await monitor?.openSubmissionWindow(page);
     await page.fill('#customer_name', '山田 太郎');
     await page.fill('#memo', 'メモ');
+    // T40R-fix-A: 値を入れる間は窓の観察の段。押す直前に送信の段を開く（書き込みの入力の部品と同じ順）。
+    monitor?.openSubmissionPhase();
     await Promise.all([
       page.waitForEvent('framenavigated', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined),
       page.click('#go'),
@@ -157,6 +159,6 @@ describe.each(LAUNCHERS)('T30b: the write stage Context of the factory (%s)', (_
     const context = await factory.createWriteStageContext(VIEWPORT, { expectation: expectationFor(server.originA), monitor });
     await expect(factory.createWriteStageContext(VIEWPORT, { expectation: expectationFor(server.originA), monitor })).rejects.toThrow(TypeError);
     await factory.closePassiveContext(context);
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
   });
 });

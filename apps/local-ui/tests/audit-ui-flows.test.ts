@@ -13,15 +13,21 @@
 import { readFileSync } from 'node:fs';
 import type { Browser, BrowserContext, Download, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { AUDIT_JOB_STATE_CATALOG, RUN_STATUS_CATALOG } from '../../../src/presentation/catalog.js';
+import { AUDIT_JOB_STATE_CATALOG, RUN_EXECUTION_END_REASON_CATALOG, RUN_STATUS_CATALOG } from '../../../src/presentation/catalog.js';
 import { formatCount, formatDuration } from '../../../src/presentation/format.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
+  AUDIT_JOB_STOP_DIALOG_BODIES,
+  AUDIT_JOB_STOP_TARGET_NAMES,
+  AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION,
+  INCOMPLETE_REASON_DESCRIPTIONS,
   LOCAL_UI_AUDIT_TEXT,
+  LOCAL_UI_JOB_NEXT_STEPS,
   LOCAL_UI_JOB_CONSOLE_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../src/presentation/messages.js';
 import { BROWSER_DEFAULT_FAVICON_PATH, launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
+import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   outputDirectoryOf,
@@ -42,6 +48,7 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
+import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
@@ -74,6 +81,12 @@ const RESUME_PROFILE = 't24f-ui-resume';
 const ASCII_FILE_NAME = /^[A-Za-z0-9._-]+$/u;
 
 const text = LOCAL_UI_AUDIT_TEXT;
+/** T44e: ジョブの画面の次にできること。 */
+const nextSteps = LOCAL_UI_JOB_NEXT_STEPS;
+/** T44e: ページの上限で止まる場面（ページの上限 1）。 */
+const LIMIT_PROFILE = 't44e-ui-limit';
+/** T44g: 設定のファイルの `crawl.allowedQueryParameters` に秘密に見える名前（`token`）を持つ、公開の監査のプロファイル。 */
+const SECRET_QUERY_PROFILE = 't44g-ui-secret-query';
 const SCREENSHOT_DIRECTORY = process.env['T24F_SCREENSHOT_DIR'];
 
 let root: TemporaryUiRoot | undefined;
@@ -182,6 +195,10 @@ beforeAll(async () => {
   writeAuditTargetConfig(root.root, FULL_PROFILE, site.origin, { minNavigationIntervalMs: FULL_INTERVAL_MS, screenshots: true });
   writeAuditTargetConfig(root.root, STOP_PROFILE, site.origin, { minNavigationIntervalMs: SLOW_INTERVAL_MS, screenshots: false });
   writeAuditTargetConfig(root.root, RESUME_PROFILE, site.origin, { minNavigationIntervalMs: SLOW_INTERVAL_MS, screenshots: false });
+  writeAuditTargetConfig(root.root, LIMIT_PROFILE, site.origin, { minNavigationIntervalMs: FULL_INTERVAL_MS, screenshots: false, maxPages: 1 });
+  writeAuditTargetConfig(root.root, SECRET_QUERY_PROFILE, site.origin, {
+    minNavigationIntervalMs: FULL_INTERVAL_MS, screenshots: false, allowedQueryParameters: ['page', 'token'],
+  });
   browser = await launchHeadlessChromium();
   await startServerOnRoot();
 });
@@ -197,7 +214,7 @@ afterAll(async () => {
   expect(await waitUntilExited(descendants, PROCESS_EXIT_LIMIT_MS)).toEqual([]);
   // fixture のサイトに届いた要求は、GET と HEAD だけ（upgrade と CONNECT もない）。
   const methods = [...new Set(site?.requests().map((request) => request.method))];
-  expect(methods.filter((method) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+  expect(methods.filter((method) => !READ_METHODS.has(method))).toEqual([]);
   await site?.close();
   root?.remove();
 });
@@ -207,7 +224,8 @@ describe('local UI: audit from the screen', () => {
     // プロファイルの登録（画面）。
     const form = await openPage('/profiles/new');
     await form.getByLabel(LOCAL_UI_TEXT.profileForm.profileId).fill(FULL_PROFILE);
-    await form.getByLabel(LOCAL_UI_TEXT.profileForm.targetConfigPath).selectOption(targetConfigPathOf(FULL_PROFILE));
+    // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
+    await chooseExistingTargetConfig(form, targetConfigPathOf(FULL_PROFILE), UI_TIMEOUT_MS);
     await form.getByText(LOCAL_UI_TEXT.profileForm.configOk).waitFor({ timeout: UI_TIMEOUT_MS });
     await form.getByRole('button', { name: LOCAL_UI_TEXT.profileForm.save }).click();
     await form.getByText(LOCAL_UI_TEXT.profileForm.created).waitFor({ timeout: UI_TIMEOUT_MS });
@@ -268,7 +286,8 @@ describe('local UI: audit from the screen', () => {
     expect(names.every((name) => ASCII_FILE_NAME.test(name)), names.join(', ')).toBe(true);
     expect(names[0]).toMatch(/run\.json$/u);
     expect(names[1]).toMatch(/audit\.json$/u);
-    expect(names[2]).toMatch(/^beaksight-audit-bundle_\d{14}\.zip$/u);
+    // PRE42-BN: 画面のジョブのバンドルの名前は、プロファイルの名前（profileId）を含む。
+    expect(names[2]).toMatch(new RegExp(`^beaksight-audit-bundle_${FULL_PROFILE}_\\d{14}\\.zip$`, 'u'));
     const runJson = JSON.parse(readFileSync(await downloads[0]?.path() ?? '', 'utf8')) as { runId: string };
     expect(await start.getByTestId('job-run-id').textContent()).toBe(runJson.runId);
 
@@ -284,18 +303,22 @@ describe('local UI: audit from the screen', () => {
     await waitForFirstPage(start);
     await recordDescendants();
 
-    const stop = start.getByRole('button', { name: text.job.stop });
+    // T44d（Task 44 の設計書 P2-3）: 大きい止めるボタンも、ジョブの種類（監査）の呼び名。
+    const stop = start.getByRole('button', { name: text.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT), exact: true });
     await tabTo(start, stop);
     await start.keyboard.press('Enter');
-    const dialog = start.getByRole('dialog', { name: text.stopDialog.title });
+    // DEF-146: 題と確定のボタンは、ジョブの種類（監査）の呼び名。
+    const dialog = start.getByRole('dialog', { name: text.stopDialog.title(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT) });
     await dialog.waitFor();
+    // T44d: 本文は監査のもの（今のページを終えてから止まり、前回の続きから再開できる）。
+    expect(await dialog.textContent()).toContain(AUDIT_JOB_STOP_DIALOG_BODIES.AUDIT.stop);
     await screenshot(start, '05-stop-dialog');
-    await tabTo(start, dialog.getByRole('button', { name: text.stopDialog.confirm }));
+    await tabTo(start, dialog.getByRole('button', { name: text.stopDialog.confirm(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT), exact: true }));
     await start.keyboard.press('Enter');
     await jobState(start, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
     const auditFinishedAt = Date.now();
     expect(await start.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
-    expect(await start.getByRole('button', { name: text.job.stop }).count()).toBe(0);
+    expect(await start.getByRole('button', { name: text.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT), exact: true }).count()).toBe(0);
     expectPacedArrivals(navigationArrivals(site?.requests() ?? [], auditStartedAt, auditFinishedAt), SLOW_INTERVAL_MS);
     await start.close();
 
@@ -304,6 +327,17 @@ describe('local UI: audit from the screen', () => {
     await jobState(reopened, 'FINISHED').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await reopened.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
     expect(await reopened.getByTestId('job-run-status').textContent()).toContain(RUN_STATUS_CATALOG.PARTIAL.label);
+    // T44e（Task 44 の設計書 P2-7）: 終わり方と Run の理由を、表示のカタログの文で出し、次にできることも出す。
+    const runEnd = reopened.getByTestId('job-run-end');
+    await runEnd.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await runEnd.getByTestId('job-run-execution-end').getAttribute('data-end-reason')).toBe('STOPPED_BY_SIGNAL');
+    expect(await runEnd.textContent()).toContain(RUN_EXECUTION_END_REASON_CATALOG.STOPPED_BY_SIGNAL.label);
+    expect(await runEnd.textContent()).toContain(RUN_EXECUTION_END_REASON_CATALOG.STOPPED_BY_SIGNAL.description);
+    expect(await runEnd.textContent()).toContain(nextSteps.runExecutionEndReasons.STOPPED_BY_SIGNAL ?? '');
+    expect(await runEnd.textContent()).toContain(nextSteps.runStatuses.PARTIAL ?? '');
+    const interrupted = runEnd.locator('[data-testid="job-run-reason"][data-reason="RUN_INTERRUPTED"]');
+    expect(await interrupted.textContent()).toContain(INCOMPLETE_REASON_DESCRIPTIONS.RUN_INTERRUPTED);
+    expect(await interrupted.textContent()).toContain(nextSteps.runReasons.RUN_INTERRUPTED ?? '');
     await screenshot(reopened, '06-stopped');
 
     // 実行履歴と、一覧の「最後の Run」。
@@ -367,5 +401,42 @@ describe('local UI: audit from the screen', () => {
     };
     expect(runJson.runId).toBe(firstRunId);
     expect(runJson.executions.length).toBeGreaterThanOrEqual(2);
+  }, SCENARIO_TIMEOUT_MS);
+
+  // T44e（Task 44 の設計書 P2-7。測りの記録の 3.3 の A4）: ページの上限で止まった Run（PARTIAL）の理由と次にできること（「監査の負荷」でページの上限を上げる）。
+  it('shows the reason and the next step when the audit stops at the page limit (MAX_PAGES_REACHED)', async () => {
+    await createProfile(LIMIT_PROFILE);
+    const start = await openStartFromList(LIMIT_PROFILE);
+    await startFromStartPage(start, true);
+    await recordDescendants();
+    await jobState(start, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+    expect(await start.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
+    const runEnd = start.getByTestId('job-run-end');
+    await runEnd.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await runEnd.getByTestId('job-run-execution-end').getAttribute('data-end-reason')).toBe('COMPLETED');
+    const limit = runEnd.locator('[data-testid="job-run-reason"][data-reason="MAX_PAGES_REACHED"]');
+    expect(await limit.textContent()).toContain(INCOMPLETE_REASON_DESCRIPTIONS.MAX_PAGES_REACHED);
+    expect(await limit.textContent()).toContain(nextSteps.runReasons.MAX_PAGES_REACHED ?? '');
+    // 監査しなかったページの数と、ページごとの理由の置き場所（HTML レポート）。
+    expect(await runEnd.getByTestId('job-run-page-reasons').count()).toBe(1);
+    await screenshot(start, '11-max-pages');
+  }, SCENARIO_TIMEOUT_MS);
+
+  // T44g（Task 44 の P4-1 の発見事項 4）: 公開の監査も、設定のファイルの `crawl.allowedQueryParameters` に秘密に見える名前があれば始めない。ジョブの画面に、
+  // 設定の誤り（`CONFIG_ERROR`）の理由と、秘密に見える名前を入れられないことの案内が出る。サイトへは何も送らない。
+  it('shows CONFIG_ERROR with the guidance when the public audit keeps a secret-like name in crawl.allowedQueryParameters', async () => {
+    const requestsBefore = site?.requests().length ?? 0;
+    await createProfile(SECRET_QUERY_PROFILE);
+    const start = await openStartFromList(SECRET_QUERY_PROFILE);
+    await startFromStartPage(start, true);
+    await recordDescendants();
+    await jobState(start, 'FAILED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+    const failure = start.getByTestId('job-failure');
+    expect(await failure.getAttribute('data-reason')).toBe('CONFIG_ERROR');
+    expect(await failure.textContent()).toBe(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.CONFIG_ERROR.description);
+    expect(await start.getByText(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.CONFIG_ERROR.action).count()).toBe(1);
+    expect(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.CONFIG_ERROR.action).toContain(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION);
+    expect(site?.requests().length ?? 0).toBe(requestsBefore);
+    await screenshot(start, '12-secret-query-parameters');
   }, SCENARIO_TIMEOUT_MS);
 });

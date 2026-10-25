@@ -5,19 +5,19 @@
 // - Chromium は headless だけで起動する。テストの既定（headless shell。`launchHeadlessChromium`）と、CLI の起動の設定
 //   （`chromiumLaunchOptions`。`chrome.exe` の新しい headless）の両方で確かめる。
 // - 127.0.0.1 の fixture のサーバだけを使う。
-// - 場面: blob・http の script・Shared・module・入れ子・srcdoc の iframe の Worker。Passive の Context と、Interaction の凍結の前。どれも、
+// - 場面: blob・http の script・Shared・module・入れ子・srcdoc の iframe の Worker。Interaction の凍結の前。どれも、
 //   WebSocket の Upgrade がサーバに届かず、違反 0。Dedicated の場面は `blockedWebSockets` に理由 `WORKER_CONNECT_POLICY` の記録が残る
-//   （Shared Worker の違反は page の session に出ないので、記録は求めない）。対照は、Guard なしで届く。
+//   （Shared Worker の違反は page の session に出ないので、記録は求めない）。TS-f: Passive の Context の場面は `safety-gates.test.ts` の
+//   GATE-S07（DEF-040）に、Guard なしで届く対照は `gate-fixtures.test.ts` の DEF-040（両方の Chromium）に、まとめた。
 // - DEF-044（NP5）: テストの Chromium と CLI の Chromium は、Shared Worker を無効にして起動する（`CHROMIUM_SHARED_WORKERS_DISABLED_ARGS`）。
 //   Shared の場面は、Shared Worker が作れず（fixture が `unavailable` を残す）、接続も script の GET も起きず、違反 0 であることを確かめる
 //   （対照でも届かない）。CSP による Shared Worker の中の WebSocket の止め方は、Shared Worker がないので確かめない。
 // - 監査への影響: DOM の Evidence に meta が写らない、console の Evidence に CSP の文が入らない、network の Evidence に加えたヘッダが写らない、
 //   WebSocket 以外の接続（fetch、XHR、EventSource、img、script、Worker の中の fetch、data:・blob: への fetch）は変わらない。POST（beacon、ping）は
 //   今までどおり Guard が止める。
-import { chromium, type Browser, type Page } from 'playwright';
+import type { Browser, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import type { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
@@ -25,20 +25,19 @@ import { createPageId } from '../../src/core/ids.js';
 import { ConsoleCollector } from '../../src/evidence/console-collector.js';
 import { collectDomEvidence } from '../../src/evidence/dom-collector.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchHeadlessChromium } from '../helpers/chromium.js';
+import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import {
   createGateFactory,
   expectedWorkerWebSocketState,
+  logWorkerWebSocketRounds,
   NO_NON_READ_REQUESTS,
   openGuardedPassiveSession,
   openInteractionSessionBeforeFreeze,
   openServerWindow,
-  openUnguardedWorkerWebSocketPage,
   QUIET_PERIOD_MS,
   readWorkerWebSocketState,
   RECORDED_WORKER_WEBSOCKET_KINDS,
   runGuardedWorkerWebSocketRounds,
-  UNAVAILABLE_WORKER_WEBSOCKET_KINDS,
   UNLOAD_BEACON_TARGET_PATH,
   WORKER_WEBSOCKET_CONNECT_SCRIPT_PATH,
   WORKER_WEBSOCKET_KINDS,
@@ -46,7 +45,6 @@ import {
   WORKER_WEBSOCKET_TEST_TIMEOUT_MS,
   workerWebSocketPassivePath,
   workerWebSocketScriptRequestLines,
-  withUnguardedPage,
   type WorkerWebSocketKind,
   type WorkerWebSocketRounds,
 } from '../helpers/gate-harness.js';
@@ -90,20 +88,9 @@ interface ChromiumLaunch {
 
 const CHROMIUM_LAUNCHES: readonly ChromiumLaunch[] = [
   { name: 'the headless shell (test default)', launch: () => launchHeadlessChromium() },
-  { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: () => chromium.launch(chromiumLaunchOptions({ headless: true })) },
+  // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+  { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: () => launchCliChromium() },
 ];
-
-/** 回ごとの結果を、検証の記録のために出力する（既定の報告では、PASS したテストの出力は表示されない）。 */
-function logRounds(label: string, { rounds }: WorkerWebSocketRounds): void {
-  console.info(`DEF-040 ${label}: ${JSON.stringify(rounds.map((round) => ({
-    round: round.round,
-    upgrades: round.upgrades,
-    requestLines: round.requestLines,
-    blockedWebSockets: round.blockedWebSockets.map((entry) => `${entry.url} ${entry.reason}`),
-    violations: round.invariantViolations,
-    workerState: round.workerState,
-  })))}`);
-}
 
 /** `CONNECT_POLICY_CONTROLS_PAGE` が html 要素に残した、接続の結果（名前ごと）。 */
 const readConnectPolicyControlResults = (page: Page): Promise<Record<string, string | undefined>> => page.evaluate(
@@ -152,29 +139,15 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-040: WebSockets opened inside Workers are 
     }
   }
 
-  it.each(WORKER_WEBSOCKET_KINDS)('Passive: the WebSocket upgrade from inside the %s Worker never reaches the server, is recorded for Dedicated Workers, and there is no violation', async (kind) => {
-    const result = await runGuardedWorkerWebSocketRounds(() => openGuardedPassiveSession(factory, viewport), server, kind);
-    logRounds(`Passive ${kind} (${name})`, result);
-
-    expectRoundsStopped(kind, result);
-  }, WORKER_WEBSOCKET_TEST_TIMEOUT_MS);
+  // TS-f: Passive の場面（くり返し）は `safety-gates.test.ts` の GATE-S07（DEF-040）に、Guard のない対照（Worker の中の WebSocket と、
+  // WebSocket 以外の接続）は、両方の Chromium で `gate-fixtures.test.ts` の DEF-040 に、1 か所ずつまとめた。
 
   it.each(WORKER_WEBSOCKET_KINDS)('Interaction (before the freeze): the WebSocket upgrade from inside the %s Worker never reaches the server, is recorded for Dedicated Workers, and there is no violation', async (kind) => {
     const result = await runGuardedWorkerWebSocketRounds(() => openInteractionSessionBeforeFreeze(factory, viewport), server, kind);
-    logRounds(`Interaction before freeze ${kind} (${name})`, result);
+    logWorkerWebSocketRounds(`Interaction before freeze ${kind} (${name})`, result);
 
     expectRoundsStopped(kind, result);
   }, WORKER_WEBSOCKET_TEST_TIMEOUT_MS);
-
-  it.each(WORKER_WEBSOCKET_KINDS)('control: without the Guard, the WebSocket upgrade from inside the %s Worker reaches the server, except the Shared Worker that cannot be created (DEF-044)', async (kind) => {
-    const window = await openUnguardedWorkerWebSocketPage(browser, server, viewport, kind);
-
-    if (UNAVAILABLE_WORKER_WEBSOCKET_KINDS.includes(kind)) {
-      expect(window.counters().webSocketUpgrade).toBe(0);
-    } else {
-      expect(window.counters().webSocketUpgrade).toBeGreaterThan(0);
-    }
-  });
 
   it.each(['blob', 'http'] as const satisfies readonly WorkerWebSocketKind[])('Passive: the audit Evidence (DOM, console, network) of the page with the %s Worker shows neither the meta nor the injected header', async (kind) => {
     const session = await openGuardedPassiveSession(factory, viewport);
@@ -238,19 +211,5 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-040: WebSockets opened inside Workers are 
     } finally {
       await session.close();
     }
-  });
-
-  it('control: without the Guard, the same connections reach the server, and the POST (beacon, ping) reaches it too', async () => {
-    await withUnguardedPage(browser, viewport, async (page) => {
-      const window = openServerWindow(server);
-      await page.goto(urlOf(CONNECT_POLICY_CONTROLS_PAGE), { waitUntil: 'load' });
-      await expect.poll(() => readConnectPolicyControlResults(page)).toEqual(CONNECT_POLICY_CONTROL_RESULTS);
-      await expect.poll(() => window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThanOrEqual(2);
-
-      for (const path of CONNECT_POLICY_CONTROL_GET_PATHS) {
-        expect(window.count('GET', path), path).toBeGreaterThan(0);
-      }
-      expect(window.requestLines().filter((line) => line === `GET ${BROWSER_DEFAULT_FAVICON_PATH}`).length).toBeLessThanOrEqual(1);
-    });
   });
 });

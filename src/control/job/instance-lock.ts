@@ -9,6 +9,7 @@
 // - 判定の部品（`judgeRunLock`、`createRunLock`、`isProcessRunning`、`currentProcessRunLockHost`）は `src/core/process-lock.ts` のものを使い、
 //   同じ意味の判定をここに書かない。ファイルは書かない（GATE-ARCH08）。
 import {
+  ACTIVE_RUN_LOCK_STATE,
   createRunLock,
   judgeRunLock,
   type RunLock,
@@ -108,7 +109,7 @@ export const acquireControlInstanceLock = (database: ControlDatabase, request: C
         bootedAtMs: request.host.bootedAtMs,
         isProcessRunning: request.isProcessRunning,
       });
-      if (state === 'ACTIVE') {
+      if (state === ACTIVE_RUN_LOCK_STATE) {
         return deepFreeze({ acquired: false, holder: { processId: row.process_id, port: row.port } });
       }
     }

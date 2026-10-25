@@ -7,7 +7,7 @@
  * - 求められないとき（設定のファイルを読めない、パスを受けない、資格情報のメタデータを読めない、保存した設定の形が違う）は `null`（fail-closed。
  *   画面は承認の状態を「確かめられない」と示し、承認・撤回の要求は `SCENARIO_FACTS_UNAVAILABLE` で拒む）。
  */
-import type { ApprovalExternalFacts } from '../../../../src/control/approval-view.js';
+import { listScenarios, readScenarioApprovalStatus, type ApprovalExternalFacts } from '../../../../src/control/approval-view.js';
 import { approvalExternalFactsOf as externalFactsOf } from '../../../../src/control/approval-external-facts.js';
 import type { StoredProfile } from '../../../../src/control/store/profile-store.js';
 import { localUiRepositoryRoot, localUiStore } from './control-store';
@@ -20,3 +20,21 @@ export type ScenarioRequestLocalRejectionReason = (typeof SCENARIO_REQUEST_LOCAL
 /** 承認の判定に渡す管理データの外の事実（求められなければ null）。 */
 export const approvalExternalFactsOf = (stored: StoredProfile): Promise<ApprovalExternalFacts | null> =>
   externalFactsOf(stored, { database: localUiStore(), repositoryRoot: localUiRepositoryRoot(), credentialStore: localUiCredentialStore() });
+
+/**
+ * 今承認が有効なシナリオの数（書き込みのモードのシナリオがなければ 0。承認の判定の事実を求められなければ、有効な承認はない）。FM2e で
+ * `crawl-limits-functions.ts` から移した（監査の負荷の変更と、1 回の操作で自動ログインに切り替える確認のダイアログが共用する。どちらも、保存で承認が外れる
+ * シナリオの数を出す）。
+ */
+export const approvedScenarioCountOf = async (stored: StoredProfile): Promise<number> => {
+  const scenarios = listScenarios(localUiStore(), stored.profile.profileId);
+  if (scenarios.length === 0) {
+    return 0;
+  }
+  const external = await approvalExternalFactsOf(stored);
+  if (external === null) {
+    return 0;
+  }
+  const now = new Date();
+  return scenarios.filter((scenario) => readScenarioApprovalStatus(localUiStore(), scenario.scenarioId, external, now)?.validity.approved === true).length;
+};

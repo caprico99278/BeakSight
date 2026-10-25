@@ -9,7 +9,7 @@
 // - 起動したら `READY`。
 // - `START <profileId> <改訂>` → `RESULT OK <jobId> <ワーカーの process の ID か ->`、拒まれたら `RESULT <理由> - -`。
 // - `EXIT` → ジョブの管理を閉じ（残ったワーカーを止める）、管理データを閉じて `CLOSED` を書き、終わる。
-import { fork, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { writeSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import { createAuditJobManager, type AuditJobContextResolver, type AuditJobManag
 import { createStartingJob } from '../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase } from '../../src/control/store/control-database.js';
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
+import { createCountingFork } from '../helpers/worker-fork.js';
 import { JOB_CHILD_PROTOCOL } from './control-audit-jobs-fixtures.js';
 import { resolveTestContext } from './control-profile-fixtures.js';
 
@@ -37,18 +38,16 @@ const loadConfigContext: AuditJobContextResolver = async (targetConfigPath) => (
 });
 
 const database = openControlDatabase(databasePath);
-const workers: ChildProcess[] = [];
+/** 本物の `fork` で起動し、起動した子を記録する（CC-097: `worker-fork.ts` の補助）。 */
+const forks = createCountingFork();
+const workers: readonly ChildProcess[] = forks.children;
 const storeOnly = contextKind === JOB_CHILD_PROTOCOL.storeOnly;
 const manager: AuditJobManager | null = storeOnly ? null : createAuditJobManager({
   database,
   repositoryRoot,
   workerPath,
   resolveContext: contextKind === JOB_CHILD_PROTOCOL.loadConfigContext ? loadConfigContext : resolveTestContext,
-  forkWorker: (modulePath, args, options) => {
-    const child = fork(modulePath, [...args], options);
-    workers.push(child);
-    return child;
-  },
+  forkWorker: forks.fork,
 });
 
 /** 管理を作らずに、ジョブの行だけを作る（`store-only`）。 */

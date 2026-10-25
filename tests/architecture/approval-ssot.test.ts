@@ -1,8 +1,12 @@
 /**
  * シナリオの承認の判定の SSOT と、承認の部品の境界の Architecture Gate（Task 28 の設計書 5 章、6 章の Gate。T28a）。
- * - (a) 承認が有効かの判定（`evaluateApprovalValidity`、期限の計算 `approvalExpiresAtOf`、理由の一覧 `APPROVAL_INVALIDITY_REASONS`）は、
+ * - (a) 承認が有効かの判定（`evaluateApprovalValidity`、期限の計算 `approvalExpiresAtOf`）は、
  *   `src/control/approval/approval-validity.ts` にだけ定義する。承認の digest（`computeApprovalDigest`、`approvalBoundFactsOf`、
  *   `APPROVAL_DIGEST_FORMAT`）は `approval-digest.ts` にだけ、下書きの確かめ（`validateScenarioDraft`）は `scenario-policy.ts` にだけ定義する。
+ *   PRE42-CC 組 UI-K3（台帳の CC-113）: 理由の一覧（再承認が要る理由 `APPROVAL_INVALIDITY_REASONS`、下書きを拒む理由
+ *   `SCENARIO_DRAFT_REJECTION_REASONS`）は、画面のブラウザ側からも読めるように、値だけを持つ純粋な core のファイル
+ *   （`src/core/approval-invalidity-reasons.ts`・`src/core/scenario-draft-rejection-reasons.ts`。import を持たない）にだけ定義し、判定の owner
+ *   （`approval-validity.ts`・`scenario-policy.ts`）は、そこから読んで同じ名前で公開し直す（値は変えない。判定は owner のまま）。
  * - (b) 同じ意味の判定を owner の外に書かない: 承認の期限の 1 日の長さ（`APPROVAL_TTL_DAY_MS`）は、定義（`scenario-contracts.ts`）と期限の
  *   計算の owner（`approval-validity.ts`）の外で参照しない。期限の日数（`APPROVAL_TTL_DAYS`、`approvalTtlDays`）を掛け算に使う（日数から時刻を
  *   求める）のは owner だけ。
@@ -23,14 +27,20 @@
 import { describe, expect, it } from 'vitest';
 import {
   PLAYWRIGHT_PACKAGE_PATTERN,
+  countDefinitions,
   countIdentifier,
+  escapeRegExp,
   findModuleSpecifiers,
   findTransitiveForbiddenReferences,
+  isPathUnder,
+  isPathUnderAny,
   loadLocalUiSourceFiles,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  pathReferenceCandidatesOf,
+  refersUnderAny,
   resolveRelativeSpecifier,
   scanSource,
+  sourceFileAt,
   type ScannedSource,
   type SourceFile,
 } from './source-scan.js';
@@ -46,10 +56,18 @@ const CONTRACTS_FILE = 'src/control/approval/scenario-contracts.ts';
 const VALIDITY_OWNER = 'src/control/approval/approval-validity.ts';
 const DIGEST_OWNER = 'src/control/approval/approval-digest.ts';
 const POLICY_OWNER = 'src/control/approval/scenario-policy.ts';
+/** (a) 組 UI-K3: 理由の一覧の、値だけを持つ純粋な core のファイルと、それを公開し直す判定の owner。 */
+const INVALIDITY_REASONS_OWNER = 'src/core/approval-invalidity-reasons.ts';
+const DRAFT_REJECTION_REASONS_OWNER = 'src/core/scenario-draft-rejection-reasons.ts';
+const REASON_LIST_REEXPORTS: readonly { readonly owner: string; readonly reexporter: string; readonly name: string }[] = [
+  { owner: INVALIDITY_REASONS_OWNER, reexporter: VALIDITY_OWNER, name: 'APPROVAL_INVALIDITY_REASONS' },
+  { owner: DRAFT_REJECTION_REASONS_OWNER, reexporter: POLICY_OWNER, name: 'SCENARIO_DRAFT_REJECTION_REASONS' },
+];
 
 /** owner と、owner にだけ定義する名前。 */
 const OWNERSHIPS: readonly { readonly owner: string; readonly names: readonly string[] }[] = [
-  { owner: VALIDITY_OWNER, names: ['evaluateApprovalValidity', 'approvalExpiresAtOf', 'APPROVAL_INVALIDITY_REASONS'] },
+  { owner: VALIDITY_OWNER, names: ['evaluateApprovalValidity', 'approvalExpiresAtOf'] },
+  { owner: INVALIDITY_REASONS_OWNER, names: ['APPROVAL_INVALIDITY_REASONS'] },
   // T28e: 承認の digest の項目の一覧と項目ごとの値と差分も、digest の owner にだけ定義する（差分の項目と並びを書き写さない）。
   {
     owner: DIGEST_OWNER,
@@ -62,7 +80,8 @@ const OWNERSHIPS: readonly { readonly owner: string; readonly names: readonly st
       'approvalDigestDifferencesOf',
     ],
   },
-  { owner: POLICY_OWNER, names: ['validateScenarioDraft', 'SCENARIO_DRAFT_REJECTION_REASONS'] },
+  { owner: POLICY_OWNER, names: ['validateScenarioDraft'] },
+  { owner: DRAFT_REJECTION_REASONS_OWNER, names: ['SCENARIO_DRAFT_REJECTION_REASONS'] },
 ];
 
 /** (b) 承認の期限の 1 日の長さの名前と、参照してよいファイル。 */
@@ -75,17 +94,7 @@ const TTL_DAYS_NAMES: readonly string[] = ['APPROVAL_TTL_DAYS', 'approvalTtlDays
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-
-/** (a) `bare` の中の `name` の定義の数（`function name`、`const`・`let`・`var` の `name =`・`name:`、`class name`）。 */
-const countDefinitions = (bare: string, name: string): number => {
-  const escaped = escapeRegExp(name);
-  const pattern = new RegExp(
-    `(?<![\\w$])(?:function\\s*\\*?\\s*${escaped}(?![\\w$])|(?:const|let|var)\\s+${escaped}\\s*[=:]|class\\s+${escaped}(?![\\w$]))`,
-    'gu',
-  );
-  return [...bare.matchAll(pattern)].length;
-};
+// (a) 定義の数は `source-scan.ts` の `countDefinitions`（`function`・`const`・`let`・`var`・`class` の定義。PRE42-CC 組 G）。
 
 /** (a) owner の外で owner の名前を定義している箇所（`パス: 名前`）。 */
 const copiedDefinitionsOf = (files: readonly (Pick<SourceFile, 'path'> & ScannedSource)[]): readonly string[] =>
@@ -108,7 +117,7 @@ const copiedExpiryJudgementsOf = (files: readonly (Pick<SourceFile, 'path'> & Sc
 /** (c) `src/control/approval/` から参照しないディレクトリ。 */
 const FORBIDDEN_DIRECTORIES: readonly string[] = ['src/browser/', 'src/worker/', 'src/orchestration/'];
 
-const isForbiddenPath = (path: string): boolean => FORBIDDEN_DIRECTORIES.some((directory) => `${path}/`.startsWith(directory));
+const isForbiddenPath = (path: string): boolean => isPathUnderAny(path, FORBIDDEN_DIRECTORIES);
 
 /** (d) 画面向けの公開し直しのファイル（T28e）。 */
 const APPROVAL_VIEW_FILE = 'src/control/approval-view.ts';
@@ -129,7 +138,7 @@ const approvalViewViolationsOf = (path: string, source: ScannedSource): readonly
   ...findModuleSpecifiers(source.code)
     .filter((specifier) => {
       const resolved = resolveRelativeSpecifier(path, specifier);
-      return resolved === null || !`${resolved}/`.startsWith(APPROVAL_DIRECTORY);
+      return resolved === null || !isPathUnder(resolved, APPROVAL_DIRECTORY);
     })
     .map((specifier) => `<${specifier}>`),
   ...(/(?<![\w$])(?:function|class|let|var)\s|(?<![\w$])const\s+[\w$]+\s*[=:]/u.test(source.bare) ? ['<definition>'] : []),
@@ -140,18 +149,19 @@ const WRITE_START_FUNCTIONS_FILE = 'apps/local-ui/src/server/write-job-functions
 /** (e) 実行の許可の発行の参照の数（コメントと文字列の中身を除いた本文の識別子）。 */
 const grantIssueReferencesOf = (source: ScannedSource): number => countIdentifier(source.bare, 'issueExecutionGrant');
 
-/** (c) `text`（指定子か相対パスのリテラル）が禁止の対象を指すか。 */
-const pointsToForbidden = (fromPath: string, text: string): boolean => {
-  const resolved = resolveRelativeSpecifier(fromPath, text);
-  if (resolved !== null) {
-    return isForbiddenPath(resolved);
-  }
-  return PLAYWRIGHT_PACKAGE_PATTERN.test(text) || /(?:^|\/)src\/(?:browser|worker|orchestration)(?:\/|$)/u.test(text);
-};
+/**
+ * (c) `text`（指定子か文字列リテラル）が禁止の対象を指すか: Playwright の名前か、指す先（相対なら解決したパス、相対でなければ文字列の中の
+ * `src/` からのパス。`source-scan.ts` の `refersUnderAny`。PRE42-CC 組 G で最も広い形にそろえた）が禁止のフォルダの下か。
+ */
+const pointsToForbidden = (fromPath: string, text: string): boolean =>
+  PLAYWRIGHT_PACKAGE_PATTERN.test(text) || refersUnderAny(fromPath, text, FORBIDDEN_DIRECTORIES);
 
-/** (c) 禁止の対象を指す参照（指定子のすべて（型だけの import を含む）と、相対パス・Playwright の名前の文字列リテラル）。 */
+/**
+ * (c) 禁止の対象を指す参照（指定子のすべて（型だけの import を含む）と、相対パス・`src/` のパス・Playwright の名前の文字列リテラル。
+ * PRE42-CC 組 G: 相対でない `src/` のパスの文字列リテラルも見る）。
+ */
 const findForbiddenReferences = (path: string, source: ScannedSource): readonly string[] =>
-  moduleReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => pointsToForbidden(path, text));
+  pathReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => pointsToForbidden(path, text));
 
 /** (c) 実行時の import をたどった先の、禁止の対象（`<始まり> -> … -> <先>`）。 */
 const findTransitiveForbidden = (files: ReadonlyMap<string, ScannedSource>, starts: readonly string[]): readonly string[] =>
@@ -212,6 +222,9 @@ describe('approval SSOT detectors (T28a)', () => {
       "export { runAudit } from '../../orchestration/run-coordinator.js';",
       "const worker = await import('../../worker/audit-worker.js');",
       "const directory = '../../worker/';",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスの文字列リテラルと、`\` の区切りも見る。
+      "const entry = 'beaksight/src/worker/audit-worker.js';",
+      "const entry = 'src\\\\orchestration\\\\run-coordinator.ts';",
     ]) {
       expect(findForbiddenReferences(path, scanSource(line)), line).toHaveLength(1);
     }
@@ -298,13 +311,7 @@ describe('approval SSOT detectors (T28a)', () => {
 // Gate
 // ---------------------------------------------------------------------------------------------------------------
 
-const fileOf = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  if (file === undefined) {
-    throw new Error(`missing source file: ${path}`);
-  }
-  return file;
-};
+const fileOf = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 const APPROVAL_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(APPROVAL_DIRECTORY));
 const ACTIONS_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(ACTIONS_DIRECTORY));
@@ -321,6 +328,18 @@ describe('approval SSOT and boundary (Task 28 design 5, 6)', () => {
 
   it('(a) defines no judgement of an owner outside the owner', () => {
     expect(copiedDefinitionsOf(SOURCE_FILES)).toEqual([]);
+  });
+
+  it('(a) keeps the reason lists in pure core files, and the judgement owners read and re-export them (PRE42-CC group UI-K3, CC-113)', () => {
+    for (const { owner, reexporter, name } of REASON_LIST_REEXPORTS) {
+      const core = fileOf(owner);
+      // 値だけを持つ純粋なファイル（import を持たない。画面のブラウザ側が読む）。
+      expect(findModuleSpecifiers(core.code), owner).toEqual([]);
+      const judgement = fileOf(reexporter);
+      const specifier = `../../core/${owner.slice(owner.lastIndexOf('/') + 1).replace(/\.ts$/u, '.js')}`;
+      expect(findModuleSpecifiers(judgement.code), reexporter).toContain(specifier);
+      expect(new RegExp(`\\bexport\\s*\\{[^}]*(?<![\\w$])${name}(?![\\w$])[^}]*\\}`, 'u').test(judgement.bare), `${reexporter} re-exports ${name}`).toBe(true);
+    }
   });
 
   it('(a) computes the approval digest with createSha256Fingerprint (not a copy of SHA-256)', () => {

@@ -6,7 +6,7 @@ import { controlledScroll } from '../browser/controlled-scroll.js';
 import type { MainFrameLoadObservation } from '../browser/main-frame-load.js';
 import { startNavigationDiagnostics } from '../browser/navigation-diagnostics.js';
 import { pageFailureReason } from '../browser/page-failure.js';
-import { waitForPageSettled } from '../browser/page-settling.js';
+import { waitForPageSettled, type PageSettlingResult } from '../browser/page-settling.js';
 import type { AuditConfig, Viewport } from '../config/types.js';
 import { viewportSizeFor } from '../config/viewport-size.js';
 import { artifactFilePath, screenshotRelativePath } from '../core/artifact-layout.js';
@@ -34,7 +34,14 @@ import {
 } from '../core/contracts.js';
 import { awaitBeforeDeadline } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
-import type { NormalizedHttpUrlEvidence, ScreenshotCaptureType, ScrollEvidence } from '../core/evidence-types.js';
+import {
+  PAGE_SCHEMA_VERSION,
+  type NormalizedHttpUrlEvidence,
+  type SafetyEvidenceLoad,
+  type ScreenshotCaptureType,
+  type ScrollEvidence,
+  type SessionLossEvidence,
+} from '../core/evidence-types.js';
 import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
 import { deepFreeze } from '../core/immutable.js';
 import {
@@ -45,6 +52,7 @@ import {
   MAX_ERROR_MESSAGE_LENGTH,
   PAGE_SETTLING_PACING,
   SCROLL_STAGE_BUDGET_SETTLING_MULTIPLIER,
+  STRESS_LAYOUT_MEASURE_RESERVE_MS,
 } from '../core/limits.js';
 import {
   collectorIncompleteReason,
@@ -71,13 +79,25 @@ import {
   type InteractionAuditSession,
 } from '../interaction/isolated-auditor.js';
 import type { InteractionCandidate } from '../safety/interaction-policy.js';
+import { pageEventPhaseOf, pageLoadFactsOf, pageRequestCountsOf } from '../safety/passive-request-guard.js';
 import {
   safetyEventsEvidenceFromSnapshot,
   summarizePageSafety,
   type SafetyLedger,
   type SafetyLedgerSnapshot,
 } from '../safety/safety-ledger.js';
-import { AUTH_SESSION_LOST_SKIP_REASON, authSessionLostReason, sessionLostUrlOf } from './authenticated-run.js';
+import {
+  AUTH_SESSION_LOST_SKIP_REASON,
+  SESSION_LOSS_CHECK_POINTS,
+  authSessionLostReason,
+  observeSessionLossNavigation,
+  sessionLossEvidenceOf,
+  sessionLossStageDetailOf,
+  sessionLostUrlAt,
+  type SessionLossCheckPoint,
+  type SessionLossNavigationObserver,
+  type SessionLossNavigationRecord,
+} from './authenticated-run.js';
 import { createEvidenceRecord } from './evidence-builder.js';
 import type { IdAllocator } from './id-allocator.js';
 import { navigatePage, navigationFailureDetail, type PageNavigationResult } from './page-navigation.js';
@@ -174,6 +194,11 @@ export interface PageAuditorDependencies {
    */
   readonly safetyViolationRecorded: () => boolean;
   /**
+   * DEF-172: スクリーンショットを Run のディレクトリに書いてよいか（書く直前に呼ぶ。Run Coordinator は、Run のロックが今も自分のものかを読んで
+   * 確かめる）。偽なら撮らない（書かない）。省略すると、いつも書く。reject は、撮影の失敗と同じに扱う。
+   */
+  readonly mayWriteScreenshots?: (() => Promise<boolean>) | undefined;
+  /**
    * ページの読み込みの間隔を守る部品（サイトへの負荷の制御の設計書 4.1）。Run Coordinator が Run の初めに1つだけ作り、robots.txt と
    * sitemap.xml の取得にも同じものを渡す。Page Auditor は、Passive の各ビューポート（再試行を含む）、幅の走査の各幅、Interaction の
    * 各候補の読み込みの前に `beforeNavigation()` を呼ぶ。待った時間は、期限を消費しない（設計書 4.4。待った分だけ期限を延ばす）。
@@ -188,6 +213,10 @@ export interface PageAuditorDependencies {
    * ビューポートと幅を始めず、結果の `authSessionLostDetail` に当たった場所を返す（ページを捨てて Run を止めるのは Run Coordinator）。
    */
   readonly sessionLostPathPrefix?: string | undefined;
+  /**
+   * DEF-138: 承認したサービスの Origin（スクリプトで送るログインの Run の監査の段の口の値）。セッションの切れの証拠の Origin の区別だけに使う。省略は空。
+   */
+  readonly approvedServiceOrigins?: readonly string[] | undefined;
 }
 
 /**
@@ -208,6 +237,16 @@ export const SAFETY_VIOLATION_ABORT_REASON: IncompleteReason = Object.freeze({ c
  * Interaction の段階を途中で止めた理由の `detail` にも、同じ文字列を使う。
  */
 const SITE_UNAVAILABLE_CODE = SITE_UNAVAILABLE_SKIP_REASON.code;
+/** DEF-129: ページが始めた main frame の読み込みを Guard が上限で止めたビューポートの理由（`detail` は `null`）。 */
+const PAGE_NAVIGATION_LIMIT_INCOMPLETE_REASON: IncompleteReason = Object.freeze({
+  code: 'PAGE_NAVIGATION_LIMIT_REACHED' satisfies IncompleteReasonCode,
+  detail: null,
+});
+/** DEF-130-fix: ページが出す文書でない要求を Guard が上限で止めたビューポートの理由（`detail` は `null`）。 */
+const PAGE_SUBRESOURCE_LIMIT_INCOMPLETE_REASON: IncompleteReason = Object.freeze({
+  code: 'PAGE_SUBRESOURCE_LIMIT_REACHED' satisfies IncompleteReasonCode,
+  detail: null,
+});
 
 /** Passive の各ビューポートの読み込みの段階の名前（不調を検知した段階。`SITE_UNAVAILABILITY_STAGES` の1つ）。 */
 const PASSIVE_STAGE: Extract<SiteUnavailabilityStage, 'passive'> = 'passive';
@@ -249,9 +288,37 @@ class AuthSessionLostAbortError extends Error {
 /** セッションの切れを検知した理由のコード（`AUTH_SESSION_LOST_SKIP_REASON` のコード。幅の走査の段階の理由の `detail` にも使う）。 */
 const AUTH_SESSION_LOST_CODE = AUTH_SESSION_LOST_SKIP_REASON.code;
 
-/** 1 つのビューポートで、セッションの切れを検知した段階（T25c）。最初の 1 つだけを持つ。 */
+/**
+ * 1 つのビューポートで、セッションの切れを検知した段階（T25c）。最初の 1 つだけを持つ。DEF-138: `source` は、証拠を組み立てるための、判定した読み込みの
+ * page と Context と経路の記録（Context を閉じた後に、factory が読んだ状態の名前と合わせて組み立てる）。
+ * DF-3: `stage` は場所の印の段階の部分（`sessionLossStageDetailOf`。読み込みの直後は `passive`・`stress-layout`、後の時機は `passive:settled` など）。
+ */
 interface ViewportAuthSessionLoss {
-  stage: Extract<SiteUnavailabilityStage, 'passive' | 'stress-layout'> | null;
+  stage: string | null;
+  source: SessionLossSource | null;
+}
+
+/** DF-3: このビューポートで読み込んだ page（Passive と、幅の走査の各幅）。決めた時機に、セッションの切れを確かめ直すために、読み込んだ順に持つ。 */
+interface SessionLossLoad {
+  readonly stage: Extract<SiteUnavailabilityStage, 'passive' | 'stress-layout'>;
+  readonly page: Page;
+  readonly context: BrowserContext;
+  /** DEF-138: 経路の記録（認証つきの Run だけ）。ビューポートの Context を閉じる前に外す。 */
+  readonly route: SessionLossNavigationObserver | null;
+}
+
+/**
+ * DF-3: ビューポートの終わりの確かめの時機。最後のビューポートはページの監査の終わり（`pageEnd`）、ほかは次のビューポートの前（`beforeNextLoad`）。
+ */
+const viewportEndCheckPointOf = (profile: ViewportProfile): SessionLossCheckPoint => (
+  profile === VIEWPORT_PROFILES[VIEWPORT_PROFILES.length - 1] ? SESSION_LOSS_CHECK_POINTS.pageEnd : SESSION_LOSS_CHECK_POINTS.beforeNextLoad
+);
+
+/** DEF-138: セッションの切れを判定した読み込みの、証拠の材料（値は持たない。page と Context は閉じた後に読む）。 */
+interface SessionLossSource {
+  readonly page: Page;
+  readonly context: BrowserContext;
+  readonly navigation: SessionLossNavigationRecord | null;
 }
 
 /**
@@ -324,8 +391,13 @@ interface ViewportAuditOutcome {
    * ビューポートは、`passive` が `null` で、幅と候補は空。
    */
   readonly navigationDiagnostics: ViewportNavigationDiagnostics | null;
-  /** このビューポートで、セッションの切れを検知した段階（T25c）。検知しなかった場合と、始めなかったビューポートは `null`。 */
+  /**
+   * このビューポートで、セッションの切れを検知した段階（T25c。DF-3: 後の時機なら `<段階>:<時機>`）。検知しなかった場合と、始めなかったビューポートは
+   * `null`。
+   */
   readonly authSessionLostStage: ViewportAuthSessionLoss['stage'];
+  /** DEF-138: セッションの切れの証拠（検知したビューポートだけ。ほかは `null`）。 */
+  readonly authSessionLoss: SessionLossEvidence | null;
 }
 
 /**
@@ -388,12 +460,17 @@ class ViewportSiteUnavailability {
  * - `interactionSnapshots`: Interaction の候補ごとの、隔離した Context の Ledger の snapshot（Desktop だけ）。
  *   `auditInteraction` が Context を閉じた後に取ったものである。
  * - `stressLedgers`: 幅の走査のセッションの Ledger（Desktop だけ）
+ * BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 4）: Interaction の snapshot は候補の番号（候補の発見の順で 0 から）と、
+ * 幅の走査の Ledger はその幅と組にして持つ（safety の Evidence の読み込みの印 `load` に写す。Evidence の並びに頼らない）。
  */
 interface ViewportSafetySources {
   readonly passiveLedgers: SafetyLedger[];
-  readonly interactionSnapshots: SafetyLedgerSnapshot[];
-  readonly stressLedgers: SafetyLedger[];
+  readonly interactionSnapshots: { readonly snapshot: SafetyLedgerSnapshot; readonly candidateIndex: number }[];
+  readonly stressLedgers: { readonly ledger: SafetyLedger; readonly width: number }[];
 }
+
+/** BN-a: ページの監査の読み込み（Desktop と Mobile の Passive の Context）の safety の Evidence の読み込みの印。 */
+const PAGE_AUDIT_LOAD: SafetyEvidenceLoad = Object.freeze({ kind: 'PAGE_AUDIT' });
 
 /** 候補1つの監査の結果。後片付けの失敗は、エラーが保持する Safety の snapshot だけを持つ（4.5.8）。 */
 type InteractionCandidateOutcome =
@@ -419,9 +496,13 @@ export class PageAuditor {
   readonly #collectors: PageAuditCollectors;
   readonly #deadlines: ResolvedPassiveSessionDeadlines;
   readonly #safetyViolationRecorded: () => boolean;
+  /** DEF-172: スクリーンショットを書いてよいか（省略は `null`。いつも書く）。 */
+  readonly #mayWriteScreenshots: (() => Promise<boolean>) | null;
   readonly #pacer: NavigationPacer;
   /** 認証つきの Run のセッションの切れの path の前方一致（T25c）。公開監査では `null`。 */
   readonly #sessionLostPathPrefix: string | null;
+  /** DEF-138: 承認したサービスの Origin（証拠の Origin の区別だけ）。 */
+  readonly #approvedServiceOrigins: readonly string[];
 
   /** 注入した期限（`dependencies.deadlines`）が不正なら、`RangeError` か `TypeError` を投げる。 */
   constructor(dependencies: PageAuditorDependencies) {
@@ -437,6 +518,11 @@ export class PageAuditor {
       throw new TypeError('PageAuditor requires a safetyViolationRecorded function');
     }
     this.#safetyViolationRecorded = safetyViolationRecorded;
+    const { mayWriteScreenshots } = dependencies;
+    if (mayWriteScreenshots !== undefined && typeof mayWriteScreenshots !== 'function') {
+      throw new TypeError('PageAuditor mayWriteScreenshots must be a function when given');
+    }
+    this.#mayWriteScreenshots = mayWriteScreenshots ?? null;
     const { navigationPacer } = dependencies;
     if (
       !isRecord(navigationPacer)
@@ -451,6 +537,12 @@ export class PageAuditor {
       throw new TypeError('PageAuditor sessionLostPathPrefix must be a string when given');
     }
     this.#sessionLostPathPrefix = sessionLostPathPrefix ?? null;
+    const { approvedServiceOrigins } = dependencies;
+    if (approvedServiceOrigins !== undefined
+      && (!Array.isArray(approvedServiceOrigins) || !approvedServiceOrigins.every((origin) => typeof origin === 'string'))) {
+      throw new TypeError('PageAuditor approvedServiceOrigins must be strings when given');
+    }
+    this.#approvedServiceOrigins = Object.freeze([...(approvedServiceOrigins ?? [])]);
     this.#deadlines = resolvePassiveSessionDeadlines(dependencies.deadlines);
     this.#factory = contextFactory;
     this.#config = config;
@@ -499,6 +591,8 @@ export class PageAuditor {
     let firstSiteUnavailableDetail: string | null = null;
     // 認証つきの Run で、最初にセッションの切れを検知した場所（`<ビューポート>:<段階>`。T25c）。検知しなければ `null`。
     let authSessionLostDetail: string | null = null;
+    // DEF-138: そのときの証拠。
+    let authSessionLoss: SessionLossEvidence | null = null;
     for (const profile of VIEWPORT_PROFILES) {
       // 違反を検出した後は、同じページの次のビューポートを始めない（Task 19 の前の整理の設計書 4.5）。最初のビューポートの前には
       // 確かめない（ページを始めるかは、Run Coordinator が決める）。
@@ -512,7 +606,8 @@ export class PageAuditor {
         outcomes.push(skippedViewportOutcome(url, pageId, profile, SITE_UNAVAILABLE_SKIP_REASON));
         continue;
       }
-      // T25c: セッションの切れを検知した後は、次のビューポートを始めない（ログインの画面を管理画面として監査しない）。
+      // T25c: セッションの切れを検知した後は、次のビューポートを始めない（ログインの画面を管理画面として監査しない）。DF-3: 前のビューポートの終わり
+      // （Context を閉じる前と後）に、そのビューポートで読み込んだ page を確かめ直してある（時機 `beforeNextLoad`）。
       if (authSessionLostDetail !== null) {
         outcomes.push(skippedViewportOutcome(url, pageId, profile, AUTH_SESSION_LOST_SKIP_REASON));
         continue;
@@ -522,6 +617,7 @@ export class PageAuditor {
       if (outcome.authSessionLostStage !== null) {
         // セッションの切れを検知したので、次のビューポートを始めない。再試行の判断（`precedesRetry`）も呼ばない。
         authSessionLostDetail = `${profile}:${outcome.authSessionLostStage}`;
+        authSessionLoss = outcome.authSessionLoss;
       } else if (outcome.siteUnavailability !== null) {
         // 不調を検知したので、次のビューポートを始めない。そのため、Desktop でも、再試行の判断（`precedesRetry`）を呼ばない。
         const { stage, unavailability } = outcome.siteUnavailability;
@@ -537,7 +633,7 @@ export class PageAuditor {
       VIEWPORT_PROFILES.map((profile, index) => [profile, (outcomes[index] as ViewportAuditOutcome).navigationDiagnostics]),
     ) as Record<ViewportProfile, ViewportNavigationDiagnostics | null>;
     const result: PageAuditResult = {
-      schemaVersion: 'page-schema/1.0',
+      schemaVersion: PAGE_SCHEMA_VERSION,
       pageId,
       pageUrl: url,
       status: derivePageAuditStatus(outcomes.map((outcome) => outcome.result.status)),
@@ -549,15 +645,15 @@ export class PageAuditor {
     // 違反の集計は、Context を閉じた後の snapshot で行う（閉じる処理の中で記録された違反も含めるため）。
     const safety = summarizePageSafety(outcomes.flatMap(({ safety: sources }) => [
       ...sources.passiveLedgers.map((ledger) => ledger.snapshot()),
-      ...sources.interactionSnapshots,
-      ...sources.stressLedgers.map((ledger) => ledger.snapshot()),
+      ...sources.interactionSnapshots.map(({ snapshot }) => snapshot),
+      ...sources.stressLedgers.map(({ ledger }) => ledger.snapshot()),
     ]));
     return deepFreeze({
       result,
       safety,
       siteUnavailableDetail: firstSiteUnavailableDetail,
-      // T25c: 認証つきの Run だけ、セッションの切れの場所を返す（公開監査の結果の形は変えない）。
-      ...(this.#sessionLostPathPrefix === null ? {} : { authSessionLostDetail }),
+      // T25c: 認証つきの Run だけ、セッションの切れの場所を返す（公開監査の結果の形は変えない）。DEF-138: 証拠も返す。
+      ...(this.#sessionLostPathPrefix === null ? {} : { authSessionLostDetail, authSessionLoss }),
       navigationDiagnostics,
     });
   }
@@ -588,7 +684,6 @@ export class PageAuditor {
     const evidence: EvidenceRecord[] = [];
     const reasons: IncompleteReason[] = [];
     const safety: ViewportSafetySources = { passiveLedgers: [], interactionSnapshots: [], stressLedgers: [] };
-    let findings: readonly Finding[] = [];
     let navigation: PageNavigationResult | null = null;
     // Passive の読み込みの間の、ページ本体の要求の観察の結果（診断の記録の設計書 2.2）。読み込みを始めなければ `null` のまま。
     let passiveDiagnostics: NavigationDiagnostics | null = null;
@@ -597,7 +692,9 @@ export class PageAuditor {
     // このビューポートで最初に検知したサイトの不調（Passive、幅の走査、Interaction のどこで検知しても1つだけ。設計書 3.1）。
     const siteUnavailability = new ViewportSiteUnavailability(reasons);
     // このビューポートで最初に検知したセッションの切れ（T25c。Passive か、幅の走査のどこかで 1 つだけ）。
-    const authSessionLoss: ViewportAuthSessionLoss = { stage: null };
+    const authSessionLoss: ViewportAuthSessionLoss = { stage: null, source: null };
+    // DF-3: このビューポートで読み込んだ page（決めた時機に、セッションの切れを確かめ直す）。
+    const sessionLossLoads: SessionLossLoad[] = [];
     let failed = false;
     let stages: StageRunner | undefined;
     let context: BrowserContext | undefined;
@@ -620,7 +717,8 @@ export class PageAuditor {
         factory,
         viewportSize,
         passiveSessionOpenDeadlineAtMs({ timeoutMs: this.#deadlines.sessionOpenTimeoutMs, notAfterMs: deadlines.pageAtMs }),
-        this.#deadlines,
+        // T44b（設計者の判断の (1)）: ページの監査の読み込み（Desktop と Mobile）の印。閉じる前にページを離れて待つのは、この読み込みだけ。
+        { ...this.#deadlines, pageAuditLoad: true },
       );
       // 構築に失敗した Context の Ledger も、Safety の Evidence と違反の集計に含める（設計書 4.3、R14 の I2、R14r の Important-1）。
       // Guard の取り付けの失敗は、この Ledger に違反として記録されるためである。Guard が Context を閉じた場合も、エラーは Ledger を持つ。
@@ -663,7 +761,9 @@ export class PageAuditor {
         // 2. collector を取り付ける（performance の init script はナビゲーションの前に入れる）。
         const performanceInstalled = config.audit.performance
           && (await attempt('performance', () => this.#collectors.performance.installBeforeNavigation(context as BrowserContext))).ok;
-        network = NetworkCollector.attach(activePage);
+        // BN-a（設計書 3.1 の 3）: 失敗の行の時点の印は、Guard の時点の決め方（`pageEventPhaseOf`）で付ける。collector は閉じる前（手順 6）に外すので、
+        // ページの監査の network の Evidence の失敗は、測りの前と最中（`LOAD`）のものだけである。
+        network = NetworkCollector.attach(activePage, { phaseOf: () => pageEventPhaseOf(activePage) });
         consoleHandle = ConsoleCollector.attach(activePage);
 
         // 3. ナビゲーションする。
@@ -681,6 +781,11 @@ export class PageAuditor {
         const navigationDeadlineAtMs = stageDeadline(deadlines.pageAtMs, navigationStartedAtMs, config.crawl.navigationTimeoutMs);
         // ナビゲーションは、期限（`timeoutMs`）を受け取り、例外を投げずに結果を返す。crash の段階を記すためだけに、処理中の段階にする。
         const passiveContext = context;
+        // DEF-138: 認証つきの Run では、main frame の文書の要求の経路を、セッションの切れの確かめまで記録する（要求を足さない。証拠だけに使う）。DF-3:
+        // 確かめは、ビューポートの終わりまで続くので、記録は Context を閉じる前に外す。
+        const route = this.#sessionLostPathPrefix === null ? null : observeSessionLossNavigation(activePage);
+        const passiveLoad: SessionLossLoad = { stage: PASSIVE_STAGE, page: activePage, context: passiveContext, route };
+        sessionLossLoads.push(passiveLoad);
         try {
           navigation = await runner.during('navigation', () => navigatePage(activePage, url, {
             timeoutMs: Math.max(1, Math.ceil(navigationDeadlineAtMs - navigationStartedAtMs)),
@@ -698,10 +803,8 @@ export class PageAuditor {
         // T25c: 認証つきの Run では、main frame の最後の URL がセッションの切れの path に当たったら（Guard が除外で止めた移動の先を含む）、
         // FAILED にし、理由 `AUTH_SESSION_LOST`（`detail` は段階）を加え、収集をしない（ログインの画面を管理画面として監査しない）。
         // サイトの不調の判定より先に確かめる（除外で止めたログインの画面への移動の失敗を、サイトの不調と取り違えないため）。
-        if (this.#authSessionLostAfterNavigation(activePage, factory.getSafetyLedger(passiveContext))) {
+        if (this.#detectSessionLoss(SESSION_LOSS_CHECK_POINTS.navigation, [passiveLoad], authSessionLoss, reasons) !== null) {
           failed = true;
-          authSessionLoss.stage = PASSIVE_STAGE;
-          reasons.push(authSessionLostReason(PASSIVE_STAGE));
         } else if (siteUnavailability.observe(PASSIVE_STAGE, navigation.loadObservation)) {
           // 読み込みの観測で、サイトの不調を判定する（サイトが応答しないときに Run を止める設計書 3.1）。不調なら、読み込みが `OK`
           // （503 など）でも FAILED にし、理由 `SITE_UNAVAILABLE`（`<段階>:<判定の詳細>`）を加える。読み込みの失敗の理由は、そのまま残す。
@@ -711,13 +814,18 @@ export class PageAuditor {
         // などでページの部品の読み込みがさらに起きるのを避ける。設計書 3.1）。
         if (navigation.navigationOutcome === 'OK' && siteUnavailability.detected === null && authSessionLoss.stage === null) {
           // 4. DOM の準備を待ち、controlled scroll を行う。
-          const settling = await attempt('settling', () => waitForPageSettled(activePage, {
-            deadlineAtMs: this.#stageDeadline(deadlines.collectorAtMs, config.crawl.resourceSettlingTimeoutMs),
-            ...PAGE_SETTLING_PACING,
-          }));
+          const settling = await attempt('settling', () => this.#waitForSettled(activePage, deadlines.collectorAtMs));
           if (settling.ok && settling.value.status === 'PARTIAL') {
             reasons.push(Object.freeze({ code: 'DOM_READINESS_FAILED', detail: settling.value.reason }));
           }
+          // DF-3（DEF-167）: 落ち着きを待った後にも確かめる（読み込みの後にスクリプトがログインの画面へ移すサイト）。当たれば、読み込みの直後と同じく
+          // FAILED にし、収集をしない。
+          if (this.#detectSessionLoss(SESSION_LOSS_CHECK_POINTS.settled, [passiveLoad], authSessionLoss, reasons) !== null) {
+            failed = true;
+          }
+        }
+        // 落ち着きの待ちの後にセッションの切れを検知した場合も、scroll と収集をしない（同じ条件で確かめ直す）。
+        if (navigation.navigationOutcome === 'OK' && siteUnavailability.detected === null && authSessionLoss.stage === null) {
           const scroll = await attempt('scroll', () => controlledScroll(activePage, {
             deadlineAtMs: this.#stageDeadline(
               deadlines.collectorAtMs,
@@ -746,6 +854,7 @@ export class PageAuditor {
             safety,
             siteUnavailability,
             authSessionLoss,
+            sessionLossLoads,
             navigationDiagnostics,
             record,
             attempt,
@@ -763,36 +872,59 @@ export class PageAuditor {
         if (consoleSnapshot.ok) {
           record('console', consoleSnapshot.value);
         }
+        // DF-3（DEF-167）: ビューポートの終わりに、このビューポートで読み込んだ page を確かめ直す（Context を閉じる前。ページを離れる手順（T44b）の前の、
+        // main frame の最後の URL を見るため）。時機は、次のビューポートの前か、ページの監査の終わり（`viewportEndCheckPointOf`）。
+        this.#detectSessionLoss(viewportEndCheckPointOf(profile), sessionLossLoads, authSessionLoss, reasons);
       }
 
       // 段階の途中で見つけられなかった crash も、理由として記録する（設計書 4.5.4、R14 の m1）。
       stages?.recordPendingCrash('safety');
-
-      // 6. Safety の Evidence を、Ledger ごとに1つ作る（Passive の Context、Interaction の候補ごと、幅の走査のセッション）。
-      for (const ledger of safety.passiveLedgers) {
-        record('safety', safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE'));
-      }
-      for (const snapshot of safety.interactionSnapshots) {
-        record('safety', safetyEventsEvidenceFromSnapshot(snapshot, 'INTERACTION'));
-      }
-      for (const ledger of safety.stressLedgers) {
-        record('safety', safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE'));
-      }
-
-      // 7. page rule を評価する。Interaction の Safety の Evidence は、ここまでに Rule の入力にそろっている（設計書 4.3）。
-      findings = this.#evaluateRules(url, pageId, profile, evidence, reasons);
-      stages?.recordPendingCrash('rules');
     } finally {
-      // 8. page と Context を必ず閉じる。閉じる処理の失敗も、理由として記録する。ページの期限を過ぎて見放した段階は、
-      // Context を閉じると終わる（メインスレッドが止まったページも含む。設計書 4.5.7）。
+      // 6. page と Context を必ず閉じる。閉じる処理の失敗も、理由として記録する。ページの期限を過ぎて見放した段階は、
+      // Context を閉じると終わる（メインスレッドが止まったページも含む。設計書 4.5.7）。閉じる順と、ページを離れる手順（T44b）は変えない。
       network?.detach();
       consoleHandle?.detach();
       if (stages !== undefined) {
         page?.off('crash', stages.onCrash);
       }
+      // DEF-138・DF-3: 経路の記録は、閉じる前に外す（BeakSight がページを離れる移動を記録しない）。
+      for (const load of sessionLossLoads) {
+        load.route?.dispose();
+      }
       reasons.push(...await closePassiveSession(factory, context, this.#deadlines));
     }
+    // DF-3: Context を閉じた後にも、もう一度確かめる（閉じる間に Guard が止めた main frame の移動を含める。Ledger は閉じた後も factory から読める）。
+    this.#detectSessionLoss(viewportEndCheckPointOf(profile), sessionLossLoads, authSessionLoss, reasons);
 
+    // 7. Safety の Evidence を、Ledger ごとに1つ作る（Passive の Context、Interaction の候補ごと、幅の走査のセッション）。BN-a（設計書
+    // `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 2・4）: Context を閉じた後の snapshot で作る（閉じる途中・ページを離れた後に止めた
+    // 要求も、時点 `CLOSING` で page.json に残す。違反の集計 `summarizePageSafety` と同じ時点）。各 Evidence に、読み込みの印を付ける。
+    for (const ledger of safety.passiveLedgers) {
+      record('safety', safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE', PAGE_AUDIT_LOAD));
+    }
+    for (const { snapshot, candidateIndex } of safety.interactionSnapshots) {
+      record('safety', safetyEventsEvidenceFromSnapshot(snapshot, 'INTERACTION', { kind: 'INTERACTION', candidateIndex }));
+    }
+    for (const { ledger, width } of safety.stressLedgers) {
+      record('safety', safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE', { kind: 'STRESS_WIDTH', width }));
+    }
+
+    // 8. page rule を評価する。Safety の Evidence は、ここまでに Rule の入力にそろっている（設計書 4.3）。Rule は Evidence だけを読む（page と Context を
+    // 閉じた後でもよい）。
+    const findings = this.#evaluateRules(url, pageId, profile, evidence, reasons);
+    stages?.recordPendingCrash('rules');
+
+    // DEF-129: Context を閉じた後に、文書の読み込みの事実を読む（Guard の 1 か所が数えた値）。ページが始めた読み込み（main frame か、T37R2-fix で子の
+    // frame）を上限で止めたビューポートは、読み切れていない（`PAGE_NAVIGATION_LIMIT_REACHED`）。Guard の main frame の文書の要求を受けなかった
+    // ビューポート（読み込まなかった）は、数を書かない。DEF-130-fix: 文書でない要求を上限で止めたビューポートも、読み切れていない
+    // （`PAGE_SUBRESOURCE_LIMIT_REACHED`）。
+    const loadFacts = page === undefined ? null : pageLoadFactsOf(page);
+    if (loadFacts?.limitReached === true) {
+      reasons.push(PAGE_NAVIGATION_LIMIT_INCOMPLETE_REASON);
+    }
+    if (loadFacts?.subresourceLimitReached === true) {
+      reasons.push(PAGE_SUBRESOURCE_LIMIT_INCOMPLETE_REASON);
+    }
     // 描画プロセスが落ちた場合は FAILED にする（設計書 4.5.4）。
     const status: ViewportAuditStatus = failed || stages?.crashed === true ? 'FAILED' : reasons.length > 0 ? 'PARTIAL' : 'AUDITED';
     return {
@@ -803,12 +935,15 @@ export class PageAuditor {
         status,
         incompleteReasons: reasons,
         navigationOutcome: navigation?.navigationOutcome ?? null,
+        ...(loadFacts === null ? {} : pageRequestCountsOf(loadFacts)),
       },
       evidence,
       findings,
       safety,
       siteUnavailability: siteUnavailability.detected,
       authSessionLostStage: authSessionLoss.stage,
+      // DEF-138: Context を閉じた後に組み立てる（閉じるときに factory が読んだ状態の名前と、閉じる間に止めた要求を含める）。
+      authSessionLoss: this.#sessionLossEvidenceOf(url, profile, authSessionLoss),
       navigationDiagnostics: {
         passive: passiveDiagnostics,
         stressWidths: navigationDiagnostics.stressWidths,
@@ -818,19 +953,65 @@ export class PageAuditor {
   }
 
   /**
-   * 認証つきの Run で、読み込みの後に、セッションが切れたか（T25c。Task 25 の設計書 4.3）。公開監査（前方一致の指定なし）では、いつも偽。
+   * 認証つきの Run で、決めた時機（`point`。`SESSION_LOSS_CHECK_POINTS`）に、読み込んだ page（`loads`。読み込んだ順）のどれかで、セッションが切れたかを
+   * 確かめる（T25c。Task 25 の設計書 4.3。DF-3 で時機を増やした）。公開監査（前方一致の指定なし）と、このビューポートで記録した後は、確かめずに `null`。
    * - main frame の最後の URL（`page.url()`）の path が、セッションの切れの path の前方一致に当たる。
    * - または、その Context の Guard が、監査の段の除外で止めた main frame の移動の先（Safety Ledger の `blockedAuditExclusions` の、
    *   `mainFrameNavigation` が真の記録の URL）の path が当たる（ログインの画面が読む範囲の外で、Guard がリダイレクトを止めた場合）。
-   * 判定は、ワーカーの 1 画面の読み込みと同じ部品（`authenticated-run.ts` の `sessionLostUrlOf`。CCX-6）。
-   * URL や値は記録しない（当たったかどうかだけを返す）。
+   * 判定は、ワーカーの 1 画面の読み込みと同じ部品（`authenticated-run.ts` の `sessionLostUrlAt` を通した `sessionLostUrlOf`。CCX-6）。
+   * 当たれば、最初に当たった読み込みを `loss` に記録し（段階の部分は `sessionLossStageDetailOf`。証拠の経路はその時点の記録）、理由 `AUTH_SESSION_LOST` を
+   * `reasons` に加え、当たった読み込みの段階を返す。URL や値は記録しない。
    */
-  #authSessionLostAfterNavigation(page: Page, ledger: SafetyLedger): boolean {
+  #detectSessionLoss(
+    point: SessionLossCheckPoint,
+    loads: readonly SessionLossLoad[],
+    loss: ViewportAuthSessionLoss,
+    reasons: IncompleteReason[],
+  ): SessionLossLoad['stage'] | null {
     const prefix = this.#sessionLostPathPrefix;
-    if (prefix === null) {
-      return false;
+    if (prefix === null || loss.stage !== null) {
+      return null;
     }
-    return sessionLostUrlOf(page, ledger, prefix) !== null;
+    for (const load of loads) {
+      if (sessionLostUrlAt(point, load.page, this.#factory.getSafetyLedger(load.context), prefix) !== null) {
+        const stage = sessionLossStageDetailOf(load.stage, point);
+        loss.stage = stage;
+        loss.source = { page: load.page, context: load.context, navigation: load.route?.snapshot() ?? null };
+        reasons.push(authSessionLostReason(stage));
+        return load.stage;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * DEF-138: セッションの切れの証拠（設計書 2.1）を、判定と同じ owner の部品（`sessionLossEvidenceOf`）で組み立てる。検知しなかったビューポートは `null`。
+   * Context を閉じた後に呼ぶ（Ledger と状態の名前は、閉じた後でも factory から読める）。サイトへの要求を出さない。
+   */
+  #sessionLossEvidenceOf(url: NormalizedHttpUrlEvidence, profile: ViewportProfile, loss: ViewportAuthSessionLoss): SessionLossEvidence | null {
+    const prefix = this.#sessionLostPathPrefix;
+    const { stage, source } = loss;
+    if (prefix === null || stage === null || source === null) {
+      return null;
+    }
+    try {
+      const factory = this.#factory;
+      return sessionLossEvidenceOf({
+        stage: `${profile}:${stage}`,
+        requestedUrl: url,
+        page: source.page,
+        ledger: factory.getSafetyLedger(source.context),
+        sessionLostPathPrefix: prefix,
+        navigation: source.navigation,
+        // 状態の名前を持たない factory（テストの差し替えなど）は、名前の違いを読めない（`null`）。
+        stateNames: typeof factory.authenticatedStateNamesOf === 'function' ? factory.authenticatedStateNamesOf(source.context) : null,
+        allowedOrigins: this.#config.site.allowedOrigins,
+        serviceOrigins: this.#approvedServiceOrigins,
+      });
+    } catch {
+      // 証拠を組み立てられなくても、セッションの切れで止めること（判定）は変えない。
+      return null;
+    }
   }
 
   /** 設計書 4.5.2 の 5。設定で無効な段階は実行しない（4.5.5）。 */
@@ -871,8 +1052,9 @@ export class PageAuditor {
         // afterNavigation` を直列に行う（次の幅のセッションを、前の幅の受け口を呼ぶ前に作らない）ことを前提にしている（D3R の Minor-2）。
         // 幅を並行に読み込む形に変えるときは、幅の値を受け口の引数で渡す形に改める。
         let loadingStressWidth: number | null = null;
-        // T25c: 読み込み中の幅のセッションの page（読み込みの後に、セッションの切れを確かめるため）。
-        let loadingStressPage: Page | null = null;
+        // T25c: 読み込み中の幅のセッションの page と、DEF-138 の経路の記録（認証つきの Run だけ）。読み込みの後に、セッションの切れを確かめるため。
+        // DF-3: 読み込んだ幅は、このビューポートの読み込みの一覧（`state.sessionLossLoads`）にも加え、後の時機にも確かめ直す。
+        let loadingStressLoad: SessionLossLoad | null = null;
         const createSession: StressSessionFactory['createSession'] = async (viewport) => {
           if (this.#safetyViolationRecorded()) {
             throw new SafetyViolationAbortError();
@@ -880,11 +1062,17 @@ export class PageAuditor {
           if (siteUnavailability.detected !== null) {
             throw new SiteUnavailableAbortError();
           }
-          if (state.authSessionLoss.stage !== null) {
+          // DF-3（DEF-167）: 幅の走査の前と、各幅の前に、それまでに読み込んだ page（Passive と前の幅）を確かめ直す。当たれば、この幅を始めない。
+          if (state.authSessionLoss.stage !== null || this.#detectSessionLoss(
+            SESSION_LOSS_CHECK_POINTS.beforeNextLoad,
+            state.sessionLossLoads,
+            state.authSessionLoss,
+            reasons,
+          ) !== null) {
             throw new AuthSessionLostAbortError();
           }
           loadingStressWidth = viewport.width;
-          loadingStressPage = null;
+          loadingStressLoad = null;
           // 幅の走査の Context は、ページの読み込み直しなので、役割は `REVISIT` である（負荷の制御の設計書 4.7）。
           const sessions = createStressSessionFactory(this.#factory, {
             deadlines: this.#deadlines,
@@ -893,10 +1081,18 @@ export class PageAuditor {
           });
           try {
             const session = await sessions.createSession(viewport);
-            loadingStressPage = session.page;
+            // DEF-138: 読み込みの前に、経路の記録を付ける（認証つきの Run だけ）。
+            loadingStressLoad = {
+              stage: STRESS_LAYOUT_STAGE,
+              page: session.page,
+              context: session.page.context(),
+              route: this.#sessionLostPathPrefix === null ? null : observeSessionLossNavigation(session.page),
+            };
+            state.sessionLossLoads.push(loadingStressLoad);
             return session;
           } finally {
-            safety.stressLedgers.push(...sessions.ledgers());
+            // BN-a: 幅のセッションの Ledger を、その幅と組にして残す（safety の Evidence の読み込みの印）。
+            safety.stressLedgers.push(...sessions.ledgers().map((ledger) => ({ ledger, width: viewport.width })));
           }
         };
         // 幅の走査は、この page ではなく幅ごとの Context で行うので、この page の crash とも、ページの期限とも競わせない
@@ -914,15 +1110,28 @@ export class PageAuditor {
           () => collectors.collectStressLayout(createSession, url, stressSweepWidths(config), {
             deadlineAtMs: deadlineAtMs(),
             beforeNavigation: () => this.#pacer.beforeNavigation(),
+            // T44 P1-5（ユーザーの判断「待ってから測る」）: 幅の走査の読み込みも、最初の読み込みと同じ落ち着きの待ち（`#waitForSettled`）の後に形を測る。
+            // T44R2 の I-6: 上限は、その幅の期限から形を測る予備（`STRESS_LAYOUT_MEASURE_RESERVE_MS`）を引いた時刻と、今から `resourceSettlingTimeoutMs` 後の
+            // 早い方（落ち着かない画面でも、形を測る時間を残す）。結果は使わない（落ち着かなくても、今までどおり測る）。
+            settleBeforeLayout: async (stressPage, widthDeadlineAtMs) => {
+              await this.#waitForSettled(stressPage, widthDeadlineAtMs - STRESS_LAYOUT_MEASURE_RESERVE_MS);
+              // DF-3（DEF-167）: 落ち着きを待った後にも確かめる（当たれば、次の幅を始めない）。
+              this.#detectSessionLoss(
+                SESSION_LOSS_CHECK_POINTS.settled,
+                state.sessionLossLoads.filter((load) => load.page === stressPage),
+                state.authSessionLoss,
+                reasons,
+              );
+            },
             afterNavigation: (observation, diagnostics) => {
               // T25c: セッションの切れを先に確かめる（当たれば、次の幅を始めない。サイトの不調とは取り違えない）。
-              if (loadingStressPage !== null && state.authSessionLoss.stage === null && this.#authSessionLostAfterNavigation(
-                loadingStressPage,
-                this.#factory.getSafetyLedger(loadingStressPage.context()),
-              )) {
-                state.authSessionLoss.stage = STRESS_LAYOUT_STAGE;
-                reasons.push(authSessionLostReason(STRESS_LAYOUT_STAGE));
-              } else {
+              const stressLoad = loadingStressLoad;
+              if (stressLoad === null || this.#detectSessionLoss(
+                SESSION_LOSS_CHECK_POINTS.navigation,
+                [stressLoad],
+                state.authSessionLoss,
+                reasons,
+              ) === null) {
                 siteUnavailability.observe(STRESS_LAYOUT_STAGE, observation);
               }
               const { stressWidths } = state.navigationDiagnostics;
@@ -989,7 +1198,12 @@ export class PageAuditor {
       };
       // 期限切れや crash で見放した撮影が、後で終わった場合も、Evidence のないファイルを残さない。
       let abandoned = false;
+      const mayWrite = this.#mayWriteScreenshots;
       const screenshots = await attempt('screenshot', async () => {
+        // DEF-172: 書く直前に、Run のディレクトリに書いてよいか（Run のロックが今も自分のものか）を確かめる。偽なら撮らない（書かない）。
+        if (mayWrite !== null && !(await mayWrite())) {
+          throw new Error('the screenshots are not written: the run lock is no longer held by this start');
+        }
         try {
           const captured = await collectors.captureScreenshots(page, paths);
           if (abandoned) {
@@ -1102,13 +1316,14 @@ export class PageAuditor {
         continue;
       }
       if (audited.value.kind === 'CLEANUP_FAILED') {
-        safety.interactionSnapshots.push(audited.value.safety);
+        safety.interactionSnapshots.push({ snapshot: audited.value.safety, candidateIndex: index });
         reasons.push(interactionStoppedReason(INTERACTION_STOP_REASONS.cleanup, candidates.length - index - 1));
         return;
       }
       const { safety: snapshot, ...interaction } = audited.value.result;
       record('interaction', interaction);
-      safety.interactionSnapshots.push(snapshot);
+      // BN-a: 候補の番号（候補の発見の順。診断の記録の候補の番号と同じ）と組にして残す。
+      safety.interactionSnapshots.push({ snapshot, candidateIndex: index });
     }
   }
 
@@ -1166,7 +1381,7 @@ export class PageAuditor {
           deadlines,
           SESSION_FAILURE_LABELS.interactionContextClose,
         ));
-        sink.safety.interactionSnapshots.push(error.ledger.snapshot());
+        sink.safety.interactionSnapshots.push({ snapshot: error.ledger.snapshot(), candidateIndex: index });
       }
       throw error;
     }
@@ -1209,6 +1424,17 @@ export class PageAuditor {
     }
   }
 
+  /**
+   * 落ち着きの待ち（T44R2 の M-5: 最初の読み込みと幅の走査の、唯一の呼び出しの形）。部品は `waitForPageSettled`、待ち方は `PAGE_SETTLING_PACING`、上限は
+   * `notAfterMs` と、今から `crawl.resourceSettlingTimeoutMs` 後の早い方。
+   */
+  #waitForSettled(page: Page, notAfterMs: number): Promise<PageSettlingResult> {
+    return waitForPageSettled(page, {
+      deadlineAtMs: this.#stageDeadline(notAfterMs, this.#config.crawl.resourceSettlingTimeoutMs),
+      ...PAGE_SETTLING_PACING,
+    });
+  }
+
   #stageDeadline(pageDeadlineAtMs: number, stageBudgetMs: number | null): number {
     return stageDeadline(pageDeadlineAtMs, this.#now(), stageBudgetMs);
   }
@@ -1236,6 +1462,8 @@ interface CollectionState {
   readonly siteUnavailability: ViewportSiteUnavailability;
   /** このビューポートで最初に検知したセッションの切れ（T25c）。幅の走査の各幅の読み込みの後にも確かめて記録する。 */
   readonly authSessionLoss: ViewportAuthSessionLoss;
+  /** DF-3: このビューポートで読み込んだ page（Passive と、幅の走査の各幅。読み込んだ順）。幅の走査は、読み込んだ幅を加える。 */
+  readonly sessionLossLoads: SessionLossLoad[];
   /** 幅の走査の幅ごとと、Interaction の候補ごとの、ページ本体の要求の観察の結果の集め先（診断の記録の設計書 2.2）。 */
   readonly navigationDiagnostics: ViewportNavigationDiagnosticsSink;
   readonly record: <TType extends EvidenceType>(type: TType, payload: EvidencePayloadByType[TType]) => EvidenceRecord;
@@ -1527,6 +1755,7 @@ function skippedViewportOutcome(
     siteUnavailability: null,
     navigationDiagnostics: null,
     authSessionLostStage: null,
+    authSessionLoss: null,
   };
 }
 

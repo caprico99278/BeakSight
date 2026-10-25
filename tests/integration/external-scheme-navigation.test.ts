@@ -5,7 +5,7 @@
 // 記録し、Guard が Context を閉じる。Guard は headed かどうかを受け取らないので、headed の設定の注入はしない。
 //
 // 厳守事項: Chromium は headless だけで起動する（`useHeadlessChromium`）。外部スキームの URL は、実在しない宛先だけを使う。
-import type { Browser, Page } from 'playwright';
+import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import type { BrowserContextFactory, InteractionGuardedSession } from '../../src/browser/context-factory.js';
@@ -13,14 +13,12 @@ import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
 import type { ExternalSchemeNavigationEvent } from '../../src/core/evidence-types.js';
 import { auditInteraction } from '../../src/interaction/isolated-auditor.js';
-import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
+import { externalSchemeNavigationViolationMessage, isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import type { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
 import {
   attemptExternalSchemeNavigation,
   EXTERNAL_SCHEME_KEYS,
-  EXTERNAL_SCHEME_REDIRECT_FRAME_PAGE,
-  EXTERNAL_SCHEME_REDIRECT_PATH,
   EXTERNAL_SCHEME_ROUTES,
   EXTERNAL_SCHEME_TARGETS,
   externalSchemeAttemptRecord,
@@ -94,7 +92,7 @@ async function expectAttemptViolation(
   expect(snapshot.invariantViolations).toEqual([
     {
       code: ATTEMPTED_VIOLATION_CODE,
-      message: `Navigation to the external scheme ${expected.scheme} was attempted; the browser may have launched an external application`,
+      message: externalSchemeNavigationViolationMessage(expected.scheme),
     },
   ]);
 }
@@ -131,14 +129,18 @@ describe('C18a / R7d: an external scheme navigation by the page is recorded, is 
     await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
       await page.goto(pageUrl(), { waitUntil: 'load' });
 
+      // EL-12: Guard は `Page.windowOpen`（CDP）で検出するので、`evaluate` が返る前に Context を閉じることがある（その失敗は受ける）。
       await page.evaluate((target) => {
         window.open(target);
-      }, EXTERNAL_SCHEME_TARGETS.custom.url);
+      }, EXTERNAL_SCHEME_TARGETS.custom.url).catch(() => undefined);
       await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
 
       const snapshot = ledger.snapshot();
       expect(snapshot.invariantViolations.map(({ code }) => code)).toContain('FRAME_CLASSIFICATION_FAILED');
       expect(snapshot.invariantViolations.map(({ code }) => code)).toContain(ATTEMPTED_VIOLATION_CODE);
+      // EL-12: CDP の `Page.windowOpen` と `request`（headless shell では両方来る）で、同じ移動は 1 回だけ記録する（`FRAME_CLASSIFICATION_FAILED` は、
+      // popup の page の route の層からも出ることがあるので、数を決めない）。
+      expect(snapshot.invariantViolations.filter(({ code }) => code === ATTEMPTED_VIOLATION_CODE)).toHaveLength(1);
       // popup の navigation のリクエストは、frame ができる前に出るので、frame の種類が分からない。frame の種類を推し量って
       // 記録することはせず、違反（fail-closed）だけにする。
       expect(snapshot.externalSchemeNavigations).toEqual([]);
@@ -157,7 +159,8 @@ describe('C18a / R7d: an external scheme navigation by the page is recorded, is 
       await wait(QUIET_PERIOD_MS);
 
       expect(ledger.snapshot().blockedNavigations).toEqual([
-        { method: 'GET', url: externalUrl, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+        // BN-a: 止めた時点（読み込みの最中）も記録する。
+        { method: 'GET', url: externalUrl, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
       ]);
       expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
       expect(ledger.snapshot().invariantViolations).toEqual([]);
@@ -185,51 +188,9 @@ describe('C18a / R7d: an external scheme navigation by the page is recorded, is 
 // RC18a の再現では、記録が0件だった。
 describe('C18g: a server redirect to an external scheme is stopped before it is followed, and recorded', () => {
   const redirectUrl = (key: ExternalSchemeKey): string => `${server.origin}${externalSchemeRedirectPath(key)}`;
-  /**
-   * page の frame の URL のうち、外部スキームのもの。止めた iframe は Chromium のエラーのページ（`chrome-error://`）になるので、
-   * それは外部スキームへの移動として数えない（`NON_EXTERNAL_NAVIGATION_SCHEMES` とは別の、テストの観測の条件である）。
-   */
-  const externalFrameUrls = (page: Page): string[] =>
-    page.frames().map((frame) => frame.url()).filter((url) => url !== '' && !/^(https?|about|chrome-error):/u.test(url));
 
-  it.each(EXTERNAL_SCHEME_KEYS)('Passive: an iframe redirect to %s is stopped, recorded without a violation, and the page stays', async (key) => {
-    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
-      const window = openServerWindow(server);
-      const url = `${server.origin}${externalSchemeRedirectFramePath(key)}`;
-
-      await page.goto(url, { waitUntil: 'load' });
-      await waitForRecord(ledger);
-
-      const snapshot = ledger.snapshot();
-      expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB', 'PASSIVE')]);
-      expect(snapshot.invariantViolations).toEqual([]);
-      expect(isPassiveRequestGuardClosed(context)).toBe(false);
-      expect(page.url()).toBe(url);
-      expect(externalFrameUrls(page)).toEqual([]);
-      // リダイレクトの元のリクエストはサーバに届き、外部スキームへの移動は起きない。
-      expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_REDIRECT_FRAME_PAGE}`, `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`]);
-    });
-  });
-
-  it.each(EXTERNAL_SCHEME_KEYS)('Passive: a main frame redirect to %s is stopped and recorded without a violation, and the navigation fails', async (key) => {
-    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
-      const window = openServerWindow(server);
-
-      const navigation = await page.goto(redirectUrl(key)).then(() => 'RESOLVED', () => 'REJECTED');
-      await waitForRecord(ledger);
-
-      expect(navigation).toBe('REJECTED');
-      const snapshot = ledger.snapshot();
-      expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'MAIN', 'PASSIVE')]);
-      // この経路（止めたリダイレクト）は、ページのスクリプトによる移動の違反にしない。
-      expect(snapshot.invariantViolations.map(({ code }) => code)).not.toContain(ATTEMPTED_VIOLATION_CODE);
-      // RC18a の指摘3（設計者の判断）: Guard 自身が止めた main frame のリクエストの失敗は、予期した失敗なので、
-      // `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反にしない。ナビゲーションは失敗し（上の REJECTED）、Context は閉じない。
-      expect(snapshot.invariantViolations).toEqual([]);
-      expect(isPassiveRequestGuardClosed(context)).toBe(false);
-      expect(window.requestLines()).toEqual([`GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`]);
-    });
-  });
+  // TS-f（B1・B2）: Passive の iframe と main frame のリダイレクトの場面（止めた記録、違反 0、Context を閉じない、サーバに届く要求、外部スキームの
+  // frame がない、main frame の移動の失敗）は、同じ確かめをしていた `safety-gates.test.ts` の GATE-S03 に、1 か所にまとめた。
 
   it.each(EXTERNAL_SCHEME_KEYS)('Interaction (before the freeze): an iframe redirect to %s during the load is recorded with phase PASSIVE', async (key) => {
     const session = await headlessFactory.createInteractionSession(viewport);
@@ -330,7 +291,7 @@ describe('C18a: the Interaction result with external scheme navigations (headles
     expect(result.safety.invariantViolations).toEqual([
       {
         code: ATTEMPTED_VIOLATION_CODE,
-        message: 'Navigation to the external scheme tel was attempted; the browser may have launched an external application',
+        message: externalSchemeNavigationViolationMessage('tel'),
       },
       OWNER_CLOSE_OF_INVALIDATED_SESSION,
     ]);
@@ -409,7 +370,7 @@ describe('C18a: the Interaction result with external scheme navigations (headles
     expect(result.safety.invariantViolations).toEqual([
       {
         code: ATTEMPTED_VIOLATION_CODE,
-        message: 'Navigation to the external scheme mailto was attempted; the browser may have launched an external application',
+        message: externalSchemeNavigationViolationMessage('mailto'),
       },
       OWNER_CLOSE_OF_INVALIDATED_SESSION,
     ]);

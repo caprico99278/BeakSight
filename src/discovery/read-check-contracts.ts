@@ -14,27 +14,58 @@
 //   秘密に見える名前の方針の owner `src/core/secret-query-names.ts` の `PAGE_ISSUED_TOKEN_FIELD_WORDS`）と、値を読めず照らせない秘密に見える
 //   名前の欄の判定（`isUnreadableSecretField`）の唯一の owner。書き込みの照合の期待の作り手（`src/browser/write-form-submitter.ts`）と、シナリオの
 //   下書きの確かめが使う（書き写さない）。
+// - T37d（Task 37 の設計書 3.5）: 定義の対象は、READ の候補の識別の digest（`targetIdentityDigest`）か、画面の path（`targetPagePath`）のどちらか
+//   1 つ（`READ_CHECK_TARGET_KINDS`、`readCheckTargetKindOf`）。画面の path の定義は送る値を持たない。画面の path の読む URL の組み立て
+//   （`readCheckPageUrlOf`。正規の形の path だけ）の唯一の owner。
 // - 純粋な定義と関数だけのファイル（実行時の import は、候補の契約の純粋な判定 `isUnsendableFieldType`、状態の語の判定 `fieldNameHasStateWord`、
 //   欄の名前の語の判定 `fieldNameHasListedWord`、秘密に見える名前の方針の owner の判定 `isSecretUrlQueryParameterName` と一覧
 //   `PAGE_ISSUED_TOKEN_FIELD_WORDS` だけ。DEF-094。候補の欄の形は型だけ）。Playwright、ブラウザ、`node:fs`、`src/control/`、
 //   監査エンジンを import しない（`src/control/` とワーカーから import できるようにするため。`tests/architecture/discovery-boundary.test.ts`）。
 import { isSecretUrlQueryParameterName, PAGE_ISSUED_TOKEN_FIELD_WORDS } from '../core/secret-query-names.js';
+// PRE42-CC 組 UI-K2（CC-113）: 期待の種類の一覧の定義（画面のブラウザ側も読む、import を持たない純粋な core のファイル）。ここは公開し直す。
+import {
+  DETAIL_FIELD_EQUALS_EXPECTATION_KIND,
+  READ_CHECK_EXPECTATION_KINDS,
+  ROW_COUNT_AT_LEAST_EXPECTATION_KIND,
+  ROW_COUNT_EQUALS_EXPECTATION_KIND,
+  ROW_COUNT_EXPECTATION_KINDS,
+  TEXT_CONTAINS_EXPECTATION_KIND,
+  type ReadCheckExpectationKind,
+} from '../core/read-check-expectation-kinds.js';
 import { isUnsendableFieldType, writeFieldsOfName, type CandidateField, type DiscoveryCandidate } from './candidate-contracts.js';
 import { fieldNameHasListedWord, fieldNameHasStateWord } from './classify.js';
+import { PATH_TEMPLATE_ID_SEGMENT } from './fingerprint.js';
 
 /**
- * 期待の種類（設計書 4.5。閉じた一覧）。
- * - `ROW_COUNT_EQUALS`・`ROW_COUNT_AT_LEAST`: 構造にした結果の行の数が、ちょうど・少なくとも `count`。
- * - `TEXT_CONTAINS`: ページの本文が `text` を含む。
- * - `DETAIL_FIELD_EQUALS`: 詳細（`dl` など）の項目 `field` の値が `value`。
+ * 期待の種類（設計書 4.5。閉じた一覧）。定義と値の意味は `src/core/read-check-expectation-kinds.ts`（PRE42-CC 組 UI-K2）。ここは同じ名前で公開し直す
+ * （行の数を照らす種類 `ROW_COUNT_EXPECTATION_KINDS` と、名前つきの定数も）。
  */
-export const READ_CHECK_EXPECTATION_KINDS = Object.freeze([
-  'ROW_COUNT_EQUALS',
-  'ROW_COUNT_AT_LEAST',
-  'TEXT_CONTAINS',
-  'DETAIL_FIELD_EQUALS',
-] as const);
-export type ReadCheckExpectationKind = (typeof READ_CHECK_EXPECTATION_KINDS)[number];
+export {
+  DETAIL_FIELD_EQUALS_EXPECTATION_KIND,
+  READ_CHECK_EXPECTATION_KINDS,
+  ROW_COUNT_AT_LEAST_EXPECTATION_KIND,
+  ROW_COUNT_EQUALS_EXPECTATION_KIND,
+  ROW_COUNT_EXPECTATION_KINDS,
+  TEXT_CONTAINS_EXPECTATION_KIND,
+  type ReadCheckExpectationKind,
+};
+
+/**
+ * T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2 (a)）: 書き込みの照合の READ で、生成した値と比べる期待の種類（本文の文字、詳細の項目の値）。
+ * 行の数の期待は、取り違えた ID の画面でも一致しうるので、ここに入れない。
+ */
+export const GENERATED_VALUE_EXPECTATION_KINDS = Object.freeze(['TEXT_CONTAINS', 'DETAIL_FIELD_EQUALS'] as const satisfies readonly ReadCheckExpectationKind[]);
+
+/**
+ * 期待の一覧に、生成した値と比べる期待が 1 つ以上あるか（T40R-fix-B。API の `{id}` の照合の READ の保存の確かめ（`scenario-policy.ts`）と、IPC の手書きの
+ * 確かめ（`worker-protocol.ts`）が使う唯一の判定。シナリオの検証の指定の期待と、結び付けた後の READ の期待の、どちらの形も種類で見る）。
+ * T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-1）: 比べる値が実行のたびに変わるかの述語（`varies`）を渡せば、その述語に当たる期待だけを数える
+ * （許可の発行は、比べる欄の入力の規則が変わる欄か。IPC は、比べる値が生成した値のどれか）。省けば種類だけで見る（保存の時。規則がまだない）。
+ */
+export function hasGeneratedValueExpectation<T extends { readonly kind: string }>(expectations: readonly T[], varies?: (expectation: T) => boolean): boolean {
+  return expectations.some((expectation) => (GENERATED_VALUE_EXPECTATION_KINDS as readonly string[]).includes(expectation.kind)
+    && (varies === undefined || varies(expectation)));
+}
 
 /**
  * READ の確かめの結果（設計書 4.5。閉じた一覧。管理データの `read_check_results.result`）。
@@ -78,6 +109,17 @@ export const MAX_READ_CHECK_EXPECTED_TEXT_LENGTH = 256;
 /** 詳細の項目の名前（`DETAIL_FIELD_EQUALS` の `field`）の最大長（UTF-16 のコード単位。1 文字以上）。 */
 export const MAX_READ_CHECK_DETAIL_FIELD_LENGTH = 256;
 
+/**
+ * 定義の対象の種類（T37d。Task 37 の設計書 3.5。閉じた一覧）。
+ * - `CANDIDATE`: READ の候補（識別の digest `targetIdentityDigest`）。候補の送信先に送る値を付けて読む。
+ * - `PAGE`: 画面の path（`targetPagePath`）。プロファイルの開始の URL と同じ Origin のその画面を、送る値なしで 1 回読む（データを後から API で描く画面）。
+ */
+export const READ_CHECK_TARGET_KINDS = Object.freeze(['CANDIDATE', 'PAGE'] as const);
+export type ReadCheckTargetKind = (typeof READ_CHECK_TARGET_KINDS)[number];
+
+/** 画面の path（`targetPagePath`）の最大長（UTF-16 のコード単位。`/` を含む。T37d）。 */
+export const MAX_READ_CHECK_PAGE_PATH_LENGTH = 1_024;
+
 /** 送る値（欄の名前 → 値。テスト環境のテスト用の値だけ）。 */
 export type ReadCheckParameters = Readonly<Record<string, string>>;
 
@@ -88,14 +130,127 @@ export type ReadCheckExpectation =
   | { readonly kind: 'TEXT_CONTAINS'; readonly text: string }
   | { readonly kind: 'DETAIL_FIELD_EQUALS'; readonly field: string; readonly value: string };
 
-/** READ の確かめの定義の中身（人が画面で決める。`schemas/control/read-check-definition.schema.json` の形）。 */
-export interface ReadCheckDefinition {
+/** READ の候補を対象にした定義（今の形）。 */
+export interface ReadCheckCandidateDefinition {
   /** 対象の READ の候補の識別の digest（`computeCandidateDigests` の `identityDigest`）。 */
   readonly targetIdentityDigest: string;
+  readonly targetPagePath?: never;
   readonly parameters: ReadCheckParameters;
   /** 期待（1 件以上、`MAX_READ_CHECK_EXPECTATIONS` 件まで）。 */
   readonly expectations: readonly ReadCheckExpectation[];
 }
+
+/** 画面の path を対象にした定義（T37d）。送る値を持たない（空だけ）。 */
+export interface ReadCheckPageDefinition {
+  readonly targetIdentityDigest?: never;
+  /** 対象の画面の path（`/` で始まる正規の形。query と fragment を持たない。`readCheckPageUrlOf` が受ける形）。 */
+  readonly targetPagePath: string;
+  readonly parameters: Readonly<Record<string, never>>;
+  readonly expectations: readonly ReadCheckExpectation[];
+}
+
+/**
+ * READ の確かめの定義の中身（人が画面で決める。`schemas/control/read-check-definition.schema.json` の形）。T37d: 対象は、READ の候補か画面の path の
+ * どちらか 1 つ（`readCheckTargetKindOf`）。
+ */
+export type ReadCheckDefinition = ReadCheckCandidateDefinition | ReadCheckPageDefinition;
+
+/** 定義の対象の種類（T37d。`targetPagePath` を持てば `PAGE`、ほかは `CANDIDATE`）。 */
+export const readCheckTargetKindOf = (definition: ReadCheckDefinition): ReadCheckTargetKind =>
+  (typeof definition.targetPagePath === 'string' ? 'PAGE' : 'CANDIDATE');
+
+/** http(s) の scheme（`URL.protocol` の値）。 */
+const PAGE_URL_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:']);
+
+/**
+ * 画面の path の定義の、読む URL（T37d。純粋。保存の確かめ `src/control/read-check-policy.ts` と、ワーカーの実行 `src/worker/read-check-run.ts` が
+ * 使う唯一の組み立て）。`origin` は http(s) の Origin の正規の直列化だけ、`path` は `/` で始まり（`//` で始まらない）、長さが
+ * `MAX_READ_CHECK_PAGE_PATH_LENGTH` 以下で、URL の解析で形が変わらない（正規の形）ものだけ受ける。組み立てた URL の Origin が `origin` で、path が
+ * `path` のまま、query と fragment がないこと。どれかに外れたら null（fail-closed。`..` の区切り、URL の解析が取り除く・符号化する文字（タブ、
+ * 空白、日本語の文字など）、`\`（区切りとして読まれる）、`?`、`#` を含む path は受けない）。
+ */
+export const readCheckPageUrlOf = (origin: string, path: string): string | null => {
+  if (path.length === 0 || path.length > MAX_READ_CHECK_PAGE_PATH_LENGTH || !path.startsWith('/') || path.startsWith('//')
+    || path.includes('\\') || path.includes('?') || path.includes('#')) {
+    return null;
+  }
+  // 組み立てる URL は、Origin と path をつないだ文字列そのもの。URL の解析で形が変わらない（Origin が正規の直列化で path を持たず、path が正規の形）
+  // ときだけ受ける（受け入れの判定ではない。読み込む前に、ワーカーが要求の判定の owner で確かめる）。
+  const expected = `${origin}${path}`;
+  let base: URL;
+  let url: URL;
+  try {
+    base = new URL(origin);
+    url = new URL(expected);
+  } catch {
+    return null;
+  }
+  if (!PAGE_URL_PROTOCOLS.has(base.protocol) || base.href !== `${origin}/` || origin.includes('@') || url.href !== expected) {
+    return null;
+  }
+  return expected;
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// T38c（Task 38 の設計書 3.4、7 章の履歴のユーザーの判断 (3)、T38c の Blocker の判断（案 A））: `{id}` つきの画面の path の型
+// ---------------------------------------------------------------------------------------------------------------
+// API のシナリオの照合の READ に使う、画面の path の定義の型。path の区切りのちょうど 1 つの全体が `{id}`（`PATH_TEMPLATE_ID_SEGMENT`。型の owner
+// `fingerprint.ts` と同じ印）で、ほかに `{`・`}` を持たない。読む URL は、`{id}` に台帳の ID（安全な形だけ。判定は呼び出し側の唯一の判定
+// `isUsableRecordId` を受ける）を入れて、`readCheckPageUrlOf` で組み立てる。保存の確かめは、代わりの値（`READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID`）を
+// 入れた path で、今の画面の READ の確かめを通す。READ の確かめのジョブが型の定義を単独で読むことはない（`readCheckPageUrlOf` が型を組み立てないので、
+// ワーカーは読まずに `URL_NOT_BUILT`。fail-closed）。実際の照合（ID を入れて読む）は Task 40。
+
+/** path の区切り。 */
+const PAGE_PATH_SEPARATOR = '/';
+
+/** 保存の確かめで `{id}` に入れる代わりの値（台帳の ID の安全な形の 1 つ。英数字だけ）。 */
+export const READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID = '1';
+
+/**
+ * 画面の path の型か（区切りのちょうど 1 つの全体が `{id}` で、ほかの所に `{`・`}` がない）。T38R-fix の M-1: `{id}` の前に、固定の区切り（空でない区切り）を
+ * 1 つ以上求める（`/{id}` のように、ID だけで画面が決まる型を受けない）。
+ */
+export const isReadCheckPageTemplatePath = (path: string): boolean => {
+  const segments = path.split(PAGE_PATH_SEPARATOR);
+  const idSegments = segments.filter((segment) => segment === PATH_TEMPLATE_ID_SEGMENT).length;
+  const idIndex = segments.indexOf(PATH_TEMPLATE_ID_SEGMENT);
+  return path.startsWith(PAGE_PATH_SEPARATOR) && idSegments === 1
+    && segments.slice(0, idIndex).some((segment) => segment.length > 0)
+    && segments.every((segment) => segment === PATH_TEMPLATE_ID_SEGMENT || (!segment.includes('{') && !segment.includes('}')));
+};
+
+/** 型の `{id}` の区切りに値を入れた path（型でなければ null）。 */
+export const readCheckPagePathOfTemplate = (template: string, recordId: string): string | null =>
+  (isReadCheckPageTemplatePath(template)
+    ? template.split(PAGE_PATH_SEPARATOR).map((segment) => (segment === PATH_TEMPLATE_ID_SEGMENT ? recordId : segment)).join(PAGE_PATH_SEPARATOR)
+    : null);
+
+/**
+ * 型の画面の path の定義の、読む URL（純粋）。`recordId` は台帳の ID で、`isRecordIdValue`（呼び出し側の唯一の判定。`isUsableRecordId`）が受ける値だけ
+ * 入れる。型でない path、受けない ID、入れた path が正規の形でない（`readCheckPageUrlOf` が組み立てない）なら null。
+ */
+export const readCheckPageTemplateUrlOf = (
+  origin: string,
+  template: string,
+  recordId: string,
+  isRecordIdValue: (value: string) => boolean,
+): string | null => {
+  if (!isRecordIdValue(recordId)) {
+    return null;
+  }
+  const path = readCheckPagePathOfTemplate(template, recordId);
+  return path === null ? null : readCheckPageUrlOf(origin, path);
+};
+
+/**
+ * 保存の確かめが見る形の path（T38c）: 型なら、代わりの値を入れた path。`{`・`}` を持つが型でない path は null（正規の形でない）。ほかはそのまま。
+ */
+export const checkedReadCheckPagePathOf = (path: string): string | null => {
+  if (isReadCheckPageTemplatePath(path)) {
+    return readCheckPagePathOfTemplate(path, READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID);
+  }
+  return path.includes('{') || path.includes('}') ? null : path;
+};
 
 /**
  * 値を送ってよい欄か（名前があり、見えていて、readonly でも disabled でもなく、値を送れない型（`password`・`file`。owner は

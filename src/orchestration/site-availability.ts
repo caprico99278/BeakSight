@@ -94,6 +94,57 @@ function httpStatusUnavailability(httpStatus: number | null): SiteUnavailability
 const unavailability = (kind: SiteUnavailabilityKind, detail: string): SiteUnavailability => Object.freeze({ kind, detail });
 
 /**
+ * サイトの不調でページを捨てた後、同じページを確かめ直すまでに待つ時間の段階（ms。1 回目の確かめ直しの前は 60 秒、2 回目は 2 分、3 回目は
+ * 4 分、4 回目は 8 分。1 ページにつき、この段階の数（4 回）まで確かめ直す。サイトが応答しないときに Run を止める設計書 3.6.2）。
+ * 設定の項目にしない: 設定の項目を増やすと、保存した設定と今の設定の比較が合わなくなり、今の途中の Run を続きから再開できなくなるため
+ * （設定が違う Run は再開しない。中断した Run の再開の設計書 4.7）。待っている間は、サイトへ何も送らない。待ちは、止める印（Ctrl+C）で
+ * 打ち切る。待った時間は、実行時間の上限に含める。
+ * DEF-136: 読み取りの監査（Run Coordinator）と、発見と READ の確かめのジョブ（最初の待ちだけを使う）が共有するので、判定の owner のここに置いた
+ * （Run Coordinator は公開し直す）。
+ */
+export const SITE_UNAVAILABLE_RECHECK_DELAYS_MS: readonly number[] = Object.freeze([60_000, 120_000, 240_000, 480_000]);
+
+/**
+ * 確かめ直しで通った後の減速の倍率（設計書 3.6.2）。通るたびに、Run で 1 つの pacer の最小の間隔を、この倍率で上げる（何回目の確かめ直しで
+ * 通ったかによらない）。設定の項目にしない（理由は `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` と同じ）。DEF-136: ジョブと共有する。
+ */
+export const SITE_UNAVAILABLE_SLOWDOWN_FACTOR = 2;
+
+/**
+ * 減速の上限（設定の `crawl.minNavigationIntervalMs` の倍率。設計書 3.6.2。既定の 5 秒なら 40 秒）。設定の項目にしない（理由は
+ * `SITE_UNAVAILABLE_RECHECK_DELAYS_MS` と同じ）。設定の間隔が 0（ループバックのテスト）なら、上限も 0 で、減速しない。DEF-136: ジョブと共有する。
+ */
+export const SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR = 8;
+
+/**
+ * DEF-136: 確かめ直しで通った後の、読み込みの最小の間隔（今の間隔 `currentMs` の `SITE_UNAVAILABLE_SLOWDOWN_FACTOR` 倍。上限は設定の間隔
+ * `configuredMs` の `SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR` 倍）。読み取りの監査とジョブが共有する唯一の規則。呼ぶ側は、返った値が今の間隔より
+ * 大きいときだけ上げる（設定の間隔が 0 なら 0 のまま）。
+ */
+export function slowedNavigationIntervalMs(currentMs: number, configuredMs: number): number {
+  return Math.min(currentMs * SITE_UNAVAILABLE_SLOWDOWN_FACTOR, configuredMs * SITE_UNAVAILABLE_SLOWDOWN_MAX_FACTOR);
+}
+
+/**
+ * DEF-136: `ms` だけ待つ（注入した `sleep`）。止める印（`signal`）が付いたら、待ちを打ち切って返る（`sleep` の終わりは待たない。止める印の受け手は、
+ * 終わったら外す）。印がなければ、`sleep` の終わりまで待つ。`sleep` の失敗（reject）は、そのまま投げる。読み取りの監査とジョブが共有する。
+ */
+export async function sleepUnlessStopped(sleep: (ms: number) => Promise<void>, ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) {
+    await sleep(ms);
+    return;
+  }
+  if (signal.aborted) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => resolve();
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleep(ms).then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort)).catch(() => undefined);
+  });
+}
+
+/**
  * サイトの不調を検知した段階の閉じた一覧（設計書 3.1）。
  * - `passive`: Passive の各ビューポートの読み込み（`navigatePage`）。
  * - `stress-layout`: 幅の走査の各幅の読み込み。

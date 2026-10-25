@@ -15,7 +15,7 @@
 // 純粋な定義と関数だけのファイル。
 import { foldNfkcCase } from '../../core/text.js';
 import type { CandidateField, CandidateFieldType } from '../../discovery/candidate-contracts.js';
-import { fieldNameHasListedWord } from '../../discovery/classify.js';
+import { fieldNameHasListedWord, isAsciiWord } from '../../discovery/classify.js';
 
 /**
  * 外部到達の種類（閉じた一覧。判定の結果は、この順に並ぶ）。
@@ -227,7 +227,7 @@ export const notificationFieldNameIsNegated = (name: string): boolean => fieldNa
 export const isNotificationOptOutValue = (value: string): boolean => {
   const folded = foldNfkcCase(value).trim();
   return (NOTIFICATION_OPT_OUT_OPTION_WORDS as readonly string[]).some((word) =>
-    (/^[\x20-\x7e]+$/u.test(word) ? folded === word : folded.includes(word)));
+    (isAsciiWord(word) ? folded === word : folded.includes(word)));
 };
 
 /** autocomplete の値を、空白で分けて畳み込んだ語の一覧（値がなければ空）。 */

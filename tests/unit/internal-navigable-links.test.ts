@@ -1,12 +1,13 @@
 // CCX-6（共通化の台帳の CC-070）: Link の Evidence から、巡回の候補にする URL（`INTERNAL_NAVIGABLE` で、正規化できたもの）を取り出す表。
-// Run Coordinator（Desktop の `link` の Evidence）と、発見のワーカーの流れ（`discoverLinks` の結果）が、同じ部品を使う。
+// Run Coordinator（Desktop の `link` の Evidence）と、発見のワーカーの流れ（`discoverLinks` の結果）、Cross-page rule（内部のリンクの索引）が、
+// 同じ部品（`src/crawl/internal-navigable-links.ts`。PRE42-CC 組 5b で Run Coordinator から移した）を使う。
 // - 受け入れの判定が `INTERNAL_NAVIGABLE` で、正規化が `ok` のリンクだけを、正規化した URL にする。
 // - 文書の順を保つ。重なりは取り除かない（巡回の待ち行列が扱う）。
 // 例の値は、匿名の値（`example.com`）だけを使う。
 import { describe, expect, it } from 'vitest';
 import type { LinkAdmissionEvidence, LinkEvidence, LinkNormalizationEvidence, NormalizedHttpUrlEvidence } from '../../src/core/evidence-types.js';
 import { createPageId } from '../../src/core/ids.js';
-import { internalNavigableUrlsOf } from '../../src/orchestration/run-coordinator.js';
+import { internalNavigableUrlsOf } from '../../src/crawl/internal-navigable-links.js';
 
 const ORIGIN = 'https://example.com';
 const normalized = (url: string): NormalizedHttpUrlEvidence => url as NormalizedHttpUrlEvidence;

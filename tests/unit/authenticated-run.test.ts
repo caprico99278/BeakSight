@@ -5,7 +5,7 @@
 // 範囲は引数（`AUDIT_EXCLUSION`: 巡回の候補の除外、`ANY_BLOCK`: READ の事前の判定）で選ぶ。巡回（`isExcludedCrawlCandidate`）と READ
 // （`isReadUrlAllowed`）の判定の表を、まとめる前と後で同じに保つ。
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import {
   assertRunAuthentication,

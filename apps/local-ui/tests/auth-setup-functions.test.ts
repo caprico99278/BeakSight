@@ -9,8 +9,9 @@
  * 管理データ、ターゲット設定は、一時の root の中だけ。fixture のサイトは 127.0.0.1 で、このテストでは要求を送らない（監査を始めない）。
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../../src/control/auth/auth-setup-contracts.js';
-import { publicProfileDocument, startTimedSite, writeAuditTargetConfig, type TimedSite } from './helpers/audit-site.ts';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../../src/control/auth/auth-setup-contracts.js';
+import { START_PATH, publicProfileDocument, startTimedSite, writeAuditTargetConfig, type TimedSite } from './helpers/audit-site.ts';
 import {
   createTemporaryUiRoot,
   findFreePort,
@@ -60,7 +61,7 @@ const valueOf = async <T>(name: string, method: 'GET' | 'POST', data?: unknown):
 
 /** 正しい認証の設定（改訂 `revision` に結びつく）。 */
 const setupFor = (revision: number, overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: AUTH_PROFILE,
   profileRevision: revision,
   loginStartUrl: `${origin()}/login`,
@@ -73,7 +74,7 @@ const setupFor = (revision: number, overrides: Readonly<Record<string, unknown>>
   allowedIdpOrigins: [],
   automatedLogin: null,
   ...overrides,
-} satisfies Record<keyof AuthSetup, unknown>);
+} satisfies Record<Exclude<keyof AuthSetup, 'auditReadRequests' | 'serviceRequestLimits'>, unknown>);
 
 const authProfileDocument = (revision: number): Record<string, unknown> => ({
   ...publicProfileDocument(AUTH_PROFILE, authConfig),
@@ -126,9 +127,13 @@ describe('auth setup Server Functions: registration, input validation and CSRF',
         auth: 'MANUAL_SESSION',
         status: 'ACTIVE',
         approvedTestOrigins: [origin()],
+        // T34d で画面の値に足した項目（プロファイルに項目がなければ空。T34R2-fix で期待を直した）。
+        approvedServiceOrigins: [],
       },
       eligible: true,
       stored: null,
+      // T43b（Task 43 の設計書 4.2）で画面の値に足した項目: 新しい認証の設定の案に使う、対象の設定の開始の URL の path。
+      startUrlPath: START_PATH,
     });
     expect(await getPage(PUBLIC_PROFILE)).toMatchObject({ eligible: false, stored: null });
     expect(await getPage('not-there')).toBeNull();

@@ -27,7 +27,7 @@ import {
   type ControlDatabase,
 } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
-import { CONTROL_DB_APPLICATION_ID, CONTROL_SCHEMA_VERSION } from '../../src/control/store/migrations.js';
+import { CONTROL_DB_APPLICATION_ID, CONTROL_SCHEMA_BASE, CONTROL_SCHEMA_VERSION } from '../../src/control/store/migrations.js';
 import { ControlStoreError, type ControlStoreFailureReason } from '../../src/control/store/store-errors.js';
 import { withWriteTransaction } from '../../src/control/store/transaction.js';
 
@@ -292,6 +292,39 @@ describe('openControlDatabase: stops without touching the user\'s files (design 
     expect(failureReasonOf(path)).toBe('DATABASE_FROM_NEWER_VERSION');
     expect(hashOf(path)).toBe(before);
     withRaw(path, (connection) => expect(pragmaOf(connection, 'user_version')).toBe(CONTROL_SCHEMA_VERSION + 1));
+  });
+
+  // LG-2（設計書 `2026-10-24-beaksight-test-suite-tiers-design.md` 3.7.1）: 版 1〜16 の段は捨てた。基準の版より前の管理データ（合成。BeakSight の
+  // `application_id` と版と表 1 つ）は、版を読む確かめの段で、何も書かないうちに止める（WAL にもしない。ファイルの byte も変えない）。
+  it('DATABASE_FROM_OLDER_VERSION: versions 1 to 16 stop before anything is written, without WAL', () => {
+    const path = databasePathIn(workDirectory);
+    mkdirSync(dirname(path));
+    const olderVersions = Array.from({ length: CONTROL_SCHEMA_BASE.version - 1 }, (_value, index) => index + 1);
+    expect(olderVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    for (const version of olderVersions) {
+      rmSync(path, { force: true });
+      withRaw(path, (connection) => {
+        connection.exec(`PRAGMA application_id = ${CONTROL_DB_APPLICATION_ID}`);
+        connection.exec('CREATE TABLE profiles (profile_id TEXT PRIMARY KEY NOT NULL) STRICT');
+        connection.exec(`PRAGMA user_version = ${version}`);
+      });
+      const before = hashOf(path);
+      let caught: unknown;
+      try {
+        open(path);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught, `version ${version}`).toBeInstanceOf(ControlStoreError);
+      expect((caught as ControlStoreError).reason, `version ${version}`).toBe('DATABASE_FROM_OLDER_VERSION');
+      expect((caught as ControlStoreError).message, `version ${version}`).toContain(`user_version ${version}`);
+      expect(hashOf(path), `version ${version}`).toBe(before);
+      expect(existsSync(`${path}-wal`), `version ${version}`).toBe(false);
+      withRaw(path, (connection) => {
+        expect(pragmaOf(connection, 'journal_mode')).toBe('delete');
+        expect(pragmaOf(connection, 'user_version')).toBe(version);
+      });
+    }
   });
 
   it('DATABASE_READ_ONLY: the database file is read-only', () => {

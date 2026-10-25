@@ -15,6 +15,7 @@ import {
   PATH_TEMPLATE_ID_SEGMENT,
   computeCandidateDigests,
   concretePathOfTemplate,
+  pagePathTemplateOptionsOf,
   pathTemplateOptionsOf,
   recordIdOfTemplates,
   recordIdSegmentPairOfTemplates,
@@ -215,5 +216,28 @@ describe('T31i: the templated identity digest for a record id', () => {
     ['an empty record id', editForm('7'), ''],
   ] as const)('is null for %s', (_label, candidate, recordId) => {
     expect(templatedIdentityDigestForRecordIdOf(candidate, recordId)).toBeNull();
+  });
+});
+
+// T38f（Task 38 の設計書 3.7）: 画面の path から作れる型（API の UPDATE の台帳の参照の、更新の画面の path の型の選択肢。送信先を持たない候補）。
+describe('T38f: the page path template options of a page path', () => {
+  const isRecordId = (value: string): boolean => /^[A-Za-z0-9_-]+$/u.test(value);
+  it('replaces one segment of the record id form at a time, the digits first, and gives back the path with the value', () => {
+    expect(pagePathTemplateOptionsOf('/admin/members/1/edit', isRecordId)).toEqual([
+      `/admin/members/${PATH_TEMPLATE_ID_SEGMENT}/edit`,
+      `/${PATH_TEMPLATE_ID_SEGMENT}/members/1/edit`,
+      `/admin/${PATH_TEMPLATE_ID_SEGMENT}/1/edit`,
+      `/admin/members/1/${PATH_TEMPLATE_ID_SEGMENT}`,
+    ]);
+    for (const template of pagePathTemplateOptionsOf('/admin/members/1/edit', isRecordId)) {
+      expect(template.split('/').filter((segment) => segment === PATH_TEMPLATE_ID_SEGMENT)).toHaveLength(1);
+    }
+    expect(Object.isFrozen(pagePathTemplateOptionsOf('/a/1', isRecordId))).toBe(true);
+  });
+
+  it('makes no option for segments that are not of the record id form, and for the root', () => {
+    expect(pagePathTemplateOptionsOf('/', isRecordId)).toEqual([]);
+    expect(pagePathTemplateOptionsOf('/会員/一覧', isRecordId)).toEqual([]);
+    expect(pagePathTemplateOptionsOf('/admin/members/1', () => false)).toEqual([]);
   });
 });

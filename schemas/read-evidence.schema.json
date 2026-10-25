@@ -5,16 +5,39 @@
   "additionalProperties": false,
   "required": ["schemaVersion", "jobId", "runId", "startedAt", "finishedAt", "runStatus", "endReason", "checks"],
   "properties": {
-    "schemaVersion": { "const": "read-evidence-schema/1.0" },
+    "schemaVersion": {
+      "description": "T37d: the current version 1.2 (the target kind and the page path of each check, and the two details of the audit stage); the writer writes 1.2 (src/discovery/read-check-evaluation.ts). LG-4: the previous versions 1.0 and 1.1 are no longer read.",
+      "enum": ["read-evidence-schema/1.2"]
+    },
     "jobId": { "$ref": "#/$defs/id" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
     "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
     "finishedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
     "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
     "endReason": {
-      "enum": ["COMPLETED", "MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"]
+      "enum": ["COMPLETED", "MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "SITE_UNAVAILABLE", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"]
     },
-    "checks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/check" } }
+    "checks": { "type": "array", "maxItems": 20, "items": { "$ref": "#/$defs/check" } },
+    "endReasonDetail": {
+      "description": "Optional (T37a; Task 37 design 3.1): the detail of the end (the same list as discovery.json). Absent otherwise.",
+      "$ref": "urn:beaksight:schema:discovery:1.0#/properties/endReasonDetail"
+    },
+    "authentication": {
+      "description": "Optional (T37a; Task 37 design 3.1): the counts of the audit stage of the job (the same counts as run.json). Counts only; never a URL or a value.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/auditStageCounts"
+    },
+    "sessionLoss": {
+      "description": "Optional (DEF-138): the evidence of the load where the session was lost (endReason AUTH_SESSION_LOST; the same shape as authentication.sessionLoss of run.json). Absent otherwise.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/sessionLoss"
+    },
+    "auditSendPolicy": {
+      "description": "Optional (AS-b; audit send policy design 2.3): the effective audit send policy of the job (the same values as audit.sendPolicy of run.json). A document written before AS-b does not have it and is read as READ_ONLY.",
+      "$ref": "urn:beaksight:schema:run:1.0#/properties/effectiveConfig/properties/audit/properties/sendPolicy"
+    },
+    "safetyViolation": {
+      "description": "Optional (DEF-144): the content of the invariant violation of the Safety Ledger that stopped the job (endReason SAFETY_VIOLATION; the same shape as safetyViolation of discovery.json; a READ check does not press, so press is null). Absent otherwise and in the documents of the earlier writers.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/jobSafetyViolation"
+    }
   },
   "$defs": {
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
@@ -27,13 +50,33 @@
       "anyOf": [{ "enum": ["STRUCTURE_NOT_FOUND", "STRUCTURE_AMBIGUOUS", "STRUCTURE_LIMIT_REACHED", "PAGE_NOT_SETTLED"] }, { "type": "null" }]
     },
     "check": { "oneOf": [{ "$ref": "#/$defs/executed" }, { "$ref": "#/$defs/notExecuted" }] },
+    "targetKind": { "enum": ["CANDIDATE", "PAGE"] },
+    "target": {
+      "description": "T37d: the target of a check is either a READ candidate (the target kind CANDIDATE and the identity digest) or a page path (the target kind PAGE and the page path).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["targetKind", "targetIdentityDigest"],
+          "properties": { "targetKind": { "const": "CANDIDATE" }, "targetIdentityDigest": { "$ref": "#/$defs/digest" }, "targetPagePath": false }
+        },
+        {
+          "type": "object",
+          "required": ["targetKind", "targetPagePath"],
+          "properties": {
+            "targetKind": { "const": "PAGE" },
+            "targetPagePath": { "$ref": "urn:beaksight:schema:control:read-check-definition:1#/properties/targetPagePath" },
+            "targetIdentityDigest": false
+          }
+        }
+      ]
+    },
     "executed": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [{ "$ref": "#/$defs/target" }],
       "required": [
         "readCheckId",
         "readCheckRevision",
-        "targetIdentityDigest",
         "state",
         "result",
         "detail",
@@ -46,7 +89,9 @@
       "properties": {
         "readCheckId": { "$ref": "#/$defs/id" },
         "readCheckRevision": { "$ref": "#/$defs/revision" },
+        "targetKind": { "$ref": "#/$defs/targetKind" },
         "targetIdentityDigest": { "$ref": "#/$defs/digest" },
+        "targetPagePath": { "type": "string" },
         "state": { "const": "EXECUTED" },
         "result": {
           "enum": ["MATCHED", "NOT_MATCHED", "UNDETERMINED", "READ_BLOCKED_BY_POLICY", "READ_CANDIDATE_DRIFTED", "READ_CANDIDATE_NOT_READ"]
@@ -66,26 +111,46 @@
             "NAVIGATION_FAILED",
             "HTTP_ERROR_STATUS",
             "RESULT_PAGE_UNREADABLE",
-            "SESSION_LOST"
+            "SESSION_LOST",
+            "SERVICE_READ_REFUSED",
+            "AUDIT_STAGE_REQUEST_BLOCKED"
           ]
         },
         "url": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
-        "httpStatus": { "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 599 }, { "type": "null" }] },
+        "httpStatus": {
+          "description": "DEF-164: the observed HTTP status of the READ URL (the range OBSERVABLE_HTTP_STATUS_RANGE of src/core/http-status.ts; a status of 600 or more is kept and judged as an error).",
+          "anyOf": [{ "type": "integer", "minimum": 100, "maximum": 999 }, { "type": "null" }]
+        },
         "blockedRequests": { "$ref": "#/$defs/count" },
         "structure": { "anyOf": [{ "$ref": "#/$defs/structure" }, { "type": "null" }] },
-        "expectations": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/expectationEvidence" } }
+        "expectations": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/expectationEvidence" } },
+        "documentRequests": {
+          "description": "Optional (DEF-129): the main frame document requests that the Guard sent when the READ URL was loaded (the load of BeakSight, the redirects and the loads started by the page).",
+          "$ref": "#/$defs/count"
+        },
+        "childFrameDocumentRequests": {
+          "description": "Optional (T37R2-fix): the child frame document requests that the Guard sent when the READ URL was loaded (a separate count).",
+          "$ref": "#/$defs/count"
+        },
+        "subresourceRequests": {
+          "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent when the READ URL was loaded (a separate count).",
+          "$ref": "#/$defs/count"
+        }
       }
     },
     "notExecuted": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["readCheckId", "readCheckRevision", "targetIdentityDigest", "state", "reason"],
+      "allOf": [{ "$ref": "#/$defs/target" }],
+      "required": ["readCheckId", "readCheckRevision", "state", "reason"],
       "properties": {
         "readCheckId": { "$ref": "#/$defs/id" },
         "readCheckRevision": { "$ref": "#/$defs/revision" },
+        "targetKind": { "$ref": "#/$defs/targetKind" },
         "targetIdentityDigest": { "$ref": "#/$defs/digest" },
+        "targetPagePath": { "type": "string" },
         "state": { "const": "NOT_EXECUTED" },
-        "reason": { "enum": ["MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"] }
+        "reason": { "enum": ["MAX_RUNTIME_REACHED", "STOPPED", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED", "SITE_UNAVAILABLE", "SAFETY_VIOLATION", "PREFLIGHT_FAILED"] }
       }
     },
     "structure": {

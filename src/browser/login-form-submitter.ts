@@ -14,6 +14,14 @@
  *    - action（送信のボタンに `formaction` があれば、それ）を解決した URL が、呼ぶ側が渡した判定（要求の判定の owner の口。送信先の Origin と
  *      path の完全一致）に当たる。
  *    - 送信の先の閲覧の文脈が、同じ page（`formtarget`・`target`・`<base target>` が、ないか `_self`）。
+ *    T36a（Task 36 の設計書 3.2）: スクリプトで送るログイン（`LoginFormTarget.submission` が `SCRIPT_REQUEST`）では、method と action を確かめない
+ *    （スクリプトが送るため。送信先の判定は Guard のスクリプトの口）。ほかの確かめ（3 つの要素、欄の種類、同じ form、送信の先）は今どおり。
+ *    T36R-fix（ユーザーの判断「ログインの画面に form の要素がなければ止めるのでは監査が開始できない」）: スクリプトで送るログインでは、3 つがすべて
+ *    form の外（form の持ち主も、祖先の form もない）の画面も通す。そのときは、3 つがそれぞれちょうど 1 つ（main frame の中だけ。今どおり）、欄の種類
+ *    （今どおり）、見えている、欄は編集できる、送信の要素は押せる（Playwright の `isVisible`・`isEditable`・`isEnabled`。外れたら、その要素の理由）、
+ *    送信の要素は `button`・`input[type=submit|button]`・`role="button"` の要素のどれか（`href` のある要素は止める。T36R2-fix: 祖先に `href` のある
+ *    `a`・`area` があるときも止める。shadow root をまたいで祖先をたどる。押すとページが移りうるため）、送信の先が同じ page（今どおり）を
+ *    確かめる。一部だけが form の中か、別々の form の中なら `NOT_SAME_FORM`。フォームの送信のログイン（`FORM_NAVIGATION`）は変えない。
  *    プロパティは、要素の上書き（DOM clobbering。`<input name="action">` など）を受けないように、標準の prototype の getter で読む。
  *    T32j-4（Task 32 の設計書 4.4 の「CC-068 の設計」の 2。調査 T32j-3 の Lc）: 読み取りは isolated world で行う（`readInIsolatedWorld`。ページの JS
  *    は結果を偽れず、読む間に走らない）。isolated world の中で、設定のセレクタ（標準の CSS）から、文書と open な shadow root ごとに要素を
@@ -43,8 +51,11 @@ export const LOGIN_FORM_STEP_TIMEOUT_MS = FORM_STEP_TIMEOUT_MS;
  * - `SELECTOR_NOT_UNIQUE`: 3 つのセレクタのどれかが、ちょうど 1 つの要素に当たらない（0 か 2 以上）。
  * - `USERNAME_FIELD_INVALID`: ユーザー名の欄が、閉じた一覧の入力の欄（`USERNAME_INPUT_TYPES`）でない。
  * - `PASSWORD_FIELD_INVALID`: パスワードの欄が `input[type=password]` でない。
- * - `SUBMIT_BUTTON_INVALID`: 送信の要素が、送信のボタンでない（`button[type=button]`、リンクなど）。
- * - `NOT_SAME_FORM`: 3 つが同じ `form` に属さない（どれかが `form` に属さない場合を含む）。
+ * - `SUBMIT_BUTTON_INVALID`: 送信の要素が、送信のボタンでない（`button[type=button]`、リンクなど）。T36R-fix: form のない画面のスクリプトで送る
+ *   ログインでは、`button`・`input[type=submit|button]`・`role="button"` でない、`href` がある（T36R2-fix: 祖先の `a`・`area` を含む）、見えない、押せない。ユーザー名とパスワードの欄が
+ *   見えないか編集できないときは、その欄の理由。
+ * - `NOT_SAME_FORM`: 3 つが同じ `form` に属さない（どれかが `form` に属さない場合を含む）。T36R-fix: スクリプトで送るログインでは、3 つがすべて
+ *   form の外なら通し、一部だけが form の中か、別々の form の中のとき。
  * - `METHOD_NOT_POST`: method（`formmethod` を含む）が POST でない。
  * - `ACTION_NOT_ALLOWED`: action（`formaction` を含む）を解決した URL が、許した送信先でない。
  * - `FORM_TARGET_NOT_SELF`: 送信の先が、同じ page でない（`_blank`、名前つきの窓や iframe）。
@@ -63,6 +74,17 @@ export const LOGIN_FORM_INVALID_REASONS = Object.freeze([
 ] as const);
 export type LoginFormInvalidReason = (typeof LOGIN_FORM_INVALID_REASONS)[number];
 
+/**
+ * ログインの送り方（T36a。閉じた一覧）。`FORM_NAVIGATION` は form の送信（method と action を確かめる。今の確かめ）、`SCRIPT_REQUEST` はスクリプトの送信
+ * （method と action を確かめない）。値と順は、認証の設定の `LOGIN_TRANSPORTS`（`src/control/auth/auth-setup-contracts.ts`）と同じ（この部品は
+ * `src/control/` を読まないので写す。一致は `tests/unit/script-login-boundary-consistency.test.ts`）。
+ */
+export const LOGIN_FORM_SUBMISSIONS = Object.freeze(['FORM_NAVIGATION', 'SCRIPT_REQUEST'] as const);
+export type LoginFormSubmission = (typeof LOGIN_FORM_SUBMISSIONS)[number];
+
+/** method と action を確かめない送り方（スクリプトの送信）。 */
+const SCRIPT_SUBMISSION: LoginFormSubmission = 'SCRIPT_REQUEST';
+
 /** ユーザー名の欄として受ける `input` の `type`（ブラウザの `type` のプロパティの値。未指定と、知らない値は `text`）。 */
 export const USERNAME_INPUT_TYPES: ReadonlySet<string> = new Set(['text', 'email', 'tel']);
 
@@ -76,6 +98,21 @@ const POST_FORM_METHOD = FORM_POST_METHOD;
 const SELF_TARGETS = FORM_SELF_TARGETS;
 /** 要素の数（ちょうど 1 つ）。 */
 const ONE_ELEMENT = 1;
+/**
+ * T36R-fix: 3 つの要素の form の中の置き方（ページの中で読む。要素ごとに、form の持ち主か、なければ祖先の form）。`SAME` は 3 つが同じ form の中、
+ * `NONE` は 3 つとも form の外、`MIXED` はほか（一部だけが form の中、別々の form の中）。
+ */
+const FORM_PLACEMENTS: ReadonlySet<string> = new Set(['SAME', 'NONE', 'MIXED']);
+/** 3 つとも form の外。 */
+const NO_FORM_PLACEMENT = 'NONE';
+/** 一部だけが form の中か、別々の form の中。 */
+const MIXED_FORM_PLACEMENT = 'MIXED';
+/** T36R-fix: form のない画面で、送信の要素として受ける `input` の `type`。 */
+const FORMLESS_SUBMIT_INPUT_TYPES: ReadonlySet<string> = new Set([SUBMIT_TYPE, 'button']);
+/** T36R-fix: form のない画面で、送信の要素として受ける要素の名前（`button` は `type` を問わない）と `role`。 */
+const BUTTON_TAG = 'button';
+const INPUT_TAG = 'input';
+const BUTTON_ROLE = 'button';
 
 /** 認証の設定の 3 つのセレクタ（標準の CSS。isolated world で、文書と open な shadow root ごとに探し直す）。 */
 export interface LoginFormSelectors {
@@ -93,6 +130,11 @@ export interface LoginFormTarget {
   readonly selectors: LoginFormSelectors;
   /** action を解決した URL が、許した送信先か（要求の判定の owner の口。呼ぶ側が渡す）。 */
   readonly isAllowedAction: (actionUrl: string) => boolean;
+  /**
+   * T36a: ログインの送り方（`LOGIN_FORM_SUBMISSIONS`）。省略は `FORM_NAVIGATION`（今の確かめ）。`SCRIPT_REQUEST` では method と action を確かめない
+   * （`isAllowedAction` を呼ばない）。
+   */
+  readonly submission?: LoginFormSubmission | undefined;
 }
 
 /** 入れる値（使った後に、呼ぶ側が参照を捨てる）。 */
@@ -122,6 +164,12 @@ interface LoginFormFacts {
   readonly method: string;
   readonly action: string;
   readonly target: string;
+  /** T36R-fix: 3 つの要素の form の中の置き方（`FORM_PLACEMENTS`）。 */
+  readonly placement: string;
+  /** T36R-fix: 送信の要素の `role` 属性（前後の空白を除き、小文字。なければ空）。 */
+  readonly submitRole: string;
+  /** T36R-fix: 送信の要素が `href` 属性を持つ。T36R2-fix: または、祖先（shadow root をまたぐ）に `href` のある `a`・`area` がある。 */
+  readonly submitHasHref: boolean;
 }
 
 /** ページの中で読んだ結果: 3 つのセレクタの要素の数（ユーザー名、パスワード、送信の順）と、どれもちょうど 1 つのときの事実。 */
@@ -138,35 +186,9 @@ interface LoginFormReading {
  */
 function readLoginFormFactsReader(R: StandardReaders, selectors: LoginFormSelectors): LoginFormReading {
   const { standardProperty: read } = R;
-  const shadowRootOf = R.standardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
-  const nodeListLengthOf = R.standardGetter<number>(NodeList.prototype, 'length');
-  // 文書と、その中の open な shadow root（入れ子を含む。文書の順）。
-  const roots: (Document | ShadowRoot)[] = [document];
-  const walk = (root: Document | ShadowRoot): void => {
-    const walker = Document.prototype.createTreeWalker.call(document, root, NodeFilter.SHOW_ELEMENT);
-    for (let node = TreeWalker.prototype.nextNode.call(walker); node !== null; node = TreeWalker.prototype.nextNode.call(walker)) {
-      const shadowRoot = shadowRootOf(node);
-      if (shadowRoot !== null) {
-        roots.push(shadowRoot);
-        walk(shadowRoot);
-      }
-    }
-  };
-  walk(document);
-  const find = (selector: string): Node[] => {
-    const found: Node[] = [];
-    for (let index = 0; index < roots.length; index += 1) {
-      const root = roots[index];
-      const list = root instanceof Document
-        ? Document.prototype.querySelectorAll.call(root, selector)
-        : DocumentFragment.prototype.querySelectorAll.call(root as ShadowRoot, selector);
-      for (let item = 0; item < nodeListLengthOf(list); item += 1) {
-        const node = NodeList.prototype.item.call(list, item);
-        if (node !== null) found.push(node);
-      }
-    }
-    return found;
-  };
+  // 文書と、その中の open な shadow root（入れ子を含む。文書の順）で探す（CC-099: 部品の `openRoots`・`queryAllInRoots`）。
+  const roots = R.openRoots();
+  const find = (selector: string): Node[] => R.queryAllInRoots(roots, selector);
   const usernames = find(selectors.username);
   const passwords = find(selectors.password);
   const submits = find(selectors.submit);
@@ -207,6 +229,19 @@ function readLoginFormFactsReader(R: StandardReaders, selectors: LoginFormSelect
   const formTarget = override('formtarget', 'formTarget') ?? (form instanceof HTMLFormElement && hasAttribute(form, 'target')
     ? formProperty('target')
     : baseTarget());
+  // T36R-fix: 要素ごとの form（form の持ち主か、なければ祖先の form。持ち主のない要素が form の中にあれば、form の中とみなす）。
+  const containerOf = (node: Node): unknown => {
+    const owner = formOf(node);
+    if (owner instanceof HTMLFormElement) return owner;
+    return node instanceof Element ? Element.prototype.closest.call(node, 'form') : null;
+  };
+  const containers = [containerOf(username), containerOf(password), containerOf(submit)];
+  const placement = containers.every((container) => container === null)
+    ? 'NONE'
+    : containers.every((container) => container !== null && container === containers[0]) ? 'SAME' : 'MIXED';
+  const submitRole = submit instanceof Element ? text(Element.prototype.getAttribute.call(submit, 'role')) : '';
+  // T36R2-fix: 送信の要素の祖先（shadow root では host へ移る）に、`href` のある `a`・`area` があるか（押すとページが移りうる。CC-099: 部品の
+  // `hasLinkAncestor`）。
   return { counts, facts: {
     usernameTag: tagOf(username),
     usernameType: typeOf(username),
@@ -218,28 +253,59 @@ function readLoginFormFactsReader(R: StandardReaders, selectors: LoginFormSelect
     method: override('formmethod', 'formMethod') ?? formProperty('method'),
     action: override('formaction', 'formAction') ?? formProperty('action'),
     target: formTarget.trim().toLowerCase(),
+    placement,
+    submitRole: submitRole.trim().toLowerCase(),
+    submitHasHref: hasAttribute(submit, 'href') || R.hasLinkAncestor(submit),
   } };
 }
 const readLoginFormFactsInPage = composeInPage(readLoginFormFactsReader);
 
-/** 読んだ事実から、最初に外れた理由（なければ `null`）。 */
-const invalidReasonOf = (facts: LoginFormFacts, isAllowedAction: (actionUrl: string) => boolean): LoginFormInvalidReason | null => {
-  if (facts.usernameTag !== 'input' || !USERNAME_INPUT_TYPES.has(facts.usernameType)) {
+/** T36R-fix: スクリプトで送るログインの、form のない画面（3 つとも form の外）か。 */
+const isFormlessScriptLogin = (facts: LoginFormFacts, scriptSubmission: boolean): boolean =>
+  scriptSubmission && facts.placement === NO_FORM_PLACEMENT;
+
+/** T36R-fix: form のない画面の送信の要素か（`button`・`input[type=submit|button]`・`role="button"`。`href` のある要素は除く）。 */
+const isFormlessSubmitElement = (facts: LoginFormFacts): boolean =>
+  !facts.submitHasHref
+  && (facts.submitTag === BUTTON_TAG
+    || (facts.submitTag === INPUT_TAG && FORMLESS_SUBMIT_INPUT_TYPES.has(facts.submitType))
+    || facts.submitRole === BUTTON_ROLE);
+
+/**
+ * 読んだ事実から、最初に外れた理由（なければ `null`）。T36a: スクリプトの送信（`scriptSubmission`）では、method と action を確かめない。
+ * T36R-fix: スクリプトの送信で、3 つとも form の外なら、送信の要素を form のない画面の形で確かめ、form と method と action を確かめない（送信の先は
+ * 今どおり）。一部だけが form の中か、別々の form の中なら、送信の要素より先に `NOT_SAME_FORM`。
+ */
+const invalidReasonOf = (
+  facts: LoginFormFacts,
+  isAllowedAction: (actionUrl: string) => boolean,
+  scriptSubmission: boolean,
+): LoginFormInvalidReason | null => {
+  if (facts.usernameTag !== INPUT_TAG || !USERNAME_INPUT_TYPES.has(facts.usernameType)) {
     return 'USERNAME_FIELD_INVALID';
   }
-  if (facts.passwordTag !== 'input' || facts.passwordType !== PASSWORD_INPUT_TYPE) {
+  if (facts.passwordTag !== INPUT_TAG || facts.passwordType !== PASSWORD_INPUT_TYPE) {
     return 'PASSWORD_FIELD_INVALID';
   }
-  if (!((facts.submitTag === 'button' || facts.submitTag === 'input') && facts.submitType === SUBMIT_TYPE)) {
+  if (scriptSubmission && facts.placement === MIXED_FORM_PLACEMENT) {
+    return 'NOT_SAME_FORM';
+  }
+  if (isFormlessScriptLogin(facts, scriptSubmission)) {
+    if (!isFormlessSubmitElement(facts)) {
+      return 'SUBMIT_BUTTON_INVALID';
+    }
+    return SELF_TARGETS.has(facts.target) ? null : 'FORM_TARGET_NOT_SELF';
+  }
+  if (!((facts.submitTag === BUTTON_TAG || facts.submitTag === INPUT_TAG) && facts.submitType === SUBMIT_TYPE)) {
     return 'SUBMIT_BUTTON_INVALID';
   }
   if (!facts.sameForm) {
     return 'NOT_SAME_FORM';
   }
-  if (facts.method !== POST_FORM_METHOD) {
+  if (!scriptSubmission && facts.method !== POST_FORM_METHOD) {
     return 'METHOD_NOT_POST';
   }
-  if (!isAllowedAction(facts.action)) {
+  if (!scriptSubmission && !isAllowedAction(facts.action)) {
     return 'ACTION_NOT_ALLOWED';
   }
   return SELF_TARGETS.has(facts.target) ? null : 'FORM_TARGET_NOT_SELF';
@@ -254,7 +320,32 @@ const LOGIN_FORM_FACT_TEXT_KEYS: readonly string[] = [
 const isLoginFormFacts = (value: unknown): value is LoginFormFacts =>
   isRecord(value)
   && LOGIN_FORM_FACT_TEXT_KEYS.every((key) => typeof value[key] === 'string')
-  && typeof value['sameForm'] === 'boolean';
+  && typeof value['sameForm'] === 'boolean'
+  && typeof value['placement'] === 'string' && FORM_PLACEMENTS.has(value['placement'])
+  && typeof value['submitRole'] === 'string'
+  && typeof value['submitHasHref'] === 'boolean';
+
+/**
+ * T36R-fix: form のない画面で、3 つの要素が見えていて、欄が編集でき、送信の要素が押せるかを、Playwright で確かめる（外れた最初の要素の理由。
+ * 通れば `null`）。値は入れない。
+ */
+async function formlessActionabilityReasonOf(target: LoginFormTarget, timeoutMs: number): Promise<LoginFormInvalidReason | null> {
+  const [usernameVisible, usernameEditable, passwordVisible, passwordEditable, submitVisible, submitEnabled] = await Promise.all([
+    target.username.isVisible(),
+    target.username.isEditable({ timeout: timeoutMs }),
+    target.password.isVisible(),
+    target.password.isEditable({ timeout: timeoutMs }),
+    target.submit.isVisible(),
+    target.submit.isEnabled({ timeout: timeoutMs }),
+  ]);
+  if (!usernameVisible || !usernameEditable) {
+    return 'USERNAME_FIELD_INVALID';
+  }
+  if (!passwordVisible || !passwordEditable) {
+    return 'PASSWORD_FIELD_INVALID';
+  }
+  return submitVisible && submitEnabled ? null : 'SUBMIT_BUTTON_INVALID';
+}
 
 /** 読んだ結果の形を確かめる（ページの中の結果は、信じずに形を見る）。 */
 const isLoginFormReading = (value: unknown): value is LoginFormReading =>
@@ -279,7 +370,9 @@ async function inspectWithin(target: LoginFormTarget, timeoutMs: number): Promis
     || outcome.value.counts.some((count, index) => count !== counts[index])) {
     return { ok: false, reason: 'FORM_UNREADABLE' };
   }
-  const reason = invalidReasonOf(facts, target.isAllowedAction);
+  const scriptSubmission = target.submission === SCRIPT_SUBMISSION;
+  const reason = invalidReasonOf(facts, target.isAllowedAction, scriptSubmission)
+    ?? (isFormlessScriptLogin(facts, scriptSubmission) ? await formlessActionabilityReasonOf(target, timeoutMs) : null);
   return reason === null ? { ok: true } : { ok: false, reason };
 }
 

@@ -15,8 +15,6 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../../src/cli/exit-codes.js';
-import { WORKER_PROTOCOL_VERSION } from '../../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../../src/discovery/discovery-result.js';
@@ -29,8 +27,10 @@ import {
   LOCAL_UI_TEXT,
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
 } from '../../../src/presentation/messages.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeFakeWorker, type FakeWorkerMode, type FakeWorkerValues } from '../../../tests/helpers/fake-audit-worker.js';
+import { fakeWorkerValuesOf } from '../../../tests/helpers/job-test-support.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import { sampleAction, sampleField, sampleForm } from '../../../tests/unit/discovery-candidate-samples.js';
 import {
@@ -44,6 +44,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403, NOT_FOUND: 404 });
@@ -158,20 +159,10 @@ const discoveryDocument = (): DiscoveryDocument => ({
 const installFakeWorker = (mode: FakeWorkerMode, extra: Partial<FakeWorkerValues>): void => {
   const directory = `${rootOf().root}/fake-workers/${mode}`;
   mkdirSync(directory, { recursive: true });
-  const worker = writeFakeWorker(directory, mode, {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
+  const worker = writeFakeWorker(directory, mode, fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, {
     heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
     ...extra,
-  });
+  }));
   writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
 };
 
@@ -184,20 +175,19 @@ interface JobDetail {
   readonly artifacts: readonly { readonly kind: string; readonly href: string }[];
 }
 
-const waitForEnd = async (jobId: string): Promise<JobDetail> => {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const job = await valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-    if (job !== null && !job.active) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`ジョブが終わらなかった: ${JSON.stringify(job)}`);
-    }
-    descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
-};
+/** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する。待ち方は補助 `waitForJobViaServerFunctions`。PRE42-CC 組 UI-K2）。 */
+const waitForEnd = (jobId: string): Promise<JobDetail> => waitForJobViaServerFunctions(
+  (id) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId: id }),
+  jobId,
+  (job) => !job.active,
+  {
+    limitMs: WAIT_LIMIT_MS,
+    stepMs: WAIT_POLL_MS,
+    onPending: async () => {
+      descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+    },
+  },
+);
 
 const writeTarget = (name: string, origins: readonly string[]): string => {
   const path = `config/targets/${name}.json`;
@@ -226,7 +216,7 @@ const testProfile = (profileId: string, targetConfigPath: string): Record<string
 });
 
 const authSetup = (profileId: string): Record<string, unknown> => ({
-  schemaVersion: 'beaksight-auth-setup/2',
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: 1,
   loginStartUrl: `${ORIGIN_A}/login`,

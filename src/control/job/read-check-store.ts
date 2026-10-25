@@ -7,7 +7,8 @@
 // - 書く前に、定義の形と秘密に見える名前を確かめ直す（`assertStorableReadCheckDefinition`）。候補に照らした確かめ（送れる欄、分類が READ）は、
 //   候補を持つ呼び出し側が `validateReadCheckDefinition` で行う（T27f。設計書の変更履歴「Blocker: T27c」の行の (4)）。
 // - 送る値は、設計どおり平文で保存する（テスト環境のテスト用の値だけ。設計書 4.5、10 章の 4）。入力の型に、資格情報・トークン・label の口はない。
-//   定義は、契約の 3 つの項目だけを選んで書く（余分な項目は書かない）。
+//   定義は、契約の 3 つの項目だけを選んで書く（余分な項目は書かない）。T37d: 対象は、候補の識別の digest（列 `target_identity_digest`）か画面の
+//   path（管理データの版 12 の列 `target_page_path`）のどちらか 1 つ。
 // - 結果: ジョブ・定義・定義の版・閉じた一覧の結果（`READ_CHECK_RESULTS`）・時刻。ジョブと定義の組で 1 行。T27e（T27c の申し送り 11）: 定義の版が、
 //   今の版と違う結果（実行の間に定義が変わった）は書かない（`recordReadCheckResult` は `RangeError`、まとめて書く `recordReadCheckResults` は、その
 //   結果だけを書かずに数える）。
@@ -23,7 +24,7 @@ import {
 import { isProfileOperationAllowed, type ProfileOperation } from '../execution-policy.js';
 import { assertStorableReadCheckDefinition, type ReadCheckDefinitionRejectionReason } from '../read-check-policy.js';
 import type { ControlDatabase } from '../store/control-database.js';
-import type { ProfileStatus } from '../store/profile-records.js';
+import { ACTIVE_PROFILE_STATUS } from '../store/profile-records.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
 import { ControlStoreError } from '../store/store-errors.js';
 import { withReadTransaction, withWriteTransaction } from '../store/transaction.js';
@@ -111,7 +112,10 @@ export const DEFAULT_RECENT_READ_CHECK_RESULTS = 50;
 interface ReadCheckRow {
   readonly read_check_id: string;
   readonly profile_id: string;
-  readonly target_identity_digest: string;
+  /** READ の候補の識別の digest（画面の path の定義は null。T37d）。 */
+  readonly target_identity_digest: string | null;
+  /** 画面の path（候補の定義は null。管理データの版 12。T37d）。 */
+  readonly target_page_path: string | null;
   readonly parameters: string;
   readonly expectations: string;
   readonly revision: number;
@@ -128,7 +132,8 @@ interface ResultRow {
   readonly recorded_at: string;
 }
 
-const READ_CHECK_COLUMNS = 'read_check_id, profile_id, target_identity_digest, parameters, expectations, revision, created_at, updated_at, canceled_at';
+const READ_CHECK_COLUMNS =
+  'read_check_id, profile_id, target_identity_digest, target_page_path, parameters, expectations, revision, created_at, updated_at, canceled_at';
 const SELECT_READ_CHECK_SQL = `SELECT ${READ_CHECK_COLUMNS} FROM read_checks WHERE read_check_id = ?`;
 const SELECT_PROFILE_READ_CHECKS_SQL = `SELECT ${READ_CHECK_COLUMNS} FROM read_checks WHERE profile_id = ?
   AND (? OR canceled_at IS NULL) ORDER BY created_at, read_check_id`;
@@ -137,9 +142,9 @@ const SELECT_PROFILE_READ_CHECKS_SQL = `SELECT ${READ_CHECK_COLUMNS} FROM read_c
 const SELECT_PROFILE_STATUS_SQL =
   "SELECT status, json_extract(document, '$.mode') AS mode, json_extract(document, '$.auth') AS auth FROM profiles WHERE profile_id = ?";
 const SELECT_ACTIVE_COUNT_SQL = 'SELECT count(*) AS n FROM read_checks WHERE profile_id = ? AND canceled_at IS NULL';
-const INSERT_READ_CHECK_SQL = `INSERT INTO read_checks (${READ_CHECK_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`;
-const UPDATE_READ_CHECK_SQL = `UPDATE read_checks SET target_identity_digest = ?, parameters = ?, expectations = ?, revision = ?, updated_at = ?
-  WHERE read_check_id = ? AND revision = ? AND canceled_at IS NULL`;
+const INSERT_READ_CHECK_SQL = `INSERT INTO read_checks (${READ_CHECK_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`;
+const UPDATE_READ_CHECK_SQL = `UPDATE read_checks SET target_identity_digest = ?, target_page_path = ?, parameters = ?, expectations = ?, revision = ?,
+  updated_at = ? WHERE read_check_id = ? AND revision = ? AND canceled_at IS NULL`;
 const UPDATE_CANCELED_SQL = `UPDATE read_checks SET canceled_at = ?, updated_at = ?
   WHERE read_check_id = ? AND revision = ? AND canceled_at IS NULL`;
 const INSERT_RESULT_SQL = `INSERT INTO read_check_results (job_id, read_check_id, read_check_revision, result, recorded_at)
@@ -164,8 +169,8 @@ const integrityError = (table: string, detail: string): ControlStoreError =>
 
 const rejected = (reason: ReadCheckDefinitionRejectionReason): ReadCheckStoreResult => Object.freeze({ ok: false, reason });
 
-/** 定義を作り・変えてよいプロファイルの状態（T27f。T27c の申し送り 6: 取り消したプロファイルでは作らない・変えない）。 */
-const ACTIVE_PROFILE_STATUS = 'ACTIVE' satisfies ProfileStatus;
+// 定義を作り・変えてよいプロファイルの状態（T27f。T27c の申し送り 6: 取り消したプロファイルでは作らない・変えない）は、owner の
+// `profile-records.ts` の `ACTIVE_PROFILE_STATUS` から読む（CC-109）。
 
 /** READ の確かめの操作（T28b fix round 1。許すモードと認証の方式は `execution-policy.ts` の `READ_CHECK` の行だけで決める）。 */
 const READ_CHECK_OPERATION = 'READ_CHECK' satisfies ProfileOperation;
@@ -209,12 +214,20 @@ const requireRevision = (value: number): number => {
   return value;
 };
 
-/** 定義の契約の 3 つの項目だけを選び（余分な項目は写さない）、形と秘密に見える名前を確かめた凍結した写し。 */
+/**
+ * 定義の契約の 3 つの項目だけを選び（余分な項目は写さない）、形と秘密に見える名前を確かめた凍結した写し。T37d: 対象は、候補の識別の digest か
+ * 画面の path の、渡された方（両方を渡せば形の誤り）。
+ */
 const requireDefinition = (definition: ReadCheckDefinition): ReadCheckDefinition => assertStorableReadCheckDefinition({
-  targetIdentityDigest: definition.targetIdentityDigest,
+  ...(definition.targetIdentityDigest === undefined ? {} : { targetIdentityDigest: definition.targetIdentityDigest }),
+  ...(definition.targetPagePath === undefined ? {} : { targetPagePath: definition.targetPagePath }),
   parameters: definition.parameters,
   expectations: definition.expectations,
-});
+} as ReadCheckDefinition);
+
+/** 定義の対象の列の値（候補の識別の digest と、画面の path。どちらか一方は null。T37d）。 */
+const targetColumnsOf = (definition: ReadCheckDefinition): readonly [string | null, string | null] =>
+  [definition.targetIdentityDigest ?? null, definition.targetPagePath ?? null];
 
 // ---------------------------------------------------------------------------------------------------------------
 // 行から形へ
@@ -231,11 +244,13 @@ const parsedJson = (text: string, detail: string): unknown => {
 const readCheckViewOf = (row: ReadCheckRow): ReadCheckView => {
   let definition: ReadCheckDefinition;
   try {
+    // T37d: 対象の列は、どちらか一方だけが値を持つ（表の CHECK）。値のある方を契約の項目にする（両方あれば形の誤り）。
     definition = assertStorableReadCheckDefinition({
-      targetIdentityDigest: row.target_identity_digest,
+      ...(row.target_identity_digest === null ? {} : { targetIdentityDigest: row.target_identity_digest }),
+      ...(row.target_page_path === null ? {} : { targetPagePath: row.target_page_path }),
       parameters: parsedJson(row.parameters, 'parameters') as ReadCheckDefinition['parameters'],
       expectations: parsedJson(row.expectations, 'expectations') as ReadCheckDefinition['expectations'],
-    });
+    } as ReadCheckDefinition);
   } catch (error) {
     if (error instanceof ControlStoreError) {
       throw error;
@@ -309,7 +324,7 @@ const createIn = (connection: SqliteConnection, input: NewReadCheck): ReadCheckS
   }
   const { definition } = input;
   connection.prepare(INSERT_READ_CHECK_SQL).run(
-    input.readCheckId, input.profileId, definition.targetIdentityDigest, JSON.stringify(definition.parameters),
+    input.readCheckId, input.profileId, ...targetColumnsOf(definition), JSON.stringify(definition.parameters),
     JSON.stringify(definition.expectations), FIRST_READ_CHECK_REVISION, input.at, input.at,
   );
   const row = readCheckRowOf(connection, input.readCheckId);
@@ -331,7 +346,7 @@ const updateIn = (connection: SqliteConnection, input: ReadCheckChange): ReadChe
   }
   const { definition } = input;
   const changes = connection.prepare(UPDATE_READ_CHECK_SQL).run(
-    definition.targetIdentityDigest, JSON.stringify(definition.parameters), JSON.stringify(definition.expectations), current.revision + 1,
+    ...targetColumnsOf(definition), JSON.stringify(definition.parameters), JSON.stringify(definition.expectations), current.revision + 1,
     input.at, input.readCheckId, current.revision,
   ).changes;
   const row = readCheckRowOf(connection, input.readCheckId);

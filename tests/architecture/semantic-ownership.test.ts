@@ -13,7 +13,9 @@ import {
   findModuleReferences,
   findModuleSpecifiers,
   loadSourceFiles,
+  matchingBracket,
   scanSource,
+  sourceFileAt,
   splitTopLevelArguments,
   withoutModuleExtension,
   type ScannedSource,
@@ -285,23 +287,7 @@ const INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS = ['closePassivePage', 'closePassi
 const findIndividualPassivePageCloses = (source: ScannedSource): readonly string[] =>
   INDIVIDUAL_PASSIVE_PAGE_CLOSE_FUNCTIONS.flatMap((name) => callsOf(source, name));
 
-/** `bare` の `open` の位置の開き括弧（`(` か `{`）に対応する閉じ括弧の位置。見つからなければ `-1`（近似。DEF-038 の検査だけで使う）。 */
-const matchingBracket = (bare: string, open: number): number => {
-  const opener = bare[open];
-  const closer = opener === '(' ? ')' : '}';
-  let depth = 0;
-  for (let cursor = open; cursor < bare.length; cursor += 1) {
-    if (bare[cursor] === opener) {
-      depth += 1;
-    } else if (bare[cursor] === closer) {
-      depth -= 1;
-      if (depth === 0) {
-        return cursor;
-      }
-    }
-  }
-  return -1;
-};
+// `bare` の `open` の位置の開き括弧（`(` か `{`）に対応する閉じ括弧の位置は、`source-scan.ts` の `matchingBracket`（PRE42-CC 組 G）。
 
 /**
  * `definition`（関数かメソッドの定義の始まりから、引数の開き括弧 `(` までに一致する正規表現）の本体の範囲（`{` から `}` まで）。
@@ -665,6 +651,12 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'src/worker/audit-worker-session.ts: loadConfig(',
       'ワーカーの流れが、入口から渡された `loadConfig` を、検証した `START` のパスと `--headless` に当たる上書きだけで呼ぶ（Task 24 の設計書 4.2）',
     ],
+    // FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: テストだけの口（`hideJobBrowser`）で、ワーカーの流れに渡す `loadConfig` を、
+    // CLI の `--headless` と同じ上書き（`HEADLESS_CONFIG_OVERRIDES`）だけで呼ぶ形に包む。設定の owner は変えない。
+    [
+      'src/worker/audit-worker-process.ts: loadConfig(',
+      'ワーカーの入口の組み立てが、テストだけの口で、`loadConfig` を `--headless` に当たる上書きだけで呼ぶ形に包む（FM-2。ジョブのブラウザを今どおり headless にする）',
+    ],
   ]),
   'ARCH03-extraction': new Map([
     [
@@ -788,6 +780,20 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
       'src/worker/write-create-run.ts: ): RunStatus =>',
       '`writeRunStatusOf` は、`deriveRunStatus` の結果をそのまま返す（入力を写すだけ。判定はしない）',
     ],
+    // T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブも監査の Run（`run.json`）を作らない。入口の確かめの Run Status の owner は
+    // `src/control/entry-check.ts` の `entryCheckRunStatusOf`（終わり方を `deriveRunStatus` の入力に写すだけ）。
+    [
+      'src/control/entry-check.ts: deriveRunStatus(',
+      '入口の確かめの Run Status は、終わり方を Run Status の入力に写して、唯一の判定 `deriveRunStatus` に任せる（判定を書き写さない）',
+    ],
+    [
+      'src/control/entry-check.ts: ): RunStatus =>',
+      '`entryCheckRunStatusOf` は、`deriveRunStatus` の結果をそのまま返す（入力を写すだけ。判定はしない）',
+    ],
+    [
+      'src/worker/entry-check-run.ts: runStatus = entryCheckRunStatusOf(visit.endReason',
+      '成果物 entry-check.json の Run Status に、`deriveRunStatus` に任せた `entryCheckRunStatusOf` の結果を入れる（判定はしない）',
+    ],
     [
       'src/worker/write-create-run.ts: runStatus = writeRunStatusOf(outcome.result',
       '書き込みのジョブの結果の Run Status に、`deriveRunStatus` に任せた `writeRunStatusOf` の結果を入れる（判定はしない）',
@@ -824,6 +830,10 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     [
       'src/orchestration/preflight.ts: writeFile(',
       'PREFLIGHT が、出力先に書けるかを、空の一時ファイルを新しく作ってすぐ消して確かめる（artifact ではない）',
+    ],
+    [
+      'src/browser/chromium-launch.ts: writeFile(',
+      'EL-12: 起動の部品が、OS の一時のフォルダに作った使い捨ての Chromium のプロファイルに、外部のアプリの起動を止める Preferences を書く（artifact ではない）',
     ],
     // T26a（Task 26 の設計書 4.1）: 資格情報のファイル（`local/secrets/`。Run の artifact ではない）の唯一の owner が、一時のファイルに書いて
     // fsync してから rename する。境界は `tests/architecture/credential-boundary.test.ts`。
@@ -869,11 +879,7 @@ const violationsAfterExclusions = (gate: ExclusionScope, detections: readonly De
 const detectIn = (files: readonly SourceFile[], detector: (source: ScannedSource) => readonly string[]): readonly Detection[] =>
   files.flatMap((file) => detector(file).map((match) => ({ path: file.path, match })));
 
-const sourceFile = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  expect(file, path).toBeDefined();
-  return file ?? { path, content: '', ...scanSource('') };
-};
+const sourceFile = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 const filesOtherThan = (paths: readonly string[]): readonly SourceFile[] => SOURCE_FILES.filter((file) => !paths.includes(file.path));
 

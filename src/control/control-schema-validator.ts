@@ -25,12 +25,13 @@ export const CONTROL_SCHEMA_NAMES = Object.freeze([
   'ui-audit-job-start',
   'ui-audit-job-stop',
   'ui-audit-job-key',
-  // 認証の設定（Task 25 の設計書 4.1。T25a）。契約は `src/control/auth/auth-setup-contracts.ts`、検証は `auth-setup-policy.ts`。
-  'auth-setup',
-  // 認証の設定の版 2（Task 26 の設計書 4.3。T26b）。検証と保存は版 2 だけ。版 1（`auth-setup`）は管理データの版 1 の文書を読むために残す。
-  'auth-setup-v2',
+  // 認証の設定の版 3（Task 25 の設計書 4.1、Task 34 の設計書 3.2。T34a）。契約は `src/control/auth/auth-setup-contracts.ts`、検証は
+  // `auth-setup-policy.ts`。LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 版 1（`auth-setup`）と版 2（`auth-setup-v2`）は捨てた（版 3 だけ）。
+  'auth-setup-v3',
   // ローカルの管理画面の認証の設定の保存の Server Function の入力（Task 25 の設計書 4.5。T25e）。
   'ui-auth-setup-save',
+  // T43d（Task 43 の設計書 4.4）: 認証の設定と、プロファイルに足す承認したサービスの Origin をまとめて保存する Server Function の入力。
+  'ui-auth-setup-profile-save',
   // 資格情報のファイル（Task 26 の設計書 4.1。T26a）。読み書きは `src/control/credentials/credential-store.ts`。
   'credential-file',
   // ローカルの管理画面の資格情報の登録・変更・入れ直しと、ログインの検証の開始の Server Function の入力（Task 26 の設計書 4.2、4.6。T26e）。
@@ -58,14 +59,31 @@ export const CONTROL_SCHEMA_NAMES = Object.freeze([
   'ui-scenario-update',
   'ui-scenario-approve',
   'ui-scenario-revoke',
-  // 入力の規則の集まりの版（Task 29 の設計書 4.1。T29a）。契約は `src/control/data-rules/rule-contracts.ts`。
-  'data-rule',
+  // ローカルの管理画面の、シナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2。FM2b）。
+  'ui-scenario-auto-draft',
+  'ui-scenario-auto-rules',
+  // 入力の規則の集まりの版 2（Task 29 の設計書 4.1。手動の操作を減らす設計書 3A.3。FM2c）。契約は `src/control/data-rules/rule-contracts.ts`。
+  // LG-3（2026-10-24 のテストの組の設計 3.7.2）: 版 1（`data-rule`）は捨てた（保存も読み出しも版 2 だけ）。
+  'data-rule-v2',
   // ローカルの管理画面の、入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4。T29e）。
   'ui-data-rule-save',
   // ローカルの管理画面の、書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章。T30g fix round 1）。
   'ui-write-start',
   // ローカルの管理画面の、更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章。T31h-2）。
   'ui-write-update-start',
+  // ローカルの管理画面の、「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1。T41g-3）。
+  'ui-write-chain-start',
+  // ローカルの管理画面の、入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3。T43c）。
+  'ui-entry-check-start',
+  // ローカルの管理画面の、ログインの段の表の 1 行の「登録する」の Server Function の入力（手動の操作を減らす設計書 2.1。FM-1）。
+  'ui-login-stage-row-key',
+  'ui-login-stage-row-register',
+  // ローカルの管理画面の、プロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2。FM-1）。
+  'ui-profile-display-settings',
+  // ローカルの管理画面の、プロファイルの負荷の値（ページの上限・時間の上限・読み込みの間隔）の確かめと保存の Server Function の入力（Task 44 の設計書 P2-1。T44d）。
+  'ui-target-crawl-limits',
+  // ローカルの管理画面の、1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4。FM2e）。
+  'ui-automated-login-setup',
 ] as const);
 export type ControlSchemaName = (typeof CONTROL_SCHEMA_NAMES)[number];
 
@@ -83,9 +101,9 @@ const schemaIdByName: Readonly<Record<ControlSchemaName, string>> = Object.freez
   'ui-audit-job-start': 'urn:beaksight:schema:control:ui-audit-job-start:1',
   'ui-audit-job-stop': 'urn:beaksight:schema:control:ui-audit-job-stop:1',
   'ui-audit-job-key': 'urn:beaksight:schema:control:ui-audit-job-key:1',
-  'auth-setup': 'urn:beaksight:schema:control:auth-setup:1',
-  'auth-setup-v2': 'urn:beaksight:schema:control:auth-setup:2',
+  'auth-setup-v3': 'urn:beaksight:schema:control:auth-setup:3',
   'ui-auth-setup-save': 'urn:beaksight:schema:control:ui-auth-setup-save:1',
+  'ui-auth-setup-profile-save': 'urn:beaksight:schema:control:ui-auth-setup-profile-save:1',
   'credential-file': 'urn:beaksight:schema:control:credential-file:1',
   'ui-credential-register': 'urn:beaksight:schema:control:ui-credential-register:1',
   'ui-credential-change': 'urn:beaksight:schema:control:ui-credential-change:1',
@@ -106,10 +124,19 @@ const schemaIdByName: Readonly<Record<ControlSchemaName, string>> = Object.freez
   'ui-scenario-update': 'urn:beaksight:schema:control:ui-scenario-update:1',
   'ui-scenario-approve': 'urn:beaksight:schema:control:ui-scenario-approve:1',
   'ui-scenario-revoke': 'urn:beaksight:schema:control:ui-scenario-revoke:1',
-  'data-rule': 'urn:beaksight:schema:control:data-rule:1',
+  'ui-scenario-auto-draft': 'urn:beaksight:schema:control:ui-scenario-auto-draft:1',
+  'ui-scenario-auto-rules': 'urn:beaksight:schema:control:ui-scenario-auto-rules:1',
+  'data-rule-v2': 'urn:beaksight:schema:control:data-rule:2',
   'ui-data-rule-save': 'urn:beaksight:schema:control:ui-data-rule-save:1',
   'ui-write-start': 'urn:beaksight:schema:control:ui-write-start:1',
   'ui-write-update-start': 'urn:beaksight:schema:control:ui-write-update-start:1',
+  'ui-write-chain-start': 'urn:beaksight:schema:control:ui-write-chain-start:1',
+  'ui-entry-check-start': 'urn:beaksight:schema:control:ui-entry-check-start:1',
+  'ui-login-stage-row-key': 'urn:beaksight:schema:control:ui-login-stage-row-key:1',
+  'ui-login-stage-row-register': 'urn:beaksight:schema:control:ui-login-stage-row-register:1',
+  'ui-profile-display-settings': 'urn:beaksight:schema:control:ui-profile-display-settings:1',
+  'ui-target-crawl-limits': 'urn:beaksight:schema:control:ui-target-crawl-limits:1',
+  'ui-automated-login-setup': 'urn:beaksight:schema:control:ui-automated-login-setup:1',
 });
 
 let validators: Readonly<Record<ControlSchemaName, SchemaDocumentValidator>> | undefined;

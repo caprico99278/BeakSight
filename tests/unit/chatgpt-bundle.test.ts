@@ -12,10 +12,21 @@ import {
   RUN_ARTIFACT_FILE_NAMES,
   pageArtifactRelativePath,
 } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, EvidenceId, EvidenceRecord, PageAuditResult } from '../../src/core/contracts.js';
+import { SEVERITIES, type AuditRunResult, type EvidenceId, type EvidenceRecord, type PageAuditResult } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
 import { CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES } from '../../src/core/limits.js';
-import { RUN_EXECUTION_END_REASON_CATALOG, type DisplaySpec } from '../../src/presentation/catalog.js';
+import {
+  AUDIT_SEND_POLICY_CATALOG,
+  BEAKSIGHT_BLOCK_RELATION_CATALOG,
+  FINDING_CATEGORY_CATALOG,
+  RUN_EXECUTION_END_REASON_CATALOG,
+  RUN_STATUS_CATALOG,
+  SEVERITY_CATALOG,
+  SEVERITY_GROUP_CATALOG,
+  sortByDisplayOrder,
+  type DisplaySpec,
+} from '../../src/presentation/catalog.js';
+import { AUDIT_SEND_TEXT, CHATGPT_BUNDLE_GUIDE_TEXT, RUN_SUMMARY_TEXT, listText } from '../../src/presentation/messages.js';
 import {
   CHATGPT_BUNDLE_FILE_NAMES,
   CHATGPT_BUNDLE_OMISSION_REASONS,
@@ -25,13 +36,16 @@ import {
 } from '../../src/report/chatgpt-bundle.js';
 import { buildReportViewModel, type ReportViewModel } from '../../src/report/view-model.js';
 import {
+  FIXTURE_ORIGIN,
   JAPANESE_TEXT,
   PAGE_1,
   auditRun,
+  beaksightBlockAuditRun,
   dom,
   edgeCaseAuditRun,
   executionsDisplaySample,
   finding,
+  fixtureUrl,
   idOf,
   loadDisplaySample,
   metadata,
@@ -179,17 +193,40 @@ const EDGE_SHOTS = Object.freeze({
   secondDesktopViewport: 'EV-SHOT-000011' as EvidenceId,
 });
 
+/**
+ * `edgeCaseAuditRun()` の、バンドルに入れる関係するスクリーンショット（パスの順）。T44f: 関係するページ全体のスクリーンショット
+ * （`pages/PAGE-000001/desktop/full-page.png`）は、バンドルに入れない。
+ */
 const EDGE_RELATED_SCREENSHOT_PATHS = [
-  'pages/PAGE-000001/desktop/full-page.png',
   'pages/PAGE-000001/desktop/viewport.png',
   'pages/PAGE-000002/desktop/viewport.png',
 ];
 
+/** ZIP の中の JSON のうち、`page.json` を除くもの（ZIP の中の順。T44i: `findings-by-rule.json` を足した。BN-d: 外した指摘のファイルを足した）。 */
 const JSON_FILE_PATHS = [
   CHATGPT_BUNDLE_FILE_NAMES.manifest,
   RUN_ARTIFACT_FILE_NAMES.run,
   CHATGPT_BUNDLE_FILE_NAMES.summary,
+  CHATGPT_BUNDLE_FILE_NAMES.findingsByRule,
   CHATGPT_BUNDLE_FILE_NAMES.findings,
+  CHATGPT_BUNDLE_FILE_NAMES.relatedFindings,
+  CHATGPT_BUNDLE_FILE_NAMES.pages,
+  CHATGPT_BUNDLE_FILE_NAMES.evidenceIndex,
+];
+
+/**
+ * ZIP の中で、各ページの `page.json` の前に並ぶファイル（ZIP の中の順）。T44i（Task 44 の設計書 6 章の 2026-10-22 の行）: 読み方の案内（`README.md`。JSON では
+ * ない）を `manifest.json` の次に、Rule ごとの要約（`findings-by-rule.json`）を `summary.json` の次に入れる。BN-d: 外した指摘（`beaksight-related-findings.json`）を
+ * `findings.json` の次に入れる。
+ */
+const LEADING_FILE_PATHS = [
+  CHATGPT_BUNDLE_FILE_NAMES.manifest,
+  CHATGPT_BUNDLE_FILE_NAMES.readme,
+  RUN_ARTIFACT_FILE_NAMES.run,
+  CHATGPT_BUNDLE_FILE_NAMES.summary,
+  CHATGPT_BUNDLE_FILE_NAMES.findingsByRule,
+  CHATGPT_BUNDLE_FILE_NAMES.findings,
+  CHATGPT_BUNDLE_FILE_NAMES.relatedFindings,
   CHATGPT_BUNDLE_FILE_NAMES.pages,
   CHATGPT_BUNDLE_FILE_NAMES.evidenceIndex,
 ];
@@ -197,14 +234,13 @@ const JSON_FILE_PATHS = [
 /** `edgeCaseAuditRun()` の各ページの `page.json` のパス（パスの順。R16f）。 */
 const EDGE_PAGE_JSON_PATHS = ['pages/PAGE-000001/page.json', 'pages/PAGE-000002/page.json'];
 
-/** ZIP の中で、スクリーンショットの前に並ぶファイル（JSON と、各ページの `page.json`）の数。 */
-const EDGE_FILES_BEFORE_SCREENSHOTS = JSON_FILE_PATHS.length + EDGE_PAGE_JSON_PATHS.length;
+/** ZIP の中で、スクリーンショットの前に並ぶファイル（JSON・README と、各ページの `page.json`）の数。 */
+const EDGE_FILES_BEFORE_SCREENSHOTS = LEADING_FILE_PATHS.length + EDGE_PAGE_JSON_PATHS.length;
 
-/** `edgeCaseAuditRun()` の関係するスクリーンショットを、入れる順（`VIEWPORT` のパスの順、`FULL_PAGE` のパスの順。設計書 6.1.11）に並べたもの。 */
+/** `edgeCaseAuditRun()` の関係するスクリーンショットを、入れる順（`VIEWPORT` のパスの順。T44f: `FULL_PAGE` は入れない）に並べたもの。 */
 const EDGE_RELATED_SCREENSHOT_READ_ORDER = [
   'pages/PAGE-000001/desktop/viewport.png',
   'pages/PAGE-000002/desktop/viewport.png',
-  'pages/PAGE-000001/desktop/full-page.png',
 ];
 
 afterEach(() => {
@@ -216,12 +252,11 @@ afterEach(() => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe('createChatGptBundle', () => {
-  it('puts manifest, run, summary, findings, pages and the Evidence index first, then the related screenshots in path order', async () => {
+  it('puts manifest, README, run, summary, the digests by Rule, findings, pages and the Evidence index first, then the related screenshots in path order', async () => {
     const result = edgeCaseAuditRun();
-    // 見本の前提: 関係するスクリーンショットのパスは、この3つである。
+    // 見本の前提: バンドルに入れる関係するスクリーンショット（見える範囲）のパスは、この 2 つである（T44f: 関係するページ全体のものは入れない）。
     expect([
       screenshotPathOf(result, EDGE_SHOTS.desktopViewport),
-      screenshotPathOf(result, EDGE_SHOTS.desktopFullPage),
       screenshotPathOf(result, EDGE_SHOTS.secondDesktopViewport),
     ].sort()).toEqual(EDGE_RELATED_SCREENSHOT_PATHS);
 
@@ -229,16 +264,21 @@ describe('createChatGptBundle', () => {
 
     expect(Object.keys(entries)).toEqual([
       'manifest.json',
+      // T44i: 読み方の案内と、Rule ごとの要約。
+      'README.md',
       'run.json',
       'summary.json',
+      'findings-by-rule.json',
       'findings.json',
+      // BN-d: 本体から外した指摘（遮断が原因・影響の可能性・安全の区分）。
+      'beaksight-related-findings.json',
       'pages.json',
       'evidence-index.json',
       // R16f: 各ページの page.json（パスの順）を、evidence-index.json の後、スクリーンショットの前に入れる。
       ...EDGE_PAGE_JSON_PATHS,
       ...EDGE_RELATED_SCREENSHOT_PATHS,
     ]);
-    expect(JSON_FILE_PATHS).toEqual(Object.keys(entries).slice(0, JSON_FILE_PATHS.length));
+    expect(LEADING_FILE_PATHS).toEqual(Object.keys(entries).slice(0, LEADING_FILE_PATHS.length));
     expect(EDGE_PAGE_JSON_PATHS).toEqual(result.pages.map((value) => pageArtifactRelativePath(value.pageId, 'page')).sort());
   });
 
@@ -247,9 +287,10 @@ describe('createChatGptBundle', () => {
     const entries = unzipSync(await bundleOf(result));
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
-    expect(CHATGPT_BUNDLE_SCHEMA_VERSION).toBe('chatgpt-bundle/1.0');
+    // T44i: README.md と findings-by-rule.json を足したので、版を 1.1 にした。BN-d: 本体と外した指摘を分けたので、1.2 にした。
+    expect(CHATGPT_BUNDLE_SCHEMA_VERSION).toBe('chatgpt-bundle/1.2');
     expect(manifest).toEqual({
-      bundleSchemaVersion: 'chatgpt-bundle/1.0',
+      bundleSchemaVersion: 'chatgpt-bundle/1.2',
       runId: result.run.runId,
       runStatus: result.run.runStatus,
       toolVersion: result.run.toolVersion,
@@ -265,6 +306,8 @@ describe('createChatGptBundle', () => {
     });
     expect(manifest.files.map(({ path }) => path)).toEqual(Object.keys(entries).slice(1));
     expect(manifest.files.map(({ path }) => path)).toEqual(expect.arrayContaining(EDGE_PAGE_JSON_PATHS));
+    // T44i: 目録は、読み方の案内と Rule ごとの要約も、大きさと SHA-256 つきで持つ。
+    expect(manifest.files.map(({ path }) => path).slice(0, 4)).toEqual(['README.md', 'run.json', 'summary.json', 'findings-by-rule.json']);
     expect(CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES).toBe(64 * 1024 * 1024);
     expect(result.run.runStatus).toBe('PARTIAL');
   });
@@ -361,7 +404,7 @@ describe('createChatGptBundle', () => {
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
     expect(Object.keys(entries)).not.toContain('run.json');
-    expect(Object.keys(entries).slice(0, 5)).toEqual(JSON_FILE_PATHS.filter((path) => path !== 'run.json'));
+    expect(Object.keys(entries).slice(0, LEADING_FILE_PATHS.length - 1)).toEqual(LEADING_FILE_PATHS.filter((path) => path !== 'run.json'));
     // 入れられなかったファイルは、ZIP の中の順（run.json、スクリーンショットのパスの順）に並ぶ。
     expect(manifest.omittedFiles).toEqual([
       { path: 'run.json', reason: 'ARTIFACT_FILE_NOT_FOUND' },
@@ -409,20 +452,24 @@ describe('createChatGptBundle', () => {
     const entries = unzipSync(await bundleOf(result));
     const findings = jsonOf(entries, 'findings.json');
 
+    // BN-d: `findings.json` は本体の Finding（表示用モデルの `mainFindings`。この見本では SAFETY の 6 番を除く全部）だけ。
+    expect(model.mainFindings.map((view) => view.finding.findingId)).toEqual(
+      result.findings.filter((value) => value.severity !== 'SAFETY').map((value) => value.findingId),
+    );
     expect(findings).toEqual(
-      JSON.parse(JSON.stringify(result.findings.map((value, index) => ({
-        finding: value,
-        evidence: value.evidenceRefs.map((evidenceId) => {
-          const location = model.findings[index]?.evidence.find((ref) => ref.evidenceId === evidenceId)?.location ?? null;
-          return { evidenceId, path: location?.path ?? null, pointer: location?.pointer ?? null };
-        }),
-        screenshotPaths: model.findings[index]?.screenshots.map((shot) => shot.relativePath) ?? [],
+      JSON.parse(JSON.stringify(model.mainFindings.map((view) => ({
+        finding: view.finding,
+        evidence: view.evidence.map(({ evidenceId, location }) => ({ evidenceId, path: location?.path ?? null, pointer: location?.pointer ?? null })),
+        // T44f: バンドルに入れる撮り方（見える範囲）のスクリーンショットだけ。
+        screenshotPaths: view.screenshots.filter((shot) => shot.captureType === 'VIEWPORT').map((shot) => shot.relativePath),
       })))),
     );
-    // 見本の確認: ERROR の Finding は、Desktop の2枚のスクリーンショットに関係づく。どのページにもない Evidence は、場所が null。
+    // 見本の確認: ERROR の Finding は、Desktop の2枚のスクリーンショットに関係づくが、バンドルの screenshotPaths は見える範囲の 1 枚だけ（T44f）。どのページにも
+    // ない Evidence は、場所が null。
     const parsed = findings as readonly { readonly evidence: readonly { readonly path: string | null }[]; readonly screenshotPaths: readonly string[] }[];
-    expect(parsed[0]?.screenshotPaths).toEqual(['pages/PAGE-000001/desktop/viewport.png', 'pages/PAGE-000001/desktop/full-page.png']);
-    expect(parsed[6]?.evidence).toEqual([{ evidenceId: unknownEvidence, path: null, pointer: null }]);
+    expect(model.findings[0]?.screenshots.map((shot) => shot.relativePath)).toEqual(['pages/PAGE-000001/desktop/viewport.png', 'pages/PAGE-000001/desktop/full-page.png']);
+    expect(parsed[0]?.screenshotPaths).toEqual(['pages/PAGE-000001/desktop/viewport.png']);
+    expect(parsed.at(-1)?.evidence).toEqual([{ evidenceId: unknownEvidence, path: null, pointer: null }]);
   });
 
   it('puts the summary and the pages of the view model, referring to Findings and Evidence by ID and without the reason descriptions', async () => {
@@ -438,11 +485,13 @@ describe('createChatGptBundle', () => {
       JSON.parse(JSON.stringify({ ...model.summary, executions, incompleteReasons: withoutDescription(model.summary.incompleteReasons) })),
     );
     expect(jsonOf(entries, 'pages.json')).toEqual(
-      JSON.parse(JSON.stringify(model.pages.map(({ findings, retryAttempts, incompleteReasons, viewports, ...rest }) => ({
+      JSON.parse(JSON.stringify(model.pages.map(({ findings: _findings, mainFindingIds, excludedFindingIds, retryAttempts, incompleteReasons, viewports, ...rest }) => ({
         ...rest,
         incompleteReasons: withoutDescription(incompleteReasons),
         viewports: viewports.map((viewport) => ({ ...viewport, incompleteReasons: withoutDescription(viewport.incompleteReasons) })),
-        findingIds: findings.map((value) => value.finding.findingId),
+        // BN-d: 本体の Finding の ID と、外した Finding の ID。
+        findingIds: mainFindingIds,
+        excludedFindingIds,
         retryAttempts: retryAttempts.map(({ evidence, ...attempt }) => ({
           ...attempt,
           evidenceIds: evidence.map((location) => location.evidenceId),
@@ -483,6 +532,30 @@ describe('createChatGptBundle', () => {
     }
   });
 
+  // AS-b（監査の段の送信の扱いの設計書 2.3）: `summary.json` の `auditSend` は、表示用モデルの要約の `auditSend`（扱い、目立つ形で出すか、通した数）と同じ値。
+  // バンドルの側で数え直さない。日本語の文言は入れない。
+  it('puts the same audit send policy and passed counts as the view model summary in summary.json', async () => {
+    const base = edgeCaseAuditRun();
+    const auditSend = { policy: 'PASS_EXCEPT_DELETE', passedRequests: 5, passedRequestsByMethod: { POST: 4, PUT: 1 } } as const;
+    const result: AuditRunResult = { ...base, run: { ...base.run, safety: { ...base.run.safety, auditSend } } };
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly auditSend?: unknown };
+
+    // AS-c: 持たない Run は、ほかの Origin へ通した数と WebSocket の接続の数を 0 と読む。
+    // AS-c fix round 1: Guard の判定を通らずに開いた接続と危険な語の接続も 0 と読み、その知らせは出さない。
+    expect(summary.auditSend).toEqual({
+      ...auditSend,
+      prominent: true,
+      passedOtherOriginRequests: 0,
+      passedWebSockets: 0,
+      passedWebSocketsOutsideGuard: 0,
+      passedDangerousWebSockets: 0,
+      webSocketCaution: false,
+    });
+    expect(summary.auditSend).toEqual(JSON.parse(JSON.stringify(model.summary.auditSend)));
+  });
+
   it('puts one execution and no resume in summary.json for a Run that was not interrupted', async () => {
     const result = auditRun();
     const entries = unzipSync(await bundleOf(result));
@@ -513,7 +586,8 @@ describe('createChatGptBundle', () => {
     expect(text).not.toContain(RUN_EXECUTION_END_REASON_CATALOG.STOPPED_BY_SIGNAL.label);
   });
 
-  it('writes JSON with two-space indentation and a trailing LF, keeping codes and leaving out Japanese labels', async () => {
+  // T44f（Task 44 の設計書 P3-1）: artifact の JSON の書式は字下げなし。
+  it('writes JSON without indentation and with a trailing LF, keeping codes and leaving out Japanese labels', async () => {
     const result = edgeCaseAuditRun();
     const model = buildReportViewModel(result);
     const entries = unzipSync(await bundleOf(result));
@@ -522,7 +596,7 @@ describe('createChatGptBundle', () => {
 
     for (const path of JSON_FILE_PATHS.filter((value) => value !== 'run.json')) {
       const text = decodeUtf8(entries[path] ?? new Uint8Array());
-      expect(text, path).toBe(`${JSON.stringify(JSON.parse(text), null, 2)}\n`);
+      expect(text, path).toBe(`${JSON.stringify(JSON.parse(text))}\n`);
       expect(text.includes('\r'), path).toBe(false);
       for (const description of descriptions) {
         expect(text.includes(description), path).toBe(false);
@@ -652,7 +726,7 @@ describe('createChatGptBundle: the page.json of each page (R16f, design 6.1.11)'
     const entries = unzipSync(await bundleOf(result, store));
     const paths = Object.keys(entries);
 
-    expect(paths.slice(JSON_FILE_PATHS.length, EDGE_FILES_BEFORE_SCREENSHOTS)).toEqual(EDGE_PAGE_JSON_PATHS);
+    expect(paths.slice(LEADING_FILE_PATHS.length, EDGE_FILES_BEFORE_SCREENSHOTS)).toEqual(EDGE_PAGE_JSON_PATHS);
     expect(store.calls.slice(1, 1 + EDGE_PAGE_JSON_PATHS.length)).toEqual(EDGE_PAGE_JSON_PATHS);
     for (const path of EDGE_PAGE_JSON_PATHS) {
       expect(entries[path], path).toEqual(store.files.get(path));
@@ -662,7 +736,8 @@ describe('createChatGptBundle: the page.json of each page (R16f, design 6.1.11)'
   it('leaves out a page.json that cannot be read and records it in the manifest, in the order of the ZIP', async () => {
     const result = edgeCaseAuditRun();
     const [missingPage, presentPage] = EDGE_PAGE_JSON_PATHS as [string, string];
-    const missingScreenshot = 'pages/PAGE-000001/desktop/full-page.png';
+    // T44f: バンドルに入れるのは見える範囲のスクリーンショットだけなので、読めないものも見える範囲のもので確かめる。
+    const missingScreenshot = 'pages/PAGE-000002/desktop/viewport.png';
     const entries = unzipSync(await bundleOf(result, artifactStore(result, [missingScreenshot, missingPage, 'run.json'])));
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
@@ -693,7 +768,15 @@ describe('createChatGptBundle: the page.json of each page (R16f, design 6.1.11)'
 });
 
 describe('createChatGptBundle: the budget of the screenshots (R16f, design 6.1.11)', () => {
-  const [p1Viewport, p2Viewport, p1FullPage] = EDGE_RELATED_SCREENSHOT_READ_ORDER as [string, string, string];
+  const [p1Viewport, p2Viewport] = EDGE_RELATED_SCREENSHOT_READ_ORDER as [string, string];
+  /** T44f: 関係はあるが、バンドルに入れないページ全体のスクリーンショット。 */
+  const p1FullPage = screenshotPathOf(edgeCaseAuditRun(), EDGE_SHOTS.desktopFullPage);
+  /** T44f: 見える範囲のスクリーンショットを 3 つにする（再試行の前の試行のスクリーンショットを直接参照する Finding を足す）。 */
+  const withRetryShot = (): AuditRunResult => {
+    const base = edgeCaseAuditRun();
+    return { ...base, findings: [...base.findings, finding(7, 'INFO', 'LAYOUT', PAGE_1, [EDGE_SHOTS.retryDesktopViewport])] };
+  };
+  const retryViewport = 'pages/PAGE-000001/retry-1/desktop/viewport.png';
 
   /** 大きさを変えたスクリーンショットを置いた、書き出し済みの Run のディレクトリの代わり。 */
   const sizedStore = (
@@ -716,36 +799,53 @@ describe('createChatGptBundle: the budget of the screenshots (R16f, design 6.1.1
     expect(injected.screenshotBudgetBytes).toBe(12_345);
   });
 
-  it('puts the VIEWPORT screenshots first and leaves out a FULL_PAGE one that would go over the budget', async () => {
+  // T44f（Task 44 の設計書 P3-1 の E）: バンドルには、ページ全体のスクリーンショット（FULL_PAGE）を入れない（読まない。成果物のフォルダには残る）。
+  // findings.json の screenshotPaths も、バンドルに入る見える範囲のスクリーンショット（VIEWPORT）だけ。
+  it('leaves the FULL_PAGE screenshots out of the bundle and out of the screenshot paths of findings.json (T44f)', async () => {
     const result = edgeCaseAuditRun();
-    // どれも 40 バイト。パスの順（full-page.png が先）に入れると、PAGE-000002 の VIEWPORT が入らない。
-    const store = sizedStore(result, [[p1Viewport, 40], [p2Viewport, 40], [p1FullPage, 40]]);
+    const store = artifactStore(result);
+    const entries = unzipSync(await bundleOf(result, store));
+    expect(store.calls).not.toContain(p1FullPage);
+    expect(Object.keys(entries)).not.toContain(p1FullPage);
+    expect(screenshotEntriesOf(entries)).toEqual([p1Viewport, p2Viewport].sort());
+    const manifest = jsonOf(entries, 'manifest.json') as Manifest;
+    expect(manifest.omittedFiles).toEqual([]);
+    const findings = jsonOf(entries, 'findings.json') as readonly { readonly screenshotPaths: readonly string[] }[];
+    expect(findings.flatMap(({ screenshotPaths }) => screenshotPaths)).not.toContain(p1FullPage);
+    expect(findings[0]?.screenshotPaths).toEqual([p1Viewport]);
+  });
+
+  it('leaves out a screenshot that would go over the budget', async () => {
+    const result = edgeCaseAuditRun();
+    // 60（入る）→ 50（合計 110 で超えるので、入れない）。
+    const store = sizedStore(result, [[p1Viewport, 60], [p2Viewport, 50]]);
     const entries = unzipSync(await bundleOf(result, store, { screenshotBudgetBytes: 100 }));
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
-    expect(screenshotEntriesOf(entries)).toEqual([p1Viewport, p2Viewport].sort());
-    expect(manifest.omittedFiles).toEqual([{ path: p1FullPage, reason: 'BUNDLE_SIZE_LIMIT' }]);
-    expect(manifest.files.map(({ path }) => path)).not.toContain(p1FullPage);
+    expect(screenshotEntriesOf(entries)).toEqual([p1Viewport]);
+    expect(manifest.omittedFiles).toEqual([{ path: p2Viewport, reason: 'BUNDLE_SIZE_LIMIT' }]);
+    expect(manifest.files.map(({ path }) => path)).not.toContain(p2Viewport);
     expect(manifest.runStatus).toBe(result.run.runStatus);
   });
 
   it('still puts a smaller screenshot after one that went over the budget, keeping the path order in the ZIP', async () => {
-    const result = edgeCaseAuditRun();
-    // 60（入る。合計 60）→ 50（合計 110 で超えるので、入れない）→ 30（合計 90 で入る）。
-    const store = sizedStore(result, [[p1Viewport, 60], [p2Viewport, 50], [p1FullPage, 30]]);
+    const result = withRetryShot();
+    // 入れる順はパスの順（p1、retry、p2）。60（入る。合計 60）→ 50（合計 110 で超えるので、入れない）→ 30（合計 90 で入る）。
+    const store = sizedStore(result, [[p1Viewport, 60], [retryViewport, 50], [p2Viewport, 30]]);
     const entries = unzipSync(await bundleOf(result, store, { screenshotBudgetBytes: 100 }));
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
-    expect(screenshotEntriesOf(entries)).toEqual([p1FullPage, p1Viewport]);
-    expect(manifest.omittedFiles).toEqual([{ path: p2Viewport, reason: 'BUNDLE_SIZE_LIMIT' }]);
-    expect(entries[p1FullPage]?.byteLength).toBe(30);
+    expect(screenshotEntriesOf(entries)).toEqual([p1Viewport, p2Viewport]);
+    expect(manifest.omittedFiles).toEqual([{ path: retryViewport, reason: 'BUNDLE_SIZE_LIMIT' }]);
+    expect(entries[p2Viewport]?.byteLength).toBe(30);
     expect(entries[p1Viewport]?.byteLength).toBe(60);
+    expect(Object.keys(entries)).not.toContain(p1FullPage);
   });
 
   it('puts every screenshot when the total is exactly the budget, and none when the budget is 0', async () => {
     const result = edgeCaseAuditRun();
-    const sizes = [[p1Viewport, 40], [p2Viewport, 40], [p1FullPage, 40]] as const;
-    const exact = unzipSync(await bundleOf(result, sizedStore(result, sizes), { screenshotBudgetBytes: 120 }));
+    const sizes = [[p1Viewport, 40], [p2Viewport, 40]] as const;
+    const exact = unzipSync(await bundleOf(result, sizedStore(result, sizes), { screenshotBudgetBytes: 80 }));
     expect(screenshotEntriesOf(exact)).toEqual(EDGE_RELATED_SCREENSHOT_PATHS);
     expect((jsonOf(exact, 'manifest.json') as Manifest).omittedFiles).toEqual([]);
 
@@ -755,23 +855,24 @@ describe('createChatGptBundle: the budget of the screenshots (R16f, design 6.1.1
     expect((jsonOf(zero, 'manifest.json') as Manifest).omittedFiles).toEqual(
       EDGE_RELATED_SCREENSHOT_PATHS.map((path) => ({ path, reason: 'BUNDLE_SIZE_LIMIT' })),
     );
-    // page.json と JSON は、上限の対象ではない。
-    expect(Object.keys(zero)).toEqual([...JSON_FILE_PATHS, ...EDGE_PAGE_JSON_PATHS]);
+    // page.json と JSON（と README）は、上限の対象ではない。
+    expect(Object.keys(zero)).toEqual([...LEADING_FILE_PATHS, ...EDGE_PAGE_JSON_PATHS]);
   });
 
   it('does not count a screenshot that cannot be read against the budget', async () => {
     const result = edgeCaseAuditRun();
-    const store = sizedStore(result, [[p1Viewport, 60], [p2Viewport, 50], [p1FullPage, 40]], [p1Viewport]);
+    const store = sizedStore(result, [[p1Viewport, 60], [p2Viewport, 50]], [p1Viewport]);
     const entries = unzipSync(await bundleOf(result, store, { screenshotBudgetBytes: 100 }));
     const manifest = jsonOf(entries, 'manifest.json') as Manifest;
 
-    expect(screenshotEntriesOf(entries)).toEqual([p1FullPage, p2Viewport]);
+    // 読めなかった 60 は数えないので、50 が入る（数えると 110 で超える）。
+    expect(screenshotEntriesOf(entries)).toEqual([p2Viewport]);
     expect(manifest.omittedFiles).toEqual([{ path: p1Viewport, reason: 'ARTIFACT_FILE_NOT_FOUND' }]);
   });
 
   it('makes the same bytes from the same input and the same budget', async () => {
     const result = edgeCaseAuditRun();
-    const sizes = [[p1Viewport, 60], [p2Viewport, 50], [p1FullPage, 30]] as const;
+    const sizes = [[p1Viewport, 60], [p2Viewport, 50]] as const;
     const first = await bundleOf(result, sizedStore(result, sizes), { screenshotBudgetBytes: 100 });
     const second = await bundleOf(result, sizedStore(result, sizes), { screenshotBudgetBytes: 100 });
     expect(second).toEqual(first);
@@ -788,12 +889,346 @@ describe('createChatGptBundle: the budget of the screenshots (R16f, design 6.1.1
   );
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+// T44i（Task 44 の設計書 6 章の 2026-10-22 の行。P2-9）: 読み方の案内（README.md）と、Rule ごとの要約（findings-by-rule.json）
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('createChatGptBundle: the guide and the digests by Rule (T44i)', () => {
+  const textOf = (entries: Readonly<Record<string, Uint8Array>>, path: string): string => decodeUtf8(entries[path] ?? new Uint8Array());
+  const code = (value: string): string => `\`${value}\``;
+  const tableRow = (cells: readonly string[]): string => `| ${cells.join(' | ')} |`;
+
+  /** 見分けやすい値を、案内に出してはならない欄に入れた見本（targetId、startUrl、許可 Origin、Finding の文と pageUrl）。 */
+  const DISTINCT = Object.freeze({
+    targetId: 'readme-distinct-target-4c1d',
+    startPath: '/readme-distinct-start-8e2b',
+    message: 'README-DISTINCT-MESSAGE-71f0',
+    pagePath: '/readme-distinct-page-93aa',
+  });
+  const distinctRun = (): AuditRunResult => {
+    const base = edgeCaseAuditRun();
+    return {
+      ...base,
+      run: { ...base.run, target: { id: DISTINCT.targetId }, startUrl: fixtureUrl(DISTINCT.startPath) },
+      findings: base.findings.map((value) => ({
+        ...value,
+        message: `${DISTINCT.message} ${value.message}`,
+        pageUrl: value.pageId === null ? value.pageUrl : fixtureUrl(DISTINCT.pagePath),
+      })),
+    };
+  };
+
+  it('puts the digests by Rule of the view model, with the paths of the screenshots of the bundled capture types only', async () => {
+    const result = edgeCaseAuditRun();
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+
+    const digestEntries = (digests: typeof model.ruleDigests): unknown =>
+      digests.map(({ examples, ...digest }) => ({
+        ...digest,
+        examples: examples.map(({ screenshots, ...example }) => ({
+          ...example,
+          screenshotPaths: screenshots.filter((shot) => shot.captureType === 'VIEWPORT').map((shot) => shot.relativePath),
+        })),
+      }));
+    // BN-d: 本体の Finding の要約（`main`）と、外した Finding の要約（`excluded`）。
+    expect(jsonOf(entries, 'findings-by-rule.json')).toEqual(
+      JSON.parse(JSON.stringify({ main: digestEntries(model.mainRuleDigests), excluded: digestEntries(model.excludedRuleDigests) })),
+    );
+    // 見本の確かめ: ERROR の Rule（TEST_RULE_1）の例は、見える範囲のスクリーンショットだけを持つ（ページ全体のものは、バンドルに入らない）。
+    const digests = (jsonOf(entries, 'findings-by-rule.json') as {
+      readonly main: readonly { readonly ruleId: string; readonly examples: readonly { readonly screenshotPaths: readonly string[] }[] }[];
+    }).main;
+    expect(digests[0]?.ruleId).toBe('TEST_RULE_1');
+    expect(digests[0]?.examples[0]?.screenshotPaths).toEqual(['pages/PAGE-000001/desktop/viewport.png']);
+  });
+
+  it('puts the counts by category and by Rule of the view model in summary.json', async () => {
+    const result = edgeCaseAuditRun();
+    const model = buildReportViewModel(result);
+    const summary = jsonOf(unzipSync(await bundleOf(result)), 'summary.json') as { readonly findingCountsByCategory?: unknown; readonly findingCountsByRule?: unknown };
+
+    expect(summary.findingCountsByCategory).toEqual(JSON.parse(JSON.stringify(model.summary.findingCountsByCategory)));
+    expect(summary.findingCountsByRule).toEqual(JSON.parse(JSON.stringify(model.summary.findingCountsByRule)));
+  });
+
+  it('writes the guide as UTF-8 Markdown with LF line ends and one trailing LF, the same bytes from the same input', async () => {
+    const result = edgeCaseAuditRun();
+    const first = unzipSync(await bundleOf(result));
+    const second = unzipSync(await bundleOf(result));
+    const text = textOf(first, 'README.md');
+
+    expect(first['README.md']).toEqual(second['README.md']);
+    expect(text.includes('\r')).toBe(false);
+    expect(text.endsWith('\n')).toBe(true);
+    expect(text.endsWith('\n\n')).toBe(false);
+    expect(text.startsWith(`# ${CHATGPT_BUNDLE_GUIDE_TEXT.title}\n`)).toBe(true);
+  });
+
+  it('names the files in the reading order, and explains the repetition of the same Finding on each page', async () => {
+    const text = textOf(unzipSync(await bundleOf(edgeCaseAuditRun())), 'README.md');
+    // BN-d: 外した指摘のファイルを、本体の次に読む。
+    const readingOrder = ['summary.json', 'findings-by-rule.json', 'findings.json', 'beaksight-related-findings.json', 'pages.json', 'evidence-index.json'];
+    const order = readingOrder.map((name, index) => text.indexOf(`${String(index + 1)}. ${code(name)}`));
+
+    expect(order.every((position) => position >= 0), String(order)).toBe(true);
+    expect([...order].sort((left, right) => left - right)).toEqual(order);
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.readingOrderHeading);
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.repetitionNote(code('findings.json'), code('findings-by-rule.json')));
+    expect(text).toContain(code('pages/<pageId>/page.json'));
+  });
+
+  it('has the table of the counts by category (every category, in the display order) and the table of the Rules', async () => {
+    const result = edgeCaseAuditRun();
+    const model = buildReportViewModel(result);
+    const text = textOf(unzipSync(await bundleOf(result)), 'README.md');
+    const lines = text.split('\n');
+
+    expect(lines).toContain(tableRow([...CHATGPT_BUNDLE_GUIDE_TEXT.categoryColumns]));
+    const categoryRows = model.summary.findingCountsByCategory.map((entry) =>
+      tableRow([FINDING_CATEGORY_CATALOG[entry.category].label, code(entry.category), String(entry.count)]));
+    const categoryPositions = categoryRows.map((row) => lines.indexOf(row));
+    expect(categoryPositions.every((position) => position >= 0), categoryRows.join('\n')).toBe(true);
+    expect([...categoryPositions].sort((left, right) => left - right)).toEqual(categoryPositions);
+    // 見本の確かめ: 0 件の category（HTTP）も、行を持つ。
+    expect(lines).toContain(tableRow([FINDING_CATEGORY_CATALOG.HTTP.label, code('HTTP'), '0']));
+
+    expect(lines).toContain(tableRow([...CHATGPT_BUNDLE_GUIDE_TEXT.ruleColumns]));
+    // BN-d: Rule の表は、本体の Finding の要約。
+    const ruleRows = model.mainRuleDigests.map((digest) =>
+      tableRow([
+        code(digest.ruleId),
+        listText(sortByDisplayOrder(SEVERITIES, SEVERITY_CATALOG).filter((severity) => digest.bySeverity[severity] > 0).map((severity) => SEVERITY_CATALOG[severity].label)),
+        FINDING_CATEGORY_CATALOG[digest.category].label,
+        String(digest.count),
+        String(digest.pageCount),
+      ]));
+    const rulePositions = ruleRows.map((row) => lines.indexOf(row));
+    expect(rulePositions.every((position) => position >= 0), ruleRows.join('\n')).toBe(true);
+    expect([...rulePositions].sort((left, right) => left - right)).toEqual(rulePositions);
+  });
+
+  it('tells the Run Status, the page coverage and that the Findings of the Safety group are records of BeakSight, not defects of the site', async () => {
+    const result = edgeCaseAuditRun();
+    const text = textOf(unzipSync(await bundleOf(result)), 'README.md');
+
+    expect(text).toContain(`${RUN_STATUS_CATALOG.PARTIAL.label}（${code('PARTIAL')}）`);
+    expect(text).toContain(code(result.run.runId));
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.incompletePagesNote(code('summary.json')));
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.safetyNote(SEVERITY_GROUP_CATALOG.SAFETY.label));
+    expect(text).toContain(`${RUN_SUMMARY_TEXT.coverage.discovered} 2件`);
+  });
+
+  // T44R2 の I-5・M-6: 送信の扱いが PASS_EXCEPT_DELETE の Run や認証つきの Run は、読むだけではないので、「読むだけで」と書かない。安全の区分の Finding は、
+  // BeakSight の決まりで止めた送信や操作（多くはページが出した送信）の記録であると書く（重大度と区分を混ぜない）。
+  it('does not say that the audit only read the site, and tells what the Findings of the Safety group record', async () => {
+    const text = textOf(unzipSync(await bundleOf(edgeCaseAuditRun())), 'README.md');
+
+    expect(text).not.toContain('読むだけ');
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.intro);
+    const safetyNote = CHATGPT_BUNDLE_GUIDE_TEXT.safetyNote(SEVERITY_GROUP_CATALOG.SAFETY.label);
+    expect(text).toContain(safetyNote);
+    expect(safetyNote).toContain('ページが出した送信');
+    expect(safetyNote).toContain(`重大度の区分が「${SEVERITY_GROUP_CATALOG.SAFETY.label}」`);
+  });
+
+  // T44R2 の I-5: 送信の扱いの行（`summary.auditSend.policy` を `AUDIT_SEND_POLICY_CATALOG` の名前で）と、ログインの送信の一般の文。扱いが違えば README も違う。
+  it('writes the audit send policy of the Run with its catalog name, so READ_ONLY and PASS_EXCEPT_DELETE give different guides', async () => {
+    const base = edgeCaseAuditRun();
+    const withPolicy = (policy: 'READ_ONLY' | 'PASS_EXCEPT_DELETE'): AuditRunResult => ({
+      ...base,
+      run: { ...base.run, safety: { ...base.run.safety, auditSend: { policy, passedRequests: 0, passedRequestsByMethod: {} } } },
+    });
+    const readOnly = textOf(unzipSync(await bundleOf(withPolicy('READ_ONLY'))), 'README.md');
+    const passExceptDelete = textOf(unzipSync(await bundleOf(withPolicy('PASS_EXCEPT_DELETE'))), 'README.md');
+    const policyLine = (policy: 'READ_ONLY' | 'PASS_EXCEPT_DELETE'): string =>
+      `- ${AUDIT_SEND_TEXT.label}: ${AUDIT_SEND_POLICY_CATALOG[policy].label}（${code(policy)}）`;
+
+    expect(readOnly).not.toBe(passExceptDelete);
+    expect(readOnly.split('\n')).toContain(policyLine('READ_ONLY'));
+    expect(passExceptDelete.split('\n')).toContain(policyLine('PASS_EXCEPT_DELETE'));
+    expect(readOnly).not.toContain(AUDIT_SEND_POLICY_CATALOG.PASS_EXCEPT_DELETE.label);
+    expect(passExceptDelete).not.toContain(AUDIT_SEND_POLICY_CATALOG.READ_ONLY.label);
+    for (const text of [readOnly, passExceptDelete]) {
+      expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.loginNote);
+    }
+  });
+
+  it('says that there is no Finding instead of an empty table of the Rules', async () => {
+    const base = auditRun();
+    const result: AuditRunResult = { ...base, findings: [] };
+    const text = textOf(unzipSync(await bundleOf(result)), 'README.md');
+
+    expect(text).toContain(CHATGPT_BUNDLE_GUIDE_TEXT.noRules);
+    expect(text.split('\n')).not.toContain(tableRow([...CHATGPT_BUNDLE_GUIDE_TEXT.ruleColumns]));
+  });
+
+  it('does not write a URL, the targetId, the startUrl or the message of a Finding in the guide', async () => {
+    const result = distinctRun();
+    const entries = unzipSync(await bundleOf(result));
+    const text = textOf(entries, 'README.md');
+    // 見本の確かめ: 見分けやすい値は、バンドルのほかのファイルには入っている。
+    expect(textOf(entries, 'summary.json')).toContain(DISTINCT.targetId);
+    expect(textOf(entries, 'summary.json')).toContain(DISTINCT.startPath);
+    expect(textOf(entries, 'findings.json')).toContain(DISTINCT.message);
+    expect(textOf(entries, 'findings.json')).toContain(DISTINCT.pagePath);
+    expect(textOf(entries, 'findings-by-rule.json')).toContain(DISTINCT.message);
+
+    for (const value of [
+      DISTINCT.targetId,
+      DISTINCT.startPath,
+      DISTINCT.message,
+      DISTINCT.pagePath,
+      FIXTURE_ORIGIN,
+      '127.0.0.1',
+      '://',
+      'mailto:',
+      'tel:',
+      'javascript:',
+      ...result.findings.map((value) => value.message),
+    ]) {
+      expect(text.includes(value), value).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// BN-d（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.5）: 本体（`findings.json`）と、外した指摘（`beaksight-related-findings.json`）
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('createChatGptBundle: the body and the Findings related to the BeakSight blocks (BN-d)', () => {
+  const textOf = (entries: Readonly<Record<string, Uint8Array>>, path: string): string => decodeUtf8(entries[path] ?? new Uint8Array());
+  const code = (value: string): string => `\`${value}\``;
+  interface BundledFinding {
+    readonly finding: { readonly findingId: string; readonly severity: string };
+    readonly beaksightBlockRelation?: { readonly relation: string; readonly reason: string; readonly blocks: readonly unknown[]; readonly blockCount: number } | null;
+  }
+
+  it('is the version 1.2, and puts beaksight-related-findings.json right after findings.json', async () => {
+    const entries = unzipSync(await bundleOf(beaksightBlockAuditRun()));
+    expect(CHATGPT_BUNDLE_SCHEMA_VERSION).toBe('chatgpt-bundle/1.2');
+    expect((jsonOf(entries, 'manifest.json') as Manifest).bundleSchemaVersion).toBe('chatgpt-bundle/1.2');
+    const paths = Object.keys(entries);
+    expect(paths.indexOf(CHATGPT_BUNDLE_FILE_NAMES.relatedFindings)).toBe(paths.indexOf(CHATGPT_BUNDLE_FILE_NAMES.findings) + 1);
+    expect(CHATGPT_BUNDLE_FILE_NAMES.relatedFindings).toBe('beaksight-related-findings.json');
+  });
+
+  it('puts only the site quality Findings not linked to a block in findings.json, and the CAUSED, POSSIBLE and SAFETY ones with their relation in the related file', async () => {
+    const result = beaksightBlockAuditRun();
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    const body = jsonOf(entries, 'findings.json') as readonly BundledFinding[];
+    const related = jsonOf(entries, 'beaksight-related-findings.json') as readonly BundledFinding[];
+
+    expect(body.map((entry) => entry.finding.findingId)).toEqual(['FIND-000003', 'FIND-000004']);
+    expect(body.some((entry) => 'beaksightBlockRelation' in entry)).toBe(false);
+    expect(related.map((entry) => [entry.finding.findingId, entry.beaksightBlockRelation?.relation ?? null])).toEqual([
+      ['FIND-000001', 'CAUSED'],
+      ['FIND-000002', 'POSSIBLE'],
+      ['FIND-000005', null],
+    ]);
+    expect(related[0]?.beaksightBlockRelation).toEqual(JSON.parse(JSON.stringify(model.findings[0]?.beaksightBlockRelation)));
+    // 本体には、CAUSED・POSSIBLE・SAFETY の指摘が入らない。
+    const bodyIds = new Set(body.map((entry) => entry.finding.findingId));
+    for (const view of model.excludedFindings) {
+      expect(bodyIds.has(view.finding.findingId), view.finding.findingId).toBe(false);
+    }
+  });
+
+  it('splits the counts and the IDs of summary.json, findings-by-rule.json and pages.json into the body and the excluded ones', async () => {
+    const result = beaksightBlockAuditRun();
+    const model = buildReportViewModel(result);
+    const entries = unzipSync(await bundleOf(result));
+    const summary = jsonOf(entries, 'summary.json') as { readonly beaksightBlockRelation: unknown };
+    expect(summary.beaksightBlockRelation).toEqual(JSON.parse(JSON.stringify(model.summary.beaksightBlockRelation)));
+
+    const byRule = jsonOf(entries, 'findings-by-rule.json') as {
+      readonly main: readonly { readonly ruleId: string; readonly count: number }[];
+      readonly excluded: readonly { readonly ruleId: string; readonly count: number }[];
+    };
+    expect(Object.keys(byRule)).toEqual(['main', 'excluded']);
+    expect(byRule.main.map((digest) => [digest.ruleId, digest.count])).toEqual([['HTTP_4XX', 1], ['MISSING_TITLE', 1]]);
+    expect(byRule.excluded.map((digest) => [digest.ruleId, digest.count])).toEqual([
+      ['SCRIPT_LOAD_FAILED', 1],
+      ['MISSING_TITLE', 1],
+      ['SAFETY_NON_READ_REQUEST_BLOCKED', 1],
+    ]);
+
+    const pages = jsonOf(entries, 'pages.json') as readonly {
+      readonly findingIds: readonly string[];
+      readonly excludedFindingIds: readonly string[];
+      readonly mainFindingCounts: { readonly total: number };
+      readonly excludedFindingCounts: { readonly total: number };
+    }[];
+    expect(pages.map((entry) => [entry.findingIds, entry.excludedFindingIds])).toEqual([
+      [['FIND-000003'], ['FIND-000001', 'FIND-000002', 'FIND-000005']],
+      [['FIND-000004'], []],
+    ]);
+    expect(pages.map((entry) => [entry.mainFindingCounts.total, entry.excludedFindingCounts.total])).toEqual([[1, 3], [1, 0]]);
+    // 件数の一致: 本体と外した指摘の件数は、ファイルの件数と同じ。
+    const relatedCount = (jsonOf(entries, 'beaksight-related-findings.json') as readonly unknown[]).length;
+    expect(model.summary.beaksightBlockRelation.mainFindingCounts.total).toBe((jsonOf(entries, 'findings.json') as readonly unknown[]).length);
+    expect(model.summary.beaksightBlockRelation.excludedFindingCounts.total).toBe(relatedCount);
+  });
+
+  it('tells in the guide what the body means, the excluded counts by relation, the BeakSight blocks in page.json and the blocks while closing', async () => {
+    const result = beaksightBlockAuditRun();
+    const text = textOf(unzipSync(await bundleOf(result)), 'README.md');
+    const lines = text.split('\n');
+    const guide = CHATGPT_BUNDLE_GUIDE_TEXT;
+
+    expect(lines).toContain(`## ${guide.blockHeading}`);
+    expect(text).toContain(guide.bodyNote(code('findings.json'), code('beaksight-related-findings.json')));
+    expect(lines).toContain(`- ${guide.bodyCount}: 2件`);
+    for (const relation of ['CAUSED', 'POSSIBLE'] as const) {
+      const spec = BEAKSIGHT_BLOCK_RELATION_CATALOG[relation];
+      expect(lines).toContain(`- ${guide.excludedCount(spec.label)}（${code(relation)}）: ${guide.excludedCountValue('1件', spec.description)}`);
+    }
+    expect(text).not.toContain(guide.excludedCount(BEAKSIGHT_BLOCK_RELATION_CATALOG.NONE.label));
+    expect(lines).toContain(`- ${guide.excludedCount(SEVERITY_GROUP_CATALOG.SAFETY.label)}: 1件`);
+    expect(text).toContain(guide.blockedByClientNote(code('pages/<pageId>/page.json')));
+    expect(text).toContain(guide.closingNote);
+    // BN-R1 の M-5: 指摘の件数の行と category の別の件数の表は、外した指摘を含む全部の件数であることを書く。閉じる途中の遮断は、影響の可能性の元に使わない。
+    expect(text).toContain(`- ${guide.findingCounts}: 5件`);
+    expect(lines).toContain(`## ${guide.categoryHeading}`);
+    for (const label of [guide.findingCounts, guide.categoryHeading]) {
+      expect(label).toContain('本体と外した指摘を合わせた全部');
+    }
+    expect(guide.closingNote).toContain('影響の可能性（`POSSIBLE`）の元には使いません');
+    // 読む順に、外した指摘のファイルが、本体の次に入る。
+    const readingOrder = ['summary.json', 'findings-by-rule.json', 'findings.json', 'beaksight-related-findings.json', 'pages.json', 'evidence-index.json'];
+    const order = readingOrder.map((name, index) => text.indexOf(`${String(index + 1)}. ${code(name)}`));
+    expect(order.every((position) => position >= 0), String(order)).toBe(true);
+  });
+
+  it('makes the same bytes from the same input', async () => {
+    expect(sha256Of(await bundleOf(beaksightBlockAuditRun()))).toBe(sha256Of(await bundleOf(beaksightBlockAuditRun())));
+  });
+});
+
 // T32f（Task 32 の設計書 4.1 の「決定論の ZIP」）: ZIP の組み立て（時刻の固定、目録の sha256）を共通の部品 `deterministic-zip.ts`（T32R2 M-2 から `src/core/`）に
 // 出す前に、今のバンドルのバイト列を sha256 で固定する（移した後も、監査のバンドルは 1 バイトも変わらない）。
+// AS-b（監査の段の送信の扱いの設計書 2.1・2.3）で、値を求め直した: 見本の実効の設定に `audit.sendPolicy`（既定の `READ_ONLY`）が入り（`run.json`）、表示用モデルの要約に
+// `auditSend` が入った（`summary.json`）ため。ZIP の組み立ては変えていない。AS-c でも求め直した: 要約の `auditSend` に、ほかの Origin へ通した数と WebSocket の
+// 接続の数（持たない見本は 0）が入ったため。AS-c fix round 1 でも求め直した: 要約の `auditSend` に、Guard の判定を通らずに開いた WebSocket の接続と危険な語の
+// 接続の数（持たない見本は 0）と、その知らせを出すか（偽）が入ったため。T44f（Task 44 の設計書 P3-1 の A・E）でも求め直した: JSON を字下げなしで書き、
+// ページ全体のスクリーンショットを入れなくなったため。ZIP の組み立ては変えていない。
+// T44i（Task 44 の設計書 6 章の 2026-10-22 の行）でも求め直した: 読み方の案内（README.md）と Rule ごとの要約（findings-by-rule.json）を足し、版を 1.1 にし、要約に
+// category の別・Rule の別の件数が入ったため。ZIP の組み立ては変えていない。
+// BN-d（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.5）でも求め直した: 版を 1.2 にし、外した指摘のファイル（beaksight-related-findings.json）を
+// 足し、findings.json を本体の指摘だけにし、summary.json・findings-by-rule.json・pages.json の件数と ID を本体の分と外した分に分け、README.md に本体と外した
+// 指摘の節を足したため（BN-R0 の M-1・M-3 の印も含む）。ZIP の組み立ては変えていない。
+// BN-R1 の M-5 でも求め直した: README.md の指摘の件数の行と category の別の件数の表の名前に「本体と外した指摘を合わせた全部」を足し、閉じる途中の遮断の文を事実に
+// 合わせたため。ZIP の組み立ては変えていない。
+// BN-R1 の確かめ直しの N-3 でも求め直した: README.md の「遮断が原因」の説明（表示カタログの説明）を、`output.md` と同じ意味（指摘の対象の要求か、行き先の移動か、測った
+// 画面そのものを、BeakSight の遮断が決めた）に直したため。ZIP の組み立ては変えていない。
 describe('createChatGptBundle: the bytes stay the same when the ZIP is built by a shared part (T32f)', () => {
   it.each<readonly [string, () => AuditRunResult, string]>([
-    ['the audit run sample', auditRun, 'sha256:efc9a609a2d96869c836813df02e5846215d82c1e54c1fe83befb78834f14a68'],
-    ['the edge case sample', edgeCaseAuditRun, 'sha256:9944d215969160c2c4f8ec4b43877381dbcbe983ce58b6a335b83665ddccf7fd'],
+    // T44R2 の I-5・M-6 でも求め直した（担当 T の M-8 の後の値）: README.md の前書きと安全の区分の文を直し、送信の扱いの行とログインの送信の文を足したため。
+    // LG-4 でも求め直した: 見本の page.json を `page-schema/1.1` にし、BeakSight の遮断の記録の印（時点・要求の種類・読み込みの種類・network の失敗の印）を
+    // 足したため（page.json のバイト列が変わった）。ZIP の組み立ては変えていない。
+    ['the audit run sample', auditRun, 'sha256:e67d58af2a6956f91b4453ca694ca834a334ffa78ace9d69f2b8e25a3f5a577a'],
+    ['the edge case sample', edgeCaseAuditRun, 'sha256:39a268abeb4ebd65819957ca04adfc577f8a644fc3664fa2d9d70f8ea41234ed'],
   ])('keeps the SHA-256 of the bundle of %s', async (_label, sample, expected) => {
     expect(sha256Of(await bundleOf(sample()))).toBe(expected);
   });

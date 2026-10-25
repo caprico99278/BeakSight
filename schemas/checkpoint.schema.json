@@ -110,7 +110,47 @@
             "lastNavigationStartedAtMs": { "type": ["integer", "null"], "minimum": 0 }
           }
         },
-        "meter": { "$ref": "urn:beaksight:schema:run:1.0#/properties/load/properties/requests" }
+        "meter": { "$ref": "urn:beaksight:schema:run:1.0#/properties/load/properties/requests" },
+        "approvedServiceOrigins": { "$ref": "urn:beaksight:schema:run:1.0#/properties/load/properties/approvedServiceOrigins" },
+        "auditStageCounts": {
+          "description": "Optional (T35c; Task 35 design 3.7): the counts of the audit stage of a script login audit up to this checkpoint. Counts only. T35R-fix: the requests to the approved service origins admitted and refused by the limit of the whole Run.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "registeredReadRequestsAllowed",
+            "tokenRefreshBlocked",
+            "otherNonReadBlocked",
+            "serviceUnauthorizedResponses",
+            "serviceRequestsAdmitted",
+            "serviceRequestLimitRefused",
+            "allowedOriginDataRequestsBlocked",
+            "serviceRequestPacingWaits",
+            "serviceRequestPacingWaitMs"
+          ],
+          "properties": {
+            "registeredReadRequestsAllowed": { "type": "integer", "minimum": 0 },
+            "tokenRefreshBlocked": { "type": "integer", "minimum": 0 },
+            "otherNonReadBlocked": { "type": "integer", "minimum": 0 },
+            "serviceUnauthorizedResponses": { "type": "integer", "minimum": 0 },
+            "serviceRequestsAdmitted": { "type": "integer", "minimum": 0 },
+            "serviceRequestLimitRefused": { "type": "integer", "minimum": 0 },
+            "allowedOriginDataRequestsBlocked": {
+              "description": "T37R-fix-B2: the fetch and xhr non-read requests to the allowed origins that were blocked (recorded only). LG-4: required (an earlier checkpoint without it is no longer read).",
+              "type": "integer",
+              "minimum": 0
+            },
+            "serviceRequestPacingWaits": {
+              "description": "DEF-141: the times the audit waited before the next load by the per minute limit of the requests to the approved service origins. LG-4: required.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "serviceRequestPacingWaitMs": {
+              "description": "DEF-141: the total milliseconds of those waits. LG-4: required.",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
       }
     },
     "authentication": {
@@ -144,6 +184,7 @@
             "STOPPED_BY_SITE_UNAVAILABLE",
             "INTERRUPTED_ABNORMALLY",
             "STOPPED_BY_AUTH_SESSION_LOST",
+            "STOPPED_BY_SERVICE_REQUEST_LIMIT",
             null
           ]
         },
@@ -220,6 +261,9 @@
         },
         "recordLimits": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/safetyLedgerRecordLimits" },
         "blockedAuditExclusions": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/blockedAuditExclusions" },
+        "passedAuditSendRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/passedAuditSendRequests" },
+        "passedAuditSendWebSockets": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/passedAuditSendWebSockets" },
+        "blockedClosingRequests": { "$ref": "urn:beaksight:schema:page:1.0#/$defs/blockedClosingRequests" },
         "invariantViolations": { "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolations" },
         "invariantViolationCount": {
           "$ref": "urn:beaksight:schema:run:1.0#/properties/safety/properties/invariantViolationCount"

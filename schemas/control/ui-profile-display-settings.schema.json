@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-profile-display-settings:1",
+  "description": "Local UI Server Function input (FM-1; fewer manual steps design 2.2): save the display setting of a profile (showJobBrowser: start the browser of the audit, discovery, READ check and write jobs as headed). AS-b (audit send policy design 2.1): the optional audit send policy of the audit, discovery and READ check jobs (the value list is owned by src/core/audit-send-policy.ts; absent keeps the stored value). The settings are kept apart from the profile document and revision bound to the approvals (saveProfileDisplaySettings).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "showJobBrowser"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "showJobBrowser": { "type": "boolean" },
+    "auditSendPolicy": { "enum": ["READ_ONLY", "PASS_EXCEPT_DELETE"] }
+  }
+}

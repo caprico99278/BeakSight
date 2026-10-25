@@ -7,7 +7,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   MAX_WORKER_READ_CHECKS,
   WORKER_PROTOCOL_VERSION,
@@ -25,7 +26,7 @@ const DIGEST = `sha256:${'b'.repeat(64)}`;
 const SECRET_VALUE = 'secret-value-example';
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-read',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -142,6 +143,23 @@ describe('T27e: START of a READ check job', () => {
     expect(schema.$defs.start.properties.readChecks.maxItems).toBe(MAX_WORKER_READ_CHECKS);
     expect(schema.$defs.readCheckSummary.properties.checks.maximum).toBe(MAX_WORKER_READ_CHECKS);
     expect(schema.$defs.readCheckSummary.properties.executed.maximum).toBe(MAX_WORKER_READ_CHECKS);
+  });
+
+  // T37d（Task 37 の設計書 3.5）: 画面の path の定義は、送る値を持たず、対象の画面（親が開始の URL の Origin と、その path で入れる）が定義の path と同じ。
+  it('accepts a page path definition whose target page is the page of the path, and rejects another or no target page', () => {
+    const pageCheck = (overrides: Record<string, unknown> = {}): Record<string, unknown> => readCheck(1, {
+      targetPage: { origin: ORIGIN, path: '/admin/members' },
+      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
+      ...overrides,
+    });
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [pageCheck(), readCheck(2)] }))).toEqual([]);
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [pageCheck({ targetPage: null })] })))
+      .toContain('/readChecks/0/targetPage must be the page of the page path of the definition');
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [pageCheck({ targetPage: { origin: ORIGIN, path: '/admin' } })] })))
+      .toContain('/readChecks/0/targetPage must be the page of the page path of the definition');
+    expect(errorsOf(start(WORKER_READ_CHECK_JOB_KIND, { readChecks: [pageCheck({
+      definition: { targetPagePath: '/admin/members', parameters: { q: 'x' }, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
+    })] })).length).toBeGreaterThan(0);
   });
 });
 

@@ -57,7 +57,7 @@ import {
   type FormMethod,
   type MethodOverride,
 } from './candidate-contracts.js';
-import { submitterWordsOf } from './classify.js';
+import { submitterTextHasSubmitWord, submitterWordsOf } from './classify.js';
 import { readInIsolatedWorld } from './isolated-read.js';
 import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
 
@@ -520,6 +520,16 @@ export interface ProbedCandidate {
   readonly fields: readonly CandidateField[];
   /** 送信ボタンの語（文言から `submitterWordsOf` で求めた語。文言は持たない）。 */
   readonly submitterWords: readonly string[];
+  /**
+   * DEF-142: 送信ボタンの文言（ボタンの文字・`aria-label`・`title`）が空白を除いて空でないか（文言は持たない）。送らずに観察する probe の押す順だけが
+   * 使う（候補の契約・識別の digest・成果物には入れない）。送信ボタンのない form は false。
+   */
+  readonly hasSubmitterText: boolean;
+  /**
+   * T44c（設計者の判断）: 送信ボタンの文言に、送信の語（「送信」「確定」「submit」。`submitterTextHasSubmitWord`）があるか（文言は持たない）。送らずに観察する
+   * probe の押す順だけが使う（候補の契約・識別の digest・成果物には入れない）。送信ボタンのない form は false。
+   */
+  readonly hasSubmitWord: boolean;
   /** inline の処理（form の `onsubmit`、送信ボタンの `onclick` の属性）があるか。 */
   readonly inlineHandler: boolean;
   /** form（`BUTTON` は null）。 */
@@ -641,6 +651,9 @@ const candidateOf = (value: unknown): { readonly candidate: ProbedCandidate; rea
   const common = {
     // T27R-fix-1（DEF-086）: 文言は、分類の語を求めるためだけに使い、持たない。
     submitterWords: submitterText === null ? Object.freeze([]) : submitterWordsOf(normalizeWhitespace(submitterText).slice(0, MAX_SUBMITTER_TEXT_LENGTH)),
+    hasSubmitterText: submitterText !== null && normalizeWhitespace(submitterText).length > 0,
+    // T44c: 押す順だけの送信の語の印（文言は持たない）。
+    hasSubmitWord: submitterText !== null && submitterTextHasSubmitWord(normalizeWhitespace(submitterText).slice(0, MAX_SUBMITTER_TEXT_LENGTH)),
     inlineHandler: requireBoolean(raw['inlineHandler']),
     submitter: elementOf(raw['submitter']),
   };

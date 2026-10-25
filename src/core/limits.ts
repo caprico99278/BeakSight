@@ -185,6 +185,15 @@ export const PAGE_SETTLING_PACING = Object.freeze({
 } as const);
 
 /**
+ * T44R2 の I-6（P1-5）: 幅の走査の各幅で、落ち着きの待ちを止めて形を測るために残す時間（ms）。落ち着きの待ちの上限は、その幅の期限からこの時間を引いた
+ * 時刻と、今から `crawl.resourceSettlingTimeoutMs` 後の早い方（落ち着かない画面でも、その幅の形を測る時間を残す）。
+ * 値の根拠: 重いページの fixture（`startHeavyPageSite`。1,000 行）で、幅 320・768・1,024 の形を測る時間（`collectLayoutEvidence`）は、最大 322ms（テストの
+ * 既定の Chromium）と 248ms（CLI の起動の設定）だった（各 3 回。2026-10-22）。混み合った環境での遅れと、収集の部分結果の予備
+ * （`LAYOUT_THRESHOLDS.partialResultReserveMs` の 250ms）を見込んで、約 4 倍の 1,500ms にした。
+ */
+export const STRESS_LAYOUT_MEASURE_RESERVE_MS = 1_500;
+
+/**
  * controlled scroll（`controlledScroll`）の待ち方（設計書 第11章: 人間に近い一定の刻みと待ちで、極端な操作をしない）。
  * - `stepViewportFraction`: 1回にスクロールする量の、ビューポートの高さに対する割合。0.75 は、前後の画面を4分の1ずつ重ねて、
  *   遅延読み込みの境界（`IntersectionObserver` の交差）を読み飛ばさない量である（controlled scroll が受け付ける上限は 0.9）。
@@ -213,3 +222,38 @@ export const SCROLL_STAGE_BUDGET_SETTLING_MULTIPLIER = 4;
  * 値の根拠: 64 MiB。手でアップロードするバンドルの大きさを抑えるための上限である（設計者の決定）。
  */
 export const CHATGPT_BUNDLE_SCREENSHOT_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Rule ごとの要約（表示用モデルの `ruleDigests`。ChatGPT 用バンドルの `findings-by-rule.json`）の、1 つの Rule の例の数の上限（T44i。Task 44 の設計書 6 章の
+ * 2026-10-22 の行。P2-9）。例は `AuditRunResult.findings` の順で、ページの違うものを先に選ぶ。
+ * 値の根拠: 同じ指摘がページごとに繰り返すことを見分けるのに足り、要約の大きさを数十 KB の内に抑える数（設計者の決定）。
+ */
+export const REPORT_RULE_DIGEST_EXAMPLE_COUNT = 3;
+
+/**
+ * BN-c（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.3）: 表示用モデルの指摘ごとの、結び付いた BeakSight の遮断の参照
+ * （`beaksightBlockRelation.blocks`）の数の上限。超えた分は数だけを残す（`blockCount`）。
+ * 値の根拠: 区分の理由を読み手が確かめるのに足り、1 ページで多くの遮断がある Run でもバンドルの大きさを抑える数（BN-c の実装者の決定）。
+ */
+export const REPORT_BEAKSIGHT_BLOCK_REFERENCE_COUNT = 5;
+
+/**
+ * 設定のページの上限（`crawl.maxPages`）の上限（T44R。Task 44 のレビューの M-3）。`validateConfig` と、プロファイルの画面の「監査の負荷」の欄の確かめが使う。
+ * 値の根拠: 1 回の Run で監査するページの数として十分に大きく（既定は 500）、承認したサービスの Origin への要求の 1 回の Run の上限の既定
+ * （`defaultServiceRequestLimitsFor`。ページの上限 × 1 ページあたりの量）が安全な整数を十分に下回る値（設計者の決定）。
+ */
+export const MAX_CRAWL_MAX_PAGES = 100_000;
+
+/**
+ * 範囲の手がかり（欄の min・max・step）がない日付・日時の欄に、入力の規則の自動の作成（`src/control/data-rules/rule-set-inference.ts`）が入れる
+ * 既定の幅（基準日からの日の数。両端を含む。FM2c。手動の操作を減らす設計書 3A.3）。基準日は、実行の許可の発行日（Asia/Tokyo）。
+ * 値の根拠: ユーザーの判断（2026-10-22）。「基準日から 30 日後までの幅」。Task 29 の設計書 10 章の 3「基準日から推さない」を、この場面について改めた。
+ */
+export const DEFAULT_UNRANGED_DATE_WINDOW_DAYS = Object.freeze({ fromDays: 0, toDays: 30 });
+
+/**
+ * 範囲の手がかり（欄の min・max・step）がない数の欄に、入力の規則の自動の作成が入れる既定の幅（両端を含む整数。刻みは 1。FM2c。手動の操作を
+ * 減らす設計書 3A.3）。
+ * 値の根拠: ユーザーの判断（2026-10-22）。「1〜100 の整数」。
+ */
+export const DEFAULT_UNRANGED_INTEGER_RANGE = Object.freeze({ min: 1, max: 100 });

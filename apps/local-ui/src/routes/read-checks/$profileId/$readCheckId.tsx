@@ -6,6 +6,7 @@ import {
   LOCAL_UI_READ_CHECK_TEXT,
   LOCAL_UI_TEXT,
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
+  READ_CHECK_TARGET_KIND_LABELS,
 } from '../../../../../../src/presentation/messages.js';
 import { ConfirmDialog } from '../../../components/ConfirmDialog';
 import { Notice } from '../../../components/Notice';
@@ -57,6 +58,11 @@ function EditReadCheckPage() {
       <section className="panel">
         <h2 className="panel-heading">{text.formHeading}</h2>
         <dl className="facts" data-testid="read-check-current" data-revision={String(definition.revision)}>
+          <dt>{text.page.target}</dt>
+          <dd data-testid="read-check-current-target" data-target-kind={definition.targetKind}>
+            {READ_CHECK_TARGET_KIND_LABELS[definition.targetKind]}
+            {definition.targetPagePath === null ? null : <>{' '}<code>{definition.targetPagePath}</code></>}
+          </dd>
           <dt>{text.columns.revision}</dt>
           <dd>{LOCAL_UI_TEXT.profileForm.revisionText(definition.revision)}</dd>
           <dt>{text.columns.updatedAt}</dt>
@@ -74,13 +80,15 @@ function EditReadCheckPage() {
           <Notice kind="caution">
             <p data-testid="read-check-retired">{page.eligible ? text.retired : text.notEligible}</p>
           </Notice>
-        ) : definition.candidate === null ? (
+        ) : definition.targetKind === 'CANDIDATE' && definition.candidate === null ? (
           <Notice kind="caution">
             <p data-testid="read-check-candidate-missing">{text.candidateMissing}</p>
           </Notice>
         ) : (
           <ReadCheckForm
-            candidate={definition.candidate}
+            target={definition.candidate === null
+              ? { kind: 'PAGE', pagePaths: page.pagePaths, initialPath: definition.targetPagePath ?? '' }
+              : { kind: 'CANDIDATE', candidate: definition.candidate }}
             form={page.form}
             initial={{ parameters: definition.definition.parameters, expectations: definition.definition.expectations }}
             onSave={(changed) => update({ data: { readCheckId: definition.readCheckId, expectedRevision: definition.revision, definition: changed } })}

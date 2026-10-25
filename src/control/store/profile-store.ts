@@ -14,6 +14,7 @@
 // - 拒否は、閉じた一覧の理由の値（`PROFILE_STORE_REJECTION_REASONS`）で返す。日本語の説明は `src/presentation/messages.ts`（T23d）。
 //   データベースそのものの誤り（busy の待ちを過ぎた、読み取り専用、保存された文書が読めない）は `ControlStoreError` で投げる。
 // - 生の接続（`ControlDatabase.connection`）を外へ出さない。返す値は凍結した写し。
+import { DEFAULT_AUDIT_SEND_POLICY, isAuditSendPolicyName, type AuditSendPolicyName } from '../../core/audit-send-policy.js';
 import { isRecord } from '../../core/guards.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
@@ -32,7 +33,13 @@ import {
   type ProfileValidationContext,
 } from '../profile-policy.js';
 import type { ControlDatabase } from './control-database.js';
-import { PROFILE_STATUSES, type ProfileChangeKind, type ProfileStatus } from './profile-records.js';
+import {
+  ACTIVE_PROFILE_STATUS,
+  PROFILE_STATUSES,
+  RETIRED_PROFILE_STATUS,
+  type ProfileChangeKind,
+  type ProfileStatus,
+} from './profile-records.js';
 import type { SqliteConnection } from './sqlite-module.js';
 import { ControlStoreError } from './store-errors.js';
 import { withWriteTransaction } from './transaction.js';
@@ -125,8 +132,6 @@ const UPDATE_PROFILE_SQL =
 const INSERT_REVISION_SQL =
   'INSERT INTO profile_revisions (profile_id, revision, document, change_kind, recorded_at) VALUES (?, ?, ?, ?, ?)';
 
-const ACTIVE: ProfileStatus = 'ACTIVE';
-const RETIRED: ProfileStatus = 'RETIRED';
 /** 1 回の変更で書き換える `profiles` の行の数。 */
 const ONE_ROW = 1;
 
@@ -236,7 +241,7 @@ const currentForChange = (
   if (row === undefined) {
     return rejected('PROFILE_NOT_FOUND', 'no profile has this profileId');
   }
-  if (row.status === RETIRED) {
+  if (row.status === RETIRED_PROFILE_STATUS) {
     return rejected('PROFILE_RETIRED', 'a retired profile cannot be changed');
   }
   if (row.revision !== expectedRevision) {
@@ -321,10 +326,31 @@ export const createProfile = (database: ControlDatabase, input: unknown, options
     }
     const recordedAt = timestampOf(options.now);
     const document = JSON.stringify(next);
-    connection.prepare(INSERT_PROFILE_SQL).run(next.profileId, next.revision, ACTIVE, document, recordedAt);
+    connection.prepare(INSERT_PROFILE_SQL).run(next.profileId, next.revision, ACTIVE_PROFILE_STATUS, document, recordedAt);
     recordRevision(connection, next, document, 'CREATED', recordedAt);
-    return accepted({ profile: next, status: ACTIVE, updatedAt: recordedAt });
+    return accepted({ profile: next, status: ACTIVE_PROFILE_STATUS, updatedAt: recordedAt });
   });
+};
+
+/**
+ * 検証した次の改訂を書く（書き込みのトランザクションの中だけで呼ぶ。今の行の確かめ、改訂の照合、改訂が増えることの確かめ、行と履歴の書き込み）。
+ * T43d: `updateProfile` と `updateProfileWithFollowingWrite` が共有する。
+ */
+const applyUpdate = (
+  connection: SqliteConnection,
+  candidate: ValidatedSiteProfile,
+  expectedRevision: number,
+  now: (() => Date) | undefined,
+): ProfileStoreResult => {
+  const current = currentForChange(connection, candidate.profileId, expectedRevision);
+  if (!current.ok) {
+    return current;
+  }
+  const advance = advanceOf(current.profile, candidate);
+  if (!advance.ok) {
+    return advance;
+  }
+  return accepted(replaceRow(connection, current.profile.revision, advance.profile, ACTIVE_PROFILE_STATUS, 'UPDATED', timestampOf(now)));
 };
 
 /** プロファイルを更新する（次の改訂。履歴は `UPDATED`）。 */
@@ -338,16 +364,49 @@ export const updateProfile = (
     return incoming;
   }
   const candidate = incoming.profile;
-  return withWriteTransaction(database, (connection) => {
-    const current = currentForChange(connection, candidate.profileId, request.expectedRevision);
-    if (!current.ok) {
-      return current;
+  return withWriteTransaction(database, (connection) => applyUpdate(connection, candidate, request.expectedRevision, options.now));
+};
+
+/**
+ * T43d（Task 43 の設計書 4.4）: プロファイルの次の改訂の後に、同じトランザクションで続けて書くもの。`validate` は次の改訂を検証した後、トランザクション
+ * の外で呼ぶ（検証の結果を返す）。`write` は、プロファイルの行を書いた直後に、同じ書き込みのトランザクションの中で呼ぶ（投げると両方を元に戻す）。
+ */
+export interface ProfileFollowingWrite<TValidated, TRejection, TWritten> {
+  readonly validate: (candidate: ValidatedSiteProfile) => { readonly ok: true; readonly value: TValidated } | { readonly ok: false; readonly rejection: TRejection };
+  readonly write: (connection: SqliteConnection, value: TValidated) => TWritten;
+}
+
+/** `updateProfileWithFollowingWrite` の結果（どちらの拒否か）。 */
+export type ProfileFollowingWriteResult<TRejection, TWritten> =
+  | { readonly ok: true; readonly stored: StoredProfile; readonly written: TWritten }
+  | { readonly ok: false; readonly part: 'PROFILE'; readonly rejection: Extract<ProfileStoreResult, { ok: false }> }
+  | { readonly ok: false; readonly part: 'FOLLOWING'; readonly rejection: TRejection };
+
+/**
+ * プロファイルを更新し、続けて同じ書き込みのトランザクションで別のもの（認証の設定）を書く（T43d。プロファイルと認証の設定のまとめて保存
+ * `profile-auth-setup-store.ts` が使う）。検証の決まりと改訂の照合は `updateProfile` と同じ。どちらかが拒めば、どちらも書かない。
+ */
+export const updateProfileWithFollowingWrite = <TValidated, TRejection, TWritten>(
+  database: ControlDatabase,
+  request: ProfileUpdateRequest,
+  options: ProfileWriteOptions,
+  following: ProfileFollowingWrite<TValidated, TRejection, TWritten>,
+): ProfileFollowingWriteResult<TRejection, TWritten> => {
+  const incoming = validateIncoming(request.profile, options.resolveContext);
+  if (!incoming.ok) {
+    return { ok: false, part: 'PROFILE', rejection: incoming };
+  }
+  const candidate = incoming.profile;
+  const followed = following.validate(candidate);
+  if (!followed.ok) {
+    return { ok: false, part: 'FOLLOWING', rejection: followed.rejection };
+  }
+  return withWriteTransaction(database, (connection): ProfileFollowingWriteResult<TRejection, TWritten> => {
+    const updated = applyUpdate(connection, candidate, request.expectedRevision, options.now);
+    if (!updated.ok) {
+      return { ok: false, part: 'PROFILE', rejection: updated };
     }
-    const advance = advanceOf(current.profile, candidate);
-    if (!advance.ok) {
-      return advance;
-    }
-    return accepted(replaceRow(connection, current.profile.revision, advance.profile, ACTIVE, 'UPDATED', timestampOf(options.now)));
+    return { ok: true, stored: updated.stored, written: following.write(connection, followed.value) };
   });
 };
 
@@ -372,5 +431,100 @@ export const retireProfile = (
       ? rejected('STORED_PROFILE_INVALID', 'the stored profile is not a profile', retired.errors)
       : rejected('PROFILE_REVISION_NOT_ADVANCED', 'the revision of the stored profile cannot be advanced', retired.errors);
   }
-  return accepted(replaceRow(connection, current.profile.revision, retired.profile, RETIRED, 'RETIRED', timestampOf(options.now)));
+  return accepted(replaceRow(connection, current.profile.revision, retired.profile, RETIRED_PROFILE_STATUS, 'RETIRED', timestampOf(options.now)));
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: プロファイルごとの表示の設定（管理データの版 15 の `profile_display_settings`）。
+// 承認に結ばれるプロファイルの文書と改訂とは別に持ち、書いても、プロファイルの改訂・履歴・承認・発見の有効性を変えない。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** プロファイルの表示の設定（AS-b から、監査の段の送信の扱いも持つ。どちらも承認に結ばれるプロファイルの改訂の外の設定）。 */
+export interface ProfileDisplaySettings {
+  /** 監査・発見・READ の確かめ・書き込みのジョブのブラウザを表示（headed）で起動するか。 */
+  readonly showJobBrowser: boolean;
+  /**
+   * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査・発見・READ の確かめのジョブの、監査の段の送信の扱い（管理データの版 17 の
+   * `audit_send_policy`。行がなければ既定の `READ_ONLY`）。ジョブの開始のときに `START` の `auditSendPolicy` で渡す。
+   */
+  readonly auditSendPolicy: AuditSendPolicyName;
+}
+
+/** 保存の入力（AS-b: 監査の段の送信の扱いを省略すると、今の値を変えない。行がなければ既定の `READ_ONLY`）。 */
+export interface ProfileDisplaySettingsInput {
+  readonly showJobBrowser: boolean;
+  readonly auditSendPolicy?: AuditSendPolicyName;
+}
+
+/** 行のないプロファイルの表示の設定（既定は表示する・読み取りだけ）。 */
+export const DEFAULT_PROFILE_DISPLAY_SETTINGS: ProfileDisplaySettings = Object.freeze({
+  showJobBrowser: true,
+  auditSendPolicy: DEFAULT_AUDIT_SEND_POLICY,
+});
+
+/** 表示の設定の保存が拒む理由（閉じた一覧）。 */
+export const PROFILE_DISPLAY_SETTINGS_REJECTION_REASONS = Object.freeze(['PROFILE_NOT_FOUND', 'SETTINGS_INVALID'] as const);
+export type ProfileDisplaySettingsRejectionReason = (typeof PROFILE_DISPLAY_SETTINGS_REJECTION_REASONS)[number];
+
+/** 表示の設定の保存の結果。 */
+export type ProfileDisplaySettingsSaveResult =
+  | { readonly ok: true; readonly settings: ProfileDisplaySettings }
+  | { readonly ok: false; readonly reason: ProfileDisplaySettingsRejectionReason };
+
+const SELECT_DISPLAY_SETTINGS_SQL = 'SELECT show_job_browser, audit_send_policy FROM profile_display_settings WHERE profile_id = ?';
+/** 行がなければ、扱いは列の既定（`READ_ONLY`）で作る。扱いを省略した保存は、行があれば扱いを変えない。 */
+const UPSERT_DISPLAY_SETTINGS_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, updated_at) VALUES (?, ?, ?)
+  ON CONFLICT (profile_id) DO UPDATE SET show_job_browser = excluded.show_job_browser, updated_at = excluded.updated_at`;
+/** AS-b: 扱いも書く保存。 */
+const UPSERT_DISPLAY_AND_AUDIT_SEND_SETTINGS_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, audit_send_policy, updated_at)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT (profile_id) DO UPDATE SET show_job_browser = excluded.show_job_browser, audit_send_policy = excluded.audit_send_policy,
+    updated_at = excluded.updated_at`;
+
+/** 表の行を設定の値にする（扱いが一覧の値でなければ、データベースの誤り。CHECK で起きない）。 */
+const displaySettingsOfRow = (row: { readonly show_job_browser: number; readonly audit_send_policy: unknown }): ProfileDisplaySettings => {
+  if (!isAuditSendPolicyName(row.audit_send_policy)) {
+    throw new ControlStoreError('DATABASE_INTEGRITY_FAILED', 'profile_display_settings.audit_send_policy is not a listed audit send policy');
+  }
+  return Object.freeze({ showJobBrowser: row.show_job_browser === 1, auditSendPolicy: row.audit_send_policy });
+};
+
+/** プロファイルの表示の設定を読む（行がなければ既定。プロファイルがなくても既定）。 */
+export const readProfileDisplaySettings = (database: ControlDatabase, profileId: string): ProfileDisplaySettings => {
+  const row = database.connection.prepare(SELECT_DISPLAY_SETTINGS_SQL).get(profileId) as
+    | { readonly show_job_browser: number; readonly audit_send_policy: unknown }
+    | undefined;
+  return row === undefined ? DEFAULT_PROFILE_DISPLAY_SETTINGS : displaySettingsOfRow(row);
+};
+
+/**
+ * プロファイルの表示の設定を保存する（行があれば置き換える）。プロファイルがなければ `PROFILE_NOT_FOUND`、表示の値が真偽でないか、AS-b の監査の段の送信の
+ * 扱いが一覧の値でなければ `SETTINGS_INVALID`（どちらも書かない）。扱いを省略すると、今の値を変えない（行がなければ既定の `READ_ONLY`）。プロファイルの行と
+ * 改訂と履歴は変えない。データベースそのものの誤りは `ControlStoreError` で投げる。結果の設定は、保存した後の行の値。
+ */
+export const saveProfileDisplaySettings = (
+  database: ControlDatabase,
+  profileId: string,
+  settings: ProfileDisplaySettingsInput,
+  options: { readonly now?: () => Date } = {},
+): ProfileDisplaySettingsSaveResult => {
+  const showJobBrowser: unknown = isRecord(settings) ? settings.showJobBrowser : undefined;
+  const auditSendPolicyGiven = isRecord(settings) && Object.hasOwn(settings, 'auditSendPolicy');
+  const auditSendPolicy: unknown = auditSendPolicyGiven ? settings.auditSendPolicy : undefined;
+  if (typeof showJobBrowser !== 'boolean' || (auditSendPolicyGiven && !isAuditSendPolicyName(auditSendPolicy))) {
+    return Object.freeze({ ok: false, reason: 'SETTINGS_INVALID' });
+  }
+  return withWriteTransaction(database, (connection) => {
+    if (typeof profileId !== 'string' || readRow(connection, profileId) === undefined) {
+      return Object.freeze({ ok: false, reason: 'PROFILE_NOT_FOUND' } as const);
+    }
+    const updatedAt = timestampOf(options.now);
+    if (isAuditSendPolicyName(auditSendPolicy)) {
+      connection.prepare(UPSERT_DISPLAY_AND_AUDIT_SEND_SETTINGS_SQL).run(profileId, showJobBrowser ? 1 : 0, auditSendPolicy, updatedAt);
+    } else {
+      connection.prepare(UPSERT_DISPLAY_SETTINGS_SQL).run(profileId, showJobBrowser ? 1 : 0, updatedAt);
+    }
+    const row = connection.prepare(SELECT_DISPLAY_SETTINGS_SQL).get(profileId) as { readonly show_job_browser: number; readonly audit_send_policy: unknown };
+    return Object.freeze({ ok: true, settings: displaySettingsOfRow(row) } as const);
+  });
+};

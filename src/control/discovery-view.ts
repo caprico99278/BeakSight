@@ -47,7 +47,11 @@ export {
 export type {
   DiscoveryDocument,
   DiscoveryEndReason,
+  // DEF-144: 外部スキームで押さなかった候補の数と、読み込み直した画面の数（ジョブの画面が出す）。
+  DiscoveryExternalSchemeProbes,
   DiscoveryPageEntry,
+  // T44c: 押す数の上限で押せなかった、登録・更新の語の候補の数（ジョブの画面が出す）。
+  DiscoveryPressLimitProbes,
   DiscoveryUnreadReason,
 } from '../discovery/discovery-result.js';
 
@@ -61,6 +65,10 @@ export {
   READ_CHECK_EXPECTATION_KINDS,
   READ_CHECK_RESULTS,
   isSendableReadCheckParameter,
+  // T37d（Task 37 の設計書 3.5）: 定義の対象の種類と、画面の path の上限。
+  MAX_READ_CHECK_PAGE_PATH_LENGTH,
+  READ_CHECK_TARGET_KINDS,
+  readCheckTargetKindOf,
 } from '../discovery/read-check-contracts.js';
 export type {
   ReadCheckDefinition,
@@ -68,6 +76,7 @@ export type {
   ReadCheckExpectationKind,
   ReadCheckParameters,
   ReadCheckResult,
+  ReadCheckTargetKind,
 } from '../discovery/read-check-contracts.js';
 
 export {
@@ -88,8 +97,28 @@ export type {
   ReadRowSource,
 } from '../discovery/read-check-evaluation.js';
 
+// T37c（Task 37 の設計書 3.4、3.6）: 送らずに観察する probe の結果の契約（結果と理由の閉じた一覧と、結果の形）。
+// T38f: probe の型の鍵と欄の対応（API のシナリオの作成の画面の案）。
+// T38R-fix の M-2: 書き込みの probe の結果と、シナリオの種類と method の対応（契約の 1 か所）。
+export {
+  SUBMISSION_PROBE_REASONS,
+  SUBMISSION_PROBE_RESULTS,
+  submissionProbeKeyFieldsOf,
+  submissionProbeWriteOf,
+} from '../discovery/submission-probe-contracts.js';
+export type {
+  SubmissionProbeKeyField,
+  SubmissionProbeReason,
+  SubmissionProbeRecord,
+  SubmissionProbeResult,
+} from '../discovery/submission-probe-contracts.js';
+
+// T38f: `{id}` つきの画面の path の READ の定義か（API のシナリオの照合の READ の選択肢）。
+export { isReadCheckPageTemplatePath } from '../discovery/read-check-contracts.js';
+
 // T31h-1（Task 31 の設計書 3 章の「UPDATE の指定」）: 候補から作れる path の型の組の一覧（画面が ID の区切りを選んで型を作る。ID の形の判定は、
 // 画面のサーバが `src/control/actions/action-outcome.ts` の `usableRecordIdOf` を渡す）。T31h-2: 型に ID を入れた具体的な path（開始の画面が、
 // 予定のレコードの送り先と画面の path を出す。CCX-28 の owner の関数）。
-export { concretePathOfTemplate, pathTemplateOptionsOf } from '../discovery/fingerprint.js';
+// T38f: 画面の path から作れる型（API の UPDATE の台帳の参照の、更新の画面の path の型の選択肢）。
+export { concretePathOfTemplate, pagePathTemplateOptionsOf, pathTemplateOptionsOf } from '../discovery/fingerprint.js';
 export type { PathTemplateOption } from '../discovery/fingerprint.js';

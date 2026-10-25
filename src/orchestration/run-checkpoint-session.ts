@@ -1,5 +1,7 @@
 import { clearInterval, setInterval } from 'node:timers';
-import type { PageId } from '../core/contracts.js';
+import { isDeepStrictEqual } from 'node:util';
+import type { PageId, RunId } from '../core/contracts.js';
+import { wait } from '../core/deadline.js';
 import { isRecord } from '../core/guards.js';
 import { isPageId } from '../core/ids.js';
 import {
@@ -7,15 +9,18 @@ import {
   currentProcessRunLockHost,
   isOwnRunLock,
   isProcessRunning,
-  judgeRunLock,
   renewRunLock,
   takeOverStaleLock,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  type RunCheckpoint,
-  type RunCheckpointPage,
-  type RunCheckpointStore,
   type RunLock,
   type RunLockHost,
+} from '../core/process-lock.js';
+import {
+  checkRunCheckpointConsistency,
+  type RunCheckpoint,
+  type RunCheckpointPage,
+  type RunCheckpointPageWriteOptions,
+  type RunCheckpointStore,
 } from './run-checkpoint.js';
 
 // 再開のための保存のセッション（中断した Run の再開の設計書 4.3.1。この意味の owner）。
@@ -25,6 +30,31 @@ import {
 //   ロックの判定は、R2 の `judgeRunLock` が行う（設計書 4.4）。
 // - 作るのは CLI か、テストである。Run Coordinator は、始める、ページの保存、状態の保存だけを頼む。最後の状態の書き出し（終える）と、
 //   やめるは、CLI が呼ぶ（設計書 4.3.1）。
+
+/**
+ * ハートビートで読み直したロックが読めない（ない、JSON でない）ときに、もう 1 回読み直す前に置く間（ms。DEF-170。一時的な読み取りの失敗を、
+ * ロックを失ったとみなさないため。2 回目も自分のものと分からなければ、失ったとする）。
+ */
+export const RUN_LOCK_REREAD_DELAY_MS = 200;
+
+/**
+ * ロックを失った（DEF-170）。ハートビートで読み直したロックが、ほかの起動のものだった（または読めなかった）。この起動は、すぐにサイトへの読み込みを
+ * 止め、Run のディレクトリに何も書かずに終わる（最後の状態・成果物・保存を書かない。ロックのファイルにも触らない。今の持ち主のもの）。
+ * 保存のセッションの保存と終える（`savePage`・`saveState`・`finish`）と、Run Coordinator が投げる。CLI とワーカーは、別の起動が Run を持つときと
+ * 同じ終わり方（`RUN_ACTIVE`）にし、ロックを失ったことを知らせる。
+ */
+export class RunLockLostError extends Error {
+  override readonly name = 'RunLockLostError';
+  /** Run の ID（Run Coordinator が投げたとき。保存のセッションが投げたときは `null`）。 */
+  readonly runId: RunId | null;
+  readonly runDirectory: string;
+
+  constructor(input: { readonly runId: RunId | null; readonly runDirectory: string }) {
+    super('RUN_LOCK_LOST: another start holds the lock of this Run; this start stopped without writing into the run directory');
+    this.runId = input.runId;
+    this.runDirectory = input.runDirectory;
+  }
+}
 
 /** ハートビートのタイマー（`setInterval` の戻り値）。`unref` で、プロセスの終わりを妨げないようにする。 */
 export interface RunCheckpointHeartbeatTimer {
@@ -59,6 +89,13 @@ export interface RunCheckpointSessionOptions {
   readonly timers?: RunCheckpointSessionTimers | undefined;
   /** 再開のときのロックの判定で、ロックのプロセスが動いているかを調べる関数。省略すると `isProcessRunning`。 */
   readonly isProcessRunning?: ((processId: number) => boolean) | undefined;
+  /**
+   * 待つ関数（DEF-170 の読み直しの間、DEF-172 の取り直す前の猶予）。省略すると `src/core/deadline.ts` の `wait`。テストは注入した待ちで、実際には
+   * 待たずに進める。
+   */
+  readonly wait?: ((ms: number) => Promise<void>) | undefined;
+  /** DEF-172: 再開のときに、動いている持ち主のロックを取り直す前に待つことの知らせ（待つ時間 ms）。省略は知らせない。 */
+  readonly onLockGraceWait?: ((waitMs: number) => void) | undefined;
 }
 
 /**
@@ -80,6 +117,12 @@ export interface RunCheckpointSessionResumeStartOptions {
   readonly mode: Extract<RunCheckpointSessionStartMode, 'RESUME'>;
   /** 再開に使う保存の、終わったページの ID（`state.json` の `completedPageIds`）。後始末で、これにないページのものを消す。 */
   readonly completedPageIds: readonly PageId[];
+  /**
+   * SR-1-F5（SR-1R3 の M3）: 再開を選んだときに読んだ状態の保存（省略できる）。渡すと、Run のロックを取った後（取り直す前の猶予の後を含む）、
+   * 後始末の前に、状態の保存を読み直し（書き手の `readCheckpointState`）、これと違えば（読めない、持ち主が終えた、別のページまで進んだ）、
+   * 取ったロックを外して、再開を始めない（`LOCK_HELD_BY_ACTIVE_RUN`。別の起動が、この Run を動かしていた）。
+   */
+  readonly expectedState?: RunCheckpoint | undefined;
 }
 
 /** `RunCheckpointSession.start` の指定。 */
@@ -135,6 +178,7 @@ const STORE_OPERATION_NAMES = Object.freeze([
   'acquireRunLock',
   'rewriteRunLock',
   'readRunLock',
+  'takeOverRunLock',
   'releaseRunLock',
   'cleanUpForResume',
 ] as const satisfies readonly (keyof RunCheckpointStore)[]);
@@ -166,7 +210,7 @@ function assertCompletedPageIds(value: unknown): asserts value is readonly PageI
  *   ハートビートが止まるので、`RUN_LOCK_STALE_AFTER_MS` の後に古いとみなされる）。
  *
  * ハートビートの書き出しの失敗は、外に投げず、Run を止めない（次の回で書き直す）。前の回の書き出しが終わっていなければ、その回は
- * 飛ばす。`finish` と `abandon` は、書き出し中のハートビートの終わりを待つ（ロックを外した後に、ハートビートの書き出しがロックの
+ * 飛ばす。DEF-170: ハートビートは、読み直したロックが自分のものときだけ書き換える。違えば書き換えず、ハートビートを止め、`lockLost` を真にする。`finish` と `abandon` は、書き出し中のハートビートの終わりを待つ（ロックを外した後に、ハートビートの書き出しがロックの
  * ファイルを作り直さないようにするため）。
  */
 export class RunCheckpointSession {
@@ -180,6 +224,10 @@ export class RunCheckpointSession {
   #lock: RunLock | null = null;
   #heartbeatTimer: RunCheckpointHeartbeatTimer | null = null;
   #heartbeatWrite: Promise<void> | null = null;
+  #lockLost = false;
+  readonly #lockLostController = new AbortController();
+  readonly #wait: (ms: number) => Promise<void>;
+  readonly #onLockGraceWait: ((waitMs: number) => void) | undefined;
 
   /**
    * 不正な指定（書き手の7つの操作、時刻、ロックの値を作る関数、タイマー、プロセスが動いているかを調べる関数が関数でない）は
@@ -210,6 +258,14 @@ export class RunCheckpointSession {
     this.#createLockHost = options.createLockHost ?? currentProcessRunLockHost;
     this.#timers = options.timers ?? NODE_TIMERS;
     this.#isProcessRunning = options.isProcessRunning ?? isProcessRunning;
+    if (given.wait !== undefined && typeof given.wait !== 'function') {
+      throw new TypeError('RunCheckpointSession wait must be a function when given');
+    }
+    if (given.onLockGraceWait !== undefined && typeof given.onLockGraceWait !== 'function') {
+      throw new TypeError('RunCheckpointSession onLockGraceWait must be a function when given');
+    }
+    this.#wait = options.wait ?? wait;
+    this.#onLockGraceWait = options.onLockGraceWait;
   }
 
   /**
@@ -226,10 +282,11 @@ export class RunCheckpointSession {
    * 2. ロックのファイルがすでにあれば、その中身を `judgeRunLock` で判定する（今の時刻と今の OS の起動の時刻は `createLockHost` の値、
    *    プロセスが動いているかは `isProcessRunning`）。`ACTIVE` なら、`{ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock }`
    *    を返す。`STALE` なら、書き手の `takeOverRunLock` で原子的に取り直す（DEF-060。`#takeOverStaleLock`。判定し直しを含む）。ほかの起動が
-   *    同時に取り直したら、`{ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: <読み直した中身> }` を返す。
-   *    `takeOverRunLock` のない書き手では、自分のロックの中身で `rewriteRunLock` で作り直し、`readRunLock` で読み直す。読み直した中身が自分の
-   *    もの（プロセスの ID とロックを取った時刻が同じ）でなければ、ロックに触れずに（相手のロックのまま）、同じ結果を返す。
+   *    同時に取り直したら、ロックに触れずに（相手のロックのまま）、`{ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: <読み直した
+   *    中身> }` を返す（LG-4: 書き手は `takeOverRunLock` を必ず持つ。書き換えて読み直す前の方式は捨てた）。
    * 3. 書き手の `cleanUpForResume` で後始末を行う（ハートビートと保存の書き出しの前。書き出しの途中の一時ファイルを消すため）。
+   *    DEF-170: その後にロックを読み直し、自分のもの（`isOwnRunLock`）でなければ、`{ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock:
+   *    <読み直した中身> }` を返す（ハートビートを始めない）。
    * 4. ハートビートのタイマーを始めて `unref` し、`{ ok: true, removedPaths }`（後始末で消したもの）を返す。
    *
    * 始めなかった場合（`ok` が偽）は、ハートビートを始めない。書き手が失敗した場合と、ロックの値が不正な場合は reject する（作った、
@@ -271,7 +328,20 @@ export class RunCheckpointSession {
             return refusal;
           }
         }
+        // SR-1-F5（SR-1R3 の M3）: ロックを取った後、後始末の前に、状態の保存が再開を選んだときと同じかを確かめる。違えば、取ったロックを外して
+        // 始めない（猶予の間に持ち主が終えた、進めた。古い判断で再開しない）。
+        if (options.expectedState !== undefined && !(await this.#stateUnchanged(runDirectory, options.expectedState))) {
+          await this.#store.releaseRunLock(runDirectory);
+          this.#phase = 'IDLE';
+          return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: null });
+        }
         removedPaths = Object.freeze([...await this.#store.cleanUpForResume(runDirectory, options.completedPageIds)]);
+        // DEF-170: 後始末の後に、ロックが今も自分のものかを読み直す（ほかの起動に動かされ、空いた名前に別のロックが作られていれば、始めない）。
+        const current = await this.#store.readRunLock(runDirectory);
+        if (!isOwnRunLock(current, lock)) {
+          this.#phase = 'IDLE';
+          return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: current });
+        }
       }
       this.#runDirectory = runDirectory;
       this.#lock = lock;
@@ -295,15 +365,22 @@ export class RunCheckpointSession {
     }
   }
 
-  /** ページの保存（R2 の `createRunCheckpointPage` の値）を、書き手の `writeCheckpointPage` で書く。失敗は reject する。 */
-  async savePage(page: RunCheckpointPage): Promise<void> {
+  /**
+   * ページの保存（R2 の `createRunCheckpointPage` の値）を、書き手の `writeCheckpointPage` で書く。失敗は reject する。T44R3 の M-2: `options` は、
+   * そのまま書き手に渡す（巡回が知っている URL）。
+   */
+  async savePage(page: RunCheckpointPage, options?: RunCheckpointPageWriteOptions): Promise<void> {
     this.#requireActive('savePage');
-    await this.#store.writeCheckpointPage(this.#runDirectory, page);
+    await this.#requireLockHeld();
+    await (options === undefined
+      ? this.#store.writeCheckpointPage(this.#runDirectory, page)
+      : this.#store.writeCheckpointPage(this.#runDirectory, page, options));
   }
 
   /** 状態の保存（R2 の `createRunCheckpoint` の値）を、書き手の `writeCheckpointState` で書く。失敗は reject する。 */
   async saveState(state: RunCheckpoint): Promise<void> {
     this.#requireActive('saveState');
+    await this.#requireLockHeld();
     await this.#store.writeCheckpointState(this.#runDirectory, state);
   }
 
@@ -316,6 +393,7 @@ export class RunCheckpointSession {
    */
   async finish(finalState: RunCheckpoint): Promise<void> {
     this.#requireActive('finish');
+    await this.#requireLockHeld();
     this.#phase = 'FINISHING';
     try {
       await this.#store.writeCheckpointState(this.#runDirectory, finalState);
@@ -339,10 +417,9 @@ export class RunCheckpointSession {
   /**
    * 再開のときに、すでにあったロック（`existing`）を判定し、古ければ自分のロック（`lock`）で取り直す（設計書 4.4）。取り直して自分のものに
    * なったら `null` を返す。始めない場合は、その結果（`ok` が偽）を返す。
-   * - 書き手が `takeOverRunLock` を持てば（本番の `ArtifactWriter`）、原子的な取り直し（`takeOverStaleLock`。古いファイルを一意の名前へ動かして
-   *   から `wx` で作る。DEF-060）を使う。動いている Run のロックなら `LOCK_HELD_BY_ACTIVE_RUN`、ほかの起動が同時に取り直したら
-   *   `LOCK_TAKEN_OVER_CONCURRENTLY`（`existingLock` は、読み直した今の中身）。
-   * - 持たなければ（テストの偽の書き手）、前の方式（`rewriteRunLock` で書き換え、`readRunLock` で読み直して自分のものか確かめる）で取り直す。
+   * 書き手の `takeOverRunLock` で、原子的に取り直す（`takeOverStaleLock`。古いファイルを一意の名前へ動かしてから `wx` で作る。DEF-060）。動いている
+   * Run のロックなら `LOCK_HELD_BY_ACTIVE_RUN`、ほかの起動が同時に取り直したら `LOCK_TAKEN_OVER_CONCURRENTLY`（`existingLock` は、読み直した今の
+   * 中身）。
    */
   async #takeOverStaleLock(
     runDirectory: string,
@@ -352,34 +429,79 @@ export class RunCheckpointSession {
   ): Promise<RunCheckpointSessionResumeStart | null> {
     const judgement = { nowMs: host.nowMs, bootedAtMs: host.bootedAtMs, isProcessRunning: this.#isProcessRunning };
     const store = this.#store;
-    if (typeof store.takeOverRunLock === 'function') {
-      const takeOverRunLock = store.takeOverRunLock.bind(store);
-      const result = await takeOverStaleLock({
-        acquire: async (value) => await store.acquireRunLock(runDirectory, value),
-        takeOver: async (judged, value) => await takeOverRunLock(runDirectory, judged, value),
-      }, existing, lock, judgement);
-      switch (result.kind) {
-        case 'ACQUIRED':
-          return null;
-        case 'HELD':
-          return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: result.existing });
-        case 'CONTENDED':
-          return Object.freeze<RunCheckpointSessionResumeStart>({
-            ok: false,
-            reason: 'LOCK_TAKEN_OVER_CONCURRENTLY',
-            existingLock: await store.readRunLock(runDirectory),
-          });
-      }
+    // DEF-172: 動いている持ち主のロックが古く見えるときは、取り直す前に猶予を置いて読み直す（`judgeRunLockWithGrace`）。
+    const result = await takeOverStaleLock({
+      acquire: async (value) => await store.acquireRunLock(runDirectory, value),
+      takeOver: async (judged, value) => await store.takeOverRunLock(runDirectory, judged, value),
+    }, existing, lock, judgement, {
+      reread: async () => await store.readRunLock(runDirectory),
+      wait: this.#wait,
+      onWait: this.#onLockGraceWait,
+    });
+    switch (result.kind) {
+      case 'ACQUIRED':
+        return null;
+      case 'HELD':
+        return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: result.existing });
+      case 'CONTENDED':
+        return Object.freeze<RunCheckpointSessionResumeStart>({
+          ok: false,
+          reason: 'LOCK_TAKEN_OVER_CONCURRENTLY',
+          existingLock: await store.readRunLock(runDirectory),
+        });
     }
-    const state = judgeRunLock(existing, judgement);
-    if (state === 'ACTIVE') {
-      return Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN', existingLock: existing });
+  }
+
+  /**
+   * DEF-170・DEF-172: Run のディレクトリに書く前に、ロックが今も自分のものかを読んで確かめる（`confirmLockHeld`）。違えば何も書かずに
+   * `RunLockLostError` を投げる（今の持ち主の保存を壊さない）。
+   */
+  async #requireLockHeld(): Promise<void> {
+    if (!(await this.confirmLockHeld())) {
+      throw new RunLockLostError({ runId: null, runDirectory: this.#runDirectory });
     }
-    await this.#store.rewriteRunLock(runDirectory, lock);
-    const readBack = await this.#store.readRunLock(runDirectory);
-    return isOwnRunLock(readBack, lock)
-      ? null
-      : Object.freeze<RunCheckpointSessionResumeStart>({ ok: false, reason: 'LOCK_TAKEN_OVER_CONCURRENTLY', existingLock: readBack });
+  }
+
+  /**
+   * DEF-172: ロックのファイルを読んで、今も自分のものかを確かめる（読み込みの直前と、Run のディレクトリへの書き込みの直前に呼ぶ）。自分のものなら
+   * 真。読めないときは、ハートビートと同じく `RUN_LOCK_REREAD_DELAY_MS` を置いて 1 回だけ読み直す。違えば（読めないままを含む）、ロックを失った
+   * （`lockLost`・`lockLostSignal`。ハートビートを止める）として偽。すでに失っていれば、読まずに偽。始めていないセッションでは偽。読み取りの失敗
+   * （reject）は、そのまま reject する。
+   */
+  async confirmLockHeld(): Promise<boolean> {
+    const lock = this.#lock;
+    if (this.#lockLost || lock === null) {
+      return false;
+    }
+    if (await this.#readsOwnLock(lock)) {
+      return true;
+    }
+    this.#loseLock();
+    return false;
+  }
+
+  /**
+   * SR-1-F5: 状態の保存を読み直し、`expected`（再開を選んだときの保存）と同じか。書き手が読み方を持たなければ、確かめずに真（今までどおり）。
+   * 読めなければ偽。
+   */
+  async #stateUnchanged(runDirectory: string, expected: RunCheckpoint): Promise<boolean> {
+    const read = this.#store.readCheckpointState;
+    if (read === undefined) {
+      return true;
+    }
+    const current = await read.call(this.#store, runDirectory, checkRunCheckpointConsistency);
+    return current.ok && isDeepStrictEqual(current.state, expected);
+  }
+
+  /** ロックを読み、自分のもの（`isOwnRunLock`）か。読めない（ない、JSON でない）ときは、間を置いて 1 回だけ読み直す（DEF-170、DEF-172）。 */
+  async #readsOwnLock(lock: RunLock): Promise<boolean> {
+    const runDirectory = this.#runDirectory;
+    let current = await this.#store.readRunLock(runDirectory);
+    if (current === null) {
+      await this.#wait(RUN_LOCK_REREAD_DELAY_MS);
+      current = await this.#store.readRunLock(runDirectory);
+    }
+    return isOwnRunLock(current, lock);
   }
 
   #requireActive(operation: string): void {
@@ -388,21 +510,59 @@ export class RunCheckpointSession {
     }
   }
 
-  /** ハートビートの1回分。前の回の書き出しが終わっていなければ飛ばす。失敗は、外に投げない（次の回で書き直す）。 */
+  /**
+   * ハートビートで、ロックが自分のものでなくなったと分かったか（DEF-170。読み直したロックが、ほかの起動のものだった）。真になったら、ハートビートは
+   * 止まり、ロックを書き換えない。
+   */
+  get lockLost(): boolean {
+    return this.#lockLost;
+  }
+
+  /** ロックを失ったときに付く印（DEF-170。Run Coordinator が読み、すぐに読み込みを止めて、Run のディレクトリに書かずに終える）。 */
+  get lockLostSignal(): AbortSignal {
+    return this.#lockLostController.signal;
+  }
+
+  /**
+   * ハートビートの1回分。前の回の書き出しが終わっていなければ飛ばす。失敗は、外に投げない（次の回で書き直す）。
+   * DEF-170: ロックを読み直し、自分のもの（`isOwnRunLock`）のときだけ書き換える。読めなかった（ない、読めない）か、ほかの起動のものなら、書き換えず
+   * （ほかの起動のロックを上書きしない）、`lockLost` を真にして、ハートビートを止める。
+   */
   #beat(): void {
     const lock = this.#lock;
     const beating = this.#phase === 'ACTIVE' || this.#phase === 'FINISHING';
-    if (!beating || this.#heartbeatWrite !== null || lock === null) {
+    if (!beating || this.#heartbeatWrite !== null || lock === null || this.#lockLost) {
       return;
     }
     const runDirectory = this.#runDirectory;
     // 時刻の読み取り、ロックの値の作成、書き手の同期の例外も、Promise の reject として扱い、外に投げない。
     this.#heartbeatWrite = Promise.resolve()
-      .then(async () => this.#store.rewriteRunLock(runDirectory, renewRunLock(lock, this.#now())))
+      .then(async () => {
+        // 読めない（ない、JSON でない）ときは、一時的な失敗を考え、少し置いて 1 回だけ読み直す（それでも自分のものと分からなければ失った）。
+        if (!(await this.#readsOwnLock(lock))) {
+          this.#loseLock();
+          return;
+        }
+        await this.#store.rewriteRunLock(runDirectory, renewRunLock(lock, this.#now()));
+      })
       .catch(() => undefined)
       .finally(() => {
         this.#heartbeatWrite = null;
       });
+  }
+
+  /**
+   * ロックを失った（DEF-170）。ハートビートのタイマーを止め、`lockLostSignal` を付ける（Run Coordinator が読み込みを止める）。セッションの段階は
+   * 変えない（やめるは呼び出し側。保存と終えるは、この後 `RunLockLostError` で拒む）。
+   */
+  #loseLock(): void {
+    this.#lockLost = true;
+    this.#lockLostController.abort();
+    const timer = this.#heartbeatTimer;
+    this.#heartbeatTimer = null;
+    if (timer !== null) {
+      this.#timers.clearInterval(timer);
+    }
   }
 
   /** ハートビートのタイマーを止め、書き出し中のハートビートの終わりを待つ。セッションは終わった段階になる。 */

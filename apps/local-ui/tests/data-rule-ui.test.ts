@@ -9,6 +9,7 @@
  *   下書きに戻る（承認していれば、要再承認）。版の衝突は保存しない。秘密に見える名前の欄に値を入れると拒む。中身の誤りも拒む。
  * - データの例: 送る欄すべてが決まったときだけ出る。メールは example.invalid の合成の宛先、通知の欄は送らない。画面の要求は画面のサーバだけ（外への要求 0）。
  * - 書き込みのモードでないプロファイルでは、編集と例が出ず、サーバも拒む。
+ * - FM2c: 推した規則（出どころの印 `INFERRED`）の印と、既定の幅を使った欄の一覧が出る。編集せずに保存すると印と幅が残り、編集した規則は人の規則になる。
  * - すべての画面で、CSP の違反と console の誤りが 0 件、外部への要求が 0 件。ブラウザのバンドルに、規則の表の SQL が入らない。
  * 管理データ、ターゲット設定、出力先は、一時の root の中だけ。Chromium は headless だけ。スクリーンショットは、環境変数 `T29E_SCREENSHOT_DIR` が
  * あれば、そこに保存する。
@@ -16,15 +17,16 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../../src/cli/exit-codes.js';
-import { WORKER_PROTOCOL_VERSION } from '../../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../../src/discovery/fingerprint.js';
+import { RULE_SOURCE_CATALOG } from '../../../src/presentation/catalog.js';
 import { LOCAL_UI_DATA_RULE_TEXT, LOCAL_UI_SCENARIO_TEXT } from '../../../src/presentation/messages.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeFakeWorker } from '../../../tests/helpers/fake-audit-worker.js';
+import { fakeWorkerValuesOf } from '../../../tests/helpers/job-test-support.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import { NO_CONSTRAINTS, sampleAction, sampleField, sampleForm } from '../../../tests/unit/discovery-candidate-samples.js';
 import {
@@ -38,6 +40,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403 });
@@ -112,6 +115,8 @@ const CREATE = candidateOf(sampleForm({
     sampleField('notify', 'checkbox', { options: ['1'] }),
     sampleField('code_x'),
     sampleField('api_key'),
+    // FM2c: 範囲の手がかりのない日付の欄（既定の幅の画面の確かめ。最初のシナリオの送る欄ではない）。
+    sampleField('visit_x', 'date'),
   ],
 }));
 
@@ -137,42 +142,31 @@ const installFakeDiscovery = (outputDirectory: string): void => {
   const directory = `${rootOf().root}/fake-workers/${outputDirectory}`;
   mkdirSync(directory, { recursive: true });
   const document = discoveryDocument();
-  const worker = writeFakeWorker(directory, 'discovery', {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
+  const worker = writeFakeWorker(directory, 'discovery', fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, {
     heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
     discovery: {
       outputDirectory: `${rootOf().root}/${outputDirectory}`,
       documentText: JSON.stringify(document),
       summary: { ...discoverySummaryOf(document) },
       runStatus: 'COMPLETE',
     },
-  });
+  }));
   writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
 };
 
-const waitForEnd = async (jobId: string): Promise<{ readonly state: string }> => {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const job = await valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId });
-    if (job !== null && !job.active) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`ジョブが終わらなかった: ${JSON.stringify(job)}`);
-    }
-    descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
-};
+/** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する。待ち方は補助 `waitForJobViaServerFunctions`。PRE42-CC 組 UI-K2）。 */
+const waitForEnd = (jobId: string): Promise<{ readonly state: string }> => waitForJobViaServerFunctions(
+  (id) => valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId: id }),
+  jobId,
+  (job) => !job.active,
+  {
+    limitMs: WAIT_LIMIT_MS,
+    stepMs: WAIT_POLL_MS,
+    onPending: async () => {
+      descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+    },
+  },
+);
 
 const writeTarget = (name: string, outputDirectory: string): string => {
   const path = `config/targets/${name}.json`;
@@ -201,7 +195,7 @@ const profileDocument = (profileId: string, targetConfigPath: string, mode: stri
 });
 
 const authSetup = (profileId: string): Record<string, unknown> => ({
-  schemaVersion: 'beaksight-auth-setup/2',
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${ORIGIN}/login`,
@@ -238,6 +232,12 @@ interface PageView {
 }
 
 const pageOf = (scenarioId: string): Promise<PageView> => valueOf<PageView>('dataRulePageFn', 'GET', { scenarioId });
+
+/** FM2c: 保存した中身と、既定の幅の印を持つ画面の値。 */
+type ContentPageView = Omit<PageView, 'fields'> & {
+  readonly content: Readonly<Record<string, unknown>>;
+  readonly fields: readonly (FieldView & { readonly defaultRange: boolean })[];
+};
 
 /** 保存の入力（中身は引数）。 */
 const saveOf = (scenarioId: string, page: PageView, content: Record<string, unknown>): Record<string, unknown> => ({
@@ -320,8 +320,9 @@ describe('T29e: data rule Server Functions (registration, input validation, CSRF
     // T30g: 実行の許可の発行と書き込みの開始は、書き込みの開始の画面の 2 つの Server Function だけ（入力の規則の画面の Server Function は当たらない。
     // 許可の消費・予約の締めの Server Function はない）。発行を呼べる画面のコードが 1 ファイルだけであることは、Gate `approval-ssot` の (e)。
     const executionPaths = [...ids.keys()].filter((name) => /grant|reserv|consume|execut|settle|write/iu.test(name)).sort();
-    // T31h-2: UPDATE の開始（`startWriteUpdateFn`）も、同じ書き込みの開始の画面のファイルにある。
-    expect(executionPaths).toEqual(['startWriteCreateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
+    // T31h-2: UPDATE の開始（`startWriteUpdateFn`）も、同じ書き込みの開始の画面のファイルにある。T41g: 作ってから更新する開始
+    // （`startWriteCreateThenUpdateFn`）も同じファイルにある（`scenario-ui` の同じ一覧と同じ）。
+    expect(executionPaths).toEqual(['startWriteCreateFn', 'startWriteCreateThenUpdateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
     expect(executionPaths.filter((name) => ['dataRulePageFn', 'saveDataRulesFn'].includes(name))).toEqual([]);
   });
 
@@ -414,8 +415,10 @@ describe('T29e: the data rule screen', () => {
     await page.keyboard.press('Tab');
     expect(await focusedText(page)).toBe(text.saveDialog.confirm);
     await page.keyboard.press('Enter');
-    await page.waitForURL(/\/rules\?notice=saved$/u, { timeout: UI_TIMEOUT_MS });
+    // DEF-137: 知らせの search は、保存した規則の集まりの版も持つ（画面の版がそれに届いたときだけ知らせを出す）。
+    await page.waitForURL(/\/rules\?notice=saved&savedRevision=1$/u, { timeout: UI_TIMEOUT_MS });
     await expect.poll(() => page.getByTestId('data-rule-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('DECIDED');
+    await page.getByTestId('data-rule-notice').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('data-rule-example').count()).toBe(EXAMPLE_COUNT);
     expect(await page.getByTestId('data-rule-synthetic').first().getAttribute('data-synthetic')).toBe('EMAIL');
     await screenshot(page, 'r04-rules-saved-examples');
@@ -435,6 +438,15 @@ describe('T29e: the data rule screen', () => {
     const detail = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}`);
     expect(await detail.getByTestId('scenario-input-rules').getAttribute('data-state')).toBe('DECIDED');
     await screenshot(detail, 'r05-scenario-detail-rules-decided');
+  });
+
+  it('shows the saved notice only when the rule set revision on the screen reached the saved revision (DEF-137)', async () => {
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(1);
+    const ahead = await openPage(`${rulesPath()}?notice=saved&savedRevision=1000`);
+    await ahead.getByTestId('data-rule-state').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await ahead.getByTestId('data-rule-notice').count()).toBe(0);
+    const reached = await openPage(`${rulesPath()}?notice=saved&savedRevision=1`);
+    await reached.getByTestId('data-rule-notice').waitFor({ timeout: UI_TIMEOUT_MS });
   });
 
   it('turns an approved scenario back to needing approval when the rules are saved again', async () => {
@@ -487,11 +499,89 @@ describe('T29e: the data rule screen', () => {
     expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(page.ruleSet?.revision);
   });
 
+  it('shows the origin marks and the fields with the default width of the inferred rules, and keeps them when saved unchanged (FM2c)', async () => {
+    // 氏名、選択肢（既定の値のある select は送る欄にする）と、範囲の手がかりのない日付の欄（visit_x）を送る、別のシナリオ。
+    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: {
+        profileId: WRITE_PROFILE_ID,
+        candidateIdentityDigest: CREATE.identityDigest,
+        fieldNames: ['name', 'plan', 'visit_x'],
+        readChecks: [],
+        sideEffectConfirmations: ALL_CONFIRMED,
+        limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
+        approvalTtlDays: 30,
+      },
+    });
+    expect(created).toMatchObject({ ok: true });
+    const scenarioId = created.scenarioId;
+    const path = `/scenarios/${WRITE_PROFILE_ID}/${scenarioId}/rules`;
+    const before = await pageOf(scenarioId);
+    // 自動の作成（FM2b が付ける）の代わりに、`inferRuleSetContent` が作る形の中身を保存する（氏名はテンプレート、visit_x は既定の幅）。
+    const inferredName = { fieldName: 'name', semanticKind: 'FULL_NAME', method: 'FROM_TEMPLATE', range: null, fixedValues: [], origin: 'INFERRED',
+      baseDateWindow: null, digitCount: null };
+    const inferredVisit = { fieldName: 'visit_x', semanticKind: 'GENERIC_DATETIME', method: 'FROM_TYPE', range: null, fixedValues: [],
+      origin: 'INFERRED', baseDateWindow: { fromDays: 0, toDays: 30 }, digitCount: null };
+    const inferredPlan = { fieldName: 'plan', semanticKind: 'GENERIC_CHOICE', method: 'FROM_TYPE', range: null, fixedValues: [], origin: 'INFERRED',
+      baseDateWindow: null, digitCount: null };
+    const inferredMarks = { uniqueKeyFieldNames: ['name'], uniqueKeyOrigin: 'INFERRED', templateDefaultsSaved: true };
+    expect(await valueOf('saveDataRulesFn', 'POST', saveOf(scenarioId, before, {
+      fieldRules: [inferredName, inferredPlan, inferredVisit], ...inferredMarks,
+    }))).toMatchObject({ ok: true });
+    const saved = await valueOf<ContentPageView>('dataRulePageFn', 'GET', { scenarioId });
+    expect(saved.content).toEqual({ fieldRules: [inferredName, inferredPlan, inferredVisit], relations: [], ...inferredMarks });
+    expect(saved.fields.map(({ fieldName, status, source, defaultRange }) => [fieldName, status, source, defaultRange])).toEqual([
+      ['name', 'DECIDED', 'HUMAN', false],
+      ['plan', 'DECIDED', 'HUMAN', false],
+      ['visit_x', 'DECIDED', 'HUMAN', true],
+    ]);
+
+    const page = await openPage(path);
+    const field = (name: string): Locator => page.locator(`[data-testid="data-rule-field"][data-field-name="${name}"]`);
+    expect(await field('name').getByTestId('data-rule-origin').getAttribute('data-origin')).toBe('INFERRED');
+    expect(await field('name').getByTestId('data-rule-origin').getAttribute('data-default-range')).toBe('false');
+    expect(await field('visit_x').getByTestId('data-rule-origin').getAttribute('data-default-range')).toBe('true');
+    expect(await page.getByTestId('data-rule-default-ranges').locator('[data-default-range-field]').evaluateAll((items) =>
+      items.map((item) => item.getAttribute('data-default-range-field')))).toEqual(['visit_x']);
+    expect(await page.getByTestId('data-rule-unique-origin').getAttribute('data-origin')).toBe('INFERRED');
+    // fix round 1: 判定の出どころ `HUMAN` の表示名は「保存した規則」（推したか人が決めたかは、出どころの印の行）。
+    expect(await field('name').getByTestId('data-rule-source').textContent()).toBe(RULE_SOURCE_CATALOG.HUMAN.label);
+    await screenshot(page, 'r07-rules-inferred');
+
+    // 編集せずに保存すると、出どころの印と既定の幅を残す。
+    const save = page.getByTestId('data-rule-save');
+    await tabTo(page, save);
+    await page.keyboard.press('Enter');
+    await page.getByRole('dialog').waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    await page.waitForURL(/\/rules\?notice=saved/u, { timeout: UI_TIMEOUT_MS });
+    const kept = await valueOf<ContentPageView>('dataRulePageFn', 'GET', { scenarioId });
+    expect(kept.ruleSet?.revision).toBe((saved.ruleSet?.revision ?? 0) + 1);
+    expect(kept.content).toEqual(saved.content);
+
+    // 編集した規則は、人の規則として保存する（出どころの印を持たない）。一意にする欄の組を変えていなければ、組の印は残る。
+    const edited = await openPage(path);
+    await edited.locator('select[data-kind-for="name"]').selectOption('FAMILY_NAME');
+    const editedSave = edited.getByTestId('data-rule-save');
+    await tabTo(edited, editedSave);
+    await edited.keyboard.press('Enter');
+    await edited.getByRole('dialog').waitFor({ timeout: UI_TIMEOUT_MS });
+    await edited.keyboard.press('Tab');
+    await edited.keyboard.press('Enter');
+    await expect.poll(async () => (await pageOf(scenarioId)).ruleSet?.revision, { timeout: UI_TIMEOUT_MS }).toBe((kept.ruleSet?.revision ?? 0) + 1);
+    const human = await valueOf<ContentPageView>('dataRulePageFn', 'GET', { scenarioId });
+    expect(human.content).toEqual({
+      fieldRules: [{ fieldName: 'name', semanticKind: 'FAMILY_NAME', method: 'FROM_TEMPLATE', range: null, fixedValues: [] }, inferredPlan, inferredVisit],
+      relations: [],
+      ...inferredMarks,
+    });
+  });
+
   it('keeps the server parts of the data rules out of the browser bundle', () => {
     const clientDirectory = `${rootOf().root}/apps/local-ui/dist/client`;
     const files = readdirSync(clientDirectory, { recursive: true, encoding: 'utf8' }).filter((path) => path.endsWith('.js'));
     const bundle = files.map((path) => readFileSync(`${clientDirectory}/${path}`, 'utf8')).join('\n');
-    for (const marker of ['rule_set_revisions', 'FROM rule_sets', 'beaksight-data-rule-digest/1', 'screen-example-']) {
+    for (const marker of ['rule_set_revisions', 'FROM rule_sets', 'beaksight-data-rule-digest/1', 'beaksight-data-rule-digest/2', 'screen-example-']) {
       expect(bundle.includes(marker), marker).toBe(false);
     }
   });

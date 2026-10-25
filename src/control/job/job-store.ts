@@ -13,6 +13,8 @@
 //   凍結した写しにする。壊れた行は `ControlStoreError`（`DATABASE_INTEGRITY_FAILED`）で止める。
 import { isPortableRelativeArtifactPath } from '../../core/artifact-layout.js';
 import { RUN_STATUSES, type RunId, type RunProgressReport, type RunStatus } from '../../core/contracts.js';
+import type { SessionLossEvidence } from '../../core/evidence-types.js';
+import { isRecord } from '../../core/guards.js';
 import { isRunId } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
 import {
@@ -21,7 +23,10 @@ import {
   type AutomatedLoginResult,
   type AutomatedLoginSubmission,
 } from '../auth/automated-login-results.js';
+import { canonicalHttpOriginOf } from '../../crawl/normalize-url.js';
+import { MAX_LOGIN_SIDE_REQUESTS } from '../auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../contracts.js';
+import { MANUAL_LOGIN_REGISTRATION_SKIP_REASONS } from '../manual-login-registration.js';
 import type { ControlDatabase } from '../store/control-database.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
 import { ControlStoreError } from '../store/store-errors.js';
@@ -37,15 +42,21 @@ import {
   validateWorkerToParentMessage,
   type WorkerAuthState,
   type WorkerLoginFormInvalidReason,
+  type WorkerLoginObservation,
+  type WorkerLoginStateNames,
+  type WorkerLoginStageBlockedRequests,
   type WorkerOutcomeKind,
   type WorkerRunNotice,
   type WorkerRunOutcome,
+  type WorkerScriptLoginCounts,
 } from '../worker-protocol.js';
 import {
   ACTIVE_AUDIT_JOB_STATES,
   AUDIT_JOB_FAILURE_REASONS,
   AUDIT_JOB_KINDS,
   AUDIT_JOB_STATES,
+  MAX_LOGIN_STAGE_SUMMARY_LENGTH,
+  MAX_SESSION_LOSS_RECORD_LENGTH,
   WRITE_REPORT_CHECKS,
   type AuditJobFailureReason,
   type AuditJobKind,
@@ -98,6 +109,11 @@ export interface AuditJobView {
    * 読まないパスに足す」を案内するため。T25d）。
    */
   readonly sessionLostUrl: string | null;
+  /**
+   * DEF-138: セッションの切れの証拠（`SESSION_LOST` の `AUTH_STATE` が持ったときだけ。管理データの版 16 の `jobs.session_loss`。値を持たない）。画面が
+   * 「止まったページの URL」の近くに、行き着いた先・経路・止めた要求・鍵の名前の違いを出す。
+   */
+  readonly sessionLoss: SessionLossEvidence | null;
   /** 自動ログインの試しの結果（T26d-2。自動ログインのジョブだけ。ほかは `null`）。 */
   readonly autoLoginAttempt: AuditJobAutoLoginAttemptView | null;
   /**
@@ -105,7 +121,113 @@ export interface AuditJobView {
    * `VALID` のときだけ報告を配る。
    */
   readonly writeReportCheck: WriteReportCheck | null;
+  /**
+   * ログインの段のまとめ（T34e。管理データの版 11 の `jobs.login_stage_summary`）。手動のログインの段の結果の `AUTH_STATE` が、数のまとめか、止めた
+   * 読み取りでない要求の一覧を持ったときだけ（ほかは `null`）。ローカルの画面だけに出す（Run の成果物には入れない）。
+   */
+  readonly loginStage: AuditJobLoginStageSummary | null;
 }
+
+/**
+ * ジョブのログインの段のまとめ（T34e。Task 34 の設計書 3.5 と 8 章の T34e の行）。値は `AUTH_STATE` の項目の写し（URL の query・本文・値を持たない）。
+ * - `scriptLogin`: スクリプトで送るログインの段の結果の数（`WorkerScriptLoginCounts`。フォームの送信のログインは `null`）。
+ * - `blockedRequests`: ログインの段で止めた読み取りでない要求の一覧（`WorkerLoginStageBlockedRequests`。止めた要求がなければ `null`）。
+ * どちらかは `null` でない。
+ */
+export interface AuditJobLoginStageSummary {
+  readonly scriptLogin: WorkerScriptLoginCounts | null;
+  readonly blockedRequests: WorkerLoginStageBlockedRequests | null;
+  /**
+   * T43d（Task 43 の設計書 4.4）: ログインの段で観察したこと（`AUTH_STATE` の `loginObservation` の写し。成功の鍵の名前の案と成功の画面のセレクタの案。
+   * 任意の項目。前の行は持たない）。値・要素の文字を持たない。
+   */
+  readonly observation?: WorkerLoginObservation;
+  /**
+   * T43R-fix の M-5: まとめが管理データの大きさの上限（JSON の escape を含めた全体の長さ）を超えたので、観察と行の query の名前を省いた印（`true` だけ）。
+   */
+  readonly observationOmitted?: true;
+  /**
+   * ML-a（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 2.1、2.3）: 手動のログインの段で通した読み取りでない要求の一覧（`AUTH_STATE` の
+   * `passedRequests` の写し。止めた一覧と同じ形。値を持たない。任意の項目）。
+   */
+  readonly passedRequests?: WorkerLoginStageBlockedRequests;
+  /** ML-a: 手動のログインの成功からの、認証の設定の自動の登録の結果（ジョブの終わりの後に 1 回だけ書く。任意の項目）。 */
+  readonly autoRegistration?: AuditJobLoginAutoRegistration;
+  /**
+   * DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 2.1）: ログインの後のブラウザの状態の名前の記録（`AUTH_STATE` の
+   * `loginStateNames` の写し。名前の形と、引き継いだか外したか。値を持たない。任意の項目。前の行は持たない）。管理データの版は上げない（JSON の列）。
+   */
+  readonly stateNames?: WorkerLoginStateNames;
+}
+
+/**
+ * ML-a: 自動の登録をしなかった理由（閉じた一覧）。組み立ての部品の理由（`MANUAL_LOGIN_REGISTRATION_SKIP_REASONS`）に、保存の段の理由を足したもの。
+ * - `PROFILE_CHANGED`: ジョブを始めた後に、プロファイルか認証の設定が変わった（改訂が違う、設定がない・古い）。利用者の変更を上書きしない。
+ * - `SAVE_REJECTED`: 保存の部品（プロファイルと認証の設定の検証）が拒んだ。
+ */
+const [NO_PASSED_REQUESTS, NO_TOKEN_REQUEST, NO_STORAGE_KEY, NOTHING_NEW, MULTIPLE_TOKEN_TARGETS] = MANUAL_LOGIN_REGISTRATION_SKIP_REASONS;
+// ML-a-fix-3（ML-R2 の M-1）: 組み立ての部品の新しい理由（`MULTIPLE_TOKEN_TARGETS`）は、一覧の末尾に足す（前の理由の順を変えない）。
+export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS = Object.freeze([
+  NO_PASSED_REQUESTS,
+  NO_TOKEN_REQUEST,
+  NO_STORAGE_KEY,
+  NOTHING_NEW,
+  'PROFILE_CHANGED',
+  'SAVE_REJECTED',
+  MULTIPLE_TOKEN_TARGETS,
+] as const);
+export type AuditJobLoginAutoRegistrationSkipReason = (typeof AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS)[number];
+
+/**
+ * ML-a: 自動の登録の結果（値を持たない）。`SAVED` は、保存したプロファイルの改訂と、プロファイルの承認したサービスの Origin に足した Origin（保存した設定の
+ * 中身は、認証の設定の保存の部品 `getAuthSetup` で読む）。`SKIPPED` は理由だけ。
+ */
+export type AuditJobLoginAutoRegistration =
+  | { readonly result: 'SAVED'; readonly profileRevision: number; readonly addedServiceOrigins: readonly string[] }
+  | { readonly result: 'SKIPPED'; readonly reason: AuditJobLoginAutoRegistrationSkipReason };
+
+/** 足した Origin の数の上限（token の送信先と、ログインに伴う送信の上限の和）。 */
+const MAX_AUTO_REGISTRATION_ADDED_ORIGINS = 1 + MAX_LOGIN_SIDE_REQUESTS;
+
+/** 自動の登録の結果として書ける・読める値か（閉じた形）。 */
+const isAutoRegistration = (value: unknown): value is AuditJobLoginAutoRegistration => {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (value['result'] === 'SKIPPED') {
+    return keys.length === 2 && (AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS as readonly unknown[]).includes(value['reason']);
+  }
+  const { profileRevision, addedServiceOrigins } = value;
+  return value['result'] === 'SAVED' && keys.length === 3
+    && typeof profileRevision === 'number' && Number.isSafeInteger(profileRevision) && profileRevision > MIN_PROFILE_REVISION
+    && Array.isArray(addedServiceOrigins) && addedServiceOrigins.length <= MAX_AUTO_REGISTRATION_ADDED_ORIGINS
+    && new Set(addedServiceOrigins).size === addedServiceOrigins.length
+    && addedServiceOrigins.every((origin) => typeof origin === 'string' && canonicalHttpOriginOf(origin) === origin);
+};
+
+/**
+ * T43R-fix の M-5: まとめを、管理データの大きさの上限に収める。JSON（escape を含めた全体）の長さが上限を超えるときは、観察（鍵の名前の案、セレクタの案）と
+ * 行の query の名前を落とし、省いた印を付ける（数のまとめと、行の Origin・path・種類・理由・回数は残す）。それでも超えるときは、そのまま返す（書く口が誤りにする）。
+ */
+export const fittedLoginStageSummary = (summary: AuditJobLoginStageSummary): AuditJobLoginStageSummary => {
+  if (JSON.stringify(summary).length <= MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
+    return summary;
+  }
+  // DEF-139: 状態の名前の記録も、観察と一緒に落とす（省いた印は同じ）。
+  const { observation: _observation, stateNames: _stateNames, ...rest } = summary;
+  return {
+    ...rest,
+    blockedRequests: summary.blockedRequests === null
+      ? null
+      : { ...summary.blockedRequests, requests: summary.blockedRequests.requests.map(({ query: _query, ...row }) => row) },
+    // ML-a: 通した送信の一覧も、行の query の名前を落とす。
+    ...(summary.passedRequests === undefined
+      ? {}
+      : { passedRequests: { ...summary.passedRequests, requests: summary.passedRequests.requests.map(({ query: _query, ...row }) => row) } }),
+    observationOmitted: true,
+  };
+};
 
 /** 作るジョブ（`STARTING`）。 */
 export interface NewAuditJob {
@@ -164,6 +286,9 @@ interface JobRow {
   readonly session_lost_url: string | null;
   readonly job_kind: string;
   readonly write_report_check: string | null;
+  readonly login_stage_summary: string | null;
+  /** DEF-138: セッションの切れの証拠（版 16）。 */
+  readonly session_loss: string | null;
   /** そのジョブの自動ログインの試しの行の ID（試しがなければ `null`。T26d-2）。 */
   readonly attempt_id: number | null;
   readonly attempt_result: string | null;
@@ -183,7 +308,7 @@ const ONE_ROW = 1;
 const JOB_COLUMNS = [
   'job_id', 'profile_id', 'profile_revision', 'state', 'start_new', 'run_id', 'run_directory', 'exit_code', 'run_status', 'end_kind',
   'last_progress', 'last_notice', 'created_at', 'started_at', 'finished_at', 'last_heartbeat_at', 'stop_requested_at', 'failure_reason',
-  'last_auth_state', 'session_lost_url', 'job_kind', 'write_report_check',
+  'last_auth_state', 'session_lost_url', 'job_kind', 'write_report_check', 'login_stage_summary', 'session_loss',
 ].map((column) => `jobs.${column}`).join(', ');
 /** そのジョブの自動ログインの試しの列（T26d-2。1 つのジョブで試しは 1 つまで。`job_id` は一意）。 */
 const ATTEMPT_COLUMNS = [
@@ -212,6 +337,15 @@ const UPDATE_PROGRESS_SQL = 'UPDATE jobs SET last_progress = ? WHERE job_id = ? 
 const UPDATE_NOTICE_SQL = 'UPDATE jobs SET last_notice = ? WHERE job_id = ? AND state IN (SELECT value FROM json_each(?))';
 const UPDATE_AUTH_STATE_SQL = `UPDATE jobs SET last_auth_state = ?, session_lost_url = COALESCE(?, session_lost_url)
   WHERE job_id = ? AND state IN (SELECT value FROM json_each(?))`;
+/** DEF-138: セッションの切れの証拠（まだ記録していない、終わっていない行だけ。1 回だけ書く）。 */
+const UPDATE_SESSION_LOSS_SQL = `UPDATE jobs SET session_loss = ?
+  WHERE job_id = ? AND session_loss IS NULL AND state IN (SELECT value FROM json_each(?))`;
+/** ログインの段のまとめ（T34e。まだ記録していない、終わっていない行だけ。1 回だけ書く）。 */
+const UPDATE_LOGIN_STAGE_SUMMARY_SQL = `UPDATE jobs SET login_stage_summary = ?
+  WHERE job_id = ? AND login_stage_summary IS NULL AND state IN (SELECT value FROM json_each(?))`;
+/** ML-a: 自動の登録の結果を足す（読んだまとめから変わっていない行だけ）。 */
+const SELECT_LOGIN_STAGE_SUMMARY_SQL = 'SELECT login_stage_summary FROM jobs WHERE job_id = ?';
+const UPDATE_LOGIN_STAGE_REGISTRATION_SQL = 'UPDATE jobs SET login_stage_summary = ? WHERE job_id = ? AND login_stage_summary = ?';
 const UPDATE_HEARTBEAT_SQL = 'UPDATE jobs SET last_heartbeat_at = ? WHERE job_id = ? AND state IN (SELECT value FROM json_each(?))';
 const UPDATE_STOPPING_SQL = `UPDATE jobs SET state = 'STOPPING', stop_requested_at = COALESCE(stop_requested_at, ?)
   WHERE job_id = ? AND state IN (SELECT value FROM json_each(?))`;
@@ -304,8 +438,108 @@ const autoLoginAttemptOf = (row: JobRow): AuditJobAutoLoginAttemptView | null =>
   } as AuditJobAutoLoginAttemptView;
 };
 
-/** 止まったページの URL として記録できる値か（契約の `AUTH_STATE` の `SESSION_LOST` の規則で確かめる）。 */
-const isSessionLostUrl = (url: string): boolean => validateWorkerToParentMessage({
+/** ログインの段のまとめの、必ずある項目の名前（閉じた形。この 2 つと、任意の `observation`（T43d）だけ）。 */
+const LOGIN_STAGE_SUMMARY_KEYS: readonly (keyof AuditJobLoginStageSummary)[] = Object.freeze(['scriptLogin', 'blockedRequests']);
+/** T43d: ログインの段のまとめの任意の項目の名前。 */
+const LOGIN_STAGE_SUMMARY_OPTIONAL_KEY: keyof AuditJobLoginStageSummary = 'observation';
+/** T43R-fix の M-5: 大きすぎたので観察と query の名前を省いた印の項目の名前（値は `true` だけ）。 */
+const LOGIN_STAGE_SUMMARY_OMITTED_KEY: keyof AuditJobLoginStageSummary = 'observationOmitted';
+/** ML-a: 通した送信の一覧と、自動の登録の結果の項目の名前（任意）。 */
+const LOGIN_STAGE_SUMMARY_PASSED_KEY: keyof AuditJobLoginStageSummary = 'passedRequests';
+const LOGIN_STAGE_SUMMARY_REGISTRATION_KEY: keyof AuditJobLoginStageSummary = 'autoRegistration';
+/** DEF-139: 状態の名前の記録の項目の名前（任意）。 */
+const LOGIN_STAGE_SUMMARY_STATE_NAMES_KEY: keyof AuditJobLoginStageSummary = 'stateNames';
+
+/**
+ * ログインの段のまとめとして書ける・読める値か（T34e）。閉じた形（2 つの項目と任意の 2 つの項目だけ、どれかは `null` でない）で、`null` でない項目は、
+ * 契約の `AUTH_STATE`（ログインの段の結果）の同じ項目の規則で確かめる。
+ */
+const isLoginStageSummary = (value: unknown): value is AuditJobLoginStageSummary => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  const hasObservation = keys.includes(LOGIN_STAGE_SUMMARY_OPTIONAL_KEY);
+  const hasOmitted = keys.includes(LOGIN_STAGE_SUMMARY_OMITTED_KEY);
+  // ML-a: 通した送信の一覧と、自動の登録の結果（どちらも任意）。
+  const hasPassed = keys.includes(LOGIN_STAGE_SUMMARY_PASSED_KEY);
+  const hasRegistration = keys.includes(LOGIN_STAGE_SUMMARY_REGISTRATION_KEY);
+  // DEF-139: 状態の名前の記録（任意）。
+  const hasStateNames = keys.includes(LOGIN_STAGE_SUMMARY_STATE_NAMES_KEY);
+  if (keys.length !== LOGIN_STAGE_SUMMARY_KEYS.length + (hasObservation ? 1 : 0) + (hasOmitted ? 1 : 0) + (hasPassed ? 1 : 0) + (hasRegistration ? 1 : 0)
+    + (hasStateNames ? 1 : 0)
+    || !LOGIN_STAGE_SUMMARY_KEYS.every((key) => keys.includes(key))) {
+    return false;
+  }
+  const { scriptLogin, blockedRequests, observation, observationOmitted, passedRequests, autoRegistration, stateNames } =
+    value as Record<keyof AuditJobLoginStageSummary, unknown>;
+  // DEF-139: 省いた印は、観察と状態の名前の記録を落とした印なので、どちらとも一緒には持たない。
+  if ((hasOmitted && (observationOmitted !== true || hasObservation || hasStateNames))
+    || (scriptLogin === null && blockedRequests === null && !hasObservation && !hasOmitted && !hasPassed && !hasStateNames)
+    || (hasRegistration && !isAutoRegistration(autoRegistration))) {
+    return false;
+  }
+  return validateWorkerToParentMessage({
+    protocol: WORKER_PROTOCOL_VERSION,
+    type: 'AUTH_STATE',
+    state: 'AUTHENTICATED',
+    sessionLostUrl: null,
+    ...(scriptLogin === null ? {} : { scriptLogin }),
+    ...(blockedRequests === null ? {} : { blockedRequests }),
+    // T43d: 観察は、契約の `AUTH_STATE` の `loginObservation` と同じ規則で確かめる（`undefined` や `null` は形の誤り）。
+    ...(hasObservation ? { loginObservation: observation } : {}),
+    // ML-a: 通した送信の一覧も、契約の `AUTH_STATE` の `passedRequests` と同じ規則で確かめる。
+    ...(hasPassed ? { passedRequests } : {}),
+    // DEF-139: 状態の名前の記録も、契約の `AUTH_STATE` の `loginStateNames` と同じ規則で確かめる。
+    ...(hasStateNames ? { loginStateNames: stateNames } : {}),
+  }).ok;
+};
+
+/**
+ * ジョブのログインの段のまとめ（なければ `null`。T34e）。閉じた形でなければ、データベースの誤り。LG-3（2026-10-24 のテストの組の設計 3.7.2）: T36c の
+ * 前に書いた行（資格情報を含む要求を止めた数の鍵 `WORKER_LOGIN_CREDENTIAL_BLOCK_REASON` がない）を 0 として読む読み替え（T36R-fix）は捨てた。動いて
+ * いる IPC と同じく、この鍵は必須（ない行は、データベースの誤り）。
+ */
+const loginStageOf = (row: JobRow): AuditJobLoginStageSummary | null => {
+  if (row.login_stage_summary === null) {
+    return null;
+  }
+  const parsed = parseStoredJson(row.job_id, 'login_stage_summary', row.login_stage_summary);
+  if (!isLoginStageSummary(parsed)) {
+    throw integrityError(row.job_id, 'login_stage_summary is not a login stage summary');
+  }
+  return parsed;
+};
+
+/** DEF-138: 読み直しの確かめで、証拠の入れ物にする止まったページの URL（証拠の確かめだけに使う、書ける文字の値）。 */
+const SESSION_LOSS_CHECK_URL = 'about:blank';
+
+/** DEF-138: セッションの切れの証拠として記録できる値か（契約の `AUTH_STATE` の `SESSION_LOST` の `sessionLoss` の規則で確かめる）。 */
+const isSessionLossRecord = (value: unknown): value is SessionLossEvidence => validateWorkerToParentMessage({
+  protocol: WORKER_PROTOCOL_VERSION,
+  type: 'AUTH_STATE',
+  state: WORKER_SESSION_LOST_STATE,
+  sessionLostUrl: SESSION_LOSS_CHECK_URL,
+  sessionLoss: value,
+}).ok;
+
+/** ジョブのセッションの切れの証拠（なければ `null`。DEF-138）。閉じた形でなければ、データベースの誤り。 */
+const sessionLossOf = (row: JobRow): SessionLossEvidence | null => {
+  if (row.session_loss === null) {
+    return null;
+  }
+  const parsed = parseStoredJson(row.job_id, 'session_loss', row.session_loss);
+  if (!isSessionLossRecord(parsed)) {
+    throw integrityError(row.job_id, 'session_loss is not a session loss evidence');
+  }
+  return parsed;
+};
+
+/**
+ * 止まったページの URL として記録できる値か（契約の `AUTH_STATE` の `SESSION_LOST` の規則で確かめる）。セッションの切れの判定（`authenticated-run.ts`
+ * の `isSessionLostUrl`）とは別の意味なので、別の名前にする（PRE42-CC 組 5b。CC-070 (c)）。
+ */
+const isRecordableSessionLostUrl = (url: string): boolean => validateWorkerToParentMessage({
   protocol: WORKER_PROTOCOL_VERSION,
   type: 'AUTH_STATE',
   state: WORKER_SESSION_LOST_STATE,
@@ -345,7 +579,7 @@ const viewOf = (row: JobRow): AuditJobView => {
   if (row.last_auth_state !== null && !isOneOf(WORKER_AUTH_STATES, row.last_auth_state)) {
     throw integrityError(jobId, 'last_auth_state is not in the closed list');
   }
-  if (row.session_lost_url !== null && !isSessionLostUrl(row.session_lost_url)) {
+  if (row.session_lost_url !== null && !isRecordableSessionLostUrl(row.session_lost_url)) {
     throw integrityError(jobId, 'session_lost_url is not a session lost URL');
   }
   if (row.write_report_check !== null && !isOneOf(WRITE_REPORT_CHECKS, row.write_report_check)) {
@@ -373,8 +607,10 @@ const viewOf = (row: JobRow): AuditJobView => {
     failureReason: row.failure_reason,
     lastAuthState: row.last_auth_state,
     sessionLostUrl: row.session_lost_url,
+    sessionLoss: sessionLossOf(row),
     autoLoginAttempt: autoLoginAttemptOf(row),
     writeReportCheck: row.write_report_check,
+    loginStage: loginStageOf(row),
   } as AuditJobView);
 };
 
@@ -454,10 +690,65 @@ export const recordNotice = (database: ControlDatabase, jobId: string, notice: W
 /**
  * 最後の認証の状態を記録する（T25d）。止まったページの URL は、`SESSION_LOST` のときだけ渡す（`null` なら、前の値を残す）。終わっていない
  * 行だけ。値と秘密は受けない（契約の `AUTH_STATE` を検証してから呼ぶ）。
+ * T34e: ログインの段のまとめ（`loginStage`）があれば、同じトランザクションの中で、まだ記録のない行にだけ書く（1 回だけ。後の状態は書き換えない）。
+ * 閉じた形でない値と、大きさの上限を超える値は、呼び出し側の誤り（`RangeError`）。
  */
-export const recordAuthState = (database: ControlDatabase, jobId: string, state: WorkerAuthState, sessionLostUrl: string | null): boolean =>
-  withWriteTransaction(database, (connection) =>
-    changedOne(connection.prepare(UPDATE_AUTH_STATE_SQL).run(state, sessionLostUrl, jobId, ACTIVE_STATES_JSON).changes));
+export const recordAuthState = (
+  database: ControlDatabase,
+  jobId: string,
+  state: WorkerAuthState,
+  sessionLostUrl: string | null,
+  received: AuditJobLoginStageSummary | null = null,
+  sessionLoss: SessionLossEvidence | null = null,
+): boolean => {
+  // T43R-fix の M-5: 上限を超えるまとめは、観察と query の名前を落として収める（RangeError で落とさない）。
+  const loginStage = received === null ? null : fittedLoginStageSummary(received);
+  const summary = loginStage === null ? null : JSON.stringify(loginStage);
+  if (loginStage !== null && (!isLoginStageSummary(loginStage) || (summary ?? '').length > MAX_LOGIN_STAGE_SUMMARY_LENGTH)) {
+    throw new RangeError('the login stage summary must be a closed login stage summary within the size limit');
+  }
+  // DEF-138: セッションの切れの証拠は、`SESSION_LOST` の閉じた形で、大きさの上限までのものだけ（呼び出し側が契約を確かめてから渡す）。
+  const loss = sessionLoss === null ? null : JSON.stringify(sessionLoss);
+  if (sessionLoss !== null && (state !== WORKER_SESSION_LOST_STATE || !isSessionLossRecord(sessionLoss) || (loss ?? '').length > MAX_SESSION_LOSS_RECORD_LENGTH)) {
+    throw new RangeError('the session loss evidence must be a closed session loss evidence of SESSION_LOST within the size limit');
+  }
+  return withWriteTransaction(database, (connection) => {
+    const changed = changedOne(connection.prepare(UPDATE_AUTH_STATE_SQL).run(state, sessionLostUrl, jobId, ACTIVE_STATES_JSON).changes);
+    if (changed && summary !== null) {
+      connection.prepare(UPDATE_LOGIN_STAGE_SUMMARY_SQL).run(summary, jobId, ACTIVE_STATES_JSON);
+    }
+    if (changed && loss !== null) {
+      connection.prepare(UPDATE_SESSION_LOSS_SQL).run(loss, jobId, ACTIVE_STATES_JSON);
+    }
+    return changed;
+  });
+};
+
+/**
+ * ML-a: 手動のログインの成功からの自動の登録の結果を、ジョブのログインの段のまとめに 1 回だけ足す（ジョブの終わりの後に書くので、行の状態は問わない）。
+ * まとめがない、すでに結果がある、閉じた形でないなら書かない（偽）。値を持たない。
+ */
+export const recordLoginStageAutoRegistration = (
+  database: ControlDatabase,
+  jobId: string,
+  registration: AuditJobLoginAutoRegistration,
+): boolean => withWriteTransaction(database, (connection) => {
+  const row = connection.prepare(SELECT_LOGIN_STAGE_SUMMARY_SQL).get(jobId) as { readonly login_stage_summary: string | null } | undefined;
+  if (row === undefined || row.login_stage_summary === null) {
+    return false;
+  }
+  // LG-3: T36c の前の行（資格情報の理由の鍵がない）は、閉じた形でないので書かない（0 として読み替えない）。
+  const current: unknown = JSON.parse(row.login_stage_summary);
+  if (!isLoginStageSummary(current) || current.autoRegistration !== undefined) {
+    return false;
+  }
+  const next: AuditJobLoginStageSummary = { ...current, autoRegistration: registration };
+  const text = JSON.stringify(next);
+  if (!isLoginStageSummary(next) || text.length > MAX_LOGIN_STAGE_SUMMARY_LENGTH) {
+    return false;
+  }
+  return changedOne(connection.prepare(UPDATE_LOGIN_STAGE_REGISTRATION_SQL).run(text, jobId, row.login_stage_summary).changes);
+});
 
 /** 生きている合図の時刻を記録する。終わっていない行だけ。 */
 export const recordHeartbeat = (database: ControlDatabase, jobId: string, at: string): boolean =>
@@ -578,6 +869,15 @@ export const readJob = (database: ControlDatabase, jobId: string): AuditJobView 
     const row = readRow(connection, jobId);
     return row === undefined ? null : viewOf(row);
   });
+
+/**
+ * 1 つのジョブを、呼び出し側のトランザクションの中で読む（T38c。読むだけ。呼び出し側の `withReadTransaction`・`withWriteTransaction` の中から呼ぶ。
+ * シナリオの下書きの確かめが、発見のジョブのプロファイルの改訂を読む）。なければ `null`。
+ */
+export const readJobIn = (connection: SqliteConnection, jobId: string): AuditJobView | null => {
+  const row = readRow(connection, jobId);
+  return row === undefined ? null : viewOf(row);
+};
 
 /** すべてのジョブ（新しい順）。 */
 export const readAllJobs = (database: ControlDatabase): readonly AuditJobView[] =>

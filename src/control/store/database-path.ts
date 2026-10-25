@@ -11,6 +11,18 @@ export const CONTROL_DATA_DIRECTORY_NAME = 'local-data';
 /** 管理データのファイルの名前。 */
 export const CONTROL_DATABASE_FILE_NAME = 'beaksight-control.sqlite';
 
+/** DEF-146: 画面のサーバが終わったときの記録のファイルを置く、管理データのフォルダの下のフォルダの名前と、ファイルの名前。 */
+export const UI_SERVER_LOG_DIRECTORY_NAME = 'logs';
+export const UI_SERVER_LOG_FILE_NAME = 'ui-server.log';
+
+/** DEF-146: 画面のサーバが終わったときの記録のファイルの場所（`<リポジトリの根>/local-data/logs/ui-server.log`。絶対パス）。 */
+export const resolveUiServerLogPath = (repoRoot: string): string => {
+  if (typeof repoRoot !== 'string' || repoRoot.length === 0 || !isAbsolute(repoRoot)) {
+    throw new RangeError('the repository root for the UI server log must be an absolute path');
+  }
+  return join(repoRoot, CONTROL_DATA_DIRECTORY_NAME, UI_SERVER_LOG_DIRECTORY_NAME, UI_SERVER_LOG_FILE_NAME);
+};
+
 /** 管理データのファイルの場所（絶対パス）。`repoRoot` は絶対パスで渡す（今の作業フォルダに依存させない）。 */
 export const resolveControlDatabasePath = (repoRoot: string): string => {
   if (typeof repoRoot !== 'string' || repoRoot.length === 0 || !isAbsolute(repoRoot)) {

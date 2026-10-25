@@ -10,12 +10,25 @@
 //   `UPDATE`）、対象のレコードの ID（UPDATE だけ）、UPDATE の証拠（`WriteUpdateEvidence`）を足した。UPDATE の対象にできるレコードの台帳
 //   （`verifiedRegistrationsIn`。参照した CREATE のシナリオの `VERIFIED` の登録）と、生成の履歴の鍵の求め直し（`writeGenerationHistoryIn`。使った
 //   値（CREATE の登録と UPDATE で送った値）から、そのシナリオの一意にする欄の組で `uniqueKeyOf` を求め直す）を足した。
+// - T40c（Task 40 の設計書 3.4。管理データの版 14）: 行に、送り方（`FORM`・`API`）と API の型の要約（型の digest、method、Origin、path の型。FORM は
+//   null）を足した（`WriteResultView.transport`・`api`）。
 // - 行の値が契約の形に合わなければ、データベースの誤り（`DATABASE_INTEGRITY_FAILED`）。
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../core/guards.js';
 import { deepFreeze } from '../../core/immutable.js';
+import { compareCodeUnits } from '../../core/text.js';
 import { READ_CHECK_RESULTS, type ReadCheckResult } from '../../discovery/read-check-contracts.js';
 import { uniqueKeyOf, type SeedRecord } from '../data-rules/scenario-data.js';
-import { SCENARIO_KINDS, type ScenarioKind } from '../approval/scenario-contracts.js';
+import {
+  API_SCENARIO_TRANSPORT,
+  CREATE_SCENARIO_KIND,
+  SCENARIO_API_METHODS,
+  SCENARIO_KINDS,
+  UPDATE_SCENARIO_KIND,
+  SCENARIO_TRANSPORTS,
+  type ScenarioApiMethod,
+  type ScenarioKind,
+  type ScenarioTransport,
+} from '../approval/scenario-contracts.js';
 import type { UpdateTargetCandidate } from '../approval/execution-grant.js';
 import type { ControlDatabase } from '../store/control-database.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
@@ -25,10 +38,12 @@ import {
   ACTION_BLOCK_REASONS,
   ACTION_OUTCOME_REASONS,
   ACTION_RESULTS,
+  NOT_SENT_SUBMISSION_STATE,
   RESPONSE_JUDGEMENTS,
   SETTLED_RESERVATION_STATES,
   SUBMISSION_STATES,
   UPDATE_EVIDENCE_FIELD_ROLES,
+  VERIFIED_ACTION_RESULT,
   type ActionBlockReason,
   type ActionOutcomeReason,
   type ActionResult,
@@ -69,14 +84,28 @@ export interface WriteResultRow {
   readonly recorded_at: string;
   readonly submitted_at: string | null;
   readonly settled_at: string | null;
+  readonly transport: string;
+  readonly api_shape_digest: string | null;
+  readonly api_method: string | null;
+  readonly api_origin: string | null;
+  readonly api_path_shape: string | null;
 }
 
-/** 行の列（この順）。 */
+/** 行の列（この順）。T40c: 版 14 の送り方と API の型の要約の列。 */
 export const WRITE_RESULT_COLUMNS = [
   'job_id', 'grant_id', 'profile_id', 'scenario_id', 'scenario_revision', 'write_kind', 'target_record_id', 'seed_record', 'submitted_values',
   'unique_key', 'phone_numbers', 'submission', 'block_reason', 'http_status', 'response_judgement', 'record_id', 'read_verification',
-  'update_evidence', 'result', 'reason', 'reservation_state', 'recorded_at', 'submitted_at', 'settled_at',
+  'update_evidence', 'result', 'reason', 'reservation_state', 'recorded_at', 'submitted_at', 'settled_at', 'transport', 'api_shape_digest',
+  'api_method', 'api_origin', 'api_path_shape',
 ].join(', ');
+
+/** 書き込みの結果の行の API の型の要約（T40c。版 14。承認した API の指定の型の digest、method、送り先の Origin、path の型。値を持たない）。 */
+export interface WriteResultApiShape {
+  readonly shapeDigest: string;
+  readonly method: ScenarioApiMethod;
+  readonly origin: string;
+  readonly pathShape: string;
+}
 
 /**
  * 書き込みの結果 1 件（凍結。日時は UTC の 14 桁）。締める前は、送信の状態から締めの時刻までが null。回復で値なしに足した行は、seed の記録が null、
@@ -110,10 +139,14 @@ export interface WriteResultView {
   readonly recordedAt: string;
   readonly submittedAt: string | null;
   readonly settledAt: string | null;
+  /** 送り方（T40c。版 14 の前の行は `FORM`）。 */
+  readonly transport: ScenarioTransport;
+  /** API の型の要約（T40c。API の行だけ。FORM は null）。 */
+  readonly api: WriteResultApiShape | null;
 }
 
-/** 書き込みの種類の UPDATE（T31e）。 */
-const UPDATE_WRITE_KIND = 'UPDATE' satisfies ScenarioKind;
+/** 書き込みの種類の UPDATE（T31e。CC-106: 種類の一覧の owner の名前つきの定数）。 */
+const UPDATE_WRITE_KIND = UPDATE_SCENARIO_KIND;
 
 /** 生成の履歴（Task 29 の生成の部品 `generateScenarioData` に渡す。凍結）。 */
 export interface WriteGenerationHistory {
@@ -135,8 +168,7 @@ const SELECT_SCENARIOS_SQL = `SELECT ${WRITE_RESULT_COLUMNS} FROM write_results
 const SELECT_VERIFIED_REGISTRATIONS_SQL = `SELECT record_id, submitted_at, job_id FROM write_results
   WHERE scenario_id = ? AND write_kind = ? AND result = ? ORDER BY submitted_at DESC, job_id DESC`;
 /** 照合まで済んだ登録の書き込みの種類と結果（T31e）。 */
-const CREATE_WRITE_KIND = 'CREATE' satisfies ScenarioKind;
-const VERIFIED_RESULT = 'VERIFIED' satisfies ActionResult;
+const CREATE_WRITE_KIND = CREATE_SCENARIO_KIND;
 
 /** 閉じた一覧の値か（null は null のまま）。合わなければ、データベースの誤り。 */
 const oneOf = <T extends string>(list: readonly T[], value: string | null, column: string): T | null => {
@@ -227,6 +259,30 @@ const storedUpdateEvidenceOf = (text: string | null): WriteUpdateEvidence | null
   return evidence;
 };
 
+/**
+ * 行の送り方と API の型の要約（T40c）。送り方は閉じた一覧、API の行は 4 つの列をすべて持ち、FORM の行は持たない（版 14 の CHECK と同じ決まり）。
+ * 合わなければ、データベースの誤り。
+ */
+const transportOfRow = (row: WriteResultRow): { readonly transport: ScenarioTransport; readonly api: WriteResultApiShape | null } => {
+  const transport = oneOf(SCENARIO_TRANSPORTS, row.transport, 'transport');
+  const method = oneOf(SCENARIO_API_METHODS, row.api_method, 'api_method');
+  const { api_shape_digest: shapeDigest, api_origin: origin, api_path_shape: pathShape } = row;
+  if (transport === null) {
+    throw storedRowIntegrityError(TABLE, 'transport is missing');
+  }
+  // T40R-fix-B（M-2）: 送り方の値はシナリオの契約の名前つきの定数。
+  if (transport !== API_SCENARIO_TRANSPORT) {
+    if (shapeDigest !== null || method !== null || origin !== null || pathShape !== null) {
+      throw storedRowIntegrityError(TABLE, 'a FORM write result has an API shape');
+    }
+    return { transport, api: null };
+  }
+  if (shapeDigest === null || method === null || origin === null || pathShape === null) {
+    throw storedRowIntegrityError(TABLE, 'an API write result has no API shape');
+  }
+  return { transport, api: { shapeDigest, method, origin, pathShape } };
+};
+
 /** 行を形にする（凍結）。 */
 export const writeResultViewOf = (row: WriteResultRow): WriteResultView => {
   if (!isPositiveSafeInteger(row.scenario_revision)) {
@@ -262,6 +318,7 @@ export const writeResultViewOf = (row: WriteResultRow): WriteResultView => {
     recordedAt: row.recorded_at,
     submittedAt: row.submitted_at,
     settledAt: row.settled_at,
+    ...transportOfRow(row),
   });
 };
 
@@ -322,7 +379,7 @@ export const writeGenerationHistoryIn = (
  * トランザクションの中で読む）。登録の ID が登録の ID の形（`isUsableRecordId`）でない行は、データベースの誤り。
  */
 export const verifiedRegistrationsIn = (connection: SqliteConnection, createScenarioId: string): readonly UpdateTargetCandidate[] =>
-  Object.freeze((connection.prepare(SELECT_VERIFIED_REGISTRATIONS_SQL).all(createScenarioId, CREATE_WRITE_KIND, VERIFIED_RESULT) as unknown as {
+  Object.freeze((connection.prepare(SELECT_VERIFIED_REGISTRATIONS_SQL).all(createScenarioId, CREATE_WRITE_KIND, VERIFIED_ACTION_RESULT) as unknown as {
     readonly record_id: string | null;
     readonly submitted_at: string | null;
     readonly job_id: string;
@@ -332,6 +389,56 @@ export const verifiedRegistrationsIn = (connection: SqliteConnection, createScen
     }
     return Object.freeze({ recordId: row.record_id, registeredAt: row.submitted_at, jobId: row.job_id });
   }));
+
+/**
+ * 台帳の書き込み 1 件の、値の履歴に要る項目（T41R2-fix-B。`WriteResultView` の一部。開始の口が、保つ鍵ごとの最後に分かっている値を求めるのに使う）。
+ */
+export type RecordValueWrite = Pick<WriteResultView, 'writeKind' | 'recordId' | 'targetRecordId' | 'result' | 'submittedValues' | 'submittedAt' | 'recordedAt'>;
+
+/** 送った時刻（なければ記録の時刻）の順に並べる比べ方（同じ時刻は記録の時刻の順）。 */
+const byWrittenAt = (left: RecordValueWrite, right: RecordValueWrite): number =>
+  compareCodeUnits(left.submittedAt ?? left.recordedAt, right.submittedAt ?? right.recordedAt) || compareCodeUnits(left.recordedAt, right.recordedAt);
+
+/** 鍵 1 つの、最後に分かっている値（T41R3-fix-B。値は BeakSight が作ったテストの値）。 */
+export interface KnownKeptValue {
+  readonly key: string;
+  readonly value: string;
+}
+
+/**
+ * 対象のレコードの、鍵ごとの最後に分かっている値（T41R2-fix-B で空でない鍵の名前を返す形で作り、T41R3-fix-B（Task 41 の設計書 8 章の「T41R3」の C-3 (1)、
+ * ユーザーの判断「API の更新だけ台帳と比べる」）で値（空を含む）を返す形に置き換えた。純粋）。対象の ID の照合済みの登録（`CREATE`・`VERIFIED`・登録の ID が
+ * 対象の ID）で送った値に、同じ ID の照合済みの更新（`UPDATE`・`VERIFIED`・対象の ID）で送った値を、送った時刻の順に重ね、`keys` のうち値が分かっている鍵の
+ * `{ key, value }` を `keys` の順で返す（凍結）。台帳が知らない鍵（どの書き込みも送らなかった鍵）と、照合済みでない書き込み（`UNKNOWN`・`BLOCKED` など）は
+ * 使わない。登録が 2 件以上あれば、送った時刻の新しい方を使う。
+ */
+export const knownKeptValuesOf = (writes: readonly RecordValueWrite[], recordId: string, keys: readonly string[]): readonly KnownKeptValue[] => {
+  const verified = writes.filter(({ result }) => result === VERIFIED_ACTION_RESULT);
+  const registrations = verified.filter((write) => write.writeKind === CREATE_WRITE_KIND && write.recordId === recordId).sort(byWrittenAt);
+  const registration = registrations.at(-1);
+  if (registration === undefined) {
+    return Object.freeze([]);
+  }
+  const updates = verified.filter((write) => write.writeKind === UPDATE_WRITE_KIND && write.targetRecordId === recordId).sort(byWrittenAt);
+  const known = new Map<string, string>(Object.entries(registration.submittedValues));
+  for (const update of updates) {
+    for (const [key, value] of Object.entries(update.submittedValues)) {
+      known.set(key, value);
+    }
+  }
+  return Object.freeze(keys.flatMap((key) => {
+    const value = known.get(key);
+    return value === undefined ? [] : [Object.freeze({ key, value })];
+  }));
+};
+
+/**
+ * 台帳のシナリオ（`scenarioIds`。呼び出し側が `writeFamilyScenarioIdsIn` で決める）の書き込みの値の履歴（T41R2-fix-B。生成の履歴と同じ読み出し
+ * `SELECT_SCENARIOS_SQL`。記録の順。呼び出し側のトランザクションの中で読む）。
+ */
+export const ledgerValueWritesIn = (connection: SqliteConnection, scenarioIds: readonly string[]): readonly RecordValueWrite[] =>
+  Object.freeze((connection.prepare(SELECT_SCENARIOS_SQL).all(JSON.stringify([...new Set(scenarioIds)])) as unknown as WriteResultRow[])
+    .map(writeResultViewOf));
 
 // ---------------------------------------------------------------------------------------------------------------
 // T32g（Task 32 の設計書 4.1 の「監査済みデータの台帳」。ロードマップ 13.4）: 監査済みデータの台帳（画面だけ。書き出しのファイルは作らない）
@@ -371,8 +478,6 @@ export interface AuditedDataLedgerEntry {
   readonly updates: AuditedRecordUpdates;
 }
 
-/** 送らずに止めた送信の状態（台帳の行にも UPDATE の回数にも入れない。データを作っても変えてもいない）。 */
-const NOT_SENT_SUBMISSION = 'NOT_SENT' satisfies SubmissionState;
 
 /**
  * プロファイルの CREATE の書き込みのうち、データを作ったかもしれないもの（送らずに止めた回を除く。締める前の回を含む）と、ジョブの Run の ID
@@ -414,9 +519,10 @@ const NO_UPDATES: AuditedRecordUpdates = deepFreeze({ count: 0, last: null });
  */
 export const readAuditedDataLedger = (database: ControlDatabase, profileId: string): readonly AuditedDataLedgerEntry[] =>
   withReadTransaction(database, (connection) => {
-    const registrations = connection.prepare(SELECT_LEDGER_REGISTRATIONS_SQL).all(profileId, CREATE_WRITE_KIND, NOT_SENT_SUBMISSION) as unknown as
+    // 送らずに止めた回（`NOT_SENT`）は、台帳の行にも UPDATE の回数にも入れない（データを作っても変えてもいない）。
+    const registrations = connection.prepare(SELECT_LEDGER_REGISTRATIONS_SQL).all(profileId, CREATE_WRITE_KIND, NOT_SENT_SUBMISSION_STATE) as unknown as
       (WriteResultRow & { readonly run_id: string | null })[];
-    const updateRows = connection.prepare(SELECT_LEDGER_UPDATES_SQL).all(profileId, UPDATE_WRITE_KIND, NOT_SENT_SUBMISSION) as unknown as
+    const updateRows = connection.prepare(SELECT_LEDGER_UPDATES_SQL).all(profileId, UPDATE_WRITE_KIND, NOT_SENT_SUBMISSION_STATE) as unknown as
       LedgerUpdateRow[];
     const updates = new Map<string, AuditedRecordUpdates>();
     for (const row of updateRows) {

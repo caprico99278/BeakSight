@@ -291,15 +291,40 @@ describe('missing verification items (T30a)', () => {
   });
 });
 
-describe('stored scenario revisions before the verification spec (T30a)', () => {
-  it('reads a revision stored before the verification spec as all unspecified, and keeps a stored spec', () => {
+// LG-3（2026-10-24 の設計 3.7.2）: 検証の指定の前に保存した版（`verification` の項目がない）は、すべて未指定として読み替えずに誤りにする。
+describe('stored scenario revisions before the verification spec (T30a, LG-3)', () => {
+  it('rejects a revision stored before the verification spec, and keeps a stored spec', () => {
     const { verification: _omitted, ...legacy } = sampleScenario();
-    expect(storedScenarioRevisionOf(JSON.parse(JSON.stringify(legacy)) as unknown)).toEqual({ ...legacy, verification: UNSPECIFIED_VERIFICATION });
+    expect(() => storedScenarioRevisionOf(JSON.parse(JSON.stringify(legacy)) as unknown)).toThrow(RangeError);
     expect(storedScenarioRevisionOf(JSON.parse(JSON.stringify(sampleScenario())) as unknown)).toEqual(sampleScenario());
   });
 
   it('rejects a stored revision with a broken verification spec (no silent default)', () => {
     expect(() => storedScenarioRevisionOf({ ...sampleScenario(), verification: null })).toThrow(RangeError);
     expect(() => storedScenarioRevisionOf({ ...sampleScenario(), verification: { successCondition: null } })).toThrow(RangeError);
+  });
+});
+
+// T37d fix round 1（T37d の発見事項 2。設計者の判断 5 の重ねの守り）: 書き込みの照合の READ に、画面の path を読む定義は使わない。シナリオの保存の
+// 時点で、専用の理由で拒む（結び付けの名前の誤りとは言わない）。開始の拒否（`WRITE_READ_VERIFICATION_PAGE_TARGET`）は、そのまま残る。
+describe('T37d fix round 1: the verification READ of a page path definition', () => {
+  const PAGE_FACT = { readCheckId: 'rc-page', profileId: READ_CHECK_FACTS[0]?.profileId ?? '', revision: 1, canceledAt: null, parameterNames: [], targetKind: 'PAGE' } as const;
+  const FACTS = [...READ_CHECK_FACTS, PAGE_FACT];
+
+  it('has the reason after the reasons before it in the closed list', () => {
+    // T38b で API の下書きの理由を、この後に足した。
+    expect(SCENARIO_DRAFT_REJECTION_REASONS[SCENARIO_DRAFT_REJECTION_REASONS.indexOf('SCENARIO_TTL_ABOVE_DEFAULT') + 1])
+      .toBe('SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET');
+  });
+
+  it('rejects a page path definition as the verification READ with its own reason, and still accepts a candidate definition', () => {
+    expect(codesOf(validateScenarioDraft(withRead({ readCheckId: 'rc-page', revision: 1 }), CREATE_CANDIDATE, FACTS)))
+      .toEqual(['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']);
+    expect(validateScenarioDraft(draftWith(FULL_VERIFICATION), CREATE_CANDIDATE, FACTS).ok).toBe(true);
+  });
+
+  it('keeps the reason of a binding to a field that is not sent', () => {
+    expect(codesOf(validateScenarioDraft(withRead({ readCheckId: 'rc-page', revision: 1, bindings: [{ parameterName: 'q', fieldName: 'include_disabled' }] }),
+      CREATE_CANDIDATE, FACTS))).toEqual(['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET', 'SCENARIO_VERIFICATION_FIELD_NOT_SENT']);
   });
 });

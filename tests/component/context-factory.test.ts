@@ -1,5 +1,5 @@
 import { request as httpRequest, type ServerResponse } from 'node:http';
-import type { Browser, BrowserContext, CDPSession, Download, Page } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, CDPSession, Download, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { BrowserContextFactory, ContextConstructionError, type BrowserContextFactoryOptions } from '../../src/browser/context-factory.js';
 import { ResourceCache } from '../../src/browser/resource-delivery.js';
@@ -8,16 +8,29 @@ import { wait } from '../../src/core/deadline.js';
 import type { LoadMeter } from '../../src/crawl/load-meter.js';
 import { startFixtureServer } from '../../fixtures/server.js';
 import type { EgressProxy, EgressProxyOptions } from '../../src/safety/egress-proxy.js';
-import { activateInteractionFreeze, isPassiveRequestGuardClosed, WriteStageMonitor } from '../../src/safety/passive-request-guard.js';
+import {
+  SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+  serviceWorkerRegistrationBlockedMessageOf,
+} from '../../src/core/guard-page-exceptions.js';
+import {
+  activateInteractionFreeze,
+  isPassiveRequestGuardClosed,
+  WriteStageMonitor,
+} from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
+import { overrideBrowser } from '../helpers/browser-proxies.js';
 import {
+  BROWSER_DEFAULT_FAVICON_PATH,
   browserWithoutServiceWorkerRegistrationBlock,
   launchCliChromium,
   launchHeadlessChromium,
+  testContextsOf,
   useHeadlessChromium,
+  withoutBrowserFaviconRecords,
 } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import {
   openServerWindow,
   QUIET_PERIOD_MS,
@@ -195,7 +208,7 @@ describe('BrowserContextFactory', () => {
       expect(constructionFailure.ledger.snapshot().invariantViolations.map((violation) => violation.code))
         .toContain('GUARD_INSTALLATION_FAILED');
       // Guard が Context を閉じている。factory は、Ledger との対応を残し、所有は解放する。
-      expect(browser.contexts()).not.toContain(constructionFailure.context);
+      expect(testContextsOf(browser)).not.toContain(constructionFailure.context);
       expect(factory.getSafetyLedger(constructionFailure.context)).toBe(constructionFailure.ledger);
       await expect(factory.closePassiveContext(constructionFailure.context)).rejects.toThrow(/no longer active|not owned/i);
     },
@@ -225,7 +238,7 @@ describe('BrowserContextFactory', () => {
     const constructionFailure = failure as ContextConstructionError;
     expect(constructionFailure.cause).toBe(pageCreationFailure);
     expect(constructionFailure.ledger).toBe(ledgers[0]);
-    expect(browser.contexts()).not.toContain(constructionFailure.context);
+    expect(testContextsOf(browser)).not.toContain(constructionFailure.context);
     expect(factory.getSafetyLedger(constructionFailure.context)).toBe(constructionFailure.ledger);
     await expect(factory.closePassiveContext(constructionFailure.context)).rejects.toThrow(/no longer active|not owned/i);
   });
@@ -291,14 +304,14 @@ describe('BrowserContextFactory', () => {
         expect(Object.isFrozen(retained)).toBe(true);
         // 利用可能な唯一のContextは、拒否された構築処理自身が持つものである。
         expect(closeCalls).toBe(1);
-        expect(browser.contexts()).toContain(retained.context);
+        expect(testContextsOf(browser)).toContain(retained.context);
         await expect(factory.createPassivePage(retained.context)).rejects.toThrow(/invalidated/i);
         expect(factory.getSafetyLedger(retained.context).snapshot().invariantViolations).toContainEqual({
           code: 'GUARD_CONTEXT_INVALIDATION_FAILED', message: 'first retained close failed',
         });
         await expect(factory.closePassiveContext(retained.context)).rejects.toThrow(/invalidated/i);
         expect(closeCalls).toBe(2);
-        expect(browser.contexts()).not.toContain(retained.context);
+        expect(testContextsOf(browser)).not.toContain(retained.context);
         await expect(factory.closePassiveContext(retained.context)).rejects.toThrow(/no longer active|not owned/i);
       } finally {
         vi.restoreAllMocks();
@@ -592,10 +605,10 @@ describe('BrowserContextFactory', () => {
         }
         // ページ失敗時のどちらのcatch分岐でも、Context所有権の削除漏れを検出する。
         expect(attempts).toBe(1);
-        expect(browser.contexts()).toContain(context);
+        expect(testContextsOf(browser)).toContain(context);
         await expect(factory.closePassiveContext(context)).rejects.toThrow('Passive request guard context was invalidated');
         expect(attempts).toBe(2);
-        expect(browser.contexts()).not.toContain(context);
+        expect(testContextsOf(browser)).not.toContain(context);
         await expect(factory.closePassiveContext(context)).rejects.toThrow(/no longer active|not owned/i);
       } finally {
         vi.restoreAllMocks();
@@ -668,8 +681,16 @@ describe('BrowserContextFactory', () => {
         await page.evaluate(() => {
           document.querySelector('button')?.click();
         });
-        await page.evaluate(async () => {
-          await navigator.serviceWorker.register('/fixture-service-worker.js').catch(() => undefined);
+        // UPG-SW: Playwright 1.64.1 の `serviceWorkers: 'block'` は、インスタンスに `register` を付けず、`ServiceWorkerContainer.prototype.register`
+        // を置き換える（その後に Guard の初期化のスクリプトが、拒否する Promise を返す関数で固定する）。`navigator.serviceWorker.register` は、
+        // Guard の `DOMException`（T44R2 の M-2 で Chromium に寄せた `NotSupportedError`）で拒否するので、拒否の名前と文言で受ける。
+        const registerOutcome = await page.evaluate(async () => {
+          try {
+            await navigator.serviceWorker.register('/fixture-service-worker.js');
+            return 'resolved';
+          } catch (error) {
+            return error instanceof DOMException ? `rejected:${error.name}:${error.message}` : `other:${String(error)}`;
+          }
         });
         await wait(200);
 
@@ -677,10 +698,65 @@ describe('BrowserContextFactory', () => {
           registrations: (await navigator.serviceWorker.getRegistrations()).length,
           controlled: navigator.serviceWorker.controller !== null,
         }));
+        expect(registerOutcome).toBe(`rejected:${SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME}:${serviceWorkerRegistrationBlockedMessageOf(
+          `${server.origin}/`,
+          `${server.origin}/fixture-service-worker.js`,
+        )}`);
         expect(state).toEqual({ registrations: 0, controlled: false });
         expect(server.getRequestObservations().map((observation) => observation.pathname))
           .not.toContain('/fixture-service-worker.js');
         expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+        // 閉じた後に、名前つきの時間だけ待ってからも、Worker の script の取得も、GET・HEAD 以外の要求も届かない。
+        await closePassiveResources({ factory, context, page });
+        await wait(QUIET_PERIOD_MS);
+        const observations = server.getRequestObservations();
+        expect(observations.map((observation) => observation.pathname)).not.toContain('/fixture-service-worker.js');
+        expect(observations.filter((observation) => !READ_METHODS.has(observation.method))).toEqual([]);
+      } finally {
+        await closePassiveResources({ factory, context, page });
+        await server.close();
+      }
+    });
+
+    it('lets a page that registers a Service Worker on load continue its script, rejecting the registration without a page error (UPG-SW)', async () => {
+      // UPG-SW: ふつうのサイトと同じく、読み込みのときに登録し、失敗を Promise の拒否で受けてから処理を続けるページ。Guard の `register` は、
+      // 同期で投げずに、拒否する Promise を返す（ページの自然な動きを止めない）。登録は起こらず、Worker の script の取得も届かない。
+      const server = await startFixtureServer();
+      const factory = factoryFor(configFor(server.origin));
+      let context: BrowserContext | undefined;
+      let page: Page | undefined;
+      try {
+        context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        page = await factory.createPassivePage(context);
+        const pageErrors: string[] = [];
+        page.on('pageerror', (error) => {
+          pageErrors.push(error.message);
+        });
+        await page.goto(`${server.origin}/service-worker-continue.html`, { waitUntil: 'load' });
+        await wait(200);
+
+        const observed = await page.evaluate(async () => ({
+          afterRegistration: document.documentElement.dataset['afterRegistration'] ?? 'missing',
+          registration: document.documentElement.dataset['serviceWorkerRegistration'] ?? 'missing',
+          registrations: (await navigator.serviceWorker.getRegistrations()).length,
+        }));
+        expect({ ...observed, pageErrors }).toEqual({
+          afterRegistration: 'ran',
+          registration: `rejected:${SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME}:${serviceWorkerRegistrationBlockedMessageOf(
+            `${server.origin}/`,
+            `${server.origin}/fixture-service-worker.js`,
+          )}`,
+          registrations: 0,
+          pageErrors: [],
+        });
+        expect(factory.getSafetyLedger(context).snapshot().invariantViolations).toEqual([]);
+        // 閉じた後に、名前つきの時間だけ待ってからも、Worker の script の取得も、GET・HEAD 以外の要求も届かない。
+        await closePassiveResources({ factory, context, page });
+        await wait(QUIET_PERIOD_MS);
+        const observations = server.getRequestObservations();
+        expect(observations.map((observation) => observation.pathname)).not.toContain('/fixture-service-worker.js');
+        expect(observations.filter((observation) => !READ_METHODS.has(observation.method))).toEqual([]);
       } finally {
         await closePassiveResources({ factory, context, page });
         await server.close();
@@ -1327,7 +1403,8 @@ describe('BrowserContextFactory', () => {
       await expect(factory.createInteractionSession(viewport)).rejects.toBe(failure);
 
       expect(newContext).not.toHaveBeenCalled();
-      expect(browser.contexts()).toEqual([]);
+      // EL-12: CLI の回の起動の部品の persistent の既定の Context は、数えない（`testContextsOf`）。
+      expect(testContextsOf(browser)).toEqual([]);
     });
 
     it('closes the proxy when the Context or the page cannot be created', async () => {
@@ -1527,7 +1604,8 @@ describe('BrowserContextFactory', () => {
       })).rejects.toBe(failure);
 
       expect(newContext).not.toHaveBeenCalled();
-      expect(browser.contexts()).toEqual([]);
+      // EL-12: CLI の回の起動の部品の persistent の既定の Context は、数えない（`testContextsOf`）。
+      expect(testContextsOf(browser)).toEqual([]);
     });
 
     it('closes the proxy when the Passive Context cannot be created', async () => {
@@ -1588,13 +1666,49 @@ describe('BrowserContextFactory', () => {
         expect(proxy.state).toBe('FROZEN');
         const afterFreeze = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/after-freeze`);
         expect(afterFreeze.status).toBe(403);
-        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+        // BN-R1 の M-4: CLI の Chromium は、ブラウザ自身の favicon の要求を凍結の後に出すことがあり、その止めた記録（`INTERACTION_FROZEN`）が 1 件増える。
+        // ブラウザ自身の favicon の記録だけを除いて比べる（止めた証拠の記録と、サーバに届かないことの確かめは、今どおり）。
+        expect(withoutBrowserFaviconRecords(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests, server.origin)).toEqual([
           { method: 'GET', url: `${server.origin}/after-freeze`, reason: 'INTERACTION_FROZEN_EGRESS' },
         ]);
         expect(server.getRequestObservations().some(({ pathname }) => pathname === '/after-freeze')).toBe(false);
+        expect(server.getRequestObservations().some(({ pathname }) => pathname === BROWSER_DEFAULT_FAVICON_PATH)).toBe(false);
         await factory.closePassiveContext(context);
         // 凍結の段の後の閉じる処理の間の拒否も、凍結の段の記録のまま（閉じる直前の凍結は、すでに凍結した中継を変えない）。
         expect(proxy.state).toBe('CLOSED');
+      } finally {
+        await server.close();
+      }
+    });
+
+    // BN-R0 fix round 1（I-1）: ページが出す、除外のパスへの GET（BN-0 で Guard が通す）は、Guard が中継に知らせるので、中継も通す。知らせのない同じ形の GET
+    // （Guard を迂回した要求）は、中継が拒んで記録する。
+    it('passes at the proxy the page read to an excluded path that the Guard let through, and still rejects one the Guard never saw (BN-R0 I-1)', async () => {
+      const server = await startFixtureServer();
+      try {
+        const factory = factoryFor(configFor(server.origin), {
+          authentication: {
+            initialState: { cookies: [], origins: [] },
+            filterState: (state) => state,
+            auditExclusions: { excludedPathPrefixes: ['/excluded/'], auditPathPrefixes: [], dangerousTerms: [] },
+          },
+        });
+        const context = await factory.createPassiveContext(viewport);
+        contexts.push(context);
+        const { proxy } = lastEgressProxy();
+        const page = await factory.createPassivePage(context);
+        await page.goto(`${server.origin}/`);
+        const window = openServerWindow(server);
+        const pageStatus = await page.evaluate(async () => (await fetch('/excluded/page-read')).status);
+        const bypass = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/bypass`);
+
+        expect(pageStatus).toBe(404);
+        expect(bypass.status).toBe(403);
+        expect(window.requestLines()).toEqual(['GET /excluded/page-read']);
+        expect(factory.getSafetyLedger(context).snapshot().blockedInteractionRequests).toEqual([
+          { method: 'GET', url: `${server.origin}/excluded/bypass`, reason: 'GUARD_BYPASS_EGRESS' },
+        ]);
+        await factory.closePassiveContext(context);
       } finally {
         await server.close();
       }
@@ -1617,6 +1731,8 @@ describe('BrowserContextFactory', () => {
 
         const read = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/`);
         // GET と HEAD は、Guard が許す読み取りなので、中継も通す。POST と除外のパスへの GET は、Guard が許さないので、中継も拒む。
+        // BN-0 の後の BN-R0 fix round 1（I-1）: Guard はページの文書でない読み取りなら除外のパスへの GET も通すが、中継は、この Context の Guard が通した
+        // （知らせた）要求でなければ、除外を当てて拒む（Guard を迂回した要求の 2 段目の守り）。ここの GET は、Guard を通らずに中継へ直に送ったもの。
         const head = await requestThroughEgressProxy(proxy, 'HEAD', `${server.origin}/`);
         const post = await requestThroughEgressProxy(proxy, 'POST', `${server.origin}/__mutation`);
         const excluded = await requestThroughEgressProxy(proxy, 'GET', `${server.origin}/excluded/logout`);
@@ -1881,11 +1997,28 @@ const serviceWorkerViolationsOf = (ledger: SafetyLedger): readonly unknown[] => 
   .filter((violation) => violation.code === SERVICE_WORKER_OBSERVED_CODE);
 
 /**
+ * UPG-SW: Service Worker の登録の入口を、ブラウザの側まで開いた Browser の Proxy（DEF-049 の自己検査のテストだけが、明示して選ぶ）。
+ * Guard の登録を塞ぐ初期化のスクリプトを外し（`browserWithoutServiceWorkerRegistrationBlock`）、factory が渡す `serviceWorkers: 'block'` を、
+ * Context の作成のときだけ `allow` に替える（Playwright の置き換えも効かない場合を作る）。製品のコードは変えない。production の起動は Browser を
+ * Proxy にしないので、production では開けない。
+ */
+const browserOpeningServiceWorkerRegistration = (real: Browser): Browser => browserWithoutServiceWorkerRegistrationBlock(
+  overrideBrowser(real, {
+    newContext: (options?: BrowserContextOptions) => real.newContext({ ...options, serviceWorkers: 'allow' }),
+  }),
+);
+
+/**
  * DEF-049（fail-closed の自己検査）: factory は、Browser の CDP の session の auto-attach（`service_worker`）で Service Worker の target を
  * 見たら、Guard の初期化のスクリプト（登録の入口を塞ぐ主な防御）が効いていないとみなし、所有するすべての Context の Ledger に違反
  * `SERVICE_WORKER_OBSERVED` を記録して、その Context を直ちに閉じる。入口を塞ぐスクリプトだけを付けない Browser の Proxy（テストの明示の
  * 選択 `browserWithoutServiceWorkerRegistrationBlock`）で、テストの既定の headless shell と CLI の Chromium の両方で確かめる。
  * Playwright が Service Worker の target を再開させるので、止める保証はない（競争）。届いた要求の数は記録するが、条件にしない。
+ * UPG-SW: Playwright 1.64.1（Chromium 156）の `serviceWorkers: 'block'` は、インスタンスではなく `ServiceWorkerContainer.prototype.register` を
+ * 置き換える（microsoft/playwright の PR #43134）。そのため、Guard のスクリプトを外しただけでは、迂回の fixture（`prototype` と `delete`、ページの
+ * 文書・同じ Origin の iframe・about:blank の iframe）は、どれも登録せずに解決し、Service Worker の target が出ない（両方の Chromium で確かめた。
+ * 自己検査の経路に届かない）。そこで、ブラウザが登録を許す条件（Playwright の置き換えも効かない場合。`browserOpeningServiceWorkerRegistration`）で
+ * 確かめる。
  */
 describe.each([
   { name: 'the headless shell', launch: (): Promise<Browser> => launchHeadlessChromium() },
@@ -1905,7 +2038,7 @@ describe.each([
   });
 
   it('records SERVICE_WORKER_OBSERVED in the Ledger of every owned Context and closes them, when a page registers a Service Worker', async () => {
-    const unblocked = browserWithoutServiceWorkerRegistrationBlock(realBrowser);
+    const unblocked = browserOpeningServiceWorkerRegistration(realBrowser);
     const factory = new BrowserContextFactory(unblocked, configFor(server.origin), () => new SafetyLedger(), TEST_FACTORY_OPTIONS);
     const window = openServerWindow(server);
     try {

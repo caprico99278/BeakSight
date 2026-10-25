@@ -64,6 +64,8 @@ describe('Control store: failure reasons', () => {
       'NOT_A_SQLITE_FILE',
       'NOT_A_BEAKSIGHT_DATABASE',
       'DATABASE_FROM_NEWER_VERSION',
+      // LG-2: 基準の版（版 17）より前の版の管理データ。
+      'DATABASE_FROM_OLDER_VERSION',
       'DATABASE_LOCKED',
       'DATABASE_READ_ONLY',
       'DATABASE_WAL_UNAVAILABLE',

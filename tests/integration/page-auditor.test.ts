@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { RuleEngine } from '../../src/audit/rule-engine.js';
 import type { AuditRule } from '../../src/audit/rule.js';
 import {
@@ -26,13 +27,15 @@ import {
   COLLECTOR_DEADLINE_MARGIN_MS,
   CONTEXT_CLOSE_TIMEOUT_MS,
   MAX_ERROR_MESSAGE_LENGTH,
+  PAGE_SETTLING_PACING,
   SESSION_OPEN_TIMEOUT_MS,
+  STRESS_LAYOUT_MEASURE_RESERVE_MS,
 } from '../../src/core/limits.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
-import { collectLayoutEvidence } from '../../src/evidence/layout-collector.js';
+import { collectLayoutEvidence, collectStressLayout } from '../../src/evidence/layout-collector.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import {
@@ -45,7 +48,7 @@ import { isNetworkLayerFailure } from '../../src/safety/network-layer-failure.js
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, isCliChromiumSelected, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
@@ -59,6 +62,8 @@ const SHORT_OPEN_DEADLINE_MS = 200;
 const SHORT_CLOSE_DEADLINE_MS = 200;
 /** タイマーが少し早く発火する場合の許容（ms）。 */
 const TIMER_TOLERANCE_MS = 50;
+/** T44R2 の I-6: 幅の走査の幅だけ落ち着かない画面の、ページの期限（最初の読み込みを終え、幅の走査に残りの時間の少ない幅を作る長さ）。 */
+const STRESS_SETTLE_PAGE_TIMEOUT_MS = 8_000;
 /** audit() が戻った後に届いた Context と session を閉じ終えるのを待つ上限（ms）。 */
 const LATE_RELEASE_TIMEOUT_MS = 10_000;
 /** 幅の走査をしない設定（幅の走査を確かめないテストを速くする）。 */
@@ -67,6 +72,10 @@ const NO_STRESS_SWEEP: TestConfigOverrides = { viewports: { stressWidths: [] } }
 const BUSY_LOOP_PAGE = '/page-auditor-busy-loop.html';
 /** 利用者の操作なしに、GET・HEAD 以外のリクエストを送るページ（R14 の m4）。 */
 const NON_READ_REQUESTS_PAGE = '/page-auditor-non-read-requests.html';
+/** `/js-error.html` の文書でない要求の数（壊れた画像 1 つ。DEF-130-fix）。 */
+const BROKEN_IMAGE_SUBRESOURCE_REQUESTS = 1;
+/** DEF-150: 1 つのビューポートの読み込みあたり、ブラウザ自身が取りに行く favicon の要求の数の上限（CLI の Chromium だけが取りに行く）。 */
+const BROWSER_FAVICON_REQUESTS_PER_LOAD = 1;
 
 let browser: Browser;
 const servers: FixtureServer[] = [];
@@ -80,7 +89,7 @@ useHeadlessChromium((launched) => {
 
 afterEach(async () => {
   // テストが失敗しても、次のテストに Context を残さない。ただし、黙って閉じるだけにせず、残っていたらテストを失敗にする（R14 の m4）。
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -163,7 +172,7 @@ async function auditFixture(server: FixtureServer, pathname: string, options: Au
   });
   const pageId = allocator.allocatePageId();
   const outcome = await auditor.audit(normalized(`${server.origin}${pathname}`, config), pageId);
-  const remainingContextCount = browser.contexts().length;
+  const remainingContextCount = testContextsOf(browser).length;
   // どの監査の後にも、ブラウザに Context が残っていない（R14 の m4）。
   expect(remainingContextCount, 'Contexts left in the browser after audit()').toBe(0);
   return { outcome, config, allocator, screenshotRootDirectory, remainingContextCount };
@@ -209,14 +218,29 @@ describe('PageAuditor on a page with a broken image and console errors (Task 14 
     expect(result.status).toBe('AUDITED');
     expect(result.pageUrl).toBe(pageUrl);
     expect(result.incompleteReasons).toEqual([]);
+    // DEF-150: CLI の Chromium は、アイコンの指定のないページで、ブラウザ自身の `/favicon.ico`（`BROWSER_DEFAULT_FAVICON_PATH`）を取りに行き、Guard は
+    // それも文書でない要求に数える（製品の振る舞いは変えない。サーバには届かないことがある）。その分を、ブラウザの別に、1 つの読み込みあたりの上限まで
+    // 除いて数える。テストの既定の headless shell は取りに行かないので、今どおり 1 ちょうど。
+    const browserFaviconAllowance = isCliChromiumSelected() ? BROWSER_FAVICON_REQUESTS_PER_LOAD : 0;
     for (const viewport of ['desktop', 'mobile'] as const) {
-      expect(result.viewports[viewport]).toEqual({
+      const viewportResult = result.viewports[viewport];
+      const browserFaviconCounted = (viewportResult?.subresourceRequests ?? 0) - BROKEN_IMAGE_SUBRESOURCE_REQUESTS;
+      expect(browserFaviconCounted, `${viewport}: the ${BROWSER_DEFAULT_FAVICON_PATH} requests of the browser itself`).toBeGreaterThanOrEqual(0);
+      expect(browserFaviconCounted, `${viewport}: the ${BROWSER_DEFAULT_FAVICON_PATH} requests of the browser itself`)
+        .toBeLessThanOrEqual(browserFaviconAllowance);
+      expect(viewportResult).toEqual({
         requestedUrl: pageUrl,
         finalUrl: pageUrl,
         httpStatus: 200,
         status: 'AUDITED',
         incompleteReasons: [],
         navigationOutcome: 'OK',
+        // DEF-129: Guard が通した main frame の文書の要求の数（BeakSight 自身の読み込み 1 回だけ）。
+        documentRequests: 1,
+        // T37R2-fix: 子の frame の文書の要求の数（この画面に子の frame はない）。
+        childFrameDocumentRequests: 0,
+        // DEF-130-fix: 文書でない要求の数（この画面の壊れた画像 1 つ。DEF-150: ブラウザ自身の favicon の分は上で除いた）。
+        subresourceRequests: BROKEN_IMAGE_SUBRESOURCE_REQUESTS + browserFaviconCounted,
       });
     }
     // Desktop の Evidence が先に採番され、その後に Mobile の Evidence が採番される。
@@ -686,7 +710,7 @@ describe('PageAuditor attempt argument (DEF-007)', () => {
       allocator.allocatePageId(),
       attempt as unknown as PageAuditAttempt,
     )).rejects.toThrow(TypeError);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     expect(server.getRequestObservations()).toEqual([]);
   });
 });
@@ -850,7 +874,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     // audit() が戻った後に Context が届く。部品が、待たずに閉じる。
     gate.resolve(undefined);
     await expect.poll(() => lateContexts, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(2);
-    await expect.poll(() => browser.contexts().length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
+    await expect.poll(() => testContextsOf(browser).length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
     expect(server.getRequestObservations()).toEqual([]);
   }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
 
@@ -1114,7 +1138,7 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
     // audit() が戻った後に session が届く。待たずに閉じる。
     gate.resolve(undefined);
     await expect.poll(() => lateSessions, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(sessionCalls);
-    await expect.poll(() => browser.contexts().length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
+    await expect.poll(() => testContextsOf(browser).length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
   }, DEADLINE_AUDIT_TEST_TIMEOUT_MS);
 
   it('closes the Context of a ContextConstructionError that arrives after the Interaction session open deadline', async () => {
@@ -1160,8 +1184,8 @@ describe('PageAuditor session open and close deadlines (DEF-008)', () => {
       // audit() が戻った後に、Context を持つ失敗が届く。その Context を閉じる。
       gate.resolve(undefined);
       await expect.poll(() => lateFailures, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(sessionCalls);
-      await expect.poll(() => browser.contexts().length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await expect.poll(() => testContextsOf(browser).length, { timeout: LATE_RELEASE_TIMEOUT_MS }).toBe(0);
+      await wait(20);
       expect(unhandledRejections).toEqual([]);
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
@@ -1247,7 +1271,7 @@ describe('PageAuditor page deadline (R14 I1)', () => {
         .resolves.toEqual({ ok: true });
 
       // 期限を過ぎた後に遅れて返る結果や reject は、封じ込める。
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await wait(200);
       expect(unhandledRejections).toEqual([]);
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
@@ -1430,6 +1454,71 @@ describe('PageAuditor collector deadline margin (R14r Minor-2)', () => {
     receivedDeadlines.forEach((deadlineAtMs, index) => {
       expect(deadlineAtMs).toBeLessThanOrEqual((latestPageDeadlines[index] ?? Number.NaN) - COLLECTOR_DEADLINE_MARGIN_MS);
     });
+  }, AUDIT_TEST_TIMEOUT_MS);
+});
+
+// T44 P1-5（ユーザーの判断「待ってから測る」）と T44R2 の I-6・M-5: 幅の走査の各幅の読み込みの後に、最初の読み込みと同じ落ち着きの待ち（本物の
+// `waitForPageSettled`）を待ってから形を測る。待ちの上限は、その幅の期限から形を測る予備（`STRESS_LAYOUT_MEASURE_RESERVE_MS`）を引いた時刻と、今から
+// `crawl.resourceSettlingTimeoutMs` 後の早い方（落ち着かない画面でも、形を測る時間を残す）。ふだんの実行で、この配線を守る。
+describe('PageAuditor: the stress sweep waits for the page to settle before measuring each width (P1-5, T44R2 I-6・M-5)', () => {
+  it('calls the real settling wait once for each width, after the load and before measuring', async () => {
+    const server = await startServer();
+    const settled: { readonly width: number; readonly waitedMs: number }[] = [];
+    const { outcome } = await auditFixture(server, '/index.html', {
+      overrides: {
+        viewports: { stressWidths: [320, 768] },
+        audit: { interactions: false, performance: false, screenshots: false, accessibility: false },
+      },
+      collectors: {
+        collectStressLayout: async (createSession, url, widths, options) => collectStressLayout(createSession, url, widths, {
+          ...options,
+          settleBeforeLayout: async (page, deadlineAtMs) => {
+            const started = Date.now();
+            await options.settleBeforeLayout(page, deadlineAtMs);
+            settled.push({ width: page.viewportSize()?.width ?? 0, waitedMs: Date.now() - started });
+          },
+        }),
+      },
+    });
+    const sweep = evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep ?? [];
+    expect(sweep.map(({ width, status }) => `${String(width)} ${status}`)).toEqual(['320 COMPLETE', '768 COMPLETE']);
+    expect(settled.map(({ width }) => width)).toEqual([320, 768]);
+    // 本物の落ち着きの待ち: 高さが変わらない時間（`PAGE_SETTLING_PACING.stableWindowMs`）を待つ。
+    for (const { waitedMs } of settled) {
+      expect(waitedMs).toBeGreaterThanOrEqual(PAGE_SETTLING_PACING.stableWindowMs - TIMER_TOLERANCE_MS);
+    }
+  }, AUDIT_TEST_TIMEOUT_MS);
+
+  it('stops waiting for a page that does not settle early enough to measure the layout of the width (T44R2 I-6)', async () => {
+    const server = await startServer();
+    // 幅 320 だけ落ち着かない画面。落ち着きの待ちの上限（`resourceSettlingTimeoutMs`）を、走査の期限より長くする（残りの時間の少ない幅）。
+    const waits: { readonly waitedMs: number; readonly remainingMs: number }[] = [];
+    const { outcome } = await auditFixture(server, '/stress-narrow-never-settles.html', {
+      overrides: {
+        viewports: { stressWidths: [320] },
+        crawl: { overallPageTimeoutMs: STRESS_SETTLE_PAGE_TIMEOUT_MS, resourceSettlingTimeoutMs: STRESS_SETTLE_PAGE_TIMEOUT_MS * 10 },
+        audit: { interactions: false, performance: false, screenshots: false, accessibility: false },
+      },
+      collectors: {
+        collectStressLayout: async (createSession, url, widths, options) => collectStressLayout(createSession, url, widths, {
+          ...options,
+          settleBeforeLayout: async (page, deadlineAtMs) => {
+            const started = Date.now();
+            await options.settleBeforeLayout(page, deadlineAtMs);
+            waits.push({ waitedMs: Date.now() - started, remainingMs: deadlineAtMs - Date.now() });
+          },
+        }),
+      },
+    });
+    // 待ちは、その幅の期限の前に、形を測る予備を残して止まる。
+    expect(waits).toHaveLength(1);
+    expect(waits[0]?.remainingMs).toBeGreaterThanOrEqual(STRESS_LAYOUT_MEASURE_RESERVE_MS - TIMER_TOLERANCE_MS);
+    const [sweep] = evidenceOf(outcome, 'layout', 'desktop')[0]?.payload.stressSweep ?? [];
+    // 落ち着くのを待ち切らずに、予備を残して止め、形を測る（DEADLINE_EXCEEDED にしない）。
+    expect(sweep?.width).toBe(320);
+    expect(sweep?.status).toBe('COMPLETE');
+    expect(sweep?.layout).not.toBeNull();
+    expect(outcome.result.viewports.desktop.incompleteReasons).not.toContainEqual(expect.objectContaining({ detail: expect.stringContaining('stress-layout') }));
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 

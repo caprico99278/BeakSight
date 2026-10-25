@@ -2,13 +2,15 @@
 // （`PassiveRequestGuardOptions.auditExclusions`）。本物の Guard と、127.0.0.1 の fixture のサーバ（`tests/helpers/login-fixture-server.ts`）で
 // 確かめる。
 // - 除外のパス（ログアウト）、危険な語（既定の一覧 `DEFAULT_EXCLUDED_URL_WORDS`）、読む範囲（`/admin`）の外の URL は、巡回の main frame の
-//   移動でも、ページの中の画像・iframe・fetch の GET でも、サーバに届かない。Safety Ledger の `blockedAuditExclusions` に残り、違反は 0
+//   移動でも、ページの中の iframe の文書でも、サーバに届かない。Safety Ledger の `blockedAuditExclusions` に残り、違反は 0
 //   （CDP の層で止めた main frame の移動が `HTTP_MAIN_FRAME_DELIVERY_FAILED` にならない）。当たらない GET は届く。
+// - BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.0）: ページの中の画像・fetch の GET と HEAD（ページが出す文書でない読み取り）は、
+//   監査の段の Passive の Context では除外を当てずに届く。Isolated Interaction Context の指定（`applyToPageSubresourceReads`）では、今までどおり届かない。
 // - 指定のない Context では、今のまま届く（対照）。`blockedAuditExclusions` は現れない。
 // - Chromium は headless だけ。テストの既定（headless shell）と、CLI の起動の設定（`launchCliChromium`）の両方で確かめる。
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { wait } from '../../src/core/deadline.js';
 import {
   awaitPassiveRequestGuardReady,
@@ -138,13 +140,48 @@ describe.each(CHROMIUM_LAUNCHES)('T25b round 1: the audit stage exclusions of th
 
   const serverPaths = (): string[] => server.requests.filter((entry) => entry.site === 'A').map((entry) => entry.path);
 
-  it('the images, iframes and fetch GETs of a page that hit an exclusion never reach the server, are recorded, and there is no violation', async () => {
+  // BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.0。ユーザーの判断 2026-10-23）: 監査の段の Passive の Context では、ページが出す
+  // 文書でない GET（画像・fetch）には除外を当てない（届く）。子の frame の文書（iframe）は今どおり止まる。Isolated Interaction Context の指定（印
+  // `applyToPageSubresourceReads`）では、今までどおり、画像・iframe・fetch のどれも届かない。
+  const IFRAME_VIA = 'via=iframe';
+  const EXCLUDED_FRAME_REQUESTS = EXCLUDED_SUB_REQUESTS.filter((path) => path.includes(IFRAME_VIA));
+  const EXCLUDED_PAGE_SUBRESOURCE_REQUESTS = EXCLUDED_SUB_REQUESTS.filter((path) => !path.includes(IFRAME_VIA));
+
+  it('BN-0: in a Passive context, the images and fetch GETs of a page that hit an exclusion reach the server, the iframes never do and are recorded, and there is no violation', async () => {
     const { page, ledger } = await openGuarded(EXCLUSIONS);
 
     await openResourcesPage(page);
     await wait(LATE_DELIVERY_SETTLE_MS);
     const snapshot = ledger.snapshot();
-    console.info(`T25b round 1 sub requests (${name}): server ${JSON.stringify(serverPaths())}; `
+    console.info(`BN-0 sub requests (${name}): server ${JSON.stringify(serverPaths())}; `
+      + `recorded ${JSON.stringify(snapshot.blockedAuditExclusions)}`);
+
+    for (const path of EXCLUDED_FRAME_REQUESTS) {
+      expect(serverPaths(), path).not.toContain(path);
+    }
+    // ログアウトの画像と fetch は、fixture のサーバの 303（ログインの画面へ）をたどるので、ログインの画面の GET も届く（ページが出す読み取りのまま）。
+    const logoutReads = EXCLUDED_PAGE_SUBRESOURCE_REQUESTS.filter((path) => path.startsWith(`${LOGIN_FIXTURE_PATHS.adminLogout}?`)).length;
+    expect(serverPaths().filter((path) => path === LOGIN_FIXTURE_PATHS.login)).toHaveLength(logoutReads);
+    expect(serverPaths().filter((path) => path !== LOGIN_FIXTURE_PATHS.login).sort())
+      .toEqual([LOGIN_FIXTURE_PATHS.adminResources, ...ALLOWED_SUB_REQUESTS, ...EXCLUDED_PAGE_SUBRESOURCE_REQUESTS].sort());
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.blockedRequests).toEqual([]);
+    expect(snapshot.blockedNavigations).toEqual([]);
+    const recorded = snapshot.blockedAuditExclusions;
+    expect(recorded?.count).toBe(EXCLUDED_FRAME_REQUESTS.length);
+    expect(recorded?.events.map((event) => {
+      const url = new URL(event.url);
+      return `${event.method} ${url.pathname}${url.search} ${String(event.mainFrameNavigation)} ${event.reason}`;
+    }).sort()).toEqual(EXCLUDED_FRAME_REQUESTS.map((path) => `GET ${path} false AUDIT_EXCLUDED_URL`).sort());
+  });
+
+  it('with the Interaction exclusions, the images, iframes and fetch GETs of a page that hit an exclusion never reach the server, are recorded, and there is no violation', async () => {
+    const { page, ledger } = await openGuarded({ ...EXCLUSIONS, applyToPageSubresourceReads: true });
+
+    await openResourcesPage(page);
+    await wait(LATE_DELIVERY_SETTLE_MS);
+    const snapshot = ledger.snapshot();
+    console.info(`T25b round 1 sub requests, Interaction (${name}): server ${JSON.stringify(serverPaths())}; `
       + `recorded ${JSON.stringify(snapshot.blockedAuditExclusions)}`);
 
     for (const path of EXCLUDED_SUB_REQUESTS) {
@@ -233,8 +270,25 @@ describe.each(CHROMIUM_LAUNCHES)('T25b round 1: the audit stage exclusions of th
     .filter((entry) => RESPELLED_EXCLUDED_PATHS.some((path) => entry.path.startsWith(`${path}?`)))
     .map((entry) => `${entry.method} ${entry.path}`);
 
-  it('T25g-1: the excluded path written with repeated slashes or a segment parameter never reaches the server by an image GET, a fetch HEAD or a main frame navigation, and is recorded', async () => {
+  // BN-0: Passive の Context では、別の書き方の除外のパスでも、画像の GET と fetch の HEAD（ページの文書でない読み取り）は届き、main frame の移動だけが止まる。
+  it('BN-0: in a Passive context, the respelled excluded path reaches the server by an image GET and a fetch HEAD, and its main frame navigation is stopped and recorded', async () => {
     const { page, ledger } = await openGuarded(EXCLUSIONS_WITH_PURGE);
+
+    await attemptRespelledPaths(page);
+    const snapshot = ledger.snapshot();
+    expect(respelledRequestsReached().sort()).toEqual(RESPELLED_EXCLUDED_PATHS.flatMap((path) => [
+      `GET ${path}${RESPELLED_VIA.image}`,
+      `HEAD ${path}${RESPELLED_VIA.fetchHead}`,
+    ]).sort());
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.blockedAuditExclusions?.events.map((event) => {
+      const url = new URL(event.url);
+      return `${event.method} ${url.pathname}${url.search} ${String(event.mainFrameNavigation)} ${event.reason}`;
+    }).sort()).toEqual(RESPELLED_EXCLUDED_PATHS.map((path) => `GET ${path}${RESPELLED_VIA.navigation} true AUDIT_EXCLUDED_URL`).sort());
+  });
+
+  it('T25g-1: with the Interaction exclusions, the excluded path written with repeated slashes or a segment parameter never reaches the server by an image GET, a fetch HEAD or a main frame navigation, and is recorded', async () => {
+    const { page, ledger } = await openGuarded({ ...EXCLUSIONS_WITH_PURGE, applyToPageSubresourceReads: true });
 
     await attemptRespelledPaths(page);
     const snapshot = ledger.snapshot();

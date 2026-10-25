@@ -109,6 +109,9 @@ describe('Server Functions: preparation and environment', () => {
       // だけである（`writeStartPageFn` は読むだけ）。画面のコードで実行の許可の発行を参照するのが、その 1 ファイルだけであることは、Gate
       // `approval-ssot` の (e) で確かめる。
       'approveScenarioFn',
+      // FM2b（手を減らす段 2 の設計書 3A.2）: シナリオの下書きをボタン 1 回で作る（一覧は GET で読むだけ、作るのと案内の後の規則は POST。
+      // `scenario-autodraft-functions.ts`。実行の許可を出す関数はない）。
+      'attachAutoDraftRulesFn',
       // T24f: 監査のジョブの Server Functions（Task 24 の設計書 4.8）。
       'auditStartSummaryFn',
       // T32g: 監査済みデータの台帳の画面の Server Function（Task 32 の設計書 4.1。読むだけ。`ledger-functions.ts`）。
@@ -119,12 +122,20 @@ describe('Server Functions: preparation and environment', () => {
       'changeCredentialFn',
       'checkTargetConfigFn',
       'clearAutoLoginHoldFn',
+      // ML-b（手動のログインの設計書 2.2）: 「ログインを終えた」の Server Function（POST。ジョブの管理の `confirmManualLogin` を呼ぶ。`audit-job-functions.ts`）。
+      'confirmManualLoginFn',
+      // T44d（Task 44 の設計書 P2-1）: プロファイルの負荷の値（ページの上限・時間の上限・読み込みの間隔）の欄（GET）と、確かめ（GET。読むだけ）と
+      // 保存（POST）。`crawl-limits-functions.ts`。
+      'crawlLimitsPanelFn',
       'createProfileFn',
       'createReadCheckFn',
+      'createScenarioAutoDraftsFn',
       'createScenarioFn',
       // T29e: 入力の規則の画面の Server Functions（Task 29 の設計書 4.4。実行の許可を出す関数はない）。
       'dataRulePageFn',
       'discoveryPageFn',
+      // T43c: 入口の確かめの Server Functions（Task 43 の設計書 4.3。`entry-check-functions.ts`。要点は読むだけ、開始は POST）。
+      'entryCheckSummaryFn',
       'environmentStatusFn',
       'getAuditJobFn',
       // T25e: 認証の設定の Server Functions（Task 25 の設計書 4.5）。
@@ -133,24 +144,46 @@ describe('Server Functions: preparation and environment', () => {
       'getProfileFn',
       'listAuditJobsFn',
       'listProfilesFn',
+      // FM-1（手動の操作を減らす設計書 2.1）: ログインの段の表の 1 行の「登録する」の案（GET。読むだけ）と保存（POST）。
+      // `login-stage-registration-functions.ts`。
+      'loginStageRowProposalFn',
+      'previewCrawlLimitsFn',
+      // FM-1（同 2.2）: プロファイルの表示の設定の読み（GET）と保存（POST）。`display-settings-functions.ts`。
+      'profileDisplaySettingsFn',
+      // T43a: プロファイルの詳細の「次にすること」と「監査を始める」の Server Function（Task 43 の設計書 4.1。読むだけ。
+      // `profile-onboarding-functions.ts`）。T43b fix round 1 で期待に足した。
+      'profileOnboardingFn',
       'readCheckPageFn',
       'registerCredentialFn',
+      'registerLoginStageRowFn',
       'removeCredentialFn',
       'replaceCredentialFn',
       'retireProfileFn',
       'revokeScenarioFn',
       'saveAuthSetupFn',
+      // T43d: 認証の設定と、プロファイルに足す承認したサービスの Origin を 1 回で保存する Server Function（Task 43 の設計書 4.4。POST）。
+      'saveAuthSetupWithServiceOriginsFn',
+      'saveCrawlLimitsFn',
       'saveDataRulesFn',
+      'saveProfileDisplaySettingsFn',
+      'scenarioAutoDraftPreviewFn',
       'scenarioDetailPageFn',
       'scenarioFormPageFn',
       'scenarioListPageFn',
+      // FM2e（手を減らす段 2 の設計書 3A.4）: 1 回の操作で自動ログインの設定を終える（POST。`credential-functions.ts`）。
+      'setUpAutomatedLoginFn',
       'startAuditJobFn',
       'startDiscoveryFn',
+      'startEntryCheckFn',
       'startLoginCheckFn',
       'startReadCheckFn',
+      // FM2d（手動の操作を減らす設計書 3A.1）: まとめて実行の開始（POST。`audit-job-functions.ts`。入力は監査の開始と同じ形）。
+      'startStageChainFn',
       // T30g: 書き込みの開始の Server Functions（Task 30 の設計書 3 章。実行の許可を出すのは `startWriteCreateFn` だけ。上の T28e の説明）。
       // T31h-2: UPDATE の開始の `startWriteUpdateFn` も許可を出す（同じ `write-job-functions.ts`。Gate `approval-ssot` の (e)）。
       'startWriteCreateFn',
+      // T41g（Task 41 の設計書 3.5.1）: 「登録してから更新する」の開始（同じ `write-job-functions.ts`）。
+      'startWriteCreateThenUpdateFn',
       'startWriteUpdateFn',
       'stopAuditJobFn',
       'targetConfigCandidatesFn',
@@ -200,6 +233,24 @@ describe('Server Functions: input validation (schemas/control/ui-*)', () => {
       ['retireProfileFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 0 }],
       ['getProfileFn', 'GET', { profileId: '' }],
       ['checkTargetConfigFn', 'GET', { targetConfigPath: 1 }],
+      // T43d: まとめて保存の入力（足す Origin は 1 つ以上、画面が読んだ改訂は 1 以上の整数）。
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 1, addServiceOrigins: [] }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, addServiceOrigins: ['https://service.example.invalid'] }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 0, addServiceOrigins: ['https://service.example.invalid'] }],
+      // ML-b: 「ログインを終えた」の入力（ジョブの鍵）。
+      ['confirmManualLoginFn', 'POST', { jobId: '' }],
+      ['confirmManualLoginFn', 'POST', { jobId: 'job-1', extra: true }],
+      // T41g: 「登録してから更新する」の開始の入力（`ui-write-chain-start`）。
+      ['startWriteCreateThenUpdateFn', 'POST', {}],
+      // FM-1: 表の 1 行の「登録する」の入力（表の選び方は真偽、行の番号は 0〜7、ダイアログが出した改訂は 1 以上の整数）。
+      ['loginStageRowProposalFn', 'GET', { jobId: 'job-1', passed: 'yes', index: 0 }],
+      ['loginStageRowProposalFn', 'GET', { jobId: 'job-1', passed: true, index: 8 }],
+      ['registerLoginStageRowFn', 'POST', { jobId: 'job-1', passed: true, index: 0 }],
+      ['registerLoginStageRowFn', 'POST', { jobId: 'job-1', passed: true, index: 0, expectedProfileRevision: 0 }],
+      // FM-1: 表示の設定の入力（プロファイルの鍵と、真偽の値）。
+      ['profileDisplaySettingsFn', 'GET', { profileId: '' }],
+      ['saveProfileDisplaySettingsFn', 'POST', { profileId: PROFILE_ID, showJobBrowser: 'yes' }],
+      ['saveProfileDisplaySettingsFn', 'POST', { profileId: PROFILE_ID }],
     ];
     for (const [name, method, data] of rejected) {
       const result = await call(name, method, data);

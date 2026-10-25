@@ -62,6 +62,12 @@ export interface PassiveSessionOpenOptions {
    * factory の既定（`PRIMARY`。今の振る舞い）になる。読み込み直しの Context（幅の走査）は `REVISIT` を渡す。
    */
   readonly role?: ResourceDeliveryRole | undefined;
+  /**
+   * T44b（Task 44 の設計書の履歴の「T44b の報告」の行。設計者の判断の (1)）: ページの監査の読み込み（Desktop と Mobile）の印。付けるのは、ページの監査の
+   * 読み込みの作り手（`src/orchestration/page-auditor.ts`）だけ。ある場合だけ、factory の `createPassiveContext` に `{ pageAuditLoad: true }` を渡す
+   * （監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、閉じる前にページを離れて待つ。`AUDIT_SEND_CLOSE_SETTLE_MS`）。省略は今のまま（渡さない）。
+   */
+  readonly pageAuditLoad?: true | undefined;
 }
 
 /**
@@ -70,7 +76,7 @@ export interface PassiveSessionOpenOptions {
  * Context の役割（`role`）は含まない（作るたびに、呼び出し側が作成の部品の引数で選ぶ）。期限の注入口に `role` を書くと、型の誤りになる
  * （受け取って黙って捨てる形を残さない。RL の 7-2）。
  */
-export interface PassiveSessionDeadlineOptions extends PassiveSessionCloseTimeouts, Omit<PassiveSessionOpenOptions, 'role'> {
+export interface PassiveSessionDeadlineOptions extends PassiveSessionCloseTimeouts, Omit<PassiveSessionOpenOptions, 'role' | 'pageAuditLoad'> {
   /** Context と page の作成を待つ上限（ms）。既定は `SESSION_OPEN_TIMEOUT_MS`。 */
   readonly sessionOpenTimeoutMs?: number | undefined;
 }
@@ -246,7 +252,10 @@ export async function openPassiveContextBeforeDeadline(
   if (Date.now() >= deadlineAtMs) {
     return contextDeadlineExceeded();
   }
-  const creation = (async (): Promise<BrowserContext> => factory.createPassiveContext(viewport, options.role))();
+  // T44b: ページの監査の読み込みの印は、ある場合だけ渡す（ほかの呼び出しの引数は今のまま）。
+  const creation = (async (): Promise<BrowserContext> => (options.pageAuditLoad === true
+    ? factory.createPassiveContext(viewport, options.role, { pageAuditLoad: true })
+    : factory.createPassiveContext(viewport, options.role)))();
   const outcome = await awaitBeforeDeadline(creation, deadlineAtMs);
   switch (outcome.status) {
     case 'FULFILLED': {

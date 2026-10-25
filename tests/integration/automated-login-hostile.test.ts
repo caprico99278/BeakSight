@@ -9,7 +9,9 @@
 import { randomBytes } from 'node:crypto';
 import type { Browser, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { wait } from '../../src/core/deadline.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { runLoginStage } from '../../src/worker/authenticated-login.js';
 import { runAutomatedLoginStage, type AutomatedLoginStageResult } from '../../src/worker/automated-login.js';
 import {
@@ -23,6 +25,7 @@ import {
   type AutomatedLoginFormVariant,
 } from '../helpers/automated-login-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const LAUNCHERS = [
@@ -38,9 +41,6 @@ const MANUAL_LOGIN_TIMEOUT_MS = 20_000;
 /** 終わった後に、遅れて届く要求を待つ時間（ms）。 */
 const QUIET_PERIOD_MS = 500;
 const TEST_TIMEOUT_MS = 60_000;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
-
-const wait = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 const marker = (prefix: string): string => `${prefix}${randomBytes(12).toString('hex')}`;
 
 describe.each(LAUNCHERS)('T26g-1: hostile login pages (%s)', (_name, launch) => {
@@ -68,7 +68,7 @@ describe.each(LAUNCHERS)('T26g-1: hostile login pages (%s)', (_name, launch) => 
   };
 
   const setupFor = (variant: AutomatedLoginFormVariant): AuthSetup => ({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: 'example-auth',
     profileRevision: 1,
     loginStartUrl: fixture.formUrl(variant, OUTCOME),

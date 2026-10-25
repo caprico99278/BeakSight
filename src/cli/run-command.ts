@@ -54,7 +54,8 @@ import {
   unreadableCheckpointLines,
 } from './output.js';
 import type { CliOutput } from './output-stream.js';
-import { startingRunInOutputDirectoryText } from '../presentation/messages.js';
+import { formatDuration } from '../presentation/format.js';
+import { runLockGraceWaitText, runLockLostText, startingRunInOutputDirectoryText } from '../presentation/messages.js';
 
 export { PRODUCTION_RUN_DEPENDENCIES, artifactFileReader } from './audit-run.js';
 
@@ -136,6 +137,10 @@ export async function runAuditCommand(
       onNotice: (notice) => {
         writeStdoutLines(runNoticeLines(notice));
       },
+      // DEF-172: 取り直す前に、動いている持ち主のロックが更新されるかを待つことを知らせる。
+      onLockGraceWait: (waitMs) => {
+        writeStdoutLines([runLockGraceWaitText(formatDuration(waitMs))]);
+      },
     });
   } catch (error) {
     await stdoutWritten;
@@ -145,7 +150,12 @@ export async function runAuditCommand(
 
   switch (outcome.kind) {
     case 'RUN_ACTIVE':
-      // 別の起動が開始の段にいて、Run の ID がまだ決まっていないとき（DEF-057）は、Run の ID のない文にする。
+      // DEF-170: Run を始めた後にロックを別の起動に持たれたときは、その知らせにする。別の起動が開始の段にいて、Run の ID がまだ決まっていないとき
+      // （DEF-057）は、Run の ID のない文にする。
+      if (outcome.lockLost === true) {
+        await streams.stderr.write(joinLines([runLockLostText]));
+        return outcome.exitCode;
+      }
       await streams.stderr.write(joinLines(outcome.activeRunId === null
         ? [startingRunInOutputDirectoryText]
         : activeRunLines(outcome.activeRunId)));

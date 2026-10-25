@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
@@ -47,6 +47,7 @@ import {
   startDiscoverySite,
   type DiscoverySite,
 } from '../helpers/discovery-site-fixture.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -62,7 +63,6 @@ const LONG_NAVIGATION_INTERVAL_MS = 2_500;
 /** 読む画面の数より大きい上限。 */
 const ENOUGH_PAGES = 30;
 const SMALL_MAX_PAGES = 3;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 const WAIT_POLL_MS = 20;
 
 /** 期待する分類（画面の path → 分類の一覧）。 */
@@ -216,6 +216,8 @@ describe.each(LAUNCHERS)('T27d: the discovery job flow (%s)', (_name, launch) =>
     }
     expect((await validateArtifact('discovery', document)).ok).toBe(true);
     expect(document).toMatchObject({ jobId: 'job-discovery-1', runId: result.outcome.runId, endReason: 'COMPLETED', maxPages: ENOUGH_PAGES });
+    // AS-b: 結果の記録に、実効の監査の段の送信の扱い（既定の読み取りだけ）を残す。
+    expect(document.auditSendPolicy).toBe('READ_ONLY');
     // 読んだ画面: リンクでつながったすべての管理画面（2 段目の詳細を含む。凍結の後のリンクの抽出で先へ進めた）。
     expect([...readPathsOf(document)].sort()).toEqual([...DISCOVERY_SITE_READ_PAGES].sort());
     // 読まなかった画面: 除外（読まないパス、危険な語、読む範囲の外、ログインの画面）。
@@ -278,6 +280,24 @@ describe.each(LAUNCHERS)('T27d: the discovery job flow (%s)', (_name, launch) =>
       JSON.stringify([submitterWords, classification, identityDigest])))].map((entry) => JSON.parse(entry) as readonly unknown[])
       .map(([words, classification]) => [words, classification]).sort())
       .toEqual([[[], 'DISPLAY_ONLY'], [['削除'], 'NOT_EXECUTABLE'], [['編集'], 'DISPLAY_ONLY']].sort());
+  }, TEST_TIMEOUT_MS);
+
+  // AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1・2.2）: 監査の段の送信の扱いが `PASS_EXCEPT_DELETE` の発見は、Passive の Context に口を
+  // 渡し、ページ自身の beacon（同じ Origin の POST）をサイトに届け、結果の記録に扱いを残す。届くのは beacon だけ（ほかの読み取りでない要求はない）。
+  it('lets the beacon of the page reach the site with PASS_EXCEPT_DELETE, and records the policy in discovery.json', async () => {
+    site = await startDiscoverySite();
+    const config = configFor();
+    const result = await run({ ...config, audit: { ...config.audit, sendPolicy: 'PASS_EXCEPT_DELETE' } });
+    const document = result.document;
+    if (document === null || result.outcome.kind !== 'RAN') {
+      throw new Error('the discovery did not run');
+    }
+    expect((await validateArtifact('discovery', document)).ok).toBe(true);
+    expect(document.auditSendPolicy).toBe('PASS_EXCEPT_DELETE');
+    const beacon = document.pages.find((page) => pathOf(page.url) === DISCOVERY_SITE_PATHS.beacon);
+    expect(beacon?.state === 'READ' ? beacon.blockedRequests : Number.NaN).toBe(0);
+    expect(site.requests.filter(({ method }) => !READ_METHODS.has(method)).map(({ method, path }) => `${method} ${path.split('?')[0] ?? path}`))
+      .toEqual([`POST ${DISCOVERY_SITE_PATHS.collect}`]);
   }, TEST_TIMEOUT_MS);
 
   it('keeps the configured interval between the page loads even when it is longer than reading a page', async () => {

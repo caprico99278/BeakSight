@@ -1,6 +1,6 @@
 // T27e（Task 27 の設計書 4.5、4.6）: READ の確かめのジョブ（`READ_CHECK`）の、ジョブの管理（`createAuditJobManager` の `startReadCheck` と、ジョブの
 // 終わりの結果の記録）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `read-check` の動き）を本物の `fork` で起動して確かめる（本物の
-// ワーカーと Chromium での端から端は `read-check-job-fork.test.ts`）。
+// ワーカーと Chromium での端から端は `discovery-job-fork.test.ts` の「T27e」の describe）。
 // - 開始の確かめは発見と同じ（プロファイルが `TEST_AUTH_PASSIVE`、認証の設定が `CURRENT`）。取り消していない定義が 0 件なら
 //   `READ_CHECK_DEFINITIONS_MISSING`（ワーカーを起動しない）。公開の監査のプロファイルは拒む。
 // - `START` は、`READ_CHECK` の種類と、認証の指定（種類を含む SHA-256）と、定義の一覧（定義の ID・今の版・対象の候補の画面・定義の中身）を持つ。
@@ -10,18 +10,14 @@
 //   結果は、記録の部品が拒む（ほかの結果は記録する）。
 // - `FINISHED` の件数の要約は、READ の確かめのジョブの Run を実行した結果だけ（ないのは契約の違反）。
 // 管理データと出力先は一時のフォルダだけを使う。起動したワーカーは、すべて止まったことを確かめる。
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
-import {
-  createAuditJobManager,
-  type AuditJobManager,
-  type AuditWorkerForker,
-} from '../../src/control/job/audit-job-manager.js';
+import type { AuditJobManager, AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
 import {
   cancelReadCheck,
@@ -33,7 +29,7 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
-import { MAX_WORKER_READ_CHECKS, WORKER_PROTOCOL_VERSION, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
+import { MAX_WORKER_READ_CHECKS, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
@@ -42,11 +38,12 @@ import type { ReadCheckDefinition } from '../../src/discovery/read-check-contrac
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { blockingAfterStartFork, createCountingFork } from '../helpers/worker-fork.js';
 import {
-  CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
+  withOutputDirectory,
   type JobViewSource,
 } from '../helpers/job-test-support.js';
 import { sampleAction, sampleField, sampleForm } from '../unit/discovery-candidate-samples.js';
@@ -73,7 +70,7 @@ const DEFINITION_AT = '20261011000500';
 const CHANGED_AT = '20261011000600';
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -137,35 +134,18 @@ const countingFork: AuditWorkerForker = forks.fork;
 const fakeWorker = (mode: FakeWorkerMode, extra: Partial<FakeWorkerValues>, name: string): FakeWorker => {
   const directory = join(workDirectory, 'workers', name);
   mkdirSync(directory, { recursive: true });
-  return writeFakeWorker(directory, mode, {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
-    heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
-    ...extra,
-  });
+  return writeFakeWorker(directory, mode, fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, extra));
 };
 
 /** 偽のワーカーで、ジョブの管理を作り直す（出力先は、発見と READ の確かめで同じ）。 */
 async function managerWith(worker: FakeWorker, forkWorker: AuditWorkerForker = countingFork): Promise<AuditJobManager> {
   await manager?.close();
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
-    resolveContext: (path) => {
-      const context = resolveTestContext(path);
-      return context === undefined ? undefined : { targetConfig: { ...context.targetConfig, output: { directory: OUTPUT_DIRECTORY } } };
-    },
+    workDirectory,
+    worker,
+    resolveContext: withOutputDirectory(resolveTestContext, OUTPUT_DIRECTORY),
     forkWorker,
-    timing: CONTROL_JOB_TEST_TIMING,
   });
   return manager;
 }
@@ -317,6 +297,23 @@ describe('READ check jobs (T27e): the start', () => {
       { readCheckId: 'read-1', readCheckRevision: 1, targetPage: null, definition: definitionFor(SEARCH.identityDigest) },
     ]);
   }, TEST_TIMEOUT_MS);
+
+  // T37d（Task 37 の設計書 3.5）: 画面の path の定義の対象の画面は、ターゲット設定の開始の URL の Origin と定義の path（発見の結果によらない）。結果の
+  // 成果物は、対象の種類と画面の path まで、開始の定義と照らす。
+  it('sends a page path definition with the page of the start URL origin, and records its result', async () => {
+    await discover();
+    const pageDefinition: ReadCheckDefinition = { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] };
+    createDefinition('read-1', definitionFor(SEARCH.identityDigest));
+    createDefinition('read-2', pageDefinition);
+    const ended = await runReadCheckJob('page-path', { results: ['MATCHED', 'UNDETERMINED'] });
+    expect(ended).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', failureReason: null });
+    expect(ended.received.find((message) => message['type'] === 'START')?.['readChecks']).toEqual([
+      { readCheckId: 'read-1', readCheckRevision: 1, targetPage: location('/admin/items'), definition: definitionFor(SEARCH.identityDigest) },
+      { readCheckId: 'read-2', readCheckRevision: 1, targetPage: location('/admin/members'), definition: pageDefinition },
+    ]);
+    expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ readCheckId, result }) => [readCheckId, result]).sort())
+      .toEqual([['read-1', 'MATCHED'], ['read-2', 'UNDETERMINED']]);
+  }, TEST_TIMEOUT_MS);
 });
 
 describe('READ check jobs (T27e): recording read-evidence.json at the end of the job', () => {
@@ -359,5 +356,47 @@ describe('READ check jobs (T27e): recording read-evidence.json at the end of the
     });
     expect(ended).toMatchObject({ state: 'FINISHED', failureReason: null });
     expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ readCheckId, readCheckRevision }) => [readCheckId, readCheckRevision])).toEqual([['read-1', 1]]);
+  }, TEST_TIMEOUT_MS);
+});
+
+// T37a（Task 37 の設計書 3.1）: 監査の段の口のある READ の確かめのジョブ。成果物の監査の段の数（`authentication`）は、IPC の要約と照らし合わせる
+// （合わなければ `READ_CHECK_RESULT_INVALID`）。
+describe('READ check jobs (T37a): the counts of the audit stage', () => {
+  const AUTHENTICATION = Object.freeze({
+    registeredReadRequestsAllowed: 1,
+    tokenRefreshBlocked: 0,
+    otherNonReadBlocked: 0,
+    serviceUnauthorizedResponses: 2,
+    serviceRequestLimitReached: false,
+  });
+
+  it('finishes when the counts of FINISHED match read-evidence.json, and fails with READ_CHECK_RESULT_INVALID when they do not', async () => {
+    createDefinition('read-1', definitionFor(SEARCH.identityDigest));
+    const matched = await runReadCheckJob('authentication', { results: ['MATCHED'], authentication: AUTHENTICATION });
+    expect(matched).toMatchObject({ state: 'FINISHED', failureReason: null });
+    for (const [name, values] of [
+      ['other-counts', { results: ['MATCHED'], authentication: AUTHENTICATION, summary: { checks: 1, executed: 1, authentication: { ...AUTHENTICATION, serviceUnauthorizedResponses: 3 } } }],
+      ['missing-counts', { results: ['MATCHED'], authentication: AUTHENTICATION, summary: { checks: 1, executed: 1 } }],
+      ['extra-counts', { results: ['MATCHED'], summary: { checks: 1, executed: 1, authentication: AUTHENTICATION } }],
+    ] as const) {
+      const ended = await runReadCheckJob(name, values);
+      expect(ended, name).toMatchObject({ state: 'FAILED', failureReason: 'READ_CHECK_RESULT_INVALID' });
+    }
+  }, TEST_TIMEOUT_MS);
+});
+
+// LG-4（テストの組の設計書 3.7.3）: 前の版（`discovery-schema/1.0`）の `discovery.json` は読まない。最後の発見の成果物が前の版なら、READ の確かめの
+// 対象の画面は決まらない（null）。
+describe('READ check jobs (LG-4): a discovery.json of the previous version 1.0 is not read', () => {
+  it('gives a null target page when the last discovery.json is of the version 1.0', async () => {
+    await discover();
+    const path = join(workDirectory, OUTPUT_DIRECTORY, FAKE_RUN_ID, 'discovery.json');
+    const current = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify({ ...current, schemaVersion: 'discovery-schema/1.0' }));
+    createDefinition('read-1', definitionFor(SEARCH.identityDigest));
+    const ended = await runReadCheckJob('previous-version', { results: ['READ_CANDIDATE_DRIFTED'] });
+    expect(ended.received.find((message) => message['type'] === 'START')?.['readChecks']).toEqual([
+      { readCheckId: 'read-1', readCheckRevision: 1, targetPage: null, definition: definitionFor(SEARCH.identityDigest) },
+    ]);
   }, TEST_TIMEOUT_MS);
 });

@@ -13,12 +13,10 @@
  * - 対象は `src/**` と、画面の `apps/local-ui/src/**`（`.ts`、`.tsx`）。1 ファイル 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { loadLocalUiSourceFiles, loadSourceFiles, scanSource, type SourceFile } from './source-scan.js';
+import { MAX_GATE_MS, loadLocalUiSourceFiles, loadSourceFiles, scanSource, startCpuStopwatch, type SourceFile } from './source-scan.js';
 
 const SOURCE_FILES: readonly SourceFile[] = [...loadSourceFiles(), ...loadLocalUiSourceFiles()];
 const TIME_UNITS_OWNER = 'src/core/time-units.ts';
-/** 1 つのファイルの判定の上限（ms）。 */
-const MAX_MS_PER_FILE = 1_000;
 
 /** 置き換えを見送る定義（`<path>:<行> <本文>` の頭。理由つき）。今はない（T31h-2 の後に、画面のサーバの 1 つを置き換えた）。 */
 const DEFERRED_DEFINITIONS: Readonly<Record<string, string>> = Object.freeze({});
@@ -46,21 +44,21 @@ const matchingLines = (file: Pick<SourceFile, 'path' | 'bare'>, shapes: readonly
 
 describe('Gate: the time units have one owner (CCX-19)', () => {
   it('defines the time unit constants only in src/core/time-units.ts', () => {
-    const started = performance.now();
+    const stopwatch = startCpuStopwatch();
     const matched = SOURCE_FILES.filter(({ path }) => path !== TIME_UNITS_OWNER).flatMap((file) => matchingLines(file, [UNIT_CONSTANT_DEFINITION]));
     const pathOf = (line: string): string => line.slice(0, line.indexOf(':'));
     expect(matched.filter((line) => DEFERRED_DEFINITIONS[pathOf(line)] === undefined)).toEqual([]);
     // 使われなくなった除外を残さない。
     expect(Object.keys(DEFERRED_DEFINITIONS).filter((path) => !matched.some((line) => pathOf(line) === path))).toEqual([]);
     expect(SOURCE_FILES.find(({ path }) => path === TIME_UNITS_OWNER)?.bare).toMatch(/export const MINUTE_MS = /u);
-    expect(performance.now() - started).toBeLessThan(MAX_MS_PER_FILE * SOURCE_FILES.length);
+    expect(stopwatch.elapsedMs()).toBeLessThan(MAX_GATE_MS * SOURCE_FILES.length);
   });
 
   it('writes no time unit arithmetic outside src/core/time-units.ts', () => {
-    const started = performance.now();
+    const stopwatch = startCpuStopwatch();
     const found = SOURCE_FILES.filter(({ path }) => path !== TIME_UNITS_OWNER).flatMap((file) => matchingLines(file, UNIT_ARITHMETIC_SHAPES));
     expect(found).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(MAX_MS_PER_FILE * SOURCE_FILES.length);
+    expect(stopwatch.elapsedMs()).toBeLessThan(MAX_GATE_MS * SOURCE_FILES.length);
   });
 
   it('finds the shapes placed on purpose, and does not count named values, comments and strings (the control)', () => {

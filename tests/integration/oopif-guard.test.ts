@@ -7,7 +7,7 @@
 //   サイトの分離を無効にする起動の引数は、使わない。
 // - 別のサイトの iframe は、同じ fixture のサーバの別のホスト名（`127.0.0.1` と `localhost`）で作る。インターネット上のサイトは使わない。
 // - 外部スキームの宛先は、fixture のサーバの中の固定の一覧（実在しないもの）だけである。
-import type { Browser, BrowserContext, CDPSession, Frame, Page } from 'playwright';
+import type { Browser, CDPSession, Frame, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import type { BrowserContextFactory } from '../../src/browser/context-factory.js';
@@ -19,15 +19,12 @@ import {
   CROSS_SITE_FRAME_PAGE,
   crossSiteFramePath,
   crossSiteOriginOf,
-  EXTERNAL_SCHEME_KEYS,
   EXTERNAL_SCHEME_REDIRECT_PATH,
-  externalSchemeRedirectPath,
   NAVIGATION_TARGET_HEADING,
   NAVIGATION_TARGET_PAGE,
   SELF_NAVIGATING_FRAME_PAGE,
   selfNavigatingFramePath,
   SLOW_REDIRECT_PATH,
-  stoppedRedirectRecord,
 } from '../helpers/external-scheme-fixture.js';
 import {
   createGateFactory,
@@ -67,15 +64,6 @@ afterAll(async () => {
 /** page の、別のホスト名（`localhost`）の frame。 */
 const crossSiteFrames = (page: Page): Frame[] => page.frames().filter((frame) => frame.url().startsWith(`${crossSiteOrigin}/`));
 
-/** Context の、失敗したリクエストを `<URL> <errorText>` で集める。 */
-function collectFailedRequests(context: BrowserContext): string[] {
-  const failed: string[] = [];
-  context.on('requestfailed', (request) => {
-    failed.push(`${request.url()} ${request.failure()?.errorText ?? ''}`);
-  });
-  return failed;
-}
-
 // Context の関数の差し替え（`vi.spyOn`）は、テストごとに元に戻す。
 afterEach(() => {
   vi.restoreAllMocks();
@@ -99,67 +87,8 @@ describe('C18i: the fixture makes a cross-site iframe that runs in a separate pr
 });
 
 describe('C18i: a server redirect to an external scheme, started by the OOPIF itself, is stopped before it is followed, and recorded', () => {
-  it.each(EXTERNAL_SCHEME_KEYS)('Passive: the OOPIF navigates itself to the redirect to %s; it is stopped and recorded without a violation', async (key) => {
-    const window = openServerWindow(server);
-    let failed: string[] = [];
-    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
-      const url = `${server.origin}${crossSiteFramePath(selfNavigatingFramePath(key))}`;
-      await page.goto(url, { waitUntil: 'load' });
-      await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
-      await wait(QUIET_PERIOD_MS);
-
-      const snapshot = ledger.snapshot();
-      expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
-      expect(snapshot.invariantViolations).toEqual([]);
-      expect(isPassiveRequestGuardClosed(context)).toBe(false);
-      expect(page.url()).toBe(url);
-      // 元のリクエストは、Guard が止めた失敗（`net::ERR_BLOCKED_BY_CLIENT`）になる（止めなければ `net::ERR_ABORTED`）。
-      expect(failed).toEqual([`${crossSiteOrigin}${externalSchemeRedirectPath(key)} net::ERR_BLOCKED_BY_CLIENT`]);
-      // 移動は、別のプロセスの iframe（OOPIF）の中で始まった。
-      expect((await oopifTargetUrls(browser)).some((target) => target.startsWith(`${crossSiteOrigin}/`))).toBe(true);
-    }, {
-      prepare: (context) => {
-        failed = collectFailedRequests(context);
-      },
-    });
-    expect(window.requestLines()).toEqual([
-      `GET ${CROSS_SITE_FRAME_PAGE}`,
-      `GET ${SELF_NAVIGATING_FRAME_PAGE}`,
-      `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`,
-    ]);
-    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  });
-
-  it.each(EXTERNAL_SCHEME_KEYS)('Passive: a nested OOPIF (127.0.0.1 in localhost in 127.0.0.1) navigates itself to the redirect to %s; it is stopped and recorded', async (key) => {
-    const window = openServerWindow(server);
-    let failed: string[] = [];
-    await withGuardedPassivePage(headlessFactory, viewport, async (page, context, ledger) => {
-      await page.goto(`${server.origin}${crossSiteFramePath(crossSiteFramePath(selfNavigatingFramePath(key)))}`, { waitUntil: 'load' });
-      await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
-      await wait(QUIET_PERIOD_MS);
-
-      const snapshot = ledger.snapshot();
-      expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
-      expect(snapshot.invariantViolations).toEqual([]);
-      expect(isPassiveRequestGuardClosed(context)).toBe(false);
-      expect(failed).toEqual([`${server.origin}${externalSchemeRedirectPath(key)} net::ERR_BLOCKED_BY_CLIENT`]);
-      // 入れ子の iframe も、別のプロセスの iframe（OOPIF）である（localhost の OOPIF と、その中の 127.0.0.1 の OOPIF）。
-      const targets = await oopifTargetUrls(browser);
-      expect(targets.some((target) => target.startsWith(`${crossSiteOrigin}/`))).toBe(true);
-      expect(targets.some((target) => target.startsWith(`${server.origin}/`))).toBe(true);
-    }, {
-      prepare: (context) => {
-        failed = collectFailedRequests(context);
-      },
-    });
-    expect(window.requestLines()).toEqual([
-      `GET ${CROSS_SITE_FRAME_PAGE}`,
-      `GET ${CROSS_SITE_FRAME_PAGE}`,
-      `GET ${SELF_NAVIGATING_FRAME_PAGE}`,
-      `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`,
-    ]);
-    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  });
+  // TS-f（B3・B4）: OOPIF の自己移動と入れ子の OOPIF の自己移動の、外部スキームへのリダイレクトの場面（止めた記録、違反 0、止めた失敗の
+  // `net::ERR_BLOCKED_BY_CLIENT`、OOPIF の target、閉じた後のサーバの記録）は、`safety-gates.test.ts` の GATE-S03（OOPIF）に、1 か所にまとめた。
 
   it('Passive: a slow same-origin redirect (1.5 s) inside the OOPIF is not a false violation, and the OOPIF reaches its target', async () => {
     const window = openServerWindow(server);
@@ -184,36 +113,8 @@ describe('C18i: a server redirect to an external scheme, started by the OOPIF it
   });
 });
 
-describe('C18i: after the Interaction freeze, a navigation started by the OOPIF stops before the server', () => {
-  it('Interaction (after the freeze): the OOPIF navigating itself is blocked as INTERACTION_FROZEN, without a violation', async () => {
-    const session = await headlessFactory.createInteractionSession(viewport);
-    try {
-      await session.page.goto(`${server.origin}${crossSiteFramePath(selfNavigatingFramePath())}`, { waitUntil: 'load' });
-      await expect.poll(() => crossSiteFrames(session.page).length).toBe(1);
-      const [frame] = crossSiteFrames(session.page);
-      await session.activateInteractionFreeze();
-      const window = openServerWindow(server);
-      const target = externalSchemeRedirectPath('custom');
-
-      await frame!.evaluate((href) => {
-        location.href = href;
-      }, target);
-      await expect.poll(() => session.ledger.snapshot().blockedInteractionNavigations).toContainEqual({
-        method: 'GET',
-        url: `${crossSiteOrigin}${target}`,
-        reason: 'INTERACTION_FROZEN',
-      });
-      await wait(QUIET_PERIOD_MS);
-
-      expect(session.ledger.snapshot().invariantViolations).toEqual([]);
-      expect(session.ledger.snapshot().externalSchemeNavigations).toEqual([]);
-      expect(session.isClosed()).toBe(false);
-      expect(window.requestLines()).toEqual([]);
-    } finally {
-      if (!session.isClosed()) await session.close();
-    }
-  });
-});
+// TS-f（B5）: Interaction の凍結の後に OOPIF が自分で始めた移動が `INTERACTION_FROZEN` で止まる場面は、同じ確かめをしていた
+// `safety-gates.test.ts` の GATE-S03 Interaction OOPIF に、1 か所にまとめた。
 
 describe('C18i: the existing judgments still stop the OOPIF (navigation outside the allowed Origin, non-read methods)', () => {
   it('Passive: POST, sendBeacon, PUT and DELETE sent by the OOPIF on load are blocked and never reach the server', async () => {
@@ -236,10 +137,13 @@ describe('C18i: the existing judgments still stop the OOPIF (navigation outside 
     const window = openServerWindow(server);
     await withGuardedPassivePage(headlessFactory, viewport, async (page, _context, ledger) => {
       await page.goto(`${server.origin}${crossSiteFramePath(selfNavigatingFramePath('post-form'))}`, { waitUntil: 'load' });
+      // DEF-162: BN で足された遮断の記録の時点（`phase`）と要求の種類（`resourceType`。フォームの送信は文書の読み込み）も期待に入れる。
       await expect.poll(() => ledger.snapshot().blockedRequests).toContainEqual({
         method: 'POST',
         url: `${crossSiteOrigin}/__mutation`,
         reason: 'NON_READ_METHOD',
+        resourceType: 'document',
+        phase: 'LOAD',
       });
       await wait(QUIET_PERIOD_MS);
 
@@ -258,10 +162,12 @@ describe('C18i: the existing judgments still stop the OOPIF (navigation outside 
       const [frame] = crossSiteFrames(page);
 
       await frame!.getByRole('button', { name: 'Navigate top' }).click();
+      // DEF-162: BN で足された遮断の記録の時点（`phase`）も期待に入れる。
       await expect.poll(() => ledger.snapshot().blockedNavigations).toContainEqual({
         method: 'GET',
         url: `${crossSiteOrigin}${NAVIGATION_TARGET_PAGE}`,
         reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
+        phase: 'LOAD',
       });
       await wait(QUIET_PERIOD_MS);
 

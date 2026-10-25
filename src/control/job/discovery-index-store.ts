@@ -17,6 +17,16 @@
 //   その区切りを `{id}` にした digest。digest だけで、欄の名前は持たない）を書く。求めるのは `discoveryIndexEntryOf`（親が候補の全体から
 //   `templatedIdentityDigestsOf` で求める）。新しい候補・変わった候補・まだある候補のどれも、今回の一覧で書き直す（一覧の違いはドリフトに数えない）。
 //   版 9 の前に書いた行は一覧なし（読み出しの `templatedIdentityDigests` は null。UPDATE の承認の有効性は止める側）。
+// - T38d（Task 38 の設計書 3.1、3.5。管理データの版 13）: 候補ごとの「型の digest の一覧」（`shapeDigests`。押して見た要求の型の digest
+//   `submissionProbe.shapeDigest`。digest だけ）を書く。`inputFields` のない probe（T38a の前の成果物）と型のない probe は、型を持たないものとして扱う。
+//   同じジョブの同じ識別の digest の候補（型ごとに 1 行。`mergeDiscoveryCandidates`）は、型の一覧を合わせて 1 件にする（ほかの項目が違えば
+//   `RangeError`）。上限は `MAX_INDEX_SHAPE_DIGESTS`。どの場合も今回の一覧で書き直す（型の違いはドリフトに数えない）。版 13 の前に書いた行は
+//   一覧なし（読み出しの `shapeDigests` は null。API の承認の有効性は止める側。判定は T38c）。
+// - T38R-fix（Task 38 の設計書 7 章の最後の行）: C-1: 型の digest は、書き込みの probe（結果が `API_CREATE`・`API_UPDATE`）の型だけ。I-1: 鍵と欄の対応の
+//   digest の一覧（`keyFieldDigests`。`apiKeyFieldsDigestOf`）も、型の一覧と同じく書き、合わせ、読む（列を足す前の行は null）。
+// - T41a（Task 41 の設計書 3.1）: form のない候補の、画面の path の最後の ID を `{id}` にした識別の digest（`pagePathTemplatedIdentityDigestOf`）も、型に
+//   した識別の digest の一覧（同じ列 `templated_identity_digests`）に入れる。印が form の digest と違うので、印で分けて共用する（管理データの版は 14 のまま。
+//   列の形と上限は変わらない）。API の UPDATE の承認の有効性が、この一覧で候補を確かめる。
 // - 書き込みは、すべて `withWriteTransaction` の中。読むだけの関数は `withReadTransaction` を通す。生の接続を直接参照しない（Architecture Gate
 //   `control-store-boundary.test.ts` の (f)(g)）。呼び出し側の誤り（形の違う入力、同じジョブを 2 回、前の時刻）は、書く前に `RangeError`。
 import { isSha256Fingerprint } from '../../core/ids.js';
@@ -36,7 +46,13 @@ import {
   type MethodOverride,
 } from '../../discovery/candidate-contracts.js';
 import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../discovery/discovery-result.js';
-import { MAX_RECORD_ID_SEGMENT_PAIRS, templatedIdentityDigestsOf } from '../../discovery/fingerprint.js';
+import { MAX_RECORD_ID_SEGMENT_PAIRS, pagePathTemplatedIdentityDigestOf, templatedIdentityDigestsOf } from '../../discovery/fingerprint.js';
+import {
+  MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE,
+  submissionProbeWriteOf,
+  type SubmissionProbeRecord,
+} from '../../discovery/submission-probe-contracts.js';
+import { apiKeyFieldsDigestOf, scenarioApiKeyFieldsOfProbe } from '../approval/scenario-contracts.js';
 import { usableRecordIdOf } from '../actions/action-outcome.js';
 import type { ControlDatabase } from '../store/control-database.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
@@ -70,7 +86,23 @@ export interface DiscoveryIndexEntry {
    * `discoveryIndexEntryOf`。
    */
   readonly templatedIdentityDigests: readonly string[];
+  /**
+   * 型の digest の一覧（T38d。UTF-16 のコード単位の順、重なりなし、上限 `MAX_INDEX_SHAPE_DIGESTS` 件。digest だけ）。作るのは `discoveryIndexEntryOf`
+   * （`inputFields` を持つ probe の型の digest。ほかは空）。
+   */
+  readonly shapeDigests: readonly string[];
+  /**
+   * 鍵と欄の対応の digest の一覧（T38R-fix の I-1。`apiKeyFieldsDigestOf`。型の digest の一覧と同じ行の probe ごと。並べて重なりなし、上限
+   * `MAX_INDEX_SHAPE_DIGESTS` 件）。作るのは `discoveryIndexEntryOf`。
+   */
+  readonly keyFieldDigests: readonly string[];
 }
+
+/**
+ * 索引の 1 件が持てる型の digest の数の上限（T38d。1 画面で押す回数の上限と同じ。1 回の発見で、1 つの識別の digest の型はそれより多くならない。
+ * 管理データの版 13 の CHECK も同じ数）。
+ */
+export const MAX_INDEX_SHAPE_DIGESTS = MAX_SUBMISSION_PROBE_PRESSES_PER_PAGE;
 
 /** 発見のジョブ 1 回の記録の入力。 */
 export interface DiscoveryIndexUpdate {
@@ -95,9 +127,13 @@ export type DiscoveryIndexDrift = (typeof DISCOVERY_INDEX_DRIFTS)[number];
 export type DiscoveryIndexUpdateOutcome = { readonly [Drift in DiscoveryIndexDrift]: readonly string[] };
 
 /** 索引の 1 件（凍結。日時は UTC の 14 桁）。`drift` は、最後の発見のジョブに対するもの。 */
-export interface DiscoveryCandidateIndexView extends Omit<DiscoveryIndexEntry, 'templatedIdentityDigests'> {
+export interface DiscoveryCandidateIndexView extends Omit<DiscoveryIndexEntry, 'templatedIdentityDigests' | 'shapeDigests' | 'keyFieldDigests'> {
+  /** 鍵と欄の対応の digest の一覧（T38R-fix の I-1）。この列を足す前に書いた行（まだ次の発見で書き直していない行）は null。 */
+  readonly keyFieldDigests: readonly string[] | null;
   /** 型にした識別の digest の一覧（T31e）。管理データの版 9 の前に書いた行（まだ次の発見で書き直していない行）は null。 */
   readonly templatedIdentityDigests: readonly string[] | null;
+  /** 型の digest の一覧（T38d）。管理データの版 13 の前に書いた行（まだ次の発見で書き直していない行）は null。 */
+  readonly shapeDigests: readonly string[] | null;
   readonly profileId: string;
   readonly firstSeenJobId: string;
   readonly firstSeenAt: string;
@@ -140,6 +176,8 @@ interface CandidateRow {
   readonly last_seen_at: string;
   readonly last_changed_job_id: string | null;
   readonly templated_identity_digests: string | null;
+  readonly shape_digests: string | null;
+  readonly key_field_digests: string | null;
 }
 
 /** `discovery_jobs` の行（T27d）。 */
@@ -150,7 +188,8 @@ interface DiscoveryJobRow {
 }
 
 const CANDIDATE_COLUMNS = 'profile_id, identity_digest, rule_digest, classification, reason_code, page_path, action_path, form_method, '
-  + 'method_override, has_state_field, first_seen_job_id, first_seen_at, last_seen_job_id, last_seen_at, last_changed_job_id, templated_identity_digests';
+  + 'method_override, has_state_field, first_seen_job_id, first_seen_at, last_seen_job_id, last_seen_at, last_changed_job_id, templated_identity_digests, '
+  + 'shape_digests, key_field_digests';
 const SELECT_PROFILE_CANDIDATES_SQL = `SELECT ${CANDIDATE_COLUMNS} FROM discovery_candidates WHERE profile_id = ? ORDER BY identity_digest`;
 const SELECT_LATEST_JOB_SQL = `SELECT job_id, recorded_at, read_page_paths FROM discovery_jobs WHERE profile_id = ?
   ORDER BY recorded_at DESC, rowid DESC LIMIT 1`;
@@ -159,11 +198,12 @@ const SELECT_JOB_RECORDED_SQL = 'SELECT count(*) AS n FROM discovery_jobs WHERE 
 const SELECT_JOBS_AFTER_SQL = `SELECT count(*) AS n FROM discovery_jobs WHERE profile_id = ?
   AND (? IS NULL OR rowid > (SELECT rowid FROM discovery_jobs WHERE job_id = ?))`;
 const INSERT_JOB_SQL = 'INSERT INTO discovery_jobs (job_id, profile_id, recorded_at, read_page_paths) VALUES (?, ?, ?, ?)';
-const INSERT_CANDIDATE_SQL = `INSERT INTO discovery_candidates (${CANDIDATE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`;
-const UPDATE_SEEN_SQL = `UPDATE discovery_candidates SET last_seen_job_id = ?, last_seen_at = ?, templated_identity_digests = ?
-  WHERE profile_id = ? AND identity_digest = ?`;
+const INSERT_CANDIDATE_SQL = `INSERT INTO discovery_candidates (${CANDIDATE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`;
+const UPDATE_SEEN_SQL = `UPDATE discovery_candidates SET last_seen_job_id = ?, last_seen_at = ?, templated_identity_digests = ?, shape_digests = ?,
+  key_field_digests = ? WHERE profile_id = ? AND identity_digest = ?`;
 const UPDATE_CHANGED_SQL = `UPDATE discovery_candidates SET rule_digest = ?, classification = ?, reason_code = ?, has_state_field = ?,
-  last_seen_job_id = ?, last_seen_at = ?, last_changed_job_id = ?, templated_identity_digests = ? WHERE profile_id = ? AND identity_digest = ?`;
+  last_seen_job_id = ?, last_seen_at = ?, last_changed_job_id = ?, templated_identity_digests = ?, shape_digests = ?, key_field_digests = ?
+  WHERE profile_id = ? AND identity_digest = ?`;
 
 /** SQLite の真偽の値。 */
 const SQL_TRUE = 1;
@@ -187,12 +227,18 @@ const sortedFrozen = (values: readonly string[]): readonly string[] => Object.fr
 const isCandidatePath = (value: unknown): value is string =>
   typeof value === 'string' && value.startsWith(PATH_START) && value.length <= MAX_CANDIDATE_URL_PART_LENGTH;
 
-/** 型にした識別の digest の一覧の形か（T31e。digest の形、UTF-16 のコード単位の順で重なりなし、上限まで）。 */
-const isTemplatedIdentityDigests = (value: unknown): value is readonly string[] =>
+/** digest の一覧の形か（digest の形、UTF-16 のコード単位の順で重なりなし、上限まで）。 */
+const isSortedDigestList = (value: unknown, limit: number): value is readonly string[] =>
   Array.isArray(value)
-  && value.length <= MAX_RECORD_ID_SEGMENT_PAIRS
+  && value.length <= limit
   && value.every(isSha256Fingerprint)
   && value.every((digest, index) => index === 0 || (value[index - 1] as string) < digest);
+
+/** 型にした識別の digest の一覧の形か（T31e）。 */
+const isTemplatedIdentityDigests = (value: unknown): value is readonly string[] => isSortedDigestList(value, MAX_RECORD_ID_SEGMENT_PAIRS);
+
+/** 型の digest の一覧の形か（T38d）。 */
+const isShapeDigests = (value: unknown): value is readonly string[] => isSortedDigestList(value, MAX_INDEX_SHAPE_DIGESTS);
 
 /** 索引の 1 件の形を確かめ、項目を選んだ凍結した写しを返す（余分な項目は写さない）。 */
 const requireEntry = (entry: DiscoveryIndexEntry): DiscoveryIndexEntry => {
@@ -218,6 +264,12 @@ const requireEntry = (entry: DiscoveryIndexEntry): DiscoveryIndexEntry => {
   if (!isTemplatedIdentityDigests(entry.templatedIdentityDigests)) {
     throw new RangeError('the templated identity digests must be sorted distinct digests within the limit');
   }
+  if (!isShapeDigests(entry.shapeDigests)) {
+    throw new RangeError('the shape digests must be sorted distinct digests within the limit');
+  }
+  if (!isShapeDigests(entry.keyFieldDigests)) {
+    throw new RangeError('the key field digests must be sorted distinct digests within the limit');
+  }
   return Object.freeze({
     identityDigest: entry.identityDigest,
     ruleDigest: entry.ruleDigest,
@@ -229,12 +281,33 @@ const requireEntry = (entry: DiscoveryIndexEntry): DiscoveryIndexEntry => {
     methodOverride: entry.methodOverride,
     hasStateField: entry.hasStateField,
     templatedIdentityDigests: Object.freeze([...entry.templatedIdentityDigests]),
+    shapeDigests: Object.freeze([...entry.shapeDigests]),
+    keyFieldDigests: Object.freeze([...entry.keyFieldDigests]),
   });
 };
 
-/** 同じ識別の digest の 2 件が、同じ中身か。 */
-const sameEntry = (left: DiscoveryIndexEntry, right: DiscoveryIndexEntry): boolean =>
-  JSON.stringify(left) === JSON.stringify(right);
+/**
+ * 同じ識別の digest の 2 件が、型の digest の一覧と鍵と欄の対応の digest の一覧のほかは同じ中身か（T38d: 型ごとの行は、型の一覧を合わせて 1 件に
+ * する。T38R-fix の I-1: 鍵と欄の対応の一覧も同じ）。
+ */
+const sameEntryButShapes = (left: DiscoveryIndexEntry, right: DiscoveryIndexEntry): boolean =>
+  JSON.stringify({ ...left, shapeDigests: [], keyFieldDigests: [] }) === JSON.stringify({ ...right, shapeDigests: [], keyFieldDigests: [] });
+
+/** 2 つの digest の一覧を合わせる（並べて重なりなし。上限を超えれば `RangeError`）。 */
+const joinedDigestsOf = (left: readonly string[], right: readonly string[], label: string): readonly string[] => {
+  const joined = sortedFrozen([...new Set([...left, ...right])]);
+  if (!isShapeDigests(joined)) {
+    throw new RangeError(`one identity digest of a discovery job must have at most ${MAX_INDEX_SHAPE_DIGESTS} ${label}`);
+  }
+  return joined;
+};
+
+/** 同じ識別の digest の 2 件の、型の digest の一覧と鍵と欄の対応の digest の一覧を合わせる（T38d・T38R-fix の I-1）。 */
+const withJoinedShapes = (known: DiscoveryIndexEntry, entry: DiscoveryIndexEntry): DiscoveryIndexEntry => Object.freeze({
+  ...known,
+  shapeDigests: joinedDigestsOf(known.shapeDigests, entry.shapeDigests, 'shape digests'),
+  keyFieldDigests: joinedDigestsOf(known.keyFieldDigests, entry.keyFieldDigests, 'key field digests'),
+});
 
 /** 読み切れた画面の path の一覧を確かめ、並べた凍結した写しを返す（T27d）。形の違う値、重複、上限を超える件数は `RangeError`。 */
 const requireReadPagePaths = (paths: readonly string[]): readonly string[] => {
@@ -256,7 +329,10 @@ interface CheckedUpdate {
   readonly readPagePaths: readonly string[];
 }
 
-/** 入力を確かめ、識別の digest ごとに 1 件にまとめる（同じ中身の重複はまとめ、違う中身の重複は `RangeError`）。 */
+/**
+ * 入力を確かめ、識別の digest ごとに 1 件にまとめる（同じ中身の重複はまとめ、型の digest の一覧だけが違う重複は一覧を合わせ（T38d）、ほかの違う
+ * 中身の重複は `RangeError`）。
+ */
 const requireUpdate = (update: DiscoveryIndexUpdate): CheckedUpdate => {
   if (typeof update.jobId !== 'string' || !WORKER_JOB_ID_PATTERN.test(update.jobId)) {
     throw new RangeError('the discovery job id must match the job id pattern');
@@ -269,10 +345,10 @@ const requireUpdate = (update: DiscoveryIndexUpdate): CheckedUpdate => {
   const byDigest = new Map<string, DiscoveryIndexEntry>();
   for (const entry of update.entries.map(requireEntry)) {
     const known = byDigest.get(entry.identityDigest);
-    if (known !== undefined && !sameEntry(known, entry)) {
+    if (known !== undefined && !sameEntryButShapes(known, entry)) {
       throw new RangeError('two entries of one discovery job have the same identity digest but different contents');
     }
-    byDigest.set(entry.identityDigest, entry);
+    byDigest.set(entry.identityDigest, known === undefined ? entry : withJoinedShapes(known, entry));
   }
   return Object.freeze({ entries: Object.freeze([...byDigest.values()]), readPagePaths });
 };
@@ -297,6 +373,40 @@ const templatedIdentityDigestsOfRow = (row: CandidateRow): readonly string[] | n
   }
   if (!isTemplatedIdentityDigests(parsed)) {
     throw integrityError('templated_identity_digests is not a sorted list of distinct digests within the limit');
+  }
+  return Object.freeze([...parsed]);
+};
+
+/** 保存した型の digest の一覧（T38d。版 13 の前の行は null。壊れていれば `ControlStoreError`）。 */
+const shapeDigestsOfRow = (row: CandidateRow): readonly string[] | null => {
+  if (row.shape_digests === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.shape_digests) as unknown;
+  } catch {
+    throw integrityError('shape_digests is not JSON');
+  }
+  if (!isShapeDigests(parsed)) {
+    throw integrityError('shape_digests is not a sorted list of distinct digests within the limit');
+  }
+  return Object.freeze([...parsed]);
+};
+
+/** 保存した鍵と欄の対応の digest の一覧（T38R-fix の I-1。列を足す前の行は null。壊れていれば `ControlStoreError`）。 */
+const keyFieldDigestsOfRow = (row: CandidateRow): readonly string[] | null => {
+  if (row.key_field_digests === null) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.key_field_digests) as unknown;
+  } catch {
+    throw integrityError('key_field_digests is not JSON');
+  }
+  if (!isShapeDigests(parsed)) {
+    throw integrityError('key_field_digests is not a sorted list of distinct digests within the limit');
   }
   return Object.freeze([...parsed]);
 };
@@ -345,20 +455,24 @@ const recordIn = (
     rows.delete(entry.identityDigest);
     // T31e: 型にした識別の digest の一覧は、どの場合も今回の一覧で書く（版 9 の前の行も、次の発見で一覧を持つ）。
     const templated = JSON.stringify(entry.templatedIdentityDigests);
+    // T38d: 型の digest の一覧も、どの場合も今回の一覧で書く（版 13 の前の行も、次の発見で一覧を持つ。違いはドリフトに数えない）。
+    const shapes = JSON.stringify(entry.shapeDigests);
+    // T38R-fix の I-1: 鍵と欄の対応の digest の一覧も、どの場合も今回の一覧で書く。
+    const keyFields = JSON.stringify(entry.keyFieldDigests);
     if (row === undefined) {
       connection.prepare(INSERT_CANDIDATE_SQL).run(
         profileId, entry.identityDigest, entry.ruleDigest, entry.classification, entry.reasonCode, entry.pagePath, entry.actionPath,
-        entry.formMethod, entry.methodOverride, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, at, templated,
+        entry.formMethod, entry.methodOverride, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, at, templated, shapes, keyFields,
       );
       outcome.NEW.push(entry.identityDigest);
     } else if (changedFrom(row, entry)) {
       connection.prepare(UPDATE_CHANGED_SQL).run(
-        entry.ruleDigest, entry.classification, entry.reasonCode, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, templated, profileId,
-        entry.identityDigest,
+        entry.ruleDigest, entry.classification, entry.reasonCode, entry.hasStateField ? SQL_TRUE : SQL_FALSE, jobId, at, jobId, templated, shapes,
+        keyFields, profileId, entry.identityDigest,
       );
       outcome.CHANGED.push(entry.identityDigest);
     } else {
-      connection.prepare(UPDATE_SEEN_SQL).run(jobId, at, templated, profileId, entry.identityDigest);
+      connection.prepare(UPDATE_SEEN_SQL).run(jobId, at, templated, shapes, keyFields, profileId, entry.identityDigest);
       outcome.UNCHANGED.push(entry.identityDigest);
     }
   }
@@ -380,8 +494,42 @@ const recordIn = (
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
+ * 候補の、書き込みの probe（T38R-fix の C-1: 結果が `API_CREATE`・`API_UPDATE`。`submissionProbeWriteOf`）で、`inputFields` と型の digest を持つもの。
+ * ほかの probe（2 つの要求になった `NOT_EXECUTABLE` など）の型は、索引に入れない。
+ */
+const writeProbeOf = (candidate: DiscoveryCandidate): (SubmissionProbeRecord & { readonly shapeDigest: string }) | null => {
+  const probe = candidate.submissionProbe;
+  return probe === undefined || probe.inputFields === undefined || probe.shapeDigest === null || submissionProbeWriteOf(probe.result) === null
+    ? null
+    : { ...probe, shapeDigest: probe.shapeDigest };
+};
+
+/** 候補の型の digest の一覧（T38d。T38R-fix の C-1: 書き込みの probe の型の digest だけ。凍結）。 */
+const shapeDigestsOfCandidate = (candidate: DiscoveryCandidate): readonly string[] => {
+  const probe = writeProbeOf(candidate);
+  return Object.freeze(probe === null ? [] : [probe.shapeDigest]);
+};
+
+/** 候補の鍵と欄の対応の digest の一覧（T38R-fix の I-1。書き込みの probe の型と、欄に対応する鍵の欄の識別。凍結）。 */
+const keyFieldDigestsOfCandidate = (candidate: DiscoveryCandidate): readonly string[] => {
+  const probe = writeProbeOf(candidate);
+  return Object.freeze(probe === null ? [] : [apiKeyFieldsDigestOf(probe.shapeDigest, scenarioApiKeyFieldsOfProbe(probe))]);
+};
+
+/**
+ * 候補の型にした識別の digest の一覧（T31e の form の digest と、T41a の form のない候補の画面の path を型にした digest。印が違うので互いに当たらない。
+ * form のない候補は form の digest を持たないので、上限 `MAX_RECORD_ID_SEGMENT_PAIRS` を超えない。並べて重なりなし。凍結）。
+ */
+const templatedDigestsOfCandidate = (candidate: DiscoveryCandidate): readonly string[] => {
+  const page = pagePathTemplatedIdentityDigestOf(candidate);
+  const form = templatedIdentityDigestsOf(candidate, (value) => usableRecordIdOf(value) !== null);
+  return page === null ? form : sortedFrozen([...new Set([...form, page])]);
+};
+
+/**
  * 候補から、索引の 1 件の入力を作る（純粋。項目を選んで写す。値・トークン・label・ボタンの文言・欄の名前は写さない）。T31e: 型にした識別の digest の
- * 一覧を、候補の全体から求める（区切りの値が登録の ID の形 `usableRecordIdOf` に合う組だけ。digest だけを写す）。
+ * 一覧を、候補の全体から求める（区切りの値が登録の ID の形 `usableRecordIdOf` に合う組だけ。digest だけを写す）。T38d: 型の digest の一覧は、
+ * `inputFields` を持つ probe の型の digest（型がなければ空）。`inputFields` のない probe（T38a の前の成果物）と probe のない候補は空（型を持たない）。
  */
 export const discoveryIndexEntryOf = (candidate: DiscoveryCandidate): DiscoveryIndexEntry => Object.freeze({
   identityDigest: candidate.identityDigest,
@@ -393,7 +541,9 @@ export const discoveryIndexEntryOf = (candidate: DiscoveryCandidate): DiscoveryI
   formMethod: candidate.formMethod,
   methodOverride: candidate.methodOverride,
   hasStateField: candidate.hasStateField,
-  templatedIdentityDigests: templatedIdentityDigestsOf(candidate, (value) => usableRecordIdOf(value) !== null),
+  templatedIdentityDigests: templatedDigestsOfCandidate(candidate),
+  shapeDigests: shapeDigestsOfCandidate(candidate),
+  keyFieldDigests: keyFieldDigestsOfCandidate(candidate),
 });
 
 /**
@@ -435,6 +585,8 @@ const viewOf = (row: CandidateRow, latestJobId: string, latestReadPaths: Readonl
     methodOverride: row.method_override,
     hasStateField: row.has_state_field === SQL_TRUE,
     templatedIdentityDigests: templatedIdentityDigestsOfRow(row),
+    shapeDigests: shapeDigestsOfRow(row),
+    keyFieldDigests: keyFieldDigestsOfRow(row),
     firstSeenJobId: row.first_seen_job_id,
     firstSeenAt: row.first_seen_at,
     lastSeenJobId: row.last_seen_job_id,

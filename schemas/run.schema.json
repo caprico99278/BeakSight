@@ -62,7 +62,8 @@
               "STOPPED_BY_SAFETY_VIOLATION",
               "STOPPED_BY_SITE_UNAVAILABLE",
               "INTERRUPTED_ABNORMALLY",
-              "STOPPED_BY_AUTH_SESSION_LOST"
+              "STOPPED_BY_AUTH_SESSION_LOST",
+              "STOPPED_BY_SERVICE_REQUEST_LIMIT"
             ]
           }
         }
@@ -185,7 +186,11 @@
             "performance": { "type": "boolean" },
             "accessibility": { "type": "boolean" },
             "interactions": { "type": "boolean" },
-            "screenshots": { "type": "boolean" }
+            "screenshots": { "type": "boolean" },
+            "sendPolicy": {
+              "description": "AS-b: the audit send policy (the value list is owned by src/core/audit-send-policy.ts). Optional: a Run written before AS-b does not have it and is read as READ_ONLY.",
+              "enum": ["READ_ONLY", "PASS_EXCEPT_DELETE"]
+            }
           }
         },
         "output": {
@@ -228,14 +233,40 @@
         "invariantViolationCount": { "type": "integer", "minimum": 0 },
         "invariantViolations": {
           "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["code", "message"],
-            "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
-          }
+          "items": { "$ref": "#/$defs/invariantViolation" }
         },
-        "recordTruncated": { "type": "boolean" }
+        "recordTruncated": { "type": "boolean" },
+        "auditSend": {
+          "description": "AS-b (audit send policy design 2.3): the effective audit send policy and the number of non-read requests the Guard let through (in total and by method; no value). Optional: a Run written before AS-b does not have it and is read as READ_ONLY.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "passedRequests", "passedRequestsByMethod"],
+          "properties": {
+            "policy": { "$ref": "#/properties/effectiveConfig/properties/audit/properties/sendPolicy" },
+            "passedRequests": { "type": "integer", "minimum": 0 },
+            "passedRequestsByMethod": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+            "passedOtherOriginRequests": {
+              "description": "AS-c: the passed requests to another Origin (neither an allowed Origin nor an approved service Origin). Absent before AS-c (read as 0).",
+              "type": "integer",
+              "minimum": 0
+            },
+            "passedWebSockets": {
+              "description": "AS-c: the passed WebSocket connections. AS-c fix round 1: counted from the connections the browser opened. Absent before AS-c (read as 0).",
+              "type": "integer",
+              "minimum": 0
+            },
+            "passedWebSocketsOutsideGuard": {
+              "description": "AS-c fix round 1: of them, the connections opened without the Guard route (a page script bypassed the WebSocket mock, or a Worker). Absent before AS-c fix round 1 (read as 0).",
+              "type": "integer",
+              "minimum": 0
+            },
+            "passedDangerousWebSockets": {
+              "description": "AS-c fix round 1: of them, the connections whose URL hits a dangerous term. Absent before AS-c fix round 1 (read as 0).",
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
       }
     },
     "unverifiedInteractionCount": { "type": "integer", "minimum": 0 },
@@ -269,6 +300,20 @@
       }
     },
     "incompleteReasons": { "type": "array", "items": { "$ref": "#/$defs/incompleteReason" } },
+    "pageIncompleteReasonCounts": {
+      "description": "Optional (T44c; Task 44 design P1-4): for each incomplete reason of the audited pages (not SKIPPED; the page and viewport reasons, once per page), the number of the pages with it, in the order of the reason codes. Absent when no page has a reason, and in the documents of the earlier writers (the version stays 1.0).",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "pages"],
+        "properties": {
+          "code": { "$ref": "#/$defs/incompleteReason/properties/code" },
+          "pages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+        }
+      }
+    },
     "load": {
       "type": "object",
       "additionalProperties": false,
@@ -288,6 +333,51 @@
             "servedFromCache": { "type": "integer", "minimum": 0 },
             "withheldOtherOrigins": { "type": "integer", "minimum": 0 }
           }
+        },
+        "approvedServiceOrigins": { "$ref": "#/$defs/loadOriginRequests" }
+      }
+    },
+    "authentication": {
+      "description": "Optional (T35a; Task 35 design 3.7; DEF-138): the counts of the audit stage of a script login audit (counts only), and the evidence of the session loss (sessionLoss; paths without values; never a whole URL, a query value, a token or a cookie value) when this execution stopped by AUTH_SESSION_LOST. A script login audit has the counts; a form navigation login audit that stopped by a session loss has the evidence only. The public audit does not have it.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registeredReadRequestsAllowed": { "type": "integer", "minimum": 0 },
+        "tokenRefreshBlocked": { "type": "integer", "minimum": 0 },
+        "otherNonReadBlocked": { "type": "integer", "minimum": 0 },
+        "serviceUnauthorizedResponses": { "type": "integer", "minimum": 0 },
+        "serviceRequestLimitReached": { "type": "boolean" },
+        "allowedOriginDataRequestsBlocked": {
+          "description": "Optional (T37R-fix-B2; Task 37 design 8): the fetch and xhr non-read requests to the allowed origins that were blocked. Recorded only; not used to decide a page that could not be drawn. Absent in the artifacts of the earlier writers.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "serviceRequestPacingWaits": { "$ref": "#/$defs/auditStageCounts/properties/serviceRequestPacingWaits" },
+        "serviceRequestPacingWaitMs": { "$ref": "#/$defs/auditStageCounts/properties/serviceRequestPacingWaitMs" },
+        "sessionLoss": { "$ref": "#/$defs/sessionLoss" }
+      },
+      "if": { "required": ["registeredReadRequestsAllowed"], "properties": { "registeredReadRequestsAllowed": {} } },
+      "then": {
+        "required": ["registeredReadRequestsAllowed", "tokenRefreshBlocked", "otherNonReadBlocked", "serviceUnauthorizedResponses", "serviceRequestLimitReached"],
+        "properties": {
+          "registeredReadRequestsAllowed": {},
+          "tokenRefreshBlocked": {},
+          "otherNonReadBlocked": {},
+          "serviceUnauthorizedResponses": {},
+          "serviceRequestLimitReached": {}
+        }
+      },
+      "else": {
+        "required": ["sessionLoss"],
+        "properties": {
+          "sessionLoss": {},
+          "tokenRefreshBlocked": false,
+          "otherNonReadBlocked": false,
+          "serviceUnauthorizedResponses": false,
+          "serviceRequestLimitReached": false,
+          "allowedOriginDataRequestsBlocked": false,
+          "serviceRequestPacingWaits": false,
+          "serviceRequestPacingWaitMs": false
         }
       }
     }
@@ -314,6 +404,8 @@
             "LAYOUT_COMPARISON_LIMIT_REACHED",
             "RESOURCE_LIMIT_REACHED",
             "INVALID_BROWSER_DATA",
+            "PAGE_NAVIGATION_LIMIT_REACHED",
+            "PAGE_SUBRESOURCE_LIMIT_REACHED",
             "PREFLIGHT_FAILED",
             "RUN_DIRECTORY_UNAVAILABLE",
             "SAFETY_INVARIANT_VIOLATION",
@@ -337,7 +429,8 @@
             "CHECKPOINT_WRITE_FAILED",
             "RUN_INTERRUPTED",
             "SITE_UNAVAILABLE",
-            "AUTH_SESSION_LOST"
+            "AUTH_SESSION_LOST",
+            "SERVICE_REQUEST_LIMIT_REACHED"
           ]
         },
         "detail": { "type": ["string", "null"] }
@@ -370,6 +463,184 @@
       "properties": {
         "width": { "type": "integer", "minimum": 1 },
         "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "invariantViolation": {
+      "description": "One invariant violation of the Safety Ledger (CC-015; the shape is owned by SafetyInvariantViolationSummary in src/core/contracts.ts). DEF-144: request is optional; it is the request the violation is tied to (the method, the canonical Origin or null, and the path; never the query, the fragment, a body or a value).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["method", "origin", "path"],
+          "properties": {
+            "method": { "type": "string", "maxLength": 32 },
+            "origin": { "anyOf": [{ "type": "string", "maxLength": 2048 }, { "type": "null" }] },
+            "path": { "type": "string", "maxLength": 2048 }
+          }
+        }
+      }
+    },
+    "jobSafetyViolation": {
+      "description": "DEF-144: the safety violation of a discovery or READ check job (discovery.json, read-evidence.json and the FINISHED summary of the worker). The list, the count and the truncation are the same shape as the safety summary of run.json (summarizePageSafety). The stage where the violation was first seen, the path of the page (no query, no value) and, in the submission probe, the pressed candidate (the words of the submit button and the identity digest). The messages are one line, with the query values of the absolute URLs redacted. The shape and the limits are owned by src/safety/job-safety-violation.ts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pagePath", "stage", "press", "invariantViolationCount", "invariantViolations", "recordTruncated"],
+      "properties": {
+        "pagePath": { "type": "string", "maxLength": 2048 },
+        "stage": { "enum": ["CONTEXT_OPEN", "PAGE_LOAD", "SUBMISSION_PROBE", "CONTEXT_CLOSE"] },
+        "press": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["submitterWords", "identityDigest"],
+              "properties": {
+                "submitterWords": { "$ref": "urn:beaksight:schema:control:candidate:1#/properties/submitterWords" },
+                "identityDigest": { "$ref": "urn:beaksight:schema:control:candidate:1#/properties/identityDigest" }
+              }
+            }
+          ]
+        },
+        "invariantViolationCount": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "invariantViolations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/invariantViolation" },
+              { "type": "object", "properties": { "message": { "type": "string", "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f\\u007f\\u2028\\u2029]*$" } } }
+            ]
+          }
+        },
+        "recordTruncated": { "type": "boolean" }
+      }
+    },
+    "auditStageCounts": {
+      "description": "The counts of the audit stage (T35a; T37a): the same counts as authentication of run.json, without the evidence of the session loss. Used by discovery.json, read-evidence.json and the worker messages. Counts only; never a URL or a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registeredReadRequestsAllowed", "tokenRefreshBlocked", "otherNonReadBlocked", "serviceUnauthorizedResponses", "serviceRequestLimitReached"],
+      "properties": {
+        "registeredReadRequestsAllowed": { "type": "integer", "minimum": 0 },
+        "tokenRefreshBlocked": { "type": "integer", "minimum": 0 },
+        "otherNonReadBlocked": { "type": "integer", "minimum": 0 },
+        "serviceUnauthorizedResponses": { "type": "integer", "minimum": 0 },
+        "serviceRequestLimitReached": { "type": "boolean" },
+        "allowedOriginDataRequestsBlocked": { "type": "integer", "minimum": 0 },
+        "serviceRequestPacingWaits": {
+          "description": "Optional (DEF-141; the service request pacing design 2.2): the times the audit waited before the next load by the per minute limit of the requests to the approved service origins. Absent in the artifacts of the earlier writers.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "serviceRequestPacingWaitMs": {
+          "description": "Optional (DEF-141): the total milliseconds of those waits. Absent in the artifacts of the earlier writers.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "sessionLossOriginKind": {
+      "description": "DEF-138: the kind of an origin (an allowed origin, an approved service origin, or another origin). The origin itself is not recorded.",
+      "enum": ["ALLOWED", "SERVICE", "OTHER"]
+    },
+    "sessionLossPath": {
+      "description": "DEF-138: a path notation (the path with the value-like segments redacted, and the query names only after ?; never a query value).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "sessionLoss": {
+      "description": "DEF-138 (the session loss evidence design 2.1): the evidence of the load where the session was lost. Never a whole URL, a query value, a token, a cookie value, a body or a header value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "requestedPath", "landedPath", "landedBy", "redirectPaths", "redirectPathsOmitted", "blockedRequests", "blockedRequestsUnlisted", "storageKeyChange"],
+      "properties": {
+        "stage": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+        "requestedPath": { "anyOf": [{ "$ref": "#/$defs/sessionLossPath" }, { "type": "null" }] },
+        "landedPath": { "anyOf": [{ "$ref": "#/$defs/sessionLossPath" }, { "type": "null" }] },
+        "landedBy": { "enum": ["PAGE_URL", "BLOCKED_REDIRECT"] },
+        "redirectPaths": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["originKind", "path"],
+            "properties": {
+              "originKind": { "$ref": "#/$defs/sessionLossOriginKind" },
+              "path": { "$ref": "#/$defs/sessionLossPath" }
+            }
+          }
+        },
+        "redirectPathsOmitted": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "blockedRequests": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "originKind", "path", "reason", "count"],
+            "properties": {
+              "method": { "type": "string", "minLength": 1, "maxLength": 32 },
+              "originKind": { "$ref": "#/$defs/sessionLossOriginKind" },
+              "path": { "$ref": "#/$defs/sessionLossPath" },
+              "reason": {
+                "enum": [
+                  "NON_READ_METHOD",
+                  "SERVICE_REQUEST_LIMIT_REACHED",
+                  "SERVICE_ORIGIN_REVISIT",
+                  "PAGE_NAVIGATION_LIMIT_REACHED",
+                  "PAGE_SUBRESOURCE_LIMIT_REACHED",
+                  "AUDIT_SEND_OVER_LIMIT",
+                  "PAGE_LEAVE_REQUEST_LIMIT_REACHED",
+                  "EXTERNAL_MAIN_FRAME_NAVIGATION",
+                  "AUDIT_EXCLUDED_URL"
+                ]
+              },
+              "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+            }
+          }
+        },
+        "blockedRequestsUnlisted": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "storageKeyChange": {
+          "anyOf": [
+            {
+              "type": "array",
+              "maxItems": 18,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["storage", "originKind", "change", "count", "shapes"],
+                "properties": {
+                  "storage": { "enum": ["LOCAL_STORAGE", "COOKIE", "INDEXED_DB"] },
+                  "originKind": { "$ref": "#/$defs/sessionLossOriginKind" },
+                  "change": { "enum": ["REMOVED", "ADDED"] },
+                  "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+                  "shapes": {
+                    "type": "array",
+                    "maxItems": 4,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["prefix", "suffix"],
+                      "properties": {
+                        "prefix": { "type": "string", "maxLength": 65 },
+                        "suffix": { "type": "string", "maxLength": 65 }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
       }
     }
   }

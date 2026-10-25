@@ -7,24 +7,79 @@
  *   `EXCLUSIONS` に理由を付けて置く（除外の一覧は、このファイルの中の 1 か所だけ）。
  * - (b) owner は import を持たない（純粋な定義と関数だけ）。そのため、`src/control/`（`control-boundary.test.ts` の (b)）、
  *   `src/discovery/`（`discovery-boundary.test.ts`）、`src/safety/` のどこからも、たどった先に禁止の対象が現れずに import できる。
- * - (c) 元の場所（`auth-setup-contracts.ts`、`auth-setup-policy.ts`、`redact.ts`）は、owner から import する。
+ * - (c) 元の場所（`auth-setup-policy.ts`、`redact.ts`）は、owner から import する。
+ * - (d) PRE42-CC 組 Z（LG-4F の発見）: 認証の設定の契約（`auth-setup-contracts.ts`）は、owner の名前を公開し直さない（呼び出し側は owner から
+ *   読む）。`export { … } from '…/core/secret-query-names.js'`・`export * from …`・import した名前の `export { … }` を数える。まだ公開し直す
+ *   ファイル（`redact.ts`）は、理由を付けて `SECRET_NAME_REEXPORT_EXCEPTIONS` に置く（使われない除外は落とす）。
  * - `src/**` の読み込みは、このファイルの読み込み時に 1 回だけ行う。判定は、`fs`、正規表現、文字列の走査だけで行う（AST・TypeScript の
  *   コンパイラ API・外部ツール・子プロセス・`dist/` を使わない）。近似の検査である（テンプレートのリテラルは数えない）。
  */
 import { describe, expect, it } from 'vitest';
-import { findImportSpecifiers, findModuleSpecifiers, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import {
+  exportedNamesOf,
+  findImportSpecifiers,
+  findModuleReferences,
+  findModuleSpecifiers,
+  judgeWithFileExceptions,
+  loadSourceFiles,
+  scanSource,
+  sourceFileAt,
+  unusedExclusionsOf,
+  type FileExceptions,
+  type ScannedSource,
+  type SourceFile,
+} from './source-scan.js';
 
 const SOURCE_FILES = loadSourceFiles();
 
 /** 秘密に見える名前の方針の owner。 */
 const SECRET_NAME_POLICY_OWNER = 'src/core/secret-query-names.ts';
 
-/** owner から import する、元の場所（今の名前のまま公開し直すか、判定を使う）。 */
+/** owner から import する、元の場所（判定を使うか、今の名前のまま公開し直す）。 */
 const SECRET_NAME_POLICY_USERS: readonly string[] = [
-  'src/control/auth/auth-setup-contracts.ts',
   'src/control/auth/auth-setup-policy.ts',
   'src/safety/redact.ts',
 ];
+
+/** (d) owner の名前を公開し直してよいファイル（パス → 理由。件数も確かめる）。寄せたら消す。 */
+const SECRET_NAME_REEXPORT_EXCEPTIONS: FileExceptions = Object.freeze({
+  'src/safety/redact.ts': {
+    count: 1,
+    reason: '伏せ字の完全一致の一覧と比べ方（`SECRET_URL_QUERY_PARAMETER_NAMES`・`isSecretUrlQueryParameterName`）を、伏せ字の部品の名前で'
+      + '公開し直す（`authenticated-run.ts` と単体のテストが読む。組 Z の範囲の外。寄せるときに消す）',
+  },
+});
+
+/** owner が公開する名前（`export const`・`export function`）。 */
+const ownerExportNamesOf = (owner: ScannedSource): readonly string[] =>
+  [...owner.bare.matchAll(/\bexport\s+(?:const|function)\s+([\w$]+)/gu)].map((match) => match[1] ?? '');
+
+/** owner の指定子の終わり。 */
+const OWNER_SPECIFIER_SUFFIX = '/core/secret-query-names.js';
+
+/**
+ * (d) owner の名前の公開し直し（`<見つけた形>`）。指定子の取り出しは `source-scan.ts` の共通の補助（CCX-9）。
+ * - owner からの `export … from`（`export { … } from`・`export * from`）: `export <節> from '<指定子>'`。
+ * - それ以外の公開（`from` のない `export { … }`、`export const`）の名前が owner の名前: `export <名前>`。
+ */
+const findSecretNameReexports = (source: ScannedSource, ownerNames: readonly string[]): readonly string[] => {
+  const fromOwner = findModuleReferences(source.code)
+    .filter((reference) => reference.form === 'static' && reference.statement?.keyword === 'export' && reference.specifier.endsWith(OWNER_SPECIFIER_SUFFIX));
+  // `exportedNamesOf` は `from` のある公開の名前も数えるので、owner からの `export … from` の名前を、書いた数だけ引く。
+  const viaFrom = fromOwner.flatMap((reference) => reference.namedBindings.map((binding) => binding.split(/\s+as\s+/u).at(-1)?.trim() ?? ''));
+  const others = exportedNamesOf(source.code).filter((name) => {
+    const index = viaFrom.indexOf(name);
+    if (index >= 0) {
+      viaFrom.splice(index, 1);
+      return false;
+    }
+    return ownerNames.includes(name);
+  });
+  return [
+    ...fromOwner.map((reference) => `export ${reference.statement?.clause ?? ''} from '${reference.specifier}'`.replace(/\s+/gu, ' ')),
+    ...others.map((name) => `export ${name}`),
+  ];
+};
 
 /** 一つの並びに、秘密に見える語がこの数以上あれば、秘密に見える名前の一覧とみなす。 */
 const MIN_SECRET_LIKE_ELEMENTS = 2;
@@ -97,11 +152,7 @@ const EXCLUSIONS: ReadonlyMap<string, string> = new Map([
 
 const detects = (line: string): readonly string[] => findSecretLikeNameLists(scanSource(line));
 
-const sourceFile = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  expect(file, path).toBeDefined();
-  return file ?? { path, content: '', ...scanSource('') };
-};
+const sourceFile = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 describe('secret-like name policies detector (CCX-4)', () => {
   it('detects arrays of two or more secret-like names', () => {
@@ -117,6 +168,27 @@ describe('secret-like name policies detector (CCX-4)', () => {
     expect(detects("// ['token', 'password']\nconst A = 1;")).toEqual([]);
     expect(detects("const A = 'token';\nconst B = 'password';")).toEqual([]);
   });
+
+  it('(d) detects re-exports of the owner names, and ignores other exports and comments (PRE42-CC group Z)', () => {
+    const ownerNames = ['SECRET_LIKE_QUERY_NAME_WORDS', 'isSecretLikeQueryName'];
+    const source = scanSource([
+      "export { SECRET_LIKE_QUERY_NAME_WORDS } from '../../core/secret-query-names.js';",
+      "export {\n  isSecretLikeQueryName as isSecret,\n} from '../core/secret-query-names.js';",
+      "export * from '../core/secret-query-names.js';",
+      'export { SECRET_LIKE_QUERY_NAME_WORDS, OTHER };',
+      // 当たらない: ほかの owner からの公開し直し、owner の名前を含まない export、import、コメント。
+      "export { MAX_URL_LENGTH } from '../../core/limits.js';",
+      'export { OTHER };',
+      "import { SECRET_LIKE_QUERY_NAME_WORDS } from '../../core/secret-query-names.js';",
+      "// export { SECRET_LIKE_QUERY_NAME_WORDS } from '../../core/secret-query-names.js';",
+    ].join('\n'));
+    expect(findSecretNameReexports(source, ownerNames)).toEqual([
+      "export { SECRET_LIKE_QUERY_NAME_WORDS } from '../../core/secret-query-names.js'",
+      "export { isSecretLikeQueryName as isSecret, } from '../core/secret-query-names.js'",
+      "export * from '../core/secret-query-names.js'",
+      'export SECRET_LIKE_QUERY_NAME_WORDS',
+    ]);
+  });
 });
 
 describe('secret-like name policies Gate (CCX-4)', () => {
@@ -124,9 +196,7 @@ describe('secret-like name policies Gate (CCX-4)', () => {
     const detections = SOURCE_FILES
       .filter((file) => file.path !== SECRET_NAME_POLICY_OWNER)
       .flatMap((file) => findSecretLikeNameLists(file).map((match) => `${file.path}: ${match}`));
-    for (const key of EXCLUSIONS.keys()) {
-      expect(detections, `除外が古くなっている: ${key}`).toContain(key);
-    }
+    expect(unusedExclusionsOf(EXCLUSIONS.keys(), detections), '除外が古くなっている').toEqual([]);
     expect(detections.filter((detection) => !EXCLUSIONS.has(detection))).toEqual([]);
     expect(findSecretLikeNameLists(sourceFile(SECRET_NAME_POLICY_OWNER)).length).toBeGreaterThan(0);
   });
@@ -141,5 +211,18 @@ describe('secret-like name policies Gate (CCX-4)', () => {
       const specifiers = findImportSpecifiers(sourceFile(path).code);
       expect(specifiers.some((specifier) => specifier.endsWith('/core/secret-query-names.js')), path).toBe(true);
     }
+  });
+
+  it('(d) no file re-exports the owner names, besides the closed exceptions; callers read the owner (PRE42-CC group Z, LG-4F)', () => {
+    const ownerNames = ownerExportNamesOf(sourceFile(SECRET_NAME_POLICY_OWNER));
+    expect(ownerNames).toContain('SECRET_LIKE_QUERY_NAME_WORDS');
+    const { found, countMismatches, unusedExceptions } = judgeWithFileExceptions(
+      SOURCE_FILES.filter((file) => file.path !== SECRET_NAME_POLICY_OWNER),
+      (file) => findSecretNameReexports(file, ownerNames),
+      SECRET_NAME_REEXPORT_EXCEPTIONS,
+    );
+    expect(found).toEqual([]);
+    expect(countMismatches).toEqual([]);
+    expect(unusedExceptions, '除外が古くなっている').toEqual([]);
   });
 });

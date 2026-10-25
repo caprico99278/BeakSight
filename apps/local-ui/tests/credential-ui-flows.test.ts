@@ -23,19 +23,19 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
 } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import {
   MAX_CREDENTIAL_VALUE_LENGTH,
+  MIN_CREDENTIAL_VALUE_LENGTH,
   credentialFilePathFor,
   resolveCredentialDirectory,
 } from '../../../src/control/credentials/credential-store.js';
 import { CONTROL_DATA_DIRECTORY_NAME } from '../../../src/control/store/database-path.js';
 import { temporaryPathFor } from '../../../src/core/temporary-file-name.js';
 import { AUTOMATED_LOGIN_RESULT_CATALOG, CREDENTIAL_ENVIRONMENT_CATALOG } from '../../../src/presentation/catalog.js';
-import { formatTimes } from '../../../src/presentation/format.js';
+import { formatCount, formatInteger, formatTimes } from '../../../src/presentation/format.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
   AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
@@ -44,6 +44,7 @@ import {
   LOCAL_UI_AUTH_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_LOGIN_CHECK_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../src/presentation/messages.js';
 import {
@@ -55,8 +56,10 @@ import {
   type AutomatedLoginOutcome,
 } from '../../../tests/helpers/automated-login-fixture.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import { MANUAL_LOGIN_STAGE_RECORD, WORKER_RECORD_FILES, installTestAutomatedLoginWorkerEntry } from './helpers/auth-worker.ts';
+import { nextStepStatesOf } from './helpers/next-steps.ts';
 import {
   createTemporaryUiRoot,
   findFreePort,
@@ -69,6 +72,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { filesUnder, leakedPlaces } from './helpers/secret-markers.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
@@ -223,7 +227,7 @@ const profileDocument = (profileId: string, auth: 'AUTOMATED_LOGIN' | 'MANUAL_SE
 
 /** fixture のログインの画面の、自動ログインの認証の設定（`origin` は、ログインの画面と送信先の Origin）。 */
 const automatedSetupOf = (profileId: string, outcome: AutomatedLoginOutcome, origin: string = site().originA): Record<string, unknown> => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${origin}${new URL(site().formUrl('standard', outcome)).pathname}${new URL(site().formUrl('standard', outcome)).search}`,
@@ -258,15 +262,13 @@ interface JobDetail {
 /** ジョブが終わるまで待つ。 */
 const waitForJobEnd = async (jobId: string): Promise<JobDetail> => {
   await recordDescendants();
-  let job: JobDetail | null = null;
-  await expect.poll(async () => {
-    job = await valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-    return job?.active;
-  }, { timeout: JOB_TIMEOUT_MS, interval: POLL_MS }).toBe(false);
-  if (job === null) {
-    throw new Error('ジョブがない');
-  }
-  return job;
+  // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助 `waitForJobViaServerFunctions`（上限と間隔は前と同じ）。
+  return waitForJobViaServerFunctions(
+    (id) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId: id }),
+    jobId,
+    (job) => !job.active,
+    { limitMs: JOB_TIMEOUT_MS, stepMs: POLL_MS },
+  );
 };
 
 /** ログインの確かめの画面から、ログインの確かめを始め（キーボードだけ）、ジョブの画面に移る。ジョブの ID を返す。 */
@@ -285,6 +287,7 @@ const waitForResultOnPage = async (page: Page, result: string): Promise<void> =>
   await snapshot(page);
 };
 
+
 /** 資格情報の画面の、欄（ラベルは完全一致）。 */
 const field = (page: Page, label: string): Locator => page.getByLabel(label, { exact: true });
 
@@ -292,8 +295,7 @@ const field = (page: Page, label: string): Locator => page.getByLabel(label, { e
 const rejectionReason = (page: Page): Promise<string | null> => page.getByTestId('credential-rejection').getAttribute('data-reason');
 
 /** fixture に届いた、GET と HEAD 以外の要求（`<method> <path>`）。 */
-const nonReadRequests = (): readonly string[] =>
-  site().requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+const nonReadRequests = (): readonly string[] => nonReadRequestsOf(site().requests);
 
 describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? '' : ` [skipped: ${SKIP_REASON}]`}`, () => {
   beforeAll(async () => {
@@ -380,6 +382,12 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await page.getByRole('button', { name: setupText.save }).click();
     await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
     await snapshot(page);
+    // T43a（Task 43 の設計書 4.1）: 保存の後に、次の手順（自動ログインなら資格情報）と、プロファイルの「次にすること」へのリンクを出す。
+    const nextLinks = page.getByTestId('next-step-links');
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.actions.CREDENTIAL }).getAttribute('href'))
+      .toBe(`/credentials/${MAIN_PROFILE}`);
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.openOverview }).getAttribute('href'))
+      .toBe(`/profiles/${MAIN_PROFILE}#next-steps`);
     const stored = await valueOf<{ stored: { setup: Record<string, unknown> } }>('getAuthSetupFn', 'GET', { profileId: MAIN_PROFILE });
     expect(stored.stored.setup).toMatchObject({
       maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -444,6 +452,24 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await snapshot(page);
     await screenshot(page, '06-credentials-mismatch');
 
+    // T36c（Task 36 の設計者の判断 2）: 欄の説明に長さの下限があり、下限より短いパスワードは拒む（値は画面に残さない）。
+    // T36R-fix（DEF-123。意図して直した期待）: 長さは単位のない整数の書式（`formatInteger`）で、「4 文字以上、256 文字まで。」の形（件数の単位を付けない）。
+    const lengthHint = credentialText.valueLengthHint(formatInteger(MIN_CREDENTIAL_VALUE_LENGTH), formatInteger(MAX_CREDENTIAL_VALUE_LENGTH));
+    expect(lengthHint).toBe(`${String(MIN_CREDENTIAL_VALUE_LENGTH)} 文字以上、${String(MAX_CREDENTIAL_VALUE_LENGTH)} 文字まで。`);
+    expect(await page.textContent('body')).toContain(lengthHint);
+    expect(await page.textContent('body')).not.toContain(
+      credentialText.valueLengthHint(formatCount(MIN_CREDENTIAL_VALUE_LENGTH), formatCount(MAX_CREDENTIAL_VALUE_LENGTH)),
+    );
+    const shortPassword = 'p'.repeat(MIN_CREDENTIAL_VALUE_LENGTH - 1);
+    await typeInto(page, username, USER_OK);
+    await typeInto(page, password, shortPassword);
+    await typeInto(page, confirmation, shortPassword);
+    await page.keyboard.press('Enter');
+    await page.getByTestId('credential-rejection').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await rejectionReason(page)).toBe('CREDENTIAL_VALUE_TOO_SHORT');
+    expect(await page.getByTestId('credential-rejection').getAttribute('data-field')).toBe('password');
+    expect([await username.inputValue(), await password.inputValue(), await confirmation.inputValue()]).toEqual(['', '', '']);
+
     await typeInto(page, username, USER_OK);
     await typeInto(page, password, PASS_OK);
     await typeInto(page, confirmation, PASS_OK);
@@ -456,6 +482,12 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await page.getByTestId('credential-hold').getAttribute('data-held')).toBe('no');
     // 止めていないときは、変更の画面に停止の解除の選択を出さない。
     expect(await page.locator('input[name="clearHold"]').count()).toBe(0);
+    // T43a: 登録の後に、次の手順（ログインの確かめ）と「次にすること」へのリンク。
+    const nextLinks = page.getByTestId('next-step-links');
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.actions.LOGIN_CHECK }).getAttribute('href'))
+      .toBe(`/login-check/${MAIN_PROFILE}`);
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.openOverview }).getAttribute('href'))
+      .toBe(`/profiles/${MAIN_PROFILE}#next-steps`);
     await snapshot(page);
     await screenshot(page, '07-credentials-registered');
   }, SCENARIO_TIMEOUT_MS);
@@ -474,10 +506,19 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await list.getByTestId('job-auto-login-submitted').getAttribute('data-submitted')).toBe('YES');
     expect(await list.getByTestId('job-auto-login-description').textContent()).toBe(AUTOMATED_LOGIN_RESULT_CATALOG.SUCCEEDED.description);
     expect(await list.getByTestId('job-artifacts-empty').count()).toBe(0);
+    // T43a: ログインの確かめの成功の後に、次の手順（監査を始める）と「次にすること」へのリンク。
+    const nextLinks = list.getByTestId('next-step-links');
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.actions.AUDIT_START }).getAttribute('href'))
+      .toBe(`/start/${MAIN_PROFILE}`);
+    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.openOverview }).getAttribute('href'))
+      .toBe(`/profiles/${MAIN_PROFILE}#next-steps`);
     await screenshot(list, '09-job-login-check-succeeded');
     expect(await waitForJobEnd(jobId)).toMatchObject({ jobKind: 'LOGIN_CHECK', autoLogin: { result: 'SUCCEEDED', submitted: 'YES' } });
     // 送ったのは、ログインの POST の 1 回だけ。
     expect(nonReadRequests().slice(postsBefore)).toEqual([`POST ${site().authPath('success')}`]);
+    // T43a: プロファイルの「次にすること」では、認証の設定・資格情報・ログインの確かめが済み。
+    const detail = await openPage(`/profiles/${MAIN_PROFILE}`);
+    expect(await nextStepStatesOf(detail, UI_TIMEOUT_MS)).toEqual(['DONE', 'DONE', 'DONE', 'NEEDED']);
 
     const again = await openPage(`/login-check/${MAIN_PROFILE}`);
     expect(await again.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_RATE_LIMITED');
@@ -583,6 +624,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
 
   it('asks to replace both values when the login origin changed, replaces them, and deletes the credential after the dialog', async () => {
     expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(MAIN_PROFILE, 'success', site().originB) })).toMatchObject({ ok: true });
+    // T43a: 資格情報のログインの Origin が今の認証の設定と違う（開始の確かめの `CREDENTIAL_STALE`）ので、「次にすること」の資格情報は「古い（直す）」。
+    const detail = await openPage(`/profiles/${MAIN_PROFILE}`);
+    expect((await nextStepStatesOf(detail, UI_TIMEOUT_MS))[1]).toBe('STALE');
     const page = await openPage(`/credentials/${MAIN_PROFILE}`);
     expect(await page.getByTestId('credential-origin-state').getAttribute('data-state')).toBe('stale');
     expect(await page.getByTestId('credential-replace-needed').count()).toBe(1);
@@ -903,7 +947,7 @@ describe('T26e: on a platform that is not Windows (the server judges it), and th
     })).toMatchObject({ ok: true });
     expect(await linuxCall('saveAuthSetupFn', 'POST', {
       setup: {
-        schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+        ...FORM_NAVIGATION_SETUP_ITEMS,
         profileId: LINUX_PROFILE,
         profileRevision: FIRST_REVISION,
         loginStartUrl: 'http://127.0.0.1:9/login',

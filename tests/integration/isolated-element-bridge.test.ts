@@ -28,6 +28,7 @@ import {
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { PAGE_FORGERY_KINDS, PAGE_FORGERY_SCRIPT_PATH, pageForgeryHtml, pageForgeryInstalled, pageForgeryScript, readPageHits, type PageForgeryKind } from '../helpers/page-forgery.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 
 const LAUNCHERS = [
   ['the default test Chromium', () => launchHeadlessChromium()],
@@ -64,8 +65,8 @@ const readForm = composeInPage((_R: StandardReaders, _input: null) => {
   return { value: null, elements: [form] };
 });
 
-/** 入れ替えを続けるページの確かめの回数と、その時間の上限（ms）。 */
-const SWAP_ROUNDS = 300;
+/** 入れ替えを続けるページの確かめの回数（値は `test-rounds.ts`。TS-b のふだんの組と全部の組）と、その時間の上限（ms）。 */
+const SWAP_ROUNDS = roundsOf('isolatedElementSwap');
 const SWAP_TEST_TIMEOUT_MS = 120_000;
 /** ページの JS: 的の要素 A（`#target`）と、その写し B を、MessageChannel の回しで絶えず入れ替える（同じ位置）。 */
 const SWAP_TARGET_FOREVER = (): void => {

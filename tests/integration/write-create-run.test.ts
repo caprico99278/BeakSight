@@ -26,7 +26,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { WorkerStartWrite } from '../../src/control/worker-protocol.js';
 import { ACTION_RUN_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
@@ -373,6 +373,31 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
       }
     }, TEST_TIMEOUT_MS);
 
+    // T40R-fix-A（Task 40 の設計書 7 章の T40R の I-1）: 値を入れる間は送信の窓の観察の段で、ページの JS が入力の事象で承認どおりの form の POST を出しても、
+    // Guard は通さずに止めて数える（送り手に渡さない）。押す直前の確かめ直しが拒んでも許しても、POST は届かず、押さずに `PRECHECK_FAILED`。
+    it.each<[string, (() => Promise<WorkerWriteRecheckOutcome>) | undefined]>([
+      ['the recheck rejects', () => Promise.resolve({ allowed: false, reason: 'GRANT_INVALID' })],
+      ['the recheck allows', undefined],
+    ])('does not send the form that the page script submits on the input events while values are typed (%s)', async (_label, recheck) => {
+      const run = await runWrite('js-submit-on-input', recheck);
+      expect(run.document).toMatchObject({
+        submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', httpStatus: null, recordId: null, reservationState: 'RELEASED', result: 'BLOCKED',
+      });
+      // 止めた証拠: 窓の中で、今の判定で止めた要求を数えた。
+      expect(run.report.evidence.guard?.blockedByOtherRulesInWindow ?? 0).toBeGreaterThan(0);
+    }, TEST_TIMEOUT_MS);
+
+    // T40R-fix-A2（Task 40 の設計書 7 章の「T40R-fix-A・B の報告」）: 成功の条件に当たる画面が書き込みの画面（`/members/new`）のままで、その path が ID の
+    // 型（`/members/{id}`）に当たる。押す前の画面から同じ取り方で取れた値（`new`）は ID として使わない（`RECORD_ID_NOT_FOUND`。成功と偽らない）。
+    it('does not take the value that the form page itself gives by the record id pattern before the click, and writes PARTIAL', async () => {
+      const run = await runWrite('stay-on-form');
+      expectedPosts += 1;
+      expect(run.document).toMatchObject({
+        submission: 'SENT', blockReason: null, responseJudgement: 'SUCCESS', recordId: null, reservationState: 'COMMITTED', result: 'PARTIAL',
+        reason: 'RECORD_ID_NOT_FOUND',
+      });
+    }, TEST_TIMEOUT_MS);
+
     it('DEF-098: sends the form with optional fields once, leaving the unchosen fields empty and unchecked, and writes VERIFIED', async () => {
       const run = await runWrite('success', undefined, 'optional');
       expectedPosts += 1;
@@ -542,6 +567,7 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
     expect(site.postBodies.length).toBe(expectedPosts);
     // http: 成功・結果の種類・任意の欄の 11 件と、DEF-103 の窓の 1 件、M-b の 1 件、接続が切れる回の 1 件。https: 成功と、接続が切れる回。
     // T31R-fix-1（C-1）: CSRF の hidden を書き換えた回の 1 件を足した。
-    expect(expectedPosts).toBe(tls ? 2 : 15);
+    // T40R-fix-A2: http の回に、書き込みの画面に戻る形の 1 回を足した（15 から 16）。
+    expect(expectedPosts).toBe(tls ? 2 : 16);
   }, TEST_TIMEOUT_MS);
 });

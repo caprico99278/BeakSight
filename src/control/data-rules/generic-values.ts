@@ -401,6 +401,33 @@ const assertBaseDate = (context: GenericRuleContext): void => {
 /** 基準日が `YYYY-MM-DD` のありうる日付か（T29c。生成の入口が基準日を確かめる）。 */
 export const isGenericBaseDate = (value: string): boolean => parseDay(value) !== null;
 
+/** 基準日からの幅（FM2c）を当てる欄の型（日付と日時だけ）。 */
+export const BASE_DATE_WINDOW_FIELD_TYPES = Object.freeze(['date', 'datetime-local'] as const satisfies readonly CandidateFieldType[]);
+
+/** 日時の型の、基準日からの幅の端の時刻（その日の 0 時）。 */
+const WINDOW_BOUND_TIME = '00:00';
+
+/**
+ * 基準日からの幅（FM2c。手動の操作を減らす設計書 3A.3）の、欄の型の値の範囲（純粋）: date は基準日に日の数を足した `YYYY-MM-DD`、datetime-local は
+ * その日の `T00:00`（両端を含む）。ほかの型、ありえない基準日、日の数が整数でない・始まりが終わりの後は null。
+ */
+export const baseDateWindowRangeOf = (
+  type: CandidateFieldType,
+  baseDate: string,
+  window: { readonly fromDays: number; readonly toDays: number },
+): { readonly min: string; readonly max: string } | null => {
+  const base = parseDay(baseDate);
+  if (base === null || !(BASE_DATE_WINDOW_FIELD_TYPES as readonly CandidateFieldType[]).includes(type)
+    || !Number.isSafeInteger(window.fromDays) || !Number.isSafeInteger(window.toDays) || window.fromDays > window.toDays) {
+    return null;
+  }
+  const from = formatDay(base + window.fromDays);
+  const to = formatDay(base + window.toDays);
+  return type === 'date'
+    ? Object.freeze({ min: from, max: to })
+    : Object.freeze({ min: `${from}${DATE_TIME_SEPARATOR}${WINDOW_BOUND_TIME}`, max: `${to}${DATE_TIME_SEPARATOR}${WINDOW_BOUND_TIME}` });
+};
+
 const planOf = (field: CandidateField): SpacePlan => {
   const { type, constraints, options } = field;
   if (!isGenericRuleFieldType(type)) {

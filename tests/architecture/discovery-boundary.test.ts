@@ -46,10 +46,16 @@ import { describe, expect, it } from 'vitest';
 import {
   PLAYWRIGHT_PACKAGE_PATTERN,
   findTransitiveForbiddenReferences,
+  isPathUnderAny,
   loadSourceFiles,
   moduleReferenceCandidatesOf,
+  modulePattern,
+  nodeModuleTextPattern,
+  pathReferenceCandidatesOf,
   resolveRelativeSpecifier,
   scanSource,
+  sourceFileOf,
+  sourcePathsInText,
   withoutModuleExtension,
   type ScannedSource,
 } from './source-scan.js';
@@ -68,6 +74,14 @@ const PURE_DISCOVERY_FILES: readonly string[] = [
   'src/discovery/discovery-result.ts',
   // T27e（設計書 4.5）: READ の確かめの候補の確かめ・URL の組み立て・照合・成果物 `read-evidence.json` の形（純粋。ワーカーとジョブの管理から使う）。
   'src/discovery/read-check-evaluation.ts',
+  // T37b（Task 37 の設計書 3.3、3.4）: 送らずに観察した型の分類と、型の digest（純粋。ページを操作しない）。
+  'src/discovery/api-shape-classification.ts',
+  // T37c（Task 37 の設計書 3.2、3.4）: 送らずに観察する probe の契約（対象の選び方、目印、結果の形。純粋。押す部品は `src/interaction/submission-probe.ts`）。
+  'src/discovery/submission-probe-contracts.ts',
+  // T43c（Task 43 の設計書 4.3）: 入口の確かめの、一意な CSS の組み立て（純粋。ページを操作しない・読まない）。
+  'src/discovery/entry-check-selectors.ts',
+  // T43d（Task 43 の設計書 4.4）: ログインの段で観察したことの記録の形（query の名前、鍵の名前の差分、成功の画面のセレクタの案の選び方。純粋）。
+  'src/discovery/login-observation.ts',
 ];
 
 /** (v): 発見のブラウザの部品（T27b）。純粋な部品の一覧には含めない。 */
@@ -81,6 +95,8 @@ const BROWSER_DISCOVERY_FILES: readonly string[] = [
   // DEF-087: CDP の session の開け閉めの共通の部品と、isolated world の読み取り。
   'src/discovery/cdp-session.ts',
   'src/discovery/isolated-read.ts',
+  // T38a: CSS の当たる数の数え方（入口の確かめ、ログインの段の観察、送らずに観察する probe の欄の CSS が共有する。isolated world で動かす読み取り）。
+  'src/discovery/selector-count.ts',
 ];
 
 /** (e)・(c)（DEF-087）: isolated world の読み取りの部品と、CDP の session の共通の部品。 */
@@ -98,6 +114,14 @@ const ISOLATED_READ_CALLER_FILES: readonly string[] = [
   'src/browser/login-form-submitter.ts',
   'src/browser/write-form-submitter.ts',
   'src/interaction/discover-candidates.ts',
+  // T37c（Task 37 の設計書 3.2）: 送らずに観察する probe の押す部品（押す前の読み直しと、候補の範囲の欄の読み取り。読み取りは isolated world の部品だけ）。
+  'src/interaction/submission-probe.ts',
+  // T39d（Task 39 の設計書 3.5）: API のシナリオの書き込みの入力の前の確かめと値の読み直し（読み取りは isolated world の部品だけ）。
+  'src/browser/api-write-submitter.ts',
+  // T43c（Task 43 の設計書 4.3）: 入口の確かめのログインの画面の読み取り（案を作るために読む。読み取りは isolated world の部品だけ）。
+  'src/worker/entry-check-page.ts',
+  // T43d（Task 43 の設計書 4.4）: ログインの段の観察（鍵の名前と、成功の画面のセレクタの案を作るために読む。読み取りは isolated world の部品だけ）。
+  'src/worker/login-stage-observation.ts',
 ];
 
 /** (v): 発見の部品のフォルダ。 */
@@ -111,6 +135,11 @@ const PAGE_RECEIVING_WORKER_FILES: readonly string[] = [
   'src/worker/discovery-run.ts',
   'src/worker/read-check-run.ts',
   'src/worker/worker-run-session.ts',
+  // T43c: 入口の確かめのジョブの流れと、ログインの画面の読み取り。
+  'src/worker/entry-check-run.ts',
+  'src/worker/entry-check-page.ts',
+  // T43d: ログインの段の観察（ページを操作しない）。
+  'src/worker/login-stage-observation.ts',
 ];
 
 /** (w) の対象のファイルか（`src/discovery/` のファイルと、page を受け取るワーカーの流れ）。 */
@@ -162,8 +191,20 @@ const NON_LITERAL_SEND = /\.\s*send\s*\(\s*(?![\s'"`])/gu;
 /** (c): CDP の session を開く呼び出し（`bare` から）。 */
 const NEW_CDP_SESSION = /\bnewCDPSession\b/gu;
 
-/** (x): 読み込まない Node の部品（`node:` の有無を問わない。下の部分も含む）。`node:crypto` は許す。 */
-const FORBIDDEN_NODE_MODULE = /^(?:node:)?(?:fs|child_process|sqlite|net|http|https|http2|dgram|worker_threads|cluster|vm|inspector)(?:\/|$)/u;
+/** (x): 読み込まない Node の部品の名前。`node:crypto` は許す。 */
+const FORBIDDEN_NODE_MODULE_NAMES: readonly string[] = [
+  'fs', 'child_process', 'sqlite', 'net', 'http', 'https', 'http2', 'dgram', 'worker_threads', 'cluster', 'vm', 'inspector',
+];
+/**
+ * (x): 読み込まない Node の部品（`node:` の有無を問わない。下の部分も含む。文字列の中の `node:<名前>` も当てる。`source-scan.ts` の
+ * `modulePattern`。PRE42-CC 組 G）。
+ */
+const FORBIDDEN_NODE_MODULE = modulePattern(FORBIDDEN_NODE_MODULE_NAMES);
+/**
+ * (x): 参照の候補に足す文字列リテラル（`node:` の付いた名前だけ。付けない短い名前（`'fs'`）の文字列は、ほかの意味の語と見分けられないので
+ * 候補にしない。指定子は、付けない名前も見る）。
+ */
+const FORBIDDEN_NODE_MODULE_TEXT = nodeModuleTextPattern(FORBIDDEN_NODE_MODULE_NAMES);
 /** (x): 読み込まない `src/` のフォルダ。 */
 const FORBIDDEN_DIRECTORIES: readonly string[] = [
   'src/browser/', 'src/safety/', 'src/orchestration/', 'src/evidence/', 'src/interaction/', 'src/control/', 'src/worker/',
@@ -173,17 +214,20 @@ const FORBIDDEN_DIRECTORIES: readonly string[] = [
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 指定子（相対でないもの）が、禁止のパッケージか Node の部品か。 */
-const isForbiddenPackage = (specifier: string): boolean =>
-  PLAYWRIGHT_PACKAGE_PATTERN.test(specifier) || FORBIDDEN_NODE_MODULE.test(specifier) || /(?:^|\/)src\/(?:browser|safety|orchestration|evidence|interaction|control|worker)(?:\/|$)/u.test(specifier);
-
 /** リポジトリの根からのパスが、禁止のフォルダか、発見のブラウザの部品（T27b。拡張子を問わない）か。 */
-const isForbiddenPath = (path: string): boolean => FORBIDDEN_DIRECTORIES.some((directory) => `${path}/`.startsWith(directory))
+const isForbiddenPath = (path: string): boolean => isPathUnderAny(path, FORBIDDEN_DIRECTORIES)
   || BROWSER_DISCOVERY_FILES.includes(`${withoutModuleExtension(path)}.ts`);
 
-/** 直接の参照の違反（指定子のすべてと、相対パスの文字列リテラル。型だけの import も数える）。 */
+/**
+ * 指定子か文字列（相対でないもの）が、禁止のパッケージか Node の部品か、文字列の中の `src/` からのパスが禁止の対象か（`source-scan.ts` の
+ * `sourcePathsInText`。PRE42-CC 組 G で最も広い形にそろえた）。
+ */
+const isForbiddenPackage = (specifier: string): boolean =>
+  PLAYWRIGHT_PACKAGE_PATTERN.test(specifier) || FORBIDDEN_NODE_MODULE.test(specifier) || sourcePathsInText(specifier).some(isForbiddenPath);
+
+/** 直接の参照の違反（指定子のすべてと、相対パス・`src/` のパス・`node:` の付いた禁止の部品の名前の文字列リテラル。型だけの import も数える）。 */
 const findDirectViolations = (path: string, source: ScannedSource): readonly string[] =>
-  moduleReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => {
+  pathReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN, FORBIDDEN_NODE_MODULE_TEXT]).filter((text) => {
   const resolved = resolveRelativeSpecifier(path, text);
   return resolved === null ? isForbiddenPackage(text) : isForbiddenPath(resolved);
 });
@@ -288,6 +332,9 @@ describe('Discovery boundary detectors', () => {
       "import type { WorkerMessage } from '../worker/protocol.js';",
       "const policy = await import('../safety/request-policy.js');",
       "const directory = '../control/';",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスと、`node:` の付いた名前の文字列リテラルも見る。
+      "const entry = 'beaksight/src/safety/request-policy.js';",
+      "const module = 'node:fs/promises';",
     ]) {
       expect(findDirectViolations(path, scanSource(line)), line).toHaveLength(1);
     }
@@ -403,7 +450,7 @@ describe('Discovery boundary detectors', () => {
       'src/discovery/probe.ts',
       'src/worker/audit-worker.ts',
       'src/browser/login-form-submitter.ts',
-    ].map((path) => ({ path, ...scanSource(violation) }));
+    ].map((path) => sourceFileOf(path, violation));
     expect(findPageOperationViolations(files)).toEqual([
       'src/worker/discovery-run.ts: .click(',
       'src/worker/read-check-run.ts: .click(',

@@ -5,13 +5,13 @@
  * 例の値は、匿名の値（`example.invalid`）だけを使う。子の process もブラウザも使わない。
  */
 import { describe, expect, it } from 'vitest';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
+import {  AUTH_SETUP_SCHEMA_VERSION_3,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   MAX_LOGIN_ATTEMPTS,
   MAX_SUCCESS_SELECTOR_LENGTH,
   type AuthSetup,
 } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { validateAuthSetup } from '../../../src/control/auth/auth-setup-policy.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile, type ValidatedSiteProfile } from '../../../src/control/contracts.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../../src/control/profile-policy.js';
@@ -46,7 +46,7 @@ const profileOf = (input: SiteProfile): ValidatedSiteProfile => {
 };
 
 const validSetup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: profileInput.profileId,
   profileRevision: profileInput.revision,
   loginStartUrl: `${TEST_ORIGIN}/login`,
@@ -274,5 +274,157 @@ describe('T26e: the automated login errors are split by the form fields', () => 
     expect(automatedViewsOf({ ...automatedSetup, automatedLogin: null })).toEqual([
       { code: 'AUTH_SETUP_AUTOMATED_LOGIN_REQUIRED', field: null, line: null },
     ]);
+  });
+});
+
+// T34d（Task 34 の設計書 3.2、3.6）: 版 3（スクリプトで送るログイン）の誤りも、検証の owner が付ける位置で、画面の欄と行に分ける。
+const SERVICE_ORIGIN = 'https://service.example.invalid';
+const serviceProfileInput = { ...profileInput, approvedServiceOrigins: [SERVICE_ORIGIN] } satisfies SiteProfile;
+const validScriptSetup = {
+  ...validSetup,
+  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+  loginPostEndpoints: [],
+  loginTransport: 'SCRIPT_REQUEST',
+  scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+  loginSideRequests: [{ origin: SERVICE_ORIGIN, path: '/functions/v1/sync', method: 'POST', maxPerLoginStage: 1 }],
+  successStorageKey: { origin: TEST_ORIGIN, prefix: 'app-', suffix: '-auth-token' },
+} satisfies AuthSetup;
+const withScriptSetup = (overrides: Record<string, unknown>): Record<string, unknown> => ({ ...validScriptSetup, ...overrides });
+const scriptViewsOf = (input: Record<string, unknown>): readonly AuthSetupErrorView[] => viewsOf(input, serviceProfileInput);
+
+describe('T34d: the version 3 auth setup errors are split by the form fields', () => {
+  it('accepts the valid script login setup (the base of the cases)', () => {
+    expect(validateAuthSetup(validScriptSetup, profileOf(serviceProfileInput), context).ok).toBe(true);
+  });
+
+  // T44e（Task 44 の設計書 P2-8）: 要る項目の欠け（`AUTH_SETUP_SCRIPT_LOGIN_REQUIRED`）は、自動ログインのプロファイルだけ（下の T44e の describe）。
+  // 手動のログインのプロファイルは、token の送信先と鍵がなくても誤りにならない。
+  it('T44e: has no required error for the script login without the target and the key of a manual login profile', () => {
+    const empty = withScriptSetup({ scriptLogin: null, loginSideRequests: [], successStorageKey: null });
+    expect(validateAuthSetup(empty, profileOf(serviceProfileInput), context).ok).toBe(true);
+  });
+
+  it.each([
+    [
+      'scriptOrigin (not approved)',
+      withScriptSetup({ scriptLogin: { ...validScriptSetup.scriptLogin, origin: UNAPPROVED_ORIGIN } }),
+      { code: 'AUTH_SETUP_SERVICE_ORIGIN_NOT_APPROVED', field: 'scriptOrigin', line: null },
+    ],
+    [
+      'scriptPath',
+      withScriptSetup({ scriptLogin: { ...validScriptSetup.scriptLogin, path: 'token' } }),
+      { code: 'AUTH_SETUP_PATH_INVALID', field: 'scriptPath', line: null },
+    ],
+    [
+      'requiredQuery',
+      withScriptSetup({ scriptLogin: { ...validScriptSetup.scriptLogin, requiredQuery: [{ name: 'grant_type', value: 'password' }, { name: ' ', value: 'x' }] } }),
+      { code: 'AUTH_SETUP_REQUIRED_QUERY_INVALID', field: 'requiredQuery', line: 2 },
+    ],
+    [
+      'loginSideRequests',
+      withScriptSetup({ loginSideRequests: [{ origin: SERVICE_ORIGIN, path: '/auth/v1/token', method: 'POST', maxPerLoginStage: 1 }] }),
+      { code: 'AUTH_SETUP_LOGIN_SIDE_REQUEST_DUPLICATED', field: 'loginSideRequests', line: 1 },
+    ],
+    [
+      'storagePrefix',
+      withScriptSetup({ successStorageKey: { origin: TEST_ORIGIN, prefix: 'a\nb', suffix: '' } }),
+      { code: 'AUTH_SETUP_STORAGE_KEY_INVALID', field: 'storagePrefix', line: null },
+    ],
+    [
+      'storageOrigin (empty prefix and suffix)',
+      withScriptSetup({ successStorageKey: { origin: TEST_ORIGIN, prefix: '', suffix: '' } }),
+      { code: 'AUTH_SETUP_STORAGE_KEY_INVALID', field: 'storageOrigin', line: null },
+    ],
+    [
+      'loginTransport (form navigation with the script login items)',
+      withScriptSetup({ loginTransport: 'FORM_NAVIGATION', loginPostEndpoints: [{ origin: TEST_ORIGIN, path: '/login' }] }),
+      { code: 'AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED', field: 'scriptOrigin', line: null },
+    ],
+    [
+      'loginPostEndpoints (form navigation without an endpoint)',
+      withScriptSetup({ loginTransport: 'FORM_NAVIGATION', scriptLogin: null, loginSideRequests: [], successStorageKey: null }),
+      { code: 'AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED', field: 'loginPostEndpoints', line: null },
+    ],
+  ] as const)('puts the error on the field %s', (_field, input, expected) => {
+    expect(scriptViewsOf(input)).toContainEqual(expected);
+  });
+});
+
+// T34R-fix-b（独立レビュー T34R の M-3・M-6）: 必須の query の値に見える値の誤りは、その行に出す（検証の owner が付ける位置で分ける。対応の表は変えない）。
+// T36a（Task 36 の設計書 3.1）: 自動ログインのプロファイルのスクリプトで送るログインは、誤りにならない（M-3 の拒否を外した）。
+describe('T34R-fix-b: the automated script login error and the value-like required query value are on their fields', () => {
+  it('T36a: has no error for the script login of an automated login profile', () => {
+    const automatedServiceProfile = { ...serviceProfileInput, auth: 'AUTOMATED_LOGIN' } satisfies SiteProfile;
+    const automatedLogin = {
+      usernameSelector: '#user',
+      passwordSelector: '#pass',
+      submitSelector: '#go',
+      failureConditions: { invalidCredentials: { pathPrefix: '/login-error', selector: '#invalid' }, accountLocked: null, mfaRequired: null, credentialExpired: null },
+    };
+    const setup = withScriptSetup({ automatedLogin, maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS });
+    expect(validateAuthSetup(setup, profileOf(automatedServiceProfile), context).ok).toBe(true);
+  });
+
+  // T44e（Task 44 の設計書 P2-8）: 自動ログインのプロファイルでは、今どおり token の送信先と鍵が要り、その誤りは欄に出す。
+  it.each([
+    ['scriptOrigin (required)', { scriptLogin: null }, { code: 'AUTH_SETUP_SCRIPT_LOGIN_REQUIRED', field: 'scriptOrigin', line: null }],
+    ['storageOrigin (required)', { successStorageKey: null }, { code: 'AUTH_SETUP_SCRIPT_LOGIN_REQUIRED', field: 'storageOrigin', line: null }],
+  ] as const)('T44e: puts the required error of an automated login profile on the field %s', (_field, overrides, expected) => {
+    const automatedServiceProfile = { ...serviceProfileInput, auth: 'AUTOMATED_LOGIN' } satisfies SiteProfile;
+    const automatedLogin = {
+      usernameSelector: '#user',
+      passwordSelector: '#pass',
+      submitSelector: '#go',
+      failureConditions: { invalidCredentials: { pathPrefix: '/login-error', selector: '#invalid' }, accountLocked: null, mfaRequired: null, credentialExpired: null },
+    };
+    expect(viewsOf(withScriptSetup({ ...overrides, automatedLogin, maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS }), automatedServiceProfile))
+      .toContainEqual(expected);
+  });
+
+  it('puts SECRET_LIKE_VALUE of a required query value on its line', () => {
+    const scriptLogin = { ...validScriptSetup.scriptLogin, requiredQuery: [{ name: 'grant_type', value: 'password' }, { name: 'email', value: 'someone@example.invalid' }] };
+    expect(scriptViewsOf(withScriptSetup({ scriptLogin }))).toEqual([{ code: 'AUTH_SETUP_SECRET_LIKE_VALUE', field: 'requiredQuery', line: 2 }]);
+  });
+});
+
+// T35d（Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出しと、サービスの Origin への要求の上限の誤りも、欄と行に分ける。
+describe('T35d: the audit stage items of the version 3 auth setup are split by the form fields', () => {
+  const read = { origin: SERVICE_ORIGIN, path: '/rest/v1/rpc/list_items', method: 'POST', maxPerPageLoad: 2 } as const;
+
+  it('accepts the script login setup with the audit stage items (the base of the cases)', () => {
+    const input = withScriptSetup({ auditReadRequests: [read], serviceRequestLimits: { perMinute: 30, perRun: 300 } });
+    expect(validateAuthSetup(input, profileOf(serviceProfileInput), context).ok).toBe(true);
+  });
+
+  it.each([
+    [
+      'auditReadRequests (duplicated)',
+      withScriptSetup({ auditReadRequests: [read, read] }),
+      { code: 'AUTH_SETUP_AUDIT_READ_REQUEST_DUPLICATED', field: 'auditReadRequests', line: 2 },
+    ],
+    [
+      'auditReadRequests (origin)',
+      withScriptSetup({ auditReadRequests: [{ ...read, origin: UNAPPROVED_ORIGIN }] }),
+      { code: 'AUTH_SETUP_ORIGIN_NOT_APPROVED', field: 'auditReadRequests', line: 1 },
+    ],
+    [
+      'auditReadRequests (path)',
+      withScriptSetup({ auditReadRequests: [read, { ...read, path: 'rpc' }] }),
+      { code: 'AUTH_SETUP_PATH_INVALID', field: 'auditReadRequests', line: 2 },
+    ],
+    [
+      'servicePerMinute',
+      // DEF-141: 1 分あたりの上限は 600 まで（前は 120 まで）。
+      withScriptSetup({ serviceRequestLimits: { perMinute: 601, perRun: 300 } }),
+      { code: 'AUTH_SETUP_LIMIT_EXCEEDED', field: 'servicePerMinute', line: null },
+    ],
+    [
+      'servicePerRun',
+      // DEF-141: 1 回の Run あたりの上限は 10,000 まで（前は 600 まで）。
+      withScriptSetup({ serviceRequestLimits: { perMinute: 30, perRun: 10_001 } }),
+      { code: 'AUTH_SETUP_LIMIT_EXCEEDED', field: 'servicePerRun', line: null },
+    ],
+  ] as const)('puts the error on the field %s', (_field, input, expected) => {
+    expect(scriptViewsOf(input)).toContainEqual(expected);
   });
 });

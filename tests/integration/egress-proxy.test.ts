@@ -23,7 +23,7 @@ import {
   type EgressRejection,
   type EgressUpstreamPolicy,
 } from '../../src/safety/egress-proxy.js';
-import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
+import { closedLoopbackOrigin, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 
 /** 上流（127.0.0.1 のサーバ）が受けた要求の記録。 */
 interface UpstreamObservation {
@@ -463,14 +463,8 @@ describe('egress proxy (design 2.1.1)', () => {
   // DEF-085 fix round 1: 上流の失敗の伝え方（`upstreamFailureMode`）。`PASS_THROUGH` は、応答を作らずに失敗をそのまま伝える（中継なしと
   // 同じ結果にするため。Passive とログインの段の Context）。`BAD_GATEWAY`（既定）は、今までどおり 502 を返す（Interaction の Context）。
   describe('upstream failure mode (DEF-085 fix round 1)', () => {
-    /** 何も待ち受けていない 127.0.0.1 のポート。 */
-    const closedPort = (): Promise<number> => new Promise((resolve) => {
-      const probe = createNetServer();
-      probe.listen(0, '127.0.0.1', () => {
-        const { port } = probe.address() as AddressInfo;
-        probe.close(() => resolve(port));
-      });
-    });
+    /** 何も待ち受けていない 127.0.0.1 のポート（`closedLoopbackOrigin` の Origin のポート。CC-041）。 */
+    const portOfClosedOrigin = async (): Promise<number> => Number(new URL(await closedLoopbackOrigin()).port);
 
     async function startModeProxy(upstreamFailureMode?: 'PASS_THROUGH' | 'BAD_GATEWAY'): Promise<EgressProxy> {
       const proxy = await startEgressProxy({
@@ -488,7 +482,7 @@ describe('egress proxy (design 2.1.1)', () => {
 
     it('PASS_THROUGH: resets the client connection (RST), without a 502, when the upstream of an absolute-form request refuses the connection', async () => {
       const proxy = await startModeProxy('PASS_THROUGH');
-      const port = await closedPort();
+      const port = await portOfClosedOrigin();
 
       const failure = await settled(requestThroughProxy(proxy, 'GET', `http://127.0.0.1:${port}/refused`));
 
@@ -519,7 +513,7 @@ describe('egress proxy (design 2.1.1)', () => {
 
     it('PASS_THROUGH: resets the client connection (RST), without a 502 to CONNECT, when the upstream of a tunnel refuses the connection', async () => {
       const proxy = await startModeProxy('PASS_THROUGH');
-      const port = await closedPort();
+      const port = await portOfClosedOrigin();
 
       const failure = await settled(connectThroughProxy(proxy, `127.0.0.1:${port}`));
 
@@ -564,7 +558,7 @@ describe('egress proxy (design 2.1.1)', () => {
 
     it('BAD_GATEWAY (the default, the Interaction Context): still answers 502 to a request and to CONNECT whose upstream refuses the connection', async () => {
       const proxy = await startModeProxy();
-      const port = await closedPort();
+      const port = await portOfClosedOrigin();
 
       const response = await requestThroughProxy(proxy, 'GET', `http://127.0.0.1:${port}/refused`);
       const tunnel = await connectThroughProxy(proxy, `127.0.0.1:${port}`);
@@ -621,7 +615,7 @@ describe('egress proxy (design 2.1.1)', () => {
     it('PASS_THROUGH: remembers the upstream address of each connected host and port (absolute-form and CONNECT), and BAD_GATEWAY does not', async () => {
       const passing = await startModeProxy('PASS_THROUGH');
       const gateway = await startModeProxy();
-      const port = await closedPort();
+      const port = await portOfClosedOrigin();
 
       await requestThroughProxy(passing, 'GET', `http://127.0.0.1:${upstream.port}/remember`);
       await settled(requestThroughProxy(passing, 'GET', `http://127.0.0.1:${port}/refused`));

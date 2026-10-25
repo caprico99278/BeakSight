@@ -5,6 +5,19 @@
 // ここの一覧には値を後ろに足してよい。
 import { AUTOMATED_LOGIN_FAILURE_RESULTS, type AutomatedLoginFailureResult } from '../auth/automated-login-results.js';
 import { CREDENTIAL_CHANGE_KINDS } from '../credentials/credential-store.js';
+import { MINUTE_MS } from '../../core/time-units.js';
+import {
+  AUDIT_JOB_STATES,
+  FAILED_AUDIT_JOB_STATE,
+  FINISHED_AUDIT_JOB_STATE,
+  STOPPING_AUDIT_JOB_STATE,
+  type AuditJobState,
+} from '../../core/audit-job-values.js';
+import {
+  AUDIT_JOB_START_REJECTION_REASONS,
+  PROFILE_RETIRED_START_REJECTION_REASON,
+  type AuditJobStartRejectionReason,
+} from '../../core/audit-job-start-rejection-reasons.js';
 import {
   WORKER_FAILURE_REASONS,
   WORKER_HEARTBEAT_INTERVAL_MS,
@@ -33,9 +46,11 @@ export type AuditJobKind = WorkerJobKind;
  * - `FINISHED`: ワーカーが結果（`FINISHED`）を送った（Run の状態と終了コードは、中核の結果のまま）。
  * - `FAILED`: ワーカーが `FAILED` を送った、ワーカーを起動できなかった、契約に反した。
  * - `INTERRUPTED`: 結果の前にワーカーが終わった、止めた、応答しなくなった、画面のサーバが終わった。
+ * PRE42-CC 組 UI-K（N4-8f）: 一覧と名前つきの定数（`FINISHED_AUDIT_JOB_STATE`（PRE42-CC 組 3。N4-8b）・`STOPPING_AUDIT_JOB_STATE`・
+ * `FAILED_AUDIT_JOB_STATE`）の定義は、画面のブラウザ側からも読める純粋なファイル `src/core/audit-job-values.ts` に移し、ここは同じ名前で公開し直す
+ * （同じ定数を置き直さない。値を文字列で比べない。`tests/architecture/job-kind-constants.test.ts` の (c)）。
  */
-export const AUDIT_JOB_STATES = Object.freeze(['STARTING', 'RUNNING', 'STOPPING', 'FINISHED', 'FAILED', 'INTERRUPTED'] as const);
-export type AuditJobState = (typeof AUDIT_JOB_STATES)[number];
+export { AUDIT_JOB_STATES, FAILED_AUDIT_JOB_STATE, FINISHED_AUDIT_JOB_STATE, STOPPING_AUDIT_JOB_STATE, type AuditJobState };
 
 /** 終わっていないジョブの状態（同時に 1 つだけ。この状態の行は、全体で 1 行まで）。 */
 export const ACTIVE_AUDIT_JOB_STATES = Object.freeze(['STARTING', 'RUNNING', 'STOPPING'] as const satisfies readonly AuditJobState[]);
@@ -78,7 +93,8 @@ export type AuditJobFailureReason =
   | (typeof AUDIT_JOB_MANAGER_FAILURE_REASONS)[number]
   | AutomatedLoginFailureResult
   | (typeof AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_4)[number]
-  | (typeof AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_7)[number];
+  | (typeof AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_7)[number]
+  | (typeof AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_11)[number];
 
 /** 自動ログインの成功以外の結果か（ワーカーの `FAILED` の理由にも入っている。T26d-2）。 */
 const isAutomatedLoginFailureResult = (reason: string): boolean => (AUTOMATED_LOGIN_FAILURE_RESULTS as readonly string[]).includes(reason);
@@ -109,6 +125,14 @@ const AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_4 = Object.freeze(['DISCOV
  */
 const AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_7 = Object.freeze(['WRITE_GRANT_REJECTED', 'WRITE_RESULT_INVALID'] as const);
 
+/**
+ * 管理データの版 11 を公開した後に、ジョブの管理の理由に足した値（T43c。Task 43 の設計書 4.3。入口の確かめのジョブ `ENTRY_CHECK`）。版 7 の後に足した
+ * ジョブの管理の理由の、さらに後ろに置く（管理データの版 12 でジョブの表を作り直し、今の一覧の CHECK にした）。
+ * - `ENTRY_CHECK_RESULT_INVALID`: 入口の確かめのジョブの終わりに、ワーカーが書いた `entry-check.json` を読めない、スキーマに合わない、ジョブの ID・
+ *   Run の ID・Run Status・件数の要約が合わない。ジョブを `FAILED` にする（画面は、その案を使わない）。
+ */
+const AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_11 = Object.freeze(['ENTRY_CHECK_RESULT_INVALID'] as const);
+
 /** 版 4 の後に足したワーカーの理由か。 */
 const isWorkerFailureReasonAfterVersion4 = (reason: string): boolean => (WORKER_FAILURE_REASONS_AFTER_VERSION_4 as readonly string[]).includes(reason);
 
@@ -116,7 +140,7 @@ const isWorkerFailureReasonAfterVersion4 = (reason: string): boolean => (WORKER_
  * ジョブの失敗と中断の理由の一覧（凍結。重複を除く）。並びは、ワーカーの理由（自動ログインの結果と版 4 の後に足した理由を除く）、ジョブの管理の
  * 理由、自動ログインの成功以外の結果、版 4 の後に足したワーカーの理由（T27c）、版 4 の後に足したジョブの管理の理由（T27d）、版 7 の後に足した
  * ジョブの管理の理由（T30d）の順。T26d-2 でワーカーの `FAILED` の理由に自動ログインの結果を
- * 足したが、この並びは T26c と同じに保つ（名前つきの一覧には、値を後ろに足すだけにする。`control-store-v4.test.ts`、`control-store-v5.test.ts`）。
+ * 足したが、この並びは T26c と同じに保つ（LG-2: 並びと値は、管理データの基準の版 17 の CHECK と等しい。`tests/integration/control-store-base-schema.test.ts`）。
  */
 export const AUDIT_JOB_FAILURE_REASONS: readonly AuditJobFailureReason[] = Object.freeze([
   ...new Set<AuditJobFailureReason>([
@@ -126,6 +150,7 @@ export const AUDIT_JOB_FAILURE_REASONS: readonly AuditJobFailureReason[] = Objec
     ...WORKER_FAILURE_REASONS_AFTER_VERSION_4,
     ...AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_4,
     ...AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_7,
+    ...AUDIT_JOB_MANAGER_FAILURE_REASONS_AFTER_VERSION_11,
   ]),
 ]);
 
@@ -153,66 +178,23 @@ export const WRITE_REPORT_CHECKS = Object.freeze([
 ] as const);
 export type WriteReportCheck = (typeof WRITE_REPORT_CHECKS)[number];
 
-/** ジョブの開始を拒むときの理由（行を作らず、ワーカーを起動しない）。 */
-export const AUDIT_JOB_START_REJECTION_REASONS = Object.freeze([
-  /** 依頼の形が違う（プロファイルの ID、改訂、`startNew`）。 */
-  'INVALID_REQUEST',
-  /** プロファイルがない。 */
-  'PROFILE_NOT_FOUND',
-  /** 取り消したプロファイル。 */
-  'PROFILE_RETIRED',
-  /** 画面が読んだ改訂と、保存されている改訂が違う（開始の直前に変わった）。 */
-  'PROFILE_REVISION_CONFLICT',
-  /** そのジョブの種類を、このモードでは実行できない（`execution-policy.ts` の `PROFILE_OPERATION_POLICY` の行にない。T28b）。 */
-  'MODE_NOT_EXECUTABLE',
-  /**
-   * 今は実行できない認証の方式（T25d。`EXECUTABLE_AUTH_STRATEGIES`）。T26d-2: ログインの検証を、自動ログインでないプロファイルで始めようとした
-   * ときも、この理由（Windows 以外の自動ログインは、資格情報の暗号化の確かめで `CREDENTIAL_PROTECTION_UNAVAILABLE`）。
-   */
-  'AUTH_STRATEGY_NOT_EXECUTABLE',
-  /** 認証の設定が要るモードで、認証の設定が保存されていない（T25d）。ターゲット設定を読まない。 */
-  'AUTH_SETUP_MISSING',
-  /** 保存した認証の設定が古い（プロファイルの改訂が変わった。`STALE`。T25d）。ターゲット設定を読まない。 */
-  'AUTH_SETUP_STALE',
-  /** 保存した認証の設定が、開始の直前の `validateAuthSetup` を通らない（T25d）。 */
-  'AUTH_SETUP_INVALID',
-  /** ターゲット JSON のパスを受けない（`isAcceptedTargetConfigPath`）。ファイルを読まない。 */
-  'TARGET_PATH_INVALID',
-  /** ターゲット JSON を読めない、検証を通らない（検証の文脈を用意できない）。 */
-  'TARGET_CONFIG_UNAVAILABLE',
-  /** 今のターゲット設定で、プロファイルが `validateSiteProfile` を通らない。 */
-  'PROFILE_INVALID',
-  /** 終わっていないジョブがある（同時に 1 つだけ）。 */
-  'JOB_ALREADY_ACTIVE',
-  /** 自動ログインのプロファイルで、資格情報のファイルがない（Task 26 の設計書 4.5。T26c）。 */
-  'CREDENTIAL_MISSING',
-  /** 保存した資格情報のログインの Origin が、今の認証の設定の `loginStartUrl` の Origin と違う（T26c）。 */
-  'CREDENTIAL_STALE',
-  /** 資格情報の暗号化（DPAPI）が使えない（T26c）。 */
-  'CREDENTIAL_PROTECTION_UNAVAILABLE',
-  /** 前の自動ログインが成功以外で終わったので、人が画面で解くまで、そのプロファイルの自動ログインを止めている（T26c）。 */
-  'AUTO_LOGIN_HELD',
-  /** 自動ログインの最小の間隔、24 時間の上限、`Retry-After` の待ちの中（次に始められる時刻がある。T26c）。 */
-  'AUTO_LOGIN_RATE_LIMITED',
-  /**
-   * この管理が、管理のロック（画面のサーバを 1 つだけにする。DEF-061）を失った（ハートビートの間に、ほかの管理が古いと判定して取り直した）。
-   * 新しいジョブを始めない（T24h-4）。
-   */
-  'CONTROL_INSTANCE_LOCK_LOST',
-  /** READ の確かめを始めようとしたが、そのプロファイルに、取り消していない READ の確かめの定義が 1 件もない（T27e）。 */
-  'READ_CHECK_DEFINITIONS_MISSING',
-  /**
-   * 書き込みのジョブ（T30e）: 実行の許可を使えない（ない、別のシナリオ・プロファイル、消費済み、無効、期限切れ、消費で拒まれた）。消費で拒まれたときは、
-   * ジョブの行を `FAILED`（`WRITE_GRANT_REJECTED`）で残し、予約を返す（消費していない、そのジョブの許可を無効にする）。
-   */
-  'WRITE_GRANT_REJECTED',
-  /**
-   * 書き込みのジョブ（T30e）: 送る値を生成できない（規則が決まらない、一意にする欄の組を使い切った、照合の READ に結び付ける値がない、書き込みの
-   * 指定を作れない）。許可は消費済みのまま、結果を `BLOCKED`・`RELEASED` で締め、ジョブの行を `FAILED`（`WRITE_GRANT_REJECTED`）で残す。
-   */
-  'WRITE_DATA_NOT_GENERATED',
-] as const);
-export type AuditJobStartRejectionReason = (typeof AUDIT_JOB_START_REJECTION_REASONS)[number];
+/**
+ * ジョブのログインの段のまとめ（T34e。管理データの版 11 の `jobs.login_stage_summary`。JSON の object）の最大長（UTF-16 のコード単位。表の CHECK）。
+ * 最も大きいまとめ（上限の件数・長さの一覧と、安全な整数の最大の回数）が収まる大きさ（`tests/integration/control-store-job-summaries.test.ts` で確かめる）。
+ */
+export const MAX_LOGIN_STAGE_SUMMARY_LENGTH = 32_768;
+
+/**
+ * DEF-138: ジョブのセッションの切れの証拠（管理データの版 16 の `jobs.session_loss`。JSON の object）の最大長（UTF-16 のコード単位。表の CHECK）。最も大きい
+ * 証拠（上限の件数の経路と止めた要求の、最大の長さの path の表記）が収まる大きさ（`tests/integration/control-store-job-summaries.test.ts` で確かめる）。
+ */
+export const MAX_SESSION_LOSS_RECORD_LENGTH = 65_536;
+
+/**
+ * ジョブの開始を拒むときの理由（行を作らず、ワーカーを起動しない）。PRE42-CC 組 UI-K2（CC-113）: 一覧の定義と値の意味は、画面のブラウザ側からも読める
+ * 純粋なファイル `src/core/audit-job-start-rejection-reasons.ts` に移し、ここは同じ名前で公開し直す（定義は 1 か所）。
+ */
+export { AUDIT_JOB_START_REJECTION_REASONS, PROFILE_RETIRED_START_REJECTION_REASON, type AuditJobStartRejectionReason };
 
 /**
  * 保存した資格情報の変更と削除を拒むときの理由（Task 26 の設計書 4.2 の「ジョブが動いているとき」。T26c で置き場所を決めた。使うのは T26e）。
@@ -253,6 +235,21 @@ export const AUDIT_JOB_HEARTBEAT_TIMEOUT_MS = WORKER_HEARTBEAT_INTERVAL_MS * AUD
 
 /** 見張りが確かめる間隔（ms。合図の間隔と同じ）。 */
 export const AUDIT_JOB_WATCHDOG_INTERVAL_MS = WORKER_HEARTBEAT_INTERVAL_MS;
+
+/**
+ * DEF-143（設計書 `2026-10-20-beaksight-worker-heartbeat-heavy-steps-design.md` 4 章の判断）: ワーカーが「Run の終わり」の段の知らせ（`RUN_FINALIZING`）を
+ * 送った後の、`HEARTBEAT` が来ない時間の上限（ms。15 分）。その段（集計・成果物の書き出し・止めたときの片付け）は、大きな Run では main thread を長く
+ * 占め、その間は合図を送れない（実テスト環境の 139 ページ・168 MB で 20 秒を超えた）。過ぎたら、今と同じく止めて `INTERRUPTED`（`WORKER_UNRESPONSIVE`）。
+ * ワーカーの process の終わりは、この上限によらず、すぐ見つける。
+ */
+export const AUDIT_JOB_FINALIZING_HEARTBEAT_TIMEOUT_MS = 15 * MINUTE_MS;
+
+/**
+ * DEF-143: 見張りの回の遅れの上限（ms。途絶えの上限の半分）。見張りの間隔より、この量を超えて遅れた回は、親自身の main thread が止まっていたとみなし、
+ * その回は判定しない（止まっている間に届いて溜まった `HEARTBEAT` を受けてから、次の回で判定する）。半分なら、親が止まった時間が上限の内では、ワーカーが
+ * 止まる前に受けた最後の合図からの時間が、途絶えの上限に届かない。
+ */
+export const AUDIT_JOB_WATCHDOG_LAG_LIMIT_MS = AUDIT_JOB_HEARTBEAT_TIMEOUT_MS / 2;
 
 /** 進み具合（`PROGRESS`）を管理データに書く最短の間隔（ms）。間の値は、最後の値だけを後で書く（書き込みの回数を抑える）。 */
 export const AUDIT_JOB_PROGRESS_WRITE_INTERVAL_MS = 1_000;

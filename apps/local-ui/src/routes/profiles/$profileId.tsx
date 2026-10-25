@@ -1,25 +1,33 @@
 import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
+import { RETIRED_PROFILE_STATUS } from '../../../../../src/control/store/profile-records.js';
 import { formatDateTime } from '../../../../../src/presentation/format.js';
 import {
+  AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
+  LOCAL_UI_AUDIT_TEXT,
   LOCAL_UI_AUTH_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_DISCOVERY_TEXT,
   LOCAL_UI_LEDGER_TEXT,
   LOCAL_UI_LOGIN_CHECK_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
   LOCAL_UI_SCENARIO_TEXT,
   LOCAL_UI_TEXT,
   PROFILE_STORE_REJECTION_DESCRIPTIONS,
 } from '../../../../../src/presentation/messages.js';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { EntryCheckPanel } from '../../components/EntryCheckPanel';
+import { NextStepsPanel } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
 import { PageFrame } from '../../components/PageFrame';
 import { ProfileForm, formValuesOf, profileDocumentOf } from '../../components/ProfileForm';
 import {
   auditModeDisplay,
+  authSetupFreshnessDisplay,
   authStrategyDisplay,
   environmentDisplay,
+  offersAutomatedLogin,
   profileStatusDisplay,
   toneClass,
   usesAuthSetup,
@@ -33,8 +41,17 @@ import {
   retireProfileFn,
   targetConfigCandidatesFn,
   updateProfileFn,
+  type ProfileAuthSetupScopeView,
   type ProfileChangeView,
 } from '../../server/profile-functions';
+import { entryCheckSummaryFn } from '../../server/entry-check-functions';
+import { profileOnboardingFn } from '../../server/profile-onboarding-functions';
+import { LoginSetupPanel } from '../../components/LoginSetupPanel';
+import { DisplaySettingsPanel } from '../../components/DisplaySettingsPanel';
+import { profileDisplaySettingsFn } from '../../server/display-settings-functions';
+import { CrawlLimitsPanel } from '../../components/CrawlLimitsPanel';
+import { crawlLimitsPanelFn } from '../../server/crawl-limits-functions';
+import { isSavedNoticeCurrent, savedRevisionOf } from '../../display/saved-notice';
 
 /**
  * 保存の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。`retiredCredentialKept` は、取り消しは成功したが、保存した資格情報を消せなかった
@@ -46,17 +63,26 @@ type SavedNotice = (typeof SAVED_NOTICES)[number];
 const isSavedNotice = (value: unknown): value is SavedNotice => SAVED_NOTICES.some((notice) => notice === value);
 
 export const Route = createFileRoute('/profiles/$profileId')({
-  validateSearch: (search: Record<string, unknown>): { saved?: SavedNotice } =>
-    isSavedNotice(search['saved']) ? { saved: search['saved'] } : {},
+  // DEF-137: 保存した改訂（`savedRevision`）も受ける（知らせは、画面の改訂がそれに届いたときだけ出す）。
+  validateSearch: (search: Record<string, unknown>): { saved?: SavedNotice; savedRevision?: number } => {
+    const savedRevision = savedRevisionOf(search['savedRevision']);
+    return isSavedNotice(search['saved']) ? { saved: search['saved'], ...(savedRevision === undefined ? {} : { savedRevision }) } : {};
+  },
   loader: async ({ params }) => {
-    const [detail, candidates] = await Promise.all([
+    const [detail, candidates, onboarding, entryCheck, displaySettings, crawlLimits] = await Promise.all([
       getProfileFn({ data: { profileId: params.profileId } }),
       targetConfigCandidatesFn(),
+      profileOnboardingFn({ data: { profileId: params.profileId } }),
+      entryCheckSummaryFn({ data: { profileId: params.profileId } }),
+      // FM-1（手動の操作を減らす設計書 2.2）: 表示の設定（プロファイルの改訂とは別に持つ）。
+      profileDisplaySettingsFn({ data: { profileId: params.profileId } }),
+      // T44d（Task 44 の設計書 P2-1）: 監査の負荷（設定のファイルの値。変えると設定のファイルを書き換える）。
+      crawlLimitsPanelFn({ data: { profileId: params.profileId } }),
     ]);
-    if (detail === null) {
+    if (detail === null || onboarding === null || entryCheck === null || crawlLimits === null) {
       throw notFound();
     }
-    return { detail, candidates };
+    return { detail, candidates, onboarding, entryCheck, displaySettings, crawlLimits };
   },
   component: EditProfilePage,
 });
@@ -68,10 +94,57 @@ const SAVED_TEXT: Readonly<Record<SavedNotice, string>> = Object.freeze({
   retiredCredentialKept: LOCAL_UI_TEXT.retireDialog.done,
 });
 
+/** 前方一致のパスの一覧（空なら `emptyText`）。 */
+function PathList({ paths, emptyText }: Readonly<{ paths: readonly string[]; emptyText: string }>) {
+  return paths.length === 0 ? <>{emptyText}</> : (
+    <ul className="word-list">
+      {paths.map((path) => <li key={path}><code>{path}</code></li>)}
+    </ul>
+  );
+}
+
+/**
+ * T44d（Task 44 の設計書 P2-2）: 認証の設定への入り口（「認証の設定を開く」）と、保存してある設定の読む範囲・読まないパス・新しさの要約（読むだけ。
+ * 変えるのは認証の設定の画面）。保存していなければ、その旨を出す。
+ */
+function AuthSetupEntry({ profileId, scope }: Readonly<{ profileId: string; scope: ProfileAuthSetupScopeView | null }>) {
+  const text = LOCAL_UI_AUTH_TEXT;
+  const freshness = scope === null ? null : authSetupFreshnessDisplay(scope.freshness);
+  return (
+    <section className="panel" data-testid="profile-auth-setup">
+      <h2 className="panel-heading">{text.profileDetail.heading}</h2>
+      <p>{text.profileDetail.body}</p>
+      {scope === null || freshness === null ? (
+        <p data-testid="profile-auth-setup-summary" data-saved="no">{text.setup.notSaved}</p>
+      ) : (
+        <dl className="facts" data-testid="profile-auth-setup-summary" data-saved="yes">
+          <dt>{text.start.auditScope}</dt>
+          <dd className="cell-break" data-testid="profile-auth-setup-audit-scope">
+            <PathList paths={scope.auditPathPrefixes} emptyText={text.start.auditScopeAll} />
+          </dd>
+          <dt>{text.profileDetail.excludedPaths}</dt>
+          <dd className="cell-break" data-testid="profile-auth-setup-excluded">
+            <PathList paths={scope.excludedPaths} emptyText={text.profileDetail.excludedPathsNone} />
+          </dd>
+          <dt>{text.setup.state}</dt>
+          <dd><span className={toneClass(freshness.tone)}>{freshness.label}</span></dd>
+        </dl>
+      )}
+      <p>
+        <Link to="/auth-setup/$profileId" params={{ profileId }} className="button button--primary">
+          {text.profileDetail.open}
+        </Link>
+      </p>
+    </section>
+  );
+}
+
 /** プロファイルの編集と取り消し（設計書 4.7）。 */
 function EditProfilePage() {
-  const { detail, candidates } = Route.useLoaderData();
-  const { saved } = Route.useSearch();
+  const { detail, candidates, onboarding, entryCheck, displaySettings, crawlLimits } = Route.useLoaderData();
+  const search = Route.useSearch();
+  // DEF-137: 保存の知らせは、画面の改訂が保存した改訂に届いたときだけ出す（改訂のない知らせは今のまま）。
+  const saved = search.saved !== undefined && isSavedNoticeCurrent(search.savedRevision, detail.profile.revision) ? search.saved : undefined;
   const update = useServerFn(updateProfileFn);
   const retire = useServerFn(retireProfileFn);
   const navigate = useNavigate();
@@ -81,14 +154,19 @@ function EditProfilePage() {
   const [retireRejection, setRetireRejection] = useState<Extract<ProfileChangeView, { ok: false }> | null>(null);
   const { profile } = detail;
   const status = profileStatusDisplay(detail.status);
-  const retired = detail.status === 'RETIRED';
+  const retired = detail.status === RETIRED_PROFILE_STATUS;
   const reload = (): void => {
     void router.invalidate();
   };
-  const showSaved = (notice: SavedNotice): void => {
-    // 先に今の内容を読み直し（loader）、それから保存の知らせを出す（知らせと内容が食い違わないように）。
-    void router.invalidate().then(() =>
-      navigate({ to: '/profiles/$profileId', params: { profileId: profile.profileId }, search: { saved: notice }, replace: true }));
+  const showSaved = (notice: SavedNotice, savedRevision?: number): void => {
+    // 先に今の内容を読み直し（loader）、それから保存の知らせを出す（知らせと内容が食い違わないように）。DEF-137: 保存した改訂も載せ、画面の改訂がそれに
+    // 届くまで知らせを出さない（ルータが読み直しを反映し終える前に、新しい search で一度描くことがあるため）。
+    void router.invalidate().then(() => navigate({
+      to: '/profiles/$profileId',
+      params: { profileId: profile.profileId },
+      search: { saved: notice, ...(savedRevision === undefined ? {} : { savedRevision }) },
+      replace: true,
+    }));
   };
 
   return (
@@ -124,17 +202,55 @@ function EditProfilePage() {
         </dl>
       </section>
 
-      {!retired && usesAuthSetup(profile.mode, profile.auth) ? (
-        <section className="panel" data-testid="profile-auth-setup">
-          <h2 className="panel-heading">{LOCAL_UI_AUTH_TEXT.profileDetail.heading}</h2>
-          <p>{LOCAL_UI_AUTH_TEXT.profileDetail.body}</p>
+      {/* T44d（Task 44 の設計書 P2-2）: 認証の設定への入り口を、プロファイルの要点のすぐ後に置き、読む範囲と読まないパスの今の値の要約を近くに出す。 */}
+      {!retired && usesAuthSetup(profile.mode, profile.auth) ? <AuthSetupEntry profileId={profile.profileId} scope={detail.authSetupScope} /> : null}
+
+      {/* T43a（Task 43 の設計書 4.1）: 監査を始める（一覧の列のボタンは残す）。始められないときは、押せない形で、開始の画面と同じ確かめの理由を出す。 */}
+      <section className="panel" data-testid="profile-audit-start">
+        <h2 className="panel-heading">{LOCAL_UI_NEXT_STEP_TEXT.auditStart.heading}</h2>
+        {onboarding.auditStartBlocker === null ? (
           <p>
-            <Link to="/auth-setup/$profileId" params={{ profileId: profile.profileId }} className="button button--primary">
-              {LOCAL_UI_AUTH_TEXT.profileDetail.open}
+            <Link to="/start/$profileId" params={{ profileId: profile.profileId }} className="button button--primary">
+              {LOCAL_UI_AUDIT_TEXT.profileList.startAudit}
             </Link>
           </p>
-        </section>
-      ) : null}
+        ) : (
+          <>
+            <p>
+              <button type="button" className="button button--primary" disabled aria-describedby="profile-audit-start-reason">
+                {LOCAL_UI_AUDIT_TEXT.profileList.startAudit}
+              </button>
+            </p>
+            <div id="profile-audit-start-reason">
+              <p>{LOCAL_UI_NEXT_STEP_TEXT.auditStart.unavailable}</p>
+              <p data-testid="profile-audit-start-reason" data-reason={onboarding.auditStartBlocker}>
+                {AUDIT_JOB_START_REJECTION_DESCRIPTIONS[onboarding.auditStartBlocker].description}
+              </p>
+              <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[onboarding.auditStartBlocker].action}</p>
+            </div>
+          </>
+        )}
+      </section>
+
+      {/* T43a: 次にすること（取り消したプロファイルには出さない）。 */}
+      {retired ? null : <NextStepsPanel profileId={profile.profileId} steps={onboarding.steps} />}
+
+      {/* T43c（Task 43 の設計書 4.3）: 入口の確かめ（取り消したプロファイルには出さない。始められない理由は開始の確かめと同じ）。 */}
+      {retired ? null : <EntryCheckPanel summary={entryCheck} />}
+
+      {/* ML-b（手動のログインの設計書 2.3）: 手動のログインの成功から自動で登録した設定（見直して直す入口）。 */}
+      {retired || detail.loginSetup === null ? null : <LoginSetupPanel
+        profileId={detail.loginSetup.profileId}
+        setup={detail.loginSetup}
+        testId="profile-login-setup"
+        offerAutomatedLogin={offersAutomatedLogin(profile.mode, profile.auth)}
+      />}
+
+      {/* FM-1（手動の操作を減らす設計書 2.2）: 表示の設定（ジョブのブラウザを表示する。プロファイルの改訂とは別に持つ）。 */}
+      <DisplaySettingsPanel profileId={profile.profileId} settings={displaySettings} editable={!retired} />
+
+      {/* T44d（Task 44 の設計書 P2-1）: 監査の負荷（ページの上限・時間の上限・読み込みの間隔。取り消したプロファイルには出さない）。 */}
+      {retired ? null : <CrawlLimitsPanel view={crawlLimits} />}
 
       {/* T27f（Task 27 の設計書 4.7）: 操作の候補と READ の確かめを使うプロファイルだけ、その画面へのリンクを出す（取り消したプロファイルでも、
           記録は見られる。始める・作るは、それぞれの画面が止める）。T28b: 判定は `execution-policy.ts` の `DISCOVERY`・`READ_CHECK` の行（認証つきの
@@ -214,7 +330,7 @@ function EditProfilePage() {
               initialValues={formValuesOf(profile)}
               targetConfigCandidates={candidates}
               onSave={(values) => update({ data: { profile: profileDocumentOf(values, profile.revision + 1), expectedRevision: profile.revision } })}
-              onSaved={() => showSaved('updated')}
+              onSaved={(result) => showSaved('updated', result.detail.profile.revision)}
               onReload={reload}
             />
           </section>

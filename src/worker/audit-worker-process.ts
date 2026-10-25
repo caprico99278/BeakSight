@@ -10,6 +10,7 @@
  * - T27d（Task 27 の設計書 4.6）: 発見のジョブの流れ（`executeDiscoveryRun`。`discovery-run.ts`）。Browser は監査と同じ `PRODUCTION_RUN_DEPENDENCIES`。
  * - T27e（Task 27 の設計書 4.5）: READ の確かめのジョブの流れ（`executeReadCheckRun`。`read-check-run.ts`）。Browser は監査と同じ。
  * - T30f（Task 30 の設計書 3 章）: 書き込みのジョブの流れ（`executeWriteCreateRun`。`write-create-run.ts`）。Browser は監査と同じ。
+ * - T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブの流れ（`executeEntryCheckRun`。`entry-check-run.ts`）。Browser は監査と同じ。
  * - シグナル（`INTERRUPT_SIGNALS`。コンソールの Ctrl+C は、同じコンソールの子も受ける）を、CLI と同じ受け手の数え方で受ける。
  * - 扱われない例外と reject は、`FAILED`（`UNEXPECTED_FAILURE`）を送って、終了コード 1 で終える。
  * - 標準出力には何も書かない。標準出力と標準エラーの `'error'`（閉じたパイプ）は無視する（CLI の `index.ts` と同じ）。cwd は変えない。
@@ -21,12 +22,12 @@
  * ファイルの部品の作り方。テストは偽の暗号化の部品の部品を渡す）を替えられる。
  */
 import { readFile } from 'node:fs/promises';
-import { chromium } from 'playwright';
-import { chromiumLaunchOptions } from '../browser/chromium-launch.js';
-import { executeAuditRun, PRODUCTION_RUN_DEPENDENCIES } from '../cli/audit-run.js';
+import { launchChromium } from '../browser/chromium-launch.js';
+import { executeAuditRun, PRODUCTION_RUN_DEPENDENCIES, type AuditRunDependencies } from '../cli/audit-run.js';
 import { FAILURE_EXIT_CODE } from '../cli/exit-codes.js';
 import { registerInterruptHandlers } from '../cli/interrupt.js';
 import { ignoreOutputErrors, streamOutput } from '../cli/output-stream.js';
+import { HEADLESS_CONFIG_OVERRIDES } from '../config/config-overrides.js';
 import { loadConfig } from '../config/load-config.js';
 import { loginOriginOf } from '../control/auth/automated-login-results.js';
 import { createCredentialStore, type CredentialStore } from '../control/credentials/credential-store.js';
@@ -35,15 +36,19 @@ import { LOGIN_BROWSER_HEADLESS, runLoginStage, type LoginStageDependencies } fr
 import { runAutomatedLoginStage, type AutomatedLoginStageDependencies, type AutomatedLoginStageResult } from './automated-login.js';
 import { startAuditWorker, type WorkerAutomatedLoginStageRequest, type WorkerChannel } from './audit-worker-session.js';
 import { executeDiscoveryRun } from './discovery-run.js';
+import { executeEntryCheckRun } from './entry-check-run.js';
 import { executeReadCheckRun } from './read-check-run.js';
 import { executeWriteCreateRun } from './write-create-run.js';
 
 /** IPC がないときの終了コード（親から起動されたときだけ動く）。 */
 const NO_PARENT_EXIT_CODE = FAILURE_EXIT_CODE;
 
-/** 本番のログインの段の依存: ログイン用の Browser を、CLI の起動の設定の headed で起動する（人が操作する）。 */
+/**
+ * 本番のログインの段の依存: ログイン用の Browser を、CLI の起動の設定の headed で起動する（人が操作する）。EL-12: 起動は、外部のアプリの起動を
+ * 止める起動の部品（`launchChromium`）で行う（EL-3: 自己検査に通らなければ、ワーカーは `FAILED` の `UNEXPECTED_FAILURE` で終える。`audit-worker-session.ts`）。
+ */
 export const PRODUCTION_LOGIN_STAGE_DEPENDENCIES: LoginStageDependencies = Object.freeze({
-  launchLoginBrowser: () => chromium.launch(chromiumLaunchOptions({ headless: LOGIN_BROWSER_HEADLESS })),
+  launchLoginBrowser: () => launchChromium({ headless: LOGIN_BROWSER_HEADLESS }),
 });
 
 /**
@@ -52,9 +57,9 @@ export const PRODUCTION_LOGIN_STAGE_DEPENDENCIES: LoginStageDependencies = Objec
  */
 export const AUTOMATED_LOGIN_BROWSER_HEADLESS = true;
 
-/** 本番の自動ログインの段の依存: ログイン用の Browser を、CLI の起動の設定の headless で起動する。 */
+/** 本番の自動ログインの段の依存: ログイン用の Browser を、CLI の起動の設定の headless で、起動の部品（`launchChromium`。EL-12）で起動する。 */
 export const PRODUCTION_AUTOMATED_LOGIN_STAGE_DEPENDENCIES: AutomatedLoginStageDependencies = Object.freeze({
-  launchAutomatedLoginBrowser: () => chromium.launch(chromiumLaunchOptions({ headless: AUTOMATED_LOGIN_BROWSER_HEADLESS })),
+  launchAutomatedLoginBrowser: () => launchChromium({ headless: AUTOMATED_LOGIN_BROWSER_HEADLESS }),
 });
 
 /** ワーカーの process の指定（テストだけ。本番の入口は渡さない）。 */
@@ -65,6 +70,16 @@ export interface AuditWorkerProcessOptions {
   readonly automatedLoginStage?: Partial<AutomatedLoginStageDependencies>;
   /** 資格情報のファイルの部品の作り方の差し替え（T26d-2。省略すると本番の `createCredentialStore`）。 */
   readonly openCredentialStore?: (credentialRoot: string) => CredentialStore;
+  /**
+   * FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: テストだけの口。真なら、`START` の `showJobBrowser` によらず、ジョブのブラウザを今どおり
+   * headless で起動する（設定を、CLI の `--headless` と同じ上書き `HEADLESS_CONFIG_OVERRIDES` で読む）。本番の入口は渡さない（IPC・設定・環境変数からは渡せない）。
+   */
+  readonly hideJobBrowser?: true;
+  /**
+   * FM2d: テストだけの口。Run の Browser（監査・発見・READ の確かめ）の起動を替える（テストの既定の Chromium と CLI の起動の設定の両方で確かめるため）。省略すると
+   * 本番の `PRODUCTION_RUN_DEPENDENCIES.launchBrowser`。本番の入口は渡さない（IPC・設定・環境変数からは渡せない）。Guard・Context・上限は変えない。
+   */
+  readonly launchRunBrowser?: AuditRunDependencies['launchBrowser'];
 }
 
 /**
@@ -86,6 +101,8 @@ function runAutomatedLoginWithCredentials(
     config: request.config,
     setup,
     approvedTestOrigins: request.approvedTestOrigins,
+    // T36c: スクリプトで送るログインの口に渡す、プロファイルの承認したサービスの Origin。
+    approvedServiceOrigins: request.approvedServiceOrigins,
     expectedCredentialRevision: automatedLogin.credentialRevision,
     readCredentialMetadata: async () => credentialStore().readMetadata(setup.profileId),
     readCredential: async () => {
@@ -143,11 +160,15 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
     channel,
     stderr: streamOutput(target.stderr),
     exit: (code) => target.exit(code),
-    loadConfig,
+    // FM-2: テストだけの口（`hideJobBrowser`）があれば、表示の設定によらず headless の上書きで読む。
+    loadConfig: options.hideJobBrowser === true ? (path) => loadConfig(path, HEADLESS_CONFIG_OVERRIDES) : loadConfig,
     // ターゲット JSON は、`loadConfig` と同じく cwd（リポジトリの root）から読む。
     readTargetConfig: (path) => readFile(path),
     executeAuditRun,
-    runDependencies: PRODUCTION_RUN_DEPENDENCIES,
+    // FM2d: テストだけの口（`launchRunBrowser`）があれば、Run の Browser の起動だけを替える。
+    runDependencies: options.launchRunBrowser === undefined
+      ? PRODUCTION_RUN_DEPENDENCIES
+      : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser },
     runLoginStage: (request) => runLoginStage(request, loginStage),
     runAutomatedLoginStage: (request) => runAutomatedLoginWithCredentials(request, automatedLoginStage, openCredentialStore),
     // T27d: 発見のジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium。`runDependencies.launchBrowser`）。
@@ -155,6 +176,8 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
     // T27e: READ の確かめのジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium）。
     executeReadCheck: executeReadCheckRun,
     executeWriteCreate: executeWriteCreateRun,
+    // T43c: 入口の確かめのジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium。ログインの段を通さない）。
+    executeEntryCheck: executeEntryCheckRun,
   });
   registerInterruptHandlers(target, worker.interrupt);
   target.on('uncaughtException', worker.failUnexpectedly);

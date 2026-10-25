@@ -11,12 +11,13 @@
 // - 秘密の目印（セッションの値、資格情報、CSRF、readonly の値）を探す場所: 管理データのファイルと WAL、IPC、ワーカーの出力、ジョブの値、出力先の
 //   すべてのファイル。
 // 作業のディレクトリ（リポジトリの root の代わり）、管理データ、出力先は、一時のフォルダだけ。サーバは 127.0.0.1 だけで待ち受ける。
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect } from 'vitest';
+import { wait as sleep } from '../../src/core/deadline.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import { approvalExternalFactsOf } from '../../src/control/approval-external-facts.js';
 import {
@@ -31,7 +32,8 @@ import {
 } from '../../src/control/approval/scenario-store.js';
 import type { ScenarioLimits, ScenarioVerification } from '../../src/control/approval/scenario-contracts.js';
 import type { ScenarioDraftInput } from '../../src/control/approval/scenario-policy.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from './auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION } from '../../src/control/contracts.js';
 import type { RuleSetContent } from '../../src/control/data-rules/rule-contracts.js';
 import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js';
@@ -48,7 +50,7 @@ import { validateReadCheckDefinition } from '../../src/control/read-check-policy
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
-import { createProfile, getProfile } from '../../src/control/store/profile-store.js';
+import { createProfile, getProfile, saveProfileDisplaySettings } from '../../src/control/store/profile-store.js';
 import { validateWorkerToParentMessage, type WorkerToParentMessage } from '../../src/control/worker-protocol.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -60,6 +62,8 @@ import { databaseFilePlaces, filesUnder, placesWithMarkers } from './leak-places
 import { descendantsOf, listProcesses } from './process-tree.js';
 import { cliTargetConfig } from './run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from './temporary-build.js';
+import { testLoginWorkerEntrySource } from './test-login-worker-entry.js';
+import { STDIN_CREDENTIALS_EXPRESSION, STDIN_CREDENTIALS_PRELUDE, createRecordingFork } from './worker-fork-support.js';
 import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, writeSiteEditPathOf, writeSiteRecordPathOf, type WriteSite } from './write-site-fixture.js';
 
 const WAIT_LIMIT_MS = 180_000;
@@ -100,34 +104,16 @@ export const WRITE_JOB_VERIFICATION: ScenarioVerification = Object.freeze<Scenar
 });
 
 /**
- * テストだけの入口（一時のビルドの root に書く）。`__TIMEOUT__` を、テストが値に置き換える。資格情報は、ファイルにも環境変数にも書かず、
- * 標準入力から受ける（`[セレクタ, 値]` の組と、送るボタンのセレクタ）。
+ * テストだけの入口（一時のビルドの root に書く）。CC-061 の後半（PRE42-CC の組 6a）: 本文は、共用の `testLoginWorkerEntrySource`（CLI の起動の
+ * 設定の headless のログイン用の Browser）。資格情報は、ファイルにも環境変数にも書かず、標準入力から受ける（`[セレクタ, 値]` の組と、送るボタンの
+ * セレクタ。`worker-fork-support.ts` の準備）。
  */
-const ENTRY_SOURCE = String.raw`
-import { chromium } from 'playwright';
-import { chromiumLaunchOptions } from './dist/browser/chromium-launch.js';
-import { runAuditWorkerProcess } from './dist/worker/audit-worker-process.js';
-const LOGIN_TIMEOUT_MS = __TIMEOUT__;
-const credentials = new Promise((resolve) => {
-  let text = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => { text += chunk; });
-  process.stdin.on('end', () => resolve(JSON.parse(text)));
+const ENTRY_SOURCE = testLoginWorkerEntrySource({
+  distPrefix: './dist/',
+  loginTimeoutMs: LOGIN_TIMEOUT_MS,
+  prelude: STDIN_CREDENTIALS_PRELUDE,
+  credentialsExpression: STDIN_CREDENTIALS_EXPRESSION,
 });
-runAuditWorkerProcess(process, {
-  loginStage: {
-    launchLoginBrowser: () => chromium.launch(chromiumLaunchOptions({ headless: true })),
-    loginTimeoutMs: LOGIN_TIMEOUT_MS,
-    onLoginPageReady: async (page) => {
-      const { fields, submit } = await credentials;
-      for (const [selector, value] of fields) {
-        await page.fill(selector, value);
-      }
-      await page.click(submit);
-    },
-  },
-});
-`;
 
 /** シナリオの準備の選択肢。 */
 export interface WriteJobScenarioOptions {
@@ -240,8 +226,6 @@ export interface WriteJobHarness {
   close(): Promise<void>;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-
 /** 準備をする（一時のビルド、fixture のサイト、管理データ、プロファイルと認証の設定、ジョブの管理）。 */
 export async function startWriteJobHarness(options: { readonly profileId: string; readonly clockOffsetMs?: number }): Promise<WriteJobHarness> {
   const { profileId } = options;
@@ -276,8 +260,10 @@ export async function startWriteJobHarness(options: { readonly profileId: string
     approvedTestOrigins: [site.origin],
     environmentEvidenceRef: `evidence/${profileId}/isolation-check-1`,
   }, { resolveContext }).ok).toBe(true);
+  // FM-2: テストのジョブのブラウザは今どおり headless（プロファイルの表示の設定を切る。既定は表示）。
+  expect(saveProfileDisplaySettings(database, profileId, { showJobBrowser: false }).ok).toBe(true);
   const setup: AuthSetup = {
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId,
     profileRevision: MIN_PROFILE_REVISION,
     loginStartUrl: `${site.origin}${WRITE_SITE_PATHS.login}`,
@@ -292,24 +278,24 @@ export async function startWriteJobHarness(options: { readonly profileId: string
   };
   expect(saveAuthSetup(database, setup, { resolveContext }).ok).toBe(true);
   const entry = join(build.rootDirectory, `${Date.now()}-${ENTRY_FILE_NAME}`);
-  await writeFile(entry, ENTRY_SOURCE.split('__TIMEOUT__').join(JSON.stringify(LOGIN_TIMEOUT_MS)), 'utf8');
+  await writeFile(entry, ENTRY_SOURCE, 'utf8');
   const fields: [string, string][] = [];
   await site.fillCredentials(async (selector, value) => {
     fields.push([selector, value]);
   });
   const manualCredentials = JSON.stringify({ fields, submit: WRITE_SITE_LOGIN_FIELDS.submit });
-  const recordingFork: AuditWorkerForker = (_modulePath, args, forkOptions: ForkOptions) => {
-    const child = fork(entry, [...args], { ...forkOptions, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
-    children.push(child);
-    if (child.pid !== undefined) {
-      workerPids.push(child.pid);
-    }
-    child.on('message', (message: unknown) => received.push(message));
-    child.stdout?.setEncoding('utf8').on('data', (chunk: string) => { workerOutput += chunk; });
-    child.stderr?.setEncoding('utf8').on('data', (chunk: string) => { workerOutput += chunk; });
-    child.stdin?.end(manualCredentials);
-    return child;
-  };
+  const recordingFork: AuditWorkerForker = createRecordingFork({
+    entry,
+    stdinText: () => manualCredentials,
+    onChild: (child) => {
+      children.push(child);
+      if (child.pid !== undefined) {
+        workerPids.push(child.pid);
+      }
+    },
+    onReceived: (message) => received.push(message),
+    onOutput: (chunk) => { workerOutput += chunk; },
+  });
   const managerOf = (): AuditJobManager => createAuditJobManager({
     database,
     repositoryRoot: directory,

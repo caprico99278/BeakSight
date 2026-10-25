@@ -1,17 +1,17 @@
 import { Link, createFileRoute } from '@tanstack/react-router';
 import { formatDateTime } from '../../../../src/presentation/format.js';
-import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_LOGIN_CHECK_TEXT, LOCAL_UI_TEXT } from '../../../../src/presentation/messages.js';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_LOGIN_CHECK_TEXT, LOCAL_UI_NEXT_STEP_TEXT, LOCAL_UI_TEXT } from '../../../../src/presentation/messages.js';
 import { PageFrame } from '../components/PageFrame';
 import { LastRunCell } from '../components/LastRunCell';
 import {
   auditModeDisplay,
   authStrategyDisplay,
   environmentDisplay,
-  isExecutableProfile,
   profileStatusDisplay,
   toneClass,
   usesAutomatedLogin,
 } from '../display/labels';
+import { auditStartUnavailableReasonOf } from '../display/next-steps';
 import { listAuditJobsFn, type AuditJobRowView } from '../server/audit-job-functions';
 import { listProfilesFn } from '../server/profile-functions';
 
@@ -68,7 +68,9 @@ function ProfileListPage() {
                 {profiles.map((row) => {
                   const status = profileStatusDisplay(row.status);
                   // T25e: 今実行できるモードと認証の方式の組み合わせだけ（認証の設定の有無は、開始の画面が理由と案内を出す）。
-                  const startable = row.status === 'ACTIVE' && isExecutableProfile(row.mode, row.auth);
+                  // T43a（Task 43 の設計書 4.1）: 始められない行は、ボタンを黙って消さずに、理由を短く出す（判定は `next-steps.ts` の
+                  // `auditStartUnavailableReasonOf`。`execution-policy.ts` の判定を呼ぶだけ）。
+                  const unavailableReason = auditStartUnavailableReasonOf(row.status, row.mode, row.auth);
                   return (
                     <tr key={row.profileId} data-profile-id={row.profileId}>
                       <th scope="row" className="nowrap">
@@ -84,7 +86,11 @@ function ProfileListPage() {
                       <td>{formatDateTime(row.updatedAt)}</td>
                       <td className="cell-wrap" data-testid="last-run">
                         <LastRunCell job={lastJobs.get(row.profileId) ?? null} />
-                        {startable ? (
+                        {unavailableReason !== null ? (
+                          <p className="cell-action muted" data-testid="profile-start-unavailable" data-reason={unavailableReason}>
+                            {LOCAL_UI_NEXT_STEP_TEXT.auditStartUnavailable[unavailableReason]}
+                          </p>
+                        ) : (
                           <p className="cell-action">
                             <Link to="/start/$profileId" params={{ profileId: row.profileId }} className="button button--primary">
                               {LOCAL_UI_AUDIT_TEXT.profileList.startAudit}
@@ -99,7 +105,7 @@ function ProfileListPage() {
                               </>
                             ) : null}
                           </p>
-                        ) : null}
+                        )}
                       </td>
                     </tr>
                   );

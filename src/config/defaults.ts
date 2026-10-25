@@ -1,3 +1,4 @@
+import { DEFAULT_AUDIT_SEND_POLICY } from '../core/audit-send-policy.js';
 import type { AuditConfigDefaults } from './types.js';
 
 export const DEFAULT_CONFIG: AuditConfigDefaults = {
@@ -32,6 +33,8 @@ export const DEFAULT_CONFIG: AuditConfigDefaults = {
     accessibility: true,
     interactions: true,
     screenshots: true,
+    // AS-b: 監査の段の送信の扱い（既定は読み取りだけ）。
+    sendPolicy: DEFAULT_AUDIT_SEND_POLICY,
   },
   output: {
     directory: 'artifacts',

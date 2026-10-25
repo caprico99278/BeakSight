@@ -25,7 +25,7 @@ export interface StandardReaders {
   readonly standardGetter: <T = unknown>(prototype: object, name: string) => (target: unknown) => T;
   /**
    * `standardGetter` と同じく、呼んだ時点で getter を取り出すが、getter がなければ例外にせず、返す関数が `undefined` を返す
-   * （今までの `discover-links.ts` の `shadowRootGetter?.call(…)` と同じ）。
+   * （今までの `discover-links.ts` の `shadowRootGetter?.call(…)` と同じ。`optionalOpenRoots` が使う）。
    */
   readonly optionalStandardGetter: <T = unknown>(prototype: object, name: string) => (target: unknown) => T | undefined;
   /**
@@ -42,6 +42,29 @@ export interface StandardReaders {
   readonly elementPathOf: (element: Element) => number[] | null;
   /** 位置（`elementPathOf` の並び）の要素。なければ `null`（空の並びも `null`）。 */
   readonly elementAtPath: (path: readonly number[]) => Element | null;
+  /**
+   * CC-099（T37c fix round 1）: 文書と、その中の open な shadow root（入れ子を含む。文書の順）。closed な shadow root はページの中から見えない。
+   * ログインの form の事前の確かめと、入口の確かめの CSS の数え方が共有する（`queryAllInRoots` と組みで使う）。
+   */
+  readonly openRoots: () => (Document | ShadowRoot)[];
+  /**
+   * PRE42-CC 組 5b（CC-099）: `openRoots` と同じ根を同じ順で返すが、`Element.prototype` の `shadowRoot` の標準の getter がない（ページの JS が
+   * 消した）ときは、例外にせず shadow root を飛ばす（文書だけになる）。link の取り出し（`src/crawl/discover-links.ts`）が使う（細工したページで
+   * 発見が止まらない。今までの link の取り出しの振る舞い）。
+   */
+  readonly optionalOpenRoots: () => (Document | ShadowRoot)[];
+  /** CC-099: `openRoots` の根ごとに CSS で探した要素（根の順）。CSS が標準の CSS でなければ例外。 */
+  readonly queryAllInRoots: (roots: readonly (Document | ShadowRoot)[], selector: string) => Node[];
+  /**
+   * CC-099: 要素の祖先（shadow root では host へ移る）に、`href` のある `a`・`area` があるか（押すとページが移りうる）。移動の要素の名前と `href` 属性で
+   * 見る（リンクの取り出しの owner の書き方は使わない。GATE-ARCH03）。ログインの form の事前の確かめと、入口の確かめの送信の要素の受け方が共有する。
+   */
+  readonly hasLinkAncestor: (node: Node) => boolean;
+  /**
+   * T43d fix round 1: 要素が見えるか（`checkVisibility` があれば、不透明度と `visibility` を含めて見え、さらに枠の幅と高さが 0 より大きい）。入口の確かめの
+   * 欄の読み取り（`src/worker/entry-check-page.ts`）と、ログインの段の観察（`src/worker/login-stage-observation.ts`）が共有する。
+   */
+  readonly isVisible: (element: Element) => boolean;
 }
 
 /**
@@ -109,7 +132,68 @@ function createStandardReadersInPage(): StandardReaders {
     }
     return current;
   };
-  return { standardGetter, optionalStandardGetter, standardProperty, documentProperty, elementPathOf, elementAtPath };
+  // 根の取り出しの本体（`openRoots`・`optionalOpenRoots` が、shadow root の読み方だけを変えて共有する）。
+  const openRootsWith = (shadowRootOf: (element: Node) => ShadowRoot | null): (Document | ShadowRoot)[] => {
+    const roots: (Document | ShadowRoot)[] = [document];
+    const walk = (root: Document | ShadowRoot): void => {
+      const walker = Document.prototype.createTreeWalker.call(document, root, NodeFilter.SHOW_ELEMENT);
+      for (let node = TreeWalker.prototype.nextNode.call(walker); node !== null; node = TreeWalker.prototype.nextNode.call(walker)) {
+        const shadowRoot = shadowRootOf(node);
+        if (shadowRoot !== null) {
+          roots.push(shadowRoot);
+          walk(shadowRoot);
+        }
+      }
+    };
+    walk(document);
+    return roots;
+  };
+  const openRoots = (): (Document | ShadowRoot)[] => openRootsWith(standardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot'));
+  const optionalOpenRoots = (): (Document | ShadowRoot)[] => {
+    const shadowRootGetterOf = optionalStandardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
+    return openRootsWith((element) => shadowRootGetterOf(element) ?? null);
+  };
+  const queryAllInRoots = (roots: readonly (Document | ShadowRoot)[], selector: string): Node[] => {
+    const nodeListLengthOf = standardGetter<number>(NodeList.prototype, 'length');
+    const found: Node[] = [];
+    for (let index = 0; index < roots.length; index += 1) {
+      const root = roots[index];
+      const list = root instanceof Document
+        ? Document.prototype.querySelectorAll.call(root, selector)
+        : DocumentFragment.prototype.querySelectorAll.call(root as ShadowRoot, selector);
+      for (let item = 0; item < nodeListLengthOf(list); item += 1) {
+        const node = NodeList.prototype.item.call(list, item);
+        if (node !== null) found.push(node);
+      }
+    }
+    return found;
+  };
+  const hasLinkAncestor = (node: Node): boolean => {
+    const parentNodeOf = standardGetter<Node | null>(Node.prototype, 'parentNode');
+    const hostOf = standardGetter<Element>(ShadowRoot.prototype, 'host');
+    const localNameOf = standardGetter<unknown>(Element.prototype, 'localName');
+    for (let current: Node | null = parentNodeOf(node); current !== null;) {
+      const name = current instanceof Element ? localNameOf(current) : '';
+      if ((name === 'a' || name === 'area') && current instanceof Element && Element.prototype.hasAttribute.call(current, 'href')) return true;
+      current = current instanceof ShadowRoot ? hostOf(current) : parentNodeOf(current);
+    }
+    return false;
+  };
+  const isVisible = (element: Element): boolean => {
+    const checkVisibility = Element.prototype.checkVisibility;
+    if (typeof checkVisibility === 'function'
+      && !checkVisibility.call(element, { checkOpacity: true, checkVisibilityCSS: true, opacityProperty: true, visibilityProperty: true })) {
+      return false;
+    }
+    const rect = Element.prototype.getBoundingClientRect.call(element);
+    const width: unknown = standardProperty(DOMRectReadOnly.prototype, 'width', rect);
+    const height: unknown = standardProperty(DOMRectReadOnly.prototype, 'height', rect);
+    return typeof width === 'number' && typeof height === 'number' && width > 0 && height > 0;
+  };
+  return {
+    standardGetter, optionalStandardGetter, standardProperty, documentProperty, elementPathOf, elementAtPath, openRoots, optionalOpenRoots, queryAllInRoots,
+    hasLinkAncestor, isVisible,
+  };
 }
 
 /** 部品を作る関数の本文（モジュールを読み込んだときに 1 回だけ文字列にする）。 */

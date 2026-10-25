@@ -19,13 +19,26 @@
 //   digest。CREATE と、UPDATE の指定の前に保存した版は、どれも null）を一覧の末尾に足し、印の版を `/3` に上げた（今までの承認はすべて再承認になる。
 //   意図した変化）。保つ欄は、並びの順に依らない（並べてから求める）。UPDATE の承認は、型にした識別の digest に縛る（有効性の判定は
 //   `approval-validity.ts`）。
+// - T38c（Task 38 の設計書 3.3、5 章の 2、7 章の履歴）: 送り方と API の指定の 9 項目（送り方、型の digest、要求の型（method、Origin の文字列、path の
+//   型、query の名前、媒体の型、`Prefer`）、鍵と欄の対応、ページが決める鍵、許すヘッダの名前、filter の名前、登録の ID の取り方、台帳の参照）を一覧の
+//   末尾に足し、印の版を `/4` に上げた。FORM のシナリオは送り方 `FORM` で、API の項目はどれも null（ほかの項目は今のまま。v4 の印で求め直す）。
+//   値は持たない（鍵・型・欄の識別・名前だけ）。並びの順に依らない所（query の名前、`Prefer`、鍵と欄、ページが決める鍵、ヘッダの名前）は並べてから
+//   求める。v3 で承認した記録は、確かめ直しで digest が合わないので、縛った値がどれも同じなら `SCENARIO_REVISION_CHANGED`（記録の書き換えと同じ扱い）
+//   になり、再承認が要る（意図した変化。`approval-validity.ts`）。
+// - T41a（Task 41 の設計書 3.1）: v4 は未公開なので、印の版を上げずに、保つ鍵の項目（`apiKeptKeys`。登録は null）を一覧の末尾に足した。受けたページが
+//   決める鍵の欄の識別は `apiPageKeys` の 1 件に、画面の path を型にした識別の digest は `apiLedger` に入れる（どちらも UPDATE だけ。登録の値は変えない）。
+import { apiFieldIdentityValueOf } from '../../core/api-field-identity.js';
 import { createSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { compareCodeUnits } from '../../core/text.js';
 import {
   SIDE_EFFECT_CONFIRMATIONS,
+  scenarioTransportOf,
   type ApprovalBoundFacts,
   type ReadCheckReference,
+  type ScenarioApiKeyField,
+  type ScenarioApiPageKey,
+  type ScenarioApiSpec,
   type ScenarioRecordIdSpec,
   type ScenarioResultCondition,
   type ScenarioRevision,
@@ -33,7 +46,7 @@ import {
 } from './scenario-contracts.js';
 
 /** 承認の digest の入力の形の印（版つき）。 */
-export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/3';
+export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/4';
 
 /** 承認の digest が縛る、シナリオの外の事実（承認の時点の値）。 */
 export interface ApprovalDigestFacts {
@@ -59,6 +72,8 @@ export type ApprovalDigestScenario = Pick<
   | 'inputRuleReference'
   | 'verification'
   | 'update'
+  | 'transport'
+  | 'api'
 >;
 
 /**
@@ -93,6 +108,18 @@ export const APPROVAL_DIGEST_ITEMS = Object.freeze([
   'updateActionPathTemplate',
   'updateKeepFieldNames',
   'updateTemplatedIdentityDigest',
+  // T38c: 送り方と API の指定（FORM のシナリオは送り方 `FORM` で、ほかは null）。
+  'transport',
+  'apiShapeDigest',
+  'apiRequest',
+  'apiKeyFields',
+  'apiPageKeys',
+  'apiHeaderNames',
+  'apiFilterName',
+  'apiRecordId',
+  'apiLedger',
+  // T41a: API の UPDATE の保つ鍵（v4 は未公開なので、印の版を上げずに足した）。
+  'apiKeptKeys',
 ] as const);
 export type ApprovalDigestItem = (typeof APPROVAL_DIGEST_ITEMS)[number];
 
@@ -137,6 +164,46 @@ const verificationReadEntryOf = (scenario: ApprovalDigestScenario): ApprovalDige
   ];
 };
 
+/** 鍵と欄の対応 1 件の形（`[鍵, JSON の型, 欄の識別の種類, 名前か CSS, 欄の型]` の JSON。T38c。欄の型は T38R2-fix の M-2）。 */
+const apiKeyFieldEntryOf = ({ key, type, field, fieldType }: ScenarioApiKeyField): string =>
+  JSON.stringify([key, type, field.kind, apiFieldIdentityValueOf(field), fieldType]);
+
+/** 並べ替えた写し（UTF-16 のコード単位の順）。 */
+const sortedOf = (values: readonly string[]): readonly string[] => [...values].sort(compareCodeUnits);
+
+/**
+ * ページが決める鍵 1 件の形（`[鍵, JSON の型]` の JSON。T41a: UPDATE の欄の識別を持つ鍵は `[鍵, JSON の型, 欄の識別の種類, 名前か CSS]`。登録の形は
+ * 変えない）。
+ */
+const apiPageKeyEntryOf = ({ key, type, field }: ScenarioApiPageKey): string =>
+  JSON.stringify(field === undefined ? [key, type] : [key, type, field.kind, apiFieldIdentityValueOf(field)]);
+
+/** API の指定の項目の値（T38c。API の指定がなければ、どれも null）。 */
+const apiEntriesOf = (api: ScenarioApiSpec | undefined): Pick<Record<ApprovalDigestItem, ApprovalDigestValue>,
+  'apiShapeDigest' | 'apiRequest' | 'apiKeyFields' | 'apiPageKeys' | 'apiHeaderNames' | 'apiFilterName' | 'apiRecordId' | 'apiLedger' | 'apiKeptKeys'> => {
+  if (api === undefined) {
+    return {
+      apiShapeDigest: null, apiRequest: null, apiKeyFields: null, apiPageKeys: null, apiHeaderNames: null, apiFilterName: null, apiRecordId: null, apiLedger: null,
+      apiKeptKeys: null,
+    };
+  }
+  const { request, recordId, ledger, keptKeys, templatedIdentityDigest } = api;
+  return {
+    apiShapeDigest: api.shapeDigest,
+    apiRequest: [request.method, request.origin, request.pathShape, sortedOf(request.queryNames), request.contentType, sortedOf(request.prefer)],
+    apiKeyFields: sortedOf(api.keyFields.map(apiKeyFieldEntryOf)),
+    apiPageKeys: sortedOf(api.pageKeys.map(apiPageKeyEntryOf)),
+    apiHeaderNames: sortedOf(api.headerNames),
+    apiFilterName: api.filterName,
+    apiRecordId: recordId === null ? null : [recordId.source, recordId.key],
+    // T41a: UPDATE の画面の path を型にした識別の digest は、台帳の画面の path の型から決まるので、台帳の参照の項目に入れる（持たなければ今の形）。
+    apiLedger: ledger === null ? null : [ledger.targetCreateScenarioId, ledger.formPathTemplate,
+      ...(templatedIdentityDigest === undefined ? [] : [templatedIdentityDigest])],
+    // T41a: 保つ鍵（鍵と欄の対応と同じ形。登録は持たないので null）。
+    apiKeptKeys: keptKeys === undefined ? null : sortedOf(keptKeys.map(apiKeyFieldEntryOf)),
+  };
+};
+
 /**
  * 承認の digest の項目ごとの値（純粋。入力を変えない。凍結。T28e で `computeApprovalDigest` から取り出した）。並びの順に依らない所は並べ替えた値。
  * 鍵の順は `APPROVAL_DIGEST_ITEMS` の順。
@@ -156,7 +223,8 @@ export const approvalDigestEntriesOf = (
     kind: scenario.kind,
     candidateIdentityDigest: scenario.candidate.identityDigest,
     candidateRuleDigest: scenario.candidate.ruleDigest,
-    request: [request.formMethod, request.methodOverride, request.origin, request.path, request.enctype],
+    // T38b: API のシナリオは form の要求の形を持たない（null）。API の要求の型は `apiRequest`（T38c）。
+    request: request === null ? null : [request.formMethod, request.methodOverride, request.origin, request.path, request.enctype],
     fieldNames: [...scenario.fieldNames].sort(compareCodeUnits),
     sideEffectConfirmations: SIDE_EFFECT_CONFIRMATIONS.map((item) => scenario.sideEffectConfirmations[item]),
     limits: [limits.maxCreatesPerRun, limits.maxCumulativeCreates],
@@ -172,6 +240,8 @@ export const approvalDigestEntriesOf = (
     updateActionPathTemplate: update?.actionPathTemplate ?? null,
     updateKeepFieldNames: update === null ? null : [...update.keepFieldNames].sort(compareCodeUnits),
     updateTemplatedIdentityDigest: update?.templatedIdentityDigest ?? null,
+    transport: scenarioTransportOf(scenario),
+    ...apiEntriesOf(scenario.api),
   };
   return deepFreeze(entries);
 };

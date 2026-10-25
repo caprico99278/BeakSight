@@ -15,12 +15,14 @@ import { runCli } from '../../src/cli/main.js';
 import type { CliOutput } from '../../src/cli/output-stream.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { RUN_ARTIFACT_FILE_NAMES } from '../../src/core/artifact-layout.js';
+import { findingsOfAuditArtifact } from '../../src/core/audit-artifact-findings.js';
 import type { AuditRunResult, Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import { RunCoordinator, type RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { launchHeadlessChromium } from './chromium.js';
+import { READ_METHODS } from './leak-places.js';
 import { createTestConfig, type TestConfigOverrides } from './test-config.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -217,15 +219,19 @@ export async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, 'utf8')) as unknown;
 }
 
-/** Run のディレクトリの audit.json（ページの結果と、Run の Finding の一覧）を読む。 */
+/**
+ * Run のディレクトリの audit.json（ページの結果と、Run の Finding の一覧）を読む。T44f: audit.json の最上位の `findings` はページに入っていない Finding だけ
+ * なので、`findings` は、読む側の決まり（`findingsOfAuditArtifact`）で、Run のすべての Finding にして返す。
+ */
 export async function readRunAudit(runDirectory: string): Promise<{
   readonly pages: readonly PageAuditResult[];
   readonly findings: readonly Finding[];
 }> {
-  return await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit)) as {
+  const audit = await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit)) as {
     readonly pages: readonly PageAuditResult[];
     readonly findings: readonly Finding[];
   };
+  return { pages: audit.pages, findings: findingsOfAuditArtifact(audit) };
 }
 
 /** 書き出した artifact の1つ（ZIP の中のファイルは `<ZIP の相対パス>!/<項目の名前>`）。 */
@@ -328,5 +334,5 @@ export function expectOnlyReadRequests(
     webSocketUpgrade: 0,
     download: 0,
   });
-  expect(observations.every(({ method }) => method === 'GET' || method === 'HEAD')).toBe(true);
+  expect(observations.every(({ method }) => READ_METHODS.has(method))).toBe(true);
 }

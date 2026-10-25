@@ -1,0 +1,13 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-login-stage-row-register:1",
+  "description": "Local UI Server Function input (FM-1; fewer manual steps design 2.1): add one row of the login stage table of a job to the auth setup on the spot, after the confirmation dialog. The row is chosen as in ui-login-stage-row-key; expectedProfileRevision is the profile revision the dialog showed. The server builds the auth setup again from the job record and saves it with saveProfileAndAuthSetup (the profile revision advances).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jobId", "passed", "index", "expectedProfileRevision"],
+  "properties": {
+    "jobId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" },
+    "passed": { "type": "boolean" },
+    "index": { "type": "integer", "minimum": 0, "maximum": 7 },
+    "expectedProfileRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+  }
+}

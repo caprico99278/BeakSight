@@ -10,7 +10,7 @@
 // - 置き場所: 組み立てる形（契約）の owner の `action-contracts.ts` の隣（`src/control/actions/`）。承認の判定の部品（`src/control/approval/`）に置くと、
 //   報告の形が承認の SSOT に入り込むため。管理データ・画面・ブラウザ・ワーカーに触れない。
 import { deepFreeze } from '../../core/immutable.js';
-import type { ApprovalReceipt, ApprovalReceiptRecord, ScenarioKind, ScenarioRevision } from '../approval/scenario-contracts.js';
+import { UPDATE_SCENARIO_KIND, type ApprovalReceipt, type ApprovalReceiptRecord, type ScenarioKind, type ScenarioRevision } from '../approval/scenario-contracts.js';
 import {
   AUTOMATED_ACTIONS,
   HUMAN_DECISIONS,
@@ -21,8 +21,8 @@ import {
   type HumanDecision,
 } from './action-contracts.js';
 
-/** UPDATE のシナリオの種類（UPDATE だけの項目を含める）。 */
-const UPDATE_KIND = 'UPDATE' satisfies ScenarioKind;
+/** UPDATE のシナリオの種類（UPDATE だけの項目を含める。CC-106: 種類の一覧の owner の名前つきの定数）。 */
+const UPDATE_KIND = UPDATE_SCENARIO_KIND;
 /** 承認の記録の種類（承認と撤回）。 */
 const APPROVAL_RECEIPT_KIND = 'APPROVAL' satisfies ApprovalReceiptRecord['kind'];
 const REVOCATION_RECEIPT_KIND = 'REVOCATION' satisfies ApprovalReceiptRecord['kind'];

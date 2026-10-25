@@ -3,7 +3,8 @@
  * - 画面から（Server Function で）監査を 1 回動かし（スクリーンショットあり。127.0.0.1 の fixture のサイト）、その Run のディレクトリの成果物を、
  *   ビルドした画面のサーバ（一時の root）から取り出す。
  * - 許可の一覧のファイル（`run.json`、`audit.json`、`report.html`、バンドルの ZIP、`audit.json` が参照する `page.json` とスクリーンショット）は
- *   配られ、JSON と ZIP は `Content-Disposition: attachment`（ASCII の決まった名前）、`report.html` は script を動かさない CSP。
+ *   配られ、JSON と ZIP は `Content-Disposition: attachment`（ASCII の決まった名前。PRE42-BN: 日本語などの名前のバンドルは `filename*` も）、
+ *   `report.html` は script を動かさない CSP。
  * - 一覧の外（`checkpoint/` の中、参照されていないファイル、`..`、符号化、Windows の別名とデバイス名、junction）は 404。cookie なしは 401。
  * - Chromium（headless）で `report.html` を開くと、書き足した script も事象の属性も動かず、style は動き、レポートの中の相対のリンク
  *   （スクリーンショット）は同じ Server Routes で開ける。外部への要求は 0。
@@ -31,6 +32,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 
 /** HTTP の状態。 */
 const STATUS = Object.freeze({ OK: 200, UNAUTHORIZED: 401, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405 });
@@ -93,21 +95,19 @@ beforeAll(async () => {
   expect((await call('createProfileFn', 'POST', { profile: publicProfileDocument(PROFILE_ID, targetConfigPath) })).value).toMatchObject({ ok: true });
   const start = (await call('startAuditJobFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 1, startNew: true })).value as { jobId: string };
   jobId = start.jobId;
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  let job: JobDetail | null = null;
-  for (;;) {
-    job = (await call('getAuditJobFn', 'GET', { jobId })).value as JobDetail | null;
-    if (job?.active === true) {
-      descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    }
-    if (job !== null && !job.active) {
-      break;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`監査が終わらなかった: ${JSON.stringify(job)}`);
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
+  // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助（上限と間隔は前と同じ）。読むたびに、動いている間は画面のサーバの子孫を記録する。
+  const job = await waitForJobViaServerFunctions(
+    async (id) => {
+      const current = (await call('getAuditJobFn', 'GET', { jobId: id })).value as JobDetail | null;
+      if (current?.active === true) {
+        descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+      }
+      return current;
+    },
+    jobId,
+    (current) => !current.active,
+    { limitMs: WAIT_LIMIT_MS, stepMs: WAIT_POLL_MS },
+  );
   expect(job.state).toBe('FINISHED');
   runDirectory = `${root.root}/${outputDirectoryOf(PROFILE_ID)}/${job.runId ?? ''}`;
   // audit.json が参照するスクリーンショットと page.json を 1 つずつ選ぶ。
@@ -167,13 +167,48 @@ describe('artifact routes: the allowed files', () => {
     expect(response.headers['x-beaksight-artifact-style-sha256']).toBeUndefined();
   });
 
-  it('serves the bundle ZIP as an attachment under its own ASCII name', async () => {
+  it('serves the bundle ZIP as an attachment under its own name, with the profile name in it (PRE42-BN)', async () => {
     const bundle = readdirSync(runDirectory).find((name) => name.endsWith('.zip')) ?? '';
-    expect(bundle).toMatch(/^beaksight-audit-bundle_\d{14}\.zip$/u);
+    // PRE42-BN: 画面のジョブのバンドルの名前は、プロファイルの名前（profileId）を含む。
+    expect(bundle).toMatch(new RegExp(`^beaksight-audit-bundle_${PROFILE_ID}_\\d{14}\\.zip$`, 'u'));
     const response = await getArtifact(bundle);
     expect(response.status).toBe(STATUS.OK);
     expect(response.headers['content-type']).toBe('application/zip');
     expect(response.headers['content-disposition']).toBe(`attachment; filename="${bundle}"`);
+    const ids = readServerFunctionIds(`${root?.root ?? ''}/apps/local-ui/dist/server/server.js`);
+    const detail = (await callServerFunction({ port: started().port, origin: started().origin, cookie, ids }, 'getAuditJobFn', 'GET', { jobId }))
+      .value as JobDetail;
+    expect(detail.artifacts.find((artifact) => artifact.kind === 'BUNDLE')?.relativePath).toBe(bundle);
+  });
+
+  // PRE42-BN: 日本語などの名前のバンドルは、`filename*`（UTF-8 の percent-encode。RFC 5987 の attr-char の外の `'()` も符号化）で名前を渡し、
+  // `filename` には ASCII の代わりの名前を置く。一覧は、名前の順ではなく、日時の新しい順の最初を示す。
+  it('serves a bundle with a Japanese name with filename* in UTF-8, and lists the newest bundle by its time', async () => {
+    const bundle = readdirSync(runDirectory).find((name) => name.endsWith('.zip')) ?? '';
+    const digits = /_(\d{14})\.zip$/u.exec(bundle)?.[1] ?? '';
+    const olderDigits = String(Number(digits.slice(0, 4)) - 1) + digits.slice(4);
+    const japanese = `beaksight-audit-bundle_管理画面 (1)_${olderDigits}.zip`;
+    const sortsLast = `beaksight-audit-bundle_zzz_${olderDigits}.zip`;
+    const bytes = readFileSync(`${runDirectory}/${bundle}`);
+    writeFileSync(`${runDirectory}/${japanese}`, bytes);
+    writeFileSync(`${runDirectory}/${sortsLast}`, bytes);
+    try {
+      const response = await getArtifact(encodeURIComponent(japanese));
+      expect(response.status).toBe(STATUS.OK);
+      expect(response.headers['content-type']).toBe('application/zip');
+      expect(response.headers['content-disposition']).toBe(
+        `attachment; filename="beaksight-audit-bundle_______1__${olderDigits}.zip"; `
+        + `filename*=UTF-8''beaksight-audit-bundle_%E7%AE%A1%E7%90%86%E7%94%BB%E9%9D%A2%20%281%29_${olderDigits}.zip`,
+      );
+      expect(response.body.length).toBeGreaterThan(0);
+      const ids = readServerFunctionIds(`${root?.root ?? ''}/apps/local-ui/dist/server/server.js`);
+      const detail = (await callServerFunction({ port: started().port, origin: started().origin, cookie, ids }, 'getAuditJobFn', 'GET', { jobId }))
+        .value as JobDetail;
+      expect(detail.artifacts.find((artifact) => artifact.kind === 'BUNDLE')?.relativePath).toBe(bundle);
+    } finally {
+      unlinkSync(`${runDirectory}/${japanese}`);
+      unlinkSync(`${runDirectory}/${sortsLast}`);
+    }
   });
 
   it('serves a screenshot and a page.json that audit.json refers to', async () => {

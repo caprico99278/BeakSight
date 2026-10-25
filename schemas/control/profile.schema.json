@@ -22,6 +22,7 @@
     "mode": { "enum": ["PUBLIC_PASSIVE", "TEST_AUTH_PASSIVE", "TEST_APPROVED_WRITE"] },
     "auth": { "enum": ["NONE", "MANUAL_SESSION", "AUTOMATED_LOGIN"] },
     "approvedTestOrigins": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-    "environmentEvidenceRef": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 }
+    "environmentEvidenceRef": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 },
+    "approvedServiceOrigins": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "maxItems": 4 }
   }
 }

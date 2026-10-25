@@ -133,7 +133,8 @@ const saveRulesOnScreen = async (page: Page): Promise<void> => {
   expect(await dialog.textContent()).toContain(text.saveDialog.body);
   await flow.snapshot(page);
   await dialog.getByRole('button', { name: text.saveDialog.confirm, exact: true }).click();
-  await page.waitForURL(/\/rules\?notice=saved$/u, { timeout: UI_TIMEOUT_MS });
+  // DEF-137: 知らせの search は、保存した規則の集まりの版も持つ。
+  await page.waitForURL(/\/rules\?notice=saved&savedRevision=[1-9]\d*$/u, { timeout: UI_TIMEOUT_MS });
   await expect.poll(() => page.getByTestId('data-rule-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('DECIDED');
   await expect.poll(() => page.getByTestId('data-rule-example').count(), { timeout: UI_TIMEOUT_MS }).toBe(EXAMPLE_COUNT);
   await flow.snapshot(page);

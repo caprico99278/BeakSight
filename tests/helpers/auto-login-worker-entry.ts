@@ -11,6 +11,7 @@
  * - 資格情報の部品: `portableCredentialStore` が真なら、移せる偽の暗号化の部品（`PORTABLE_TEST_PROTECTOR_SOURCE`）で開く。偽なら本番の部品のまま。
  * - 資格情報とセッションの値は、入口に書かない（偽の暗号化の部品の鍵はテストだけの値で、資格情報ではない）。
  */
+import { TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from './test-chromium-args.js';
 import { PORTABLE_TEST_PROTECTOR_SOURCE } from './test-credential-store.js';
 
 /** ログイン用の Browser の起動の種類。 */
@@ -36,8 +37,10 @@ export interface AutoLoginWorkerEntryOptions {
 
 /** ログイン用の Browser の起動の式。 */
 const LAUNCH_EXPRESSIONS: Readonly<Record<AutoLoginEntryLaunch, string>> = Object.freeze({
-  'test-default': 'chromium.launch({ headless: true, args: [...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS] })',
-  cli: 'chromium.launch(chromiumLaunchOptions({ headless: true }))',
+  // CC-098: テストの既定の headless shell の起動の引数は、1 か所（`test-chromium-args.ts`。WebRTC と Shared Worker の引数）から読む。
+  'test-default': TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE,
+  // EL-12: CLI の起動の設定は、本番と同じ起動の部品（`launchChromium`）で起動する。
+  cli: 'launchChromium({ headless: true })',
 });
 
 /** 標準入力で受けるセッション（空なら null）。 */
@@ -76,7 +79,12 @@ const manualStageSource = (stage: ManualLoginStageOfEntry): string => (stage.kin
     },
   },`);
 
-const PORTABLE_CREDENTIAL_STORE_SOURCE = String.raw`
+/**
+ * 移せる偽の暗号化の部品で資格情報の部品を開く口（`runAuditWorkerProcess` の口の項目。CC-091。PRE42-CC の組 6a: 発見のジョブの fork のテストも
+ * `testLoginWorkerEntrySource` の `additionalHooks` で使う）。使う import は `PORTABLE_CREDENTIAL_STORE_IMPORTS_SOURCE`、偽の部品は
+ * `portableTestProtectorSourceOf` の本文。
+ */
+export const PORTABLE_CREDENTIAL_STORE_HOOK_SOURCE = String.raw`
   openCredentialStore: (root) => createCredentialStoreWith(root, {
     protector: portableProtector,
     spawnProcess: () => { throw new Error('no child process in the test worker'); },
@@ -86,20 +94,27 @@ const PORTABLE_CREDENTIAL_STORE_SOURCE = String.raw`
     waitBeforeRetry: async () => undefined,
   }),`;
 
-/** テストだけの入口の本文（ESM）。 */
-export const autoLoginWorkerEntrySource = (options: AutoLoginWorkerEntryOptions): string => String.raw`
-import { appendFileSync } from 'node:fs';
+/** 上の口と偽の部品が使う import（ESM。入口は一時のビルドの root に置き、`./dist/` を読む）。 */
+export const PORTABLE_CREDENTIAL_STORE_IMPORTS_SOURCE = String.raw`
 import { rename } from 'node:fs/promises';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCredentialStoreWith } from './dist/control/credentials/credential-store.js';`;
+
+/** 鍵（16 進）を入れた、移せる偽の暗号化の部品の本文（`portableProtector` を作る）。 */
+export const portableTestProtectorSourceOf = (protectorKey: string): string =>
+  PORTABLE_TEST_PROTECTOR_SOURCE.split('__KEY__').join(JSON.stringify(protectorKey));
+
+/** テストだけの入口の本文（ESM）。 */
+export const autoLoginWorkerEntrySource = (options: AutoLoginWorkerEntryOptions): string => String.raw`
+import { appendFileSync } from 'node:fs';${PORTABLE_CREDENTIAL_STORE_IMPORTS_SOURCE}
 import { chromium } from 'playwright';
-import { CHROMIUM_SHARED_WORKERS_DISABLED_ARGS, chromiumLaunchOptions } from './dist/browser/chromium-launch.js';
-import { createCredentialStoreWith } from './dist/control/credentials/credential-store.js';
+import { launchChromium } from './dist/browser/chromium-launch.js';
 import { runAuditWorkerProcess } from './dist/worker/audit-worker-process.js';
 const MANUAL_RECORD = ${JSON.stringify(options.manualStageRecord)};
-${PORTABLE_TEST_PROTECTOR_SOURCE.split('__KEY__').join(JSON.stringify(options.protectorKey))}${options.manualStage.kind === 'SESSION_HANDOFF' ? SESSION_HANDOFF_SOURCE : ''}
+${portableTestProtectorSourceOf(options.protectorKey)}${options.manualStage.kind === 'SESSION_HANDOFF' ? SESSION_HANDOFF_SOURCE : ''}
 const manualStageCalled = (name) => appendFileSync(MANUAL_RECORD, name + '\n');
 const launchLoginBrowser = () => ${LAUNCH_EXPRESSIONS[options.launch]};
 runAuditWorkerProcess(process, {${manualStageSource(options.manualStage)}${options.launch === 'test-default' ? String.raw`
-  automatedLoginStage: { launchAutomatedLoginBrowser: launchLoginBrowser },` : ''}${options.portableCredentialStore ? PORTABLE_CREDENTIAL_STORE_SOURCE : ''}
+  automatedLoginStage: { launchAutomatedLoginBrowser: launchLoginBrowser },` : ''}${options.portableCredentialStore ? PORTABLE_CREDENTIAL_STORE_HOOK_SOURCE : ''}
 });
 `;

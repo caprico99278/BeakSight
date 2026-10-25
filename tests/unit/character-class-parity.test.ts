@@ -4,11 +4,12 @@
 //   Zl・Zp、向きを変える文字、対になっていないサロゲート、`\s`）を明示し、各場所が今の意味で受けるか、どう書き換えるかを確かめる。
 // - 変わるのは、profile-policy の環境の証拠の参照で U+061C（ARABIC LETTER MARK）を拒むようになることだけ（設計者の判断）。
 //   その 1 件は、下の「CCX-3 の判断で変えた期待」で明示する。
-// - isolated-auditor の要約の掃除（Node の側の関数。公開していない）は、`tests/integration/isolated-interaction.test.ts` の
-//   「removes %s from a click failure reason」の表で固定する。
+// - isolated-auditor の要約の掃除（Node の側の関数。公開していない）は、`tests/integration/isolated-interaction-cases.ts` の
+//   「removes %s from a click failure reason」の表で固定する（F16 の部分。`isolated-interaction-evidence.test.ts` が流す）。
 import { describe, expect, it } from 'vitest';
 import type { AuditConfig } from '../../src/config/types.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile, type ValidatedSiteProfile } from '../../src/control/contracts.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
@@ -107,7 +108,7 @@ const manualProfile = ((): ValidatedSiteProfile => {
 })();
 
 const setupWithSelector = (selector: string): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-test-env',
   profileRevision: 1,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,

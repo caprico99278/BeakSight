@@ -12,7 +12,8 @@ import { artifactFileReader } from '../../src/cli/audit-run.js';
 import { ConfigError } from '../../src/config/config-error.js';
 import { loadConfig } from '../../src/config/load-config.js';
 import { validateScenarioDraft } from '../../src/control/approval/scenario-policy.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { authSetupDigestOf } from '../../src/control/auth/auth-setup-digest.js';
 import { workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import { createRunArtifactDirectory, listRunDirectories } from '../../src/core/artifact-layout.js';
@@ -228,7 +229,7 @@ describe('CC-076: the effective method and the _method field name keep their res
 describe('CC-078: the digests made from the sorted-keys JSON keep their values', () => {
   const ORIGIN = 'http://127.0.0.1:4173';
   const SETUP: AuthSetup = Object.freeze({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: 'example-auth',
     profileRevision: 1,
     loginStartUrl: `${ORIGIN}/login`,
@@ -257,18 +258,21 @@ describe('CC-078: the digests made from the sorted-keys JSON keep their values',
 
   // T28R-fix-1（独立レビュー T28R の I-1）: 認証の設定の digest に、資格情報の変更の最後の出来事の id を足し、形の印を版 2 に上げた（意図した値の
   // 変化）。前の値（版 1）は `sha256:86d0ab6a…`・`sha256:cf94991c…` だった。新しい値は、T28R-fix-1 の build の `dist` から求めた。
+  // LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 見本の設定を版 2 から版 3（フォームの送信）に替えたので、下の 4 つの値は版 3 の見本の値に置き換えた
+  // （digest の求め方は変えていない。版 3 の値が前と同じことは `auth-setup-digest.test.ts` の、変更の前のコードで固定した値で確かめる）。前の版 2 の見本の値は
+  // `sha256:c7749d84…`・`sha256:0055b842…`・`fdc37868…`・`4ea842b8…` だった。
   const CREDENTIAL_EVENT_ID = 3;
   it('keeps the auth setup digest', () => {
     expect(authSetupDigestOf(stored(SETUP), { credentialRevision: CREDENTIAL_REVISION, lastCredentialEventId: CREDENTIAL_EVENT_ID }))
-      .toBe('sha256:c7749d84a1f17990d6dc6cfdf455d5d49796fec310ba6b80cde97ed7fd6d5537');
-    expect(authSetupDigestOf(stored(reordered(SETUP)), null)).toBe('sha256:0055b842c451868f53081a2423a39b5ffcceeae93a52402230b7dbc954fda73c');
+      .toBe('sha256:c092f3d2497f79d58e2d2eac63707fef1918cf2358993b12ea32266497e66233');
+    expect(authSetupDigestOf(stored(reordered(SETUP)), null)).toBe('sha256:b6ea842f23884cd44faf0c67cdd69e9083c46e729395be2c040228e1250457c7');
   });
 
   it('keeps the worker authentication digest', () => {
-    expect(workerAuthenticationDigestOf(SETUP, [ORIGIN], { jobKind: 'AUDIT', automatedLogin: null })).toBe('fdc37868ae79418dbd82b2e9be9b3a482752b2fe888331d702ddec21c36e25ac');
+    expect(workerAuthenticationDigestOf(SETUP, [ORIGIN], { jobKind: 'AUDIT', automatedLogin: null })).toBe('9c3cbd766a39d9d9e03f6c3fd5826e7117d0153fbc34d1e596662545c5cc8e88');
     expect(workerAuthenticationDigestOf(reordered(SETUP), [ORIGIN, 'http://localhost:4173'], {
       jobKind: 'LOGIN_CHECK',
       automatedLogin: { credentialRevision: CREDENTIAL_REVISION, credentialRoot: 'C:\\example-root' },
-    })).toBe('4ea842b834f9e6ed3bcd91d06aa81b7981db2da9969a0b39209fb305e88d9cb1');
+    })).toBe('798b85da7070fd656bc741ab5d17622855ed5edbef80d9ff7ffc7fc67112ab85');
   });
 });

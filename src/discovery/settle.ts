@@ -10,7 +10,12 @@
 //   `requestfailed` で終わりとする（Guard が止めた要求も `requestfailed` で終わる）。数え始める前に始まった要求は数えられないので、呼ぶ側は、
 //   画面を読み込む前（`goto` の前）に作る。終わりの事象の来ない要求（長く開いたままの要求など）があると、上限まで待って `TIMED_OUT` になる
 //   （fail-closed の向き）。Guard の中の進行中の数（`pendingRequestTaskCount`）は外から読めず、Guard は変えない（T27b の範囲の外）ので使わない。
-import type { Page, Request } from 'playwright';
+// - DEF-127（T37a fix round 1）: ページが応答の本文を読まない要求（`fetch` の結果の `ok` だけを見るなど）は、Chromium が本文を受け取りきらず、
+//   `requestfinished` が上限まで来ないことがある（実機で確かめた）。T37R-fix-B（T37R の I-2）: 応答を受けた要求は、応答から名前つきの猶予
+//   （`DISCOVERY_RESPONSE_BODY_GRACE_MS`。既定 2 秒）までは進行中に数え（本文が遅い応答で、描かれる前に読まない）、猶予を過ぎたら外す（本文を読まない
+//   応答でも、上限まで待たない）。猶予を超えて本文が遅い応答は、描かれる前に読みうる（限界）。待ちの条件の「2 回続けて同じ候補の集合」は今どおり。この
+//   数え方は落ち着きの待ちだけのもので、Guard の安全の数え方（止めた要求、上限の部品）と、負荷の数え方（`load-meter.ts`。DEF-121）には関わらない。
+import type { Page, Request, Response } from 'playwright';
 import { awaitBeforeDeadline, wait } from '../core/deadline.js';
 
 /** 進行中の要求が 0 の状態が続く時間（ms。設計書 4.2）。 */
@@ -21,6 +26,11 @@ export const DISCOVERY_SETTLE_TIMEOUT_MS = 5_000;
 export const DISCOVERY_SETTLE_POLL_INTERVAL_MS = 50;
 /** 2 回の読み取りの、始まりの間の最小の間隔（ms。描画の後の短い遅れを、同じ集合と取り違えないため）。 */
 export const DISCOVERY_SETTLE_PROBE_INTERVAL_MS = 250;
+/**
+ * 応答を受けた後、本文の終わり（`requestfinished`・`requestfailed`）を待つ猶予（ms。T37R-fix-B。Task 37 の設計書 8 章の T37R の行の I-2。設計者の判断の
+ * 既定 2 秒）。猶予の間は進行中に数え、過ぎたら外す。
+ */
+export const DISCOVERY_RESPONSE_BODY_GRACE_MS = 2_000;
 
 /** 落ち着きの待ちの指定。 */
 export interface DiscoverySettlePolicy {
@@ -45,6 +55,8 @@ export interface QuietSource {
 
 /** page の要求の事象の名前（数え始めと、終わり。Guard が止めた要求も `requestfailed` で終わる）。 */
 const REQUEST_START_EVENT = 'request';
+/** DEF-127: 応答を受けた（ヘッダを受けた）事象。応答を受けた要求は、進行中から外す。 */
+const RESPONSE_EVENT = 'response';
 const REQUEST_FINISHED_EVENT = 'requestfinished';
 const REQUEST_FAILED_EVENT = 'requestfailed';
 
@@ -53,35 +65,67 @@ const REQUEST_FAILED_EVENT = 'requestfailed';
  */
 export class InFlightRequestCounter implements QuietSource {
   readonly #page: Page;
-  readonly #inFlight = new Set<Request>();
-  #quietSinceMs: number | null = Date.now();
+  /** 進行中の要求と、応答を受けた時刻（`Date.now()`。まだなら `null`）。 */
+  readonly #inFlight = new Map<Request, number | null>();
+  /** 応答の後の猶予（ms。T37R-fix-B）。 */
+  readonly #responseBodyGraceMs: number;
+  /** 最後に進行中の要求が終わった（か猶予を過ぎた）時刻。作った時点から数える。 */
+  #lastEndMs: number = Date.now();
   #disposed = false;
 
   readonly #onStart = (request: Request): void => {
-    this.#inFlight.add(request);
-    this.#quietSinceMs = null;
+    this.#inFlight.set(request, null);
   };
 
   readonly #onEnd = (request: Request): void => {
-    if (this.#inFlight.delete(request) && this.#inFlight.size === 0) {
-      this.#quietSinceMs = Date.now();
+    if (this.#inFlight.delete(request)) {
+      this.#lastEndMs = Math.max(this.#lastEndMs, Date.now());
     }
   };
 
-  constructor(page: Page) {
+  /**
+   * DEF-127・T37R-fix-B（T37R の I-2）: 応答を受けた要求は、応答から猶予（`responseBodyGraceMs`）を過ぎたら進行中から外す（猶予の間は、本文が届いて画面が
+   * 描かれるのを待つ。本文を読まない応答で `requestfinished` が来なくても、猶予で終わる）。読めない応答は無視する（今どおり終わりの事象を待つ）。
+   */
+  readonly #onResponse = (response: Response): void => {
+    try {
+      const request = response.request();
+      if (this.#inFlight.get(request) === null) {
+        this.#inFlight.set(request, Date.now());
+      }
+    } catch {
+      // 読めない応答は、今どおり終わりの事象を待つ。
+    }
+  };
+
+  constructor(page: Page, options: { readonly responseBodyGraceMs?: number } = {}) {
     this.#page = page;
+    this.#responseBodyGraceMs = options.responseBodyGraceMs ?? DISCOVERY_RESPONSE_BODY_GRACE_MS;
     page.on(REQUEST_START_EVENT, this.#onStart);
+    page.on(RESPONSE_EVENT, this.#onResponse);
     page.on(REQUEST_FINISHED_EVENT, this.#onEnd);
     page.on(REQUEST_FAILED_EVENT, this.#onEnd);
   }
 
-  /** 進行中の要求の数。 */
+  /** 猶予を過ぎた要求を、猶予の終わりの時刻で終わったものとして外す。 */
+  #pruneExpired(nowMs: number): void {
+    for (const [request, respondedAtMs] of this.#inFlight) {
+      if (respondedAtMs !== null && nowMs - respondedAtMs >= this.#responseBodyGraceMs) {
+        this.#inFlight.delete(request);
+        this.#lastEndMs = Math.max(this.#lastEndMs, respondedAtMs + this.#responseBodyGraceMs);
+      }
+    }
+  }
+
+  /** 進行中の要求の数（応答の後の猶予の間の要求を含む）。 */
   get inFlight(): number {
+    this.#pruneExpired(Date.now());
     return this.#inFlight.size;
   }
 
   quietSinceMs(): number | null {
-    return this.#quietSinceMs;
+    this.#pruneExpired(Date.now());
+    return this.#inFlight.size === 0 ? this.#lastEndMs : null;
   }
 
   /** 事象の受け口を外す（何度呼んでもよい）。外した後は数えない。 */
@@ -91,6 +135,7 @@ export class InFlightRequestCounter implements QuietSource {
     }
     this.#disposed = true;
     this.#page.off(REQUEST_START_EVENT, this.#onStart);
+    this.#page.off(RESPONSE_EVENT, this.#onResponse);
     this.#page.off(REQUEST_FINISHED_EVENT, this.#onEnd);
     this.#page.off(REQUEST_FAILED_EVENT, this.#onEnd);
   }

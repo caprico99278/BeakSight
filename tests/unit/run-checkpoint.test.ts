@@ -24,29 +24,33 @@ import { createNavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { CrawlFrontier, type CrawlFrontierSnapshot, type CrawlUrlEntry } from '../../src/orchestration/crawl-frontier.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import {
+  createRunLock,
+  currentProcessRunLockHost,
+  isProcessRunning,
+  judgeRunLock,
+  renewRunLock,
+  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
+  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
+  RUN_LOCK_STALE_AFTER_MS,
+  type RunLock,
+  type RunLockJudgementInput,
+} from '../../src/core/process-lock.js';
+import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
   closeInterruptedRunExecutions,
   createRunCheckpoint,
   createRunCheckpointPage,
-  createRunLock,
-  currentProcessRunLockHost,
   decideRunCheckpointConclusion,
   decideRunExecutionEndReason,
   decideRunResumption,
   effectiveConfigDifferences,
-  isProcessRunning,
-  judgeRunLock,
-  renewRunLock,
   RESUME_CONFIG_IGNORED_PATHS,
   RESUME_REQUEUE_SKIP_REASON_CODES,
   RUN_CHECKPOINT_CONCLUSION_ACTIONS,
   RUN_CHECKPOINT_FINAL_CONTENTS,
   RUN_CHECKPOINT_PAGE_SCHEMA_VERSION,
   RUN_CHECKPOINT_SCHEMA_VERSION,
-  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
-  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  RUN_LOCK_STALE_AFTER_MS,
   RUN_RESUME_SELECTION_KINDS,
   RUN_VERSION_FIELDS,
   runVersionDifferences,
@@ -59,8 +63,6 @@ import {
   type RunCheckpointFinalContent,
   type RunCheckpointInput,
   type RunCheckpointPage,
-  type RunLock,
-  type RunLockJudgementInput,
   type RunResumeCandidate,
   type RunResumeSelection,
   type RunVersionField,
@@ -170,8 +172,8 @@ async function sampleRunState(): Promise<RunCheckpointInput> {
   const environmentLedger = new SafetyLedger();
   environmentLedger.recordInvariantViolation({ code: 'TEST_VIOLATION', message: 'テストの違反' });
   const siteMetadataLedger = new SafetyLedger();
-  siteMetadataLedger.recordBlockedRequest({ method: 'POST', url: fixtureUrl('/api/submit'), reason: 'NON_READ_METHOD' });
-  siteMetadataLedger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+  siteMetadataLedger.recordBlockedRequest({ method: 'POST', url: fixtureUrl('/api/submit'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+  siteMetadataLedger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
   siteMetadataLedger.recordExternalSchemeNavigation({
     url: 'beaksight-test-app:probe',
     scheme: 'beaksight-test-app',
@@ -220,12 +222,12 @@ const sampleCheckpoint = async (): Promise<RunCheckpoint> => createRunCheckpoint
  */
 const firstPageLedgerSnapshots = () => {
   const desktop = new SafetyLedger();
-  desktop.recordBlockedRequest({ method: 'POST', url: fixtureUrl('/api/form'), reason: 'NON_READ_METHOD' });
+  desktop.recordBlockedRequest({ method: 'POST', url: fixtureUrl('/api/form'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
   return [desktop.snapshot(), new SafetyLedger().snapshot()];
 };
 const secondPageLedgerSnapshots = () => {
   const retried = new SafetyLedger();
-  retried.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+  retried.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
   return [new SafetyLedger().snapshot(), retried.snapshot()];
 };
 
@@ -933,7 +935,9 @@ describe('R2: whether a run can be resumed (design 3.2)', () => {
   // （理由 `SITE_UNAVAILABLE`）も、再開のときに待ち行列に戻す。
   it('requeues the URLs skipped by the runtime limit of one execution, by a stop signal (R4b1) and by site unavailability (SU1)', () => {
     // T25c（Task 25 の設計書 4.3）: 認証つきの Run でセッションの切れで止めた URL（理由 `AUTH_SESSION_LOST`）も戻す。
-    expect(RESUME_REQUEUE_SKIP_REASON_CODES).toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE', 'AUTH_SESSION_LOST']);
+    // T35c: 承認したサービスの Origin への要求の上限で止めた URL も、再開のときに待ち行列に戻す（再開は新しい予算で数える）。
+    expect(RESUME_REQUEUE_SKIP_REASON_CODES)
+      .toEqual(['MAX_RUNTIME_REACHED', 'RUN_INTERRUPTED', 'SITE_UNAVAILABLE', 'AUTH_SESSION_LOST', 'SERVICE_REQUEST_LIMIT_REACHED']);
     expect(Object.isFrozen(RESUME_REQUEUE_SKIP_REASON_CODES)).toBe(true);
   });
 
@@ -1493,8 +1497,10 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
 
   // R5-fix-round-1（設計書 4.7。R5b の報告）: 出力先（`output.directory`。`--output` の上書きを含む）は比べない。出力先は途中の Run を探す
   // 場所そのものなので、書き方が違っても（相対のパスと、同じ場所の絶対のパス）、同じ出力先の途中の Run を再開する。比べない項目の一覧は
-  // `RESUME_CONFIG_IGNORED_PATHS` で、パスの書き方は `effectiveConfigDifferences` が返すパスと同じ。`--headed`・`--headless` の上書き
-  // （`browser.headed`）は、今までどおり比べる。
+  // `RESUME_CONFIG_IGNORED_PATHS` で、パスの書き方は `effectiveConfigDifferences` が返すパスと同じ。
+  // FM-2 fix round 1（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: 表示（`browser.headed`。画面の表示の設定と、
+  // `--headed`・`--headless` の上書き）も比べない。表示は承認に結ばれるプロファイルの改訂の外にあり、切り替えただけで中断した Run が
+  // 再開できなくなってはならない。Guard・Context・上限は表示で変わらない。
   describe('R5-fix-round-1: the items of the effective configuration that are not compared (design 4.7)', () => {
     /** 保存の実効の設定の出力先を、同じ場所の絶対のパスに書き換えた保存（今回の設定の出力先は、相対のパス）。 */
     const withAbsoluteOutput = (checkpoint: RunCheckpoint): RunCheckpoint => withCheckpoint(checkpoint, {
@@ -1502,11 +1508,14 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
     });
 
     it('has the closed list of the paths that are not compared, written as effectiveConfigDifferences returns them', () => {
-      expect(RESUME_CONFIG_IGNORED_PATHS).toEqual(['output.directory']);
+      expect(RESUME_CONFIG_IGNORED_PATHS).toEqual(['browser.headed', 'output.directory']);
       expect(Object.isFrozen(RESUME_CONFIG_IGNORED_PATHS)).toBe(true);
       const config = current();
-      expect(effectiveConfigDifferences(config, { ...config, output: { directory: resolve(config.output.directory) } }))
-        .toEqual(RESUME_CONFIG_IGNORED_PATHS);
+      expect(effectiveConfigDifferences(config, {
+        ...config,
+        browser: { ...config.browser, headed: !config.browser.headed },
+        output: { directory: resolve(config.output.directory) },
+      })).toEqual(RESUME_CONFIG_IGNORED_PATHS);
     });
 
     it('resumes the latest run whose effective configuration differs only in the output directory', async () => {
@@ -1526,13 +1535,28 @@ describe('R5a: selecting the run to resume (design 4.7.1)', () => {
       expect(selectRunToResume([latest], current())).toEqual({ kind: 'CONFIG_DIFFERS', candidate: latest, differences: ['crawl.maxPages'] });
     });
 
-    it('still compares the override by --headed and --headless (browser.headed)', async () => {
+    it('resumes the latest run whose effective configuration differs only in the display (browser.headed, FM-2 fix round 1)', async () => {
       const checkpoint = await resumable();
       const latest = runOf(1, withCheckpoint(checkpoint, {
         effectiveConfig: { ...checkpoint.effectiveConfig, browser: { ...checkpoint.effectiveConfig.browser, headed: !checkpoint.effectiveConfig.browser.headed } },
       }), NEWER);
+      expect(effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current())).toEqual(['browser.headed']);
 
-      expect(selectRunToResume([latest], current())).toEqual({ kind: 'CONFIG_DIFFERS', candidate: latest, differences: ['browser.headed'] });
+      expect(selectRunToResume([latest], current())).toEqual({ kind: 'RESUME', candidate: latest, decision: 'RESUME' });
+    });
+
+    it('does not resume, without browser.headed in the different items, when another item differs too (FM-2 fix round 1)', async () => {
+      const checkpoint = await resumable();
+      const latest = runOf(1, withCheckpoint(checkpoint, {
+        effectiveConfig: {
+          ...checkpoint.effectiveConfig,
+          browser: { ...checkpoint.effectiveConfig.browser, headed: !checkpoint.effectiveConfig.browser.headed },
+          crawl: { ...checkpoint.effectiveConfig.crawl, maxPages: checkpoint.effectiveConfig.crawl.maxPages + 1 },
+        },
+      }), NEWER);
+      expect(effectiveConfigDifferences(latest.checkpoint.effectiveConfig, current())).toEqual(['crawl.maxPages', 'browser.headed']);
+
+      expect(selectRunToResume([latest], current())).toEqual({ kind: 'CONFIG_DIFFERS', candidate: latest, differences: ['crawl.maxPages'] });
     });
   });
 
@@ -1728,6 +1752,8 @@ describe('R2: closed lists used by the checkpoint', () => {
       'INTERRUPTED_ABNORMALLY',
       // T25c（Task 25 の設計書 4.3）: 認証つきの Run で、セッションの切れで止まった終わり方（既存の表示の順を変えないよう、最後に加えた）。
       'STOPPED_BY_AUTH_SESSION_LOST',
+      // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いて止まった終わり方（同じく、最後に加えた）。
+      'STOPPED_BY_SERVICE_REQUEST_LIMIT',
     ]);
     expect(Object.isFrozen(RUN_EXECUTION_END_REASONS)).toBe(true);
     expect(Object.isFrozen(RUN_CHECKPOINT_STATES)).toBe(true);

@@ -22,9 +22,13 @@
 //     画面の確かめが使う）。
 //   - T31h-1: 候補から作れる path の型の組の一覧（`pathTemplateOptionsOf`）。組の列挙は `recordIdSegmentPairsOf` と同じ。画面が、候補の具体的な
 //     path から ID の区切りを選んで型を作るための口（ID の形の判定は呼び出し側が渡す）。
+// - T41a（Task 41 の設計書 3.1）: form のない候補の、画面の path の最後の ID を `{id}` にした識別の digest（`pagePathTemplatedIdentityDigestOf`。別の印
+//   `CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT`）。索引の型にした digest の一覧の列を、印で分けて共用する（管理データの版は 14 のまま）。
 // 純粋な関数だけのファイル。Playwright、ブラウザ、`node:fs`、`src/control/`、監査エンジンを import しない
 // （`tests/architecture/discovery-boundary.test.ts`）。
+import { lastRecordIdLikePathSegmentIndexOf } from '../core/api-request-shape.js';
 import { createSha256Fingerprint } from '../core/ids.js';
+import { PATH_TEMPLATE_ID_SEGMENT } from '../core/record-id-path-pattern.js';
 import { compareCodeUnits } from '../core/text.js';
 import {
   FIELD_CONSTRAINT_NAMES,
@@ -36,14 +40,23 @@ import {
 /** 識別の digest の入力の形の印（版つき）。 */
 export const CANDIDATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-identity/2';
 
+/**
+ * 画面の path を型にした識別の digest の入力の形の印（版つき。T41a）。form の型にした識別の digest（`CANDIDATE_TEMPLATE_IDENTITY_DIGEST_FORMAT`）と
+ * 印が違うので、索引の同じ一覧の列に入れても、互いに当たらない（印で分けて共用する）。
+ */
+export const CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-page-template-identity/1';
+
 /** 入力規則の digest の入力の形の印（版つき）。 */
 export const CANDIDATE_RULE_DIGEST_FORMAT = 'beaksight-candidate-rules/1';
 
 /** 型にした識別の digest の入力の形の印（版つき。T31b）。 */
 export const CANDIDATE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-template-identity/1';
 
-/** path の型の中の、レコードの ID の区切りの印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b）。 */
-export const PATH_TEMPLATE_ID_SEGMENT = '{id}';
+/**
+ * path の型の中の、レコードの ID の区切りの印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b）。T40R2-fix: 定義は core の
+ * `record-id-path-pattern.ts`（画面のブラウザ側のコードも、ID の型の注意の判定に使うため）。ここは公開し直す。
+ */
+export { PATH_TEMPLATE_ID_SEGMENT, recordIdOfPathPattern } from '../core/record-id-path-pattern.js';
 
 /** 1 つの候補の、ID の区切りの組の最大の件数（索引の一覧の上限。T31b）。 */
 export const MAX_RECORD_ID_SEGMENT_PAIRS = 8;
@@ -187,6 +200,23 @@ export const templatedIdentityDigestForRecordIdOf = (candidate: DiscoveredCandid
   return pairs.length === 1 && pair !== undefined ? templatedIdentityDigestOf(candidate, pair) : null;
 };
 
+/**
+ * T41a（Task 41 の設計書 3.1 の「画面の path を型にした識別の digest」）: form のない候補（送信先のない画面のボタン。API の候補）の、画面の path の最後の
+ * ID の区切り（core の `lastRecordIdLikePathSegmentIndexOf`。probe の分類が filter の値と比べる ID と同じ決まり）を `{id}` にした識別の digest（純粋）。
+ * ID だけが違う 2 つの画面の候補で同じになる。入力は、識別の digest の並びの画面の path を型にした形（送信先は null）。送信先のある候補と、画面の path に
+ * ID のない候補は null。発見の索引の型にした digest の一覧に入れ（印が違うので form の digest と当たらない）、API の UPDATE のシナリオが持つ。
+ */
+export const pagePathTemplatedIdentityDigestOf = (candidate: DiscoveredCandidate): string | null => {
+  const segment = candidate.action === null ? lastRecordIdLikePathSegmentIndexOf(candidate.page.path) : null;
+  if (segment === null) {
+    return null;
+  }
+  return createSha256Fingerprint(JSON.stringify([
+    CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT,
+    ...identityItemsOf(candidate, replacedPathOf(segmentsOf(candidate.page.path), segment, PATH_TEMPLATE_ID_SEGMENT), null),
+  ]));
+};
+
 /** path の型の中の、`{id}` の区切りの位置（`{id}` がちょうど 1 つで、区切りの全体でなければ null）。 */
 const placeholderSegmentOf = (template: string): number | null => {
   const positions = segmentsOf(template).flatMap((segment, index) => (segment === PATH_TEMPLATE_ID_SEGMENT ? [index] : []));
@@ -262,4 +292,24 @@ export const pathTemplateOptionsOf = (
     return recordId === null ? [] : [Object.freeze({ formPathTemplate, actionPathTemplate, recordId })];
   });
   return Object.freeze(options);
+};
+
+/** 数字だけの区切りか（型の選択肢の並び。T38f）。 */
+const DIGITS_ONLY = /^[0-9]+$/u;
+
+/**
+ * 画面の path から作れる型の一覧（T38f。API の UPDATE の台帳の参照の、更新の画面の path の型の選択肢。送信先を持たない候補（form のない画面の
+ * ボタン）のため、画面の path だけを見る）。区切りの値が `isRecordId` に当たる区切りごとに、その区切りを `{id}` にした型（型に値を入れると元の
+ * path に戻るものだけ。`concretePathOfTemplate`）。区切りの値が数字だけの型を先に並べる（レコードの ID の案を先に示す。そのほかは path の順）。凍結。
+ */
+export const pagePathTemplateOptionsOf = (path: string, isRecordId: (value: string) => boolean): readonly string[] => {
+  const segments = segmentsOf(path);
+  const options = segments.flatMap((segment, index) => {
+    if (index === 0 || segment.length === 0 || !isRecordId(segment)) {
+      return [];
+    }
+    const template = replacedPathOf(segments, index, PATH_TEMPLATE_ID_SEGMENT);
+    return concretePathOfTemplate(template, segment) === path ? [{ template, digits: DIGITS_ONLY.test(segment) }] : [];
+  });
+  return Object.freeze([...options.filter(({ digits }) => digits), ...options.filter(({ digits }) => !digits)].map(({ template }) => template));
 };

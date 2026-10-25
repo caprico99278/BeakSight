@@ -18,18 +18,17 @@
 //   `read_check_results` に記録される。サーバが受けた要求は、ログインの POST のほかは GET（と HEAD）だけで、READ の URL の query は定義の欄の名前だけ。
 //   秘密の目印（表の行の目印を含む）が、`read-evidence.json`、管理データ、IPC、ワーカーの出力に出ない。
 // 作業のディレクトリ（リポジトリの root の代わり）、管理データ、資格情報のフォルダ、出力先は、一時のフォルダだけ。サーバは 127.0.0.1 だけで待ち受ける。
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config/load-config.js';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION } from '../../src/control/contracts.js';
 import { createAuditJobManager, type AuditJobManager, type AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import { AUTO_LOGIN_MIN_INTERVAL_MS } from '../../src/control/job/auto-login-limits.js';
@@ -42,8 +41,15 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import {
+  STDIN_CREDENTIALS_EXPRESSION,
+  STDIN_CREDENTIALS_PRELUDE,
+  createRecordingFork,
+  hideJobBrowser,
+} from '../helpers/worker-fork-support.js';
 import { validateWorkerToParentMessage, type WorkerToParentMessage } from '../../src/control/worker-protocol.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, READ_EVIDENCE_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
+import { wait } from '../../src/core/deadline.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { discoveryCandidatesOf, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
 import type { ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
@@ -68,11 +74,16 @@ import {
   textLeakPlace,
   type LeakPlace,
 } from '../helpers/leak-places.js';
+import {
+  PORTABLE_CREDENTIAL_STORE_HOOK_SOURCE,
+  PORTABLE_CREDENTIAL_STORE_IMPORTS_SOURCE,
+  portableTestProtectorSourceOf,
+} from '../helpers/auto-login-worker-entry.js';
 import { descendantsOf, listProcesses } from '../helpers/process-tree.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
+import { testLoginWorkerEntrySource } from '../helpers/test-login-worker-entry.js';
 import {
-  PORTABLE_TEST_PROTECTOR_SOURCE,
   createPortableTestCredentialProtector,
   createPortableTestKey,
   createTestCredentialStore,
@@ -104,52 +115,19 @@ const SMALL_MAX_PAGES = 3;
 const AUTO_LOGIN_MIN_INTERVAL_MARGIN_MS = 1_000;
 
 /**
- * テストだけの入口（一時のビルドの root に書く）。`__READ_CREDENTIALS__`・`__PROTECTOR__` を、テストが値に置き換える。資格情報は、ファイルにも
- * 環境変数にも書かず、手動のログインでは標準入力から受ける（`[セレクタ, 値]` の組と、送るボタンのセレクタ）。自動ログインの資格情報は、偽の
- * 暗号化の部品で暗号化した資格情報のファイル（一時のフォルダ）から、本番の流れで読む。
+ * テストだけの入口の本文（一時のビルドの root に書く）。CC-091（PRE42-CC の組 6a）: 共用の `testLoginWorkerEntrySource`（CLI の起動の設定の
+ * headless のログイン用の Browser）に、移せる偽の暗号化の部品で資格情報の部品を開く口（`auto-login-worker-entry.ts`）を `additionalHooks` で足す。
+ * 資格情報は、ファイルにも環境変数にも書かず、手動のログインでは標準入力から受ける（`worker-fork-support.ts` の準備。`[セレクタ, 値]` の組と、
+ * 送るボタンのセレクタ）。自動ログインでは標準入力を読まず、ログインの画面の口を渡さない。自動ログインの資格情報は、偽の暗号化の部品で暗号化した
+ * 資格情報のファイル（一時のフォルダ）から、本番の流れで読む。
  */
-const ENTRY_SOURCE = String.raw`
-import { rename } from 'node:fs/promises';
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { chromium } from 'playwright';
-import { chromiumLaunchOptions } from './dist/browser/chromium-launch.js';
-import { createCredentialStoreWith } from './dist/control/credentials/credential-store.js';
-import { runAuditWorkerProcess } from './dist/worker/audit-worker-process.js';
-const READ_CREDENTIALS = __READ_CREDENTIALS__;
-const LOGIN_TIMEOUT_MS = __TIMEOUT__;
-__PROTECTOR__
-const credentials = READ_CREDENTIALS
-  ? new Promise((resolve) => {
-    let text = '';
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk) => { text += chunk; });
-    process.stdin.on('end', () => resolve(JSON.parse(text)));
-  })
-  : null;
-runAuditWorkerProcess(process, {
-  loginStage: {
-    launchLoginBrowser: () => chromium.launch(chromiumLaunchOptions({ headless: true })),
-    loginTimeoutMs: LOGIN_TIMEOUT_MS,
-    ...(credentials === null ? {} : {
-      onLoginPageReady: async (page) => {
-        const { fields, submit } = await credentials;
-        for (const [selector, value] of fields) {
-          await page.fill(selector, value);
-        }
-        await page.click(submit);
-      },
-    }),
-  },
-  openCredentialStore: (root) => createCredentialStoreWith(root, {
-    protector: portableProtector,
-    spawnProcess: () => { throw new Error('no child process in the test worker'); },
-    now: () => new Date(),
-    platform: 'win32',
-    renameFile: rename,
-    waitBeforeRetry: async () => undefined,
-  }),
+const entrySourceOf = (automated: boolean, protectorKey: string): string => testLoginWorkerEntrySource({
+  distPrefix: './dist/',
+  loginTimeoutMs: LOGIN_TIMEOUT_MS,
+  prelude: `${PORTABLE_CREDENTIAL_STORE_IMPORTS_SOURCE}\n${portableTestProtectorSourceOf(protectorKey)}${automated ? '' : STDIN_CREDENTIALS_PRELUDE}`,
+  credentialsExpression: automated ? null : STDIN_CREDENTIALS_EXPRESSION,
+  additionalHooks: PORTABLE_CREDENTIAL_STORE_HOOK_SOURCE,
 });
-`;
 
 let build: TemporaryBuild;
 const children: ChildProcess[] = [];
@@ -240,7 +218,7 @@ async function writeTarget(maxPages: number): Promise<void> {
 }
 
 const setupFor = (site: DiscoverySite, automated: boolean): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${site.origin}${DISCOVERY_SITE_PATHS.login}`,
@@ -286,12 +264,11 @@ async function prepareProfile(automated: boolean, maxPages = ENOUGH_PAGES): Prom
     approvedTestOrigins: [space.site.origin],
     environmentEvidenceRef: 'evidence/example-discovery-fork/isolation-check-1',
   }, { resolveContext: contextResolver }).ok).toBe(true);
+  // FM-2: テストのジョブのブラウザは今どおり headless。
+  hideJobBrowser(space.database, PROFILE_ID);
   expect(saveAuthSetup(space.database, setupFor(space.site, automated), { resolveContext: contextResolver }).ok).toBe(true);
   const entry = join(build.rootDirectory, `${Date.now()}-${automated ? 'automated' : 'manual'}-${ENTRY_FILE_NAME}`);
-  await writeFile(entry, ENTRY_SOURCE
-    .split('__PROTECTOR__').join(PORTABLE_TEST_PROTECTOR_SOURCE.split('__KEY__').join(JSON.stringify(space.key)))
-    .split('__READ_CREDENTIALS__').join(JSON.stringify(!automated))
-    .split('__TIMEOUT__').join(JSON.stringify(LOGIN_TIMEOUT_MS)), 'utf8');
+  await writeFile(entry, entrySourceOf(automated, space.key), 'utf8');
   if (!automated) {
     const fields: [string, string][] = [];
     await space.site.fillCredentials(async (selector, value) => {
@@ -299,18 +276,18 @@ async function prepareProfile(automated: boolean, maxPages = ENOUGH_PAGES): Prom
     });
     space.manualCredentials = JSON.stringify({ fields, submit: DISCOVERY_SITE_LOGIN_FIELDS.submit });
   }
-  const recordingFork: AuditWorkerForker = (_modulePath, args, options: ForkOptions) => {
-    const child = fork(entry, [...args], { ...options, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
-    children.push(child);
-    if (child.pid !== undefined) {
-      space.workerPids.push(child.pid);
-    }
-    child.on('message', (message: unknown) => space.received.push(message));
-    child.stdout?.setEncoding('utf8').on('data', (chunk: string) => { space.workerOutput += chunk; });
-    child.stderr?.setEncoding('utf8').on('data', (chunk: string) => { space.workerOutput += chunk; });
-    child.stdin?.end(space.manualCredentials ?? '');
-    return child;
-  };
+  const recordingFork: AuditWorkerForker = createRecordingFork({
+    entry,
+    stdinText: () => space.manualCredentials ?? '',
+    onChild: (child) => {
+      children.push(child);
+      if (child.pid !== undefined) {
+        space.workerPids.push(child.pid);
+      }
+    },
+    onReceived: (message) => space.received.push(message),
+    onOutput: (chunk) => { space.workerOutput += chunk; },
+  });
   space.manager = createAuditJobManager({
     database: space.database,
     repositoryRoot: space.directory,
@@ -423,7 +400,7 @@ async function expectNoProcessLeft(): Promise<void> {
       expect(workersDone).toBe(true);
       return;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
 }
 
@@ -517,7 +494,7 @@ describe('T27d: the discovery job end to end with the manual login', () => {
         if (Date.now() > deadline) {
           throw new Error('the discovery did not start reading');
         }
-        await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+        await wait(WAIT_POLL_MS);
       }
       children.at(-1)?.kill();
     });

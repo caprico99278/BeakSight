@@ -6,8 +6,11 @@
 // - 今の CLI の監査のコマンドは、このファイルを読み込まない（影響させない）。
 import { loadNodeSqlite } from '../store/sqlite-module.js';
 
-/** 管理データの部品が求める Node の版の下限（`node:sqlite` が Release candidate になり、警告が出なくなった版）。 */
-export const MIN_CONTROL_NODE_VERSION = '24.15.0';
+/**
+ * 管理データの部品が求める Node の版の下限。`node:sqlite` が Release candidate になり警告が出なくなった 24.15.0 を土台に、
+ * Node.js の 2026-10-21 のセキュリティリリースの修正版（24.22.1）まで上げた。
+ */
+export const MIN_CONTROL_NODE_VERSION = '24.22.1';
 
 /** 環境の確かめで止める理由（閉じた一覧。確かめる順）。 */
 export const CONTROL_ENVIRONMENT_FAILURE_REASONS = Object.freeze(['NODE_VERSION_UNSUPPORTED', 'NODE_SQLITE_UNAVAILABLE'] as const);

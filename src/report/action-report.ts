@@ -5,7 +5,8 @@
  *   組み合わせるだけにする（GATE-UI03）。値は部品がエスケープする。見た目は `html-tokens.ts` のクラスだけ（GATE-UI02）。
  * - 日本語の文言は `ACTION_REPORT_TEXT` と表示のカタログから取る（GATE-UI06）。結果や理由の値の文字列を書かない（値で分岐しない）。
  * - 先頭に注意を置く: 人が入れた値が入りうるとき（`notices.humanEnteredValues`）と、結果のお知らせ（`UNKNOWN`・`PARTIAL` など。文言の表にある結果）。
- * - 照合の READ の URL は、リンクにせず文字で示す（`renderUrlAsText`。1 回のクリックで要求を送らせない）。
+ * - 照合の READ の URL は、リンクにせず文字で示す（`renderUrlAsText`。1 回のクリックで要求を送らせない）。T40d: API の送り先の Origin も同じ。
+ * - T40d: API の書き込みだけ、送信の節の後に API の要約の節を置く（FORM の HTML は変えない）。
  * - 同じ入力からは、同じ文字列を返す（時刻や乱数を使わない）。ファイルは書かない（書くのは ArtifactWriter）。
  */
 import { ACTION_REPORT_NOTICE_CATALOG } from '../presentation/catalog.js';
@@ -36,6 +37,7 @@ const SECTION_ANCHORS = Object.freeze({
   summary: 'action-summary',
   precheck: 'action-precheck',
   submission: 'action-submission',
+  api: 'action-api',
   response: 'action-response',
   update: 'action-update',
   readVerification: 'action-read-verification',
@@ -118,6 +120,37 @@ const submissionOf = ({ submission }: ActionViewModel): Fragment => section('sub
     emptyText: ACTION_REPORT_TEXT.noSubmittedValues,
   }),
 ]);
+
+/**
+ * T40d: API の要約の節（API の書き込みだけ。FORM は節を置かない）。送り方のバッジ、method、送り先の Origin（リンクにせず文字で示す）と path の型、型の
+ * digest、送る鍵、許すヘッダの名前、登録の ID の鍵、判定のしかたの説明、ページが決める鍵とその値（残していない値は文言を薄く示す）。
+ */
+const apiOf = ({ api }: ActionViewModel): readonly Fragment[] => {
+  if (api === null) {
+    return [];
+  }
+  const text = ACTION_REPORT_TEXT.api;
+  return [section('api', [
+    renderKeyValueList([
+      { label: text.transport, value: badgeOf(api.transport) },
+      { label: text.method, value: renderCode(api.method) },
+      { label: text.origin, value: renderUrlAsText(api.origin) },
+      { label: text.pathShape, value: renderCode(api.pathShape) },
+      { label: text.shapeDigest, value: renderCode(api.shapeDigest) },
+      { label: text.keyNames, value: api.keyNamesText },
+      { label: text.httpFieldNames, value: api.httpFieldNamesText },
+      { label: text.recordIdKey, value: api.recordIdKeyText },
+    ]),
+    renderParagraph(api.judgementNote),
+    renderTable({
+      caption: text.pageKeyValuesHeading,
+      columns: [text.pageKeyColumns.key, text.pageKeyColumns.value],
+      rows: api.pageKeys.map((pageKey) =>
+        renderTableRow([renderCode(pageKey.key), pageKey.kept ? renderCode(pageKey.valueText) : renderMutedText(pageKey.valueText)])),
+      emptyText: text.noPageKeys,
+    }),
+  ])];
+};
 
 const responseOf = ({ response }: ActionViewModel): Fragment => section('response', response === null
   ? [renderParagraph(renderMutedText(ACTION_REPORT_TEXT.none))]
@@ -242,6 +275,7 @@ export const renderActionReport = (model: ActionViewModel): string => renderDocu
     summaryOf(model),
     precheckOf(model),
     submissionOf(model),
+    ...apiOf(model),
     responseOf(model),
     ...updateOf(model),
     readVerificationOf(model),

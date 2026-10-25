@@ -1,6 +1,6 @@
 // 入力の規則（規則の集まり）の契約の SSOT（Task 29 の設計書 3 章、4.1。T29a）。
 // - 閉じた一覧は `as const` の凍結した配列として 1 回だけ定義し、TypeScript の型はその配列から導く（`scenario-contracts.ts` と同じ方式）。
-// - JSON Schema（`schemas/control/data-rule.schema.json`）の enum は、ここの配列と一致する（`tests/unit/schema-enum-consistency.test.ts`）。
+// - JSON Schema（`schemas/control/data-rule-v2.schema.json`）の enum は、ここの配列と一致する（`tests/unit/schema-enum-consistency.test.ts`）。
 //   上限・形・分岐の const は、ここの名前つきの定数と一致する（`tests/unit/data-rule-contracts.test.ts`）。
 // - 規則の集まり（RuleSet）はシナリオごとに 1 つ。版ごとに変えない写し（追記だけ。保存は T29d）。欄ごとの規則、欄どうしの関係、一意にする欄の組を
 //   持つ。digest は `rule-digest.ts`（Task 28 の入力の規則の参照 `InputRuleReference` の digest）。
@@ -16,13 +16,29 @@ import {
 } from '../../discovery/candidate-contracts.js';
 import { MAX_SCENARIO_FIELD_NAMES, MIN_SCENARIO_REVISION, SCENARIO_ID_PATTERN } from '../approval/scenario-contracts.js';
 import { foldNfkcCase } from '../../core/text.js';
+// PRE42-CC 組 UI-K3（台帳の CC-113）: 値の作り方と出どころの印の一覧（画面のブラウザ側も読む、import を持たない純粋な core のファイル）。ここは公開し直す。
+import {
+  FIXED_LIST_GENERATION_METHOD,
+  GENERATION_METHODS,
+  TEMPLATE_GENERATION_METHOD,
+  type GenerationMethod,
+} from '../../core/generation-methods.js';
+import { DEFAULT_RULE_ORIGIN, RULE_ORIGINS, type RuleOrigin } from '../../core/rule-origins.js';
+import { MAX_SIMPLE_PATTERN_REPEAT } from './simple-pattern.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 版の印と閉じた一覧
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 規則の集まりの版の文書の形の印（スキーマの `schemaVersion` の const）。 */
-export const RULE_SET_SCHEMA_VERSION = 'beaksight-data-rule/1';
+/**
+ * 規則の集まりの版の文書の形の印（新しく保存する文書の版。スキーマの `schemaVersion` の const）。
+ * - FM2c（手動の操作を減らす設計書 3A.3）で版 2 にした: 欄の規則に出どころの印（`origin`）と基準日からの幅（`baseDateWindow`）を足し、意味の種類に
+ *   「番号・コード」（`DIGIT_CODE`）を足した。スキーマは `schemas/control/data-rule-v2.schema.json`。
+ * - LG-3（2026-10-24 のテストの組の設計 3.7.2）: 版 1（T29a の形）の文書の読み替えと、そのスキーマは捨てた（利用者のデータに残っていない）。保存して
+ *   ある版 1 の文書は、読むとき（`rule-set-policy.ts` の `ruleSetRevisionOfStoredDocument`）に契約の形の誤りになる。
+ */
+export const RULE_SET_SCHEMA_VERSION = 'beaksight-data-rule/2';
+export type RuleSetSchemaVersion = typeof RULE_SET_SCHEMA_VERSION;
 
 /**
  * 欄の意味の種類（閉じた一覧。設計書 4.1。電話を含む）。
@@ -33,6 +49,8 @@ export const RULE_SET_SCHEMA_VERSION = 'beaksight-data-rule/1';
  * - 業務の数値と日時: `UNIT_PRICE`（単価）、`QUANTITY`（数量）、`TOTAL_PRICE`（合計）、`DATE`（日付）、`START_TIME`・`END_TIME`（開始・終了の
  *   時刻）、`PARTY_SIZE`（人数）。
  * - `FIXED_LIST`（人の固定の一覧の値だけ）、`OUT_OF_TEMPLATE`（テンプレートの外。人の固定の一覧がなければ作らない）。
+ * - `DIGIT_CODE`（番号・コード。FM2c）: 欄の pattern が数字だけの固定の桁数（`^\d{7}$`、`[0-9]{4}` など）のとき、その桁数の数字を作る。ほかの
+ *   pattern からは作らない（`PATTERN_UNSUPPORTED`）。規則の集まりの版 2 から。
  */
 export const SEMANTIC_KINDS = Object.freeze([
   'GENERIC_NUMBER',
@@ -58,20 +76,21 @@ export const SEMANTIC_KINDS = Object.freeze([
   'PARTY_SIZE',
   'FIXED_LIST',
   'OUT_OF_TEMPLATE',
+  'DIGIT_CODE',
 ] as const);
 export type SemanticKind = (typeof SEMANTIC_KINDS)[number];
 
 /**
- * 値の作り方（閉じた一覧。設計書 3 章の規則の優先順位: 汎用の規則 → 業務テンプレート → 人の上書き）。
- * - `FROM_TYPE`: 欄の型と制約から（汎用の規則）。
- * - `FROM_TEMPLATE`: 業務テンプレート（顧客・予約・商品）と辞書から。
- * - `FROM_FIXED_LIST`: 人が入れた固定の値の一覧から（最も強い）。固定の値の一覧は、この作り方のときだけ 1 件以上を持つ。
+ * 値の作り方（閉じた一覧）と、固定の値の一覧を持つ作り方。PRE42-CC 組 UI-K3（台帳の CC-113）: 値と意味は、画面のブラウザ側からも読める純粋なファイル
+ * `src/core/generation-methods.ts` に移し、ここは同じ名前で公開し直す。
  */
-export const GENERATION_METHODS = Object.freeze(['FROM_TYPE', 'FROM_TEMPLATE', 'FROM_FIXED_LIST'] as const);
-export type GenerationMethod = (typeof GENERATION_METHODS)[number];
+export { FIXED_LIST_GENERATION_METHOD, GENERATION_METHODS, TEMPLATE_GENERATION_METHOD, type GenerationMethod };
 
-/** 固定の値の一覧を持つ作り方。 */
-export const FIXED_LIST_GENERATION_METHOD = 'FROM_FIXED_LIST' satisfies GenerationMethod;
+/** 推した規則（出どころ `INFERRED`。FM2c）が持てる作り方（固定の値の一覧のほか。スキーマの分岐の enum）。 */
+export const INFERRED_RULE_GENERATION_METHODS = Object.freeze(
+  GENERATION_METHODS.filter((method): method is Exclude<GenerationMethod, typeof FIXED_LIST_GENERATION_METHOD> =>
+    method !== FIXED_LIST_GENERATION_METHOD),
+);
 
 /**
  * 欄どうしの関係（閉じた一覧。設計書 4.1）。関係ごとに、欄の役割の名前（`FIELD_RELATION_ROLES`）を持つ。
@@ -146,6 +165,9 @@ export type NeedsRuleInputDetail = (typeof NEEDS_RULE_INPUT_DETAILS)[number];
  * - `NOTIFICATION_OPT_OUT_UNAVAILABLE`: 外部到達の欄（通知・SMS・メールの送信を求める欄）で、「送らない」側の値が選べない。
  * - `FIELD_NOT_SENDABLE`: 送る欄が、候補の送れる欄でない（ない、hidden・readonly・disabled、password・file、`_method`。T29c。Task 28 の下書きの
  *   確かめを通った後に候補が変わった場合の備え）。
+ * - `PAGE_KEY_RULE_NOT_ALLOWED`: API のシナリオの、ページが決める鍵（`api.pageKeys`）に規則がある（値を作らない鍵。T38e）。
+ * - `JSON_VALUE_TYPE_MISMATCH`: API のシナリオの鍵の JSON の型と、規則が作る値の型が合わない（number の鍵の固定の値・範囲が正規の数の形でない、
+ *   欄の型と鍵の JSON の型の組が合わない。`json-value.ts`。T38e）。
  */
 export const RULE_CONFLICT_DETAILS = Object.freeze([
   'SEMANTIC_KIND_TYPE_MISMATCH',
@@ -157,6 +179,8 @@ export const RULE_CONFLICT_DETAILS = Object.freeze([
   'STATE_FIELD_NOT_USABLE',
   'NOTIFICATION_OPT_OUT_UNAVAILABLE',
   'FIELD_NOT_SENDABLE',
+  'PAGE_KEY_RULE_NOT_ALLOWED',
+  'JSON_VALUE_TYPE_MISMATCH',
 ] as const);
 export type RuleConflictDetail = (typeof RULE_CONFLICT_DETAILS)[number];
 
@@ -200,6 +224,18 @@ export type FieldRuleStatus = (typeof FIELD_RULE_STATUSES)[number];
 export const RULE_SOURCES = Object.freeze(['HUMAN', 'TEMPLATE', 'GENERIC', 'OPT_OUT'] as const);
 export type RuleSource = (typeof RULE_SOURCES)[number];
 
+/**
+ * 保存した規則の出どころの印（閉じた一覧）と、印のない規則の出どころ。PRE42-CC 組 UI-K3（台帳の CC-113）: 値と意味は、画面のブラウザ側からも読める
+ * 純粋なファイル `src/core/rule-origins.ts` に移し、ここは同じ名前で公開し直す（読み替えの関数 `ruleOriginOf` はここ）。
+ */
+export { DEFAULT_RULE_ORIGIN, RULE_ORIGINS, type RuleOrigin };
+
+/** 保存した規則の出どころ（印がなければ人。読み替えの規則はここだけ）。 */
+export const ruleOriginOf = (rule: Pick<FieldRule, 'origin'>): RuleOrigin => rule.origin ?? DEFAULT_RULE_ORIGIN;
+
+/** 規則の基準日からの幅（印がなければ null）。 */
+export const ruleBaseDateWindowOf = (rule: Pick<FieldRule, 'baseDateWindow'>): BaseDateWindow | null => rule.baseDateWindow ?? null;
+
 // ---------------------------------------------------------------------------------------------------------------
 // 上限
 // ---------------------------------------------------------------------------------------------------------------
@@ -224,6 +260,13 @@ export const MAX_RULE_RANGE_VALUE_LENGTH = MAX_CONSTRAINT_VALUE_LENGTH;
 
 /** 一意にする欄の組が、使った組とぶつかったときの、決定的な作り直しの最大の回数（超えれば `UNIQUE_COMBINATIONS_EXHAUSTED`）。 */
 export const MAX_UNIQUE_RETRIES = 32;
+
+/**
+ * 基準日からの幅の、日の数の最大（FM2c。スキーマの `baseDateWindow` の maximum と一致する）。
+ * 値の根拠: 既定の幅（`DEFAULT_UNRANGED_DATE_WINDOW_DAYS`。30 日）を十分に含み、生成の値の空間が安全な整数に収まる（datetime-local の 60 秒の刻みで
+ * 約 526 万）長さ（設計者の決定の範囲。FM2c の実装者が置いた）。
+ */
+export const MAX_BASE_DATE_WINDOW_DAYS = 3_650;
 
 /** 規則の集まりの版の最小（シナリオの版と同じ）。 */
 export const MIN_RULE_SET_REVISION = MIN_SCENARIO_REVISION;
@@ -329,7 +372,16 @@ export interface RuleRange {
   readonly step: string | null;
 }
 
-/** 欄の規則 1 件（`schemas/control/data-rule.schema.json` の `fieldRule`）。 */
+/**
+ * 基準日からの幅（FM2c。日付・日時の欄だけ。両端を含む日の数。基準日は実行の許可の発行日（Asia/Tokyo））。値は、基準日を足して求める
+ * （date は `YYYY-MM-DD`、datetime-local はその日の `T00:00`。`generic-values.ts` の `baseDateWindowRangeOf`）。範囲（`range`）とは一緒に持たない。
+ */
+export interface BaseDateWindow {
+  readonly fromDays: number;
+  readonly toDays: number;
+}
+
+/** 欄の規則 1 件（`schemas/control/data-rule-v2.schema.json` の `fieldRule`。印の項目は任意）。 */
 export interface FieldRule {
   /** 欄の名前（規則の集まりの中で重ならない）。 */
   readonly fieldName: string;
@@ -342,10 +394,22 @@ export interface FieldRule {
    * 替えない）。管理データに平文で残る（設計書 10 章の 4。秘密に見える名前の欄は拒む。確かめは T29c・T29d）。
    */
   readonly fixedValues: readonly string[];
+  /** 出どころの印（FM2c。なければ人の規則。`ruleOriginOf` で読む）。 */
+  readonly origin?: RuleOrigin;
+  /** 基準日からの幅（FM2c。なければ null と同じ。`ruleBaseDateWindowOf` で読む。範囲と一緒に持たない）。 */
+  readonly baseDateWindow?: BaseDateWindow | null;
+  /**
+   * 番号・コードの桁の数（FM2c fix round 1。`DIGIT_CODE` の規則だけ。なければ null と同じで、欄の pattern の桁の数を使う）。API のシナリオの鍵の欄は
+   * 制約を持たないので、自動の作成が同じ form の欄の pattern から求めた桁の数を、ここに固定する。
+   */
+  readonly digitCount?: number | null;
 }
 
-/** 欄どうしの関係 1 件（`schemas/control/data-rule.schema.json` の `relation` の分岐）。 */
-export type FieldRelation =
+/**
+ * 欄どうしの関係 1 件（`schemas/control/data-rule-v2.schema.json` の `relation` の分岐）。FM2c fix round 1: 出どころの印（`origin`。なければ人。
+ * 自動の作成がテンプレートの既定から求めて保存した関係は `INFERRED`）。
+ */
+export type FieldRelation = (
   | { readonly kind: 'END_AFTER_START'; readonly startFieldName: string; readonly endFieldName: string }
   | {
     readonly kind: 'TOTAL_EQUALS_UNIT_PRICE_TIMES_QUANTITY';
@@ -353,7 +417,8 @@ export type FieldRelation =
     readonly quantityFieldName: string;
     readonly totalFieldName: string;
   }
-  | { readonly kind: 'KANA_MATCHES_NAME'; readonly nameFieldName: string; readonly kanaFieldName: string };
+  | { readonly kind: 'KANA_MATCHES_NAME'; readonly nameFieldName: string; readonly kanaFieldName: string }
+) & { readonly origin?: RuleOrigin };
 
 /** 関係の欄の名前（役割の順。`FIELD_RELATION_ROLES[relation.kind]` と同じ並び）。役割の項目を引くのは、この関数だけ。 */
 export const relationFieldNamesOf = (relation: FieldRelation): readonly string[] => {
@@ -369,11 +434,35 @@ export interface RuleSetContent {
   readonly relations: readonly FieldRelation[];
   /** 一意にする欄の組（重ならない。欄ごとの規則の欄。空なら業務テンプレートの既定の組（T29c の `defaultUniqueKeyFieldNamesOf`）を使う）。 */
   readonly uniqueKeyFieldNames: readonly string[];
+  /** 一意にする欄の組の出どころの印（FM2c fix round 1。なければ人。自動の作成がテンプレートの既定から求めて保存した組は `INFERRED`）。 */
+  readonly uniqueKeyOrigin?: RuleOrigin;
+  /**
+   * テンプレートの既定の関係と一意にする欄の組を、保存した中身に固定したか（FM2c fix round 1。なければ false）。真なら、判定は保存した関係と組だけを
+   * 使い、テンプレートの既定を足さない（自動の作成の後に、コードの変更で関係や組が黙って変わらないため）。偽なら、今どおり足す。
+   */
+  readonly templateDefaultsSaved?: boolean;
 }
 
-/** 規則の集まりの版 1 つ（変えない写し。`schemas/control/data-rule.schema.json` の形。日時は UTC の 14 桁）。 */
+/** 番号・コードの桁の数の最大（FM2c fix round 1。単純な pattern の量の最大と同じ。スキーマの `digitCount` の maximum と一致する）。 */
+export const MAX_DIGIT_CODE_DIGITS = MAX_SIMPLE_PATTERN_REPEAT;
+
+/** 規則の番号・コードの桁の数（印がなければ null）。 */
+export const ruleDigitCountOf = (rule: Pick<FieldRule, 'digitCount'>): number | null => rule.digitCount ?? null;
+
+/** 関係の出どころ（印がなければ人）。 */
+export const relationOriginOf = (relation: Pick<FieldRelation, 'origin'>): RuleOrigin => relation.origin ?? DEFAULT_RULE_ORIGIN;
+
+/** 一意にする欄の組の出どころ（印がなければ人）。 */
+export const uniqueKeyOriginOf = (content: Pick<RuleSetContent, 'uniqueKeyOrigin'>): RuleOrigin => content.uniqueKeyOrigin ?? DEFAULT_RULE_ORIGIN;
+
+/** テンプレートの既定を保存した中身か（印がなければ偽）。 */
+export const templateDefaultsSavedOf = (content: Pick<RuleSetContent, 'templateDefaultsSaved'>): boolean => content.templateDefaultsSaved ?? false;
+
+/**
+ * 規則の集まりの版 1 つ（変えない写し。`schemas/control/data-rule-v2.schema.json` の形。日時は UTC の 14 桁）。
+ */
 export interface RuleSetRevision extends RuleSetContent {
-  readonly schemaVersion: typeof RULE_SET_SCHEMA_VERSION;
+  readonly schemaVersion: RuleSetSchemaVersion;
   readonly ruleSetId: string;
   readonly scenarioId: string;
   readonly revision: number;

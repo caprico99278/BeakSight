@@ -14,7 +14,8 @@ import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { wait } from '../../src/core/deadline.js';
 import { MAX_SELECT_OPTION_VALUES, type DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
-import { DISCOVERY_READ_TIMEOUT_MS, discoverPageCandidates, type DiscoveryPageRecord } from '../../src/discovery/discover-page.js';
+import { DISCOVERY_READ_TIMEOUT_MS, discoverPageCandidates } from '../../src/discovery/discover-page.js';
+import type { DiscoveryReadPageRecord } from '../../src/discovery/discovery-result.js';
 import { probePageCandidates } from '../../src/discovery/probe.js';
 import { readPageStructure, readSettledPageStructure } from '../../src/discovery/read-executor.js';
 import { DISCOVERY_SETTLE_TIMEOUT_MS, InFlightRequestCounter } from '../../src/discovery/settle.js';
@@ -29,6 +30,7 @@ import {
   type DiscoveryFixture,
   type DiscoveryFixtureRequest,
 } from '../helpers/discovery-fixture.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
@@ -40,7 +42,6 @@ const LAUNCHERS = [
 const QUIET_PERIOD_MS = 500;
 /** 落ち着かない画面のテストの上限（ms）。落ち着きの待ちの上限と、読み取りの時間を含む。 */
 const UNSTABLE_TEST_TIMEOUT_MS = 60_000;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 const NO_LISTENERS = { form: [], submitter: [], ancestor: [], document: [], window: [], inlineHandler: false };
 const NO_CONSTRAINTS = { pattern: null, min: null, max: null, step: null, minlength: null, maxlength: null, autocomplete: null };
 /** DEF-087: ページの主の thread を占める時間（ms）と、占めている間の読み取りの期限（ms）、占め始めるのを待つ時間（ms）。 */
@@ -63,7 +64,7 @@ const readPageHits = async (page: Page): Promise<number> => {
 };
 
 interface DiscoveryRun {
-  readonly record: DiscoveryPageRecord;
+  readonly record: DiscoveryReadPageRecord;
   /** 発見を呼んでから、終わって `QUIET_PERIOD_MS` 待つまでに、サーバが受けた要求。 */
   readonly requestsDuringDiscovery: readonly DiscoveryFixtureRequest[];
   readonly elapsedMs: number;
@@ -125,7 +126,7 @@ describe.each(LAUNCHERS)('T27b: discovering candidates by reading only (%s)', (_
   };
 
   /** 値・トークン・選択肢の label・hidden の値の目印が、結果のどこにも出ない。候補は成果物のスキーマに通る。 */
-  const expectSafeRecord = (record: DiscoveryPageRecord): void => {
+  const expectSafeRecord = (record: DiscoveryReadPageRecord): void => {
     const text = JSON.stringify(record);
     for (const value of Object.values(fixture.markers)) {
       expect(text.includes(value), value).toBe(false);

@@ -1,11 +1,22 @@
 {
   "$id": "urn:beaksight:schema:control:read-check-definition:1",
-  "description": "The content of one READ check definition (Task 27 design 4.5): the target READ candidate, the values to send (field name to value, test values of the test environment only) and the expectations. The value lists and limits are owned by src/discovery/read-check-contracts.ts. The rules against the candidate (visible, editable fields only; no secret-like names; the candidate is READ) are checked by src/control/read-check-policy.ts.",
+  "description": "The content of one READ check definition (Task 27 design 4.5): the target READ candidate, the values to send (field name to value, test values of the test environment only) and the expectations. The value lists and limits are owned by src/discovery/read-check-contracts.ts. The rules against the candidate (visible, editable fields only; no secret-like names; the candidate is READ) are checked by src/control/read-check-policy.ts. T37d (Task 37 design 3.5): the target is either a READ candidate (targetIdentityDigest) or a page path (targetPagePath), exactly one; a page path definition sends no value (parameters is empty). The page path is checked against the start URL and the exclusions by src/control/read-check-policy.ts (its canonical form by readCheckPageUrlOf).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["targetIdentityDigest", "parameters", "expectations"],
+  "required": ["parameters", "expectations"],
+  "oneOf": [
+    {
+      "required": ["targetIdentityDigest"],
+      "properties": { "targetIdentityDigest": { "$ref": "#/properties/targetIdentityDigest" }, "targetPagePath": false }
+    },
+    {
+      "required": ["targetPagePath"],
+      "properties": { "targetPagePath": { "$ref": "#/properties/targetPagePath" }, "targetIdentityDigest": false, "parameters": { "type": "object", "maxProperties": 0 } }
+    }
+  ],
   "properties": {
     "targetIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "targetPagePath": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/(?!/)[^?#\\\\\\s]*$" },
     "parameters": {
       "type": "object",
       "maxProperties": 50,

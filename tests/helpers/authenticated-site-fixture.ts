@@ -12,9 +12,9 @@
 //   無効にする（届いたら、セッションが壊れる）。
 // - サーバに届いた要求（Origin の別、method、path と query、受け取った Cookie の名前、認証済みだったか）を、順に記録する。Cookie の値は記録しない。
 import { randomBytes } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 /** T25f（`expireFirstSessionAtPath`）: 最初のセッションの系列の番号。 */
 const FIRST_SESSION_FAMILY = 1;
@@ -32,7 +32,10 @@ export const AUTH_SITE_OTHER_ORIGIN_COOKIE = 'idp';
 /** localStorage の項目の名前（値は秘密の目印）。 */
 export const AUTH_SITE_LOCAL_STORAGE_ITEM = 'ls_token';
 
-/** 1 つのページで、除外に当たる画像の数（除外の記録の上限 256 件を超える数）。 */
+/**
+ * 1 つのページで、除外に当たる iframe の数（除外の記録の上限 256 件を超える数）。BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md`
+ * 3.0）から、監査の段の除外はページの文書でない GET（画像など）に当てず、文書の読み込み（iframe を含む）に当てるので、iframe の文書で数を作る。
+ */
 export const AUTH_SITE_MANY_EXCLUDED_IMAGES = 300;
 /** `adminPinging` の画面が `adminPing` を GET する間隔（ms）。 */
 const ADMIN_PING_INTERVAL_MS = 100;
@@ -113,7 +116,35 @@ export interface AuthenticatedSiteOptions {
    * 持たない（`AUTH_SITE_RELOGIN_FIELD_VALUE`）。指定がなければ、画面もリンクもない（今のまま）。
    */
   readonly adminReloginForm?: boolean;
+  /**
+   * DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 3 章の 1）: `loginForm` と一緒に使う。ログインの POST の後の画面
+   * （`/admin?login=1`。`AUTH_SITE_INDEXED_DB.landingQuery`）が、IndexedDB（`AUTH_SITE_INDEXED_DB`）に秘密の目印を書き、書き終えてから成功の画面の
+   * 要素（`#admin-ok`）を出す。2 ページ目（`AUTH_SITE_PATHS.adminSecond`）は、読み込みの後に IndexedDB を読み、その記録がなければ、ログインの画面
+   * （`AUTH_SITE_INDEXED_DB.missingPath`）へ移す（クライアントの側の移動。Cookie は有効なまま）。指定がなければ、今のまま。
+   */
+  readonly indexedDbGate?: boolean;
 }
+
+/** DEF-139（`indexedDbGate`）: IndexedDB のデータベースと object store と鍵の名前、ログインの後の画面の query、記録がないときに移す先。 */
+export const AUTH_SITE_INDEXED_DB = Object.freeze({
+  database: 'beak-session',
+  store: 'kv',
+  key: 'auth-token',
+  landingQuery: '?login=1',
+  missingPath: '/login?expired=idb',
+  /**
+   * 2 ページ目の、parser を止めるスクリプト（応答を `INDEXED_DB_GATE_WAIT_MS` 遅らせ、DOMContentLoaded の前に IndexedDB の確かめと移動を終えさせる）。
+   * DEF-165: BeakSight の読み込みは DOMContentLoaded で返り、セッションの切れはその直後に確かめる。前は画像（`load` だけを遅らせる）だったので、CLI の
+   * Chromium では IndexedDB の確かめが読み込みの戻りより後になり、記録がなくてもセッションの切れと判定されなかった（fixture の競争）。
+   */
+  waitPath: '/admin/gate-wait.js',
+} as const);
+
+/**
+ * DEF-139（`indexedDbGate`）: 2 ページ目の parser を止めるスクリプトの応答を遅らせる時間（ms。IndexedDB の確かめと移動が、DOMContentLoaded より先に
+ * 済む長さ。DEF-165 の観察では、移動は読み込みの開始から CLI の Chromium で約 70ms、既定の Chromium で約 20ms。混雑の下の余裕を見る）。
+ */
+const INDEXED_DB_GATE_WAIT_MS = 1_000;
 
 /** T32i（`adminReloginForm`）: 監査の段の画面が送ろうとするフォームの欄の値（資格情報ではない、固定の目印）。 */
 export const AUTH_SITE_RELOGIN_FIELD_VALUE = 'relogin-attempt';
@@ -168,13 +199,14 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
   const rotatedAway = new Map<string, number>();
   const issued: string[] = [];
   const requests: AuthenticatedSiteRequest[] = [];
-  const sockets = new Set<Duplex>();
   let families = 0;
   let port = 0;
   // T25d（`loginForm`）: 仮の資格情報と CSRF の値、管理画面が localStorage に書く秘密の目印。
   const credentials = { user: `u${randomSecretValue()}`, pass: `p${randomSecretValue()}` };
   const csrf = randomSecretValue();
   const localStorageMarker = randomSecretValue();
+  // DEF-139（`indexedDbGate`）: ログインの後の画面が IndexedDB に書く秘密の目印。
+  const indexedDbMarker = randomSecretValue();
   let successfulLogins = 0;
   // T25f（`queryTokens`）: URL の query に入れる秘密の目印。
   const queryTokens = {
@@ -217,7 +249,8 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
     const p = AUTH_SITE_PATHS;
     if (path === p.adminManyExcluded) {
       return '<h1 id="admin-ok">MANY</h1>'
-        + Array.from({ length: AUTH_SITE_MANY_EXCLUDED_IMAGES }, (_, index) => `<img src="${p.adminLogout}?img=${index}" alt="">`).join('');
+        + Array.from({ length: AUTH_SITE_MANY_EXCLUDED_IMAGES }, (_, index) =>
+          `<iframe title="f${String(index)}" src="${p.adminLogout}?frame=${String(index)}" style="width:1px;height:1px"></iframe>`).join('');
     }
     if (path === p.adminFrames) {
       return '<h1 id="admin-ok">FRAMES</h1>'
@@ -230,7 +263,8 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
         + `<script>setInterval(() => { fetch('${p.adminPing}').catch(() => undefined); }, ${ADMIN_PING_INTERVAL_MS});</script>`;
     }
     if (path === p.adminSecond) {
-      return `<h1 id="admin-ok">SECOND</h1><p><a href="${p.admin}">admin</a></p>`;
+      return `<h1 id="admin-ok">SECOND</h1><p><a href="${p.admin}">admin</a></p>`
+        + (options.indexedDbGate === true ? `${indexedDbGateScript()}<script src="${AUTH_SITE_INDEXED_DB.waitPath}"></script>` : '');
     }
     if (options.adminReloginForm === true && path === p.adminRelogin) {
       return '<h1 id="admin-ok">RELOGIN</h1>'
@@ -246,6 +280,37 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
       + `<li><a href="${p.login}">login</a></li>`
       + `<li><a href="${originB()}${p.otherExternal}">external</a></li>`
       + '</ul>';
+  };
+
+  /**
+   * DEF-139（`indexedDbGate`）: 2 ページ目の、IndexedDB の記録を確かめるスクリプト（データベースか記録がなければ、ログインの画面へ移す）。データベースが
+   * ないときに `open` で作らないよう、先に `indexedDB.databases()` で名前を確かめる。値は比べない（記録があるかだけ）。
+   */
+  const indexedDbGateScript = (): string => {
+    const d = AUTH_SITE_INDEXED_DB;
+    return '<script>(async () => {'
+      + `const toLogin = () => location.replace(${JSON.stringify(d.missingPath)});`
+      + `const names = (await indexedDB.databases()).map((info) => info.name);`
+      + `if (!names.includes(${JSON.stringify(d.database)})) { toLogin(); return; }`
+      + `const db = await new Promise((resolve, reject) => { const r = indexedDB.open(${JSON.stringify(d.database)}); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });`
+      + `if (!db.objectStoreNames.contains(${JSON.stringify(d.store)})) { db.close(); toLogin(); return; }`
+      + `const value = await new Promise((resolve, reject) => { const r = db.transaction(${JSON.stringify(d.store)}, 'readonly').objectStore(${JSON.stringify(d.store)}).get(${JSON.stringify(d.key)}); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });`
+      + 'db.close();'
+      + 'if (typeof value !== "string" || value.length === 0) toLogin();'
+      + '})().catch(() => location.replace(' + JSON.stringify(d.missingPath) + '));</script>';
+  };
+
+  /** DEF-139（`indexedDbGate`）: ログインの後の画面。IndexedDB に目印を書き終えてから、成功の画面の要素を出す。 */
+  const indexedDbLandingHtml = (): string => {
+    const d = AUTH_SITE_INDEXED_DB;
+    return '<h1 id="admin-pending">ADMIN</h1><script>(async () => {'
+      + `const db = await new Promise((resolve, reject) => { const r = indexedDB.open(${JSON.stringify(d.database)}, 1);`
+      + ` r.onupgradeneeded = () => r.result.createObjectStore(${JSON.stringify(d.store)}); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });`
+      + `await new Promise((resolve, reject) => { const tx = db.transaction(${JSON.stringify(d.store)}, 'readwrite');`
+      + ` tx.objectStore(${JSON.stringify(d.store)}).put(${JSON.stringify(indexedDbMarker)}, ${JSON.stringify(d.key)}); tx.oncomplete = () => resolve(undefined); tx.onerror = () => reject(tx.error); });`
+      + 'db.close();'
+      + 'document.getElementById("admin-pending").id = "admin-ok";'
+      + '})();</script>';
   };
 
   const loginFormHtml = (): string => '<h1 id="login-title">LOGIN</h1>'
@@ -269,7 +334,8 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
       successfulLogins += 1;
       const sid = issueSession();
       response.writeHead(STATUS_SEE_OTHER, {
-        location: AUTH_SITE_PATHS.admin,
+        // DEF-139（`indexedDbGate`）: ログインの後の画面（IndexedDB に書く）へ移す。
+        location: options.indexedDbGate === true ? `${AUTH_SITE_PATHS.admin}${AUTH_SITE_INDEXED_DB.landingQuery}` : AUTH_SITE_PATHS.admin,
         'set-cookie': `${AUTH_SITE_SESSION_COOKIE}=${sid}; HttpOnly; SameSite=Lax; Path=/`,
       });
       response.end();
@@ -336,6 +402,13 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
       response.end();
       return true;
     }
+    if (options.indexedDbGate === true && pathname === AUTH_SITE_INDEXED_DB.waitPath) {
+      setTimeout(() => {
+        response.writeHead(STATUS_OK, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+        response.end('');
+      }, INDEXED_DB_GATE_WAIT_MS);
+      return true;
+    }
     if (pathname === p.adminPing) {
       response.writeHead(STATUS_OK, { 'content-type': 'application/json', 'cache-control': 'no-store' });
       response.end('{"ok":true}');
@@ -360,7 +433,9 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
     const storageScript = options.loginForm === true
       ? `<script>localStorage.setItem('${AUTH_SITE_LOCAL_STORAGE_ITEM}', '${localStorageMarker}');</script>`
       : '';
-    sendHtml(response, `${adminHtml(pathname)}${storageScript}`, headers);
+    // DEF-139（`indexedDbGate`）: ログインの後の画面だけ、IndexedDB に書く画面にする。
+    const landing = options.indexedDbGate === true && pathname === p.admin && url.search === AUTH_SITE_INDEXED_DB.landingQuery;
+    sendHtml(response, `${landing ? indexedDbLandingHtml() : adminHtml(pathname)}${storageScript}`, headers);
     return true;
   };
 
@@ -378,7 +453,7 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
     response.end('');
   };
 
-  const server = createServer((request, response) => {
+  const loopback = await startLoopbackHttpServer((request, response) => {
     const site = siteOf(request);
     const url = new URL(request.url ?? '/', site === 'A' ? originA() : originB());
     const cookieNames = [...cookiesOf(request).keys()].sort();
@@ -396,17 +471,12 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
     }
     requests.push({ site, method: request.method ?? '', path: `${url.pathname}${url.search}`, cookieNames, authenticated });
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
+  loopback.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
     const site = siteOf(request);
     requests.push({ site, method: 'UPGRADE', path: request.url ?? '/', cookieNames: [], authenticated: false });
     socket.destroy();
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, () => resolve()));
-  port = (server.address() as AddressInfo).port;
+  port = loopback.port;
 
   return {
     originA: originA(),
@@ -414,7 +484,12 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
     requests,
     issueSession: () => issueSession(),
     // T25d: `loginForm` の管理画面が localStorage に書く目印も、秘密の値に含める。
-    secretValues: () => [...issued, ...(options.loginForm === true ? [localStorageMarker] : [])],
+    // DEF-139: `indexedDbGate` の画面が IndexedDB に書く目印も、秘密の値に含める。
+    secretValues: () => [
+      ...issued,
+      ...(options.loginForm === true ? [localStorageMarker] : []),
+      ...(options.indexedDbGate === true ? [indexedDbMarker] : []),
+    ],
     async fillCredentials(fill) {
       await fill(AUTH_SITE_LOGIN_FIELDS.user, credentials.user);
       await fill(AUTH_SITE_LOGIN_FIELDS.pass, credentials.pass);
@@ -423,10 +498,7 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
       return successfulLogins;
     },
     queryTokenValues: () => (options.queryTokens === true ? Object.values(queryTokens) : []),
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: () => loopback.close(),
   };
 }
 

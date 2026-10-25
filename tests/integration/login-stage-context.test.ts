@@ -9,12 +9,13 @@
 //   `SHARED_WORKER_OBSERVED` を記録して、その Context を閉じる。
 import type { Browser, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { isPassiveRequestGuardClosed, type GuardLoginStage } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { closeTestContexts, launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
 import { sharedWorkerPostsPath } from '../helpers/gate-harness.js';
 import { LOGIN_FIXTURE_PATHS, startLoginFixtureServer, type LoginFixtureServer } from '../helpers/login-fixture-server.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
@@ -28,8 +29,6 @@ const VIEWPORT: Viewport = Object.freeze({ width: 1280, height: 800 });
 const QUIET_PERIOD_MS = 300;
 const NAVIGATION_SETTLE_TIMEOUT_MS = 10_000;
 
-const wait = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-
 describe.each(LAUNCHERS)('T25d: the login stage Context of the factory (%s)', (_name, launch) => {
   let browser: Browser;
   let server: LoginFixtureServer;
@@ -41,7 +40,7 @@ describe.each(LAUNCHERS)('T25d: the login stage Context of the factory (%s)', (_
 
   afterEach(async () => {
     await Promise.all(factories.splice(0).map((factory) => factory.close()));
-    await Promise.all(browser.contexts().map((context) => context.close().catch(() => undefined)));
+    await closeTestContexts(browser);
     await server?.close();
   });
 
@@ -143,7 +142,7 @@ describe.each(LAUNCHERS)('T25d: the login stage Context of the factory (%s)', (_
     ]) {
       await expect(factory.createLoginStageContext(VIEWPORT, stage as never), JSON.stringify(stage)).rejects.toThrow(TypeError);
     }
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   });
 });
 

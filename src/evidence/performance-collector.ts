@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { BrowserContext, Page } from 'playwright';
 import { awaitBeforeDeadline } from '../core/deadline.js';
@@ -116,10 +117,21 @@ const BROWSER_PERFORMANCE_VALUE_LISTS: BrowserPerformanceValueLists = Object.fre
   inpInteractionTypes: INP_INTERACTION_TYPES,
 });
 
+/** `PAGE_PERFORMANCE_STATE_PROPERTY` の乱数の bytes の数（16 進で 2 倍の文字数になる）。 */
+const PAGE_PERFORMANCE_STATE_PROPERTY_RANDOM_BYTES = 8;
+
+/**
+ * Web Vitals の状態を置く、ページの main world の大域の名前（UPG-SW。ただ 1 つの作る所）。web-vitals は main world で動くので、状態は main world の
+ * 大域に置き、`collect` の `page.evaluate` で読む。ページのスクリプトは大域の名前を読めるので、BeakSight や Collector だと推し量れる名前にしない
+ * （ユーザーの方針）。名前は、プロセスごとの暗号の乱数（16 進。BeakSight の文字を作れない）で、初期化のスクリプトと `collect` に引数で渡す。
+ */
+export const PAGE_PERFORMANCE_STATE_PROPERTY: string = `_${randomBytes(PAGE_PERFORMANCE_STATE_PROPERTY_RANDOM_BYTES).toString('hex')}`;
+
 function initializePerformanceState(
   library: unknown,
   limits: BrowserPerformanceLimits,
   valueLists: BrowserPerformanceValueLists,
+  stateProperty: string,
 ): void {
   const { maxIdLength, maxTextLength, maxUrlLength, maxResourceTimingEntries } = limits;
   // Resource Timing のバッファを広げ、満杯になったことを記録する。ページのリスナーより先に動くよう capture で登録する。
@@ -278,7 +290,7 @@ function initializePerformanceState(
     // リスナーを登録できなかった場合は、満杯かどうかが分からないので `null` にする。
     resourceBuffer: { size: resourceBufferSize, full: resourceBufferObservable ? resourceBufferFull : null },
   });
-  Object.defineProperty(globalThis, '__BEAKSIGHT_PERFORMANCE__', {
+  Object.defineProperty(globalThis, stateProperty, {
     configurable: false,
     enumerable: false,
     get: snapshot,
@@ -294,7 +306,7 @@ async function createInitScript(): Promise<string> {
   const bundle = await readFile(webVitalsBundleUrl(), { encoding: 'utf8' });
   return `${bundle}\n;(${initializePerformanceState.toString()})(`
     + `typeof webVitals === 'object' ? webVitals : undefined, ${JSON.stringify(BROWSER_PERFORMANCE_LIMITS)}, `
-    + `${JSON.stringify(BROWSER_PERFORMANCE_VALUE_LISTS)});`;
+    + `${JSON.stringify(BROWSER_PERFORMANCE_VALUE_LISTS)}, ${JSON.stringify(PAGE_PERFORMANCE_STATE_PROPERTY)});`;
 }
 
 function validateOptions(options: PerformanceCollectionOptions): void {
@@ -1083,11 +1095,15 @@ function telemetryFacts(networkEvidence: ProjectedNetworkEvidence): TelemetryFac
   });
 }
 
-function browserSnapshot(limits: BrowserPerformanceLimits): unknown {
-  const globalObject = globalThis as typeof globalThis & {
-    __BEAKSIGHT_PERFORMANCE__?: unknown;
-  };
-  const pageState = globalObject.__BEAKSIGHT_PERFORMANCE__;
+/** `browserSnapshot` に渡す値（ブラウザ内では import できないため、引数で渡す）。 */
+interface BrowserSnapshotInput {
+  readonly limits: BrowserPerformanceLimits;
+  /** Web Vitals の状態の大域の名前（`PAGE_PERFORMANCE_STATE_PROPERTY`）。 */
+  readonly stateProperty: string;
+}
+
+function browserSnapshot({ limits, stateProperty }: BrowserSnapshotInput): unknown {
+  const pageState: unknown = (globalThis as unknown as Record<string, unknown>)[stateProperty];
   const pageStateRecord = typeof pageState === 'object' && pageState !== null && !Array.isArray(pageState)
     ? pageState as Record<string, unknown>
     : undefined;
@@ -1238,7 +1254,7 @@ export class PerformanceCollector {
     if (Date.now() >= deadlineAtMs) return partial('DEADLINE_EXCEEDED', unavailable);
 
     const evaluated = await awaitBeforeDeadline(
-      page.evaluate(browserSnapshot, BROWSER_PERFORMANCE_LIMITS),
+      page.evaluate(browserSnapshot, { limits: BROWSER_PERFORMANCE_LIMITS, stateProperty: PAGE_PERFORMANCE_STATE_PROPERTY }),
       deadlineAtMs,
     );
     if (evaluated.status === 'REJECTED') {

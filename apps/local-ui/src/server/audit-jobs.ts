@@ -21,10 +21,12 @@ import {
 } from '../../../../src/control/job/audit-job-manager.js';
 import { AUDIT_JOB_SHUTDOWN_WAIT_MS } from '../../../../src/control/job/job-records.js';
 import { ControlInstanceLockedError } from '../../../../src/control/job/instance-lock.js';
+import { errorMessageOrString } from '../../../../src/core/errors.js';
 import { LOCAL_UI_JOB_CONSOLE_TEXT, describeLocalUiStartFailure } from '../../../../src/presentation/messages.js';
 import { localUiRepositoryRoot, localUiStore } from './control-store';
 import { localUiCredentialRoot, localUiCredentialStore } from './credential-runtime';
 import { loadTargetContext } from './target-config';
+import { recordLocalUiWorkerExit } from './ui-server-log-file';
 
 /** リポジトリの root からの、監査のワーカーの入口（`npm run build` の出力）。 */
 const WORKER_ENTRY_SEGMENTS = Object.freeze(['dist', 'worker', 'audit-worker.js'] as const);
@@ -60,10 +62,12 @@ const create = (port: number | null): { readonly manager: AuditJobManager; reado
     workerPath: localUiWorkerPath(),
     resolveContext: async (targetConfigPath) => (await loadTargetContext(targetConfigPath)).context,
     onBackgroundError: (error) => {
-      console.error(LOCAL_UI_JOB_CONSOLE_TEXT.backgroundError, error instanceof Error ? error.message : String(error));
+      console.error(LOCAL_UI_JOB_CONSOLE_TEXT.backgroundError, errorMessageOrString(error));
     },
     instancePort: port,
     credentials: { root: localUiCredentialRoot(), store: localUiCredentialStore() },
+    // DEF-146: 結果の前に終わったワーカーの終わり方（終了コード・シグナル）を、画面のサーバの終わりの記録のファイルに 1 行書く。
+    onUnexpectedWorkerExit: (event) => recordLocalUiWorkerExit(event),
   });
   return { manager, recovered: manager.recoverInterruptedJobs() };
 };

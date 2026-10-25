@@ -16,7 +16,10 @@
     "omittedUnreadPages"
   ],
   "properties": {
-    "schemaVersion": { "const": "discovery-schema/1.0" },
+    "schemaVersion": {
+      "description": "The current version 1.1; the writer writes 1.1 (src/discovery/discovery-result.ts). LG-4: the previous version 1.0 is no longer read.",
+      "enum": ["discovery-schema/1.1"]
+    },
     "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
     "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
@@ -29,13 +32,54 @@
         "MAX_RUNTIME_REACHED",
         "STOPPED",
         "AUTH_SESSION_LOST",
+        "SERVICE_REQUEST_LIMIT_REACHED",
+        "SITE_UNAVAILABLE",
         "SAFETY_VIOLATION",
         "PREFLIGHT_FAILED"
       ]
     },
     "maxPages": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
-    "omittedUnreadPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+    "omittedUnreadPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "endReasonDetail": {
+      "description": "Optional (T37a; Task 37 design 3.1): the detail of the end. session-key: the session was taken as lost because the key of the login state disappeared (endReason AUTH_SESSION_LOST). Absent otherwise.",
+      "enum": ["session-key"]
+    },
+    "authentication": {
+      "description": "Optional (T37a; Task 37 design 3.1): the counts of the audit stage of the job (the same counts as run.json). Counts only; never a URL or a value.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/auditStageCounts"
+    },
+    "sessionLoss": {
+      "description": "Optional (DEF-138): the evidence of the load where the session was lost (endReason AUTH_SESSION_LOST; the same shape as authentication.sessionLoss of run.json). Absent otherwise.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/sessionLoss"
+    },
+    "auditSendPolicy": {
+      "description": "Optional (AS-b; audit send policy design 2.3): the effective audit send policy of the job (the same values as audit.sendPolicy of run.json). A document written before AS-b does not have it and is read as READ_ONLY.",
+      "$ref": "urn:beaksight:schema:run:1.0#/properties/effectiveConfig/properties/audit/properties/sendPolicy"
+    },
+    "safetyViolation": {
+      "description": "Optional (DEF-144): the content of the invariant violation of the Safety Ledger that stopped the job (endReason SAFETY_VIOLATION; the same list as the safety summary of run.json, with the stage, the page path and the pressed candidate). Absent otherwise and in the documents of the earlier writers (the version stays 1.1).",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/jobSafetyViolation"
+    },
+    "externalSchemeProbes": {
+      "description": "Optional (DEF-144; probe external scheme design 2.3): the candidates the probe did not press because they point to (or tried to move to) an external scheme (reason EXTERNAL_SCHEME), and the pages loaded again for the probe. The current writer always writes it; absent in the documents of the earlier writers.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notPressed", "reloadedPages"],
+      "properties": {
+        "notPressed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "reloadedPages": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "pressLimitProbes": {
+      "description": "Optional (T44c; Task 44 design P1-3): the candidates with a create or update word in the submitter words that the probe did not press because of the press limit of a page (reason PRESS_LIMIT_REACHED; the invisible candidates are TARGET_NOT_FOUND and not counted). The current writer always writes it; absent in the documents of the earlier writers (the version stays 1.1).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["priorityNotPressed"],
+      "properties": {
+        "priorityNotPressed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
   },
   "$defs": {
     "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
@@ -50,7 +94,36 @@
             "url": { "$ref": "#/$defs/url" },
             "state": { "const": "READ" },
             "record": { "$ref": "#/$defs/record" },
-            "blockedRequests": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+            "blockedRequests": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "documentRequests": {
+              "description": "Optional (DEF-129): the main frame document requests that the Guard sent in the context of the page (the load of BeakSight, the redirects and the loads started by the page). Absent in the artifacts of the earlier writers.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "childFrameDocumentRequests": {
+              "description": "Optional (T37R2-fix): the child frame document requests that the Guard sent in the context of the page (a separate count). Absent in the artifacts of the earlier writers.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "subresourceRequests": {
+              "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent in the context of the page (a separate count). Absent in the artifacts of the earlier writers.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "safetyViolations": {
+              "description": "Optional (DEF-144; probe external scheme design 2.2): the contents of the violations of a press that tried to move to an external scheme on this page (the discovery went on; at most 2: before and after the reload). Absent otherwise.",
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "items": { "$ref": "urn:beaksight:schema:run:1.0#/$defs/jobSafetyViolation" }
+            },
+            "reloadedForProbe": {
+              "description": "Optional (DEF-144): the page was loaded again once to press the rest of the candidates. Absent otherwise.",
+              "const": true
+            }
           }
         },
         {
@@ -65,10 +138,13 @@
                 "EXCLUDED",
                 "MAX_DEPTH_REACHED",
                 "NAVIGATION_FAILED",
+                "HTTP_ERROR_STATUS",
                 "MAX_PAGES_REACHED",
                 "MAX_RUNTIME_REACHED",
                 "STOPPED",
                 "AUTH_SESSION_LOST",
+                "SERVICE_REQUEST_LIMIT_REACHED",
+                "SITE_UNAVAILABLE",
                 "SAFETY_VIOLATION",
                 "PREFLIGHT_FAILED"
               ]

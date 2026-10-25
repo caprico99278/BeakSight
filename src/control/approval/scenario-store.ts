@@ -20,6 +20,7 @@
 // - 呼び出し側の誤り（形の違う ID・時刻・digest・件数・状態、使った ID、前の時刻、契約の形に合わない候補）は、書く前に `RangeError`。
 import { isSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
+import { jsonCopyOf } from '../../core/json-copy.js';
 import { isNonNegativeSafeInteger, isRecord } from '../../core/guards.js';
 import { MAX_FIELD_NAME_LENGTH } from '../../discovery/candidate-contracts.js';
 import { READ_CHECK_RESULTS, type ReadCheckResult } from '../../discovery/read-check-contracts.js';
@@ -28,6 +29,7 @@ import {
   MAX_HTTP_STATUS,
   MAX_SUBMITTED_VALUE_LENGTH,
   MIN_HTTP_STATUS,
+  NOT_SENT_SUBMISSION_STATE,
   RESPONSE_JUDGEMENTS,
   SUBMISSION_STATES,
   type ActionBlockReason,
@@ -39,9 +41,11 @@ import {
 } from '../actions/action-contracts.js';
 import { actionOutcomeOf, fieldsMatchedOf, isUsableRecordId, reservationSettlementOf, usableRecordIdOf } from '../actions/action-outcome.js';
 import {
+  ledgerValueWritesIn,
   updateEvidenceOf,
   verifiedRegistrationsIn,
   writeGenerationHistoryIn,
+  type RecordValueWrite,
   writeResultRowOfGrant,
   writeResultRowOfJob,
   writeResultViewOf,
@@ -52,16 +56,19 @@ import {
 import { isDataSeed } from '../data-rules/deterministic-stream.js';
 import type { SeedRecord } from '../data-rules/scenario-data.js';
 import { ACTIVE_AUDIT_JOB_STATES } from '../job/job-records.js';
+import { readJobIn } from '../job/job-store.js';
 import { dateOfCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import type { DiscoveryDocument } from '../../discovery/discovery-result.js';
-import { candidateOfDiscoveryDocument } from '../discovery-candidate-lookup.js';
+import { candidateOfDiscoveryDocument, candidateOfDiscoveryDocumentByShape } from '../discovery-candidate-lookup.js';
 import { evaluateRuleSet } from '../data-rules/field-evaluation.js';
+import { readVerificationVaryingRejectionOf } from '../data-rules/varying-values.js';
 import type { FieldRuleProblem } from '../data-rules/rule-contracts.js';
 import { latestRuleSetIn, latestRuleSetReferenceIn } from '../data-rules/rule-set-facts.js';
 import { isProfileOperationAllowed } from '../execution-policy.js';
 import type { DiscoveryCandidateIndexView } from '../job/discovery-index-store.js';
 import type { ControlDatabase } from '../store/control-database.js';
+import { RETIRED_PROFILE_STATUS } from '../store/profile-records.js';
 import { getProfile } from '../store/profile-store.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
 import { withReadTransaction, withWriteTransaction } from '../store/transaction.js';
@@ -127,27 +134,38 @@ import {
   MIN_SCENARIO_REVISION,
   SCENARIO_ID_PATTERN,
   SCENARIO_SCHEMA_VERSION,
+  DRAFT_SCENARIO_STATE,
+  UPDATE_SCENARIO_KIND,
   WRITE_RESERVATION_STATES,
+  scenarioTransportOf,
+  updateLedgerScenarioIdOf,
+  API_SCENARIO_TRANSPORT,
+  FORM_SCENARIO_TRANSPORT,
   type ApprovalReceipt,
   type ApprovalReceiptRecord,
   type InputRuleReference,
   type RevocationReceipt,
   type ScenarioContent,
   type ScenarioKind,
+  type ScenarioKindFact,
   type ScenarioRecordIdSpec,
   type ScenarioRevision,
   type ScenarioState,
+  type ScenarioTransport,
   type WriteReservationState,
 } from './scenario-contracts.js';
 import {
   assertStorableApprovalReceipt,
   assertStorableScenarioRevision,
+  apiUpdateLedgerBindingRejectionOf,
   isUpdatePathBoundToLedger,
   missingVerificationItemsOf,
   unconfirmedSideEffectsOf,
   validateScenarioDraft,
+  type ScenarioDraftContext,
   type ScenarioDraftError,
 } from './scenario-policy.js';
+import type { SiteProfile } from '../contracts.js';
 
 // 行の読み出しと今の事実の集め方は `scenario-facts.ts`（T28d で移した）。形の名前は、ここからも公開し直す。
 export type { ApprovalExternalFacts, ScenarioRevisionView, ScenarioView } from './scenario-facts.js';
@@ -170,7 +188,8 @@ export type { ApprovalExternalFacts, ScenarioRevisionView, ScenarioView } from '
  * - `SCENARIO_NOT_APPROVABLE`: 今の事実では承認できない（再承認の判定の理由は `invalidityReasons`）。
  * - `SCENARIO_NOT_APPROVED`: 撤回する承認がない（承認済みでない、撤回済み）。
  * - `SCENARIO_FACTS_CHANGED`: 確かめの間に、プロファイルの発見のジョブが記録された（読み直してやり直す）。
- * - `SCENARIO_UPDATE_SPEC_MISSING`: UPDATE のシナリオの版に UPDATE の指定がない（UPDATE の指定の前に保存した版。読めるが承認できない。T31b）。
+ * - LG-3（2026-10-24 のテストの組の設計 3.7.2）: T31b の `SCENARIO_UPDATE_SPEC_MISSING`（UPDATE の指定の前に保存した UPDATE の版）は捨てた。その版は
+ *   読むときに契約の形の誤り（`DATABASE_INTEGRITY_FAILED`）で止まる。
  * - `SCENARIO_INPUT_RULES_NOT_LATEST`: 付ける入力の規則の参照が、シナリオの規則の集まりの最新の版（id・版・digest）と一致しない（形だけの参照、
  *   古い版。T29d fix round 1）。
  */
@@ -189,7 +208,6 @@ export const SCENARIO_STORE_REJECTION_REASONS = Object.freeze([
   'SCENARIO_NOT_APPROVED',
   'SCENARIO_FACTS_CHANGED',
   'SCENARIO_INPUT_RULES_NOT_LATEST',
-  'SCENARIO_UPDATE_SPEC_MISSING',
 ] as const);
 export type ScenarioStoreRejectionReason = (typeof SCENARIO_STORE_REJECTION_REASONS)[number];
 
@@ -204,11 +222,9 @@ export type ScenarioStoreResult =
   };
 
 /** 状態。 */
-const DRAFT_STATE = 'DRAFT' satisfies ScenarioState;
+const DRAFT_STATE = DRAFT_SCENARIO_STATE;
 const APPROVED_STATE = 'APPROVED' satisfies ScenarioState;
 const REVOKED_STATE = 'REVOKED' satisfies ScenarioState;
-/** 取り消したプロファイルの状態。 */
-const RETIRED_PROFILE_STATUS = 'RETIRED';
 /** 1 回の変更で書き換える行の数。 */
 const ONE_ROW = 1;
 const NO_DRAFT_ERRORS: readonly ScenarioDraftError[] = Object.freeze([]);
@@ -321,8 +337,14 @@ const UPDATE_SCENARIO_REVISION_SQL = `UPDATE scenarios SET revision = ?, state =
 /** 候補を最後の発見で確かめられないドリフト。 */
 const UNCONFIRMED_DRIFTS: ReadonlySet<DiscoveryCandidateIndexView['drift']> = new Set(['MISSING', 'NOT_REVISITED']);
 
-/** 下書きの JSON の写し（入力を変えない。JSON でない値は落ちて、`validateScenarioDraft` で拒まれる）。 */
-const draftCopyOf = (draft: unknown): unknown => (draft === undefined ? undefined : JSON.parse(JSON.stringify(draft)) as unknown);
+/** T38b: 下書きが送り方 `API` なら、その型の digest（文字列でなければ null。形の確かめは `validateScenarioDraft`）。FORM の下書きは null。 */
+const apiShapeDigestOfDraft = (draft: unknown): string | null => {
+  if (!isRecord(draft) || draft['transport'] !== API_SCENARIO_TRANSPORT || !isRecord(draft['api'])) {
+    return null;
+  }
+  const shapeDigest = draft['api']['shapeDigest'];
+  return typeof shapeDigest === 'string' ? shapeDigest : null;
+};
 
 /** 下書きの、文字列の項目（形の確かめは `validateScenarioDraft`）。 */
 const draftTextOf = (draft: unknown, key: 'profileId' | 'candidateIdentityDigest'): string | null =>
@@ -353,6 +375,44 @@ type CheckedDraft =
   | { readonly ok: true; readonly content: ScenarioContent; readonly evidence: DiscoveryCandidate; readonly discoveryJobId: string }
   | { readonly ok: false; readonly result: ScenarioStoreResult };
 
+/** 発見のジョブのプロファイルの改訂（T38c。ジョブの行の owner の読み出し。行がないか、別のプロファイルのジョブなら null）。 */
+const discoveryJobProfileRevisionIn = (connection: SqliteConnection, profileId: string, jobId: string): number | null => {
+  const job = readJobIn(connection, jobId);
+  return job === null || job.profileId !== profileId ? null : job.profileRevision;
+};
+
+/**
+ * 下書きの確かめの文脈（トランザクションの中で読む。作成と版の更新の確かめと、T38f の作成の画面の確かめ `readScenarioDraftContext` が共用する）。
+ * - T31b: 台帳の参照は、プロファイルのシナリオの事実で確かめる（確かめるシナリオの id を渡す）。
+ * - T38b: API の候補の Origin は、プロファイルの承認したサービスの Origin。
+ * - T38c: 候補を見つけた発見のジョブのプロファイルの改訂（ジョブの行。同じプロファイルのジョブでなければ分からない）と、今の改訂。
+ */
+const draftContextIn = (
+  connection: SqliteConnection,
+  profile: Pick<SiteProfile, 'profileId' | 'revision' | 'approvedServiceOrigins'>,
+  scenarioId: string | null,
+  discoveryJobId: string,
+): ScenarioDraftContext => ({
+  scenarioId,
+  scenarios: scenarioKindFactsIn(connection, profile.profileId),
+  approvedServiceOrigins: profile.approvedServiceOrigins ?? [],
+  profileRevisions: { discoveryJob: discoveryJobProfileRevisionIn(connection, profile.profileId, discoveryJobId), current: profile.revision },
+});
+
+/**
+ * 下書きの確かめの文脈を読む（T38f。作成の画面が、保存と同じ文脈で選べる項目と候補の誤りを求める。読むだけ）。プロファイルがなければ null。
+ * `discoveryJobId` は、画面が読んだ最後の発見のジョブ。
+ */
+export const readScenarioDraftContext = (
+  database: ControlDatabase,
+  profileId: string,
+  discoveryJobId: string,
+  scenarioId: string | null,
+): ScenarioDraftContext | null => {
+  const stored = getProfile(database, profileId);
+  return stored === null ? null : withReadTransaction(database, (connection) => draftContextIn(connection, stored.profile, scenarioId, discoveryJobId));
+};
+
 /** プロファイルと発見と下書きを、トランザクションの中で確かめる（作成と版の更新に共通）。 */
 const checkDraftIn = (database: ControlDatabase, connection: SqliteConnection, input: CheckedDraftInput): CheckedDraft => {
   const stored = getProfile(database, input.profileId);
@@ -374,7 +434,13 @@ const checkDraftIn = (database: ControlDatabase, connection: SqliteConnection, i
     return { ok: false, result: rejected('SCENARIO_DISCOVERY_NOT_LATEST') };
   }
   const identityDigest = draftTextOf(input.draft, 'candidateIdentityDigest');
-  const candidate = identityDigest === null ? null : candidateOfDiscoveryDocument(discovery, identityDigest);
+  // T38b（Task 38 の設計書 3.2）: API のシナリオの下書きは、候補の行を型の digest で選ぶ（同じ識別で型が違う行が別に残るため）。
+  const apiShapeDigest = apiShapeDigestOfDraft(input.draft);
+  const candidate = identityDigest === null
+    ? null
+    : (apiShapeDigest === null
+      ? candidateOfDiscoveryDocument(discovery, identityDigest)
+      : candidateOfDiscoveryDocumentByShape(discovery, identityDigest, apiShapeDigest));
   if (identityDigest !== null) {
     const fact = candidateFactOf(snapshot, identityDigest);
     if (candidate === null || fact === null || UNCONFIRMED_DRIFTS.has(fact.drift)
@@ -383,10 +449,8 @@ const checkDraftIn = (database: ControlDatabase, connection: SqliteConnection, i
     }
   }
   // T31b: 台帳の参照は、同じトランザクションで読んだプロファイルのシナリオの事実で確かめる（確かめるシナリオの id を文脈に渡す）。
-  const validation = validateScenarioDraft(input.draft, candidate, readCheckFactsIn(connection, input.profileId), {
-    scenarioId: input.scenarioId,
-    scenarios: scenarioKindFactsIn(connection, input.profileId),
-  });
+  const validation = validateScenarioDraft(input.draft, candidate, readCheckFactsIn(connection, input.profileId),
+    draftContextIn(connection, stored.profile, input.scenarioId, discovery.jobId));
   if (!validation.ok) {
     return { ok: false, result: rejected('SCENARIO_DRAFT_INVALID', { draftErrors: validation.errors }) };
   }
@@ -513,7 +577,8 @@ const checkedDraftInputOf = (
 ): CheckedDraftInput | ScenarioStoreResult => {
   const scenarioId = requireId(input.scenarioId, 'scenario id');
   const at = requireTimestamp(input.at);
-  const draft = draftCopyOf(input.draft);
+  // 下書きの JSON の写し（入力を変えない。JSON でない値は落ちて、`validateScenarioDraft` で拒まれる）。
+  const draft = jsonCopyOf(input.draft);
   const profileId = draftTextOf(draft, 'profileId');
   if (profileId === null) {
     const validation = validateScenarioDraft(draft, null, []);
@@ -660,9 +725,6 @@ const insertReceiptIn = (connection: SqliteConnection, receipt: ApprovalReceiptR
   );
 };
 
-/** UPDATE のシナリオの版に UPDATE の指定がないか（UPDATE の指定の前に保存した版。T31b）。 */
-const isUpdateSpecMissing = (scenario: ScenarioRevision): boolean => scenario.kind === 'UPDATE' && scenario.update === null;
-
 interface CheckedApproval extends ScenarioApproval {
   readonly snapshot: DiscoverySnapshot;
 }
@@ -675,11 +737,8 @@ const approveIn = (database: ControlDatabase, connection: SqliteConnection, inpu
   if (!discoveryUnchangedIn(connection, row.profile_id, input.snapshot)) {
     return rejected('SCENARIO_FACTS_CHANGED');
   }
+  // LG-3: UPDATE の指定の前に保存した UPDATE の版は、読むとき（`revisionViewOf`）に止まる（T31b の承認の前の確かめは捨てた）。
   const scenario = revisionViewOf(revisionRowOf(connection, row.scenario_id, row.revision)).scenario;
-  // T31b: UPDATE の指定の前に保存した UPDATE の版は、承認しない（読めるが承認と発行はできない）。
-  if (isUpdateSpecMissing(scenario)) {
-    return rejected('SCENARIO_UPDATE_SPEC_MISSING');
-  }
   const facts = currentFactsIn(connection, database, scenario, input.snapshot, input.external);
   const digestFacts = digestFactsOf(facts);
   const approvalDigest = computeApprovalDigest(scenario, digestFacts);
@@ -1044,8 +1103,8 @@ const requireStoredTarget = (targetRecordId: string | null): string | null => {
   return targetRecordId;
 };
 
-/** UPDATE のシナリオの kind（T31e）。 */
-const UPDATE_KIND = 'UPDATE' satisfies ScenarioKind;
+/** UPDATE のシナリオの kind（T31e。CC-106: 種類の一覧の owner の名前つきの定数）。 */
+const UPDATE_KIND = UPDATE_SCENARIO_KIND;
 
 /**
  * UPDATE のシナリオの、今の対象のレコードの ID（T31e。参照した CREATE のシナリオの `VERIFIED` の登録の最新の 1 件。呼び出し側のトランザクションの中で
@@ -1056,12 +1115,41 @@ const UPDATE_KIND = 'UPDATE' satisfies ScenarioKind;
  * 台帳がない・未指定なら null）。
  */
 const ledgerRecordIdIn = (connection: SqliteConnection, profileId: string, ledgerScenarioId: string): ScenarioRecordIdSpec | null =>
-  scenarioKindFactsIn(connection, profileId).find(({ scenarioId }) => scenarioId === ledgerScenarioId)?.recordId ?? null;
+  ledgerFactIn(connection, profileId, ledgerScenarioId)?.recordId ?? null;
 
-const updateTargetOfIn = (connection: SqliteConnection, scenario: ScenarioRevision): string | null =>
-  (scenario.kind !== UPDATE_KIND || scenario.update === null
-    ? null
-    : selectUpdateTargetRecordId(verifiedRegistrationsIn(connection, scenario.update.targetCreateScenarioId)));
+/** 台帳の今の版の事実（T41b。下書きの確かめと同じ `scenarioKindFactsIn`。API の登録の応答の鍵の取り方を含む。なければ undefined）。 */
+const ledgerFactIn = (connection: SqliteConnection, profileId: string, ledgerScenarioId: string): ScenarioKindFact | undefined =>
+  scenarioKindFactsIn(connection, profileId).find(({ scenarioId }) => scenarioId === ledgerScenarioId);
+
+/**
+ * API の UPDATE の台帳の結び付きの誤り（T41b の発行の確かめ直しを、T41e-2 で開始の画面の読み出しと共用するために取り出した）: 台帳の今の登録の ID の取り方に、
+ * filter の名前と更新の画面の path の型が結び付かなければ、その理由（唯一の判定 `apiUpdateLedgerBindingRejectionOf`）。API の UPDATE でなければ null。
+ */
+const apiUpdateLedgerRejectionIn = (
+  connection: SqliteConnection,
+  profileId: string,
+  scenario: ScenarioRevision,
+): ReturnType<typeof apiUpdateLedgerBindingRejectionOf> => {
+  const apiLedger = scenario.kind === UPDATE_KIND ? scenario.api?.ledger ?? null : null;
+  if (apiLedger === null || scenario.api === undefined) {
+    return null;
+  }
+  const fact = ledgerFactIn(connection, profileId, apiLedger.targetCreateScenarioId);
+  // T41R-fix-B: 台帳が同じ表（同じ API の Origin と path の型）の API の登録であることも、同じ部品で確かめ直す（台帳がなければ、送り先が分からないので拒む）。
+  const { request } = scenario.api;
+  return apiUpdateLedgerBindingRejectionOf(
+    { filterName: scenario.api.filterName, formPathTemplate: apiLedger.formPathTemplate, origin: request.origin, pathShape: request.pathShape },
+    { recordId: fact?.recordId ?? null, apiRecordId: fact?.apiRecordId ?? null, apiRequest: fact?.apiRequest ?? null },
+  );
+};
+
+// T41R2-fix-B: UPDATE のシナリオの台帳の参照の決まり（`updateLedgerScenarioIdOf`）は、同じ台帳のシナリオの集まりと共用するため `scenario-contracts.ts` へ移した。
+
+/** T41b: 対象の選び方は Task 31 と同じ部品（台帳の照合済みの登録の最新の 1 件）。API の UPDATE は `api.ledger` の台帳から選ぶ。 */
+const updateTargetOfIn = (connection: SqliteConnection, scenario: ScenarioRevision): string | null => {
+  const ledgerScenarioId = updateLedgerScenarioIdOf(scenario);
+  return ledgerScenarioId === null ? null : selectUpdateTargetRecordId(verifiedRegistrationsIn(connection, ledgerScenarioId));
+};
 
 /** 消費していない許可を無効にし、その `RESERVED` の予約を `RELEASED` にする（同じトランザクションの中）。 */
 const invalidateGrantIn = (connection: SqliteConnection, grantId: string, at: string): void => {
@@ -1108,12 +1196,11 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
   if (!discoveryUnchangedIn(connection, row.profile_id, input.snapshot)) {
     return grantRejected('GRANT_FACTS_CHANGED');
   }
+  // T40a・T41b: API のシナリオも、下の確かめ（有効性、入力の規則、検証の指定、上限、予約）を FORM と同じく使う。LG-3b: T41a の契約のない API の
+  // 更新を拒む送り方の確かめ（T38b の重ねの守り）は捨てた（その版は、読むときに `DATABASE_INTEGRITY_FAILED` で止まる）。
   const now = dateOfCompactUtcTimestamp(input.at);
   const state = approvalStateIn(connection, database, row, input.snapshot, input.external, now);
-  // T31b: UPDATE の指定の前に保存した UPDATE の版には、許可を出さない（承認の判定より先に、理由を分けて返す）。
-  if (isUpdateSpecMissing(state.scenario.current)) {
-    return grantRejected('SCENARIO_UPDATE_SPEC_MISSING');
-  }
+  // LG-3: UPDATE の指定の前に保存した UPDATE の版は、読むときに止まる（T31b の発行の前の確かめは捨てた）。
   if (!state.validity.approved) {
     return grantRejected('GRANT_APPROVAL_INVALID', state.validity.reasons);
   }
@@ -1136,8 +1223,15 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
       evaluation.fields.flatMap((field) => (field.problem === null ? [] : [{ fieldName: field.fieldName, problem: field.problem }])));
   }
   // T30d: 検証の指定（成否の条件・登録の ID の取り方・照合の READ）がそろっていないシナリオには、許可を出さない（承認はできる）。
-  if (missingVerificationItemsOf(scenario.verification).length > 0) {
+  // T40a-fix: 求める項目は送り方で決まる（API は照合の READ と ID の取り方だけ。判定は `missingVerificationItemsOf`）。
+  if (missingVerificationItemsOf(scenario.verification, scenario).length > 0) {
     return grantRejected('VERIFICATION_SPEC_MISSING');
+  }
+  // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-1）: API のシナリオの送る値を持たない照合の READ は、実行のたびに変わる値と比べる期待が要る。
+  // 入力の規則（毎回同じ値になる欄か）は、シナリオの保存の時にはまだないので、規則を確かめるここで判定する（開始の画面も同じ判定を出す）。
+  const varyingRejection = readVerificationVaryingRejectionOf(latestRules.ruleSet, scenario, state.scenario.evidence);
+  if (varyingRejection !== null) {
+    return grantRejected(varyingRejection);
   }
   // T30d: プロファイルの環境の証跡の参照が空なら、許可を出さない（プロファイルの確かめに重ねた確かめ。設計書 10 章の 4）。
   const evidenceRejection = environmentEvidenceRejectionOf(getProfile(database, row.profile_id)?.profile.environmentEvidenceRef ?? null);
@@ -1175,6 +1269,12 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
     scenario.update.actionPathTemplate, ledgerRecordIdIn(connection, row.profile_id, scenario.update.targetCreateScenarioId),
   )) {
     return grantRejected('SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID');
+  }
+  // T41b（Task 41 の設計書 3.2）: API の UPDATE も、台帳の今の登録の ID の取り方に、filter の名前と更新の画面の path の型が結び付くかを確かめ直す
+  // （下書きの確かめと同じ唯一の判定 `apiUpdateLedgerBindingRejectionOf`。外れれば何も書かない）。T41e-2: 開始の画面と同じ部品（`apiUpdateLedgerRejectionIn`）。
+  const bindingRejection = apiUpdateLedgerRejectionIn(connection, row.profile_id, scenario);
+  if (bindingRejection !== null) {
+    return grantRejected(bindingRejection);
   }
   // T31e: UPDATE の対象を、同じトランザクションの中で選び直し、画面が見せた予定の ID と照らす（2 つの process の競争でも、選び直しと結び付けは
   // 1 つのトランザクション）。CREATE に予定の ID を渡すのは、呼び出し側の誤り。
@@ -1404,6 +1504,21 @@ export const readUsedCumulativeWrites = (database: ControlDatabase, scenarioId: 
   });
 
 /**
+ * T41e-2（Task 41 の設計書 3.2）: API の UPDATE のシナリオの、台帳の結び付きの誤り（画面の開始の確かめに出す。読むだけ）。発行の確かめ直しと同じ部品
+ * （`apiUpdateLedgerRejectionIn`）で、許可を出さない理由を先に示す。API の UPDATE でない・結び付く・シナリオがないときは null。
+ */
+export const readApiUpdateLedgerBindingRejection = (
+  database: ControlDatabase,
+  scenarioId: string,
+): ReturnType<typeof apiUpdateLedgerBindingRejectionOf> =>
+  withReadTransaction(database, (connection) => {
+    const row = scenarioRowOf(connection, scenarioId);
+    return row === undefined
+      ? null
+      : apiUpdateLedgerRejectionIn(connection, row.profile_id, revisionViewOf(revisionRowOf(connection, row.scenario_id, row.revision)).scenario);
+  });
+
+/**
  * UPDATE のシナリオの、更新の予定のレコードの ID（T31e。画面の開始の確かめに出す。読むだけ）。発行と同じ選び方（参照した CREATE のシナリオの
  * `VERIFIED` の登録の最新の 1 件）。UPDATE でない・UPDATE の指定がない・対象がない・シナリオがないときは null。画面は、この値を発行の
  * `expectedTargetRecordId` に渡す（発行の中で選び直して照らす）。
@@ -1427,6 +1542,13 @@ export const readScenarioWriteGenerationHistory = (
 ): WriteGenerationHistory =>
   withReadTransaction(database, (connection) =>
     writeGenerationHistoryIn(connection, scenarioId, writeFamilyScenarioIdsIn(connection, scenarioId), uniqueKeyFieldNames));
+
+/**
+ * 同じ台帳のシナリオ（`writeFamilyScenarioIdsIn`。生成の履歴と同じ集まり）の書き込みの値の履歴（T41R2-fix-B。Task 41 の設計書 8 章の「T41R2」の C-2 (1)）。
+ * 開始の口（`write-job-start.ts` の `writeStartSpecOf`）が、対象のレコードの保つ鍵ごとの最後に分かっている値（T41R3-fix-B）を求めるのに使う。1 つの読むトランザクションの中で読む。
+ */
+export const readLedgerValueWrites = (database: ControlDatabase, scenarioId: string): readonly RecordValueWrite[] =>
+  withReadTransaction(database, (connection) => ledgerValueWritesIn(connection, writeFamilyScenarioIdsIn(connection, scenarioId)));
 
 /** シナリオの予約の一覧（予約の順）。 */
 export const readWriteReservations = (database: ControlDatabase, scenarioId: string): readonly WriteReservationView[] =>
@@ -1456,6 +1578,8 @@ export const readWriteReservations = (database: ControlDatabase, scenarioId: str
 //   送る前の記録の値と同じであること。T31e fix round 1: UPDATE の結果は、対象の ID（行の値）と、証拠の欄の一致（`fieldsMatchedOf`）も入れて
 //   `actionOutcomeOf` で決める（取れた ID が対象と違えば `UNKNOWN` の `RECORD_ID_MISMATCH`、一致しない欄があれば `UNKNOWN` の
 //   `UNEXPECTED_FIELD_CHANGE`、証拠がない・照合できない欄があれば `VERIFIED` にしない）。証拠は締めの列として 1 回だけ書く（Gate (m)）。
+// - T40c（Task 40 の設計書 3.4。管理データの版 14）: 行を足すとき（送る前の記録、回復、送らずに止めたときの締め）に、送り方と API の型の要約（型の digest、
+//   method、Origin、path の型）を、許可の版のシナリオから書く（`writeTransportColumnsOf`。ワーカーの報告を鵜呑みにしない）。締めでは書き換えない。
 // ===============================================================================================================
 
 /**
@@ -1533,7 +1657,8 @@ interface SettledWriteValues {
 }
 
 const INSERT_WRITE_RESULT_SQL = `INSERT INTO write_results (job_id, grant_id, profile_id, scenario_id, scenario_revision, write_kind, target_record_id,
-  seed_record, submitted_values, unique_key, phone_numbers, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  seed_record, submitted_values, unique_key, phone_numbers, recorded_at, transport, api_shape_digest, api_method, api_origin, api_path_shape)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 const UPDATE_WRITE_RESULT_SETTLED_SQL = `UPDATE write_results SET submission = ?, block_reason = ?, http_status = ?, response_judgement = ?,
   record_id = ?, read_verification = ?, update_evidence = ?, result = ?, reason = ?, reservation_state = ?, submitted_at = ?, settled_at = ?
   WHERE job_id = ? AND settled_at IS NULL`;
@@ -1717,15 +1842,39 @@ const settleWriteIn = (connection: SqliteConnection, row: WriteResultRow, reserv
 };
 
 /**
- * 許可の書き込みの種類と対象のレコードの ID（T31e。種類は許可の版のシナリオの kind、対象は許可に結んだ ID。UPDATE なのに対象がない、CREATE なのに
- * 対象がある許可は、データベースの誤り）。
+ * 書き込みの結果の行の送り方と API の型の要約の列（T40c。版 14。`transport`・`api_shape_digest`・`api_method`・`api_origin`・`api_path_shape` の順）。
+ * 許可の版のシナリオの送り方と、承認した API の指定から書く（ワーカーの報告を鵜呑みにしない）。FORM は要約の列が null。API なのに API の指定がない版は、
+ * データベースの誤り。
  */
-const writeKindOfGrantIn = (connection: SqliteConnection, grant: GrantRow): { readonly kind: ScenarioKind; readonly target: string | null } => {
+type WriteTransportColumns = readonly [ScenarioTransport, string | null, string | null, string | null, string | null];
+
+// T40R-fix-B（M-2）: 送り方の値はシナリオの契約の名前つきの定数（`FORM_SCENARIO_TRANSPORT`・`API_SCENARIO_TRANSPORT`）。
+const FORM_TRANSPORT_COLUMNS: WriteTransportColumns = Object.freeze([FORM_SCENARIO_TRANSPORT, null, null, null, null] as const);
+
+const writeTransportColumnsOf = (scenario: ScenarioRevision): WriteTransportColumns => {
+  if (scenarioTransportOf(scenario) !== API_SCENARIO_TRANSPORT) {
+    return FORM_TRANSPORT_COLUMNS;
+  }
+  const { api } = scenario;
+  if (api === undefined) {
+    throw integrityError('scenario_revisions', 'an API scenario has no API spec');
+  }
+  return Object.freeze([API_SCENARIO_TRANSPORT, api.shapeDigest, api.request.method, api.request.origin, api.request.pathShape] as const);
+};
+
+/**
+ * 許可の書き込みの種類と対象のレコードの ID（T31e。種類は許可の版のシナリオの kind、対象は許可に結んだ ID。UPDATE なのに対象がない、CREATE なのに
+ * 対象がある許可は、データベースの誤り）。T40c: 送り方と API の型の要約の列（`writeTransportColumnsOf`）も返す。
+ */
+const writeKindOfGrantIn = (
+  connection: SqliteConnection,
+  grant: GrantRow,
+): { readonly kind: ScenarioKind; readonly target: string | null; readonly transport: WriteTransportColumns } => {
   const { scenario } = revisionViewOf(revisionRowOf(connection, grant.scenario_id, grant.scenario_revision));
   if ((scenario.kind === UPDATE_KIND) !== (grant.target_record_id !== null)) {
     throw integrityError('execution_grants', 'the update target of the grant does not match the kind of the scenario');
   }
-  return Object.freeze({ kind: scenario.kind, target: requireStoredTarget(grant.target_record_id) });
+  return Object.freeze({ kind: scenario.kind, target: requireStoredTarget(grant.target_record_id), transport: writeTransportColumnsOf(scenario) });
 };
 
 const recordAttemptIn = (connection: SqliteConnection, input: ReturnType<typeof requireAttempt>): WriteResultStoreResult => {
@@ -1752,10 +1901,10 @@ const recordAttemptIn = (connection: SqliteConnection, input: ReturnType<typeof 
   if (input.at < grant.consumed_at) {
     throw new RangeError('the attempt must not be recorded before the consumption of the grant');
   }
-  const { kind, target } = writeKindOfGrantIn(connection, grant);
+  const { kind, target, transport } = writeKindOfGrantIn(connection, grant);
   connection.prepare(INSERT_WRITE_RESULT_SQL).run(
     input.jobId, grant.grant_id, grant.profile_id, grant.scenario_id, grant.scenario_revision, kind, target, input.seedJson,
-    JSON.stringify(input.submittedValues), input.uniqueKey, JSON.stringify(input.phoneNumbers), input.at,
+    JSON.stringify(input.submittedValues), input.uniqueKey, JSON.stringify(input.phoneNumbers), input.at, ...transport,
   );
   const written = writeResultRowOfJob(connection, input.jobId);
   if (written === undefined) {
@@ -1808,10 +1957,10 @@ export const closeOrphanedWriteResults = (database: ControlDatabase, at: string)
     return grants.filter((grant) => {
       const recordedAt = laterOf(at, grant.consumed_at ?? at);
       if (writeResultRowOfGrant(connection, grant.grant_id) === undefined) {
-        const { kind, target } = writeKindOfGrantIn(connection, grant);
+        const { kind, target, transport } = writeKindOfGrantIn(connection, grant);
         connection.prepare(INSERT_WRITE_RESULT_SQL).run(
           grant.job_id, grant.grant_id, grant.profile_id, grant.scenario_id, grant.scenario_revision, kind, target, null, NO_SUBMITTED_VALUES, null,
-          NO_PHONE_NUMBERS, recordedAt,
+          NO_PHONE_NUMBERS, recordedAt, ...transport,
         );
       }
       const row = writeResultRowOfGrant(connection, grant.grant_id);
@@ -1845,7 +1994,6 @@ const UNCHANGED_CLOSURE: WriteClosureWithoutSendingResult = Object.freeze({ kind
 const GRANT_RELEASED_CLOSURE: WriteClosureWithoutSendingResult = Object.freeze({ kind: 'GRANT_RELEASED' });
 /** 送らずに止めた理由（送る前の確かめで止めた）。 */
 const PRECHECK_FAILED_REASON = 'PRECHECK_FAILED' satisfies ActionBlockReason;
-const NOT_SENT_SUBMISSION = 'NOT_SENT' satisfies SubmissionState;
 
 const closeWithoutSendingIn = (connection: SqliteConnection, input: WriteClosureWithoutSending): WriteClosureWithoutSendingResult => {
   const grant = grantRowOf(connection, input.grantId);
@@ -1862,10 +2010,10 @@ const closeWithoutSendingIn = (connection: SqliteConnection, input: WriteClosure
   }
   const recordedAt = laterOf(input.at, grant.consumed_at);
   if (writeResultRowOfGrant(connection, grant.grant_id) === undefined) {
-    const { kind, target } = writeKindOfGrantIn(connection, grant);
+    const { kind, target, transport } = writeKindOfGrantIn(connection, grant);
     connection.prepare(INSERT_WRITE_RESULT_SQL).run(
       grant.job_id, grant.grant_id, grant.profile_id, grant.scenario_id, grant.scenario_revision, kind, target, null, NO_SUBMITTED_VALUES, null,
-      NO_PHONE_NUMBERS, recordedAt,
+      NO_PHONE_NUMBERS, recordedAt, ...transport,
     );
   }
   const row = writeResultRowOfGrant(connection, grant.grant_id);
@@ -1873,7 +2021,7 @@ const closeWithoutSendingIn = (connection: SqliteConnection, input: WriteClosure
     return UNCHANGED_CLOSURE;
   }
   const result = settleWriteIn(connection, row, reservation, {
-    submission: NOT_SENT_SUBMISSION, blockReason: PRECHECK_FAILED_REASON, httpStatus: null, responseJudgement: null, recordId: null,
+    submission: NOT_SENT_SUBMISSION_STATE, blockReason: PRECHECK_FAILED_REASON, httpStatus: null, responseJudgement: null, recordId: null,
     readVerification: null, submittedAt: null, updateEvidence: null, at: laterOf(input.at, row.recorded_at),
   });
   return Object.freeze({ kind: 'SETTLED_NOT_SENT', result });
