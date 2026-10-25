@@ -18,7 +18,6 @@ import {
   type DiscoveryCandidate,
 } from '../../src/discovery/candidate-contracts.js';
 import { CANDIDATE_CLASSIFICATION_RULES, classifyCandidate } from '../../src/discovery/classify.js';
-import type { DiscoveryPageRecord } from '../../src/discovery/discover-page.js';
 import {
   DISCOVERY_ARTIFACT_SCHEMA_VERSION,
   DISCOVERY_END_REASONS,
@@ -30,10 +29,13 @@ import {
   discoverySummaryOf,
   isDiscoveryPageReadInFull,
   mergeDiscoveryCandidates,
+  pressLimitProbesOf,
   type DiscoveryDocument,
   type DiscoveryPageEntry,
+  type DiscoveryReadPageRecord,
 } from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
+import { notObservedSubmissionProbeOf } from '../../src/discovery/submission-probe-contracts.js';
 import { SAMPLE_ALLOWED_ORIGINS, SAMPLE_ORIGIN, sampleAction, sampleButton, sampleField, sampleForm } from './discovery-candidate-samples.js';
 
 const candidateOf = (discovered: DiscoveredCandidate): DiscoveryCandidate => ({
@@ -68,10 +70,10 @@ const SEARCH_BOUND = candidateOf(sampleForm({
 }));
 const BUTTON = candidateOf(sampleButton({ page: { origin: SAMPLE_ORIGIN, path: '/admin' } }));
 
-const record = (path: string | null, candidates: readonly DiscoveryCandidate[], incompleteReasons: DiscoveryPageRecord['incompleteReasons'] = []): DiscoveryPageRecord =>
+const record = (path: string | null, candidates: readonly DiscoveryCandidate[], incompleteReasons: DiscoveryReadPageRecord['incompleteReasons'] = []): DiscoveryReadPageRecord =>
   ({ location: path === null ? null : { origin: SAMPLE_ORIGIN, path }, incompleteReasons, candidates });
 
-const readEntry = (path: string, candidates: readonly DiscoveryCandidate[], incompleteReasons: DiscoveryPageRecord['incompleteReasons'] = []): DiscoveryPageEntry =>
+const readEntry = (path: string, candidates: readonly DiscoveryCandidate[], incompleteReasons: DiscoveryReadPageRecord['incompleteReasons'] = []): DiscoveryPageEntry =>
   ({ url: `${SAMPLE_ORIGIN}${path}`, state: 'READ', record: record(path, candidates, incompleteReasons), blockedRequests: 0 });
 
 const unreadEntry = (path: string, reason: (typeof DISCOVERY_UNREAD_REASONS)[number]): DiscoveryPageEntry =>
@@ -236,11 +238,12 @@ describe('T27d: the read pages, the summary and the Run Status of a discovery do
 describe('T27d: the discovery.json schema (the candidates are the candidate schema, not a copy)', () => {
   it('uses the job id pattern of the IPC contract, the limits of the contracts and the schema version constant', () => {
     const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'discovery.schema.json'), 'utf8')) as {
-      properties: { jobId: { pattern: string }; schemaVersion: { const: string } };
+      properties: { jobId: { pattern: string }; schemaVersion: { enum: readonly string[] } };
       $defs: { url: { maxLength: number } };
     };
     expect(schema.properties.jobId.pattern).toBe(WORKER_JOB_ID_PATTERN.source);
-    expect(schema.properties.schemaVersion.const).toBe(DISCOVERY_ARTIFACT_SCHEMA_VERSION);
+    // T37a fix round 1: 読み手は前の版も受ける（enum）。書き手の版は、その最後。
+    expect(schema.properties.schemaVersion.enum.at(-1)).toBe(DISCOVERY_ARTIFACT_SCHEMA_VERSION);
     expect(schema.$defs.url.maxLength).toBe(MAX_URL_LENGTH);
   });
 
@@ -269,6 +272,41 @@ describe('T27d: the discovery.json schema (the candidates are the candidate sche
       ['an unknown end reason', { ...valid, endReason: 'DONE' }],
     ] as const) {
       expect((await validateArtifact('discovery', JSON.parse(JSON.stringify(value)))).ok, name).toBe(false);
+    }
+  });
+});
+
+// T44c（Task 44 の設計書 P1-3）: 押す数の上限で押せなかった、登録・更新の語の候補の数（成果物の `pressLimitProbes`）。
+describe('T44c: the candidates with a create or update word that the probe did not press because of the press limit', () => {
+  const BOUND = { form: [], submitter: ['click'], ancestor: [], document: [], window: [], inlineHandler: false } as const;
+  const probed = (submitterText: string, reason: Parameters<typeof notObservedSubmissionProbeOf>[0] | null): DiscoveryCandidate => {
+    const candidate = candidateOf(sampleButton({ page: { origin: SAMPLE_ORIGIN, path: '/admin/items/1' }, submitterText, jsBinding: BOUND }));
+    return reason === null ? candidate : { ...candidate, submissionProbe: notObservedSubmissionProbeOf(reason) };
+  };
+
+  it('counts only PRESS_LIMIT_REACHED with a create or update word (not the hidden ones, not the buttons without the words)', () => {
+    const pages = [
+      readEntry('/admin/items/1', [
+        probed('保存', 'PRESS_LIMIT_REACHED'),
+        probed('新規', 'PRESS_LIMIT_REACHED'),
+        probed('表示', 'PRESS_LIMIT_REACHED'),
+        probed('', 'PRESS_LIMIT_REACHED'),
+        probed('追加', 'TARGET_NOT_FOUND'),
+        probed('変更', null),
+      ]),
+      readEntry('/admin/items/2', [probed('update', 'PRESS_LIMIT_REACHED')]),
+      unreadEntry('/admin/logout', 'EXCLUDED'),
+    ];
+    expect(pressLimitProbesOf(pages)).toEqual({ priorityNotPressed: 3 });
+    expect(pressLimitProbesOf([])).toEqual({ priorityNotPressed: 0 });
+  });
+
+  it('accepts the count in discovery.json and rejects a negative count or an extra item', async () => {
+    const valid = documentOf([readEntry('/admin', [BUTTON])], { pressLimitProbes: { priorityNotPressed: 2 } });
+    const accepted = await validateArtifact('discovery', JSON.parse(JSON.stringify(valid)));
+    expect(accepted.ok ? [] : accepted.errors).toEqual([]);
+    for (const value of [{ priorityNotPressed: -1 }, { priorityNotPressed: 1, pages: 1 }, {}]) {
+      expect((await validateArtifact('discovery', JSON.parse(JSON.stringify({ ...valid, pressLimitProbes: value })))).ok, JSON.stringify(value)).toBe(false);
     }
   });
 });

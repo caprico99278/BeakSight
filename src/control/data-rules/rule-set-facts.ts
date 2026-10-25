@@ -3,15 +3,15 @@
 // - 承認の判定の今の事実（`src/control/approval/scenario-facts.ts` の `currentFactsIn`）と、実行の許可の発行の確かめ（`scenario-store.ts`）と、
 //   規則の保存（`rule-store.ts`）が、同じこの読み出しを使う（`connection` を受ける関数は、呼び出し側の `withWriteTransaction`・`withReadTransaction`
 //   の中から呼ぶ）。
-// - 版の写しは、契約の形（`assertStorableRuleSet`）と、行の列（規則の集まりの id・版・シナリオ・digest）が文書と合うことを確かめて読む。合わなければ
-//   データベースの誤り（`DATABASE_INTEGRITY_FAILED`）。
+// - 版の写しは、契約の形（`ruleSetRevisionOfStoredDocument`。版 2 のスキーマ。LG-3: 版 1 の文書は契約の形の誤り）と、行の列（規則の集まりの
+//   id・版・シナリオ・digest）が文書と合うことを確かめて読む。合わなければデータベースの誤り（`DATABASE_INTEGRITY_FAILED`）。
 import { deepFreeze } from '../../core/immutable.js';
 import type { InputRuleReference } from '../approval/scenario-contracts.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
 import { storedRowIntegrityError } from '../store/store-errors.js';
 import type { RuleSetRevision } from './rule-contracts.js';
 import { computeRuleSetDigest } from './rule-digest.js';
-import { assertStorableRuleSet } from './rule-set-policy.js';
+import { ruleSetRevisionOfStoredDocument } from './rule-set-policy.js';
 
 /** `rule_sets` の列（読み書きの共通）。 */
 export const RULE_SET_COLUMNS = 'rule_set_id, scenario_id, profile_id, revision, created_at, updated_at';
@@ -58,7 +58,7 @@ const integrityError = storedRowIntegrityError;
 const storedRuleSetOf = (row: RuleSetRevisionRow): StoredRuleSet => {
   let ruleSet: RuleSetRevision;
   try {
-    ruleSet = assertStorableRuleSet(JSON.parse(row.document) as RuleSetRevision);
+    ruleSet = ruleSetRevisionOfStoredDocument(JSON.parse(row.document) as unknown);
   } catch (error) {
     throw integrityError('rule_set_revisions', 'the stored document does not match the contract', error);
   }

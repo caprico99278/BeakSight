@@ -4,17 +4,15 @@
 //   確かめる（`validateControlDocument`）→ 凍結（`deepFreeze`）。
 // - 使う所: READ の確かめの定義（`src/control/read-check-policy.ts`）、シナリオの版と承認の記録（`src/control/approval/scenario-policy.ts`）、
 //   発見の根拠の写し（`src/control/approval/scenario-facts.ts`）、入力の規則の集まりの版（`src/control/data-rules/rule-set-policy.ts`）。同じ手順を
-//   ほかのファイルに書かない（Architecture Gate `schema-checked-copy-ownership.test.ts`）。
+//   ほかのファイルに書かない（Architecture Gate `control-read-ownership.test.ts` の (a)）。
 import { deepFreeze } from '../core/immutable.js';
+import { jsonCopyOf } from '../core/json-copy.js';
 import { validateControlDocument, type ControlSchemaName } from './control-schema-validator.js';
 
 /** スキーマで確かめた写し。通れば凍結した写し、通らなければスキーマの誤りの文（英語。項目の位置だけ）。 */
 export type SchemaCheckedCopy<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly errors: readonly string[] };
-
-/** JSON の値の写し（入力を変えない。`undefined` はそのまま）。 */
-const jsonCopyOf = (value: unknown): unknown => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)) as unknown);
 
 /** 管理の契約のスキーマ（`schemaName`）で確かめた、凍結した写し（純粋。入力を変えない）。 */
 export const schemaCheckedCopyOf = <T>(schemaName: ControlSchemaName, value: unknown): SchemaCheckedCopy<T> => {

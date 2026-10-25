@@ -34,12 +34,18 @@ if (FULL_READ === null) {
 }
 
 const FACTS: ApprovalCurrentFacts = Object.freeze<ApprovalCurrentFacts>({
-  profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE' },
+  profile: { profileId: PROFILE_ID, revision: 4, status: 'ACTIVE', mode: 'TEST_APPROVED_WRITE', approvedServiceOrigins: [] },
   authSetupDigest: AUTH_SETUP_DIGEST,
   targetConfigDigest: TARGET_CONFIG_DIGEST,
   candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest, classification: 'CREATE', drift: 'UNCHANGED' },
   // T31b: 型にした識別の digest の一覧（UPDATE だけが使う。CREATE の判定は見ない）。
   templatedCandidates: null,
+  // T38c: 候補の型の digest の一覧（API のシナリオだけが使う。FORM の判定は見ない）。
+  candidateShapeDigests: null,
+  // T38R-fix: 鍵と欄の対応の digest の一覧、型の Origin の番号、最新の発見の改訂（API のシナリオだけが使う）。
+  candidateKeyFieldDigests: null,
+  apiShapeOriginIndex: null,
+  latestDiscoveryProfileRevision: null,
   inputRuleReference: INPUT_RULES,
   readChecks: READ_CHECK_FACTS,
 });
@@ -80,9 +86,15 @@ describe('approval validity (T28a)', () => {
       'TARGET_CONFIG_CHANGED',
       'CANDIDATE_CHANGED',
       'CANDIDATE_MISSING',
-      // T31b: UPDATE のシナリオ（`approval-validity-update.test.ts`）。
-      'UPDATE_SPEC_MISSING',
+      // T31b: UPDATE のシナリオ（`approval-validity-update.test.ts`）。LG-3: `UPDATE_SPEC_MISSING` は捨てた。
       'CANDIDATE_TEMPLATES_UNAVAILABLE',
+      // T38c: API のシナリオ（`approval-api-v4.test.ts`）。
+      'CANDIDATE_SHAPE_CHANGED',
+      'CANDIDATE_SHAPES_UNAVAILABLE',
+      // T38R-fix（`scenario-api-review-fixes.test.ts`）。
+      'CANDIDATE_FIELDS_CHANGED',
+      'API_ORIGIN_NOT_APPROVED',
+      'API_DISCOVERY_PROFILE_STALE',
       'INPUT_RULES_CHANGED',
       'READ_CHECK_CHANGED',
       'EXPIRED',
@@ -188,9 +200,14 @@ describe('approval validity (T28a)', () => {
     });
   });
 
-  it('reports a tampered receipt (the digest differs while every bound fact is equal) as SCENARIO_REVISION_CHANGED', () => {
-    const tampered = sampleApproval('sha256:9999999999999999999999999999999999999999999999999999999999999999');
-    expect(reasonsOf(evaluateApprovalValidity(input({ lastApproval: tampered })))).toEqual(['SCENARIO_REVISION_CHANGED']);
+  // LG-3（O5）: 前の印の版（v3）の承認の digest の記録も、同じ一般の判定で `SCENARIO_REVISION_CHANGED`（`approval-api-v4.test.ts` の同じ確かめを
+  // ここにまとめた。v3 の値は `approval-digest-differences.test.ts` で T31b が固定した見本の値）。
+  it.each([
+    ['a tampered receipt', 'sha256:9999999999999999999999999999999999999999999999999999999999999999'],
+    ['a receipt of the v3 digest format', 'sha256:f1d363c24e761a844bd54a540f2d39769201813176a94b484b91410eb0f269c0'],
+  ])('reports %s (the digest differs while every bound fact is equal) as SCENARIO_REVISION_CHANGED', (_label, digest) => {
+    expect(reasonsOf(evaluateApprovalValidity(input({ lastApproval: sampleApproval(digest) })))).toEqual(['SCENARIO_REVISION_CHANGED']);
+    expect(reasonsOf(evaluateApprovalValidity(input()))).toEqual([]);
   });
 
   describe('the expiry (the clock is injected)', () => {
@@ -223,11 +240,15 @@ describe('approval validity (T28a)', () => {
     const validity = evaluateApprovalValidity(input({
       scenario: sampleScenario({ revision: 4 }),
       facts: {
-        profile: { profileId: PROFILE_ID, revision: 5, status: 'RETIRED', mode: 'TEST_AUTH_PASSIVE' },
+        profile: { profileId: PROFILE_ID, revision: 5, status: 'RETIRED', mode: 'TEST_AUTH_PASSIVE', approvedServiceOrigins: [] },
         authSetupDigest: null,
         targetConfigDigest: '8888888888888888888888888888888888888888888888888888888888888888',
         candidate: { ...(FACTS.candidate ?? CREATE_CANDIDATE), drift: 'CHANGED', ruleDigest: UPDATE_CANDIDATE.ruleDigest } as ApprovalCurrentFacts['candidate'],
         templatedCandidates: null,
+        candidateShapeDigests: null,
+        candidateKeyFieldDigests: null,
+        apiShapeOriginIndex: null,
+        latestDiscoveryProfileRevision: null,
         inputRuleReference: null,
         readChecks: [],
       },

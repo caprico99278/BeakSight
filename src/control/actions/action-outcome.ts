@@ -8,7 +8,16 @@
 // - T31e fix round 1（Task 31 の設計書 3 章の「結果の判定」「更新の後の照合」）: UPDATE の書き込みは、成功の後に、更新の後の照合で一致しない欄が
 //   あれば `UNKNOWN`（`UNEXPECTED_FIELD_CHANGE`）、取れた ID が対象の ID と違えば `UNKNOWN`（`RECORD_ID_MISMATCH`）、照合できない欄があれば
 //   `PARTIAL`（`READ_VERIFICATION_UNDETERMINED`）。`VERIFIED` は、欄がすべて一致し、ID が対象と同じで、照合の READ が一致したときだけ。
+// - T40c（Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」）: API の書き込みの応答の状態から結果の判定を決める唯一の口
+//   （`apiResponseJudgementOf`）。今の閉じた一覧の値だけを返し、ID の判定は `actionOutcomeOf` に任せる。
 // - 入出力を持たない。管理データ・画面・ブラウザ・ワーカーに触れない。
+import {
+  CLIENT_ERROR_HTTP_STATUS_RANGE,
+  SERVER_ERROR_HTTP_STATUS_RANGE,
+  SUCCESS_HTTP_STATUS_RANGE,
+  TOO_MANY_REQUESTS_HTTP_STATUS,
+  isHttpStatusInRange,
+} from '../../core/http-status.js';
 import { hasControlOrLineSeparator, hasLoneSurrogate } from '../../core/text.js';
 import { MAX_RECORD_ID_LENGTH } from '../approval/scenario-contracts.js';
 import type {
@@ -16,6 +25,7 @@ import type {
   ActionOutcomeInput,
   ActionOutcomeReason,
   ActionResult,
+  ResponseJudgement,
   SettledReservationState,
   SubmissionState,
   WriteUpdateEvidence,
@@ -84,6 +94,30 @@ export const fieldsMatchedOf = (evidence: WriteUpdateEvidence | null): boolean |
     return false;
   }
   return evidence.fields.every(({ matched }) => matched === true) ? true : null;
+};
+
+/**
+ * API の書き込みの応答の判定（純粋。T40c。Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」の設計者の判断）。送り手が応答を受けた
+ * （`RESPONDED`）ときの状態から、今の閉じた一覧の値を決める（一覧は増やさない）。ワーカー（T40b）は、この関数を呼ぶだけにする。
+ * - 2xx → `SUCCESS`（ID がない・安全でないときは、`actionOutcomeOf` が `RECORD_ID_NOT_FOUND`・`RECORD_ID_UNSAFE` にする。成功と偽らない）。
+ * - 429 → `RATE_LIMITED`。ほかの 4xx → `INPUT_ERROR`。5xx → `SERVER_ERROR`（登録を済ませていることがあるので `UNKNOWN`）。
+ * - それ以外（1xx・3xx、600 以上、整数でない値）→ `NO_CONDITION_MATCHED`（`UNKNOWN`）。応答がない（`NO_RESPONSE`）ときは呼ばない（判定は null）。
+ * - 範囲と 429 は `src/core/http-status.ts` の共通の値（第二の定義を持たない）。
+ */
+export const apiResponseJudgementOf = (status: number): ResponseJudgement => {
+  if (!Number.isSafeInteger(status)) {
+    return 'NO_CONDITION_MATCHED';
+  }
+  if (isHttpStatusInRange(status, SUCCESS_HTTP_STATUS_RANGE)) {
+    return 'SUCCESS';
+  }
+  if (status === TOO_MANY_REQUESTS_HTTP_STATUS) {
+    return 'RATE_LIMITED';
+  }
+  if (isHttpStatusInRange(status, CLIENT_ERROR_HTTP_STATUS_RANGE)) {
+    return 'INPUT_ERROR';
+  }
+  return isHttpStatusInRange(status, SERVER_ERROR_HTTP_STATUS_RANGE) ? 'SERVER_ERROR' : 'NO_CONDITION_MATCHED';
 };
 
 /** `ActionResult` とそれを決めた理由（純粋。凍結）。 */

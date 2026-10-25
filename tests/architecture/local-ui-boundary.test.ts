@@ -30,29 +30,34 @@
  *   （`findImportChains`）、相対の指定子の解決と拡張子の補い（`resolveRelativeSpecifier`・`resolveImportTarget`）、import の文の範囲
  *   （`findImportStatementRanges`）は、`source-scan.ts` の共通の部品を使う（指定子を取り出す正規表現は、このファイルに書かない）。
  */
-import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  LOCAL_UI_APP_DIRECTORY,
   PLAYWRIGHT_PACKAGE_PATTERN,
-  REPOSITORY_ROOT,
   findImportChains,
   findImportStatementRanges,
   findModuleSpecifiers,
   findRuntimeModuleSpecifiers,
+  isNodeBuiltinSpecifier,
+  isPathUnder,
+  isPathUnderAny,
+  loadLocalUiAppFiles,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  matchingBracket,
+  modulePattern,
+  pathReferenceCandidatesOf,
+  referencedPathsOf,
+  refersUnderAny,
   resolveImportTarget,
   resolveRelativeSpecifier,
   scanSource,
+  unusedExclusionsOf,
   type ScannedSource,
 } from './source-scan.js';
 
-const APP_DIRECTORY = 'apps/local-ui/';
-const APP_TESTS_DIRECTORY = 'apps/local-ui/tests/';
-/** 読まないフォルダ（ビルドの出力）。 */
-const APP_SKIPPED_DIRECTORIES: readonly string[] = ['apps/local-ui/dist/', 'apps/local-ui/node_modules/'];
-const APP_SOURCE_EXTENSION = /\.tsx?$/u;
+const APP_TESTS_DIRECTORY = `${LOCAL_UI_APP_DIRECTORY}tests/`;
+/** `src/` の全体（(f) の判定で、`src/` の中を指す参照だけを見る）。 */
+const SRC_DIRECTORY = 'src/';
 
 /** (f): 画面のコードが import してよい `src/` の範囲。 */
 const ALLOWED_SRC_DIRECTORIES: readonly string[] = ['src/control/', 'src/presentation/', 'src/config/', 'src/core/'];
@@ -62,8 +67,8 @@ const FORBIDDEN_ENGINE_DIRECTORIES: readonly string[] = [
 ];
 /** (g) の例外（たどった先で許す、ただ 1 つのファイル。拡張子は `.ts`）。 */
 const TRANSITIVE_EXCEPTION_FILES: ReadonlySet<string> = new Set(['src/safety/interaction-policy.ts']);
-/** `node:sqlite`。 */
-const NODE_SQLITE_PATTERN = /(?<![\w-])node:sqlite(?![\w-])/u;
+/** `node:sqlite`（`source-scan.ts` の `modulePattern`。文字列の中の `node:sqlite` と、`node:` のない形、下位のパスも当てる。PRE42-CC 組 G）。 */
+const NODE_SQLITE_PATTERN = modulePattern(['sqlite']);
 /** すべてのアドレスで待ち受けるアドレスの文字列（`0.0.0.0`、`::`、`[::]`）。 */
 const WILDCARD_ADDRESS_LITERALS: ReadonlySet<string> = new Set(['0.0.0.0', '::', '[::]']);
 const WILDCARD_ADDRESS_IN_TEXT = /(?<![\w.:])0\.0\.0\.0(?![\w.])/u;
@@ -72,41 +77,38 @@ const WILDCARD_ADDRESS_IN_TEXT = /(?<![\w.:])0\.0\.0\.0(?![\w.])/u;
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-const isUnder = (path: string, directories: readonly string[]): boolean => directories.some((directory) => `${path}/`.startsWith(directory));
+/**
+ * (f): 参照（指定子と、相対パス・`src/` のパスの文字列リテラル）の違反（`<参照>` の形）: Playwright の名前か、指す先（相対なら解決したパス、
+ * 相対でなければ文字列の中の `src/` からのパスのすべて。`source-scan.ts` の `referencedPathsOf`。PRE42-CC 組 G）が、`src/` の中の許す範囲の外。
+ */
+const findDirectViolations = (path: string, source: ScannedSource): readonly string[] =>
+  pathReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => PLAYWRIGHT_PACKAGE_PATTERN.test(text)
+    || referencedPathsOf(path, text).some((target) => isPathUnder(target, SRC_DIRECTORY) && !isPathUnderAny(target, ALLOWED_SRC_DIRECTORIES)));
 
-/** (f): 参照（指定子と、相対パスの文字列リテラル）の違反（`<参照>` の形）。 */
-const findDirectViolations = (path: string, source: ScannedSource): readonly string[] => {
-  const references = moduleReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]);
-  return references.filter((text) => {
-    if (PLAYWRIGHT_PACKAGE_PATTERN.test(text)) {
-      return true;
-    }
-    const resolved = resolveRelativeSpecifier(path, text);
-    if (resolved !== null) {
-      return `${resolved}/`.startsWith('src/') && !isUnder(resolved, ALLOWED_SRC_DIRECTORIES);
-    }
-    const srcPath = /(?:^|[\\/])(src[\\/][^'"]*)$/u.exec(text)?.[1]?.replaceAll('\\', '/');
-    return srcPath !== undefined && !isUnder(srcPath, ALLOWED_SRC_DIRECTORIES);
-  });
-};
+/**
+ * (f) PRE42-CC 組 G（新 Gate の 2）で、相対でない `src/` のパスの文字列リテラルも見るようにして、新しく当たった所（`<ファイル>: <参照>`）。
+ * 直さずに記録し、扱いは設計者が決める。画面の Vite の設定の module id（`/src/server/…`、`${APP_ROOT}src/server/…`）で、リポジトリの `src/`
+ * ではなく `apps/local-ui/src/server/` を指すと見られる。使われなくなったら誤りにする。
+ */
+const NEWLY_FOUND_SOURCE_PATH_LITERALS: readonly string[] = Object.freeze([
+  'apps/local-ui/vite.config.ts: /src/server/control-store.ts',
+  'apps/local-ui/vite.config.ts: /src/server/audit-jobs.ts',
+  'apps/local-ui/vite.config.ts: src/server/launcher-bridge.ts',
+]);
 
 /** (j): 画面が直接 import しない、承認の部品のフォルダ（T28e）。 */
 const APPROVAL_INTERNAL_DIRECTORY = 'src/control/approval/';
 
-/** (j): `src/control/approval/` を指す参照（指定子のすべて（型だけの import を含む）と、相対パスの文字列リテラル）。 */
-const findApprovalInternalReferences = (path: string, source: ScannedSource): readonly string[] => moduleReferenceCandidatesOf(source).filter((text) => {
-  const resolved = resolveRelativeSpecifier(path, text);
-  return resolved === null ? /(?:^|[\\/])src[\\/]control[\\/]approval[\\/]/u.test(text) : `${resolved}/`.startsWith(APPROVAL_INTERNAL_DIRECTORY);
-});
+/** (j): `src/control/approval/` を指す参照（指定子のすべて（型だけの import を含む）と、相対パス・`src/` のパスの文字列リテラル）。 */
+const findApprovalInternalReferences = (path: string, source: ScannedSource): readonly string[] =>
+  pathReferenceCandidatesOf(source).filter((text) => refersUnderAny(path, text, [APPROVAL_INTERNAL_DIRECTORY]));
 
 /** (k): 画面が直接 import しない、入力の規則の部品のフォルダ（T29e）。 */
 const DATA_RULES_INTERNAL_DIRECTORY = 'src/control/data-rules/';
 
-/** (k): `src/control/data-rules/` を指す参照（指定子のすべて（型だけの import を含む）と、相対パスの文字列リテラル）。 */
-const findDataRulesInternalReferences = (path: string, source: ScannedSource): readonly string[] => moduleReferenceCandidatesOf(source).filter((text) => {
-  const resolved = resolveRelativeSpecifier(path, text);
-  return resolved === null ? /(?:^|[\/])src[\/]control[\/]data-rules[\/]/u.test(text) : `${resolved}/`.startsWith(DATA_RULES_INTERNAL_DIRECTORY);
-});
+/** (k): `src/control/data-rules/` を指す参照（指定子のすべて（型だけの import を含む）と、相対パス・`src/` のパスの文字列リテラル）。 */
+const findDataRulesInternalReferences = (path: string, source: ScannedSource): readonly string[] =>
+  pathReferenceCandidatesOf(source).filter((text) => refersUnderAny(path, text, [DATA_RULES_INTERNAL_DIRECTORY]));
 
 /** (h): `node:sqlite` の参照と、すべてのアドレスの待ち受けのアドレスの文字列。 */
 const findForbiddenLiterals = (source: ScannedSource): readonly string[] =>
@@ -129,7 +131,7 @@ const findTransitiveViolations = (
     return undefined;
   }
   const allowedException = target !== undefined && TRANSITIVE_EXCEPTION_FILES.has(target);
-  return isUnder(resolved, forbiddenDirectories) && !allowedException ? resolved : undefined;
+  return isPathUnderAny(resolved, forbiddenDirectories) && !allowedException ? resolved : undefined;
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -190,25 +192,12 @@ const findServerFilesImportedByBrowser = (
   return importers;
 };
 
-/** (i) の例外 1: `start` から実行時の相対の import をたどり、Node の部品（`node:` の指定子）に届いた道（`<始まり> -> … -> <指定子>`）。 */
+/**
+ * (i) の例外 1: `start` から実行時の相対の import をたどり、Node の部品（`node:` の付いた指定子と、付けない組み込みの名前。`source-scan.ts` の
+ * `isNodeBuiltinSpecifier`。PRE42-CC 組 G）に届いた道（`<始まり> -> … -> <指定子>`）。
+ */
 const findNodeModuleChains = (files: ReadonlyMap<string, ScannedSource>, start: string): readonly string[] =>
-  findImportChains(files, [start], ({ specifier }) => (specifier.startsWith('node:') ? specifier : undefined));
-
-/** `bare` の `open`（`{` の位置）に対応する `}` の位置。見つからなければ `-1`。 */
-const matchingBrace = (bare: string, open: number): number => {
-  let depth = 0;
-  for (let cursor = open; cursor < bare.length; cursor += 1) {
-    if (bare[cursor] === '{') {
-      depth += 1;
-    } else if (bare[cursor] === '}') {
-      depth -= 1;
-      if (depth === 0) {
-        return cursor;
-      }
-    }
-  }
-  return -1;
-};
+  findImportChains(files, [start], ({ specifier }) => (isNodeBuiltinSpecifier(specifier) ? specifier : undefined));
 
 const SERVER_BLOCK_START = /\bserver\s*:\s*\{/u;
 
@@ -216,7 +205,7 @@ const SERVER_BLOCK_START = /\bserver\s*:\s*\{/u;
 const findUsesOutsideServerHandlers = (route: ScannedSource, names: readonly string[]): readonly string[] => {
   const block = SERVER_BLOCK_START.exec(route.bare);
   const open = block === null ? -1 : block.index + block[0].length - 1;
-  const close = open < 0 ? -1 : matchingBrace(route.bare, open);
+  const close = open < 0 ? -1 : matchingBracket(route.bare, open);
   const imports = findImportStatementRanges(route.bare);
   return names.flatMap((name) => [...route.bare.matchAll(new RegExp(`(?<![\\w$])${name}(?![\\w$])`, 'gu'))]
     .map((match) => match.index)
@@ -244,6 +233,9 @@ describe('Local UI boundary detectors', () => {
       "const m = require('../../../../src/evidence/x.js');",
       "const dir = '../../../../src/interaction/';",
       "import { x } from 'beaksight/src/audit/x.js';",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスの文字列リテラル（`\` の区切りを含む）も見る。
+      "const entry = 'beaksight/src/safety/passive-request-guard.js';",
+      "const entry = 'src\\\\browser\\\\context-factory.ts';",
     ]) {
       expect(findDirectViolations(path, scanSource(line)), line).toHaveLength(1);
     }
@@ -372,6 +364,8 @@ describe('Local UI boundary detectors', () => {
       "export { computeApprovalDigest } from '../../../../src/control/approval/approval-digest.js';",
       "const m = await import('../../../../src/control/approval/approval-validity.js');",
       "const directory = '../../../../src/control/approval/';",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスの文字列リテラルも見る。
+      "const entry = 'beaksight/src/control/approval/scenario-store.js';",
     ]) {
       expect(findApprovalInternalReferences(path, scanSource(line)), line).toHaveLength(1);
     }
@@ -414,16 +408,8 @@ describe('Local UI boundary detectors', () => {
 // Gate
 // ---------------------------------------------------------------------------------------------------------------
 
-interface AppFile extends ScannedSource {
-  readonly path: string;
-}
-
-/** `apps/local-ui/` の `.ts`・`.tsx` を、1 回だけ列挙して読み込み、走査する（`dist/` を除く）。 */
-const APP_FILES: readonly AppFile[] = readdirSync(join(REPOSITORY_ROOT, APP_DIRECTORY), { recursive: true, encoding: 'utf8' })
-  .map((relativePath) => `${APP_DIRECTORY}${relativePath.replaceAll('\\', '/')}`)
-  .filter((path) => APP_SOURCE_EXTENSION.test(path) && !isUnder(path, APP_SKIPPED_DIRECTORIES))
-  .sort()
-  .map((path) => ({ path, ...scanSource(readFileSync(join(REPOSITORY_ROOT, path), 'utf8')) }));
+/** `apps/local-ui/` の TypeScript を、1 回だけ列挙して読み込み、走査する（`dist/` と `node_modules/` を除く。`source-scan.ts` の `loadLocalUiAppFiles`）。 */
+const APP_FILES = loadLocalUiAppFiles();
 const APP_CODE_FILES = APP_FILES.filter((file) => !file.path.startsWith(APP_TESTS_DIRECTORY));
 const SOURCE_FILES = loadSourceFiles();
 
@@ -446,7 +432,8 @@ describe('Local UI boundary (Task 23 design 4.2, 4.4)', () => {
     expect(findModuleSpecifiers((index ?? scanSource('')).code).map((specifier) => resolveRelativeSpecifier('apps/local-ui/src/routes/index.tsx', specifier)))
       .toContain('src/presentation/format.js');
     const violations = APP_CODE_FILES.flatMap((file) => findDirectViolations(file.path, file).map((text) => `${file.path}: ${text}`));
-    expect(violations).toEqual([]);
+    expect(violations.filter((violation) => !NEWLY_FOUND_SOURCE_PATH_LITERALS.includes(violation))).toEqual([]);
+    expect(unusedExclusionsOf(NEWLY_FOUND_SOURCE_PATH_LITERALS, violations), 'exclusions that are no longer used').toEqual([]);
   });
 
   it('(g) nothing the UI code loads at run time reaches Playwright or the audit engine', () => {

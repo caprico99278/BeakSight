@@ -37,7 +37,9 @@ import {
   formatTimes,
 } from '../../src/presentation/format.js';
 import {
+  BLOCKED_REQUEST_REASON_DESCRIPTIONS,
   HTML_REPORT_TEXT,
+  INCOMPLETE_REASON_NEXT_STEPS,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
   describeInteractionReason,
@@ -160,6 +162,21 @@ describe('renderHtmlReport: sections (design 6.1.4)', () => {
     }
   });
 
+  // T44f（Task 44 の設計書 P3-1 の D）: 「重大な指摘」の節は、Finding の行を出し直さず、分類ごとの節の行へのリンクの一覧にする（ページの節の一覧と同じ形）。
+  it('lists the critical findings as links to their rows in the category sections, not as rows again (T44f)', () => {
+    const viewModel = buildReportViewModel(edgeCaseAuditRun());
+    const html = renderHtmlReport(viewModel);
+    const criticalPart = sliceBetween(html, 'critical-findings', 'findings-by-category');
+    expect(criticalPart).not.toContain('<table');
+    expect(criticalPart).not.toContain(`class="${REPORT_CLASS_NAMES.findingRow}"`);
+    for (const view of viewModel.criticalFindings) {
+      const anchor = toAnchorId('finding', view.finding.findingId);
+      expect(criticalPart, view.finding.findingId).toContain(`href="#${anchor}"`);
+      // リンク先の行は、分類ごとの節にある。
+      expect(sliceBetween(html, 'findings-by-category', 'interactions'), view.finding.findingId).toContain(`id="${anchor}"`);
+    }
+  });
+
   it('says that there is no finding in a section without findings', () => {
     const html = render(auditRun());
     const criticalPart = sliceBetween(html, 'critical-findings', 'findings-by-category');
@@ -238,6 +255,35 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     expect(summary).toContain(reason!.code);
     expect(summary).toContain(escapeHtml(reason!.description));
     expect(summary).toContain(escapeHtml(reason!.detail!));
+  });
+
+  // T44c（Task 44 の設計書 P1-4）: 内側のスクロールの領域を走査しきれなかった理由には、説明の後に次にできることを出す。T44h の判断 (1): ほかの理由にも出す。
+  it('shows the next step after the description of INNER_SCROLL_CONTAINER_NOT_TRAVERSED and the other reasons (T44c, T44h (1))', () => {
+    const base = edgeCaseAuditRun();
+    const [first, ...rest] = base.pages;
+    if (first === undefined) throw new Error('the sample has no page');
+    const result: AuditRunResult = {
+      ...base,
+      pages: [{
+        ...first,
+        incompleteReasons: [
+          ...first.incompleteReasons,
+          { code: 'INNER_SCROLL_CONTAINER_NOT_TRAVERSED', detail: null },
+          { code: 'UNHANDLED_FAILURE', detail: null },
+        ],
+      }, ...rest],
+    };
+    const viewModel = buildReportViewModel(result);
+    const reasons = viewModel.pages[0]?.incompleteReasons ?? [];
+    const inner = reasons.find(({ code }) => code === 'INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
+    expect(inner?.nextStep).toBe(INCOMPLETE_REASON_NEXT_STEPS.INNER_SCROLL_CONTAINER_NOT_TRAVERSED);
+    expect(reasons.length).toBeGreaterThan(1);
+    expect(reasons.every(({ code, nextStep }) => nextStep === INCOMPLETE_REASON_NEXT_STEPS[code])).toBe(true);
+    expect(sliceBetween(renderHtmlReport(viewModel), 'pages', null)).toContain([
+      renderCode('INNER_SCROLL_CONTAINER_NOT_TRAVERSED').html,
+      escapeHtml(inner?.description ?? ''),
+      escapeHtml(HTML_REPORT_TEXT.reasonNextStep(INCOMPLETE_REASON_NEXT_STEPS.INNER_SCROLL_CONTAINER_NOT_TRAVERSED)),
+    ].join(' '));
   });
 
   it('shows each finding with its message as written by the rule, rule ID and version, viewport, Evidence and screenshots', () => {
@@ -334,11 +380,16 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
         [renderCode(code).html, escapeHtml(description), ...(detail === null ? [] : [renderCode(detail).html])].join(' '),
       );
     }
-    // ページの未完了の理由の一覧も、同じ形（コード、説明、詳細を空白でつないだもの）で示す。
+    // ページの未完了の理由の一覧も、同じ形（コード、説明、詳細を空白でつないだもの）で示す。T44h の判断 (1): ページの理由は、説明の後に次にできることが続く。
     const [pageReason] = viewModel.pages[0]?.incompleteReasons ?? [];
     expect(pageReason).toBeDefined();
     expect(sliceBetween(html, 'pages', null)).toContain(
-      [renderCode(pageReason!.code).html, escapeHtml(pageReason!.description), renderCode(pageReason!.detail!).html].join(' '),
+      [
+        renderCode(pageReason!.code).html,
+        escapeHtml(pageReason!.description),
+        escapeHtml(HTML_REPORT_TEXT.reasonNextStep(pageReason!.nextStep ?? '')),
+        renderCode(pageReason!.detail!).html,
+      ].join(' '),
     );
     expect(html).not.toContain('<script');
   });
@@ -746,6 +797,30 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     expect(withoutAnything).toBeGreaterThanOrEqual(0);
     const cells = cellsOf(rows[withoutAnything] ?? '');
     expect(cells[candidateColumn]).toBe(cells[columns.indexOf('メソッド')]);
+  });
+
+  // T44R2 の M-7: 止めた要求の理由は、今の止め方（読み取りでない送信のほか、上限や、離れた後の上限は GET も止める）ごとに違うので、事象の一覧の理由の欄に、
+  // 理由の説明（`BLOCKED_REQUEST_REASON_DESCRIPTIONS`。表示はこの 1 か所）を添える。種類の説明も、読み取り以外だけを止めるとは書かない。
+  it('describes the reason of each blocked request in the reason column, and the kind does not say only the non-read requests are blocked (T44R2 M-7)', () => {
+    const run = safetyEventsRun();
+    const [first, ...rest] = run.pages;
+    if (first === undefined) throw new Error('the sample has no page');
+    const leave = safety(41, first.pageId, 'desktop', {
+      blockedRequests: [{ method: 'GET', url: fixtureUrl('/beacon.gif'), reason: 'PAGE_LEAVE_REQUEST_LIMIT_REACHED', resourceType: 'image', phase: 'LOAD' }],
+    });
+    const viewModel = buildReportViewModel({ ...run, pages: [{ ...first, evidence: [...first.evidence, leave] }, ...rest] });
+    const rows = eventRows(renderHtmlReport(viewModel));
+    const reasonColumn = HTML_REPORT_TEXT.safety.eventColumns.indexOf('理由');
+    const blocked = viewModel.safety.events.flatMap((event, index) => (event.kind === 'blockedRequests' ? [{ event, index }] : []));
+    expect(blocked.map(({ event }) => event.reason)).toEqual(expect.arrayContaining(['NON_READ_METHOD', 'PAGE_LEAVE_REQUEST_LIMIT_REACHED']));
+    for (const { event, index } of blocked) {
+      const description = BLOCKED_REQUEST_REASON_DESCRIPTIONS[event.reason as keyof typeof BLOCKED_REQUEST_REASON_DESCRIPTIONS];
+      expect(cellsOf(rows[index] ?? '')[reasonColumn], event.reason).toBe(`${renderCode(event.reason).html} ${escapeHtml(description)}`);
+    }
+    const other = viewModel.safety.events.findIndex((event) => event.kind !== 'blockedRequests');
+    expect(cellsOf(rows[other] ?? '')[reasonColumn]).toBe(renderCode(viewModel.safety.events[other]?.reason ?? '').html);
+    expect(SAFETY_EVENT_KIND_CATALOG.blockedRequests.description).not.toContain('読み取り以外のメソッドのリクエストを、遮断しました');
+    expect(SAFETY_EVENT_KIND_CATALOG.blockedRequests.description).toContain('GET');
   });
 
   it('escapes the candidate ID of an event (C16e)', () => {

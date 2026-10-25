@@ -7,8 +7,11 @@
 // - ジョブの管理から（`createAuditJobManager` が fork する）: 人の操作の代わりに、テストが標準入力で渡した仮の資格情報を、テストだけの口が入力
 //   する。ログイン → 監査 → FINISHED（COMPLETE）。ジョブの行に最後の認証の状態。秘密の目印（Cookie と localStorage の値）が、親が受けた
 //   メッセージのすべて、ジョブの行、管理データのファイル（WAL を含む）、ワーカーの標準出力と標準エラーに出ない。process が残らない。
+// - DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 3 章の 1・2）: fixture のログインの後の画面が IndexedDB に目印を書き、2 ページ目は
+//   その記録がなければログインの画面へ移す。ジョブは COMPLETE で終わり（IndexedDB を引き継いだ）、ログインの段の状態の名前の記録が IPC とジョブの行に
+//   残る。IndexedDB の値の目印も、ほかの目印と同じ場所に出ない。
 // 作業のディレクトリ（リポジトリの root の代わり）、管理データ、出力先は、一時のフォルダだけ。サーバは 127.0.0.1 だけで待ち受ける。
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import { fork, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,7 +19,8 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { loadConfig } from '../../src/config/load-config.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION } from '../../src/control/contracts.js';
 import { createAuditJobManager, type AuditJobManager, type AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import { readJob, type AuditJobView } from '../../src/control/job/job-store.js';
@@ -24,6 +28,15 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import {
+  STDIN_CREDENTIALS_EXPRESSION,
+  STDIN_CREDENTIALS_PRELUDE,
+  createRecordingFork,
+  hideJobBrowser,
+  processTreeOf,
+  waitForValue,
+  type WaitTiming,
+} from '../helpers/worker-fork-support.js';
 import {
   WORKER_PROTOCOL_VERSION,
   targetConfigDigestOf,
@@ -37,7 +50,8 @@ import {
   startAuthenticatedSite,
   type AuthenticatedSite,
 } from '../helpers/authenticated-site-fixture.js';
-import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../helpers/process-tree.js';
+import { nonReadRequestsOf } from '../helpers/leak-places.js';
+import { waitUntilExited } from '../helpers/process-tree.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
 import { testLoginWorkerEntrySource } from '../helpers/test-login-worker-entry.js';
@@ -58,27 +72,18 @@ const MAX_PAGES = 3;
 /** テストだけの入口（一時のビルドの root に書く）から見た、ビルドの `dist/` の場所。 */
 const ENTRY_DIST_PREFIX = './dist/';
 
-/**
- * テストだけの入口の、資格情報の読み取りの準備（CCX-23: 入口の本文は、画面のテストと共用する `testLoginWorkerEntrySource`）。資格情報は、
- * ファイルにも環境変数にも書かず、標準入力から受ける（`[セレクタ, 値]` の組と、送るボタンのセレクタ）。起動のときから読み始める。
- */
-const STDIN_CREDENTIALS_PRELUDE = String.raw`
-const credentials = new Promise((resolve) => {
-  let text = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => { text += chunk; });
-  process.stdin.on('end', () => resolve(JSON.parse(text)));
-});
-`;
-/** 準備で読み始めた資格情報（`STDIN_CREDENTIALS_PRELUDE` の値）。 */
-const STDIN_CREDENTIALS_EXPRESSION = 'credentials';
+/** 状態を待つ時間の上限と間隔。 */
+const WAIT_TIMING: WaitTiming = Object.freeze({ limitMs: WAIT_LIMIT_MS, pollMs: WAIT_POLL_MS });
 
 let site: AuthenticatedSite;
 let build: TemporaryBuild;
 let workDirectory: string;
 const children: ChildProcess[] = [];
 
-/** テストだけの入口を書き、そのパスを返す。 */
+/**
+ * テストだけの入口を書き、そのパスを返す（CCX-23: 入口の本文は、画面のテストと共用する `testLoginWorkerEntrySource`）。資格情報は、ファイルにも
+ * 環境変数にも書かず、標準入力から受ける（`worker-fork-support.ts` の準備。`[セレクタ, 値]` の組と、送るボタンのセレクタ）。
+ */
 async function writeEntry(name: string, loginTimeoutMs: number, readCredentials: boolean): Promise<string> {
   const path = join(build.rootDirectory, `${name}-${ENTRY_FILE_NAME}`);
   const source = testLoginWorkerEntrySource({
@@ -92,7 +97,7 @@ async function writeEntry(name: string, loginTimeoutMs: number, readCredentials:
 }
 
 const setupFor = (started: AuthenticatedSite): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${started.originA}${AUTH_SITE_PATHS.login}`,
@@ -121,29 +126,10 @@ const isWorkerMessage = (value: unknown): value is WorkerToParentMessage => vali
 /** 秘密の目印が、`text` に現れたもの。 */
 const leakedMarkers = (text: string): readonly string[] => site.secretValues().filter((marker) => text.includes(marker));
 
-async function waitFor<T>(read: () => T | null): Promise<T> {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const value = read();
-    if (value !== null) {
-      return value;
-    }
-    if (Date.now() > deadline) {
-      throw new Error('the expected state was not reached');
-    }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
-  }
-}
-
-/** process と、その子孫（Chromium）。 */
-async function treeOf(processId: number): Promise<readonly ProcessIdentity[]> {
-  const processes = await listProcesses();
-  return [...processes.filter((identity) => identity.processId === processId), ...descendantsOf(processId, processes)];
-}
-
 describe('T25d: the authenticated worker in a child process (login Browser replaced by the headless CLI launch settings)', () => {
   beforeAll(async () => {
-    site = await startAuthenticatedSite({ loginForm: true });
+    // DEF-139: ログインの後の画面が IndexedDB に秘密の目印を書き、2 ページ目はその記録がなければログインの画面へ移す（引き継ぎと目印の確かめ）。
+    site = await startAuthenticatedSite({ loginForm: true, indexedDbGate: true });
     build = await buildIntoTemporaryDirectory();
     workDirectory = await mkdtemp(join(tmpdir(), 'beaksight-audit-worker-auth-fork-'));
     await writeTarget();
@@ -189,8 +175,8 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
     });
     const exited = new Promise<number | null>((resolvePromise) => child.on('exit', (code) => resolvePromise(code)));
 
-    await waitFor(() => (messages.some((message) => isWorkerMessage(message) && message.type === 'AUTH_STATE') ? true : null));
-    const tree = await treeOf(child.pid ?? 0);
+    await waitForValue(() => (messages.some((message) => isWorkerMessage(message) && message.type === 'AUTH_STATE') ? true : null), WAIT_TIMING);
+    const tree = await processTreeOf(child.pid ?? 0);
     expect(tree.length, 'the worker has no Chromium while it waits for the login').toBeGreaterThan(1);
 
     expect(await exited).toBe(FAILURE_EXIT_CODE);
@@ -202,7 +188,7 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
     expect(stdout).toBe('');
     expect(leakedMarkers(`${stdout}${stderr}`)).toEqual([]);
     expect(await waitUntilExited(tree, CHROMIUM_EXIT_LIMIT_MS), 'processes left after the worker exited').toEqual([]);
-    expect(site.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect(nonReadRequestsOf(site.requests)).toEqual([]);
   }, SUITE_TIMEOUT_MS);
 
   it('runs an authenticated job from the job manager (login by the test hook), records the auth state, and leaks no secret marker', async () => {
@@ -222,6 +208,8 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
         approvedTestOrigins: [site.originA],
         environmentEvidenceRef: 'evidence/example-auth-fork/isolation-check-1',
       }, { resolveContext }).ok).toBe(true);
+      // FM-2: テストのジョブのブラウザは今どおり headless。
+      hideJobBrowser(database, PROFILE_ID);
       expect(saveAuthSetup(database, setupFor(site), { resolveContext }).ok).toBe(true);
 
       const fields: [string, string][] = [];
@@ -231,15 +219,13 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
       const entry = await writeEntry('job', LONG_LOGIN_TIMEOUT_MS, true);
       const received: unknown[] = [];
       let output = '';
-      const forkWorker: AuditWorkerForker = (_modulePath, args, options: ForkOptions) => {
-        const child = fork(entry, [...args], { ...options, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
-        children.push(child);
-        child.on('message', (message: unknown) => received.push(message));
-        child.stdout?.setEncoding('utf8').on('data', (chunk: string) => { output += chunk; });
-        child.stderr?.setEncoding('utf8').on('data', (chunk: string) => { output += chunk; });
-        child.stdin?.end(JSON.stringify({ fields, submit: AUTH_SITE_LOGIN_FIELDS.submit }));
-        return child;
-      };
+      const forkWorker: AuditWorkerForker = createRecordingFork({
+        entry,
+        stdinText: () => JSON.stringify({ fields, submit: AUTH_SITE_LOGIN_FIELDS.submit }),
+        onChild: (child) => children.push(child),
+        onReceived: (message) => received.push(message),
+        onOutput: (chunk) => { output += chunk; },
+      });
       manager = createAuditJobManager({
         database,
         repositoryRoot: workDirectory,
@@ -252,13 +238,13 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
         throw new Error(`the job did not start: ${started.reason}`);
       }
       const { jobId } = started.job;
-      await waitFor(() => (readJob(database, jobId)?.lastAuthState === 'AWAITING_LOGIN' ? true : null));
-      const tree = await treeOf(children.at(-1)?.pid ?? 0);
+      await waitForValue(() => (readJob(database, jobId)?.lastAuthState === 'AWAITING_LOGIN' ? true : null), WAIT_TIMING);
+      const tree = await processTreeOf(children.at(-1)?.pid ?? 0);
 
-      const ended: AuditJobView = await waitFor(() => {
+      const ended: AuditJobView = await waitForValue(() => {
         const job = readJob(database, jobId);
         return job !== null && job.finishedAt !== null ? job : null;
-      });
+      }, WAIT_TIMING);
       expect(ended).toMatchObject({
         state: 'FINISHED',
         resultRunStatus: 'COMPLETE',
@@ -268,10 +254,21 @@ describe('T25d: the authenticated worker in a child process (login Browser repla
         failureReason: null,
       });
       expect(site.successfulLogins).toBe(1);
-      expect(site.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`))
-        .toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
+      expect(nonReadRequestsOf(site.requests)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
       const states = received.filter(isWorkerMessage).flatMap((message) => (message.type === 'AUTH_STATE' ? [message.state] : []));
       expect(states).toEqual(['AWAITING_LOGIN', 'AUTHENTICATED']);
+      // DEF-139: IndexedDB を引き継いだので、2 ページ目まで監査した（2 ページ目はログインの画面へ移さなかった。COMPLETE は上で確かめた）。
+      expect(site.requests.filter(({ path, authenticated }) => path === AUTH_SITE_PATHS.adminSecond && authenticated).length).toBeGreaterThan(0);
+      // DEF-139（設計書 2.1）: ログインの段の状態の名前の記録が、IPC とジョブの行（画面が読む口）に残る。名前は形だけで、値を持たない。
+      const authenticatedMessage = received.filter(isWorkerMessage)
+        .find((message): message is Extract<WorkerToParentMessage, { readonly type: 'AUTH_STATE' }> => message.type === 'AUTH_STATE' && message.state === 'AUTHENTICATED');
+      const stateNames = readJob(database, jobId)?.loginStage?.stateNames;
+      expect(stateNames).toEqual(authenticatedMessage?.loginStateNames);
+      expect(stateNames?.cookies.rows).toContainEqual({
+        domain: new URL(site.originA).hostname, path: '/', hostOnly: true, shape: null, outcome: 'CARRIED', count: 1,
+      });
+      expect(stateNames?.localStorage.rows).toContainEqual({ origin: site.originA, shape: { prefix: '', suffix: '_token' }, outcome: 'CARRIED', count: 1 });
+      expect(stateNames?.indexedDB.rows).toContainEqual({ origin: site.originA, shape: { prefix: '', suffix: '-session' }, outcome: 'CARRIED', count: 1 });
 
       // 秘密の目印: 親が受けたメッセージのすべて、ジョブの行、管理データのファイルと WAL、ワーカーの標準出力と標準エラー。
       const databasePath = resolveControlDatabasePath(workDirectory);

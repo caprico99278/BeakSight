@@ -11,8 +11,14 @@
  *   （`moduleReferenceCandidatesOf`）、Playwright のパッケージの名前（`PLAYWRIGHT_PACKAGE_PATTERN`）、禁じた層へのたどり
  *   （`findTransitiveForbiddenReferences`）、静的な参照の節（`ModuleReference` の `statement`・`defaultBinding`・`namedBindings`）、括弧の対応
  *   （`matchingParenthesis`）も、ここに置く。
+ * - PRE42-CC 組 G: Gate ごとに書き写していた補助（時間の上限 `MAX_GATE_MS`、フォルダの下かの判定 `isPathUnder`、`escapeRegExp`、
+ *   `countDefinitions`、ファイルの作りと探し方 `sourceFileOf`・`sourceFileAt`、`violationsOf`、括弧の対応 `matchingBracket`、除外の確かめ
+ *   `unusedExclusionsOf`・`judgeWithFileExceptions`、テストと画面の読み込み、`createRequire` の変数の見分け、読み取りの method の写しの形）と、
+ *   相対でない参照の判定（`referencedPathsOf`・`modulePattern` など。今までの Gate のうち最も広い形）も、ここに置く。戻りは
+ *   `gate-helper-reuse.test.ts` が止める。
  */
 import { readdirSync, readFileSync } from 'node:fs';
+import { builtinModules } from 'node:module';
 import { join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -416,10 +422,17 @@ const WHOLE_STATIC_PATTERN = /\bimport\s*\*\s*as\s+[\w$]+\s*from\s*(['"])[^'"\r\
 const matchEnds = (code: string, pattern: RegExp): ReadonlyMap<number, string> =>
   new Map([...code.matchAll(pattern)].map((match) => [match.index + match[0].length, match[0]]));
 
+/**
+ * `createRequire(…)` を入れた変数の名前（`const load = createRequire(…)`、`= module.createRequire(…)`。同じ名前は 1 つにまとめる。初めに現れた順）。
+ * `code` か `bare` を渡す（PRE42-CC 組 G で公開。Gate のファイルに、変数の見分けの正規表現を書き写さない）。
+ */
+export const createRequireBindingNamesOf = (text: string): readonly string[] =>
+  [...new Set([...text.matchAll(CREATE_REQUIRE_BINDING_PATTERN)].map((binding) => binding[1] ?? ''))];
+
 /** `createRequire(…)` を入れた変数の呼び出し（`load('…'`・`load.resolve('…'`）。 */
 const createRequireBindingCallsOf = (code: string): readonly RegExpExecArray[] =>
-  [...new Set([...code.matchAll(CREATE_REQUIRE_BINDING_PATTERN)].map((binding) => binding[1] ?? ''))]
-    .flatMap((name) => [...code.matchAll(new RegExp(String.raw`(?<![\w$.])${escapeRegExp(name)}(\s*\.\s*resolve)?\s*\(\s*(['"])([^'"\r\n]+)\2`, 'gu'))]);
+  createRequireBindingNamesOf(code)
+    .flatMap((name) =>[...code.matchAll(new RegExp(String.raw`(?<![\w$.])${escapeRegExp(name)}(\s*\.\s*resolve)?\s*\(\s*(['"])([^'"\r\n]+)\2`, 'gu'))]);
 
 /**
  * `code`（コメントを除いた本文）の中の、モジュールの参照のすべて（近似。`code` の中の位置の順）。Architecture Gate の、指定子の取り出しの
@@ -678,14 +691,14 @@ export const reachableFiles = (files: ReadonlyMap<string, ScannedSource>, start:
   return [...reached].sort();
 };
 
-/** `open` の位置の括弧に対応する、閉じ括弧の位置。見つからなければ `-1`。`bare`（文字列の中身を除いた本文）を渡す（CCX-27 で公開。CC-088）。 */
-export const matchingParenthesis =(bare: string, open: number): number => {
+/** `open` の位置から、`opener` と `closer` の対を数えて、深さが 0 に戻る `closer` の位置。見つからなければ `-1`。 */
+const matchingCloser = (text: string, open: number, opener: string, closer: string): number => {
   let depth = 0;
-  for (let cursor = open; cursor < bare.length; cursor += 1) {
-    const character = bare[cursor];
-    if (character === '(') {
+  for (let cursor = open; cursor < text.length; cursor += 1) {
+    const character = text[cursor];
+    if (character === opener) {
       depth += 1;
-    } else if (character === ')') {
+    } else if (character === closer) {
       depth -= 1;
       if (depth === 0) {
         return cursor;
@@ -695,13 +708,30 @@ export const matchingParenthesis =(bare: string, open: number): number => {
   return -1;
 };
 
+/** `open` の位置の括弧に対応する、閉じ括弧の位置。見つからなければ `-1`。`bare`（文字列の中身を除いた本文）を渡す（CCX-27 で公開。CC-088）。 */
+export const matchingParenthesis = (bare: string, open: number): number => matchingCloser(bare, open, '(', ')');
+
+/** 開き括弧（`(`・`{`・`[`）と、対の閉じ括弧。 */
+const BRACKET_PAIRS: Readonly<Record<string, string>> = Object.freeze({ '(': ')', '{': '}', '[': ']' });
+
+/**
+ * `open` の位置の開き括弧（`(`・`{`・`[`）に対応する閉じ括弧の位置（同じ種類の括弧だけを数える）。`open` が開き括弧でないか、見つからなければ
+ * `-1`。`bare`（文字列の中身とコメントを除いた本文）を渡す（PRE42-CC 組 G。Gate ごとの `matchingBrace`・`matchingBracket` を寄せた）。
+ */
+export const matchingBracket = (bare: string, open: number): number => {
+  const opener = bare[open] ?? '';
+  const closer = BRACKET_PAIRS[opener];
+  return closer === undefined ? -1 : matchingCloser(bare, open, opener, closer);
+};
+
 /** 呼び出しの位置と、括弧の中の引数の本文。 */
 export interface CallSite {
   readonly index: number;
   readonly argumentText: string;
 }
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+/** 正規表現の特別な文字を逃がす（PRE42-CC 組 G で公開。Gate のファイルに書き写さない）。 */
+export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 
 /**
  * `name(…)` の形の呼び出しの一覧（`obj.name(…)`、`new name(…)`、型引数付きの `name<T>(…)` を含む）。`bare` を渡す。
@@ -753,3 +783,278 @@ export const splitTopLevelArguments = (argumentText: string): readonly string[] 
 /** `bare` の中の、識別子 `name` の出現（前後が識別子の文字でないもの）の数。 */
 export const countIdentifier = (bare: string, name: string): number =>
   [...bare.matchAll(new RegExp(String.raw`(?<![\w$])${escapeRegExp(name)}(?![\w$])`, 'gu'))].length;
+
+// ---------------------------------------------------------------------------------------------------------------
+// Gate の共通の補助（PRE42-CC の組 G。Gate ごとに書き写していたものを、ここに 1 つずつ置く。戻りは `gate-helper-reuse.test.ts` が止める）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * Gate の時間の上限（ms。1 ファイル 1 秒以内。`references/ui-ux-ssot.md` 第6章）。各 Gate は、この値に、見たファイルの数などを掛けて使う。
+ * 測り方は、`startCpuStopwatch` の CPU の時間（TS-d。壁時計で測らない。Gate `wall-clock-speed-checks.test.ts`）。
+ */
+export const MAX_GATE_MS = 1_000;
+
+/** 1 ms のマイクロ秒の数（`process.threadCpuUsage` の値は µs）。 */
+const MICROSECONDS_PER_MILLISECOND = 1_000;
+
+/** 始めてからの CPU の時間を返す測り（`startCpuStopwatch`）。 */
+export interface CpuStopwatch {
+  /** 始めてから今までに、この thread が使った CPU の時間（ms。user と system の和）。 */
+  readonly elapsedMs: () => number;
+}
+
+/**
+ * 純粋な計算の速さの要件（Gate の `MAX_GATE_MS`、単体のテストの名前つきの上限）を測る、CPU の時間の測り（TS-d。設計書
+ * `2026-10-24-beaksight-test-suite-tiers-design.md` 3.4。DEF-153）。architecture と単体のテストで共用する（ほかに書き写さない）。
+ * - `process.threadCpuUsage()`（今の thread だけの CPU の時間）で測る。Vitest の worker（既定の forks の子 process の主 thread と、threads の
+ *   worker thread）の中で使えることを、2026-10-24 に両方の pool で確かめた。`process.cpuUsage()` は process のすべての thread（GC と変換の裏の
+ *   thread、threads の pool のほかのファイル）を含むので使わない。
+ * - 並行の混雑で CPU を待つ時間（壁時計が延びる分）は数えない。測った処理そのものの重さだけを数える（DEF-153 の揺らぎの原因を除く）。
+ * - Windows の刻みは約 15.6 ms（2026-10-24 に確かめた）。上限（1 秒、100 ms など）より十分に小さい。
+ * - 測りは、検査の本体の直前に始める（モジュールの読み込みと変換の時間を含めない）。タイマーの待ち（期限の内に返るか）を測るのには使わない
+ *   （待つ間は CPU を使わないので 0 に近い）。
+ */
+export const startCpuStopwatch = (): CpuStopwatch => {
+  const started = process.threadCpuUsage();
+  return Object.freeze({
+    elapsedMs: (): number => {
+      const { user, system } = process.threadCpuUsage(started);
+      return (user + system) / MICROSECONDS_PER_MILLISECOND;
+    },
+  });
+};
+
+/** `path`（リポジトリの根からのパス。区切りは `/`）が、`directory`（末尾の `/` つき）の下か、そのフォルダそのものか。 */
+export const isPathUnder = (path: string, directory: string): boolean => `${path}/`.startsWith(directory);
+
+/** `path` が、`directories`（どれも末尾の `/` つき）のどれかの下か、そのフォルダそのものか。 */
+export const isPathUnderAny = (path: string, directories: readonly string[]): boolean =>
+  directories.some((directory) => isPathUnder(path, directory));
+
+/**
+ * `bare`（コメントと文字列の中身を除いた本文）の中の、`name` の定義の数（`function name`・`function* name`、`const`・`let`・`var` の `name =`・
+ * `name:`（型の注釈つき）、`class name`）。近似の検査。
+ */
+export const countDefinitions = (bare: string, name: string): number => {
+  const escaped = escapeRegExp(name);
+  const pattern = new RegExp(
+    String.raw`(?<![\w$])(?:function\s*\*?\s*${escaped}(?![\w$])|(?:const|let|var)\s+${escaped}\s*[=:]|class\s+${escaped}(?![\w$]))`,
+    'gu',
+  );
+  return [...bare.matchAll(pattern)].length;
+};
+
+/** 本文から、走査したファイルを作る（Gate の対照の例の、置いたファイル）。 */
+export const sourceFileOf = (path: string, content: string): SourceFile => scanFile({ path, content });
+
+/** `files` の中の、`path` のファイル。無ければ投げる（Gate の失敗。見るはずのファイルが無くなったことに気づく）。 */
+export const sourceFileAt = <T extends { readonly path: string }>(files: readonly T[], path: string): T => {
+  const file = files.find((candidate) => candidate.path === path);
+  if (file === undefined) {
+    throw new Error(`missing source file: ${path}`);
+  }
+  return file;
+};
+
+/** 検出の関数（`find`）がファイルごとに見つけたものを、`<パス>: <見つけたもの>` の形で並べる（ファイルの順、見つけた順）。 */
+export const violationsOf = <T extends { readonly path: string }>(files: readonly T[], find: (file: T) => readonly string[]): readonly string[] =>
+  files.flatMap((file) => find(file).map((match) => `${file.path}: ${match}`));
+
+/**
+ * 本文が公開する関数と値の名前: 行の始まりの `export function`・`export async function`・`export function*`・`export const` の名前（書いた順）と、
+ * 公開の一覧と公開し直しの `export { X, Y as Z }`（`from '…'` のあるなしを問わない。公開の名前 `Z` を取る）。型だけの公開は数えない。
+ * 指定子は読まない（今までの Gate のうち最も広い形）。
+ */
+export const exportedNamesOf = (text: string): readonly string[] => [
+  ...[...text.matchAll(/^export\s+(?:async\s+)?(?:function\s*\*?|const)\s+([A-Za-z_$][\w$]*)/gmu)].map((match) => match[1] ?? ''),
+  ...[...text.matchAll(/^export\s*(?!type\b)\{([^}]*)\}/gmu)].flatMap((match) => (match[1] ?? '').split(',')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0 && !part.startsWith('type '))
+    .map((part) => part.split(/\s+as\s+/u).at(-1)?.trim() ?? '')),
+];
+
+// 除外の確かめ ------------------------------------------------------------------------------------------------------
+
+/**
+ * 除外の一覧のうち、見つけたもの（`found`）に現れないもの（使われなくなった除外）。Gate は、これが空であることを確かめる（古い除外が、
+ * 新しい違反を隠さないため）。並びは除外の一覧の順。
+ */
+export const unusedExclusionsOf = (exclusions: Iterable<string>, found: Iterable<string>): readonly string[] => {
+  const seen = new Set(found);
+  return [...exclusions].filter((exclusion) => !seen.has(exclusion));
+};
+
+/** ファイルごとの除外（ファイル → 理由。件数も確かめる除外は `{ count, reason }`）。 */
+export type FileExceptions = Readonly<Record<string, string | { readonly count: number; readonly reason: string }>>;
+
+/** `judgeWithFileExceptions` の結果。 */
+export interface FileExceptionJudgement {
+  /** 除外の外で見つけたもの（`<パス>: <見つけたもの>`）。 */
+  readonly found: readonly string[];
+  /** 件数を決めた除外のうち、見つけた件数が違うもの。 */
+  readonly countMismatches: readonly string[];
+  /** 使われなくなった除外（見つけたものがないファイル）。 */
+  readonly unusedExceptions: readonly string[];
+}
+
+/** 検出の関数が当たったファイルを、ファイルごとの除外と、見つけたものに分ける（除外の件数と、使われなくなった除外も返す）。 */
+export const judgeWithFileExceptions = <T extends { readonly path: string }>(
+  files: readonly T[],
+  find: (file: T) => readonly string[],
+  exceptions: FileExceptions,
+): FileExceptionJudgement => {
+  const used: string[] = [];
+  const countMismatches: string[] = [];
+  const found = files.flatMap((file) => {
+    const matches = find(file);
+    if (matches.length === 0) {
+      return [];
+    }
+    const exception = exceptions[file.path];
+    if (exception === undefined) {
+      return matches.map((match) => `${file.path}: ${match}`);
+    }
+    used.push(file.path);
+    if (typeof exception !== 'string' && matches.length !== exception.count) {
+      countMismatches.push(`${file.path}: expected ${String(exception.count)}, found ${String(matches.length)} (${matches.join('; ')})`);
+    }
+    return [];
+  });
+  return { found, countMismatches, unusedExceptions: unusedExclusionsOf(Object.keys(exceptions), used) };
+};
+
+// 読み込み --------------------------------------------------------------------------------------------------------
+
+/** テストの Gate が見るフォルダ（結合のテスト、部品のテスト、単体のテスト、テストの補助、画面のテスト）。 */
+export const TEST_SOURCE_DIRECTORIES: readonly string[] = Object.freeze([
+  'tests/integration',
+  'tests/component',
+  'tests/unit',
+  'tests/helpers',
+  'apps/local-ui/tests',
+]);
+
+/** フォルダ（どれもリポジトリの根からの相対）の下の `.ts`・`.tsx` を、走査せずに読み込み、改行を LF にそろえる（並びはフォルダの順、その中は名前の順）。 */
+export const readLfTypeScriptFilesUnder = (directories: readonly string[]): readonly UnscannedFile[] =>
+  directories
+    .flatMap((directory) => readTypeScriptFilesUnder(directory))
+    .map(({ path, content }) => ({ path, content: content.replaceAll('\r\n', '\n') }));
+
+/** リポジトリの根からの相対のパスの 1 つのファイルを読み、改行を LF にそろえる（TypeScript の外のファイル（`.mjs`・`package.json` など）も読む）。 */
+export const readLfTextFile = (path: string): string => readFileSync(join(REPOSITORY_ROOT, path), 'utf8').replaceAll('\r\n', '\n');
+
+/** 画面のフォルダ（`apps/local-ui/`）。 */
+export const LOCAL_UI_APP_DIRECTORY = 'apps/local-ui/';
+/** 画面のフォルダの中の、読まないフォルダ（ビルドの出力と依存）。 */
+const LOCAL_UI_APP_SKIPPED_DIRECTORIES: readonly string[] = ['dist', 'node_modules'];
+/** 画面のフォルダの TypeScript の拡張子。 */
+const LOCAL_UI_APP_EXTENSION = /\.(?:ts|tsx|mts|cts)$/u;
+
+/**
+ * 画面のフォルダ（`apps/local-ui/`）の TypeScript（`.ts`・`.tsx`・`.mts`・`.cts`）を、`dist/` と `node_modules/` を除いて、1 回だけ読み込み、
+ * 走査する（画面の src・tests・launcher・build-tools と、設定のファイル）。パスは `apps/local-ui/<相対パス>`（区切りは `/`）、並びは名前の順。
+ * PRE42-CC 組 G: 3 つの Gate がそれぞれ書いていた読み込みを 1 か所にした（読まないフォルダには入らない）。
+ */
+export const loadLocalUiAppFiles = (): readonly SourceFile[] => {
+  const root = join(REPOSITORY_ROOT, LOCAL_UI_APP_DIRECTORY);
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => !(entry.isDirectory() && LOCAL_UI_APP_SKIPPED_DIRECTORIES.includes(entry.name)))
+    .flatMap((entry) => (entry.isDirectory()
+      ? readdirSync(join(root, entry.name), { recursive: true, encoding: 'utf8' }).map((relativePath) => `${entry.name}/${relativePath}`)
+      : [entry.name]))
+    .map((relativePath) => relativePath.replaceAll('\\', '/'))
+    .filter((relativePath) => LOCAL_UI_APP_EXTENSION.test(relativePath))
+    .sort()
+    .map((relativePath) => scanFile({
+      path: `${LOCAL_UI_APP_DIRECTORY}${relativePath}`,
+      content: readFileSync(join(root, relativePath), 'utf8'),
+    }));
+};
+
+// 相対でない参照（新 Gate の 2。今までの Gate のうち最も広い形）--------------------------------------------------------
+
+/**
+ * 文字列の中の、リポジトリの `src/` のパスの書き出し（文字列の始まりか区切りの後の `src/`・`src\`）。参照の候補の文字列リテラルを選ぶのに使う
+ * （相対でない指定子 `beaksight/src/…` と、組み立てて読み込むパスの文字列 `…/src/worker/…` を見る）。
+ */
+export const SOURCE_PATH_TEXT = /(?:^|[\\/])src[\\/]/u;
+
+/**
+ * 文字列の中の、リポジトリの `src/` からのパスのすべて（`beaksight/src/control/x.js` → `src/control/x.js`。現れた順）。区切りの `\` の並び
+ * （書いたままの文字列リテラルでは `\\`）は、`/` 1 つにそろえる。
+ */
+export const sourcePathsInText = (text: string): readonly string[] => {
+  const normalized = text.replace(/\\+/gu, '/');
+  return [...normalized.matchAll(/(?:^|\/)(?=src\/)/gu)].map((match) => normalized.slice(match.index + match[0].length));
+};
+
+/**
+ * 参照（指定子か、文字列リテラル）が指す、リポジトリの根からのパス: 相対（`./`・`../`）なら `fromPath` から解決したパス（拡張子は書いたまま）、
+ * 相対でなければ、文字列の中の `src/` からのパスのすべて。
+ */
+export const referencedPathsOf = (fromPath: string, text: string): readonly string[] => {
+  const resolved = resolveRelativeSpecifier(fromPath, text);
+  return resolved === null ? sourcePathsInText(text) : [resolved];
+};
+
+/** 参照（指定子か、文字列リテラル）が、`directories`（どれも末尾の `/` つき）のどれかの下を指すか（`referencedPathsOf` の、どれか 1 つでも）。 */
+export const refersUnderAny = (fromPath: string, text: string, directories: readonly string[]): boolean =>
+  referencedPathsOf(fromPath, text).some((path) => isPathUnderAny(path, directories));
+
+/**
+ * パスの参照の候補: `moduleReferenceCandidatesOf`（指定子のすべてと、相対パスの文字列リテラル）に、`src/` のパスを含む文字列リテラルと、
+ * `extraLiteralPatterns` のどれかに当たる文字列リテラルを足したもの（相対でない参照も、指定子と文字列リテラルの両方で見る）。
+ */
+export const pathReferenceCandidatesOf = (source: ScannedSource, extraLiteralPatterns: readonly RegExp[] = []): readonly string[] =>
+  moduleReferenceCandidatesOf(source, [SOURCE_PATH_TEXT, ...extraLiteralPatterns]);
+
+/** Node の組み込みのモジュールの名前（`node:` を除いた形。`fs/promises` などの下位を含む。Node の `builtinModules`）。 */
+const NODE_BUILTIN_NAMES: ReadonlySet<string> = new Set(builtinModules.map((name) => name.replace(/^node:/u, '')));
+
+/** 指定子が、Node の組み込みのモジュールか（`node:` の付いた形のすべてと、付けない名前。下位のパス `fs/promises` を含む）。 */
+export const isNodeBuiltinSpecifier = (specifier: string): boolean =>
+  specifier.startsWith('node:') || NODE_BUILTIN_NAMES.has(specifier) || NODE_BUILTIN_NAMES.has(specifier.split('/')[0] ?? '');
+
+/**
+ * 決めたモジュールを指す、指定子か文字列（相対でない参照の判定。今までの Gate のうち最も広い形）: 全体が、`node:` の有無を問わず `nodeNames` の
+ * 名前か、その下位（`fs/promises`）のもの。文字列の中の `node:<名前>`（前後が名前の文字でない）。全体が `packageNames` の名前か、その下位のもの。
+ */
+export const modulePattern = (nodeNames: readonly string[], packageNames: readonly string[] = []): RegExp => {
+  const nodeAlternatives = nodeNames.map(escapeRegExp).join('|');
+  const packageAlternatives = packageNames.map(escapeRegExp).join('|');
+  return new RegExp([
+    String.raw`^(?:node:)?(?:${nodeAlternatives})(?:\/|$)`,
+    nodeModuleTextPattern(nodeNames).source,
+    ...(packageNames.length === 0 ? [] : [String.raw`^(?:${packageAlternatives})(?:\/|$)`]),
+  ].join('|'), 'u');
+};
+
+/**
+ * 文字列の中の `node:<名前>`（前後が名前の文字でない。下位のパスを含む）。`modulePattern` の一部で、文字列リテラルの候補を選ぶのに使う
+ * （`node:` を付けない短い名前（`fs` など）の文字列は、ほかの意味の語と見分けられないので、候補にしない Gate がある）。
+ */
+export const nodeModuleTextPattern = (nodeNames: readonly string[]): RegExp =>
+  new RegExp(String.raw`(?<![\w-])node:(?:${nodeNames.map(escapeRegExp).join('|')})(?![\w-])`, 'u');
+
+// 読み取りの要求の method の写し（PRE42-CC 組 6a・7 の報告。2 つの Gate の写しを寄せた）--------------------------------------
+
+/** 2 つの値の比べを、どちらの順でも当てる形（`<a> && <b>`・`<b> && <a>`。同じ文の中。間は 200 字まで）。 */
+const eitherOrder = (first: string, joiner: string, second: string): RegExp =>
+  new RegExp(`${first}[^;]{0,200}?${joiner}[^;]{0,200}?${second}|${second}[^;]{0,200}?${joiner}[^;]{0,200}?${first}`, 'gu');
+const methodCompared = (operator: string, value: string): string => String.raw`\bmethod\s*(?:\(\s*\))?\s*${operator}\s*['"]${value}['"]`;
+
+/**
+ * 読み取りの要求の method（GET と HEAD）を書き写した形（名前と形）: 写しの `new Set(['GET', 'HEAD'])`・`['GET', 'HEAD'].includes(`、手で書いた判定
+ * `method !== 'GET' && method !== 'HEAD'`・`method === 'GET' || method === 'HEAD'`（どちらの順でも。同じ文の中）。HEAD を読み取りに数えない判定
+ * （`method !== 'GET'` だけ）は、意味が違うので当たらない。持ち主は `tests/helpers/leak-places.ts` の `READ_METHODS`・`nonReadRequestsOf`。
+ */
+export const READ_METHOD_COPY_SHAPES: readonly (readonly [string, RegExp])[] = Object.freeze([
+  ['copied set', /\bnew\s+Set\s*(?:<[^<>()]*>)?\s*\(\s*\[\s*(['"])(?:GET\1\s*,\s*['"]HEAD|HEAD\1\s*,\s*['"]GET)['"]\s*\]\s*\)/gu],
+  ['copied list includes', /\[\s*(['"])(?:GET\1\s*,\s*['"]HEAD|HEAD\1\s*,\s*['"]GET)['"]\s*\]\s*\.\s*includes\s*\(/gu],
+  ['not a read by hand', eitherOrder(methodCompared('!==?', 'GET'), '&&', methodCompared('!==?', 'HEAD'))],
+  ['a read by hand', eitherOrder(methodCompared('===?', 'GET'), String.raw`\|\|`, methodCompared('===?', 'HEAD'))],
+]);
+
+/** 本文の中の、読み取りの要求の method の写し（`<形の名前>: <当たった本文>`。空白は 1 つにそろえる。形の順、本文の順）。 */
+export const readMethodCopiesIn = (text: string): readonly string[] =>
+  READ_METHOD_COPY_SHAPES.flatMap(([name, shape]) => [...text.matchAll(shape)].map((match) => `${name}: ${match[0].replace(/\s+/gu, ' ').trim()}`));

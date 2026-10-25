@@ -6,8 +6,10 @@
  *   長さの上限は `MAX_CREDENTIAL_VALUE_LENGTH`）で確かめてから使う（`requestOf`。合わなければ 400 で、値を返さない）。値の決まりは、資格情報の
  *   ファイルの部品が確かめ直す。処理は `credential-service.ts`。
  * - 応答に値を返さない。誤りの応答には、誤りのコードと項目の名前だけを入れる。
+ * - FM2e: 1 回の操作で自動ログインの設定を終える要求（`setUpAutomatedLoginFn`。スキーマ `ui-automated-login-setup`。順は `setUpAutomatedLogin`）。
  */
 import { createServerFn, createServerOnlyFn } from '@tanstack/react-start';
+import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { localUiAuditJobs } from './audit-jobs';
 import { localUiStore } from './control-store';
 import {
@@ -17,6 +19,10 @@ import {
   registerCredential,
   removeCredential,
   replaceCredential,
+  setUpAutomatedLogin,
+  type AutomatedLoginSetupRequest,
+  type AutomatedLoginSetupResultView,
+  type AutomatedLoginSetupView,
   type CredentialChangeRequest,
   type CredentialHoldClearView,
   type CredentialPageView,
@@ -27,8 +33,10 @@ import {
 } from './credential-service';
 import { isCredentialPlatformSupported, localUiCredentialEnvironment, localUiCredentialStore } from './credential-runtime';
 import { requestOf } from './request-validation';
+import { approvedScenarioCountOf } from './scenario-facts';
+import { loadTargetContext } from './target-config';
 
-export type { CredentialHoldClearView, CredentialPageView, CredentialRequestView };
+export type { AutomatedLoginSetupResultView, AutomatedLoginSetupView, CredentialHoldClearView, CredentialPageView, CredentialRequestView };
 
 interface ProfileKeyRequest {
   readonly profileId: string;
@@ -47,6 +55,8 @@ export const localUiCredentialServiceDependencies = createServerOnlyFn((): Crede
   platformSupported: isCredentialPlatformSupported,
   environment: localUiCredentialEnvironment,
   now: () => new Date(),
+  // FM2e: 1 回の操作で自動ログインに切り替える確認のダイアログの、承認が外れるシナリオの数（監査の負荷の変更と同じ部品）。
+  approvedScenarioCount: approvedScenarioCountOf,
 }));
 
 /** 資格情報の画面の値（値を含まない）。プロファイルがなければ `null`。 */
@@ -73,6 +83,19 @@ export const replaceCredentialFn = createServerFn({ method: 'POST' })
 export const removeCredentialFn = createServerFn({ method: 'POST' })
   .validator(requestOf<ProfileKeyRequest>('ui-profile-key'))
   .handler(({ data }): Promise<CredentialRequestView> => removeCredential(localUiCredentialServiceDependencies(), data.profileId));
+
+/**
+ * FM2e（手を減らす段 2 の設計書 3A.4）: 1 回の操作で、認証の方式を自動ログインに変え、ログインの 3 つのセレクタを入れ、資格情報を登録する（確認の
+ * ダイアログの後）。プロファイルの指す対象の設定だけを、今の部品（`loadTargetContext`）で先に読み、管理データの検証の文脈として渡す。
+ */
+export const setUpAutomatedLoginFn = createServerFn({ method: 'POST' })
+  .validator(requestOf<AutomatedLoginSetupRequest>('ui-automated-login-setup'))
+  .handler(async ({ data }): Promise<AutomatedLoginSetupResultView> => {
+    const deps = localUiCredentialServiceDependencies();
+    const targetConfigPath = getProfile(deps.database, data.profileId)?.profile.targetConfigPath;
+    const { context } = await loadTargetContext(targetConfigPath);
+    return setUpAutomatedLogin(deps, data, { resolveContext: (path) => (path === targetConfigPath ? context : undefined) });
+  });
 
 /** 自動ログインの停止を解く（確かめのダイアログの後）。 */
 export const clearAutoLoginHoldFn = createServerFn({ method: 'POST' })

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { ChromiumLaunchRefusedError } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
@@ -29,6 +30,7 @@ import {
   neverSettles,
   overrideBrowser,
 } from '../helpers/browser-proxies.js';
+import { launchCliChromiumWithoutExternalLaunchBlock, testContextsOf } from '../helpers/chromium.js';
 import { createRunLauncher, type RunLauncher } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -114,7 +116,7 @@ function expectNoTargetRequests(): void {
 
 describe('runPreflight (R15c)', () => {
   it('checks the items in the documented order', () => {
-    expect(PREFLIGHT_CHECKS).toEqual(['OUTPUT_DIRECTORY', 'SCHEMA', 'START_URL', 'BROWSER_LAUNCH', 'PASSIVE_GUARD']);
+    expect(PREFLIGHT_CHECKS).toEqual(['OUTPUT_DIRECTORY', 'SCHEMA', 'START_URL', 'BROWSER_LAUNCH', 'EXTERNAL_LAUNCH_BLOCK', 'PASSIVE_GUARD']);
   });
 
   it('returns the launched Browser and a guarded context factory without touching the target site', async () => {
@@ -139,7 +141,7 @@ describe('runPreflight (R15c)', () => {
     expect(result.browser.isConnected()).toBe(true);
     expect(result.factory).toBeInstanceOf(BrowserContextFactory);
     // Guard を確かめた Context と page は、すぐに閉じている。
-    expect(result.browser.contexts()).toEqual([]);
+    expect(testContextsOf(result.browser)).toEqual([]);
     // Guard を確かめた Context の Ledger を返す（Run の Safety の集計に含めるため）。違反はない。
     expect(result.safetyLedgers).toEqual(ledgers.created);
     expect(result.safetyLedgers).toHaveLength(1);
@@ -326,6 +328,28 @@ describe('runPreflight (R15c)', () => {
     expectNoTargetRequests();
   });
 
+  // EL-12（設計書 `2026-10-24-beaksight-external-launch-block-design.md` 3.2・3.5）: 起動の部品の自己検査の不合格（閉じた理由
+  // `EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE`）は、起動の失敗と分けた項目 `EXTERNAL_LAUNCH_BLOCK` にする（Run を始めない。サイトに要求を送らない）。
+  it.each([
+    ['the launch component refuses (a fake launcher)', async (): Promise<Browser> => {
+      throw new ChromiumLaunchRefusedError('EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE', 'the self-check navigation was not blocked');
+    }],
+    ['the real CLI Chromium is launched without the Preferences', () => launchCliChromiumWithoutExternalLaunchBlock()],
+  ] as const)('fails EXTERNAL_LAUNCH_BLOCK when %s', async (_label, launchBrowser) => {
+    server.resetRequestObservations();
+    server.resetCounters();
+    const outputDirectory = await createWorkDirectory();
+    const ledgers = ledgerFactory();
+
+    const result = await runPreflight({ config: createTestConfig(server.origin), launchBrowser, createSafetyLedger: ledgers.create, outputDirectory });
+
+    const failure = expectFailure(result, 'EXTERNAL_LAUNCH_BLOCK');
+    expect(failure.reason).toEqual({ code: 'PREFLIGHT_FAILED', detail: 'EXTERNAL_LAUNCH_BLOCK' });
+    expect(failure.message).toContain('EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE');
+    expect(ledgers.created).toEqual([]);
+    expectNoTargetRequests();
+  });
+
   it('fails PASSIVE_GUARD, keeps the Ledger with the violation and closes Chromium when the Guard cannot be installed', async () => {
     server.resetRequestObservations();
     server.resetCounters();
@@ -350,7 +374,7 @@ describe('runPreflight (R15c)', () => {
     // 起動した Chromium は閉じている（Context も残らない）。
     const [realBrowser] = launcher.browsers;
     expect(realBrowser?.isConnected()).toBe(false);
-    expect(realBrowser?.contexts()).toEqual([]);
+    expect(realBrowser === undefined ? undefined : testContextsOf(realBrowser)).toEqual([]);
     expectNoTargetRequests();
   });
 
@@ -458,9 +482,14 @@ describe('runPreflight (R15c)', () => {
     server.resetCounters();
     const outputDirectory = await createWorkDirectory();
     const launcher = recordingLauncher();
-    vi.spyOn(BrowserContextFactory.prototype, 'closePassiveContext').mockImplementation(() => new Promise<never>(() => undefined));
+    // DEF-093（TS-d）: 経過は、閉じる処理が止まり始めた時（下の偽の close が呼ばれた時）から測る。Chromium の起動と確かめのページの読み込みは
+    // 期限の確かめの外で、並行の混雑で数秒延びる（5,307 ms で上限 5,300 ms を越えた回がある）。
+    let closeStartedAt: number | undefined;
+    vi.spyOn(BrowserContextFactory.prototype, 'closePassiveContext').mockImplementation(() => {
+      closeStartedAt ??= performance.now();
+      return new Promise<never>(() => undefined);
+    });
 
-    const startedAt = performance.now();
     const result = await runPreflight({
       config: createTestConfig(server.origin),
       launchBrowser: launcher.launcher,
@@ -468,11 +497,12 @@ describe('runPreflight (R15c)', () => {
       outputDirectory,
       deadlines: { contextCloseTimeoutMs: INJECTED_TIMEOUT_MS },
     });
-    const elapsedMs = performance.now() - startedAt;
+    const returnedAt = performance.now();
 
     const failure = expectFailure(result, 'PASSIVE_GUARD');
     expect(failure.message).toBe(`guarded context close failed: ${PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE}`);
-    expect(elapsedMs).toBeLessThan(INJECTED_TIMEOUT_MS + CLOSE_MARGIN_MS);
+    expect(closeStartedAt).toBeDefined();
+    expect(returnedAt - (closeStartedAt ?? returnedAt)).toBeLessThan(INJECTED_TIMEOUT_MS + CLOSE_MARGIN_MS);
     // Chromium を閉じると、閉じきれなかった Context も閉じる。
     expect(launcher.browsers[0]?.isConnected()).toBe(false);
     expectNoTargetRequests();

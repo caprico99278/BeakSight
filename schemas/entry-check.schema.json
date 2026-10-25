@@ -1,0 +1,135 @@
+{
+  "$id": "urn:beaksight:schema:entry-check:1.0",
+  "description": "The result of one entry check job (entry-check.json in the Run directory; Task 43 design 4.3; T43c). The value lists are owned by src/control/entry-check.ts. Only the facts read without a login state and the proposal of the auth setup are kept: never the value of a field, a cookie or a token. URLs pass the redaction of the writer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "jobId", "runId", "startedAt", "finishedAt", "runStatus", "endReason", "landing", "facts", "proposal", "blockedRequests"],
+  "properties": {
+    "schemaVersion": { "const": "entry-check-schema/1.0" },
+    "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "startedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "finishedAt": { "$ref": "#/$defs/compactUtcTimestamp" },
+    "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
+    "endReason": { "enum": ["READ", "LEFT_ALLOWED_ORIGINS", "READ_FAILED", "NAVIGATION_FAILED", "PREFLIGHT_FAILED", "STOPPED", "SAFETY_VIOLATION"] },
+    "landing": {
+      "description": "Where the start URL led: the origin and, inside the allowed origins, the path with the value-like segments hidden. Null when nothing was loaded.",
+      "anyOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }]
+    },
+    "facts": {
+      "description": "The facts read in the isolated world after the freeze (READ only).",
+      "anyOf": [{ "$ref": "#/$defs/facts" }, { "type": "null" }]
+    },
+    "proposal": {
+      "description": "The proposal of the auth setup (only for a login page inside the allowed origins). Not saved until the user saves it.",
+      "anyOf": [{ "$ref": "#/$defs/proposal" }, { "type": "null" }]
+    },
+    "blockedRequests": { "$ref": "#/$defs/count" },
+    "documentRequests": {
+      "description": "Optional (DEF-129): the main frame document requests that the Guard sent (the load of BeakSight, the redirects and the loads started by the page).",
+      "$ref": "#/$defs/count"
+    },
+    "childFrameDocumentRequests": {
+      "description": "Optional (T37R2-fix): the child frame document requests that the Guard sent (a separate count).",
+      "$ref": "#/$defs/count"
+    },
+    "subresourceRequests": {
+      "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent (a separate count).",
+      "$ref": "#/$defs/count"
+    }
+  },
+  "allOf": [
+    {
+      "description": "The facts are read only when the job read the page.",
+      "if": { "properties": { "endReason": { "const": "READ" } } },
+      "then": { "properties": { "landing": { "$ref": "#/$defs/location" }, "facts": { "$ref": "#/$defs/facts" } } },
+      "else": { "properties": { "facts": { "type": "null" }, "proposal": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "origin": { "type": "string", "maxLength": 2048, "pattern": "^https?://[^/?#]+$" },
+    "path": { "type": "string", "maxLength": 2048, "pattern": "^/[^?#]*$" },
+    "selector": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "path", "inAllowedOrigins"],
+      "properties": {
+        "origin": { "$ref": "#/$defs/origin" },
+        "path": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "inAllowedOrigins": { "type": "boolean" }
+      }
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidates", "selector"],
+      "properties": {
+        "candidates": { "$ref": "#/$defs/count" },
+        "selector": { "$ref": "#/$defs/selector" }
+      }
+    },
+    "form": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["placement", "action", "method"],
+      "properties": {
+        "placement": { "enum": ["SAME", "NONE", "MIXED", null] },
+        "action": { "anyOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "method": { "enum": ["GET", "POST", "DIALOG", null] }
+      }
+    },
+    "facts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loginPage", "fields", "form"],
+      "properties": {
+        "loginPage": { "type": "boolean" },
+        "fields": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["username", "password", "submit"],
+          "properties": {
+            "username": { "$ref": "#/$defs/field" },
+            "password": { "$ref": "#/$defs/field" },
+            "submit": { "$ref": "#/$defs/field" }
+          }
+        },
+        "form": { "$ref": "#/$defs/form" }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loginStartUrl", "sessionLostPathPrefix", "loginTransport", "loginPostEndpoint", "selectors"],
+      "properties": {
+        "loginStartUrl": { "type": ["string", "null"], "maxLength": 4096 },
+        "sessionLostPathPrefix": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] },
+        "loginTransport": { "enum": ["FORM_NAVIGATION", "SCRIPT_REQUEST", null] },
+        "loginPostEndpoint": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["origin", "path"],
+              "properties": { "origin": { "$ref": "#/$defs/origin" }, "path": { "$ref": "#/$defs/path" } }
+            },
+            { "type": "null" }
+          ]
+        },
+        "selectors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["username", "password", "submit"],
+          "properties": {
+            "username": { "$ref": "#/$defs/selector" },
+            "password": { "$ref": "#/$defs/selector" },
+            "submit": { "$ref": "#/$defs/selector" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -31,6 +31,8 @@ const documentOf = (): ReadEvidenceDocument => ({
   checks: [{
     readCheckId: 'read-1',
     readCheckRevision: 1,
+    // T37d: 版 1.2 の書き手は、対象の種類を必ず書く。
+    targetKind: 'CANDIDATE',
     targetIdentityDigest: `sha256:${'a'.repeat(64)}`,
     state: 'EXECUTED',
     result: 'MATCHED',
@@ -62,7 +64,8 @@ describe('T27e: writing read-evidence.json through the ArtifactWriter', () => {
   });
 
   it('writes the document checked by the schema and returns its relative path (no temporary file left)', async () => {
-    expect(await new ArtifactWriter().writeReadEvidence(runDirectory, documentOf())).toBe(READ_EVIDENCE_ARTIFACT_FILE_NAME);
+    // T44g: 既定の書き手は名前で伏せる段を通すので、書いた値をそのまま比べるために、その段を外した書き手で書く。
+    expect(await new ArtifactWriter({ urlSecretRedaction: false }).writeReadEvidence(runDirectory, documentOf())).toBe(READ_EVIDENCE_ARTIFACT_FILE_NAME);
     expect(JSON.parse(readFileSync(artifactFilePath(runDirectory, READ_EVIDENCE_ARTIFACT_FILE_NAME), 'utf8'))).toEqual(documentOf());
     expect(readdirSync(runDirectory)).toEqual([READ_EVIDENCE_ARTIFACT_FILE_NAME]);
   });

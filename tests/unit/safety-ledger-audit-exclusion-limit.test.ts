@@ -21,6 +21,8 @@ const recordExclusions = (ledger: SafetyLedger, count: number): void => {
       url: `http://127.0.0.1:4173/admin/logout?i=${index}`,
       mainFrameNavigation: false,
       reason: AUDIT_EXCLUDED_URL,
+      resourceType: 'fetch',
+      phase: 'LOAD',
     });
   }
 };
@@ -42,7 +44,7 @@ describe('T25c: the audit exclusion record limit does not make the Ledger trunca
   it('does not make the Run PARTIAL through the Ledger truncation input', () => {
     const ledger = new SafetyLedger();
     recordExclusions(ledger, LEDGER_EVENT_LIMIT + OVER_LIMIT);
-    const runSafety = summarizeRunSafety({ guardEnabled: true, snapshots: [ledger.snapshot()] });
+    const runSafety = summarizeRunSafety({ guardEnabled: true, snapshots: [ledger.snapshot()], auditSendPolicy: 'READ_ONLY' });
 
     expect(runSafety.recordTruncated).toBe(false);
     expect(deriveRunStatus({
@@ -68,7 +70,7 @@ describe('T25c: the audit exclusion record limit does not make the Ledger trunca
     const ledger = new SafetyLedger();
     recordExclusions(ledger, LEDGER_EVENT_LIMIT + OVER_LIMIT);
     for (let index = 0; index <= LEDGER_EVENT_LIMIT; index += 1) {
-      ledger.recordBlockedWebSocket({ url: `ws://127.0.0.1:4173/ws?i=${index}`, reason: 'PASSIVE_WEBSOCKET' });
+      ledger.recordBlockedWebSocket({ url: `ws://127.0.0.1:4173/ws?i=${index}`, reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
     }
     const snapshot = ledger.snapshot();
 

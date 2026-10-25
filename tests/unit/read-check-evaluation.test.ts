@@ -23,15 +23,20 @@ import {
   confirmReadTarget,
   confirmReadTargetOnPage,
   evaluateReadExpectation,
+  readCheckAuditStageDetailOf,
+  readCheckEvidenceTargetOf,
   readCheckResultOf,
   readEvidenceRunStatusOf,
   readEvidenceSummaryOf,
   readStructureSummaryOf,
+  withReadCheckAuditStageDetail,
+  type ReadCheckExecutedEvidence,
   type ReadEvidenceDocument,
   type ReadPageStructure,
 } from '../../src/discovery/read-check-evaluation.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { MAX_URL_LENGTH } from '../../src/core/limits.js';
+import { OBSERVABLE_HTTP_STATUS_RANGE, isHttpErrorOrNonStandardStatus } from '../../src/core/http-status.js';
 import { SAMPLE_ALLOWED_ORIGINS, SAMPLE_ORIGIN, sampleAction, sampleField, sampleForm, NO_JS_BINDING } from './discovery-candidate-samples.js';
 
 const candidateOf = (discovered: DiscoveredCandidate): DiscoveryCandidate => ({
@@ -246,6 +251,7 @@ describe('T27e: the read-evidence.json document', () => {
       {
         readCheckId: 'read-1',
         readCheckRevision: 2,
+        targetKind: 'CANDIDATE',
         targetIdentityDigest: DIGEST,
         state: 'EXECUTED',
         result: 'MATCHED',
@@ -263,6 +269,7 @@ describe('T27e: the read-evidence.json document', () => {
       {
         readCheckId: 'read-2',
         readCheckRevision: 1,
+        targetKind: 'CANDIDATE',
         targetIdentityDigest: DIGEST,
         state: 'EXECUTED',
         result: 'READ_BLOCKED_BY_POLICY',
@@ -298,16 +305,41 @@ describe('T27e: the read-evidence.json document', () => {
     const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'read-evidence.schema.json'), 'utf8')) as {
       readonly properties: { readonly checks: { readonly maxItems: number } };
       readonly $defs: {
-        readonly executed: { readonly properties: { readonly expectations: { readonly maxItems: number } } };
+        readonly executed: {
+          readonly properties: {
+            readonly expectations: { readonly maxItems: number };
+            readonly httpStatus: { readonly anyOf: readonly { readonly minimum?: number; readonly maximum?: number }[] };
+          };
+        };
         readonly structure: { readonly properties: { readonly tableRowCounts: { readonly maxItems: number }; readonly listItemCounts: { readonly maxItems: number } } };
         readonly detailEvidence: { readonly properties: { readonly observedValue: { readonly anyOf: readonly { readonly maxLength?: number }[] } } };
       };
     };
     expect(schema.properties.checks.maxItems).toBe(MAX_READ_CHECKS_PER_JOB);
+    // DEF-164: `httpStatus` の範囲は、観察して記録できる status の範囲（core の名前つきの範囲）と同じ。
+    const [statusRange] = schema.$defs.executed.properties.httpStatus.anyOf;
+    expect({ min: statusRange?.minimum, max: statusRange?.maximum }).toEqual({ ...OBSERVABLE_HTTP_STATUS_RANGE });
     expect(schema.$defs.executed.properties.expectations.maxItems).toBe(MAX_READ_CHECK_EXPECTATIONS);
     expect(schema.$defs.structure.properties.tableRowCounts.maxItems).toBe(MAX_READ_EVIDENCE_STRUCTURE_COUNTS);
     expect(schema.$defs.structure.properties.listItemCounts.maxItems).toBe(MAX_READ_EVIDENCE_STRUCTURE_COUNTS);
     expect(schema.$defs.detailEvidence.properties.observedValue.anyOf[0]?.maxLength).toBe(MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH);
+  });
+
+  // DEF-164: Chromium が渡しうる 600 以上の status も記録できる（判定は今どおり誤り）。範囲の外は記録できない。
+  it('accepts an observed HTTP status of 600 to 999 with HTTP_ERROR_STATUS, keeps judging it as an error, and rejects a status out of the range', async () => {
+    const document = sample();
+    const [first] = document.checks;
+    const withStatus = (httpStatus: number): unknown => JSON.parse(JSON.stringify({
+      ...document,
+      checks: [{ ...first, result: 'UNDETERMINED', detail: 'HTTP_ERROR_STATUS', httpStatus, structure: null, expectations: [] }],
+    }));
+    for (const status of [600, OBSERVABLE_HTTP_STATUS_RANGE.max]) {
+      expect(await validateArtifact('read-evidence', withStatus(status)), String(status)).toEqual({ ok: true });
+      expect(isHttpErrorOrNonStandardStatus(status), String(status)).toBe(true);
+    }
+    for (const status of [OBSERVABLE_HTTP_STATUS_RANGE.min - 1, OBSERVABLE_HTTP_STATUS_RANGE.max + 1]) {
+      expect((await validateArtifact('read-evidence', withStatus(status))).ok, String(status)).toBe(false);
+    }
   });
 
   it('blocks by the policy, without reading, a parameter that is no longer a sendable field (CCX-10), and the schema accepts it', async () => {
@@ -340,12 +372,117 @@ describe('T27e: the read-evidence.json document', () => {
     }
     expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'NOT_MATCHED' }] })).toBe('COMPLETE');
     expect(readEvidenceRunStatusOf({ endReason: 'COMPLETED', checks: [{ ...first, result: 'UNDETERMINED' }] })).toBe('PARTIAL');
-    const notExecuted = { readCheckId: 'read-3', readCheckRevision: 1, targetIdentityDigest: DIGEST, state: 'NOT_EXECUTED', reason: 'STOPPED' } as const;
+    const notExecuted = {
+      readCheckId: 'read-3', readCheckRevision: 1, targetKind: 'CANDIDATE', targetIdentityDigest: DIGEST, state: 'NOT_EXECUTED', reason: 'STOPPED',
+    } as const;
     expect(readEvidenceSummaryOf({ checks: [first, notExecuted] })).toEqual({ checks: 2, executed: 1 });
     expect(readEvidenceRunStatusOf({ endReason: 'STOPPED', checks: [first, notExecuted] })).toBe('PARTIAL');
     expect(readEvidenceRunStatusOf({ endReason: 'AUTH_SESSION_LOST', checks: [first] })).toBe('PARTIAL');
     expect(readEvidenceRunStatusOf({ endReason: 'SAFETY_VIOLATION', checks: [first] })).toBe('ABORTED_BY_SAFETY');
     expect(readEvidenceRunStatusOf({ endReason: 'PREFLIGHT_FAILED', checks: [{ ...notExecuted, reason: 'PREFLIGHT_FAILED' }] })).toBe('FAILED');
     expect(readEvidenceRunStatusOf({ endReason: 'MAX_RUNTIME_REACHED', checks: [first] })).toBe('PARTIAL');
+  });
+});
+
+// T37d（Task 37 の設計書 3.5、設計者の判断「止めた読み取りの数の扱い」）:
+// - 定義の対象の種類（候補か画面か）と画面の path を、成果物の定義ごとに書く。版は 1.2（候補の識別の digest のない定義と、新しい詳しい理由を書くため）。
+//   LG-4: 読み手は 1.2 だけを受ける（前の版 1.0・1.1 は捨てた）。
+// - 1 つの定義の読み込みの間に、(a) 上限で断ったサービスの Origin への要求か 401、(c) 登録した読み取りの手続きの呼び出しを回数の上限か送り方で止めた、
+//   (d) 承認したサービスの Origin への読み取りでない要求を止めた、のどれかがあれば、照らした結果に関係なく `UNDETERMINED`（(a) は `SERVICE_READ_REFUSED`、
+//   (c)(d) は `AUDIT_STAGE_REQUEST_BLOCKED`）。構造と期待ごとの結果は残す。(b) 鍵の消失は、今の `SESSION_LOST`（`UNDETERMINED`）。
+describe('T37d: the target kinds, the version 1.2 and the UNDETERMINED rule of the audit stage', () => {
+  const DIGEST = `sha256:${'b'.repeat(64)}`;
+  const PAGE_PATH = '/admin/members';
+  const evaluated = (result: ReadCheckExecutedEvidence['result']): ReadCheckExecutedEvidence => ({
+    readCheckId: 'read-page',
+    readCheckRevision: 1,
+    targetKind: 'PAGE',
+    targetPagePath: PAGE_PATH,
+    state: 'EXECUTED',
+    result,
+    detail: 'EXPECTATIONS_EVALUATED',
+    url: `${SAMPLE_ORIGIN}${PAGE_PATH}`,
+    httpStatus: 200,
+    blockedRequests: 0,
+    structure: readStructureSummaryOf(structureOf({ tableRowCounts: [0] })),
+    expectations: [evaluateReadExpectation(structureOf({ tableRowCounts: [0] }), { kind: 'ROW_COUNT_AT_LEAST', count: 1 })],
+  });
+  const documentOf = (checks: readonly unknown[], schemaVersion: string = READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION): Record<string, unknown> => ({
+    schemaVersion,
+    jobId: 'job-read-1',
+    runId: 'RUN-20261017000000',
+    startedAt: '20261017000000',
+    finishedAt: '20261017000100',
+    runStatus: 'PARTIAL',
+    endReason: 'COMPLETED',
+    checks,
+  });
+
+  it('adds the two details of the audit stage, both UNDETERMINED', () => {
+    expect(READ_CHECK_DETAILS.slice(-2)).toEqual(['SERVICE_READ_REFUSED', 'AUDIT_STAGE_REQUEST_BLOCKED']);
+    expect(READ_CHECK_DETAIL_RESULTS.SERVICE_READ_REFUSED).toBe('UNDETERMINED');
+    expect(READ_CHECK_DETAIL_RESULTS.AUDIT_STAGE_REQUEST_BLOCKED).toBe('UNDETERMINED');
+  });
+
+  it('tells the target of each definition for the evidence', () => {
+    expect(readCheckEvidenceTargetOf({ targetIdentityDigest: DIGEST, parameters: {}, expectations: [] }))
+      .toEqual({ targetKind: 'CANDIDATE', targetIdentityDigest: DIGEST });
+    expect(readCheckEvidenceTargetOf({ targetPagePath: PAGE_PATH, parameters: {}, expectations: [] }))
+      .toEqual({ targetKind: 'PAGE', targetPagePath: PAGE_PATH });
+  });
+
+  it('decides the detail of the audit stage of one load: the refusal first, then the blocked requests, otherwise none', () => {
+    const none = { serviceReadRefused: false, registeredReadRequestsBlocked: 0, serviceOriginNonReadBlocked: 0, allowedOriginDataRequestsBlocked: 0 };
+    expect(readCheckAuditStageDetailOf(none)).toBeNull();
+    expect(readCheckAuditStageDetailOf({ ...none, serviceReadRefused: true })).toBe('SERVICE_READ_REFUSED');
+    expect(readCheckAuditStageDetailOf({ ...none, registeredReadRequestsBlocked: 1 })).toBe('AUDIT_STAGE_REQUEST_BLOCKED');
+    expect(readCheckAuditStageDetailOf({ ...none, serviceOriginNonReadBlocked: 2 })).toBe('AUDIT_STAGE_REQUEST_BLOCKED');
+    // T37R-fix-B2（設計書 8 章の T37R の行の M-5 の取り下げ）: 許可 Origin への `fetch`・`xhr` の読み取りでない要求を止めた数は記録するだけで、判定には
+    // 使わない（`fetch` で送る計測の送信と見分けられないため）。
+    expect(readCheckAuditStageDetailOf({ ...none, allowedOriginDataRequestsBlocked: 1 })).toBeNull();
+    expect(readCheckAuditStageDetailOf({ serviceReadRefused: true, registeredReadRequestsBlocked: 1, serviceOriginNonReadBlocked: 1, allowedOriginDataRequestsBlocked: 1 }))
+      .toBe('SERVICE_READ_REFUSED');
+  });
+
+  it('makes an evaluated definition UNDETERMINED whatever the comparison was, and keeps the structure and the expectations', () => {
+    for (const result of ['MATCHED', 'NOT_MATCHED', 'UNDETERMINED'] as const) {
+      const before = evaluated(result);
+      const after = withReadCheckAuditStageDetail(before, 'SERVICE_READ_REFUSED');
+      expect(after).toEqual({ ...before, result: 'UNDETERMINED', detail: 'SERVICE_READ_REFUSED' });
+      expect(withReadCheckAuditStageDetail(before, null)).toBe(before);
+    }
+    // 読まずに決まった定義と、照らす前に判定できなかった定義は、今の詳しい理由のまま。
+    const blocked: ReadCheckExecutedEvidence = { ...evaluated('MATCHED'), result: 'UNDETERMINED', detail: 'HTTP_ERROR_STATUS', structure: null, expectations: [] };
+    expect(withReadCheckAuditStageDetail(blocked, 'AUDIT_STAGE_REQUEST_BLOCKED')).toBe(blocked);
+  });
+
+  it('passes the schema with the target kinds of the version 1.2, and rejects the mixed or missing targets', async () => {
+    const page = withReadCheckAuditStageDetail(evaluated('NOT_MATCHED'), 'AUDIT_STAGE_REQUEST_BLOCKED');
+    const candidate = { ...evaluated('MATCHED'), targetKind: 'CANDIDATE', targetPagePath: undefined, targetIdentityDigest: DIGEST };
+    const notExecuted = { readCheckId: 'read-3', readCheckRevision: 1, targetKind: 'PAGE', targetPagePath: PAGE_PATH, state: 'NOT_EXECUTED', reason: 'STOPPED' };
+    expect(await validateArtifact('read-evidence', JSON.parse(JSON.stringify(documentOf([page, candidate, notExecuted]))))).toEqual({ ok: true });
+    const { targetKind: _kind, ...withoutKind } = candidate;
+    for (const [name, check] of [
+      ['a page check with a digest', { ...page, targetIdentityDigest: DIGEST }],
+      ['a page check without the path', { ...page, targetPagePath: undefined }],
+      ['a candidate check with a page path', { ...candidate, targetPagePath: PAGE_PATH }],
+      ['a candidate check without the digest', { ...candidate, targetIdentityDigest: undefined }],
+      ['a check of the version 1.2 without the target kind', withoutKind],
+      ['a page path with a query', { ...page, targetPagePath: '/admin?x=1' }],
+      ['a not executed page check with a digest', { ...notExecuted, targetIdentityDigest: DIGEST }],
+    ] as const) {
+      expect((await validateArtifact('read-evidence', JSON.parse(JSON.stringify(documentOf([check]))))).ok, name).toBe(false);
+    }
+  });
+
+  // LG-4（テストの組の設計書 3.7.3）: 前の版（1.0・1.1）の成果物は読まない（対象の種類のない定義も、今の形の定義も）。
+  it('rejects the previous versions 1.0 and 1.1', async () => {
+    const candidate = { ...evaluated('MATCHED'), targetKind: 'CANDIDATE', targetPagePath: undefined, targetIdentityDigest: DIGEST };
+    const { targetKind: _kind, ...previousCandidate } = candidate;
+    for (const version of ['read-evidence-schema/1.0', 'read-evidence-schema/1.1']) {
+      for (const [name, check] of [['a check without the target kind', previousCandidate], ['a check of the current shape', candidate]] as const) {
+        expect((await validateArtifact('read-evidence', JSON.parse(JSON.stringify(documentOf([check], version))))).ok, `${version} ${name}`).toBe(false);
+      }
+    }
   });
 });

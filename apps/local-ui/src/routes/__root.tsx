@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { HeadContent, Link, Outlet, Scripts, createRootRoute, useRouter, useRouterState, type ErrorComponentProps } from '@tanstack/react-router';
 import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_TEXT } from '../../../../src/presentation/messages.js';
 import { PageFrame } from '../components/PageFrame';
+import { UiPresence } from '../components/UiPresence';
 import appCssUrl from '../styles/app.css?url';
 import tokensCssUrl from '../styles/tokens.css?url';
 
@@ -24,12 +25,17 @@ export const Route = createRootRoute({
   errorComponent: ErrorPage,
 });
 
-/** 左のメニュー（使える画面だけ。T24f で「実行履歴」を足した）。 */
+/** プロファイルの登録の画面の path。 */
+const NEW_PROFILE_PATH = '/profiles/new';
+
+/** 左のメニュー（使える画面だけ。T24f で「実行履歴」を、T43a で「新しいプロファイル」を足した）。 */
 function Sidebar() {
   const text = LOCAL_UI_TEXT;
   const pathname = useRouterState({ select: (state) => state.location.pathname });
-  // 一覧と、登録・編集・監査の開始の画面は、同じ「サイトとプロファイル」のメニューに入る。
-  const profilesCurrent = pathname === '/' || pathname.startsWith('/profiles/') || pathname.startsWith('/start/');
+  // T43a（Task 43 の設計書 4.1。ユーザーの確認）: 登録の画面は「新しいプロファイル」のメニューに入る。
+  const newProfileCurrent = pathname === NEW_PROFILE_PATH;
+  // 一覧と、編集・監査の開始の画面は、同じ「サイトとプロファイル」のメニューに入る。
+  const profilesCurrent = !newProfileCurrent && (pathname === '/' || pathname.startsWith('/profiles/') || pathname.startsWith('/start/'));
   // 実行履歴と、ジョブの詳細（進み具合）の画面は、「実行履歴」のメニューに入る（T24f）。
   const jobsCurrent = pathname === '/jobs' || pathname.startsWith('/jobs/');
   const environmentCurrent = pathname === '/environment';
@@ -43,6 +49,11 @@ function Sidebar() {
         <li>
           <Link to="/" className="nav-link" aria-current={profilesCurrent ? 'page' : undefined}>
             {text.pages.profiles}
+          </Link>
+        </li>
+        <li>
+          <Link to={NEW_PROFILE_PATH} className="nav-link" aria-current={newProfileCurrent ? 'page' : undefined}>
+            {text.pages.newProfile}
           </Link>
         </li>
         <li>
@@ -65,6 +76,8 @@ function Shell({ children }: Readonly<{ children: ReactNode }>) {
   const [queryClient] = useState(() => new QueryClient());
   return (
     <QueryClientProvider client={queryClient}>
+      {/* UI-close: 管理画面のブラウザを閉じたら、画面のサーバも止まるように、開いている間と閉じるときに知らせる。 */}
+      <UiPresence />
       <div className="app-shell">
         <Sidebar />
         <div className="main-column">{children}</div>

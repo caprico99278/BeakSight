@@ -40,6 +40,7 @@
 import { isRecord } from '../core/guards.js';
 import { foldNfkcCase, hasLoneSurrogate } from '../core/text.js';
 import { isMethodOverrideFieldName, type FormEnctype, type MethodOverride } from '../discovery/candidate-contracts.js';
+import { headerValueOf } from './http-headers.js';
 import { SUBMISSION_POST_METHOD, isWriteEndpointUrl } from './request-policy.js';
 
 /** 書き込みの段で送ってよい enctype（`FormEnctype` の一部。`text/plain` は値の区切りが曖昧なので送らない）。 */
@@ -612,6 +613,114 @@ function fieldsProblem(expectation: WritePayloadExpectation, enctype: WriteFormE
     }
   }
   return null;
+}
+
+/**
+ * AS-c fix round 1（I-2。監査の段の送信の扱いの設計書 5 章の「AS-R … とユーザーの判断」の行）: 要求の form の本文（urlencoded と multipart）の、method の上書きの
+ * 欄（名前は (h) と同じ `isMethodOverrideFieldName` の畳み込みで当てる）の値（UTF-8 の文字列）の一覧。判定（`DELETE` か）は要求の判定の owner
+ * （`request-policy.ts` の `isDeleteMethodOverride`）が行う。本文を読むのは、このファイルの部品だけ（Gate `write-stage-boundary` の (b)）。
+ * - `Content-Type` の本体が urlencoded の form か multipart の form でなければ、空（本文は読まない）。本文がない・空なら、空。
+ * - urlencoded は、書き込みの段の照合より緩く読む（ページのスクリプトが書く本文。`charset` などの引数、`=` のない組、percent-encode していない文字を許す。
+ *   読めない名前と値は、そのままの文字で比べる）。
+ * - multipart は、書き込みの段と同じ読み方（ブラウザの書き方）。区切りが正しくない、形が崩れている、なら `null`。
+ * - 上限（`MAX_WRITE_PAYLOAD_BYTES`）を超える本文は、調べずに空（AS-c fix round 3）。
+ * - 本文が読めない（`readBody` が `UNREADABLE`。multipart のファイルの部品など）、`Content-Type` が読めない
+ *   form なら `null`（呼ぶ側が止める。fail-closed）。例外を投げない（想定しない入力も `null`）。
+ * - AS-c fix round 2（I-E。設計書 5 章の「AS-R2」の行）: `Content-Type` のない本文（型のない Blob など）は、urlencoded として読む（Rack などのサーバが form と
+ *   して読むため）。JSON の本文（`application/json` と `+json`）は、最上位の object の鍵のうち、名前が `_method` に当たる鍵（API の書き込みの照合の
+ *   `METHOD_OVERRIDE_PRESENT` と同じく、最上位の鍵を `isMethodOverrideFieldName` で当てる）の文字列の値を返す。入れ子・配列の中の鍵と、JSON として読めない
+ *   本文は、上書きとして読まない（空）。
+ */
+export function formMethodOverrideValuesOf(
+  headers: unknown,
+  readBody: () => { readonly kind: 'NONE' } | { readonly kind: 'TEXT'; readonly text: string } | { readonly kind: 'UNREADABLE' },
+): readonly string[] | null {
+  try {
+    const contentType = headerValueOf(headers, CONTENT_TYPE_HEADER);
+    const essence = contentType === undefined ? URLENCODED : contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+    const json = isJsonMediaType(essence);
+    if (essence !== URLENCODED && essence !== MULTIPART && !json) {
+      return [];
+    }
+    const parsed = contentType === undefined ? { essence, parameters: new Map<string, string>() } : parsedContentType(contentType);
+    if (parsed === null) {
+      return null;
+    }
+    const body = readBody();
+    if (body.kind === 'NONE' || (body.kind === 'TEXT' && body.text.length === 0)) {
+      return [];
+    }
+    if (body.kind !== 'TEXT') {
+      return null;
+    }
+    const bytes = utf8Bytes(body.text);
+    // AS-c fix round 3（AS-R3 の V04・V05。設計書 5 章の「AS-R3 と区切り」の行）: 上限（`MAX_WRITE_PAYLOAD_BYTES`）を超える本文は、本文の `_method` を
+    // 調べない（空。呼ぶ側はヘッダの上書き・method・語を今どおり調べる）。
+    if (bytes.length > MAX_WRITE_PAYLOAD_BYTES) {
+      return [];
+    }
+    if (essence === URLENCODED) {
+      return urlencodedMethodOverrideValuesOf(bytes);
+    }
+    if (json) {
+      return jsonMethodOverrideValuesOf(body.text);
+    }
+    const boundary = parsed.parameters.get('boundary');
+    if (boundary === undefined || boundary.length > MAX_BOUNDARY_LENGTH || !BOUNDARY_PATTERN.test(boundary)) {
+      return null;
+    }
+    const fields = parseMultipart(bytes, boundary);
+    if (!fields.ok) {
+      return null;
+    }
+    const values: string[] = [];
+    for (const field of fields.fields) {
+      if (!isMethodOverrideFieldName(utf8Text(field.rawName))) {
+        continue;
+      }
+      if (field.isFilePart) {
+        return null;
+      }
+      values.push(utf8Text(field.valueBytes() ?? ''));
+    }
+    return values;
+  } catch {
+    return null;
+  }
+}
+
+/** AS-c fix round 2（I-E）: JSON の本文の媒体の型か（`application/json` と、`+json` で終わる型。小文字の本体で比べる）。 */
+const JSON_MEDIA_TYPE = 'application/json';
+const JSON_STRUCTURED_SUFFIX = '+json';
+const isJsonMediaType = (essence: string): boolean => essence === JSON_MEDIA_TYPE || essence.endsWith(JSON_STRUCTURED_SUFFIX);
+
+/** AS-c fix round 2（I-E）: JSON の本文の、最上位の object の method の上書きの鍵の文字列の値（`formMethodOverrideValuesOf` の説明のとおり）。 */
+function jsonMethodOverrideValuesOf(text: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed)) {
+    return [];
+  }
+  return Object.entries(parsed)
+    .filter(([key, value]) => isMethodOverrideFieldName(key) && typeof value === 'string')
+    .map(([, value]) => value as string);
+}
+
+/** AS-c fix round 1（I-2）: urlencoded の本文の method の上書きの欄の値（緩い読み方。`formMethodOverrideValuesOf` の説明のとおり）。 */
+function urlencodedMethodOverrideValuesOf(bytes: string): readonly string[] {
+  return bytes.split('&').flatMap((pair) => {
+    const separator = pair.indexOf('=');
+    const encodedName = separator < 0 ? pair : pair.slice(0, separator);
+    if (!isMethodOverrideFieldName(utf8Text(decodeUrlencoded(encodedName) ?? encodedName))) {
+      return [];
+    }
+    const encodedValue = separator < 0 ? '' : pair.slice(separator + 1);
+    return [utf8Text(decodeUrlencoded(encodedValue) ?? encodedValue)];
+  });
 }
 
 /**

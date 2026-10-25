@@ -9,6 +9,7 @@ import type {
   RunEnvironment,
   RunExecutionEndReason,
   RunId,
+  RunLoadOriginRequests,
   RunLoadRequests,
   RunRetryRecord,
   RunStatus,
@@ -76,10 +77,41 @@ export interface RunCheckpointProgress {
  */
 export type RunCheckpointSiteMetadata = Pick<SiteMetadataResult, 'records'>;
 
-/** 負荷の記録（設計書 4.9）。再開のときに、`NavigationPacer` と `LoadMeter` の `initial` に渡す。 */
+/**
+ * 負荷の記録（設計書 4.9）。再開のときに、`NavigationPacer` と `LoadMeter` の `initial` に渡す。
+ * T35c（Task 35 の設計書 3.4、3.7）: スクリプトで送るログインの監査の Run だけ、承認したサービスの Origin の区分（`approvedServiceOrigins`。`LoadMeter` の
+ * `initialServiceOriginRequests` に渡す）と、監査の段の数（`auditStageCounts`。次の実行の数に足す）を持つ（ほかの Run の保存の形は変えない）。
+ */
 export interface RunCheckpointLoad {
   readonly pacer: NavigationPacerSnapshot;
   readonly meter: RunLoadRequests;
+  readonly approvedServiceOrigins?: RunLoadOriginRequests;
+  readonly auditStageCounts?: RunCheckpointAuditStageCounts;
+}
+
+/**
+ * 保存に書く、監査の段の数（T35c。`run.json` の `authentication` の数の部分）。T35R-fix（T35R の I-2・I-3）: 承認したサービスの Origin への要求の上限の
+ * 部品が数えた要求の数（`serviceRequestsAdmitted`。次の実行の上限の部品は、この数から数える）と、上限で断った要求の数（`serviceRequestLimitRefused`。
+ * 1 つでもあれば Run を PARTIAL にする）も、Run の全体の数として持つ。
+ */
+export interface RunCheckpointAuditStageCounts {
+  readonly registeredReadRequestsAllowed: number;
+  readonly tokenRefreshBlocked: number;
+  readonly otherNonReadBlocked: number;
+  readonly serviceUnauthorizedResponses: number;
+  readonly serviceRequestsAdmitted: number;
+  readonly serviceRequestLimitRefused: number;
+  /**
+   * T37R-fix-B2（Task 37 の設計書 8 章の最後の行）: 許可 Origin への `fetch`・`xhr` の読み取りでない要求を止めた数（記録だけ。判定には使わない）。
+   * LG-4: 必須（数のない前の版の保存は読まない）。
+   */
+  readonly allowedOriginDataRequestsBlocked: number;
+  /**
+   * DEF-141（設計書 `2026-10-20-beaksight-service-request-pacing-design.md` 2.2）: 承認したサービスの Origin への要求の 1 分あたりの上限で、次の読み込みの
+   * 前に待った回数と、待った時間の合計（ms）。LG-4: 必須。
+   */
+  readonly serviceRequestPacingWaits: number;
+  readonly serviceRequestPacingWaitMs: number;
 }
 
 /** `checkpoint/state.json` の値（設計書 4.1。形は `schemas/checkpoint.schema.json`）。 */
@@ -387,13 +419,15 @@ export function checkRunCheckpointPageConsistency(page: RunCheckpointPage, check
  * `requeueSkipReasonCodes` に、この一覧を渡す。1回の実行の時間の上限（`MAX_RUNTIME_REACHED`）、止める印（Ctrl+C など）で
  * 止めた理由（`RUN_INTERRUPTED`。R4b1。設計書 4.6.1）、サイトの不調で止めた理由（`SITE_UNAVAILABLE`。不調を検知したページと、
  * 始めなかったページ。サイトが応答しないときに Run を止める設計書 3.2）、認証つきの Run でセッションの切れで止めた理由
- * （`AUTH_SESSION_LOST`。Task 25 の設計書 4.3。T25c。再開のときは、もう一度ログインする（T25d））の4つである。
+ * （`AUTH_SESSION_LOST`。Task 25 の設計書 4.3。T25c。再開のときは、もう一度ログインする（T25d））、承認したサービスの Origin への要求の上限で
+ * 止めた理由（`SERVICE_REQUEST_LIMIT_REACHED`。Task 35 の設計書 3.4。T35c。再開の実行は新しい上限で数える）の5つである。
  */
 export const RESUME_REQUEUE_SKIP_REASON_CODES = Object.freeze([
   'MAX_RUNTIME_REACHED',
   'RUN_INTERRUPTED',
   'SITE_UNAVAILABLE',
   'AUTH_SESSION_LOST',
+  'SERVICE_REQUEST_LIMIT_REACHED',
 ] as const satisfies readonly IncompleteReasonCode[]);
 
 /**
@@ -473,6 +507,8 @@ const isSafetyAbortedRun = (runStatus: RunStatus): boolean => runStatus === 'ABO
 const STOPPING_SKIP_REASONS = Object.freeze([
   { skipReasonCode: 'SITE_UNAVAILABLE', endReason: 'STOPPED_BY_SITE_UNAVAILABLE' },
   { skipReasonCode: 'AUTH_SESSION_LOST', endReason: 'STOPPED_BY_AUTH_SESSION_LOST' },
+  // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いて止めた（セッションの切れの後、実行時間の上限の前）。
+  { skipReasonCode: 'SERVICE_REQUEST_LIMIT_REACHED', endReason: 'STOPPED_BY_SERVICE_REQUEST_LIMIT' },
   { skipReasonCode: 'MAX_RUNTIME_REACHED', endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
   { skipReasonCode: 'RUN_INTERRUPTED', endReason: 'STOPPED_BY_SIGNAL' },
 ] as const satisfies readonly { readonly skipReasonCode: IncompleteReasonCode; readonly endReason: RunExecutionEndReason }[]);
@@ -569,6 +605,7 @@ const STOPPED_FROM_CRAWL_END: RunCheckpointConclusion = Object.freeze({
  * 1. Run Status が `ABORTED_BY_SAFETY` → `STOPPED_BY_SAFETY_VIOLATION`
  * 2. 理由 `SITE_UNAVAILABLE` の SKIPPED がある → `STOPPED_BY_SITE_UNAVAILABLE`
  * 2a. 理由 `AUTH_SESSION_LOST` の SKIPPED がある → `STOPPED_BY_AUTH_SESSION_LOST`（認証つきの Run だけ。T25c）
+ * 2b. 理由 `SERVICE_REQUEST_LIMIT_REACHED` の SKIPPED がある → `STOPPED_BY_SERVICE_REQUEST_LIMIT`（スクリプトで送るログインの監査の Run だけ。T35c）
  * 3. 理由 `MAX_RUNTIME_REACHED` の SKIPPED がある → `STOPPED_BY_RUNTIME_LIMIT`
  * 4. 理由 `RUN_INTERRUPTED` の SKIPPED がある → `STOPPED_BY_SIGNAL`
  * 5. それ以外 → `COMPLETED`
@@ -663,6 +700,9 @@ const collectJsonDifferences = (saved: unknown, current: unknown, path: string, 
  * 保存した実効の設定と、今回の実効の設定が、完全に同じかを確かめる（設計書 4.7）。違う項目のパス（例: `crawl.maxPages`）を返し、
  * 同じなら空の配列を返す。比べ方は、JSON の値としての深い比較である（配列は順を含めて比べ、違えば配列の項目のパスを返す）。
  * パスは、保存した設定の項目の順に並べ、今回の設定にだけある項目を最後に加える。
+ * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査の段の送信の扱い（`audit.sendPolicy`）も比べる（比べない項目にしない）。
+ * LG-4（テストの組の設計書 3.7.3、3.7.5）: 項目を持たない設定（AS-b の前の保存）を `READ_ONLY` と読み替えずに比べる（項目のない保存は「設定が違う」になり、
+ * 黙って前の方針で再開しない）。
  */
 export function effectiveConfigDifferences(saved: EffectiveAuditConfig, current: EffectiveAuditConfig): readonly string[] {
   const differences: string[] = [];
@@ -675,9 +715,12 @@ export function effectiveConfigDifferences(saved: EffectiveAuditConfig, current:
  * `effectiveConfigDifferences` が返すパスと同じ。`selectRunToResume` は、違う項目から、これらのパスを除いてから、設定が違うかを決める。
  * - `output.directory`（`--output` の上書きを含む）: 出力先は、途中の Run を探す場所そのものである。書き方が違っても（例: 相対のパスと、
  *   同じ場所の絶対のパス）、同じ出力先の途中の Run を再開できるようにする（R5b の報告）。
- * `--headed`・`--headless` の上書き（`browser.headed`）は、この一覧に入れない（比べる）。
+ * - `browser.headed`（画面の表示の設定と、`--headed`・`--headless` の上書きを含む）: 表示は、承認に結ばれるプロファイルの改訂の外にある
+ *   （FM-2 fix round 1。設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）。表示を切り替えただけで、中断した Run が再開できなく
+ *   ならないようにする。Guard・Context・上限は表示で変わらない。
+ * 並びは、`effectiveConfigDifferences` が返す順（保存の実効の設定の項目の順）である。
  */
-export const RESUME_CONFIG_IGNORED_PATHS = Object.freeze(['output.directory'] as const);
+export const RESUME_CONFIG_IGNORED_PATHS = Object.freeze(['browser.headed', 'output.directory'] as const);
 
 const RESUME_CONFIG_IGNORED_PATH_SET: ReadonlySet<string> = new Set(RESUME_CONFIG_IGNORED_PATHS);
 
@@ -810,34 +853,8 @@ export function selectRunToResume(
     : Object.freeze({ kind: 'RESUME', candidate: latest, decision });
 }
 
-// ロックの中身と判定、古いロックの原子的な取り直しの手順は、`src/core/process-lock.ts` に移した（T24h-3。画面のサーバのロックと共用するため）。
-// 利用者を変えないよう、今の名前で export し直す。
-export {
-  LOCK_TAKEOVER_MAX_ATTEMPTS,
-  LOCK_TAKEOVER_OUTCOMES,
-  LOCK_TAKEOVER_RESULT_KINDS,
-  RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
-  RUN_LOCK_HEARTBEAT_INTERVAL_MS,
-  RUN_LOCK_STALE_AFTER_MS,
-  RUN_LOCK_STATES,
-  acquireLockTakingOverStale,
-  createRunLock,
-  currentProcessRunLockHost,
-  isOwnRunLock,
-  isProcessRunning,
-  judgeRunLock,
-  renewRunLock,
-  takeOverStaleLock,
-  type LockFilePort,
-  type LockTakeoverOutcome,
-  type LockTakeoverResult,
-  type LockTakeoverResultKind,
-  type RunLock,
-  type RunLockHost,
-  type RunLockJudgementInput,
-  type RunLockState,
-  type RunLockTakeover,
-} from '../core/process-lock.js';
+// ロックの中身と判定、古いロックの原子的な取り直しの手順の置き場所は `src/core/process-lock.ts`（T24h-3。画面のサーバのロックと共用する）。
+// 呼び出し側はそこを直接 import する（LG-4: ここからの export し直しは捨てた）。
 
 /**
  * `RunCheckpointStore.acquireRunLock` の結果（設計書 4.4）。形と意味は `src/core/process-lock.ts` の `LockFileAcquisition`（T24h-3 で移した）。
@@ -851,24 +868,39 @@ export type RunCheckpointLockAcquisition = LockFileAcquisition;
  * - `writeCheckpointPage`: ページの保存を `checkpoint/pages/<pageId>.json` に書き、Run のディレクトリからの相対パスを返す。
  * - `writeCheckpointState`: 状態の保存を `checkpoint/state.json` に書く（今の `state.json` は `state.prev.json` に移す）。
  * - `acquireRunLock`: `checkpoint/run.lock` を排他的に作る。すでにあれば、作らずにその中身を返す。
- * - `rewriteRunLock`: `checkpoint/run.lock` を、渡した中身でまるごと書き換える（ハートビートと、古いロックの作り直し）。
+ * - `rewriteRunLock`: `checkpoint/run.lock` を、渡した中身でまるごと書き換える（ハートビート）。
  * - `readRunLock`: `checkpoint/run.lock` の中身を JSON として読んだ値を返す（ファイルがない、または JSON として読めなければ `null`。
- *   判定は `judgeRunLock`）。読むだけで、書かない（古いロックを作り直した後に、自分のものかを読み直すため。設計書 4.4）。
+ *   判定は `judgeRunLock`）。読むだけで、書かない（ほかの起動が同時に取り直したときに、今の中身を示すため。設計書 4.4）。
  * - `releaseRunLock`: `checkpoint/run.lock` を消す（なければ何もしない）。
  * - `cleanUpForResume`: 再開する前に、Run のディレクトリの中の、前の回の途中のもの（終わったページの一覧にないページのディレクトリ、
  *   書き出しの途中の一時ファイルなど）を消し、消したものの、Run のディレクトリからの相対パスを返す（設計書 4.5）。
- * - `takeOverRunLock`（任意）: 判定した古い `checkpoint/run.lock` を、原子的に取り直す（DEF-060。`RunLockTakeover`）。あれば、保存の
- *   セッションは、古いロックの取り直しにこれを使う（`takeOverStaleLock`）。ない書き手（テストの偽の書き手）では、前の方式（書き換えて
- *   読み直す）で取り直す。本番の `ArtifactWriter` は持つ。
+ * - `takeOverRunLock`: 判定した古い `checkpoint/run.lock` を、原子的に取り直す（DEF-060。`RunLockTakeover`）。保存のセッションは、古いロックの
+ *   取り直しにこれを使う（`takeOverStaleLock`）。LG-4: 必須（書き換えて読み直す前の方式は捨てた）。本番の `ArtifactWriter` は持つ。
  * 書けなかった場合は、どれも reject する。
  */
+/**
+ * `writeCheckpointPage` の指定（T44R3 の M-2）。`keptUrls` は、巡回が知っている URL（待ち行列と、監査したページの URL）。書き手は、記録した要求の URL を
+ * 値で照らす段で、これらを照らさない（あとで監査するページの URL を、続けて終えた Run と同じく伏せない）。
+ */
+export interface RunCheckpointPageWriteOptions {
+  readonly keptUrls: readonly string[];
+}
+
 export interface RunCheckpointStore {
-  takeOverRunLock?(runDirectory: string, judged: unknown, lock: RunLock): Promise<RunLockTakeover>;
-  writeCheckpointPage(runDirectory: string, page: RunCheckpointPage): Promise<string>;
+  takeOverRunLock(runDirectory: string, judged: unknown, lock: RunLock): Promise<RunLockTakeover>;
+  writeCheckpointPage(runDirectory: string, page: RunCheckpointPage, options?: RunCheckpointPageWriteOptions): Promise<string>;
   writeCheckpointState(runDirectory: string, state: RunCheckpoint): Promise<void>;
   acquireRunLock(runDirectory: string, lock: RunLock): Promise<RunCheckpointLockAcquisition>;
   rewriteRunLock(runDirectory: string, lock: RunLock): Promise<void>;
   readRunLock(runDirectory: string): Promise<unknown>;
   releaseRunLock(runDirectory: string): Promise<void>;
   cleanUpForResume(runDirectory: string, completedPageIds: readonly PageId[]): Promise<readonly string[]>;
+  /**
+   * SR-1-F5（SR-1R3 の M3）: 状態の保存（`state.json`、使えなければ `state.prev.json`）を、`checkState` の確かめを通して読む（省略できる。本番の
+   * `ArtifactWriter` は持つ）。保存のセッションは、再開の Run のロックを取った後に、再開を選んだときの保存と同じかを確かめるのに使う。
+   */
+  readCheckpointState?(
+    runDirectory: string,
+    checkState: (state: RunCheckpoint) => ArtifactValidationResult,
+  ): Promise<{ readonly ok: true; readonly state: RunCheckpoint } | { readonly ok: false }>;
 }

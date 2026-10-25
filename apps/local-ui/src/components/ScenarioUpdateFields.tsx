@@ -13,6 +13,10 @@
  */
 import type { ScenarioDraftRejectionReason } from '../../../../src/control/approval-view.js';
 import type { CandidateFieldType } from '../../../../src/control/discovery-view.js';
+// PRE42-CC 組 UI-K2（CC-113）: 連絡先の欄の型は、発見の部品に触れない純粋な core の owner から読む（書き写さない。`ScenarioApiFields.tsx` と同じ一覧）。
+import { CONTACT_CANDIDATE_FIELD_TYPES } from '../../../../src/core/candidate-field-types.js';
+// PRE42-CC 組 UI-K3（CC-113）: 下書きを拒む理由の値は、管理データに触れない純粋な core の owner から読む（書き写さない）。
+import { PATH_NOT_BOUND_TO_LEDGER_ID_REJECTION_REASON } from '../../../../src/core/scenario-draft-rejection-reasons.js';
 import { LOCAL_UI_SCENARIO_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../../../src/presentation/messages.js';
 import type {
   ScenarioCandidateView,
@@ -37,8 +41,8 @@ const TEMPLATE_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set([
   // T31R-fix-1 の I-2。
   'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID',
 ]);
-/** T31R-fix-1 の I-2: 型の組が台帳の取り方に結び付かない理由。 */
-const UNBOUND_REASON = 'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID' satisfies ScenarioDraftRejectionReason;
+/** T31R-fix-1 の I-2: 型の組が台帳の取り方に結び付かない理由（PRE42-CC 組 UI-K3: 値は純粋な core の owner から読む）。 */
+const UNBOUND_REASON = PATH_NOT_BOUND_TO_LEDGER_ID_REJECTION_REASON;
 
 /** 台帳の取り方に結び付かない組の番号（台帳が選択肢になければ空）。 */
 const unboundTemplatesOf = (view: ScenarioUpdateFormView, ledgerId: string): ReadonlySet<number> =>
@@ -48,8 +52,8 @@ const ROLE_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set(['SCENAR
 /** UPDATE の指定の入力の近くに出す、欄に結び付かない誤り（フォームの上のお知らせには出さない）。 */
 export const UPDATE_PLACED_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set([...LEDGER_REASONS, ...TEMPLATE_REASONS, ...ROLE_REASONS]);
 
-/** メールアドレスと電話番号の欄の型（既定で保つことを、欄の近くで知らせる。ユーザーの判断 3）。 */
-const CONTACT_FIELD_TYPES: ReadonlySet<CandidateFieldType> = new Set(['email', 'tel'] satisfies readonly CandidateFieldType[]);
+/** メールアドレスと電話番号の欄の型（既定で保つことを、欄の近くで知らせる。ユーザーの判断 3。PRE42-CC 組 UI-K2: 一覧は core から読む）。 */
+const CONTACT_FIELD_TYPES: ReadonlySet<CandidateFieldType> = new Set(CONTACT_CANDIDATE_FIELD_TYPES);
 
 /** UPDATE の指定の入力の状態。保つ欄は、役割を決める欄のうち変える欄でないもの（既定は保つ）。 */
 export interface ScenarioUpdateState {

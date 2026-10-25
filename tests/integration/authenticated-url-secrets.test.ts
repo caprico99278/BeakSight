@@ -4,10 +4,10 @@
 // - 認証つきの Run: query の秘密の目印（リンク、画像、移動の先の `code` と `state`）が、Run のディレクトリのどのファイル（保存、ZIP の中身を含む）
 //   にも現れず、伏せ字の印（`token=[REDACTED]` など）に替わって現れる。サーバには、目印つきの要求が届いている（巡回は伏せ字の前の URL で行う）。
 // - T25f round 1: 認証つきの Run では、`crawl.allowedQueryParameters` に伏せ字の一覧の名前（`token`）があれば、設定のエラーで始めない（Browser を
-//   起動せず、サイトへ何も送らない）。公開監査では今のまま始まる。
+//   起動せず、サイトへ何も送らない）。T44g: 公開監査も同じく始めない。
 // - セッションの切れで止まった Run: 知らせ（`AUTH_SESSION_LOST`）と保存に目印が出ず、保存には伏せ字の印が現れる。もう一度ログインした状態で、
 //   同じ Run を再開できる（ページの URL は伏せ字の対象にならないので、伏せ字の後の保存から再開できる）。
-// - 公開監査（認証の指定なし）では、伏せ字を通さない（今の出力のまま、目印がそのまま残る）。
+// - T44g（Task 44 の設計書 P4-1。案 2）: 公開監査（認証の指定なし）も、同じ書き手で伏せる（目印は、どのファイルにも残らない）。
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +22,7 @@ import {
 } from '../../src/cli/audit-run.js';
 import { ConfigError } from '../../src/config/config-error.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import { RUN_ARTIFACT_FILE_NAMES, listRunDirectories } from '../../src/core/artifact-layout.js';
 import { REDACTED } from '../../src/core/redaction.js';
@@ -37,6 +37,7 @@ import {
   type AuthenticatedSiteOptions,
 } from '../helpers/authenticated-site-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { nonReadRequestsOf } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const LAUNCHERS = [
@@ -48,7 +49,7 @@ const MAX_PAGES = 6;
 /** セッションの切れの場面の上限（管理画面、report、item の 1 つ目で止まる）。 */
 const SESSION_LOST_MAX_PAGES = 4;
 const TEST_TIMEOUT_MS = 240_000;
-/** `crawl.allowedQueryParameters` に入れる、伏せ字の一覧の名前（認証つきの Run では受けない。公開監査では今のまま）。 */
+/** `crawl.allowedQueryParameters` に入れる、伏せ字の一覧の名前（認証つきの Run でも公開監査でも受けない。T44g）。 */
 const TOKEN_QUERY_NAME = 'token';
 
 /** ディレクトリの下のすべてのファイルの中身（ZIP は展開した中身も）。 */
@@ -153,8 +154,7 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
   const requestsWith = (started: AuthenticatedSite, value: string): number =>
     started.requests.filter(({ path }) => path.includes(value)).length;
 
-  const nonReadRequests = (started: AuthenticatedSite): readonly string[] =>
-    started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+  const nonReadRequests = (started: AuthenticatedSite): readonly string[] => nonReadRequestsOf(started.requests);
 
   it('writes no query secret to any file of the Run directory and shows the redaction marker instead', async () => {
     const started = await startSite({ rotate: true });
@@ -173,6 +173,10 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
 
     const files = await readAllFiles(ran.runDirectory);
     expect(files.some(({ path }) => path.endsWith('.zip'))).toBe(true);
+    // TS-f（B13。`authenticated-run.test.ts` の T25c から寄せた）: 調べたファイルには、保存（checkpoint）も含まれる。
+    expect(files.some(({ path }) => path.includes('checkpoint'))).toBe(true);
+    // TS-f（同上）: 回転で替えた値を含む、サーバが作ったセッションの値は、状態に入れた秘密の値より多い（回転が起きた上で、どれも残らない）。
+    expect(new Set([...secrets, ...started.secretValues()]).size).toBeGreaterThan(secrets.length);
     const markers = [...new Set([...started.queryTokenValues(), ...secrets, ...started.secretValues()])];
     expect(leakedFiles(files, markers)).toEqual([]);
     // 伏せ字の印に替わって現れる（Evidence のリンクの生の値、画像の要求、移動の先の最後の URL）。
@@ -182,7 +186,7 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
     }
   }, TEST_TIMEOUT_MS);
 
-  it('does not start an authenticated Run that keeps a secret name in crawl.allowedQueryParameters, and the public audit starts as it does now', async () => {
+  it('does not start an authenticated Run nor a public audit that keeps a secret name in crawl.allowedQueryParameters', async () => {
     const started = await startSite({});
     const outputDirectory = join(workDirectory, `rejected-${browsers.length}-${Date.now()}`);
     const config = configFor(started, AUTH_SITE_PATHS.admin, outputDirectory, { allowedQueryParameters: [TOKEN_QUERY_NAME] });
@@ -195,15 +199,16 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
     expect(started.requests).toEqual([]);
     expect(await listRunDirectories(outputDirectory)).toEqual([]);
 
-    // 公開監査（認証の指定なし。同じサイトのセッションを問わない画面）: 今のまま始まり、`token` つきのページも読む。
-    const publicConfig = configFor(started, AUTH_SITE_TOKEN_PATHS.publicTokens, join(workDirectory, `public-allowed-${Date.now()}`), {
+    // T44g（Task 44 の P4-1 の発見事項 4）: 公開監査（認証の指定なし）も、同じ設定のエラーで、Browser を起動せず、サイトへ何も送らない。
+    const publicOutput = join(workDirectory, `public-allowed-${Date.now()}`);
+    const publicConfig = configFor(started, AUTH_SITE_TOKEN_PATHS.publicTokens, publicOutput, {
       maxPages: 2,
       allowedQueryParameters: [TOKEN_QUERY_NAME],
     });
-    const ran = ranOf(await executeAuditRun(publicConfig, dependenciesWith(), { startNew: true }));
-    const [publicLink] = started.queryTokenValues().slice(-2);
-    expect(requestsWith(started, publicLink ?? '')).toBeGreaterThan(0);
-    expect(ran.runStatus).not.toBe('FAILED');
+    await expect(executeAuditRun(publicConfig, dependenciesWith(), { startNew: true })).rejects.toBeInstanceOf(ConfigError);
+    expect(browsers.length).toBe(launchedBefore);
+    expect(started.requests).toEqual([]);
+    expect(await listRunDirectories(publicOutput)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
   it('stops with AUTH_SESSION_LOST without any secret in the notice or the checkpoint, and resumes with a new login', async () => {
@@ -240,7 +245,8 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
     expect(nonReadRequests(started)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  it('keeps the public audit unchanged: the query values stay as they are without the authentication', async () => {
+  // T44g（Task 44 の設計書 P4-1。案 2）: 公開監査（認証の指定なし）も、同じ書き手で伏せる（今までは目印がそのまま残っていた）。
+  it('redacts the public audit too: the secret query values are replaced without the authentication', async () => {
     const started = await startSite({});
     const outputDirectory = join(workDirectory, `public-${browsers.length}-${Date.now()}`);
     const ran = ranOf(await executeAuditRun(
@@ -251,12 +257,9 @@ describe.each(LAUNCHERS)('T25f: the URL secrets of an authenticated Run (%s)', (
 
     const publicValues = started.queryTokenValues().slice(-2);
     const files = await readAllFiles(ran.runDirectory);
-    const audit = files.find(({ path }) => path.endsWith(RUN_ARTIFACT_FILE_NAMES.audit));
     for (const value of publicValues) {
-      expect(containsBytes(audit?.bytes ?? new Uint8Array(), value)).toBe(true);
+      expect(files.filter(({ bytes }) => containsBytes(bytes, value)).map(({ path }) => path), value).toEqual([]);
     }
-    for (const redacted of [`token=${REDACTED}`, `access_token=${REDACTED}`]) {
-      expect(files.some(({ bytes }) => containsBytes(bytes, redacted)), redacted).toBe(false);
-    }
+    expect(files.some(({ bytes }) => containsBytes(bytes, `token=${REDACTED}`))).toBe(true);
   }, TEST_TIMEOUT_MS);
 });

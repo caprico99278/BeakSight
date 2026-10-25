@@ -25,6 +25,7 @@ import {
   MAX_FIXED_VALUES,
   SEMANTIC_KINDS,
   computeRuleSetDigest,
+  defaultRangeFieldNamesOf,
   generateScenarioData,
   isSemanticKindCompatible,
   isSyntheticEmailAddress,
@@ -48,14 +49,14 @@ import type { CandidateFieldType } from '../../../../src/control/discovery-view.
 import { getProfile, type StoredProfile } from '../../../../src/control/store/profile-store.js';
 import { baseDateOf } from '../../../../src/core/base-date.js';
 import { isSecretUrlQueryParameterName } from '../../../../src/core/secret-query-names.js';
-import { formatCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
+import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
 import { usesScenarios } from '../display/labels';
 import type { InputRuleState } from '../display/data-rules';
 import { localUiStore } from './control-store';
 import { EMPTY_RULE_CONTENT, dataRuleFactsOf, defaultRuleSetIdOf, ruleSetForEvaluationOf } from './data-rule-facts';
 import { candidateFieldViewOf, discoveryProfileViewOf, type CandidateFieldConstraintView, type DiscoveryProfileView } from './discovery-documents';
 import { requestOf } from './request-validation';
-import { isoTimestampOf } from './timestamps';
+import { isoTimestampOf, nowCompactTimestamp } from './timestamps';
 import type { ScenarioStoreRejectionReason } from '../../../../src/control/approval-view.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -83,6 +84,11 @@ export interface DataRuleFieldView {
   readonly allowedKinds: readonly SemanticKind[];
   /** 秘密に見える名前の欄か（人が入れた値を残せない）。 */
   readonly secretLike: boolean;
+  /**
+   * 保存した規則が、自動の作成が既定の幅を入れた推した規則か（FM2c。推測の印。判定は `src/control/data-rules/rule-set-inference.ts` の
+   * `defaultRangeFieldNamesOf` の 1 か所。画面は、この値だけを使う）。
+   */
+  readonly defaultRange: boolean;
 }
 
 /** 例の値 1 つ（null は送らない。合成の形は、メール・電話のとき）。 */
@@ -151,8 +157,7 @@ export type DataRuleSaveView =
 // 値の組み立て
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 保存できるプロファイルの状態。 */
-const ACTIVE_PROFILE_STATUS = 'ACTIVE';
+// 保存できるプロファイルの状態（`ACTIVE_PROFILE_STATUS`）は、owner の `profile-records.ts` から読む（CC-109）。
 /** 画面の例の数。 */
 export const EXAMPLE_COUNT = 3;
 /** 画面の例の seed の、実行の許可の id の代わりの決まった値の頭（実行の許可の id ではない）。 */
@@ -193,6 +198,18 @@ const examplesOf = (stored: StoredProfile, scenario: ScenarioView, ruleSet: Rule
   });
 };
 
+/**
+ * 規則の集まりの中身の項目だけ（FM2c: 一意にする欄の組の出どころの印と、テンプレートの既定を保存した印も、あるときだけ写す。保存した版と保存の入力の
+ * 両方に使う）。
+ */
+const ruleContentOf = (source: RuleSetContent): RuleSetContent => ({
+  fieldRules: source.fieldRules,
+  relations: source.relations,
+  uniqueKeyFieldNames: source.uniqueKeyFieldNames,
+  ...(source.uniqueKeyOrigin === undefined ? {} : { uniqueKeyOrigin: source.uniqueKeyOrigin }),
+  ...(source.templateDefaultsSaved === undefined ? {} : { templateDefaultsSaved: source.templateDefaultsSaved }),
+});
+
 /** 画面の値。 */
 const pageOf = (stored: StoredProfile, scenario: ScenarioView): DataRulePageView => {
   const eligible = usesScenarios(stored.profile.mode, stored.profile.auth);
@@ -201,6 +218,8 @@ const pageOf = (stored: StoredProfile, scenario: ScenarioView): DataRulePageView
   const ruleSet = ruleSetForEvaluationOf(scenario, saved);
   const humanRules = new Map(ruleSet.fieldRules.map((rule) => [rule.fieldName, rule]));
   const fieldsByName = new Map(scenario.evidence.fields.filter((field) => field.name.length > 0).map((field) => [field.name, field]));
+  // FM2c: 既定の幅を使った欄（推測の印）は、自動の作成と同じ部品で求め直す（承認には結ばない）。
+  const defaultRanges = new Set(saved === null ? [] : defaultRangeFieldNamesOf(saved.fieldRules, scenario.current, scenario.evidence));
   return {
     profile: discoveryProfileViewOf(stored),
     eligible,
@@ -217,7 +236,7 @@ const pageOf = (stored: StoredProfile, scenario: ScenarioView): DataRulePageView
       ? null
       : { ruleSetId: latest.ruleSet.ruleSetId, revision: latest.ruleSet.revision, createdAt: isoTimestampOf(latest.ruleSet.createdAt), reference: { ...latest.reference } },
     inputRuleState: state,
-    content: saved === null ? EMPTY_RULE_CONTENT : { fieldRules: saved.fieldRules, relations: saved.relations, uniqueKeyFieldNames: saved.uniqueKeyFieldNames },
+    content: saved === null ? EMPTY_RULE_CONTENT : ruleContentOf(saved),
     fields: evaluation.fields.map((field) => {
       const candidateField = fieldsByName.get(field.fieldName);
       const view = candidateField === undefined ? null : candidateFieldViewOf(scenario.evidence, candidateField);
@@ -235,6 +254,7 @@ const pageOf = (stored: StoredProfile, scenario: ScenarioView): DataRulePageView
         externalDeliveryKinds: [...field.externalDeliveryKinds],
         allowedKinds: candidateField === undefined ? [] : SEMANTIC_KINDS.filter((kind) => isSemanticKindCompatible(kind, candidateField.type)),
         secretLike: isSecretUrlQueryParameterName(field.fieldName),
+        defaultRange: defaultRanges.has(field.fieldName),
       };
     }),
     relations: evaluation.relations.map((relation) => ({ ...relation })),
@@ -292,9 +312,9 @@ export const saveDataRulesFn = createServerFn({ method: 'POST' })
         ruleSetId: latest?.ruleSet.ruleSetId ?? defaultRuleSetIdOf(scenario.scenarioId),
         scenarioId: scenario.scenarioId,
         expectedRevision: data.expectedRuleSetRevision,
-        content: { fieldRules: data.fieldRules, relations: data.relations, uniqueKeyFieldNames: data.uniqueKeyFieldNames },
+        content: ruleContentOf(data),
         expectedScenarioRevision: data.expectedScenarioRevision,
-        at: formatCompactUtcTimestamp(new Date(), 'data rule save time'),
+        at: nowCompactTimestamp('data rule save time'),
       });
     } catch (error) {
       if (error instanceof RangeError) {

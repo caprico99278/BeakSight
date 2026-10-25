@@ -3,18 +3,18 @@
  * - 画面のテストの補助（`apps/local-ui/tests/helpers/*.ts`）が公開する関数と、ページの補助（`helpers/ui-page.ts` の `createUiPageKit`）が返す関数と
  *   同じ名前の関数を、画面のテストのファイル（`apps/local-ui/tests/*.test.ts`）と、ほかの補助のファイルの中で定義し直さない（補助を使う）。
  *   補助の値を分割代入で受けるのは定義し直しではない（`const { openPage } = createUiPageKit(...)`）。
+ *   補助が公開し直す名前（`export { nonReadRequestsOf } from '…'`。PRE42-CC の組 7）も、補助の名前に数える。
+ * - PRE42-CC の組 7（CC-071 の CSP）: CSP の違反の記録（`securitypolicyviolation` の受け口と、ページの中の `__cspViolations`）は、ページの補助
+ *   （`helpers/ui-page.ts` の `recordCspViolations`・`cspViolationsOf`）だけに書く。開発のサーバと起動の部品のテストも、それを使う。
  * - 除外は、同じ名前で別の意味のものだけ（理由つきの閉じた一覧。使われなくなった除外も誤りにする）。
  * - 判定は、Node.js 標準の `fs`、正規表現、文字列の検索だけで行う。1 秒以内に終える。
  */
-import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { MAX_GATE_MS, exportedNamesOf, readLfTypeScriptFilesUnder, startCpuStopwatch, unusedExclusionsOf } from './source-scan.js';
 
 const TESTS_DIRECTORY = 'apps/local-ui/tests';
 const HELPERS_DIRECTORY = `${TESTS_DIRECTORY}/helpers`;
 const PAGE_KIT_FILE = `${HELPERS_DIRECTORY}/ui-page.ts`;
-/** 1 つのファイルの判定の上限（ms）。 */
-const MAX_MS_PER_FILE = 1_000;
 
 /** 同じ名前で別の意味の関数（ファイルの名前 → 名前と理由）。 */
 const ALLOWED_REDEFINITIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
@@ -31,17 +31,22 @@ interface SourceText {
   readonly text: string;
 }
 
-const readTexts = (directory: string, suffix: string): readonly SourceText[] => readdirSync(directory)
-  .filter((name) => name.endsWith(suffix))
-  .sort()
-  .map((name) => ({ name, text: readFileSync(join(directory, name), 'utf8').replaceAll('\r\n', '\n') }));
+/** 画面のテストのフォルダの TypeScript（読み込みは 1 回だけ。改行は LF にそろえる。`source-scan.ts` の `readLfTypeScriptFilesUnder`）。 */
+const UI_TEST_TEXTS = readLfTypeScriptFilesUnder([TESTS_DIRECTORY]);
+
+/** `directory` の直下（下のフォルダを含めない）の、名前が `suffix` で終わるファイル（名前の順）。 */
+const readTexts = (directory: string, suffix: string): readonly SourceText[] => UI_TEST_TEXTS
+  .map(({ path, content }) => ({ name: path.slice(directory.length + 1), inside: path.startsWith(`${directory}/`), text: content }))
+  .filter(({ name, inside }) => inside && !name.includes('/') && name.endsWith(suffix))
+  .map(({ name, text }) => ({ name, text }));
 
 const TEST_FILES = readTexts(TESTS_DIRECTORY, '.test.ts');
 const HELPER_FILES = readTexts(HELPERS_DIRECTORY, '.ts');
 
-/** 補助のファイルが公開する関数と値の名前（`export const X`、`export function X`、`export async function X`）。 */
-const exportedNamesOf = (text: string): readonly string[] =>
-  [...text.matchAll(/^export\s+(?:async\s+)?(?:function\s*\*?|const)\s+([A-Za-z_$][\w$]*)/gmu)].map((match) => match[1] ?? '');
+// 補助のファイルが公開する関数と値の名前（公開の一覧と公開し直しを含む）は、`source-scan.ts` の `exportedNamesOf`（PRE42-CC 組 G）。
+
+/** CSP の違反の記録の持ち主（ページの補助）と、記録の形（受け口の事象の名前と、ページの中の記録の名前）。 */
+const CSP_RECORD_SHAPE = /securitypolicyviolation|__cspViolations/u;
 
 /** ページの補助が返す関数の名前（`createUiPageKit` の `return { ... };`）。 */
 const pageKitNames = (): readonly string[] => {
@@ -82,7 +87,7 @@ describe('Gate: the screen tests use the shared helpers (CCX-16)', () => {
   });
 
   it('does not define again a function with the name of a shared helper in a screen test or another helper', () => {
-    const started = performance.now();
+    const stopwatch = startCpuStopwatch();
     const names = helperNames();
     const found: string[] = [];
     const usedExceptions = new Set<string>();
@@ -108,11 +113,27 @@ describe('Gate: the screen tests use the shared helpers (CCX-16)', () => {
     expect(found).toEqual([]);
     // 使われなくなった除外を残さない。
     const declared = Object.entries(ALLOWED_REDEFINITIONS).flatMap(([fileName, entries]) => Object.keys(entries).map((helperName) => `${fileName}:${helperName}`));
-    expect(declared.filter((entry) => !usedExceptions.has(entry))).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(MAX_MS_PER_FILE * (TEST_FILES.length + HELPER_FILES.length));
+    expect(unusedExclusionsOf(declared, usedExceptions)).toEqual([]);
+    expect(stopwatch.elapsedMs()).toBeLessThan(MAX_GATE_MS * (TEST_FILES.length + HELPER_FILES.length));
+  });
+
+  it('records the CSP violations only in the page kit (recordCspViolations and cspViolationsOf in helpers/ui-page.ts. PRE42-CC group 7, CC-071)', () => {
+    const owner = HELPER_FILES.find(({ name }) => `${HELPERS_DIRECTORY}/${name}` === PAGE_KIT_FILE)?.text ?? '';
+    expect(owner).toMatch(CSP_RECORD_SHAPE);
+    expect(exportedNamesOf(owner)).toEqual(expect.arrayContaining(['recordCspViolations', 'cspViolationsOf']));
+    const found = [
+      ...TEST_FILES.filter(({ text }) => CSP_RECORD_SHAPE.test(text)).map(({ name }) => name),
+      ...HELPER_FILES.filter(({ name, text }) => `${HELPERS_DIRECTORY}/${name}` !== PAGE_KIT_FILE && CSP_RECORD_SHAPE.test(text)).map(({ name }) => `helpers/${name}`),
+    ];
+    expect(found).toEqual([]);
   });
 
   it('finds a redefinition that is placed on purpose (the control)', () => {
+    expect(exportedNamesOf("export { nonReadRequestsOf } from '../../../../tests/helpers/leak-places.js';")).toEqual(['nonReadRequestsOf']);
+    expect(exportedNamesOf("export { a, type B, c as d } from './x.js';\nexport type { E } from './y.js';")).toEqual(['a', 'd']);
+    expect(CSP_RECORD_SHAPE.test("document.addEventListener('securitypolicyviolation', (event) => violations.push(event.blockedURI));")).toBe(true);
+    expect(CSP_RECORD_SHAPE.test('const violations = await page.evaluate(() => (window as unknown as { __cspViolations: string[] }).__cspViolations);')).toBe(true);
+    expect(CSP_RECORD_SHAPE.test('const violations = await cspViolationsOf(page, true);')).toBe(false);
     expect(definesFunction('const openPage = async (path: string): Promise<Page> => {', 'openPage')).toBe(true);
     expect(definesFunction('  const tabTo = async (page: Page, target: Locator): Promise<void> => {', 'tabTo')).toBe(true);
     expect(definesFunction('async function filesUnder(directory: string) {', 'filesUnder')).toBe(true);

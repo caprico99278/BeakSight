@@ -8,12 +8,19 @@
 // 許可 Origin への要求の数に入ることを確かめる（R8）。
 // 先読みを止める引数は `--enable-features` なので、CLI の起動が、Playwright の既定の feature の指定を変えないことも確かめる（最後の describe）。
 // DEF-070: Google への接続を止める引数は `--disable-features` なので、Playwright の既定の値をすべて含むことも、最後の describe で確かめる。
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { chromium, type Browser, type BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
+import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
+import { TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { LOOPBACK_TEST_CERTIFICATE, LOOPBACK_TEST_KEY, TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS } from '../helpers/tls-test-certificate.js';
 import {
   CHROMIUM_CHANNEL,
   CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES,
+  CHROMIUM_PRELOADING_DISABLED_BY_DISABLE_FEATURES,
   CHROMIUM_PRELOADING_DISABLED_FEATURES,
   PLAYWRIGHT_DEFAULT_DISABLED_FEATURES,
 } from '../../src/browser/chromium-launch.js';
@@ -44,6 +51,9 @@ const LINK_PREFETCH_TARGET = '/preloading/link-prefetch-target.html';
  * 約30ms以内にサーバに届いた（Chromium 151、この PC での実測）。遅い環境でも見逃さないよう、その100倍の時間を待つ。
  */
 const PRELOADING_SETTLE_MS = 3_000;
+/** BN-R0 の C-1: 全部の後に、遅れて届く要求を待つ時間（ms）と、1 つの場面の期限（ms）。 */
+const LATE_SETTLE_MS = 1_500;
+const SPECULATION_TEST_TIMEOUT_MS = 60_000;
 
 let browser: Browser;
 let server: FixtureServer;
@@ -223,9 +233,92 @@ describe('the CLI launch of Chromium keeps the features Playwright enables and d
     expect(defaultDisabledOccurrences).toEqual([[...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES]]);
     // CLI の起動の `--disable-features` は、Playwright の既定の1つと、最後の CLI の1つだけ。最後の1つ（Chromium が使う値）は、
     // Playwright の既定の値すべてと、Google への接続を止める feature。
+    // BN-R0 の C-1 から、先読みを止める feature（`Prerender2FallbackPrefetchSpecRules`）も、同じ最後の 1 つに入る。
     expect(cliDisabledOccurrences).toEqual([
       ...defaultDisabledOccurrences,
-      [...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES, ...CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES],
+      [...PLAYWRIGHT_DEFAULT_DISABLED_FEATURES, ...CHROMIUM_GOOGLE_SERVICES_DISABLED_FEATURES, ...CHROMIUM_PRELOADING_DISABLED_BY_DISABLE_FEATURES],
     ]);
   });
+});
+
+// BN-R0 の C-1（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` の BN-0 の独立レビュー）: speculation rules の prerender だけの指定では、
+// Chromium が prerender の代わりに prefetch（`Prerender2FallbackPrefetchSpecRules`）を行い、Guard を通らない文書の要求（`Sec-Purpose: prefetch;prerender`）が
+// サーバに届き、その後の移動が、その応答で main frame を移していた（読まないパス・危険な語の URL でも、止めた記録がない）。factory の Context（認証つきの監査の段の
+// 除外つき）で、ページの先読みの指定の形ごとに、先読みの文書の要求がサーバに届かず、その後の移動は Guard が判定して止める（除外の URL）ことを、両方の Chromium
+// （CLI の起動と、テストの既定の headless shell）と、http・https で確かめる。全部の後に名前つきの時間だけ待ってから数え直す。
+describe.each([
+  ['the CLI launch of Chromium', (tls: boolean) => launchCliChromium(tls ? { args: [...TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS] } : {})],
+  ['the default test Chromium', (tls: boolean) => launchHeadlessChromium(tls ? { args: [...TEST_BROWSER_IGNORE_CERTIFICATE_ERRORS_ARGS] } : {})],
+] as const)('BN-R0 C-1: the speculation rules and the link prefetch of a document never bypass the Guard, with %s', (_label, launch) => {
+  /** 先読みの指定の形（`target` は、先読みと移動の先の、除外に当たる URL の path）。 */
+  const FORMS: Readonly<Record<string, (target: string) => string>> = Object.freeze({
+    'prerender-immediate': (target) => `<script type="speculationrules">{"prerender":[{"source":"list","urls":["${target}"],"eagerness":"immediate"}]}</script>`,
+    'prerender-eager': (target) => `<script type="speculationrules">{"prerender":[{"source":"list","urls":["${target}"],"eagerness":"eager"}]}</script>`,
+    'prefetch-immediate': (target) => `<script type="speculationrules">{"prefetch":[{"source":"list","urls":["${target}"],"eagerness":"immediate"}]}</script>`,
+    'document-rules': (target) => `<script type="speculationrules">{"prerender":[{"source":"document","where":{"href_matches":"${target}"},"eagerness":"immediate"}],`
+      + `"prefetch":[{"source":"document","where":{"href_matches":"${target}"},"eagerness":"immediate"}]}</script><a href="${target}">next</a>`,
+    'link-prefetch-document': (target) => `<link rel="prefetch" as="document" href="${target}">`,
+  });
+  /** 先読みが起きるのを待ってから、移動する（ms）。 */
+  const NAVIGATE_AFTER_MS = 2_000;
+  const SETTLE_MS = 4_000;
+
+  it.each(Object.keys(FORMS).flatMap((form) => [[form, false], [form, true]] as const))('%s (https: %s)', async (form, tls) => {
+    const target = `/admin/${form}/logout`;
+    const received: { readonly method: string; readonly path: string; readonly purpose: string }[] = [];
+    const site = await startLoopbackHttpServer((request: IncomingMessage, response: ServerResponse) => {
+      request.resume();
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+      received.push({ method: request.method ?? 'GET', path: url.pathname, purpose: String(request.headers['sec-purpose'] ?? request.headers['purpose'] ?? '-') });
+      const html = (body: string): void => {
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(body);
+      };
+      if (url.pathname === `/admin/${form}/start`) {
+        html(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>start</title>${FORMS[form]?.(target) ?? ''}</head>`
+          + `<body><main><h1>start</h1></main><script>setTimeout(() => { location.href = '${target}'; }, ${String(NAVIGATE_AFTER_MS)});</script></body></html>`);
+      } else {
+        html('<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>target</title></head><body><p>target</p></body></html>');
+      }
+    }, tls ? { tls: { cert: LOOPBACK_TEST_CERTIFICATE, key: LOOPBACK_TEST_KEY } } : {});
+    const tested = await launch(tls);
+    try {
+      const config = createTestConfig(site.origin, `/admin/${form}/start`);
+      const factory = new BrowserContextFactory(tested, config, () => new SafetyLedger(), {
+        ...TEST_FACTORY_OPTIONS,
+        authentication: {
+          initialState: { cookies: [], origins: [] },
+          filterState: (state) => state,
+          auditExclusions: { excludedPathPrefixes: [], auditPathPrefixes: ['/admin'], dangerousTerms: DEFAULT_EXCLUDED_URL_WORDS },
+        },
+      });
+      try {
+        const context = await factory.createPassiveContext(config.viewports.primaryDesktop, 'PRIMARY', { pageAuditLoad: true });
+        const page = await factory.createPassivePage(context);
+        await page.goto(`${site.origin}/admin/${form}/start`, { waitUntil: 'load' });
+        await wait(SETTLE_MS);
+        const snapshot = factory.getSafetyLedger(context).snapshot();
+        // 先読みの文書の要求も、移動の文書の要求も、サーバに届かない。移動は、Guard が判定して止め、記録する。
+        expect(received.filter(({ path }) => path === target)).toEqual([]);
+        expect(received.filter(({ purpose }) => purpose !== '-')).toEqual([]);
+        expect(new URL(page.url()).pathname).not.toBe(target);
+        expect(snapshot.blockedAuditExclusions?.events.some(({ url, mainFrameNavigation }) => mainFrameNavigation && new URL(url).pathname === target)).toBe(true);
+        expect(snapshot.invariantViolations).toEqual([]);
+        // BN-R1 の M-2: 止めた先読みの要求（`<link rel="prefetch">`）の記録には、先読みの印（`speculative: true`）が付く。移動の記録には付かない。
+        const preloadRows = snapshot.blockedAuditExclusions?.events.filter(({ url, mainFrameNavigation }) => !mainFrameNavigation && new URL(url).pathname === target) ?? [];
+        if (form === 'link-prefetch-document') {
+          expect(preloadRows.length).toBeGreaterThan(0);
+          expect(preloadRows.every(({ speculative }) => speculative === true)).toBe(true);
+        }
+        expect(snapshot.blockedAuditExclusions?.events.filter(({ mainFrameNavigation }) => mainFrameNavigation).every(({ speculative }) => speculative === undefined)).toBe(true);
+        await factory.closePassiveContext(context);
+      } finally {
+        await factory.close();
+      }
+      await wait(LATE_SETTLE_MS);
+      expect(received.filter(({ path }) => path === target)).toEqual([]);
+    } finally {
+      await tested.close();
+      await site.close();
+    }
+  }, SPECULATION_TEST_TIMEOUT_MS);
 });

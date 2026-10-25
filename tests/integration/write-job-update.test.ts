@@ -12,6 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { readWriteResult } from '../../src/control/actions/write-result-facts.js';
 import { readExecutionGrant } from '../../src/control/approval/scenario-store.js';
@@ -128,7 +129,7 @@ describe('T31g-2: the update write job end to end with the real worker', () => {
   }, STEP_TIMEOUT_MS);
 
   it('after all the runs: no POST arrives late, and no secret marker or kept value is outside its places', async () => {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, LATE_DELIVERY_SETTLE_MS));
+    await wait(LATE_DELIVERY_SETTLE_MS);
     expect(harness.updatePosts()).toEqual([writeSiteRecordPathOf(targetId)]);
     expect(harness.createPosts()).toEqual([WRITE_SITE_PATHS.create]);
     expect(harness.leakedPlaces()).toEqual([]);

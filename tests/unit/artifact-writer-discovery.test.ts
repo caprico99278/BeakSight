@@ -52,21 +52,25 @@ describe('T27d: writing discovery.json through the ArtifactWriter', () => {
   });
 
   it('writes the document checked by the schema and returns its relative path (no temporary file left)', async () => {
-    const written = await new ArtifactWriter().writeDiscovery(runDirectory, documentOf());
+    // T44g: 既定の書き手は名前で伏せる段を通すので、書いた値をそのまま比べるために、その段を外した書き手で書く。
+    const written = await new ArtifactWriter({ urlSecretRedaction: false }).writeDiscovery(runDirectory, documentOf());
     expect(written).toBe(DISCOVERY_ARTIFACT_FILE_NAME);
     const path = artifactFilePath(runDirectory, DISCOVERY_ARTIFACT_FILE_NAME);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(documentOf());
     expect(readdirSync(runDirectory)).toEqual([DISCOVERY_ARTIFACT_FILE_NAME]);
   });
 
-  it('redacts the URL secrets with the authenticated writer, and keeps them with the default writer', async () => {
-    await new ArtifactWriter({ urlSecretRedaction: true }).writeDiscovery(runDirectory, documentOf());
-    const redacted = readFileSync(artifactFilePath(runDirectory, DISCOVERY_ARTIFACT_FILE_NAME), 'utf8');
-    expect(redacted).not.toContain(SECRET);
-    expect(redacted).toContain('/admin/report?token=');
-    expect(redacted).toContain('page=2');
+  // T44g（Task 44 の設計書 P4-1。案 2）: 既定の書き手も、認証つきの書き手と同じく伏せる（伏せないのは、その段を外した書き手だけ）。
+  it('redacts the URL secrets with the authenticated writer and the default writer, and keeps them only without the redaction', async () => {
+    for (const writer of [new ArtifactWriter({ urlSecretRedaction: true }), new ArtifactWriter()]) {
+      await writer.writeDiscovery(runDirectory, documentOf());
+      const redacted = readFileSync(artifactFilePath(runDirectory, DISCOVERY_ARTIFACT_FILE_NAME), 'utf8');
+      expect(redacted).not.toContain(SECRET);
+      expect(redacted).toContain('/admin/report?token=');
+      expect(redacted).toContain('page=2');
+    }
 
-    await new ArtifactWriter().writeDiscovery(runDirectory, documentOf());
+    await new ArtifactWriter({ urlSecretRedaction: false }).writeDiscovery(runDirectory, documentOf());
     expect(readFileSync(artifactFilePath(runDirectory, DISCOVERY_ARTIFACT_FILE_NAME), 'utf8')).toContain(SECRET);
   });
 

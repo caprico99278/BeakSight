@@ -9,6 +9,13 @@ export { closeLocalUiStore, prepareLocalUiStore, type LocalUiStorePreparation } 
 export { prepareLocalUiAuditJobs, runningLocalUiAuditJobCount, shutdownLocalUiAuditJobs } from './audit-jobs';
 // T26e（Task 26 の設計書 4.1 の「起動のとき」）: 資格情報のフォルダの一時のファイルの片付けと、暗号化の確かめ（待ち受けの前に 1 回）。
 export { prepareLocalUiCredentials } from './credential-runtime';
+// DEF-146: 画面のサーバが終わったときの記録（予期しない例外、止める決まり、process の終わり。token は記録に書かない値として渡す）。
+export {
+  recordLocalUiServerExit,
+  recordLocalUiServerShutdown,
+  recordLocalUiServerUnexpectedError,
+  setLocalUiServerLogSecrets,
+} from './ui-server-log-file';
 export { AUDIT_JOB_SHUTDOWN_WAIT_MS } from '../../../../src/control/job/job-records.js';
 export { formatCount, formatDuration } from '../../../../src/presentation/format.js';
 export {

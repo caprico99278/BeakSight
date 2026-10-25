@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { AUDIT_MODES, AUTH_STRATEGIES, type AuditMode, type AuthStrategy } from '../../src/control/contracts.js';
 import {
+  AUTH_SETUP_FREE_OPERATIONS,
   AUTH_SETUP_REQUIRED_AUDIT_MODES,
   EXECUTABLE_AUDIT_MODES,
   PROFILE_OPERATION_POLICY,
@@ -90,6 +91,8 @@ describe('profile operations by mode (T28b)', () => {
     WRITE_CREATE: [MODE, MODE, MODE, ALLOWED, ALLOWED],
     // T31e fix round 1（Task 31 の設計書 3 章）: 承認された UPDATE の書き込みのジョブも、CREATE と同じ（書き込みのモードの、ログインを使う方式だけ）。
     WRITE_UPDATE: [MODE, MODE, MODE, ALLOWED, ALLOWED],
+    // T43c（Task 43 の設計書 4.3）: 入口の確かめは、公開のモードは認証なし（`NONE`）、テストの 2 つのモードはログインを使う方式（ログインはしない）。
+    ENTRY_CHECK: [ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
   };
 
   it('decides every operation for every storable pair of the mode and the auth strategy with the closed table', () => {
@@ -113,7 +116,15 @@ describe('profile operations by mode (T28b)', () => {
     // シナリオは書き込みのモードの機能そのもので、書き込みは実行しない）と、承認された CREATE の書き込み（T30e）と、承認された UPDATE の書き込み
     // （T31e fix round 1）だけ。
     expect(PROFILE_OPERATIONS.filter((operation) => Object.hasOwn(PROFILE_OPERATION_POLICY[operation], 'TEST_APPROVED_WRITE')))
-      .toEqual(['LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE']);
+      .toEqual(['LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
+    // T43c: 入口の確かめの行は、公開のモード × `NONE`、テストの 2 つのモード × ログインを使う方式（`NONE` は方式の理由で拒む）。
+    expect(PROFILE_OPERATION_POLICY.ENTRY_CHECK).toEqual({
+      PUBLIC_PASSIVE: ['NONE'],
+      TEST_AUTH_PASSIVE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
+      TEST_APPROVED_WRITE: ['MANUAL_SESSION', 'AUTOMATED_LOGIN'],
+    });
+    expect(profileOperationRejectionOf('ENTRY_CHECK', 'TEST_AUTH_PASSIVE', 'NONE')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
+    expect(profileOperationRejectionOf('ENTRY_CHECK', 'PUBLIC_PASSIVE', 'MANUAL_SESSION')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
     // シナリオと書き込みを許すのは、書き込みのモードだけ。書き込みは、ログインを使う方式だけ（公開の方式 `NONE` は、方式の理由で拒む）。
     expect(Object.keys(PROFILE_OPERATION_POLICY.SCENARIO)).toEqual(['TEST_APPROVED_WRITE']);
     for (const write of ['WRITE_CREATE', 'WRITE_UPDATE'] as const) {
@@ -156,6 +167,10 @@ describe('profile operations by mode (T28b)', () => {
     expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('DISCOVERY', mode))).toEqual([false, true, true]);
     expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('LOGIN_CHECK', mode))).toEqual([false, true, true]);
     expect(operationRequiresAuthSetup('DISCOVERY', 'constructor')).toBe(false);
+    // T43c: 入口の確かめは、ログインをしないので、どのモードでも認証の設定が要らない（閉じた一覧 `AUTH_SETUP_FREE_OPERATIONS`）。
+    expect(AUTH_SETUP_FREE_OPERATIONS).toEqual(['ENTRY_CHECK']);
+    expect(Object.isFrozen(AUTH_SETUP_FREE_OPERATIONS)).toBe(true);
+    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('ENTRY_CHECK', mode))).toEqual([false, false, false]);
   });
 
   // 判定を owner の外に書き直さない（Gate。コメントと文字列の外の本文で、モードの値の文字列を比べない）。

@@ -57,6 +57,7 @@ import {
   type DiscoverySite,
   type DiscoverySiteRequest,
 } from '../../../tests/helpers/discovery-site-fixture.js';
+import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { WORKER_PARENT_MESSAGE_RECORD, WORKER_RECORD_FILES } from './helpers/auth-worker.ts';
 import {
   JOB_TIMEOUT_MS,
@@ -86,8 +87,6 @@ const NAVIGATION_INTERVAL_MS = 3_000;
  * `SERVER_ARRIVAL_DELAY_TOLERANCE_MS` と同じ根拠の値）。
  */
 const SERVER_ARRIVAL_DELAY_TOLERANCE_MS = 0;
-/** GET と HEAD。 */
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 /** 一時の root の検索で読まないフォルダ（リポジトリの `node_modules` への junction）。 */
 const SKIPPED_DIRECTORY_NAMES = Object.freeze(['node_modules']);
 /** ログインの段の着地（管理画面の HTML の 1 つ目）は、発見と READ の読み込みに数えない。 */

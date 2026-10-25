@@ -401,6 +401,10 @@ describe('C8: incomplete reason codes', () => {
     'LAYOUT_COMPARISON_LIMIT_REACHED',
     'RESOURCE_LIMIT_REACHED',
     'INVALID_BROWSER_DATA',
+    // DEF-129: ページが始めた main frame の読み込みを上限で止めたビューポート。
+    'PAGE_NAVIGATION_LIMIT_REACHED',
+    // DEF-130-fix: ページが出す文書でない要求を上限で止めたビューポート。
+    'PAGE_SUBRESOURCE_LIMIT_REACHED',
     'PREFLIGHT_FAILED',
     // P18d（DEF-009）: Run のディレクトリを作れなかった（同じ名前のものがすでにある場合を含む）。Run Status の入力は `preflightFailed`。
     'RUN_DIRECTORY_UNAVAILABLE',
@@ -432,6 +436,8 @@ describe('C8: incomplete reason codes', () => {
     'SITE_UNAVAILABLE',
     // T25c（Task 25 の設計書 4.3）: 認証つきの Run で、セッションの切れを検知したため、そのページを監査せず、その後の監査を始めなかった。
     'AUTH_SESSION_LOST',
+    // T35a（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いたため、その後の監査を始めなかった。
+    'SERVICE_REQUEST_LIMIT_REACHED',
   ] as const;
 
   it('defines one frozen closed list that covers collector partial reasons and every Run Status input', () => {
@@ -634,8 +640,8 @@ describe('C8: evidence payload types', () => {
     }
     const ledgerSource = await readFile(join(repositoryRoot, 'src/safety/safety-ledger.ts'), 'utf8');
     expect(ledgerSource).toContain("from '../core/evidence-types.js'");
-    // snapshot の型は、Evidence の項目を並べ直さず、Evidence の型から導く。
-    expect(ledgerSource).toMatch(/^export interface SafetyLedgerSnapshot extends Omit<SafetyEventsEvidence, 'scope'> \{$/mu);
+    // snapshot の型は、Evidence の項目を並べ直さず、Evidence の型から導く（BN-a: 読み込みの印 `load` は Evidence だけの項目）。
+    expect(ledgerSource).toMatch(/^export interface SafetyLedgerSnapshot extends Omit<SafetyEventsEvidence, 'scope' \| 'load'> \{$/mu);
   });
 
   it('defines the closed lists of the safety Evidence scopes and the Interaction rejection reasons once (T12d0)', () => {
@@ -662,7 +668,7 @@ describe('C8: evidence payload types', () => {
   // C16e（Task 14〜17 の設計書 6.1.10）: Safety の事象の記録の種類の値の一覧は、core が持つ。
   it('defines the closed list of the Safety event kinds once, as the event lists of SafetyEventsEvidence, in their order (C16e)', () => {
     // 実行時の検査: 空の Safety Ledger から作った記録の、配列の項目（記録の項目の順）と一致する。
-    const empty = safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE');
+    const empty = safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' });
     const eventListNames = Object.entries(empty)
       .filter(([, value]) => Array.isArray(value))
       .map(([name]) => name);
@@ -945,7 +951,8 @@ describe('F12: types derived from the core value arrays', () => {
     expectTypeOf<CoreEvidence.BlockedAuditExclusionEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_AUDIT_EXCLUSION_REASONS>>();
     // DEF-040（DEF-039・DEF-040 の設計書 2.2。NP3）: Worker の中の WebSocket を CSP で止めた理由は、Passive と凍結の後の両方の一覧にある。
-    expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>().toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY'>();
+    // AS-c: 監査の段の送信の扱いで通せる接続の上限を超えた理由（`AUDIT_SEND_OVER_LIMIT`）を加えた。
+    expectTypeOf<CoreEvidence.BlockedWebSocketEvent['reason']>().toEqualTypeOf<'PASSIVE_WEBSOCKET' | 'WORKER_CONNECT_POLICY' | 'AUDIT_SEND_OVER_LIMIT'>();
     // DEF-039・DEF-040 の設計書 2.1.3: 操作中に遮断したリクエストの理由は、Guard の遮断と出口の中継の拒否を区別する閉じた一覧。
     expectTypeOf<CoreEvidence.BlockedInteractionRequestEvent['reason']>()
       .toEqualTypeOf<ValueOf<typeof CoreEvidence.BLOCKED_INTERACTION_REQUEST_REASONS>>();
@@ -972,12 +979,22 @@ describe('F12: types derived from the core value arrays', () => {
   it('keeps the values of the Safety Ledger event reasons as frozen arrays (T12d0)', async () => {
     const coreEvidence = await import('../../src/core/evidence-types.js');
     const reasonLists = {
-      BLOCKED_REQUEST_REASONS: ['NON_READ_METHOD'],
+      // T35a（Task 35 の設計書 3.4）: `SERVICE_REQUEST_LIMIT_REACHED` は、承認したサービスの Origin への要求の上限で止めた理由。
+      // T35R-fix（T35R の C-1）: `SERVICE_ORIGIN_REVISIT` は、幅の走査と Interaction の読み込みで承認したサービスの Origin へ送らなかった理由。
+      // DEF-129: `PAGE_NAVIGATION_LIMIT_REACHED` は、ページが始めた main frame の読み込みの上限で止めた理由。
+      // DEF-130-fix: `PAGE_SUBRESOURCE_LIMIT_REACHED` は、ページが出す文書でない要求の数の上限で止めた理由。
+      // AS-a: `AUDIT_SEND_OVER_LIMIT` は、監査の段の送信の扱いで、1 つの読み込みで通す数の上限で止めた理由。
+      BLOCKED_REQUEST_REASONS: [
+        'NON_READ_METHOD', 'SERVICE_REQUEST_LIMIT_REACHED', 'SERVICE_ORIGIN_REVISIT', 'PAGE_NAVIGATION_LIMIT_REACHED', 'PAGE_SUBRESOURCE_LIMIT_REACHED',
+        'AUDIT_SEND_OVER_LIMIT',
+        // T44R の I-1: ページを離れた後の要求の上限と、離れた後の文書の読み込み。
+        'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+      ],
       BLOCKED_NAVIGATION_REASONS: ['EXTERNAL_MAIN_FRAME_NAVIGATION'],
       // T25b round 1: 監査の段の除外で遮断した要求の理由（`blockedAuditExclusions` の中だけで使う）。
       BLOCKED_AUDIT_EXCLUSION_REASONS: ['AUDIT_EXCLUDED_URL'],
       // DEF-040（NP3）: `WORKER_CONNECT_POLICY` は、Worker の中の WebSocket を CSP で止めた理由。
-      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY'],
+      BLOCKED_WEBSOCKET_REASONS: ['PASSIVE_WEBSOCKET', 'WORKER_CONNECT_POLICY', 'AUDIT_SEND_OVER_LIMIT'],
       INTERACTION_FROZEN_REASONS: ['INTERACTION_FROZEN'],
       // DEF-085: `GUARD_BYPASS_EGRESS` は、Guard を通らずに出ようとした要求を、すべての Guard の Context の中継が拒んだ理由。
       BLOCKED_INTERACTION_REQUEST_REASONS: ['INTERACTION_FROZEN', 'INTERACTION_FROZEN_EGRESS', 'EGRESS_UPSTREAM_DENIED', 'GUARD_BYPASS_EGRESS'],
@@ -1051,7 +1068,8 @@ describe('P14a: page audit contracts', () => {
   it('carries the detail of the first site unavailability outside the page result (site unavailability design 3.1, 3.2)', () => {
     expectTypeOf<PageAuditOutcome['siteUnavailableDetail']>().toEqualTypeOf<string | null>();
     expectTypeOf<keyof PageAuditOutcome>()
-      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'navigationDiagnostics'>();
+      // DEF-138: セッションの切れの証拠（`authSessionLoss`）も、Page の結果の外に持つ。
+      .toEqualTypeOf<'result' | 'safety' | 'siteUnavailableDetail' | 'authSessionLostDetail' | 'authSessionLoss' | 'navigationDiagnostics'>();
     expectTypeOf<PageAuditResult>().not.toHaveProperty('siteUnavailableDetail');
   });
 
@@ -1119,7 +1137,12 @@ describe('P14a: page audit contracts', () => {
 
   // P18b（CC-015）: 不変条件の違反の型は、core のこの1つだけ。形は `code` と `message` の文字列で、JSON の形を変えない。
   it('keeps one core shape of an invariant violation for the page and run summaries (P18b, CC-015)', () => {
-    expectTypeOf<SafetyInvariantViolationSummary>().toEqualTypeOf<{ readonly code: string; readonly message: string }>();
+    // DEF-144: 違反に結びつく要求（method・Origin・path）を、任意の項目として持つ。
+    expectTypeOf<SafetyInvariantViolationSummary>().toEqualTypeOf<{
+      readonly code: string;
+      readonly message: string;
+      readonly request?: { readonly method: string; readonly origin: string | null; readonly path: string };
+    }>();
     expectTypeOf<RunSafetySummary['invariantViolations']>().toEqualTypeOf<readonly SafetyInvariantViolationSummary[]>();
     // @ts-expect-error 違反には `code` が要る。
     const missingCode: SafetyInvariantViolationSummary = { message: 'missing code' };

@@ -11,7 +11,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ACTION_BLOCK_REASONS, MAX_SUBMITTED_VALUE_LENGTH, SUBMISSION_STATES } from '../../src/control/actions/action-contracts.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   PARENT_TO_WORKER_MESSAGE_TYPES,
   WORKER_PROTOCOL_VERSION,
@@ -36,7 +37,7 @@ const RULE_DIGEST = `sha256:${'c'.repeat(64)}`;
 const SCHEMA = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as Record<string, unknown>;
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-write',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -88,7 +89,8 @@ const withWrite = (overrides: Record<string, unknown>): Record<string, unknown> 
 describe('T30e: the write job messages and lists', () => {
   it('raises the protocol version and adds the message types at the end of each direction', () => {
     expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/2');
-    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual(['START', 'STOP', 'WRITE_RECHECK_RESULT']);
+    // ML-a: 「ログインを終えた」（`LOGIN_CONFIRMED`）を、親 → 子の最後に足した。FM2d: まとめて実行の `NEXT_STAGE`・`CHAIN_END` を、その後に足した。
+    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual(['START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END']);
     expect(WORKER_TO_PARENT_MESSAGE_TYPES.slice(-2)).toEqual(['WRITE_RECHECK_REQUEST', 'WRITE_SUBMISSION']);
     expect(WORKER_WRITE_CREATE_JOB_KIND).toBe('WRITE_CREATE');
     expect(WORKER_WRITE_RECHECK_REJECTION_REASONS).toEqual(['GRANT_INVALID', 'FACTS_UNAVAILABLE', 'RECHECK_REPEATED']);
@@ -141,6 +143,10 @@ describe('T30e: START of a write job', () => {
     ['a null verification item', { verification: { ...(write().verification as object), recordId: null } }],
     ['a verification READ with a secret-like parameter', { readVerification: { ...(write().readVerification as object),
       definition: { targetIdentityDigest: DIGEST, parameters: { password: 'x' }, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
+    // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない（対象の画面が path と同じでも拒む）。
+    ['a verification READ of a page path', { readVerification: { ...(write().readVerification as object),
+      targetPage: { origin: ORIGIN, path: '/members' },
+      definition: { targetPagePath: '/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
     // T30f（Blocker 1 の案 A）: プロファイルと seed の記録は必須で、seed の入力のプロファイル・シナリオ・版・許可は、書き込みの指定と同じ。
     ['no profile id', { profileId: undefined }],
     ['a bad profile id', { profileId: 'Profile 1' }],

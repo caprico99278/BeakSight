@@ -14,6 +14,7 @@ import { closeControlDatabase, openControlDatabase, type ControlDatabase } from 
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, getProfile, listProfiles } from '../../src/control/store/profile-store.js';
 import { getStoreStatus } from '../../src/control/store/store-status.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 import {
   CHILD_PROFILE_ID,
   CHILD_PROTOCOL,
@@ -25,12 +26,12 @@ import {
   spawnTypeScriptChild,
 } from './control-profile-fixtures.js';
 
-/** 同時の更新を繰り返す回数。 */
-const CONCURRENT_UPDATE_ROUNDS = 5;
-/** 書き込みのトランザクションの途中で強制終了する回数。 */
-const HELD_TRANSACTION_KILL_ROUNDS = 3;
-/** 更新を繰り返す子 process を、任意の時に強制終了する回数。 */
-const LOOP_KILL_ROUNDS = 3;
+/** 同時の更新を繰り返す回数（値は `test-rounds.ts`。TS-b のふだんの組と全部の組）。 */
+const CONCURRENT_UPDATE_ROUNDS = roundsOf('profileConcurrentUpdate');
+/** 書き込みのトランザクションの途中で強制終了する回数（値は `test-rounds.ts`）。 */
+const HELD_TRANSACTION_KILL_ROUNDS = roundsOf('profileHeldTransactionKill');
+/** 更新を繰り返す子 process を、任意の時に強制終了する回数（値は `test-rounds.ts`）。 */
+const LOOP_KILL_ROUNDS = roundsOf('profileLoopKill');
 /** 任意の時の強制終了の前に、子 process が終えるのを待つ更新の回数（少なくとも 1 回は書いてから止める）。 */
 const LOOP_UPDATES_BEFORE_KILL = 3;
 /** 子 process の 1 行の応答を待つ上限（ミリ秒）。busy の待ち（5 秒）より長く。 */

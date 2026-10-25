@@ -1,7 +1,8 @@
 /**
  * 書き込みの送信の送り手（DEF-099 fix。Task 30 の設計書 11 章の DEF-099 の行。owner）。書き込みの段の承認の POST を、ブラウザの通信の層ではなく
  * BeakSight が 1 回だけ送る（Chromium は、応答の 1 バイトも返さずに接続が切れると POST を自動で送り直すため。DEF-099 の調査）。呼ぶのは Guard の
- * 書き込みの段だけ（`passive-request-guard.ts`。Gate `write-stage-boundary` の (e)(f)）。
+ * 書き込みの段と、AS-c fix round 1（I-1）から監査の段の送信の扱いのほかの Origin への CORS の事前確認（`PREFLIGHT`）だけ（`passive-request-guard.ts`。
+ * Gate `write-stage-boundary` の (e)(f)）。
  *
  * - 中継（egress proxy）を通して送る。接続するのは引数の中継（`proxy`）だけ（直接の接続はしない）。http は absolute-form の要求、https は
  *   中継への `CONNECT` の上で TLS を張る。再試行しない。redirect を追わない（30x はそのまま返す）。
@@ -13,7 +14,9 @@
  * - ヘッダ: 呼び出し側（一時停止の要求）のヘッダをそのまま使い、通信の層の値を付け直す（`WRITE_SUBMISSION_ADDED_HEADER_NAMES`）: Host、
  *   Content-Length、`Connection: close`、`Accept-Encoding`（展開できる形だけ）、同じ Origin のトップのナビゲーションのフォームの送信の閉じた値
  *   （`Sec-Fetch-Site`・`Sec-Fetch-Mode`・`Sec-Fetch-Dest`・`Sec-Fetch-User`。`Origin` が送信先の Origin と違えば `Sec-Fetch-Site: cross-site`）、
- *   `Accept-Language`（Context の locale。呼び出し側にあればそのまま）。ホップごとのヘッダと中継のヘッダは送らない。
+ *   `Accept-Language`（Context の locale。呼び出し側にあればそのまま）。ホップごとのヘッダと中継のヘッダは送らない。T39c: API のシナリオの書き込み
+ *   （`requestKind: 'FETCH'`）は、ページのスクリプトの fetch の閉じた値（`Sec-Fetch-Mode: cors`・`Sec-Fetch-Dest: empty`、`Sec-Fetch-User` なし）で、
+ *   `POST` と `PATCH` を送る（`WRITE_SUBMISSION_REQUEST_KINDS`）。`Authorization` などのヘッダは一時停止の要求のまま送り、記録しない。
  * - 応答: gzip・deflate・br を展開して返す（`Content-Encoding` と `Content-Length` と、ホップごとのヘッダを残さない。展開できない形は、そのままの
  *   本文で `Content-Encoding` を外す）。Set-Cookie などの重なるヘッダは、受けた順に保つ。本文と展開の上限は `WRITE_SUBMISSION_MAX_RESPONSE_BYTES`。
  * - HTTP/1.1 の要求の bytes は自分で書き、応答は自分で読む（`HttpResponseReader`。status の行、ヘッダ、`Content-Length`・`chunked`・接続の閉じで
@@ -25,7 +28,8 @@
 import { connect as netConnect, isIP, type Socket } from 'node:net';
 import { connect as tlsConnect, getCACertificates, type TLSSocket } from 'node:tls';
 import { brotliDecompressSync, gunzipSync, inflateRawSync, inflateSync } from 'node:zlib';
-import { hasAllowedOrigin } from './request-policy.js';
+import { API_WRITE_METHODS } from '../core/api-request-shape.js';
+import { SUBMISSION_POST_METHOD as FORM_SUBMISSION_METHOD, hasAllowedOrigin } from './request-policy.js';
 
 /** 送ってから応答を受け終わるまでの上限（ms。中継への接続から数える。自動ログインの結果を待つ時間と同じ 30 秒）。 */
 export const WRITE_SUBMISSION_TIMEOUT_MS = 30_000;
@@ -77,6 +81,36 @@ export type WriteSubmissionOutcome =
   | { readonly kind: 'NOT_WRITTEN'; readonly reason: WriteSubmissionNotWrittenReason }
   | { readonly kind: 'NO_RESPONSE'; readonly reason: WriteSubmissionNoResponseReason };
 
+/**
+ * 送る要求の形の閉じた一覧（T39c。Task 39 の設計書 3.4）。
+ * - `FORM_NAVIGATION`: 同じ Origin のトップのナビゲーションのフォームの送信（Task 30〜32 の form の書き込み）。`POST` だけ。`Sec-Fetch-Mode: navigate`・
+ *   `Sec-Fetch-Dest: document`・`Sec-Fetch-User: ?1`。
+ * - `FETCH`: ページのスクリプトの fetch（API のシナリオの書き込み）。`POST`・`PATCH`（`API_WRITE_METHODS`。書かれたままの形）。`Sec-Fetch-Mode: cors`・
+ *   `Sec-Fetch-Dest: empty`、`Sec-Fetch-User` を付けない。
+ * - `PREFLIGHT`（AS-c fix round 1 の I-1。監査の段の送信の扱いの設計書 5 章の「AS-c fix round 1 の Blocker」の行）: CORS の事前確認。`OPTIONS` だけで、
+ *   本文は空。`Sec-Fetch-Mode: cors`・`Sec-Fetch-Dest: empty`、`Sec-Fetch-User` を付けない。資格情報を付けないため、一時停止の要求のヘッダのうち、事前確認の
+ *   ヘッダ（`PREFLIGHT_REQUEST_HEADER_NAMES`）だけを送る（`Cookie`・`Authorization` などは送らない）。
+ * どれも `Sec-Fetch-Site` は、`Origin` が送信先の Origin と同じなら `same-origin`、違えば `cross-site`（同じサイトの別の Origin の `same-site` は
+ * 見分けない限界）。
+ */
+export const WRITE_SUBMISSION_REQUEST_KINDS = Object.freeze(['FORM_NAVIGATION', 'FETCH', 'PREFLIGHT'] as const);
+
+/** AS-c fix round 1（I-1）: 事前確認で送る、一時停止の要求のヘッダ（小文字で比べる。資格情報のヘッダは含めない）。 */
+export const PREFLIGHT_REQUEST_HEADER_NAMES = Object.freeze([
+  'origin',
+  'access-control-request-method',
+  'access-control-request-headers',
+  'access-control-request-private-network',
+  'accept',
+  'user-agent',
+  'referer',
+  'accept-language',
+] as const);
+
+/** AS-c fix round 1（I-1）: 事前確認の method。 */
+export const PREFLIGHT_METHOD = 'OPTIONS';
+export type WriteSubmissionRequestKind = (typeof WRITE_SUBMISSION_REQUEST_KINDS)[number];
+
 /** 送る要求（Guard が照合した、同じ本文の bytes）。 */
 export interface WriteSubmissionRequest {
   readonly url: string;
@@ -84,6 +118,8 @@ export interface WriteSubmissionRequest {
   /** 一時停止の要求のヘッダ（名前と値）。 */
   readonly headers: Readonly<Record<string, string>>;
   readonly body: Buffer;
+  /** 要求の形（T39c。省略は `FORM_NAVIGATION`。今までの呼び出しのまま）。 */
+  readonly requestKind?: WriteSubmissionRequestKind | undefined;
 }
 
 /** 送り手の指定。 */
@@ -131,9 +167,17 @@ const ACCEPT_ENCODING = 'gzip, deflate, br';
 /** 同じ Origin のトップのナビゲーションのフォームの送信の、`Sec-Fetch-*` の閉じた値。 */
 const SEC_FETCH_SAME_ORIGIN = 'same-origin';
 const SEC_FETCH_CROSS_SITE = 'cross-site';
-const SEC_FETCH_MODE = 'navigate';
-const SEC_FETCH_DEST = 'document';
-const SEC_FETCH_USER = '?1';
+/** 要求の形ごとの `Sec-Fetch-Mode`・`Sec-Fetch-Dest`・`Sec-Fetch-User`（null は付けない）と、送ってよい method（T39c）。 */
+const REQUEST_KIND_SHAPES: Readonly<Record<WriteSubmissionRequestKind, {
+  readonly mode: string;
+  readonly dest: string;
+  readonly user: string | null;
+  readonly methods: readonly string[];
+}>> = Object.freeze({
+  FORM_NAVIGATION: Object.freeze({ mode: 'navigate', dest: 'document', user: '?1', methods: Object.freeze([FORM_SUBMISSION_METHOD]) }),
+  FETCH: Object.freeze({ mode: 'cors', dest: 'empty', user: null, methods: API_WRITE_METHODS }),
+  PREFLIGHT: Object.freeze({ mode: 'cors', dest: 'empty', user: null, methods: Object.freeze([PREFLIGHT_METHOD]) }),
+});
 
 /** 送らないヘッダ（小文字。ホップごと、中継、送り手が付け直すもの）。 */
 const DROPPED_REQUEST_HEADERS: ReadonlySet<string> = new Set([
@@ -149,7 +193,6 @@ const DROPPED_RESPONSE_HEADERS: ReadonlySet<string> = new Set([
 const HTTP_PROTOCOL = 'http:';
 const HTTPS_PROTOCOL = 'https:';
 const DEFAULT_PORTS: Readonly<Record<string, number>> = Object.freeze({ [HTTP_PROTOCOL]: 80, [HTTPS_PROTOCOL]: 443 });
-const POST_METHOD = 'POST';
 const CONNECT_ESTABLISHED_STATUS = /^HTTP\/1\.[01] 2\d\d(?: |\r)/u;
 const HEADER_END = '\r\n\r\n';
 
@@ -158,9 +201,14 @@ function submissionHeadersOf(request: WriteSubmissionRequest, url: URL, acceptLa
   const headers: Record<string, string> = {};
   let origin: string | undefined;
   let hasAcceptLanguage = false;
+  const preflight = requestKindOf(request) === 'PREFLIGHT';
   for (const [name, value] of Object.entries(request.headers)) {
     const lower = name.toLowerCase();
     if (typeof value !== 'string' || DROPPED_REQUEST_HEADERS.has(lower)) {
+      continue;
+    }
+    // AS-c fix round 1（I-1）: 事前確認は、事前確認のヘッダだけを送る（資格情報を付けない）。
+    if (preflight && !(PREFLIGHT_REQUEST_HEADER_NAMES as readonly string[]).includes(lower)) {
       continue;
     }
     if (lower === 'origin') {
@@ -172,7 +220,10 @@ function submissionHeadersOf(request: WriteSubmissionRequest, url: URL, acceptLa
     headers[name] = value;
   }
   headers['Host'] = url.host;
-  headers['Content-Length'] = String(request.body.length);
+  // 事前確認は本文を持たないので、`Content-Length` を付けない（ブラウザの事前確認と同じ形）。
+  if (!preflight) {
+    headers['Content-Length'] = String(request.body.length);
+  }
   headers['Connection'] = 'close';
   headers['Accept-Encoding'] = ACCEPT_ENCODING;
   if (!hasAcceptLanguage && acceptLanguage !== null && acceptLanguage.length > 0) {
@@ -180,11 +231,19 @@ function submissionHeadersOf(request: WriteSubmissionRequest, url: URL, acceptLa
   }
   // Origin の比べは、要求の判定の owner の許可 Origin の判定（`hasAllowedOrigin`。同じ正規化）を、`Origin` の 1 つだけの集合で使う。
   headers['Sec-Fetch-Site'] = origin === undefined || hasAllowedOrigin(url.href, new Set([origin])) ? SEC_FETCH_SAME_ORIGIN : SEC_FETCH_CROSS_SITE;
-  headers['Sec-Fetch-Mode'] = SEC_FETCH_MODE;
-  headers['Sec-Fetch-Dest'] = SEC_FETCH_DEST;
-  headers['Sec-Fetch-User'] = SEC_FETCH_USER;
+  // T39c: 要求の形ごとの閉じた値（fetch の形は `Sec-Fetch-User` を付けない）。
+  const shape = REQUEST_KIND_SHAPES[requestKindOf(request)];
+  headers['Sec-Fetch-Mode'] = shape.mode;
+  headers['Sec-Fetch-Dest'] = shape.dest;
+  if (shape.user !== null) {
+    headers['Sec-Fetch-User'] = shape.user;
+  }
   return headers;
 }
+
+/** 要求の形（省略は `FORM_NAVIGATION`。閉じた一覧の外の値は、送る前の確かめで `REQUEST_INVALID` になる）。 */
+const requestKindOf = (request: WriteSubmissionRequest): WriteSubmissionRequestKind =>
+  request.requestKind ?? 'FORM_NAVIGATION';
 
 /** 応答の本文を展開する（`Content-Encoding` の逆順）。展開できなければ null。 */
 function decodedBodyOf(body: Buffer, contentEncoding: string | undefined): Buffer | null {
@@ -460,8 +519,8 @@ class HttpResponseReader {
 }
 
 /** 要求の bytes（要求の行、ヘッダ、本文）。CR・LF を含むヘッダは送らない。 */
-const requestBytesOf = (target: string, headers: Readonly<Record<string, string>>, body: Buffer): Buffer => {
-  const lines = [`${POST_METHOD} ${target} HTTP/1.1`];
+const requestBytesOf = (method: string, target: string, headers: Readonly<Record<string, string>>, body: Buffer): Buffer => {
+  const lines = [`${method} ${target} HTTP/1.1`];
   for (const [name, value] of Object.entries(headers)) {
     if (!/[\r\n]/u.test(name) && !/[\r\n]/u.test(value)) {
       lines.push(`${name}: ${value}`);
@@ -497,8 +556,10 @@ export function sendWriteSubmissionOnce(
   } catch {
     return Promise.resolve(Object.freeze({ kind: 'NOT_WRITTEN', reason: 'REQUEST_INVALID' }));
   }
-  if ((url.protocol !== HTTP_PROTOCOL && url.protocol !== HTTPS_PROTOCOL) || request.method.toUpperCase() !== POST_METHOD
-    || !Buffer.isBuffer(request.body)) {
+  // T39c: method は、要求の形の閉じた一覧（form は `POST`、fetch は `POST`・`PATCH`）と書かれたままの形で一致すること。形が一覧の外なら送らない。
+  const kind = requestKindOf(request);
+  if ((url.protocol !== HTTP_PROTOCOL && url.protocol !== HTTPS_PROTOCOL) || !(WRITE_SUBMISSION_REQUEST_KINDS as readonly unknown[]).includes(kind)
+    || !REQUEST_KIND_SHAPES[kind].methods.includes(request.method) || !Buffer.isBuffer(request.body)) {
     return Promise.resolve(Object.freeze({ kind: 'NOT_WRITTEN', reason: 'REQUEST_INVALID' }));
   }
   const tls = url.protocol === HTTPS_PROTOCOL;
@@ -579,7 +640,7 @@ export function sendWriteSubmissionOnce(
         // 受け口の失敗は、送る処理と結果を変えない。
       }
       written = true;
-      connection.write(requestBytesOf(target, headers, request.body));
+      connection.write(requestBytesOf(request.method, target, headers, request.body));
     };
 
     let proxySocket: Socket;

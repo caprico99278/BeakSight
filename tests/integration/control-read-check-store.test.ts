@@ -26,6 +26,7 @@ import {
   type NewReadCheck,
   type ReadCheckResultInput,
 } from '../../src/control/job/read-check-store.js';
+import { readCheckFactsIn } from '../../src/control/approval/scenario-facts.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { withReadTransaction } from '../../src/control/store/transaction.js';
@@ -260,7 +261,8 @@ describe('the READ check records and secrets (design 4.5, 4.8)', () => {
   it('has no input for credentials, tokens or labels in the types', () => {
     expectTypeOf<keyof NewReadCheck>().toEqualTypeOf<'readCheckId' | 'profileId' | 'definition' | 'at'>();
     expectTypeOf<keyof ReadCheckResultInput>().toEqualTypeOf<'jobId' | 'readCheckId' | 'readCheckRevision' | 'result' | 'at'>();
-    expectTypeOf<keyof ReadCheckDefinition>().toEqualTypeOf<'targetIdentityDigest' | 'parameters' | 'expectations'>();
+    // T37d: 対象は、候補の識別の digest か画面の path のどちらか（どちらも資格情報の口ではない）。
+    expectTypeOf<keyof ReadCheckDefinition>().toEqualTypeOf<'targetIdentityDigest' | 'targetPagePath' | 'parameters' | 'expectations'>();
   });
 
   it('stores the values to send in plain text by design, and writes no marker given through any other property', () => {
@@ -290,5 +292,57 @@ describe('CCX-17: the reader of the READ checks inside a transaction', () => {
     }
     expect(withReadTransaction(database, (connection) => listReadChecksIn(connection, PROFILE_ID, { includeCanceled: true }))
       .map(({ readCheckId }) => readCheckId).sort()).toEqual(['read-1', 'read-2']);
+  });
+});
+
+// T37d（Task 37 の設計書 3.5）: 画面の path の定義（`targetPagePath`。送る値なし）も、同じ表に書いて読む（管理データの版 12 の列 `target_page_path`）。
+describe('T37d: READ check definitions of a page path', () => {
+  const PAGE_DEFINITION: ReadCheckDefinition = {
+    targetPagePath: '/admin/members',
+    parameters: {},
+    expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }, { kind: 'DETAIL_FIELD_EQUALS', field: '名前', value: 'example' }],
+  };
+
+  it('creates and reads a page path definition, and changes a candidate definition into a page path definition and back', () => {
+    expect(create('read-page', { definition: PAGE_DEFINITION })).toEqual({
+      ok: true,
+      readCheck: {
+        readCheckId: 'read-page', profileId: PROFILE_ID, definition: PAGE_DEFINITION, revision: 1, createdAt: CREATED_AT, updatedAt: CREATED_AT, canceledAt: null,
+      },
+    });
+    expect(readReadCheck(database, 'read-page')?.definition).toEqual(PAGE_DEFINITION);
+    expect(create('read-1').ok).toBe(true);
+    const changed = updateReadCheck(database, { readCheckId: 'read-1', expectedRevision: 1, definition: PAGE_DEFINITION, at: UPDATED_AT });
+    expect(changed.ok && changed.readCheck.definition).toEqual(PAGE_DEFINITION);
+    const back = updateReadCheck(database, { readCheckId: 'read-1', expectedRevision: 2, definition: DEFINITION, at: UPDATED_AT });
+    expect(back.ok && back.readCheck.definition).toEqual(DEFINITION);
+    // 作った時刻が同じなので、ID の順（`read-1`、`read-page`）。
+    expect(listReadChecks(database, PROFILE_ID).map(({ definition }) => definition)).toEqual([DEFINITION, PAGE_DEFINITION]);
+  });
+
+  it('rejects, before writing, a page path definition with values to send, both targets or a path that is not canonical', () => {
+    for (const definition of [
+      { ...PAGE_DEFINITION, parameters: { q: 'x' } },
+      { ...PAGE_DEFINITION, targetIdentityDigest: DIGEST },
+      { ...PAGE_DEFINITION, targetPagePath: '/admin/../members' },
+      { ...PAGE_DEFINITION, targetPagePath: '/admin?x=1' },
+    ]) {
+      expect(() => create('read-bad', { definition: definition as unknown as ReadCheckDefinition }), JSON.stringify(definition)).toThrow(RangeError);
+    }
+    expect(readReadCheck(database, 'read-bad')).toBeNull();
+  });
+
+  // T37d fix round 1: シナリオの下書きの確かめが使う定義の事実に、対象の種類が入る（画面の定義を照合の READ に選ぶことを拒むため）。
+  it('tells the target kind of each definition in the facts for the scenario drafts', () => {
+    expect(create('read-1').ok && create('read-page', { definition: PAGE_DEFINITION }).ok).toBe(true);
+    expect(withReadTransaction(database, (connection) => readCheckFactsIn(connection, PROFILE_ID))
+      .map(({ readCheckId, targetKind, parameterNames }) => [readCheckId, targetKind, parameterNames]))
+      .toEqual([['read-1', 'CANDIDATE', ['q']], ['read-page', 'PAGE', []]]);
+  });
+
+  it('records the results of a page path definition like the others', () => {
+    expect(create('read-page', { definition: PAGE_DEFINITION }).ok).toBe(true);
+    recordReadCheckResult(database, { jobId: 'job-1', readCheckId: 'read-page', readCheckRevision: 1, result: 'UNDETERMINED', at: RESULT_AT });
+    expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ readCheckId, result }) => [readCheckId, result])).toEqual([['read-page', 'UNDETERMINED']]);
   });
 });

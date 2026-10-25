@@ -83,6 +83,46 @@ describe('two-step shutdown of the local UI server', () => {
     expect(record.exits).toEqual([SHUTDOWN_EXIT_CODE]);
   });
 
+  it('DEF-146: records the reason of the end just before the exit (the running jobs at the start of the first step, and the immediate second step)', async () => {
+    const ends: unknown[] = [];
+    const exits: number[] = [];
+    let running = 2;
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolveHeld) => {
+      release = resolveHeld;
+    });
+    const options = {
+      runningJobCount: () => running,
+      text: TEXT,
+      log: () => undefined,
+      shutdownJobs: async () => {
+        await held;
+        running = 0;
+      },
+      closeServer: async () => undefined,
+      closeStore: () => undefined,
+      exit: (code: number) => {
+        exits.push(code);
+        ends.push(`exit:${code}`);
+      },
+      recordEnd: (reason: string | undefined, immediate: boolean, runningJobs: number) => ends.push({ reason, immediate, runningJobs }),
+    };
+    const first = createTwoStepShutdown<string>(options);
+    first('UI_CLOSED');
+    release();
+    await settle();
+    await settle();
+    expect(ends).toEqual([{ reason: 'UI_CLOSED', immediate: false, runningJobs: 2 }, `exit:${SHUTDOWN_EXIT_CODE}`]);
+
+    ends.splice(0);
+    running = 1;
+    const second = createTwoStepShutdown<string>(options);
+    second('CTRL_C');
+    second('CTRL_C');
+    expect(ends).toEqual([{ reason: 'CTRL_C', immediate: true, runningJobs: 1 }, `exit:${SHUTDOWN_EXIT_CODE}`]);
+    expect(exits.length).toBe(2);
+  });
+
   it('still closes and exits when the job shutdown fails', async () => {
     const { record, handler } = recorder(1, true);
     handler();

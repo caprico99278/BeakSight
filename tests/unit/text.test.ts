@@ -11,7 +11,9 @@ import {
   removeLoneSurrogates,
   replaceControlCharacters,
   replaceControlOrLineSeparators,
+  replaceLoneSurrogates,
   truncateText,
+  truncateWellFormed,
 } from '../../src/core/text.js';
 
 describe('normalizeWhitespace', () => {
@@ -128,6 +130,35 @@ describe('character classes (CCX-3)', () => {
       expect(replaceControlOrLineSeparators('a\u0000b\u2028c\u2029d\u202ee', ' ')).toBe('a b c d\u202ee');
       expect(removeBidiControls('a\u061cb\u200ec\u202ed\u2069e\u200bf')).toBe('abcde\u200bf');
       expect(removeLoneSurrogates('a\ud800b\u{1F600}c\udfff')).toBe('ab\u{1F600}c');
+    }
+  });
+
+  /** U+FFFD（置き換えの文字）。 */
+  const REPLACEMENT = String.fromCodePoint(0xfffd);
+  /** 試す文字列（対になっていないサロゲート、対になったサロゲート、対の前半だけが末尾に残る形）。 */
+  const WELL_FORMED_INPUTS = ['', 'abc', 'a\ud800b\u{1F600}c\udfff', '\udfff\ud800', '\u{1F600}\ud83d', 'x'.repeat(5) + '\u{1F600}'.repeat(3)];
+
+  it('replaces lone surrogates with U+FFFD like toWellFormed (PRE42-CC 組 4。CC-052・053 の残り)', () => {
+    for (const input of WELL_FORMED_INPUTS) {
+      expect(replaceLoneSurrogates(input)).toBe(input.toWellFormed());
+    }
+    expect(replaceLoneSurrogates('a\ud800b\u{1F600}c\udfff')).toBe(`a${REPLACEMENT}b\u{1F600}c${REPLACEMENT}`);
+  });
+
+  it('truncates to code units and replaces lone surrogates left by the cut (PRE42-CC 組 4)', () => {
+    // 切った位置で対が割れたら U+FFFD にする。元の文字列の中の、対になっていないサロゲートも U+FFFD にする。
+    expect(truncateWellFormed('ab\u{1F600}c', 3)).toBe(`ab${REPLACEMENT}`);
+    expect(truncateWellFormed('ab\u{1F600}c', 4)).toBe('ab\u{1F600}');
+    expect(truncateWellFormed('a\udfffbc', 3)).toBe(`a${REPLACEMENT}b`);
+    expect(truncateWellFormed('abc', 10)).toBe('abc');
+    expect(truncateWellFormed('abc', 0)).toBe('');
+    // `toWellFormed()` の後に切って、もう一度 `toWellFormed()` をかけた形（`worker-protocol.ts` の元の形）と同じになる。
+    const inputs = WELL_FORMED_INPUTS;
+    for (const input of inputs) {
+      for (let maxLength = 0; maxLength <= input.length + 1; maxLength += 1) {
+        expect(truncateWellFormed(input, maxLength)).toBe(input.slice(0, maxLength).toWellFormed());
+        expect(truncateWellFormed(input, maxLength)).toBe(input.toWellFormed().slice(0, maxLength).toWellFormed());
+      }
     }
   });
 });

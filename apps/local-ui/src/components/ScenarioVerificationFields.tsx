@@ -5,6 +5,7 @@
  * - 値は、ページの構造（path とセレクタ）と、欄の名前だけ。比べる値は、生成した値を送る欄の名前で指す（値を入力しない）。
  * - 画面の確かめは補助だけ。形と結び付けの確かめは、サーバの下書きの確かめ（`validateScenarioDraft`）が決め、誤りは項目の近くに出す。
  * - 文言は `src/presentation/` のカタログだけ。
+ * - T40a-fix: API のシナリオでは、成否の条件と入力の誤りの条件の欄を出さない（使わない。下書きにも null で送る）。
  */
 import type {
   RecordIdSource,
@@ -13,6 +14,15 @@ import type {
   VerificationExpectation,
   VerificationExpectationKind,
 } from '../../../../src/control/approval-view.js';
+// PRE42-CC 組 UI-K3（台帳の CC-113）: 照合の READ の期待の種類の一覧と値は、管理データに触れない純粋な core の owner から読む（書き写さない。
+// 文字列で比べない。Gate `browser-list-values` の (d)(e)）。
+import {
+  DETAIL_FIELD_EQUALS_EXPECTATION_KIND,
+  ROW_COUNT_EQUALS_EXPECTATION_KIND,
+  TEXT_CONTAINS_EXPECTATION_KIND,
+  VERIFICATION_EXPECTATION_KINDS,
+} from '../../../../src/core/read-check-expectation-kinds.js';
+import { recordIdPatternMatchesPagePath } from '../../../../src/core/record-id-path-pattern.js';
 import { formatInteger } from '../../../../src/presentation/format.js';
 import { LOCAL_UI_WRITE_TEXT } from '../../../../src/presentation/messages.js';
 import { readCheckExpectationKindDisplay, recordIdSourceDisplay, scenarioVerificationItemDisplay } from '../display/labels';
@@ -24,7 +34,7 @@ const text = LOCAL_UI_WRITE_TEXT;
 /** 登録の ID の取り方の選択肢（閉じた一覧の順）。 */
 const RECORD_ID_SOURCE_OPTIONS: readonly RecordIdSource[] = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT']);
 /** 照合の READ の期待の種類の選択肢（閉じた一覧の順）。 */
-const EXPECTATION_KIND_OPTIONS: readonly VerificationExpectationKind[] = Object.freeze(['ROW_COUNT_EQUALS', 'TEXT_CONTAINS', 'DETAIL_FIELD_EQUALS']);
+const EXPECTATION_KIND_OPTIONS: readonly VerificationExpectationKind[] = VERIFICATION_EXPECTATION_KINDS;
 /** 行の数の期待の既定。 */
 const DEFAULT_ROW_COUNT = '1';
 /** 未指定の選択肢の値。 */
@@ -61,11 +71,11 @@ const conditionStateOf = (condition: ScenarioResultCondition | null): ConditionS
 
 const expectationStateOf = (expectation: VerificationExpectation): ExpectationState => {
   switch (expectation.kind) {
-    case 'ROW_COUNT_EQUALS':
+    case ROW_COUNT_EQUALS_EXPECTATION_KIND:
       return { kind: expectation.kind, count: String(expectation.count), field: '', fieldName: '' };
-    case 'TEXT_CONTAINS':
+    case TEXT_CONTAINS_EXPECTATION_KIND:
       return { kind: expectation.kind, count: DEFAULT_ROW_COUNT, field: '', fieldName: expectation.fieldName };
-    case 'DETAIL_FIELD_EQUALS':
+    case DETAIL_FIELD_EQUALS_EXPECTATION_KIND:
       return { kind: expectation.kind, count: DEFAULT_ROW_COUNT, field: expectation.field, fieldName: expectation.fieldName };
   }
 };
@@ -92,21 +102,28 @@ const conditionInputOf = (condition: ConditionState): ScenarioResultCondition | 
 
 const expectationInputOf = (expectation: ExpectationState): Record<string, unknown> => {
   switch (expectation.kind) {
-    case 'ROW_COUNT_EQUALS':
+    case ROW_COUNT_EQUALS_EXPECTATION_KIND:
       return { kind: expectation.kind, count: NON_NEGATIVE_INTEGER.test(expectation.count) ? Number(expectation.count) : expectation.count };
-    case 'TEXT_CONTAINS':
+    case TEXT_CONTAINS_EXPECTATION_KIND:
       return { kind: expectation.kind, fieldName: expectation.fieldName };
-    case 'DETAIL_FIELD_EQUALS':
+    case DETAIL_FIELD_EQUALS_EXPECTATION_KIND:
       return { kind: expectation.kind, field: expectation.field, fieldName: expectation.fieldName };
   }
 };
 
-/** 入力の値を、下書きの検証の指定にする（形の確かめはサーバ）。 */
-export const verificationInputOf = (state: VerificationState, readChecks: readonly ScenarioReadCheckOptionView[]): Record<string, unknown> => {
+/**
+ * 入力の値を、下書きの検証の指定にする（形の確かめはサーバ）。T40a-fix: API のシナリオ（`api`）は、成否の条件と入力の誤りの条件を null にする
+ * （使わない。欄も出さない）。
+ */
+export const verificationInputOf = (
+  state: VerificationState,
+  readChecks: readonly ScenarioReadCheckOptionView[],
+  api = false,
+): Record<string, unknown> => {
   const readCheck = readChecks.find(({ readCheckId }) => readCheckId === state.readCheckId);
   return {
-    successCondition: conditionInputOf(state.success),
-    inputErrorCondition: conditionInputOf(state.inputError),
+    successCondition: api ? null : conditionInputOf(state.success),
+    inputErrorCondition: api ? null : conditionInputOf(state.inputError),
     recordId: state.recordSource === UNSET
       ? null
       : state.recordSource === 'URL_PATH_PATTERN'
@@ -156,7 +173,9 @@ function ConditionFields({ name, value, onChange }: Readonly<{
 }
 
 /** 検証の指定の入力（成功の条件、入力の誤りの条件、登録の ID の取り方、照合の READ）。 */
-export function ScenarioVerificationFields({ state, onChange, readChecks, fieldNames, errors }: Readonly<{
+export function ScenarioVerificationFields({
+  state, onChange, readChecks, fieldNames, errors, allowPageTemplate = false, api = false, writePagePath = null,
+}: Readonly<{
   state: VerificationState;
   onChange: (next: VerificationState) => void;
   readChecks: readonly ScenarioReadCheckOptionView[];
@@ -164,6 +183,15 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
   fieldNames: readonly string[];
   /** 検証の指定の誤りの説明（サーバの下書きの確かめ）。 */
   errors: readonly string[];
+  /** T38f: `{id}` つきの画面の path の READ の定義も選べるか（API のシナリオだけ。受けるかの判定はサーバの下書きの確かめ）。 */
+  allowPageTemplate?: boolean;
+  /** T40a-fix: API のシナリオか（成否の条件と入力の誤りの条件の欄を出さず、使わないことの説明を出す）。 */
+  api?: boolean;
+  /**
+   * T40R2-fix: 書き込みの画面の path（API のシナリオで、画面から ID を取る型がこの path にも当たれば注意を出す。保存は拒まない。判定は core の
+   * `recordIdPatternMatchesPagePath`）。
+   */
+  writePagePath?: string | null;
 }>) {
   const readCheck = readChecks.find(({ readCheckId }) => readCheckId === state.readCheckId);
   const recordDisplay = scenarioVerificationItemDisplay('recordId');
@@ -183,8 +211,12 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
       <p className="field-hint">{text.verificationNote}</p>
       {errors.length === 0 ? null : <p className="field-error" data-testid="scenario-verification-errors">{errors.join(' ')}</p>}
 
-      <ConditionFields name="successCondition" value={state.success} onChange={(success) => onChange({ ...state, success })} />
-      <ConditionFields name="inputErrorCondition" value={state.inputError} onChange={(inputError) => onChange({ ...state, inputError })} />
+      {api ? <p className="field-hint" data-testid="scenario-verification-api-note">{text.apiVerificationNote}</p> : (
+        <>
+          <ConditionFields name="successCondition" value={state.success} onChange={(success) => onChange({ ...state, success })} />
+          <ConditionFields name="inputErrorCondition" value={state.inputError} onChange={(inputError) => onChange({ ...state, inputError })} />
+        </>
+      )}
 
       <fieldset className="field-group" data-testid="scenario-verification-recordId">
         <legend className="field-group-heading">{recordDisplay.label}</legend>
@@ -206,6 +238,11 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
             )}
           </FieldFrame>
         )}
+        {/* T40R2-fix（使える度合い）: API のシナリオで、ID の型が書き込みの画面にも当たれば注意を出す（保存は拒まない）。 */}
+        {api && writePagePath !== null && state.recordSource === 'URL_PATH_PATTERN'
+          && recordIdPatternMatchesPagePath({ source: state.recordSource, pathPattern: state.recordValue }, writePagePath) ? (
+            <p className="field-hint" role="note" data-testid="scenario-verification-record-id-caution">{text.recordIdPatternCaution}</p>
+          ) : null}
       </fieldset>
 
       <fieldset className="field-group" data-testid="scenario-verification-readVerification">
@@ -217,7 +254,9 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
               <select id={id} name="readVerification-check" className="input" value={state.readCheckId} aria-describedby={describedBy}
                 onChange={(event) => onChange({ ...state, readCheckId: event.target.value, bindings: {} })}>
                 <option value={UNSET}>{text.readVerificationUnset}</option>
-                {readChecks.map(({ readCheckId, revision }) => (
+                {/* T37d fix round 1: 画面の path を読む定義は、照合の READ に使えないので出さない（サーバも拒む）。T38f: API のシナリオは、`{id}` つきの
+                    画面の path の定義も出す（結び付けは 0 件。`{id}` には台帳の ID が入る）。 */}
+                {readChecks.filter(({ verifiable, pageTemplate }) => verifiable || (allowPageTemplate && pageTemplate)).map(({ readCheckId, revision }) => (
                   <option key={readCheckId} value={readCheckId}>{text.readVerificationOption(readCheckId, formatInteger(revision))}</option>
                 ))}
               </select>
@@ -252,7 +291,7 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
                     </select>
                   )}
                 </FieldFrame>
-                {expectation.kind === 'ROW_COUNT_EQUALS' ? (
+                {expectation.kind === ROW_COUNT_EQUALS_EXPECTATION_KIND ? (
                   <FieldFrame label={text.expectationCount} errors={[]}>
                     {({ id, describedBy }) => (
                       <input id={id} name={`expectation-${String(index)}-count`} className="input" type="number" min={1} step={1} value={expectation.count}
@@ -261,7 +300,7 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
                   </FieldFrame>
                 ) : (
                   <>
-                    {expectation.kind === 'DETAIL_FIELD_EQUALS' ? (
+                    {expectation.kind === DETAIL_FIELD_EQUALS_EXPECTATION_KIND ? (
                       <FieldFrame label={text.expectationField} errors={[]}>
                         {({ id, describedBy }) => (
                           <input id={id} name={`expectation-${String(index)}-field`} className="input" type="text" value={expectation.field}
@@ -291,7 +330,7 @@ export function ScenarioVerificationFields({ state, onChange, readChecks, fieldN
               <button type="button" className="button" data-testid="scenario-verification-add-expectation"
                 onClick={() => onChange({
                   ...state,
-                  expectations: [...state.expectations, { kind: 'ROW_COUNT_EQUALS', count: DEFAULT_ROW_COUNT, field: '', fieldName: '' }],
+                  expectations: [...state.expectations, { kind: ROW_COUNT_EQUALS_EXPECTATION_KIND, count: DEFAULT_ROW_COUNT, field: '', fieldName: '' }],
                 })}>
                 {text.addExpectation}
               </button>

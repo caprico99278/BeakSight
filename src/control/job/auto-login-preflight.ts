@@ -8,7 +8,8 @@
 // - 自動ログインのプロファイルでない、ほかのプロファイルの入力、自動ログインの設定がない、などは呼び出し側の誤り（`RangeError`）。
 import type { AuthSetup } from '../auth/auth-setup-contracts.js';
 import { loginOriginOf } from '../auth/automated-login-results.js';
-import type { SiteProfile } from '../contracts.js';
+import { AUTOMATED_LOGIN_AUTH_STRATEGY, type SiteProfile } from '../contracts.js';
+import { CREDENTIAL_PROTECTION_AVAILABLE } from '../credentials/credential-platform.js';
 import type { CredentialMetadata, CredentialProtectionState } from '../credentials/credential-store.js';
 import type { AutoLoginLimitDecision } from './auto-login-limits.js';
 import type { AuditJobStartRejectionReason } from './job-records.js';
@@ -38,10 +39,8 @@ export type AutoLoginPreflightResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: AutoLoginPreflightRejectionReason; readonly nextAllowedAt: string | null };
 
-/** 自動ログインの方式。 */
-const AUTOMATED_LOGIN_STRATEGY = 'AUTOMATED_LOGIN' satisfies SiteProfile['auth'];
-/** 暗号化が使える状態。 */
-const PROTECTION_AVAILABLE = 'AVAILABLE' satisfies CredentialProtectionState;
+/** 自動ログインの方式（CC-108: 値は owner の `AUTOMATED_LOGIN_AUTH_STRATEGY`（`contracts.ts`）から読む）。 */
+const AUTOMATED_LOGIN_STRATEGY: SiteProfile['auth'] = AUTOMATED_LOGIN_AUTH_STRATEGY;
 
 const rejected = (reason: AutoLoginPreflightRejectionReason, nextAllowedAt: string | null = null): AutoLoginPreflightResult =>
   Object.freeze({ ok: false, reason, nextAllowedAt });
@@ -69,7 +68,7 @@ export const checkAutoLoginStart = (input: AutoLoginPreflightInput): AutoLoginPr
   if (credential.loginOrigin !== loginOrigin) {
     return rejected('CREDENTIAL_STALE');
   }
-  if (protection !== PROTECTION_AVAILABLE) {
+  if (protection !== CREDENTIAL_PROTECTION_AVAILABLE) {
     return rejected('CREDENTIAL_PROTECTION_UNAVAILABLE');
   }
   if (!limit.ok) {

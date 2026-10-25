@@ -16,6 +16,9 @@
  *   `COPIED_TEMPLATE_WORD_LIST_THRESHOLD`）。
  * - (f)（T29e）画面向けの公開し直し（`src/control/data-rules-view.ts`）は、`src/control/data-rules/` のものだけを公開し直し、定義の文を持たない
  *   （判断を持たない。`approval-ssot.test.ts` の (d) と同じ形）。
+ * - (g)（PRE42-CC 組 4。CC-082 1′）ASCII だけの語の判定（英語の語は語の単位、日本語の語は部分一致で比べるための振り分け）は、欄の名前の語の比べの
+ *   owner（`src/discovery/classify.ts`）の `isAsciiWord` だけに書く。`src/control/data-rules/` は、印字できる ASCII の範囲（`\x20-\x7e` など）を
+ *   書き写さず、それを import する。
  * - 判定は、`fs`、正規表現、文字列の走査だけ（`source-scan.ts` の共通の部品）。`src/**` の読み込みは、このファイルの読み込み時に 1 回だけ。
  *   1 秒以内に終える。
  */
@@ -32,13 +35,18 @@ import {
 } from '../../src/control/data-rules/business-templates.js';
 import {
   PLAYWRIGHT_PACKAGE_PATTERN,
+  countDefinitions,
   countIdentifier,
   findModuleSpecifiers,
   findTransitiveForbiddenReferences,
+  isPathUnder,
+  isPathUnderAny,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  pathReferenceCandidatesOf,
+  refersUnderAny,
   resolveRelativeSpecifier,
   scanSource,
+  sourceFileAt,
   type ScannedSource,
   type SourceFile,
 } from './source-scan.js';
@@ -53,9 +61,8 @@ const TEMPLATES_OWNER = 'src/control/data-rules/business-templates.ts';
 
 /** (a) `src/control/data-rules/` から参照しないディレクトリ。 */
 const FORBIDDEN_DIRECTORIES: readonly string[] = ['src/browser/', 'src/worker/', 'src/orchestration/'];
-const FORBIDDEN_PATH_TEXT = /(?:^|\/)src\/(?:browser|worker|orchestration)(?:\/|$)/u;
 
-const isForbiddenPath = (path: string): boolean => FORBIDDEN_DIRECTORIES.some((directory) => `${path}/`.startsWith(directory));
+const isForbiddenPath = (path: string): boolean => isPathUnderAny(path, FORBIDDEN_DIRECTORIES);
 
 /** (b)・(d) 語の一覧の owner（owner にだけ定義する名前、一覧の語、書き写しとみなす同じ語の文字列リテラルの種類の数）。 */
 interface WordListOwner {
@@ -120,30 +127,22 @@ const WORD_LIST_OWNERS: readonly WordListOwner[] = [EXTERNAL_WORD_OWNER, TEMPLAT
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** (a) `text`（指定子か相対パスのリテラル）が禁止の対象を指すか。 */
-const pointsToForbidden = (fromPath: string, text: string): boolean => {
-  const resolved = resolveRelativeSpecifier(fromPath, text);
-  if (resolved !== null) {
-    return isForbiddenPath(resolved);
-  }
-  return PLAYWRIGHT_PACKAGE_PATTERN.test(text) || FORBIDDEN_PATH_TEXT.test(text);
-};
+/**
+ * (a) `text`（指定子か文字列リテラル）が禁止の対象を指すか: Playwright の名前か、指す先（相対なら解決したパス、相対でなければ文字列の中の
+ * `src/` からのパス。`source-scan.ts` の `refersUnderAny`。PRE42-CC 組 G で最も広い形にそろえた）が禁止のフォルダの下か。
+ */
+const pointsToForbidden = (fromPath: string, text: string): boolean =>
+  PLAYWRIGHT_PACKAGE_PATTERN.test(text) || refersUnderAny(fromPath, text, FORBIDDEN_DIRECTORIES);
 
-/** (a) 禁止の対象を指す参照（指定子のすべてと、相対パス・Playwright の名前の文字列リテラル）。 */
+/** (a) 禁止の対象を指す参照（指定子のすべてと、相対パス・`src/` のパス・Playwright の名前の文字列リテラル）。 */
 const findForbiddenReferences = (path: string, source: ScannedSource): readonly string[] =>
-  moduleReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN, FORBIDDEN_PATH_TEXT]).filter((text) => pointsToForbidden(path, text));
+  pathReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => pointsToForbidden(path, text));
 
 /** (a) 実行時の import をたどった先の、禁止の対象（`<始まり> -> … -> <先>`）。 */
 const findTransitiveForbidden = (files: ReadonlyMap<string, ScannedSource>, starts: readonly string[]): readonly string[] =>
   findTransitiveForbiddenReferences(files, starts, isForbiddenPath, (specifier) => PLAYWRIGHT_PACKAGE_PATTERN.test(specifier));
 
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-
-/** (b) `bare` の中の `name` の定義の数（`function name`、`const`・`let`・`var` の `name =`・`name:`）。 */
-const countDefinitions = (bare: string, name: string): number => {
-  const escaped = escapeRegExp(name);
-  return [...bare.matchAll(new RegExp(`(?<![\\w$])(?:function\\s*\\*?\\s*${escaped}(?![\\w$])|(?:const|let|var)\\s+${escaped}\\s*[=:])`, 'gu'))].length;
-};
+// (b) 定義の数は `source-scan.ts` の `countDefinitions`（PRE42-CC 組 G。`class name` の定義も数える、最も広い形）。
 
 /** (b)・(d) owner の外の違反（`パス: 名前` か `パス: [語, …]`）: owner の名前の定義と、一覧の語の文字列リテラルの書き写し。 */
 const copiedWordListsOf = (
@@ -168,17 +167,35 @@ const dataRulesViewViolationsOf = (path: string, source: ScannedSource): readonl
   ...findModuleSpecifiers(source.code)
     .filter((specifier) => {
       const resolved = resolveRelativeSpecifier(path, specifier);
-      return resolved === null || !`${resolved}/`.startsWith(DATA_RULES_DIRECTORY);
+      return resolved === null || !isPathUnder(resolved, DATA_RULES_DIRECTORY);
     })
     .map((specifier) => `<${specifier}>`),
   ...(/(?<![\w$])(?:function|class|let|var)\s|(?<![\w$])const\s+[\w$]+\s*[=:]/u.test(source.bare) ? ['<definition>'] : []),
 ];
+
+/** (g) ASCII だけの語の判定の owner（PRE42-CC 組 4。CC-082 1′）と、その関数の名前。 */
+const ASCII_WORD_OWNER = 'src/discovery/classify.ts';
+const ASCII_WORD_FUNCTION = 'isAsciiWord';
+
+/**
+ * (g) 印字できる ASCII の文字の範囲（`\x20-\x7e`・` -~`・`\u{20}-\u{7e}`・` -~`。大文字と小文字を問わない）の書き写し（`code`。コメントは
+ * 除き、文字列と正規表現は見る）。
+ */
+const findPrintableAsciiRanges = (source: ScannedSource): readonly string[] =>
+  [...source.code.matchAll(/\\(?:x20|u0020|u\{0*20\})-\\(?:x7e|u007e|u\{0*7e\})|\[ -~\]/giu)].map((match) => match[0]);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 検出の関数の単体テスト（違反の例で RED）
 // ---------------------------------------------------------------------------------------------------------------
 
 describe('data rules boundary detectors (T29a)', () => {
+  it('(g) detects a copy of the printable ASCII range, not the comments (PRE42-CC 組 4。CC-082 1′)', () => {
+    expect(findPrintableAsciiRanges(scanSource('const a = /^[\\x20-\\x7e]+$/u.test(word);'))).toEqual(['\\x20-\\x7e']);
+    expect(findPrintableAsciiRanges(scanSource('const a = /^[\\u0020-\\u007E]+$/u;\nconst b = /^[\\u{20}-\\u{7e}]+$/u;'))).toHaveLength(2);
+    expect(findPrintableAsciiRanges(scanSource('const a = /^[ -~]+$/u;'))).toEqual(['[ -~]']);
+    expect(findPrintableAsciiRanges(scanSource('// /^[\\x20-\\x7e]+$/u\nconst a = isAsciiWord(word);'))).toEqual([]);
+  });
+
   it('(f) reports a re-export from outside src/control/data-rules/ and a definition in the screen re-export (T29e)', () => {
     const violating = scanSource([
       "export { evaluateRuleSet } from './data-rules/field-evaluation.js';",
@@ -215,6 +232,8 @@ describe('data rules boundary detectors (T29a)', () => {
       "const worker = await import('../../worker/audit-worker.js');",
       "const directory = '../../worker/';",
       "const directory = 'src/orchestration/';",
+      // PRE42-CC 組 G（新 Gate の 2）: `\` の区切りのパスも見る。
+      "const entry = 'beaksight\\\\src\\\\worker\\\\audit-worker.ts';",
     ]) {
       expect(findForbiddenReferences(path, scanSource(line)), line).toHaveLength(1);
     }
@@ -282,13 +301,7 @@ describe('data rules boundary detectors (T29a)', () => {
 // Gate
 // ---------------------------------------------------------------------------------------------------------------
 
-const fileOf = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  if (file === undefined) {
-    throw new Error(`missing source file: ${path}`);
-  }
-  return file;
-};
+const fileOf = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 const DATA_RULES_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(DATA_RULES_DIRECTORY));
 
@@ -326,6 +339,16 @@ describe('data rules boundary and the external delivery word owner (Task 29 desi
 
   it('(e) builds no regular expression at run time in src/control/data-rules/ (T29c fix round 1)', () => {
     expect(DATA_RULES_FILES.flatMap((file) => findRegExpConstructions(file).map((text) => `${file.path}: ${text}`))).toEqual([]);
+  });
+
+  it('(g) judges the ASCII words with the owner of the field name words, without a copy (PRE42-CC 組 4。CC-082 1′)', () => {
+    const owner = fileOf(ASCII_WORD_OWNER);
+    expect(owner.bare).toMatch(new RegExp(`\\bexport\\s+const\\s+${ASCII_WORD_FUNCTION}\\s*=`, 'u'));
+    expect(findPrintableAsciiRanges(owner)).toHaveLength(1);
+    expect(DATA_RULES_FILES.flatMap((file) => findPrintableAsciiRanges(file).map((text) => `${file.path}: ${text}`))).toEqual([]);
+    const words = fileOf(WORDS_OWNER);
+    expect(findModuleSpecifiers(words.code)).toContain('../../discovery/classify.js');
+    expect(countIdentifier(words.bare, ASCII_WORD_FUNCTION)).toBeGreaterThanOrEqual(2);
   });
 
   it('(c) computes the rule set digest with createSha256Fingerprint and sortedKeysJsonOf (not a copy of SHA-256)', () => {

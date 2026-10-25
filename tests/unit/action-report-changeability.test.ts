@@ -16,7 +16,7 @@ import {
   SETTLED_RESERVATION_STATES,
   SUBMISSION_STATES,
 } from '../../src/control/actions/action-contracts.js';
-import { SCENARIO_KINDS, SIDE_EFFECT_CONFIRMATIONS } from '../../src/control/approval/scenario-contracts.js';
+import { SCENARIO_KINDS, SCENARIO_TRANSPORTS, SIDE_EFFECT_CONFIRMATIONS } from '../../src/control/approval/scenario-contracts.js';
 import {
   ACTION_BLOCK_REASON_CATALOG,
   ACTION_OUTCOME_REASON_CATALOG,
@@ -25,6 +25,7 @@ import {
   HUMAN_DECISION_CATALOG,
   RESPONSE_JUDGEMENT_CATALOG,
   SCENARIO_KIND_CATALOG,
+  SCENARIO_TRANSPORT_CATALOG,
   SETTLED_RESERVATION_STATE_CATALOG,
   SIDE_EFFECT_CONFIRMATION_CATALOG,
   SUBMISSION_STATE_CATALOG,
@@ -48,6 +49,8 @@ sameKeys<keyof typeof HUMAN_DECISION_CATALOG, (typeof HUMAN_DECISIONS)[number]>(
 sameKeys<keyof typeof AUTOMATED_ACTION_CATALOG, (typeof AUTOMATED_ACTIONS)[number]>(true);
 sameKeys<keyof typeof SCENARIO_KIND_CATALOG, (typeof SCENARIO_KINDS)[number]>(true);
 sameKeys<keyof typeof SIDE_EFFECT_CONFIRMATION_CATALOG, (typeof SIDE_EFFECT_CONFIRMATIONS)[number]>(true);
+// T40d: 送り方（FORM・API）のすべてにラベルがある（新しい送り方を足しても、報告のコードを変えずにカタログで描ける）。
+sameKeys<keyof typeof SCENARIO_TRANSPORT_CATALOG, (typeof SCENARIO_TRANSPORTS)[number]>(true);
 
 /** 契約の閉じた一覧と、その表示のカタログ。 */
 const LISTS: readonly (readonly [string, readonly string[], object])[] = [
@@ -61,6 +64,7 @@ const LISTS: readonly (readonly [string, readonly string[], object])[] = [
   ['AUTOMATED_ACTIONS', AUTOMATED_ACTIONS, AUTOMATED_ACTION_CATALOG],
   ['SCENARIO_KINDS', SCENARIO_KINDS, SCENARIO_KIND_CATALOG],
   ['SIDE_EFFECT_CONFIRMATIONS', SIDE_EFFECT_CONFIRMATIONS, SIDE_EFFECT_CONFIRMATION_CATALOG],
+  ['SCENARIO_TRANSPORTS', SCENARIO_TRANSPORTS, SCENARIO_TRANSPORT_CATALOG],
 ];
 
 /** 報告のコード（値で分岐しないファイル）。 */

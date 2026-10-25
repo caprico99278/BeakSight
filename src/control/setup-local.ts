@@ -28,8 +28,9 @@ import {
   type ControlEnvironmentFailureReason,
   type ControlEnvironmentResult,
 } from './environment/control-environment.js';
+import { CREDENTIAL_PROTECTION_AVAILABLE } from './credentials/credential-platform.js';
 import { prepareCredentialStorage, type CredentialStoragePreparation } from './credentials/credential-preparation.js';
-import { createCredentialStore, type CredentialProtectionState } from './credentials/credential-store.js';
+import { createCredentialStore } from './credentials/credential-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from './store/control-database.js';
 import { resolveControlDatabasePath } from './store/database-path.js';
 import type { ProfileStoreRejectionReason } from './store/profile-store.js';
@@ -171,9 +172,6 @@ export const runSetupLocal = (options: SetupLocalOptions): SetupLocalResult => {
 // 資格情報のフォルダの準備（T26e）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 暗号化が使える状態。 */
-const PROTECTION_AVAILABLE = 'AVAILABLE' satisfies CredentialProtectionState;
-
 // 準備の手順（`prepareCredentialStorage`）の owner は `credentials/credential-preparation.ts`（CCX-5。画面のサーバと共用）。ここからも公開し続ける。
 export { prepareCredentialStorage, type CredentialStoragePreparation };
 
@@ -187,7 +185,7 @@ export const credentialStorageLines = (preparation: CredentialStoragePreparation
   }
   lines.push(cliFieldText(
     SETUP_LOCAL_TEXT.credentialProtectionLabel,
-    preparation.protection === PROTECTION_AVAILABLE ? SETUP_LOCAL_TEXT.credentialProtectionAvailable : SETUP_LOCAL_TEXT.credentialProtectionUnavailable,
+    preparation.protection === CREDENTIAL_PROTECTION_AVAILABLE ? SETUP_LOCAL_TEXT.credentialProtectionAvailable : SETUP_LOCAL_TEXT.credentialProtectionUnavailable,
   ));
   return Object.freeze(lines);
 };

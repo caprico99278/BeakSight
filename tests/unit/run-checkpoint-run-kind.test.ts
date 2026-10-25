@@ -2,7 +2,7 @@
 // （認証つきかどうかと、認証の設定を区別する値。秘密を含まない）を記録し、再開する Run を選ぶ比べ（`selectRunToResume`）で比べる。違えば
 // `CONFIG_DIFFERS`（違う項目は `authentication`）。項目のない古い保存は、公開監査の Run とみなす。
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { createRunId } from '../../src/core/ids.js';
 import { runCheckpointAuthenticationOf, type RunAuthentication } from '../../src/orchestration/authenticated-run.js';
@@ -46,6 +46,32 @@ const candidateOf = (checkpoint: RunCheckpoint): RunResumeCandidate => {
   const runId = createRunId(1);
   return { runId, runDirectory: `output/${runId}`, checkpoint };
 };
+
+// T35a（Task 35 の設計書 3.2）: 監査の段の口（`auditStage`。承認したサービスの Origin、読み取りの手続きの呼び出し、token の送信先、要求の上限）を
+// Run の種類の値に入れる。口のない Run の値は変わらない（固定の値。T35a の前のコードで求めた）。
+const RUN_KIND_DIGEST_BEFORE_T35A = 'sha256:fde44d223a644ed8ec637c51d3baeced6a309accbf87c0db8ac42b944776c4a2';
+const AUDIT_STAGE = Object.freeze({
+  approvedServiceOrigins: ['http://127.0.0.1:5173'],
+  auditReadRequests: [{ origin: 'http://127.0.0.1:5173', path: '/rest/v1/rpc/list_members', method: 'POST', maxPerPageLoad: 2 }],
+  scriptLogin: { origin: 'http://127.0.0.1:5173', path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+  serviceRequestLimits: { perMinute: 60, perRun: 300 },
+} as const);
+
+describe('T35a: the audit stage of a script login Run in the kind of the Run', () => {
+  it('keeps the value of a Run without the audit stage, and changes it with each item of the audit stage', () => {
+    expect(runCheckpointAuthenticationOf(settings()).settingsDigest).toBe(RUN_KIND_DIGEST_BEFORE_T35A);
+    const base = runCheckpointAuthenticationOf({ ...settings(), auditStage: AUDIT_STAGE });
+    expect(base.settingsDigest).not.toBe(RUN_KIND_DIGEST_BEFORE_T35A);
+    for (const change of [
+      { approvedServiceOrigins: [] },
+      { auditReadRequests: [] },
+      { scriptLogin: { ...AUDIT_STAGE.scriptLogin, path: '/auth/v1/other' } },
+      { serviceRequestLimits: { perMinute: 60, perRun: 299 } },
+    ]) {
+      expect(runCheckpointAuthenticationOf({ ...settings(), auditStage: { ...AUDIT_STAGE, ...change } }), JSON.stringify(change)).not.toEqual(base);
+    }
+  });
+});
 
 describe('T25g-2: the kind of the Run in the checkpoint', () => {
   it('derives a value without secrets that tells the authentication settings apart', () => {

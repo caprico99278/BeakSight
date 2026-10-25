@@ -1,7 +1,8 @@
 // T31b（Task 31 の設計書 3 章の「UPDATE の指定」、11 章の T31b の Blocker の判断の 4）: シナリオの版のスキーマ（`schemas/control/scenario.schema.json`）
 // の UPDATE の指定と、契約（`scenario-contracts.ts`）の名前つきの定数の一致。
-// - `update` は必須の項目。CREATE は null だけ。UPDATE は指定か null（UPDATE の指定の前に保存した版。読めるが承認と発行はできない）。
-// - 保存した版を読むとき（`storedScenarioRevisionOf`）、`update` の項目がない版は null として読む。
+// - `update` は必須の項目。CREATE は null だけ。form の UPDATE は指定だけ（LG-3: UPDATE の指定の前に保存した、null の版は捨てた）。
+// - LG-3（2026-10-24 の設計 3.7.2）: 保存した版を読むとき（`storedScenarioRevisionOf`）、`update` か `verification` の項目がない版と、form の UPDATE で
+//   `update` が null の版は、読み替えずに誤り（`RangeError`。保存の部品は `DATABASE_INTEGRITY_FAILED`）にする。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -43,11 +44,11 @@ describe('UPDATE spec in the scenario schema (T31b)', () => {
     expect(prop(updateDef, 'keepFieldNames').items?.maxLength).toBe(MAX_FIELD_NAME_LENGTH);
   });
 
-  it('accepts a CREATE revision only with a null spec, and an UPDATE revision with a spec or null', () => {
+  it('accepts a CREATE revision only with a null spec, and a form UPDATE revision only with a spec (LG-3)', () => {
     expect(assertStorableScenarioRevision(sampleScenario()).update).toBeNull();
     expect(() => assertStorableScenarioRevision(sampleScenario({ update: UPDATE_SPEC }))).toThrow(RangeError);
     expect(assertStorableScenarioRevision(sampleUpdateScenario()).update).toEqual(UPDATE_SPEC);
-    expect(assertStorableScenarioRevision(sampleUpdateScenario({ update: null })).update).toBeNull();
+    expect(() => assertStorableScenarioRevision(sampleUpdateScenario({ update: null }))).toThrow(RangeError);
     expect(() => assertStorableScenarioRevision(withoutUpdate(sampleScenario()) as never)).toThrow(RangeError);
   });
 
@@ -61,9 +62,15 @@ describe('UPDATE spec in the scenario schema (T31b)', () => {
     expect(() => assertStorableScenarioRevision(sampleUpdateScenario({ update: update as never }))).toThrow(RangeError);
   });
 
-  it('reads a stored revision without the update item as a revision without the spec', () => {
-    expect(storedScenarioRevisionOf(withoutUpdate(sampleScenario())).update).toBeNull();
-    expect(storedScenarioRevisionOf(withoutUpdate(sampleUpdateScenario())).update).toBeNull();
+  it.each<readonly [string, Record<string, unknown>]>([
+    ['a CREATE revision without the update item', withoutUpdate(sampleScenario())],
+    ['an UPDATE revision without the update item', withoutUpdate(sampleUpdateScenario())],
+    ['an UPDATE revision with a null update spec', { ...sampleUpdateScenario(), update: null }],
+  ])('does not read %s stored before the UPDATE spec (LG-3)', (_label, document) => {
+    expect(() => storedScenarioRevisionOf(JSON.parse(JSON.stringify(document)) as unknown)).toThrow(RangeError);
+  });
+
+  it('reads a stored UPDATE revision with the spec as it is', () => {
     expect(storedScenarioRevisionOf(sampleUpdateScenario()).update).toEqual(UPDATE_SPEC);
   });
 });

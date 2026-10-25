@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>幅の走査の幅だけ落ち着かない画面</title>
+  <style>
+    /*
+     * T44R2 の I-6（P1-5 の落ち着きの待ちの上限）の再現。幅 320px 以下（幅の走査の 320）のときだけ、文書の高さが 50ms ごとに伸び続ける（落ち着かない）。
+     * 最初の読み込み（Desktop 1440・Mobile 390）では伸びないので、落ち着く。
+     */
+    body { margin: 0; font-family: sans-serif; }
+    /* 最初から画面より高くする（文書の高さが画面の高さに隠れず、伸びるたびに変わる）。 */
+    #growing { height: 2000px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>幅の走査の幅だけ落ち着かない画面</h1>
+    <div id="growing"></div>
+  </main>
+  <script>
+    if (window.innerWidth <= 320) {
+      let height = 2000;
+      setInterval(() => {
+        height += 20;
+        document.getElementById('growing').style.height = `${height}px`;
+      }, 50);
+    }
+  </script>
+</body>
+</html>

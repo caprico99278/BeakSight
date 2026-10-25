@@ -9,7 +9,7 @@ import type {
   ResourceSummariesEvidence,
   WebVitalsEvidence,
 } from '../../src/core/evidence-types.js';
-import { PerformanceCollector } from '../../src/evidence/performance-collector.js';
+import { PAGE_PERFORMANCE_STATE_PROPERTY, PerformanceCollector } from '../../src/evidence/performance-collector.js';
 
 const readControl = vi.hoisted(() => ({ failuresRemaining: 0 }));
 
@@ -405,7 +405,10 @@ describe('PerformanceCollector', () => {
     expect(scripts).toHaveLength(1);
     expect(scripts[0]?.length).toBeGreaterThan(15_000);
     expect(scripts[0]).toContain('onCLS');
-    expect(scripts[0]).toContain('__BEAKSIGHT_PERFORMANCE__');
+    // UPG-SW: 状態の大域の名前は、ただ 1 つの定数（プロセスごとの乱数。BeakSight の文字を含まない）で、初期化のスクリプトに渡す。
+    expect(scripts[0]).toContain(JSON.stringify(PAGE_PERFORMANCE_STATE_PROPERTY));
+    expect(PAGE_PERFORMANCE_STATE_PROPERTY).toMatch(/^_[0-9a-f]{16}$/u);
+    expect(scripts[0]).not.toMatch(/beaksight/iu);
   });
 
   it('does not mark failed bundle reads or addInitScript calls as installed', async () => {

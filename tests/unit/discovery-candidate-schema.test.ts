@@ -143,10 +143,12 @@ describe('T27a: the candidate schema and the contract constants', () => {
       'READ', 'CREATE', 'UPDATE', 'NOT_EXECUTABLE', 'NEEDS_BINDING', 'UNSUPPORTED_READ_TRANSPORT', 'BLOCKED_EXTERNAL', 'DISPLAY_ONLY',
     ]);
     expect(METHOD_OVERRIDE_VALUES).toEqual(['PUT', 'PATCH', 'DELETE']);
-    // T27b: 凍結の条件、読み取りの失敗、上限の 3 つを足した。
+    // T27b: 凍結の条件、読み取りの失敗、上限の 3 つを足した。T37a: サービスの読み取りが届かなかった画面（`SERVICE_READ_REFUSED`）を足した。
+    // DEF-129: ページが始めた main frame の読み込みを上限で止めた画面（`INCOMPLETE_PAGE_NAVIGATION_LIMIT`）を足した。
+    // DEF-130-fix: ページが出す文書でない要求を上限で止めた画面（`INCOMPLETE_PAGE_SUBRESOURCE_LIMIT`）を足した。
     expect(INCOMPLETE_REASONS).toEqual([
       'INCOMPLETE_SETTLE_TIMEOUT', 'INCOMPLETE_FRAME_OR_CLOSED_SHADOW', 'INCOMPLETE_FREEZE_UNAVAILABLE', 'INCOMPLETE_READ_FAILED',
-      'INCOMPLETE_LIMIT_REACHED',
+      'INCOMPLETE_LIMIT_REACHED', 'INCOMPLETE_PAGE_NAVIGATION_LIMIT', 'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT', 'SERVICE_READ_REFUSED',
     ]);
     expect(METHOD_OVERRIDE_FIELD_NAME).toBe('_method');
   });

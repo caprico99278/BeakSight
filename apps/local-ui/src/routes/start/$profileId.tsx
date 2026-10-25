@@ -5,6 +5,7 @@ import { formatCount, formatDateTime, formatDuration, formatElapsedTime } from '
 import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_AUTH_TEXT, LOCAL_UI_TEXT } from '../../../../../src/presentation/messages.js';
 import { Notice } from '../../components/Notice';
 import { PageFrame } from '../../components/PageFrame';
+import { StageChainStart } from '../../components/StageChainPanel';
 import { StartReasonDetails } from '../../components/StartReasonDetails';
 import {
   auditModeDisplay,
@@ -211,6 +212,8 @@ function StartAuditPage() {
           />
         </Notice>
       )}
+      {/* FM2d: まとめて実行（ログイン 1 回の後に段を続ける）。監査の段の始め方は、上の選択のまま。 */}
+      <StageChainStart summary={summary} startNew={startNew} />
       <p>
         <Link to="/" className="button">{LOCAL_UI_TEXT.backToList}</Link>
       </p>

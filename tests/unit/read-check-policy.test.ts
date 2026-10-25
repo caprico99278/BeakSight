@@ -7,13 +7,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   READ_CHECK_DEFINITION_REJECTION_REASONS,
+  assertStorableReadCheckDefinition,
   validateReadCheckDefinition,
+  type ReadCheckPageContext,
   type ReadCheckValidationResult,
 } from '../../src/control/read-check-policy.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
-import { MAX_READ_CHECK_PARAMETER_VALUE_LENGTH } from '../../src/discovery/read-check-contracts.js';
+import { MAX_READ_CHECK_PARAMETER_VALUE_LENGTH, type ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
 import { SAMPLE_ALLOWED_ORIGINS, sampleAction, sampleField, sampleForm } from './discovery-candidate-samples.js';
 
 const candidateOf = (discovered: DiscoveredCandidate): DiscoveryCandidate => ({
@@ -72,6 +74,12 @@ describe('READ check definition validation (T27c)', () => {
       'READ_PARAMETER_DANGEROUS_WORD',
       // T28b fix round 1: READ の確かめを許さないモードのプロファイル（公開の監査）では、定義を作らない・変えない。
       'READ_CHECK_PROFILE_NOT_ELIGIBLE',
+      // T37d: 画面の path の定義の理由（下の T37d の場面で確かめる）。
+      'READ_PAGE_PATH_INVALID',
+      'READ_PAGE_START_URL_UNKNOWN',
+      'READ_PAGE_ORIGIN_NOT_ALLOWED',
+      'READ_PAGE_PATH_EXCLUDED',
+      'READ_PAGE_PATH_DANGEROUS_WORD',
     ]);
     expect(Object.isFrozen(READ_CHECK_DEFINITION_REJECTION_REASONS)).toBe(true);
   });
@@ -189,5 +197,95 @@ describe('READ check definition validation (T27c)', () => {
     const before = JSON.stringify(input);
     validateReadCheckDefinition(input, READ_CANDIDATE);
     expect(JSON.stringify(input)).toBe(before);
+  });
+});
+
+// T37d（Task 37 の設計書 3.5）: 画面の path の定義の保存の検証。path は `/` で始まる正規の形（query と fragment を持たない。長さの上限）。プロファイルの
+// 開始の URL（ターゲット設定の `site.startUrl`）と同じ Origin で組み立てた URL が、許可 Origin（ターゲット設定とプロファイルの両方）の中で、読まない
+// パス・読む範囲の外・ログインの画面・危険な語に当たらないこと。対象の候補は見ない。
+describe('T37d: the validation of a page path READ check definition', () => {
+  const ORIGIN = 'http://127.0.0.1:4173';
+  const CONTEXT: ReadCheckPageContext = Object.freeze({
+    startUrl: `${ORIGIN}/admin`,
+    allowedOrigins: [ORIGIN],
+    approvedTestOrigins: [ORIGIN],
+    excludedPathPrefixes: ['/admin/secret'],
+    auditPathPrefixes: [],
+    sessionLostPathPrefix: '/auth',
+  });
+  const pageDefinition = (path: string, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    targetPagePath: path,
+    parameters: {},
+    expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }],
+    ...overrides,
+  });
+
+  it('adds the reasons of a page path to the end of the closed list', () => {
+    expect(READ_CHECK_DEFINITION_REJECTION_REASONS.slice(-5)).toEqual([
+      'READ_PAGE_PATH_INVALID',
+      'READ_PAGE_START_URL_UNKNOWN',
+      'READ_PAGE_ORIGIN_NOT_ALLOWED',
+      'READ_PAGE_PATH_EXCLUDED',
+      'READ_PAGE_PATH_DANGEROUS_WORD',
+    ]);
+  });
+
+  it('accepts a page path on the origin of the start URL, without looking at the candidate', () => {
+    const input = pageDefinition('/admin/members');
+    expect(validateReadCheckDefinition(input, null, CONTEXT)).toEqual({ ok: true, definition: input });
+    expect(validateReadCheckDefinition(input, CREATE_CANDIDATE, CONTEXT).ok).toBe(true);
+  });
+
+  it.each([
+    ['dot segments', '/admin/../members'],
+    ['a brace (encoded by the URL parser)', '/admin{members}'],
+    ['a character the URL parser encodes', '/会員'],
+    ['a percent sign that is not an escape', '/admin%zz'],
+  ])('rejects a path with %s with READ_PAGE_PATH_INVALID', (_name, path) => {
+    expect(codesOf(validateReadCheckDefinition(pageDefinition(path), null, CONTEXT))).toEqual(['READ_PAGE_PATH_INVALID']);
+  });
+
+  it('rejects the shapes of the schema (query, fragment, another host, parameters) with READ_CHECK_INPUT_INVALID', () => {
+    for (const path of ['/admin?x=1', '/admin#x', '//example.invalid/admin', 'admin']) {
+      expect([...new Set(codesOf(validateReadCheckDefinition(pageDefinition(path), null, CONTEXT)))], path).toEqual(['READ_CHECK_INPUT_INVALID']);
+    }
+    expect([...new Set(codesOf(validateReadCheckDefinition(pageDefinition('/admin', { parameters: { q: 'x' } }), null, CONTEXT)))])
+      .toEqual(['READ_CHECK_INPUT_INVALID']);
+  });
+
+  it('rejects a page path when the start URL is unknown or not allowed', () => {
+    expect(codesOf(validateReadCheckDefinition(pageDefinition('/admin'), null, null))).toEqual(['READ_PAGE_START_URL_UNKNOWN']);
+    expect(codesOf(validateReadCheckDefinition(pageDefinition('/admin'), null))).toEqual(['READ_PAGE_START_URL_UNKNOWN']);
+    expect(codesOf(validateReadCheckDefinition(pageDefinition('/admin'), null, { ...CONTEXT, startUrl: 'not a url' })))
+      .toEqual(['READ_PAGE_START_URL_UNKNOWN']);
+    expect(codesOf(validateReadCheckDefinition(pageDefinition('/admin'), null, { ...CONTEXT, approvedTestOrigins: ['http://127.0.0.1:4174'] })))
+      .toEqual(['READ_PAGE_ORIGIN_NOT_ALLOWED']);
+    expect(codesOf(validateReadCheckDefinition(pageDefinition('/admin'), null, { ...CONTEXT, allowedOrigins: ['http://127.0.0.1:4174'] })))
+      .toEqual(['READ_PAGE_ORIGIN_NOT_ALLOWED']);
+  });
+
+  it.each([
+    ['an excluded path', '/admin/secret/list', CONTEXT],
+    ['an excluded path in capitals', '/ADMIN/SECRET', CONTEXT],
+    ['an excluded path in percent-encoding', '/admin/%73ecret', CONTEXT],
+    ['the login screen (the session lost path)', '/auth/login', CONTEXT],
+    ['a path outside the audit path prefixes', '/other', { ...CONTEXT, auditPathPrefixes: ['/admin'] }],
+  ])('rejects %s with READ_PAGE_PATH_EXCLUDED', (_name, path, context) => {
+    expect(codesOf(validateReadCheckDefinition(pageDefinition(path), null, context))).toEqual(['READ_PAGE_PATH_EXCLUDED']);
+  });
+
+  it.each([
+    ['a dangerous word', '/admin/members/1/delete'],
+    ['a dangerous word in full-width letters encoded', '/admin/%EF%BC%A4%EF%BC%A5%EF%BC%AC%EF%BC%A5%EF%BC%B4%EF%BC%A5'],
+    ['the logout path', '/admin/logout'],
+  ])('rejects %s with READ_PAGE_PATH_DANGEROUS_WORD', (_name, path) => {
+    expect(codesOf(validateReadCheckDefinition(pageDefinition(path), null, CONTEXT))).toEqual(['READ_PAGE_PATH_DANGEROUS_WORD']);
+  });
+
+  it('accepts a path inside the audit path prefixes, and stores only the checked shape', () => {
+    expect(validateReadCheckDefinition(pageDefinition('/admin/members'), null, { ...CONTEXT, auditPathPrefixes: ['/admin'] }).ok).toBe(true);
+    expect(assertStorableReadCheckDefinition(pageDefinition('/admin/members') as unknown as ReadCheckDefinition)).toEqual(pageDefinition('/admin/members'));
+    expect(() => assertStorableReadCheckDefinition(pageDefinition('/a/../b') as unknown as ReadCheckDefinition)).toThrow(RangeError);
+    expect(() => assertStorableReadCheckDefinition(pageDefinition('/a', { parameters: { q: 'x' } }) as unknown as ReadCheckDefinition)).toThrow(RangeError);
   });
 });

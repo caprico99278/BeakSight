@@ -27,9 +27,11 @@ import type { AuditJobStartResult } from '../../../../src/control/job/audit-job-
 import type { AutoLoginLimitDecision } from '../../../../src/control/job/auto-login-limits.js';
 import { checkAutoLoginStart, type AutoLoginPreflightRejectionReason } from '../../../../src/control/job/auto-login-preflight.js';
 import type { AuditJobKind, AuditJobStartRejectionReason } from '../../../../src/control/job/job-records.js';
+import { WORKER_AUDIT_JOB_KIND, WORKER_READ_CHECK_JOB_KIND } from '../../../../src/control/worker-protocol.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../../../src/control/profile-policy.js';
-import type { StoredAuthSetup } from '../../../../src/control/store/auth-setup-store.js';
-import type { ProfileStatus } from '../../../../src/control/store/profile-records.js';
+// PRE42-CC 組 UI-K2（CC-113）: 認証の設定の新しさは、owner の名前つきの定数と比べる（文字列で比べない）。
+import { CURRENT_AUTH_SETUP_FRESHNESS, type StoredAuthSetup } from '../../../../src/control/store/auth-setup-store.js';
+import { ACTIVE_PROFILE_STATUS, type ProfileStatus } from '../../../../src/control/store/profile-records.js';
 import { authSetupErrorViewsOf, type AuthSetupErrorView } from './auth-setup-errors';
 import { isoTimestampOrNull } from './timestamps';
 
@@ -49,10 +51,6 @@ export type AuditStartBlocker = Extract<
   | AutoLoginPreflightRejectionReason
 >;
 
-/** 監査のジョブの種類（確かめるジョブの種類の省略の値）。 */
-const AUDIT_JOB_KIND = 'AUDIT' satisfies AuditJobKind;
-/** READ の確かめのジョブの種類（T27f。取り消していない定義が 0 件なら始めない）。 */
-const READ_CHECK_JOB_KIND = 'READ_CHECK' satisfies AuditJobKind;
 
 /** 自動ログインの開始の前の確かめに要る、呼び出し側が読んだ値（T26e。値を含まない）。 */
 export interface AutoLoginStartInputs {
@@ -78,6 +76,11 @@ export interface AuditStartCheckInput {
   readonly autoLogin?: AutoLoginStartInputs | null;
   /** 取り消していない READ の確かめの定義の数（T27f。`READ_CHECK` の確かめだけで使う。省略は 0）。 */
   readonly readCheckDefinitionCount?: number;
+  /**
+   * FM2R の I-1: READ の確かめの定義が要るか（省略は要る）。まとめて実行の READ の段は偽（0 件は「行わなかった」で、止める理由にしない。ジョブの管理も、
+   * 連鎖の READ の段では件数を開始の確かめに入れない）。
+   */
+  readonly readCheckDefinitionsRequired?: boolean;
 }
 
 /** 確かめの結果。 */
@@ -97,12 +100,13 @@ export interface AuditStartCheck {
 /** 開始できない理由を確かめる（流れはファイルの先頭）。 */
 export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck => {
   const { status, profile, pathAccepted, context } = input;
-  const jobKind = input.jobKind ?? AUDIT_JOB_KIND;
+  // 確かめるジョブの種類の省略の値は監査（T44g の CC-105: 値は IPC の契約の名前つきの定数から読む）。
+  const jobKind = input.jobKind ?? WORKER_AUDIT_JOB_KIND;
   // T28b: 認証の設定が要るかは、その操作をそのモードで受けるときだけ（書き込みのモードの監査は始められないので、要るとは言わない）。
   const authRequired = operationRequiresAuthSetup(jobKind, profile.mode);
   const storedSetup = authRequired ? input.storedSetup : null;
   const validation = context === undefined ? null : validateSiteProfile(profile, context);
-  const setupCheck = storedSetup !== null && storedSetup.freshness === 'CURRENT' && validation !== null && validation.ok && context !== undefined
+  const setupCheck = storedSetup !== null && storedSetup.freshness === CURRENT_AUTH_SETUP_FRESHNESS && validation !== null && validation.ok && context !== undefined
     ? validateAuthSetup(storedSetup.setup, validation.profile, context)
     : null;
   // T26e: 自動ログインの設定なら、ジョブの管理と同じ開始の前の確かめ（認証の設定の検証を通ったときだけ）。
@@ -115,13 +119,14 @@ export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck 
   // （T26e のログインの確かめは自動ログインだけ、T27f の発見と READ の確かめは認証の設定が要るモードだけ。書き込みのモードは監査だけを拒む）。READ の
   // 確かめは、取り消していない定義が 0 件なら、認証の設定の確かめの前に `READ_CHECK_DEFINITIONS_MISSING`。
   const operationRejection = profileOperationRejectionOf(jobKind, profile.mode, profile.auth);
-  const readCheck = jobKind === READ_CHECK_JOB_KIND;
+  // T27f: 取り消していない定義が 0 件なら、READ の確かめのジョブは始めない。
+  const readCheck = jobKind === WORKER_READ_CHECK_JOB_KIND && input.readCheckDefinitionsRequired !== false;
   const checks: readonly (readonly [boolean, AuditStartBlocker])[] = [
-    [status !== 'ACTIVE', 'PROFILE_RETIRED'],
+    [status !== ACTIVE_PROFILE_STATUS, 'PROFILE_RETIRED'],
     ...(operationRejection === null ? [] : [[true, operationRejection] as const]),
     [readCheck && (input.readCheckDefinitionCount ?? 0) === 0, 'READ_CHECK_DEFINITIONS_MISSING'],
     [authRequired && storedSetup === null, 'AUTH_SETUP_MISSING'],
-    [storedSetup !== null && storedSetup.freshness !== 'CURRENT', 'AUTH_SETUP_STALE'],
+    [storedSetup !== null && storedSetup.freshness !== CURRENT_AUTH_SETUP_FRESHNESS, 'AUTH_SETUP_STALE'],
     [!pathAccepted, 'TARGET_PATH_INVALID'],
     [context === undefined, 'TARGET_CONFIG_UNAVAILABLE'],
     [validation !== null && !validation.ok, 'PROFILE_INVALID'],

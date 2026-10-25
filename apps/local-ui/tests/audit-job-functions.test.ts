@@ -10,6 +10,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EXIT_CODES } from '../../../src/cli/exit-codes.js';
+import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import { publicProfileDocument, startTimedSite, writeAuditTargetConfig, type TimedSite } from './helpers/audit-site.ts';
 import {
@@ -23,14 +24,14 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions, type ServerFunctionJobWaitTiming } from './helpers/server-function-job-wait.ts';
 
 /** HTTP の状態。 */
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403 });
 /** 止める場面の、ページの読み込みの最小の間隔（ms。最初のページの後、止める要求が届く前に、次のページを終えないように）。 */
 const SLOW_INTERVAL_MS = 3_000;
 /** 状態が変わるのを待つ上限と、読み直す間隔（ms）。 */
-const WAIT_LIMIT_MS = 120_000;
-const WAIT_POLL_MS = 250;
+const JOB_WAIT: ServerFunctionJobWaitTiming = Object.freeze({ limitMs: 120_000, stepMs: 250 });
 /** ワーカーと Chromium の process が消えるのを待つ上限（ms）。 */
 const PROCESS_EXIT_LIMIT_MS = 20_000;
 /** テストの値（匿名）。 */
@@ -87,20 +88,6 @@ interface JobDetail extends JobRow {
 
 const listJobs = (): Promise<readonly JobRow[]> => valueOf<readonly JobRow[]>('listAuditJobsFn', 'GET');
 const getJob = (jobId: string): Promise<JobDetail | null> => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-
-const waitForJob = async (jobId: string, predicate: (job: JobDetail) => boolean): Promise<JobDetail> => {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const job = await getJob(jobId);
-    if (job !== null && predicate(job)) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`ジョブが期待の状態にならなかった: ${JSON.stringify(job)}`);
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
-};
 
 /** 画面のサーバの子孫（ワーカーと Chromium）を記録する（後で、残っていないことを確かめる）。 */
 const recordDescendants = async (): Promise<readonly ProcessIdentity[]> => {
@@ -237,6 +224,8 @@ describe('audit job Server Functions: the start screen summary and the rejection
       auth: 'NONE',
       autoLogin: null,
       loginCheck: { blocker: 'AUTH_STRATEGY_NOT_EXECUTABLE', errorCodes: [], authSetupErrors: [], nextAllowedAt: null },
+      // FM2d: 公開の監査は、まとめて実行しない（ログインしない）。
+      chain: null,
     });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: 'not-there' })).toBeNull();
   });
@@ -308,7 +297,7 @@ describe('audit job Server Functions: start, list, detail, one at a time, stop',
   });
 
   it('reports the progress, then stops the job (PARTIAL), and refuses to stop it again', async () => {
-    const running = await waitForJob(jobId, (job) => job.state === 'RUNNING' && job.lastProgress !== null);
+    const running = await waitForJobViaServerFunctions(getJob, jobId, (job) => job.state === 'RUNNING' && job.lastProgress !== null, JOB_WAIT);
     expect(running.lastProgress?.pagesFinished).toBeGreaterThanOrEqual(1);
     expect(running.runId).toMatch(/^RUN-\d+$/u);
     expect((await recordDescendants()).length).toBeGreaterThan(0);
@@ -317,7 +306,7 @@ describe('audit job Server Functions: start, list, detail, one at a time, stop',
     expect(stopped).toMatchObject({ ok: true, job: { jobId, state: 'STOPPING' } });
     expect(await getJob(jobId)).toMatchObject({ state: 'STOPPING', forceStopAvailable: false, active: true });
 
-    const finished = await waitForJob(jobId, (job) => !job.active);
+    const finished = await waitForJobViaServerFunctions(getJob, jobId, (job) => !job.active, JOB_WAIT);
     expect(finished).toMatchObject({ state: 'FINISHED', runStatus: 'PARTIAL', endKind: 'RAN', exitCode: EXIT_CODES.PARTIAL, active: false });
     expect(finished.artifacts.map((artifact) => artifact.kind)).toEqual(['REPORT', 'RUN_JSON', 'AUDIT_JSON', 'BUNDLE']);
     expect(finished.artifacts.every((artifact) => artifact.href.startsWith(`/artifacts/${jobId}/`))).toBe(true);
@@ -328,7 +317,7 @@ describe('audit job Server Functions: start, list, detail, one at a time, stop',
 
   it('sent only GET and HEAD requests to the fixture site', () => {
     const methods = new Set(site?.requests().map((request) => request.method));
-    expect([...methods].filter((method) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect([...methods].filter((method) => !READ_METHODS.has(method))).toEqual([]);
     expect(site?.requests().length).toBeGreaterThan(0);
   });
 });

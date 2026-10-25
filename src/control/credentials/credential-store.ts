@@ -82,6 +82,14 @@ export type CredentialProtectionState = (typeof CREDENTIAL_PROTECTION_STATES)[nu
 /** ユーザー名とパスワードの長さの上限（UTF-16 の単位）。 */
 export const MAX_CREDENTIAL_VALUE_LENGTH = 256;
 
+/**
+ * 登録・変更・入れ直しで受けるユーザー名とパスワードの長さの下限（UTF-16 の単位。T36c。Task 36 の設計者の判断 2）。自動ログインの資格情報の守りは、
+ * これより短い値を部分一致で正しく比べられず、どの要求にも含まれるとみなす（ログインの画面も読めない）ので、登録の時点で拒む。Guard の側の
+ * `MIN_COMPARABLE_CREDENTIAL_LENGTH`（`src/safety/login-credential-guard.ts`）と同じ値（`src/control/` は `src/safety/` を読み込めないので、ここにも
+ * 置く。一致は `tests/unit/script-login-boundary-consistency.test.ts`）。保存済みのファイルの値を読む（復号する）ときは当てない（今の値を壊さない）。
+ */
+export const MIN_CREDENTIAL_VALUE_LENGTH = 4;
+
 /** 読む資格情報のファイルの大きさの上限（バイト）。超えたら壊れたファイルとみなす。 */
 export const MAX_CREDENTIAL_FILE_BYTES = 65_536;
 
@@ -124,6 +132,8 @@ export const CREDENTIAL_STORE_ERROR_CODES = Object.freeze([
   'CREDENTIAL_VALUE_EMPTY',
   /** 値が `MAX_CREDENTIAL_VALUE_LENGTH` を超える。 */
   'CREDENTIAL_VALUE_TOO_LONG',
+  /** T36c: 登録・変更・入れ直しの値が `MIN_CREDENTIAL_VALUE_LENGTH` より短い（空は `CREDENTIAL_VALUE_EMPTY`）。 */
+  'CREDENTIAL_VALUE_TOO_SHORT',
   /** 値が文字列でない、または対にならないサロゲートを含む。 */
   'CREDENTIAL_VALUE_MALFORMED',
   /** 一部の変更で、どちらの項目も選ばれていない。 */
@@ -293,6 +303,12 @@ const requireValue = (field: CredentialField, value: unknown): string => {
     return storeError('CREDENTIAL_VALUE_TOO_LONG', field);
   }
   return hasLoneSurrogate(value) ? storeError('CREDENTIAL_VALUE_MALFORMED', field) : value;
+};
+
+/** 登録・変更・入れ直しの入力の値の決まり（`requireValue` に、長さの下限 `MIN_CREDENTIAL_VALUE_LENGTH` を足したもの。T36c）。 */
+const requireInputValue = (field: CredentialField, value: unknown): string => {
+  const checked = requireValue(field, value);
+  return checked.length < MIN_CREDENTIAL_VALUE_LENGTH ? storeError('CREDENTIAL_VALUE_TOO_SHORT', field) : checked;
 };
 
 const FILE_NOT_FOUND = 'ENOENT';
@@ -585,8 +601,8 @@ export const createCredentialStoreWith = (repoRoot: string, dependencies: Creden
   const replaceInputOf = (input: CredentialReplaceInput): CredentialReplaceInput => ({
     profileId: requireProfileId(input.profileId),
     loginOrigin: requireOrigin(input.loginOrigin),
-    username: requireValue('username', input.username),
-    password: requireValue('password', input.password),
+    username: requireInputValue('username', input.username),
+    password: requireInputValue('password', input.password),
   });
 
   /** 両方の値を暗号化して書く（登録と、すべて入れ直し）。 */
@@ -638,8 +654,8 @@ export const createCredentialStoreWith = (repoRoot: string, dependencies: Creden
       return serialized(async () => {
         const profileId = requireProfileId(input.profileId);
         const loginOrigin = requireOrigin(input.loginOrigin);
-        const username = input.username === undefined ? null : requireValue('username', input.username);
-        const password = input.password === undefined ? null : requireValue('password', input.password);
+        const username = input.username === undefined ? null : requireInputValue('username', input.username);
+        const password = input.password === undefined ? null : requireInputValue('password', input.password);
         if (username === null && password === null) {
           storeError('CREDENTIAL_CHANGE_EMPTY');
         }

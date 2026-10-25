@@ -43,8 +43,9 @@ const blockedRun = (overrides: Partial<ActionRunDocument> = {}): ActionRunDocume
 describe('action-run.json schema (T30a)', () => {
   it('has the artifact id and the named version', () => {
     expect(schema.$id).toBe('urn:beaksight:schema:action-run:1.0');
-    expect(prop(schema, 'schemaVersion').const).toBe(ACTION_RUN_SCHEMA_VERSION);
-    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.0');
+    // T40c: 書き手は 1.1 を書き、読み手は 1.0 と 1.1 を受ける（版の一覧とスキーマの enum の一致は `action-run-v11.test.ts`）。
+    expect(prop(schema, 'schemaVersion').enum).toContain(ACTION_RUN_SCHEMA_VERSION);
+    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.1');
   });
 
   it('matches the limits and the shapes with the named constants', () => {
@@ -81,6 +82,10 @@ describe('action-run.json schema (T30a)', () => {
     })],
     ['a blocked run', blockedRun()],
     ['a blocked run by a check before sending', blockedRun({ blockReason: 'PRECHECK_FAILED', reason: 'PRECHECK_FAILED' })],
+    // T44e（Task 44 の設計書 P2-4）: 送らずに止めた具体的な理由（任意の項目。`PRECHECK_FAILED` のときだけ）。
+    ['a blocked run by a check before sending with its concrete reason', blockedRun({
+      blockReason: 'PRECHECK_FAILED', reason: 'PRECHECK_FAILED', precheckDetail: 'KNOWN_KEPT_VALUE_MISMATCH',
+    })],
     ['a run that sent no value (all values not sent)', verifiedRun({ submittedValues: {} })],
   ])('accepts %s', async (_label, document) => {
     expect(await validateArtifact('action-run', document)).toEqual({ ok: true });
@@ -88,6 +93,10 @@ describe('action-run.json schema (T30a)', () => {
 
   it.each<readonly [string, unknown]>([
     ['an unknown property', { ...verifiedRun(), note: 'x' }],
+    // T44e: 具体的な理由は、閉じた一覧の値で、`PRECHECK_FAILED` のときだけ。
+    ['an unknown concrete reason of a stop', blockedRun({ blockReason: 'PRECHECK_FAILED', reason: 'PRECHECK_FAILED', precheckDetail: 'MAYBE' as never })],
+    ['a concrete reason with the payload mismatch', blockedRun({ precheckDetail: 'PRIOR_VALUE_CHANGED' })],
+    ['a concrete reason on a sent run', verifiedRun({ precheckDetail: 'STOPPED' })],
     ['a cookie property', { ...verifiedRun(), cookies: [] }],
     ['a hidden value', { ...verifiedRun(), hiddenValues: { token: 'x' } }],
     ['a missing result', (({ result: _omitted, ...rest }) => rest)(verifiedRun())],
@@ -106,7 +115,8 @@ describe('action-run.json schema (T30a)', () => {
     ['a bad timestamp', verifiedRun({ finishedAt: '2026-10-13T00:00:00Z' })],
     ['a RESERVED reservation (not settled)', verifiedRun({ reservationState: 'RESERVED' as never })],
     ['a condition path prefix without "/"', verifiedRun({
-      resultConditions: { ...verifiedRun().resultConditions, successCondition: { pathPrefix: 'members', selector: null } },
+      // T40c: 成否の条件は API の記録で null を許す型になったので、FORM の見本の値を型どおりに写してから上書きする。
+      resultConditions: { inputErrorCondition: { pathPrefix: '/members/new', selector: null }, successCondition: { pathPrefix: 'members', selector: null } },
     })],
     ['a not sent run without a block reason', blockedRun({ blockReason: null })],
     ['a not sent run with a response', blockedRun({ httpStatus: 200 })],

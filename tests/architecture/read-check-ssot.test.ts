@@ -9,13 +9,31 @@
  * - (c) 読み込みの事前の判定（`isRunNavigationBlocked`）は、`src/orchestration/authenticated-run.ts` にだけ定義する。巡回の候補の除外
  *   （`isExcludedCrawlCandidate`。同じファイル）と、READ の確かめの事前の判定（`src/worker/read-check-run.ts` の `isReadUrlAllowed`）が使い、
  *   READ の確かめの流れは、要求の判定（`classifyPassiveRequest`）を直接呼ばない。
+ * - (d) 候補の分類の値 `READ` は、`src/discovery/candidate-contracts.ts` の `READ_CANDIDATE_CLASSIFICATION` にだけ書く（PRE42-CC 組 4。N4-8e）。
+ *   保存の確かめ（`src/control/read-check-policy.ts`）と、READ の確かめの評価（`src/discovery/read-check-evaluation.ts`）は、そこから import する。
+ *   owner の外の `src/**` と `apps/local-ui/src/**` に、`'READ' satisfies …Classification…`・`classification === 'READ'` などの書き写しを置かない。
  * - 判定は、関数の定義の名前（`function 名前`、`const 名前 =` など）と識別子の出現を、`fs`、正規表現、文字列の走査だけで数える（AST・子
  *   process・`dist/` を使わない）。`src/**` の読み込みは、このファイルの読み込み時に 1 回だけ行う（`source-scan.ts`）。1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { countIdentifier, findImportSpecifiers, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import {
+  countDefinitions,
+  countIdentifier,
+  findImportSpecifiers,
+  loadLocalUiSourceFiles,
+  loadSourceFiles,
+  scanSource,
+  sourceFileAt,
+  type ScannedSource,
+  type SourceFile,
+} from './source-scan.js';
 
 const SOURCE_FILES = loadSourceFiles();
+/** (d) 画面のコード（`apps/local-ui/src/**`）。分類の `READ` の書き写しの形だけを見る。 */
+const LOCAL_UI_SOURCE_FILES = loadLocalUiSourceFiles();
+
+/** (d) 候補の分類の値の owner。 */
+const READ_CLASSIFICATION_OWNER = 'src/discovery/candidate-contracts.ts';
 
 /** 判定の owner と、owner の外に定義しない名前と、使う側（owner から import して、その名前を使うファイル）。 */
 interface JudgementOwnership {
@@ -53,36 +71,42 @@ const OWNERSHIPS: readonly JudgementOwnership[] = [
     retiredNames: [],
     users: [{ path: 'src/worker/read-check-run.ts', name: 'isRunNavigationBlocked', specifier: '../orchestration/authenticated-run.js' }],
   },
+  {
+    // (d) 候補の分類の値 `READ`（PRE42-CC 組 4。N4-8e）。前の非公開の名前（`READ_CLASSIFICATION`）も、どこにも定義しない。
+    owner: READ_CLASSIFICATION_OWNER,
+    names: ['READ_CANDIDATE_CLASSIFICATION'],
+    retiredNames: ['READ_CLASSIFICATION'],
+    users: [
+      { path: 'src/control/read-check-policy.ts', name: 'READ_CANDIDATE_CLASSIFICATION', specifier: '../discovery/candidate-contracts.js' },
+      { path: 'src/discovery/read-check-evaluation.ts', name: 'READ_CANDIDATE_CLASSIFICATION', specifier: './candidate-contracts.js' },
+    ],
+  },
 ];
+
+/**
+ * (d) 候補の分類の `READ` の書き写しの形（`code`。コメントは除き、文字列は見る）: `'READ' satisfies …Classification…`（`CandidateClassification`、
+ * `DiscoveryCandidate['classification']` など）、`: CandidateClassification = 'READ'`、`classification === 'READ'`（`!==`・`==`・`!=`、左右が逆の形も）。
+ * 走査の状態の `'READ'`（`status`・`state` の値）は、分類でないので見ない。
+ */
+const READ_CLASSIFICATION_COPY_SHAPES: readonly RegExp[] = [
+  /(['"`])READ\1\s*(?:as\s+const\s+)?satisfies\s+[^;\n]*classification/giu,
+  /:\s*[\w$.]*CandidateClassification\s*=\s*(['"`])READ\1/gu,
+  /\bclassification\s*[!=]==?\s*(['"`])READ\1/gu,
+  /(['"`])READ\1\s*[!=]==?\s*[\w$.?]*\bclassification\b/gu,
+];
+
+/** (d) `code` の中の、分類の `READ` の書き写し。 */
+const readClassificationCopiesOf = (source: ScannedSource): readonly string[] =>
+  READ_CLASSIFICATION_COPY_SHAPES.flatMap((shape) => [...source.code.matchAll(shape)].map((match) => match[0]));
 
 /** (c): 要求の判定を直接呼ばず、読み込みの事前の判定の部品を使うファイル。 */
 const READ_CHECK_FLOW = 'src/worker/read-check-run.ts';
 const REQUEST_CLASSIFIER = 'classifyPassiveRequest';
 
-/** 正規表現の特別な文字を逃がす。 */
-const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-
-/**
- * `bare`（コメントと文字列の中身を除いた本文）の中の、`name` の定義の数（`function name`、`function* name`、`const`・`let`・`var` の `name =`・
- * `name:`（型の注釈つき）、`class name`）。近似の検査。
- */
-const countDefinitions = (bare: string, name: string): number => {
-  const escaped = escapeRegExp(name);
-  const pattern = new RegExp(
-    `(?<![\\w$])(?:function\\s*\\*?\\s*${escaped}(?![\\w$])|(?:const|let|var)\\s+${escaped}\\s*[=:]|class\\s+${escaped}(?![\\w$]))`,
-    'gu',
-  );
-  return [...bare.matchAll(pattern)].length;
-};
+// 定義の数は `source-scan.ts` の `countDefinitions`（PRE42-CC 組 G。Gate ごとの写しを寄せた）。
 
 /** ファイル（パスで探す。なければテストの失敗）。 */
-const fileOf = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  if (file === undefined) {
-    throw new Error(`missing source file: ${path}`);
-  }
-  return file;
-};
+const fileOf = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 /** owner の外で owner の名前を定義している箇所と、どこかで前の名前を定義している箇所（`パス: 名前`）。 */
 const copiedDefinitionsOf = (files: readonly (Pick<SourceFile, 'path'> & ScannedSource)[], ownership: JudgementOwnership): readonly string[] =>
@@ -124,6 +148,19 @@ describe('READ check judgement SSOT detectors (CCX-10)', () => {
     expect(copiedDefinitionsOf([copy, owner, retired], ownership))
       .toEqual(['src/control/read-check-policy.ts: isSendableField', 'src/worker/read-check-run.ts: isAllowedParameter']);
   });
+
+  it('(d) detects the copies of the READ classification, not the READ state of a scan', () => {
+    const copies = (text: string): readonly string[] => readClassificationCopiesOf(scanSource(text));
+    expect(copies("const READ_CLASSIFICATION = 'READ' satisfies DiscoveryCandidate['classification'];")).toHaveLength(1);
+    expect(copies('const A = "READ" satisfies CandidateClassification;')).toHaveLength(1);
+    expect(copies("const A: CandidateClassification = 'READ';")).toHaveLength(1);
+    expect(copies("if (candidate.classification === 'READ') {}")).toHaveLength(1);
+    expect(copies("const a = candidate.classification!=='READ';")).toHaveLength(1);
+    expect(copies("const a = 'READ' === candidate?.classification;")).toHaveLength(1);
+    expect(copies("if (probe.status !== 'READ') {}\nconst b = page.state === 'READ';")).toEqual([]);
+    expect(copies("// candidate.classification === 'READ'\nconst c = candidate.classification === READ_CANDIDATE_CLASSIFICATION;")).toEqual([]);
+    expect(copies("const d = { READ_GET_FORM: 'READ' };")).toEqual([]);
+  });
 });
 
 describe('READ check judgement SSOT (CCX-10)', () => {
@@ -150,5 +187,14 @@ describe('READ check judgement SSOT (CCX-10)', () => {
   it('leaves the request judgement of the READ check flow to the shared navigation pre-check', () => {
     expect(countIdentifier(fileOf(READ_CHECK_FLOW).bare, REQUEST_CLASSIFIER)).toBe(0);
     expect(countIdentifier(fileOf('src/orchestration/authenticated-run.ts').bare, 'isRunNavigationBlocked')).toBeGreaterThanOrEqual(2);
+  });
+
+  it('(d) writes the READ classification only in the owner (src/** and apps/local-ui/src/**)', () => {
+    expect(LOCAL_UI_SOURCE_FILES.some((file) => file.path.endsWith('.tsx'))).toBe(true);
+    const copies = [...SOURCE_FILES, ...LOCAL_UI_SOURCE_FILES]
+      .filter((file) => file.path !== READ_CLASSIFICATION_OWNER)
+      .flatMap((file) => readClassificationCopiesOf(file).map((copy) => `${file.path}: ${copy}`));
+    expect(copies).toEqual([]);
+    expect(readClassificationCopiesOf(fileOf(READ_CLASSIFICATION_OWNER))).toHaveLength(1);
   });
 });

@@ -1,6 +1,6 @@
 {
   "$id": "urn:beaksight:schema:action-evidence:1.0",
-  "description": "The evidence of one write job for the write report (action-evidence.json in the Run directory; Task 32 design 4.1; T32c), written by the worker for every run it finishes (BLOCKED included). It is built from the same facts as action-run.json: the check before sending (the candidate digest match and the block reason), the submission (the submitted values, synthetic test data in plain text, and the action path), the response, the record id, the before and after values of an UPDATE, the whole evidence of the READ verification (or a mark that it was not executed), the counts of the request guard, the ActionResult and its reason. A run that was not sent has no submitted value, no response, no record id and no executed READ. Values entered by people (the prior value of a changed field, the value read by the READ verification) are kept and marked by containsHumanEnteredValues. The value lists and limits are those of action-run, read-evidence, run and control/scenario, referenced and not copied; the contract is src/control/actions/action-contracts.ts. No property holds a credential, a cookie, a CSRF token, a hidden, readonly or kept value, a lock version or an authenticated state.",
+  "description": "The evidence of one write job for the write report (action-evidence.json in the Run directory; Task 32 design 4.1; T32c), written by the worker for every run it finishes (BLOCKED included). It is built from the same facts as action-run.json: the check before sending (the candidate digest match and the block reason), the submission (the submitted values, synthetic test data in plain text, and the action path), the response, the record id, the before and after values of an UPDATE, the whole evidence of the READ verification (or a mark that it was not executed), the counts of the request guard, the ActionResult and its reason. A run that was not sent has no submitted value, no response, no record id and no executed READ. Values entered by people (the prior value of a changed field, the value read by the READ verification) are kept and marked by containsHumanEnteredValues. The value lists and limits are those of action-run, read-evidence, run and control/scenario, referenced and not copied; the contract is src/control/actions/action-contracts.ts. No property holds a credential, a cookie, a CSRF token, a hidden, readonly or kept value, a lock version or an authenticated state. T40c (Task 40 design 3.4): the version 1.1 adds the transport and the API summary (the same values as action-run.json; null for FORM); the action path of an API write is the path of the API. The readers accept 1.1 only (LG-4: the previous version 1.0 is no longer read); the writer writes 1.1.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,10 +22,12 @@
     "result",
     "reason",
     "startedAt",
-    "finishedAt"
+    "finishedAt",
+    "transport",
+    "api"
   ],
   "properties": {
-    "schemaVersion": { "const": "action-evidence-schema/1.0" },
+    "schemaVersion": { "enum": ["action-evidence-schema/1.1"] },
     "jobId": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/id" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
     "profileId": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/profileId" },
@@ -45,9 +47,24 @@
     "result": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/result" },
     "reason": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/reason" },
     "startedAt": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" },
-    "finishedAt": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" }
+    "finishedAt": { "$ref": "urn:beaksight:schema:action-run:1.0#/$defs/compactUtcTimestamp" },
+    "transport": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/transport" },
+    "api": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/api" }
   },
   "allOf": [
+    {
+      "description": "T40c: an API evidence has the API summary (its page key values are null when not sent); a FORM evidence has none.",
+      "if": { "properties": { "transport": { "const": "API" } } },
+      "then": { "properties": { "api": { "type": "object" } } },
+      "else": { "properties": { "api": { "type": "null" } } }
+    },
+    {
+      "description": "T40c: a run that was not sent has no value of the keys decided by the page.",
+      "if": { "properties": { "submission": { "type": "object", "properties": { "state": { "const": "NOT_SENT" } } } } },
+      "then": {
+        "properties": { "api": { "anyOf": [{ "type": "null" }, { "type": "object", "properties": { "pageKeyValues": { "type": "null" } } }] } }
+      }
+    },
     {
       "description": "A run that was not sent is BLOCKED with a block reason, and has no submitted value, no action path, no response, no record id and no executed READ. A sent run has no block reason, a matched candidate, an action path and a response item, and is not BLOCKED.",
       "if": { "properties": { "submission": { "type": "object", "properties": { "state": { "const": "NOT_SENT" } } } } },
@@ -209,7 +226,22 @@
               "METHOD_OVERRIDE_MISMATCH",
               "UNEXPECTED_FIELD_PRESENT",
               "PASSTHROUGH_VALUE_MISMATCH",
-              "CHECKBOX_PAIR_MISMATCH"
+              "CHECKBOX_PAIR_MISMATCH",
+              "METHOD_MISMATCH",
+              "METHOD_OVERRIDE_PRESENT",
+              "QUERY_MISMATCH",
+              "FILTER_MISMATCH",
+              "HEADER_NOT_ALLOWED",
+              "CONTENT_TYPE_MISMATCH",
+              "PREFER_MISMATCH",
+              "BODY_NOT_OBJECT",
+              "BODY_DUPLICATE_KEY",
+              "BODY_VALUE_NOT_SCALAR",
+              "BODY_KEY_MISSING",
+              "BODY_KEY_UNEXPECTED",
+              "BODY_VALUE_TYPE_MISMATCH",
+              "BODY_VALUE_MISMATCH",
+              "BODY_STATE_KEY_UNEXPECTED"
             ]
           },
           "additionalProperties": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/count" }

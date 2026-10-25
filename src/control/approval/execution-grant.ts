@@ -31,8 +31,8 @@ import {
  * - T28R-fix-1（独立レビュー T28R の I-2、M-2）: `GRANT_RESERVATION_SETTLED`（確かめ直しで、その許可の予約が `RESERVED` でない。送った・分からない・
  *   返した後の許可で、次の書き込みの要求を送らない）、`GRANT_CLOCK_BEFORE_APPROVAL`（発行の時刻が、承認の時刻より前。時計の巻き戻し）、
  *   `GRANT_CLOCK_BEFORE_ISSUE`（消費の時刻が、発行の時刻より前）。
- * - T31b: `SCENARIO_UPDATE_SPEC_MISSING`（発行で、UPDATE のシナリオの版に UPDATE の指定がない。UPDATE の指定の前に保存した版。読めるが許可は
- *   出さない。理由の名前は、シナリオと承認の保存の理由と同じ）。
+ * - LG-3（2026-10-24 のテストの組の設計 3.7.2）: T31b の `SCENARIO_UPDATE_SPEC_MISSING`（UPDATE の指定の前に保存した UPDATE の版）は捨てた。その版は
+ *   読むときに契約の形の誤り（`DATABASE_INTEGRITY_FAILED`）で止まる。
  * - T31e（Task 31 の設計書 3 章の「対象の選び方」）: `TARGET_SELECTION_CHANGED`（発行で、UPDATE の対象を選び直した結果が、画面が見せた予定の
  *   レコードの ID と違う）、`TARGET_RECORD_UNAVAILABLE`（発行で、UPDATE の対象にできるレコード（参照した CREATE のシナリオの `VERIFIED` の登録）が
  *   ない）。
@@ -60,11 +60,18 @@ export const EXECUTION_GRANT_REJECTION_REASONS = Object.freeze([
   'GRANT_RESERVATION_SETTLED',
   'GRANT_CLOCK_BEFORE_APPROVAL',
   'GRANT_CLOCK_BEFORE_ISSUE',
-  'SCENARIO_UPDATE_SPEC_MISSING',
   'TARGET_SELECTION_CHANGED',
   'TARGET_RECORD_UNAVAILABLE',
   // T31R-fix-1 の I-2: 下書きの保存の後に台帳の登録の ID の取り方が変わり、path の型の `{id}` の位置に結び付かなくなった（下書きの理由と同じ名前）。
   'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID',
+  // LG-3b（2026-10-24 のテストの組の設計 3.7.2）: T38b の `API_WRITE_NOT_AVAILABLE`（T41a の契約のない API の更新）は捨てた（その版は、スキーマが
+  // 拒むので保存の部品が読まない）。
+  // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-1）: API のシナリオの送る値を持たない照合の READ（`{id}` の型）の期待が、実行のたびに変わる値
+  // （生成した値）と比べない（毎回同じ値になる規則の欄だけと比べる）。判定は `src/control/data-rules/varying-values.ts`。
+  'READ_VERIFICATION_NOT_VARYING',
+  // T41b（Task 41 の設計書 3.2）: 下書きの保存の後に台帳の登録の ID の取り方（応答の本文の鍵）が変わり、API の更新の filter の名前に結び付かなくなった
+  // （下書きの理由と同じ名前。判定は `scenario-policy.ts` の `apiUpdateLedgerBindingRejectionOf`）。
+  'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
 ] as const);
 export type ExecutionGrantRejectionReason = (typeof EXECUTION_GRANT_REJECTION_REASONS)[number];
 
@@ -223,6 +230,10 @@ export const writeScheduleOf = (reservations: readonly RatedWriteReservation[], 
  */
 export const environmentEvidenceRejectionOf = (reference: string | null): 'GRANT_ENVIRONMENT_EVIDENCE_MISSING' | null =>
   reference === null || reference.trim().length === 0 ? 'GRANT_ENVIRONMENT_EVIDENCE_MISSING' : null;
+
+// LG-3b（2026-10-24 のテストの組の設計 3.7.2）: API の書き込みの判定 `apiWriteRejectionOf`（T38b・T38f・T40a・T41b。T41a の契約のない API の更新に
+// 許可を出さない重ねの守り）は捨てた。契約のない API の更新の版は、シナリオのスキーマが拒むので、保存も読み出しもされない（読むときに
+// `DATABASE_INTEGRITY_FAILED`）。API の登録と、契約のある API の更新には、FORM と同じ確かめ（有効性、入力の規則、検証の指定、上限、予約）で許可を出す。
 
 /** 書き込みの同時実行の枠があるか（動いている書き込みの数（消費していない有効な許可と、決着していない消費済みの許可）が枠より少ない）。 */
 export const isWriteConcurrencyAvailable = (activeWrites: number): boolean => activeWrites < WRITE_JOB_CONCURRENCY;

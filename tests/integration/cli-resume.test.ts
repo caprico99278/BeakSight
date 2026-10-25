@@ -9,12 +9,15 @@
 // - Run の後の保存の終わり方（`FINISH`・`ABANDON`・`NONE`）、`finish` と片付けの失敗、出力の書き出しの失敗、Run Coordinator の例外、
 //   再開を始められない3つの理由は、偽の Run Coordinator（`createRunCoordinator`）で確かめる（Browser を起動しない）。
 // - R7c: 違反を検出した Run は、最後の出力の書き出しに失敗しても、保存を FINISHED にし、次の起動で再開しない（本物の Run Coordinator）。
+// - SR-1-F: 前の形の保存（送信の方針のない設定、送信の方針を書き換えた保存、`page-schema/1.0` のページ、後の項目のない監査の段の数）の途中の Run は
+//   再開せず、新しい Run を始める。サーバに届くのは GET・HEAD だけ。
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { wait } from '../../src/core/deadline.js';
 import { EXIT_CODES, RUN_UNAVAILABLE_EXIT_CODE, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
 import { runAuditCommand, type RunCommandDependencies } from '../../src/cli/run-command.js';
 import type { AuditConfig } from '../../src/config/types.js';
@@ -31,17 +34,20 @@ import { createRunId } from '../../src/core/ids.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { readToolVersion } from '../../src/orchestration/environment.js';
 import {
-  checkRunCheckpointConsistency,
   createRunLock,
   currentProcessRunLockHost,
-  decideRunResumption,
   isProcessRunning,
   judgeRunLock,
   RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
+  RUN_LOCK_TAKEOVER_GRACE_MS,
+  type RunLock,
+} from '../../src/core/process-lock.js';
+import {
+  checkRunCheckpointConsistency,
+  decideRunResumption,
   type RunCheckpoint,
   type RunCheckpointPage,
-  type RunLock,
 } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
@@ -135,6 +141,9 @@ const realDependencies = (overrides: Partial<RunCommandDependencies> = {}): RunC
   launchBrowser: runLauncher.launcher,
   clock: () => new Date(),
   now: () => Date.now(),
+  // DEF-172: 動いている process の ID の古く見えるロック（端末の再起動を模したもの）は、取り直す前に猶予を置いて読み直す。その待ちだけを、待たずに
+  // 進める（ロックは変わらないので、今までどおり取り直す）。ほかの待ち（読み込みの間隔など）は、本番の待ち。
+  sleep: async (ms) => (ms === RUN_LOCK_TAKEOVER_GRACE_MS ? undefined : await wait(ms)),
   ...overrides,
 });
 
@@ -677,6 +686,101 @@ describe('R5a: an interrupted Run whose state.json and state.prev.json are both 
     const newRunDirectory = join(outputDirectory, names.find((name) => name !== stoppedRunId) ?? '');
     expect(outcome.code).toBe(exitCodeForRunStatus((await readRun(newRunDirectory)).runStatus));
   });
+});
+
+// SR-1-F（PRE42 の安全の組の独立のレビュー SR-1 の Minor-1。レビュー担当の実験 `scratchpad\sr-1\exp\resume-legacy.test.ts` の形）: 前の形の保存の
+// 途中の Run は、本物の Chromium と Guard を通しても再開せず、新しい Run を始める。どの回も、サーバに届くのは GET・HEAD だけ。
+// - 送信の方針（`audit.sendPolicy`）のない実効の設定と、送信の方針を書き換えた保存（`PASS_EXCEPT_DELETE`。今の設定は `READ_ONLY`）: 設定が違う。
+// - `page-schema/1.0` のページの保存と、後から足した項目のない監査の段の数（LG-4 で必須にした数のない前の形）: 保存を読めない。
+describe('SR-1-F: an interrupted Run with a checkpoint of an earlier form is not resumed, and the server gets only GET and HEAD', () => {
+  type JsonObject = Record<string, unknown>;
+
+  const rewriteJson = async (path: string, change: (value: JsonObject) => JsonObject): Promise<void> => {
+    await writeFile(path, `${JSON.stringify(change(await readJson(path) as JsonObject))}\n`, 'utf8');
+  };
+  /** `state.json` と `state.prev.json`（あれば）を、同じに書き換える。 */
+  const rewriteStates = async (runDirectory: string, change: (value: JsonObject) => JsonObject): Promise<void> => {
+    for (const file of ['state', 'previousState'] as const) {
+      const path = artifactFilePath(runDirectory, checkpointArtifactRelativePath(file));
+      if (existsSync(path)) {
+        await rewriteJson(path, change);
+      }
+    }
+  };
+  const withAudit = (state: JsonObject, change: (audit: JsonObject) => JsonObject): JsonObject => {
+    const effectiveConfig = state['effectiveConfig'] as JsonObject;
+    return { ...state, effectiveConfig: { ...effectiveConfig, audit: change(effectiveConfig['audit'] as JsonObject) } };
+  };
+  /** 後から足した 3 つの項目（`allowedOriginDataRequestsBlocked`、`serviceRequestPacingWaits`、`serviceRequestPacingWaitMs`）のない、監査の段の数。 */
+  const EARLIER_AUDIT_STAGE_COUNTS: JsonObject = Object.freeze({
+    registeredReadRequestsAllowed: 0,
+    tokenRefreshBlocked: 0,
+    otherNonReadBlocked: 0,
+    serviceUnauthorizedResponses: 0,
+    serviceRequestsAdmitted: 0,
+    serviceRequestLimitRefused: 0,
+  });
+  /** サーバに届いた、GET・HEAD でない要求の数。 */
+  const nonReadCount = (): number => {
+    const { post, put, patch, delete: deleted, options, other } = server.getCounters();
+    return post + put + patch + deleted + options + other;
+  };
+
+  it.each([
+    {
+      name: 'no-send-policy',
+      unreadable: false,
+      change: async (runDirectory: string) => rewriteStates(runDirectory, (state) => withAudit(state, ({ sendPolicy: _sendPolicy, ...audit }) => audit)),
+    },
+    {
+      name: 'saved-pass-except-delete',
+      unreadable: false,
+      change: async (runDirectory: string) => rewriteStates(runDirectory, (state) => withAudit(state, (audit) => ({ ...audit, sendPolicy: 'PASS_EXCEPT_DELETE' }))),
+    },
+    {
+      name: 'page-schema-1.0',
+      unreadable: true,
+      change: async (runDirectory: string) => {
+        const pages = (await readState(runDirectory)).completedPageIds as readonly PageId[];
+        expect(pages.length).toBeGreaterThan(0);
+        for (const pageId of pages) {
+          await rewriteJson(artifactFilePath(runDirectory, checkpointPageArtifactRelativePath(pageId)), (page) => ({
+            ...page, result: { ...(page['result'] as JsonObject), schemaVersion: 'page-schema/1.0' },
+          }));
+        }
+      },
+    },
+    {
+      name: 'audit-stage-counts-without-later-items',
+      unreadable: true,
+      change: async (runDirectory: string) => rewriteStates(runDirectory, (state) => ({
+        ...state, load: { ...(state['load'] as JsonObject), auditStageCounts: EARLIER_AUDIT_STAGE_COUNTS },
+      })),
+    },
+  ])('$name: starts a new Run instead of the resume', async ({ name, unreadable, change }) => {
+    server.resetCounters();
+    const config = shortConfigFor(`legacy-${name}`);
+    const outputDirectory = join(workDirectory, `legacy-${name}`);
+    expect((await runStoppedAfter(config, 1)).code).toBe(EXIT_CODES.PARTIAL);
+    const stoppedRunDirectory = await onlyRunDirectoryIn(outputDirectory);
+    const stoppedRunId = (await readState(stoppedRunDirectory)).runId;
+    await change(stoppedRunDirectory);
+
+    const outcome = await runCommand(config, realDependencies());
+
+    const lines = outcome.stdout.split('\n');
+    const notice = unreadable ? unreadableCheckpointText(stoppedRunId) : differentConfigRunText(stoppedRunId, 'audit.sendPolicy');
+    expect(lines, outcome.stdout).toContain(notice);
+    expect(lines.indexOf(notice)).toBeLessThan(lines.indexOf(CLI_TEXT.run.started));
+    expect(outcome.stdout).not.toContain(expectedResumeLine(stoppedRunId, 1));
+    expect(outcome.stderr).toBe('');
+    const names = await directoriesIn(outputDirectory);
+    expect(names).toHaveLength(2);
+    const newRunDirectory = join(outputDirectory, names.find((directory) => directory !== stoppedRunId) ?? '');
+    expect(outcome.code).toBe(exitCodeForRunStatus((await readRun(newRunDirectory)).runStatus));
+    expect(nonReadCount(), JSON.stringify(server.getCounters())).toBe(0);
+    expect(server.getCounters().get).toBeGreaterThan(0);
+  }, SUITE_TIMEOUT_MS);
 });
 
 // R8（中断した Run の再開の設計書 4.2、4.7、4.10 の DEF-022。RR2 の指摘4）: スキーマと、ほかの整合の確かめは通るが、巡回の記録を作り直せない

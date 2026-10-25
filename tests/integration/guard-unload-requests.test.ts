@@ -5,13 +5,13 @@
 //   （`chromiumLaunchOptions`。`chrome.exe` の新しい headless）の両方で確かめる（漏れは、どちらでも起きた）。
 // - 127.0.0.1 の fixture のサーバだけを使う。別のプロセスの iframe（OOPIF）は、`--site-per-process` と、同じサーバの別のホスト名
 //   （`localhost`）で作る。
-// - 場面: Passive でページ自身が同じ Origin へ移る、`fetchLater()`、Guard が許可 Origin の外への main frame の移動を止めた後、
-//   Interaction の凍結の前、OOPIF の自己移動。どれも、サーバに届かず、`blockedRequests` に残り、違反 0。対照は、Guard なしで届く。
+// - 場面: `fetchLater()`、Guard が許可 Origin の外への main frame の移動を止めた後、Interaction の凍結の前、OOPIF の自己移動。どれも、
+//   サーバに届かず、`blockedRequests` に残り、違反 0。TS-f: Passive でページ自身が同じ Origin へ移る場面は `safety-gates.test.ts` の
+//   GATE-S01（DEF-042）に、Guard なしで届く対照は `gate-fixtures.test.ts` の DEF-042（両方の Chromium）に、まとめた。
 // - 記録は 1 要求につき 1 回（CDP の段階と route の両方で記録しない）。route が見た要求は、検証の記録のために出力する。
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import type { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { wait } from '../../src/core/deadline.js';
@@ -21,24 +21,22 @@ import {
   installPassiveRequestGuard,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchHeadlessChromium, oopifTargetUrls, SITE_PER_PROCESS_ARGS } from '../helpers/chromium.js';
+import { launchCliChromium, launchHeadlessChromium, oopifTargetUrls, SITE_PER_PROCESS_ARGS } from '../helpers/chromium.js';
 import { crossSiteFramePath, crossSiteOriginOf, NAVIGATION_TARGET_PAGE } from '../helpers/external-scheme-fixture.js';
 import {
   createGateFactory,
-  leaveUnguardedUnloadBeaconPage,
+  logSelfNavigationRounds,
   NO_NON_READ_REQUESTS,
   openGuardedPassiveSession,
   openInteractionSessionBeforeFreeze,
   openServerWindow,
   pageUrlIs,
   QUIET_PERIOD_MS,
-  readFetchLaterState,
   runGuardedSelfNavigationRounds,
   UNLOAD_BEACON_FETCH_LATER_PAGE,
   UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS,
   UNLOAD_BEACON_TARGET_PATH,
   unloadBeaconSelfNavigationPath,
-  type SelfNavigationRounds,
 } from '../helpers/gate-harness.js';
 
 const viewport: Viewport = Object.freeze({ width: 900, height: 700 });
@@ -68,23 +66,11 @@ const CHROMIUM_LAUNCHES: readonly ChromiumLaunch[] = [
   {
     name: 'the CLI Chromium (chromiumLaunchOptions, headless)',
     launch: (extraArgs) => {
-      const options = chromiumLaunchOptions({ headless: true });
-      return chromium.launch({ ...options, args: [...(options.args ?? []), ...extraArgs] });
+      // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+      return launchCliChromium({ args: extraArgs });
     },
   },
 ];
-
-/** 回ごとの結果を、検証の記録のために出力する（既定の報告では、PASS したテストの出力は表示されない）。 */
-function logRounds(label: string, { rounds }: SelfNavigationRounds): void {
-  console.info(`DEF-042 ${label}: ${JSON.stringify(rounds.map((round) => ({
-    round: round.round,
-    delivered: round.delivered,
-    blockedRequests: round.blockedRequests.map((entry) => `${entry.method} ${entry.url} ${entry.reason}`),
-    blockedNavigations: round.blockedNavigations.map((entry) => `${entry.method} ${entry.url} ${entry.reason}`),
-    violations: round.invariantViolations,
-    pageUrl: round.pageUrl,
-  })))}`);
-}
 
 describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that navigates itself are stopped by the Guard, with $name', ({ name, launch }) => {
   let server: FixtureServer;
@@ -118,22 +104,8 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
 
   const urlOf = (path: string): string => `${server.origin}${path}`;
 
-  it('Passive: the page leaves by itself to the same site; the pagehide beacon and keepalive POST never reach the server, are recorded, and there is no violation', async () => {
-    const result = await runGuardedSelfNavigationRounds(
-      () => openGuardedPassiveSession(factory, viewport),
-      server,
-      unloadBeaconSelfNavigationPath('same-site'),
-      pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
-    );
-    logRounds(`Passive same-site (${name})`, result);
-
-    expect(result.failedRounds).toEqual([]);
-    expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
-      entry.method === 'POST' && entry.url === urlOf(UNLOAD_BEACON_TARGET_PATH) && entry.reason === 'NON_READ_METHOD'
-    )))).toBe(true);
-    expect(result.allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
-    expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  }, UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS);
+  // TS-f: Passive でページ自身が同じ Origin へ移る場面（回ごとの記録の中身を含む）は、`safety-gates.test.ts` の GATE-S01（DEF-042）に、
+  // Guard のない対照（同じ Origin への移動と `fetchLater()`）は、両方の Chromium で `gate-fixtures.test.ts` の DEF-042 に、1 か所ずつまとめた。
 
   it('Passive: the fetchLater() POST scheduled by the page never reaches the server when the page leaves by itself, and is recorded', async () => {
     const result = await runGuardedSelfNavigationRounds(
@@ -142,7 +114,7 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
       UNLOAD_BEACON_FETCH_LATER_PAGE,
       pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
     );
-    logRounds(`Passive fetchLater (${name})`, result);
+    logSelfNavigationRounds(`Passive fetchLater (${name})`, result);
 
     expect(result.failedRounds).toEqual([]);
     expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
@@ -159,12 +131,24 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
       server,
       unloadBeaconSelfNavigationPath('cross-site'),
       (_page, ledger) => ledger.snapshot().blockedNavigations.length > 0,
+      // DEF-095: 混雑の下（CLI の Chromium）では、移動を止めた後、ページが離れる POST を出す前にエラーの画面（`chrome-error://chromewebdata/`）へ
+      // 移り、`blockedRequests` が空の回がある（その回も届いた要求は 0、違反 0）。移動を止めた記録（`EXTERNAL_MAIN_FRAME_NAVIGATION`）も止めた証拠に
+      // 数える。離れる POST を止めた記録が残る回は、その中身を下で確かめる。
+      {
+        evidence: (round) => round.blockedRequests.length > 0
+          || round.blockedNavigations.some((entry) => entry.reason === 'EXTERNAL_MAIN_FRAME_NAVIGATION'),
+      },
     );
-    logRounds(`Passive blocked cross-site navigation (${name})`, result);
+    logSelfNavigationRounds(`Passive blocked cross-site navigation (${name})`, result);
 
     expect(result.failedRounds).toEqual([]);
+    expect(result.rounds.every((round) => round.delivered === 0)).toBe(true);
+    expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
+      entry.method === 'POST' && entry.url === urlOf(UNLOAD_BEACON_TARGET_PATH) && entry.reason === 'NON_READ_METHOD'
+    )))).toBe(true);
     expect(result.rounds.map((round) => round.blockedNavigations)).toEqual(result.rounds.map(() => [
-      { method: 'GET', url: crossSiteTarget, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+      // BN-a: 止めた時点（読み込みの最中）も記録する。
+      { method: 'GET', url: crossSiteTarget, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
     ]));
     expect(result.allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
     expect(result.allRoundsWindow.count('GET', NAVIGATION_TARGET_PAGE)).toBe(0);
@@ -178,7 +162,7 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
       unloadBeaconSelfNavigationPath('same-site'),
       pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
     );
-    logRounds(`Interaction before freeze (${name})`, result);
+    logSelfNavigationRounds(`Interaction before freeze (${name})`, result);
 
     expect(result.failedRounds).toEqual([]);
     expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
@@ -203,7 +187,7 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
         },
       },
     );
-    logRounds(`Passive OOPIF (${name})`, result);
+    logSelfNavigationRounds(`Passive OOPIF (${name})`, result);
 
     expect(oopifObserved).toBe(true);
     expect(result.failedRounds).toEqual([]);
@@ -301,30 +285,5 @@ describe.each(CHROMIUM_LAUNCHES)('DEF-042: the leaving requests of a page that n
     } finally {
       expect(await session.close()).toEqual([]);
     }
-  });
-
-  it('control: without the Guard, the same page leaving by itself delivers POST /__mutation', async () => {
-    const window = await leaveUnguardedUnloadBeaconPage(
-      browser,
-      server,
-      viewport,
-      unloadBeaconSelfNavigationPath('same-site'),
-      pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
-    );
-
-    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
-  });
-
-  it('control: without the Guard, the fetchLater() POST is scheduled and delivered when the page leaves by itself', async () => {
-    const window = await leaveUnguardedUnloadBeaconPage(
-      browser,
-      server,
-      viewport,
-      UNLOAD_BEACON_FETCH_LATER_PAGE,
-      pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
-      { afterDomContentLoaded: async (page) => expect(await readFetchLaterState(page)).toBe('scheduled') },
-    );
-
-    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
   });
 });

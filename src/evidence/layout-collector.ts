@@ -1,5 +1,6 @@
 import type { Page } from 'playwright';
 import {
+  announceOwnMainFrameNavigation,
   observeMainFrameLoad,
   trackMainFrameDocument,
   type MainFrameLoadObservation,
@@ -179,6 +180,16 @@ export interface StressLayoutOptions {
    * 待たない呼び出し側（テストなど）は、それを明示する関数（`async () => 0`）を渡す。
    */
   readonly beforeNavigation: () => Promise<number>;
+  /**
+   * T44 P1-5（Task 44 の設計書の履歴の「T44h の測りとユーザーの判断」。「待ってから測る」）: 各幅の読み込みが終わった後、形を測る前に呼ぶ、落ち着きの待ち
+   * （Page Auditor は、最初の読み込み（Desktop・Mobile）と同じ部品 `waitForPageSettled` と待ち方 `PAGE_SETTLING_PACING`、上限
+   * `crawl.resourceSettlingTimeoutMs` を渡す。部品は複製しない）。引数は、その幅の page と、その幅の読み込みの期限。待つだけで、読み込みの間隔と回数は
+   * 変えない。落ち着かないまま上限が来ても、今までどおり測る（幅の結果の理由は足さない）。T44R2 の I-6: 呼ぶ側は、その幅の期限の前に形を測る時間を残して
+   * 待ちを止める（Page Auditor は `STRESS_LAYOUT_MEASURE_RESERVE_MS` を引いた時刻を上限にする）。
+   * 必須の引数である（渡し忘れると、後から描く画面を見ずに測る、という形を残さない。`beforeNavigation` と同じ）。待たない呼び出し側（テストなど）は、
+   * それを明示する関数（`async () => undefined`）を渡す。関数でない値は、セッションを作らずに例外を投げる。
+   */
+  readonly settleBeforeLayout: (page: Page, deadlineAtMs: number) => Promise<void>;
   /**
    * 各幅の読み込み（`page.goto`）の観測と、その読み込みの間のページ本体の要求の観察の結果を受け取る口（サイトが応答しないときに Run を
    * 止める設計書 2.1。サイトの不調で止めたときの診断の記録の設計書 2.2 の 2026-10-07 の改訂）。読み込みを始めた幅ごとに1回、読み込みが
@@ -1413,13 +1424,16 @@ export async function collectStressLayout(
   if (typeof options !== 'object' || options === null) {
     throw new Error('Responsive stress requires options with a deadline and a beforeNavigation function');
   }
-  const { beforeNavigation, afterNavigation } = options;
+  const { beforeNavigation, afterNavigation, settleBeforeLayout } = options;
   let { deadlineAtMs } = options;
   if (!Number.isFinite(deadlineAtMs)) {
     throw new Error('Responsive stress deadline must be finite');
   }
   if (typeof beforeNavigation !== 'function') {
     throw new Error('Responsive stress requires a beforeNavigation function');
+  }
+  if (typeof settleBeforeLayout !== 'function') {
+    throw new Error('Responsive stress requires a settleBeforeLayout function');
   }
   if (afterNavigation !== undefined && typeof afterNavigation !== 'function') {
     throw new Error('Responsive stress afterNavigation must be a function when given');
@@ -1453,6 +1467,8 @@ export async function collectStressLayout(
       try {
         let diagnostics: NavigationDiagnostics | null = null;
         try {
+          // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す）。
+          announceOwnMainFrameNavigation(session.page);
           navigated = await awaitBeforeDeadline(session.page.goto(url, { waitUntil: 'load' }), deadlineAtMs);
         } finally {
           diagnostics = recorder === null ? null : await recorder.finish();
@@ -1469,6 +1485,8 @@ export async function collectStressLayout(
         workError = navigated.reason;
         result = failedWidth(width, 'NAVIGATION', 'NAVIGATION_FAILED', navigated.reason);
       } else {
+        // T44 P1-5: 最初の読み込みと同じ落ち着きの待ちの後に測る（後から描く画面のデータを見る）。
+        await settleBeforeLayout(session.page, deadlineAtMs);
         const collected = await collectLayoutEvidence(session.page, viewport, { deadlineAtMs });
         result = collected.status === 'COMPLETE'
           ? Object.freeze({ width, height: STRESS_VIEWPORT_HEIGHT, status: 'COMPLETE', layout: collected.layout })

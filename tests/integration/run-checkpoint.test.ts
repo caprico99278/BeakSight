@@ -26,20 +26,22 @@ import type { AuditRunResult } from '../../src/core/contracts.js';
 import { createPageId, createRunId } from '../../src/core/ids.js';
 import { summarizeRunSafety } from '../../src/orchestration/run-aggregation.js';
 import {
-  checkRunCheckpointConsistency,
-  checkRunCheckpointPageConsistency,
-  createRunCheckpoint,
   createRunLock,
   currentProcessRunLockHost,
-  decideRunResumption,
   isProcessRunning,
   judgeRunLock,
   RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
+  type RunLock,
+} from '../../src/core/process-lock.js';
+import {
+  checkRunCheckpointConsistency,
+  checkRunCheckpointPageConsistency,
+  createRunCheckpoint,
+  decideRunResumption,
   type RunCheckpoint,
   type RunCheckpointPage,
   type RunCheckpointStore,
-  type RunLock,
 } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
@@ -83,6 +85,10 @@ function recordingStore(target: ArtifactWriter): RunCheckpointStore {
     readRunLock: async (directory) => {
       storeCalls.push('read lock');
       return target.readRunLock(directory);
+    },
+    takeOverRunLock: async (directory, judged, lock) => {
+      storeCalls.push('take over lock');
+      return target.takeOverRunLock(directory, judged, lock);
     },
     releaseRunLock: async (directory) => {
       storeCalls.push('release lock');
@@ -151,7 +157,10 @@ describe('R4a: checkpoints of a new Run with the real ArtifactWriter (resumable 
 
   it('writes the lock, the state after robots.txt and sitemap.xml, and then the page and the state after every page', async () => {
     const pageIds = result.pages.map(({ pageId }) => pageId);
-    expect(storeCalls).toEqual([
+    // DEF-172: 読み込みと書き込みの直前に、ロックを読んで自分のものかを確かめる（書き込みの順は、読み取りを除いて今までどおり）。保存の書き込みの
+    // 直前は、いつもロックの読み取り。
+    expect(storeCalls.filter((call, index) => call !== 'acquire lock' && call !== 'read lock' && storeCalls[index - 1] !== 'read lock')).toEqual([]);
+    expect(storeCalls.filter((call) => call !== 'read lock')).toEqual([
       'acquire lock',
       'state IN_PROGRESS []',
       ...pageIds.flatMap((pageId, index) => [`page ${pageId}`, `state IN_PROGRESS [${pageIds.slice(0, index + 1).join(',')}]`]),
@@ -193,7 +202,9 @@ describe('R4a: checkpoints of a new Run with the real ArtifactWriter (resumable 
     expect(pages.every(({ safetyLedgerSnapshots }) => safetyLedgerSnapshots.length > 0)).toBe(true);
     expect(state.safetyLedgerSnapshots.length + pageSnapshots.length).toBe(ledgerCount);
     // 保存の snapshot から集計した Safety が、Run の Safety と同じになる（再開の後の最後の処理に使える）。
-    expect(summarizeRunSafety({ guardEnabled: true, snapshots: [...state.safetyLedgerSnapshots, ...pageSnapshots] })).toEqual(result.run.safety);
+    // AS-b: 実効の監査の段の送信の扱いも渡す（この Run は既定の読み取りだけ）。
+    expect(summarizeRunSafety({ guardEnabled: true, snapshots: [...state.safetyLedgerSnapshots, ...pageSnapshots], auditSendPolicy: 'READ_ONLY' }))
+      .toEqual(result.run.safety);
   });
 
   it('leaves the lock of this process, which is judged as the lock of a running Run', async () => {
@@ -231,8 +242,9 @@ describe('R4a2a: resuming a run directory with a stale lock, with the real Artif
   it('takes over the lock of the previous execution (before an OS restart), removes the unfinished page, and keeps the lock against another resume', async () => {
     const root = await mkdtemp(join(tmpdir(), 'beaksight-run-checkpoint-resume-'));
     const resumeWriter = new ArtifactWriter();
-    const resumed = new RunCheckpointSession({ store: resumeWriter, now: () => Date.now() });
-    const another = new RunCheckpointSession({ store: resumeWriter, now: () => Date.now() });
+    // DEF-172: 動いている process の ID のロックは、取り直す前に猶予を置いて読み直す（ここでは注入した待ちで、待たずに進める。ロックは変わらない）。
+    const resumed = new RunCheckpointSession({ store: resumeWriter, now: () => Date.now(), wait: async () => undefined });
+    const another = new RunCheckpointSession({ store: resumeWriter, now: () => Date.now(), wait: async () => undefined });
     try {
       const directory = runArtifactDirectory(root, createRunId(20261001000000));
       const finishedPage = createPageId(1);

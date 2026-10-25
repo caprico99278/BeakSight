@@ -19,13 +19,6 @@ import {
   AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
 } from '../../src/presentation/messages.js';
 
-/** 管理データの版 3 を公開した時点の失敗の理由（T26c の前の一覧。版 4 で後ろに足す）。 */
-const VERSION_3_FAILURE_REASONS = Object.freeze([
-  'CONFIG_ERROR', 'ARTIFACT_WRITE_FAILED', 'UNEXPECTED_FAILURE', 'PROTOCOL_VIOLATION', 'START_TIMEOUT', 'CONFIG_CHANGED',
-  'AUTH_SETUP_CHANGED', 'AUTH_SETUP_REQUIRED', 'UNSUPPORTED_AUTH_STATE', 'LOGIN_TIMEOUT', 'LOGIN_ATTEMPTS_EXCEEDED',
-  'WORKER_START_FAILED', 'WORKER_NOT_READY', 'WORKER_EXITED', 'WORKER_UNRESPONSIVE', 'STOP_TIMEOUT', 'SERVER_RESTARTED', 'SERVER_SHUTDOWN',
-]);
-
 const AUTO_LOGIN_START_REJECTIONS = [
   'CREDENTIAL_MISSING', 'CREDENTIAL_STALE', 'CREDENTIAL_PROTECTION_UNAVAILABLE', 'AUTO_LOGIN_HELD', 'AUTO_LOGIN_RATE_LIMITED',
 ] as const;
@@ -34,20 +27,19 @@ describe('job records for the automated login (T26c)', () => {
   // T27c: `DISCOVERY` と `READ_CHECK` を後ろに足した（Task 27 の設計書 4.6）。
   it('has the job kinds AUDIT and LOGIN_CHECK, then DISCOVERY and READ_CHECK (T27c)', () => {
     // T30d: 書き込みのジョブ（`WRITE_CREATE`。始める口と IPC の中身は T30e）。T31e: 更新の書き込みのジョブ（`WRITE_UPDATE`。始める口は T31f）。
-    expect(AUDIT_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE']);
+    // T43c: 入口の確かめのジョブ（`ENTRY_CHECK`）を後ろに足した。
+    expect(AUDIT_JOB_KINDS).toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
     expect(Object.isFrozen(AUDIT_JOB_KINDS)).toBe(true);
   });
 
-  it('adds every result but SUCCEEDED to the failure reasons, after the reasons of version 3, without duplicates', () => {
-    expect(AUDIT_JOB_FAILURE_REASONS.slice(0, VERSION_3_FAILURE_REASONS.length)).toEqual([...VERSION_3_FAILURE_REASONS]);
-    const version4End = VERSION_3_FAILURE_REASONS.length + AUTOMATED_LOGIN_FAILURE_RESULTS.length;
-    expect(AUDIT_JOB_FAILURE_REASONS.slice(VERSION_3_FAILURE_REASONS.length, version4End)).toEqual([...AUTOMATED_LOGIN_FAILURE_RESULTS]);
-    // T27c: 版 4 の後に足したのは、ワーカーがまだ対応していない種類の START を拒む理由と、T27d の発見の結果を読めない理由だけ（名前つきの
-    // 一覧には、値を後ろに足すだけ）。
-    // T30d: 版 7 の後に、書き込みのジョブの理由（許可を消費・確かめ直しできなかった、`action-run.json` を読めない・記録できない）を足した。
-    expect(AUDIT_JOB_FAILURE_REASONS.slice(version4End)).toEqual([
+  // LG-2: 管理データの版 3 の並びを守る確かめは捨てた（一覧の並びと値が管理データの CHECK と等しいことは
+  // `tests/integration/control-store-base-schema.test.ts` が確かめる）。
+  it('adds every result but SUCCEEDED to the failure reasons, without duplicates', () => {
+    expect(AUDIT_JOB_FAILURE_REASONS).toEqual(expect.arrayContaining([...AUTOMATED_LOGIN_FAILURE_RESULTS]));
+    expect(AUDIT_JOB_FAILURE_REASONS).toEqual(expect.arrayContaining([
       'JOB_KIND_NOT_SUPPORTED', 'DISCOVERY_RESULT_INVALID', 'READ_CHECK_RESULT_INVALID', 'WRITE_GRANT_REJECTED', 'WRITE_RESULT_INVALID',
-    ]);
+      'ENTRY_CHECK_RESULT_INVALID',
+    ]));
     expect(AUDIT_JOB_FAILURE_REASONS).not.toContain('SUCCEEDED');
     expect(new Set(AUDIT_JOB_FAILURE_REASONS).size).toBe(AUDIT_JOB_FAILURE_REASONS.length);
     expect(AUDIT_JOB_FAILURE_REASONS).toEqual(expect.arrayContaining([...WORKER_FAILURE_REASONS]));

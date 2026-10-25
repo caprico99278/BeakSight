@@ -5,7 +5,7 @@ import { controlledScroll } from '../../src/browser/controlled-scroll.js';
 import { waitForPageSettled } from '../../src/browser/page-settling.js';
 import { MAX_RESOURCE_TIMING_ENTRIES } from '../../src/core/limits.js';
 import { NetworkCollector } from '../../src/evidence/network-collector.js';
-import { PerformanceCollector } from '../../src/evidence/performance-collector.js';
+import { PAGE_PERFORMANCE_STATE_PROPERTY, PerformanceCollector } from '../../src/evidence/performance-collector.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
@@ -45,12 +45,10 @@ describe('performance evidence in a guarded Chromium lifecycle', () => {
       await probeContext.addInitScript({ content: `${prelude}\n${installedContent}` });
       const probePage = await probeContext.newPage();
       await probePage.goto('about:blank', { waitUntil: 'load' });
-      return await probePage.evaluate(() => {
-        const globalObject = globalThis as typeof globalThis & {
-          __BEAKSIGHT_PERFORMANCE__?: { readonly webVitals?: Record<string, unknown> };
-        };
-        return globalObject.__BEAKSIGHT_PERFORMANCE__?.webVitals ?? {};
-      });
+      return await probePage.evaluate((stateProperty) => {
+        const state = (globalThis as unknown as Record<string, { readonly webVitals?: Record<string, unknown> } | undefined>)[stateProperty];
+        return state?.webVitals ?? {};
+      }, PAGE_PERFORMANCE_STATE_PROPERTY);
     } finally {
       await probeContext.close();
     }
@@ -102,25 +100,24 @@ describe('performance evidence in a guarded Chromium lifecycle', () => {
       stepWaitMs: 20,
       stableWindowMs: 40,
     });
-    const globalReplacement = await page.evaluate(() => {
-      const globalObject = globalThis as typeof globalThis & {
-        __BEAKSIGHT_PERFORMANCE__?: unknown;
-      };
-      const before = globalObject.__BEAKSIGHT_PERFORMANCE__;
+    const globalReplacement = await page.evaluate((stateProperty) => {
+      const globalObject = globalThis as unknown as Record<string, unknown>;
+      const before = globalObject[stateProperty];
       try {
-        globalObject.__BEAKSIGHT_PERFORMANCE__ = { replaced: true };
+        globalObject[stateProperty] = { replaced: true };
       } catch {
         // fail-closedでconfigurableでないグローバル変数は、strictモードのページコードでは代入が拒否されることがある。
       }
+      const after = globalObject[stateProperty];
       return {
         beforeIsObject: typeof before === 'object' && before !== null,
         replacementLostState: Boolean(
-          typeof globalObject.__BEAKSIGHT_PERFORMANCE__ === 'object'
-          && globalObject.__BEAKSIGHT_PERFORMANCE__ !== null
-          && 'replaced' in globalObject.__BEAKSIGHT_PERFORMANCE__
+          typeof after === 'object'
+          && after !== null
+          && 'replaced' in after
         ),
       };
-    });
+    }, PAGE_PERFORMANCE_STATE_PROPERTY);
     const networkEvidence = await network.snapshot();
     const evidence = await collector.collect(page, networkEvidence, {
       deadlineAtMs: Date.now() + 2_000,
@@ -165,15 +162,46 @@ describe('performance evidence in a guarded Chromium lifecycle', () => {
     return { collector, network, fixturePage: page };
   }
 
+  it('leaves no page-readable name that tells BeakSight, and no global webVitals, in a guarded page (UPG-SW)', async () => {
+    // UPG-SW: ページのスクリプトから、BeakSight の守りや Collector だと推し量れる名前を読めない（ユーザーの方針）。ページの大域の名前（文字列と
+    // Symbol）と、Collector の初期化のスクリプトの本文（ページは、置いた getter の `toString()` で本文を読める）に、BeakSight の文字がない。
+    // web-vitals の束の `webVitals` も、ページの大域にできない（Playwright 1.64.1 は、初期化のスクリプトを関数で包む）。
+    let installedContent = '';
+    const captureContext = {
+      addInitScript: async ({ content }: { readonly content: string }) => {
+        installedContent = content;
+      },
+    } as unknown as BrowserContext;
+    await new PerformanceCollector().installBeforeNavigation(captureContext);
+    const { collector, network, fixturePage } = await openInstrumentedPage('/index.html');
+
+    const pageGlobals = await fixturePage.evaluate(() => ({
+      names: Object.getOwnPropertyNames(globalThis).filter((name) => /beaksight/iu.test(name)),
+      symbols: Object.getOwnPropertySymbols(globalThis).map(String).filter((name) => /beaksight/iu.test(name)),
+      webVitals: 'webVitals' in globalThis,
+    }));
+    const evidence = await collector.collect(fixturePage, await network.snapshot(), {
+      deadlineAtMs: Date.now() + 2_000,
+    });
+
+    expect(installedContent).toContain('onCLS');
+    expect(installedContent).not.toMatch(/beaksight/iu);
+    expect(pageGlobals).toEqual({ names: [], symbols: [], webVitals: false });
+    // 名前を変えても、Collector は状態を読める。
+    expect(evidence.status, JSON.stringify(evidence)).toBe('COMPLETE');
+    expect(evidence.webVitals?.TTFB.status).toBe('OBSERVED');
+    network.detach();
+  });
+
   it('expands the Resource Timing buffer so all 300 stylesheets are observed and no rating is kept', async () => {
     const { collector, network, fixturePage } = await openInstrumentedPage('/many-stylesheets.html#300');
 
     const evidence = await collector.collect(fixturePage, await network.snapshot(), {
       deadlineAtMs: Date.now() + 5_000,
     });
-    const browserState = await fixturePage.evaluate(() => JSON.stringify(
-      (globalThis as typeof globalThis & { __BEAKSIGHT_PERFORMANCE__?: unknown }).__BEAKSIGHT_PERFORMANCE__,
-    ));
+    const browserState = await fixturePage.evaluate((stateProperty) => JSON.stringify(
+      (globalThis as unknown as Record<string, unknown>)[stateProperty],
+    ), PAGE_PERFORMANCE_STATE_PROPERTY);
 
     expect(evidence.status, JSON.stringify(evidence.resourceCoverage)).toBe('COMPLETE');
     expect(evidence.resources.filter((resource) => resource.url.includes('/resource-item.css'))).toHaveLength(300);

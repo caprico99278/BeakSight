@@ -17,7 +17,7 @@ import {
   type AuthenticatedContextOptions,
   type AuthenticatedStorageState,
 } from '../../src/browser/context-factory.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { Viewport } from '../../src/config/types.js';
 import type { AuditExclusionPolicy } from '../../src/safety/request-policy.js';
@@ -242,5 +242,33 @@ describe.each(LAUNCHERS)('T25c: authenticated state injection and inheritance in
     expect(await visit(second.page, AUTH_SITE_PATHS.admin)).toBe(AUTH_SITE_PATHS.admin);
     await factory.closePassiveContext(second.context);
     expect(factory.authenticatedStateReadFailureCount()).toBe(1);
+  });
+
+  // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行の次の段へ渡す、最新の状態を読むだけの口。
+  it('returns the latest (rotated) state, which a new factory can use, and returns null without the authentication', async () => {
+    await startSite({ rotate: true });
+    const { state } = authenticatedStateFor(site);
+    const factory = factoryWith(authenticationFor(state));
+    expect(factory.latestAuthenticatedState()).toEqual(filterAuthenticatedState(state, [site.originA]));
+    const first = await open(factory, DESKTOP);
+    expect(await visit(first.page, AUTH_SITE_PATHS.admin)).toBe(AUTH_SITE_PATHS.admin);
+    await factory.closePassiveContext(first.context);
+    const latest = factory.latestAuthenticatedState();
+    expect(latest).not.toBeNull();
+    expect(Object.isFrozen(latest)).toBe(true);
+    // 回転した後の状態（最初の状態は無効になった）。
+    expect(latest).not.toEqual(filterAuthenticatedState(state, [site.originA]));
+    const before = site.requests.length;
+    // 読むだけの口は、サイトへ要求を出さない。
+    factory.latestAuthenticatedState();
+    expect(site.requests.length).toBe(before);
+
+    const next = factoryWith(authenticationFor(latest ?? state));
+    const second = await open(next, DESKTOP);
+    expect(await visit(second.page, AUTH_SITE_PATHS.admin)).toBe(AUTH_SITE_PATHS.admin);
+    await next.closePassiveContext(second.context);
+    expect(site.requests.filter(({ path }) => path.startsWith(AUTH_SITE_PATHS.login))).toEqual([]);
+
+    expect(factoryWith().latestAuthenticatedState()).toBeNull();
   });
 });

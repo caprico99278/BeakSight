@@ -11,10 +11,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium, type Browser, type BrowserContext, type Page, type Request, type Response } from 'playwright';
+import type { Browser, BrowserContext, Page, Request, Response } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ERROR_HTTP_STATUS_RANGE } from '../../src/audit/rule-helpers.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import { wait } from '../../src/core/deadline.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
@@ -24,6 +23,7 @@ import {
   isPassiveRequestGuardClosed,
 } from '../../src/safety/passive-request-guard.js';
 import type { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { launchCliChromium as launchProductionCliChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGateFactory, QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
@@ -32,6 +32,8 @@ import { fastRunConfig, runWithCoordinator } from '../helpers/run-harness.js';
 
 /** 本文のない 4xx・5xx の応答を、Chromium が描かずに読み込みを失敗にしたときの理由。 */
 const HTTP_RESPONSE_CODE_FAILURE = 'net::ERR_HTTP_RESPONSE_CODE_FAILURE';
+/** DEF-145: `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反は、失敗した main frame の要求の method と path（と Origin）を持つ。 */
+const FAILED_MAIN_FRAME_REQUEST = expect.objectContaining({ method: expect.any(String), path: expect.any(String) });
 /** 401（Basic）に答える認証の情報がないので、Chromium が読み込みを失敗にしたときの理由。 */
 const INVALID_AUTH_CREDENTIALS = 'net::ERR_INVALID_AUTH_CREDENTIALS';
 /** 本文の途中の切断の理由（DEF-029 で、ネットワークの層の失敗の一覧に加えたもの）。 */
@@ -88,7 +90,8 @@ const servers: ResponseFailureServer[] = [];
 let browser: Browser;
 
 /** CLI と同じ起動の設定（headless）で Chromium を起動する。 */
-const launchCliChromium = (): Promise<Browser> => chromium.launch(chromiumLaunchOptions({ headless: true }));
+// EL-12: 本番と同じ起動の部品で起動する（`tests/helpers/chromium.ts` の `launchCliChromium`）。
+const launchCliChromium = (): Promise<Browser> => launchProductionCliChromium();
 
 beforeAll(async () => {
   browser = await launchCliChromium();
@@ -322,7 +325,7 @@ describe('DEF-029 controls: the same failures stay violations when the Guard can
 
       expect((await observed).errorText).toBe(HTTP_RESPONSE_CODE_FAILURE);
       await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
         message: HTTP_RESPONSE_CODE_FAILURE,
       }]);
       await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);
@@ -362,7 +365,7 @@ describe('DEF-029 controls: the same failures stay violations when the Guard can
 
       expect((await observed).errorText).toBe(HTTP_RESPONSE_CODE_FAILURE);
       await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
         message: HTTP_RESPONSE_CODE_FAILURE,
       }]);
       await expect.poll(() => isPassiveRequestGuardClosed(context)).toBe(true);

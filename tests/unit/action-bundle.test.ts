@@ -22,12 +22,19 @@ import {
 } from '../../src/report/action-bundle.js';
 import { renderActionReport } from '../../src/report/action-report.js';
 import { buildActionViewModel } from '../../src/report/action-view-model.js';
-import { verifiedCreateDocuments, verifiedUpdateDocuments, type ActionReportDocuments } from '../helpers/action-report-samples.js';
+import { escapeHtml } from '../../src/report/html-components.js';
+import {
+  verifiedApiCreateDocuments,
+  verifiedCreateDocuments,
+  verifiedUpdateDocuments,
+  type ActionReportDocuments,
+} from '../helpers/action-report-samples.js';
 
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const encoder = new TextEncoder();
 const sha256Of = (bytes: Uint8Array): string => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-const textOf = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+/** T44f: 書くのと同じ書式（artifact の JSON の書式は字下げなし。`serializeArtifactJson`）。 */
+const textOf = (value: unknown): string => `${JSON.stringify(value)}\n`;
 /** バイト列を固定するテストの HTML（表示の変更に左右されない固定の文字列）。 */
 const PINNED_HTML = '<!DOCTYPE html>\n<p>pinned</p>\n';
 
@@ -77,15 +84,36 @@ describe('write bundle (T32f)', () => {
 
   // T32R2 M-2: 組み立てを `src/core/` に移す前に、今のバイト列を sha256 で固定する（移した後も、書き込みのバンドルは 1 バイトも変わらない。HTML は
   // 表示の変更に左右されないよう、固定の文字列）。
+  // T40c: 見本は版 1.1（送り方と API の要約を持つ）になったので、版 1.1 の見本の値を足した（組み立ての部品は変えていない）。LG-4 で前の版 1.0 の見本の
+  // 値は捨てた。
+  // T44f（Task 44 の設計書 P3-1 の A）: artifact の JSON を字下げなしで書くようにしたので、値を求め直した（目録と 3 つの JSON の書式。組み立ての部品は変えて
+  // いない）。
+  // LG-4: 照合の READ の見本に対象の種類（`targetKind`。read-evidence の前の版を捨てて必ず持つ）を足したので、版 1.1 の値を求め直した（組み立ての部品は
+  // 変えていない）。
   it.each<readonly [string, () => ActionReportDocuments, string]>([
-    ['a verified create', verifiedCreateDocuments, 'sha256:02d5e74278ad8ca3ba04f508f701cb079655a350e584724de6e516fadbbea528'],
-    ['a verified update (with the notice)', verifiedUpdateDocuments, 'sha256:ad3f7918dc51ab14c9a0bc9668d592dbc54284d343c09e4081de83ce6a5a0a8d'],
+    ['a verified create of 1.1', verifiedCreateDocuments, 'sha256:6c6efe3bc817e05fede06b02e0852b55aee5ff82537bae78fc332210e91a2b57'],
+    ['a verified update of 1.1 (with the notice)', verifiedUpdateDocuments,
+      'sha256:0f3c4767154761d3fc35f93912fad30304cdebb86f3363ed6dcdaffd9e2298c3'],
   ])('keeps the SHA-256 of the bundle of %s (T32R2 M-2)', (_label, documents, expected) => {
     expect(sha256Of(createActionBundle({ ...inputOf(documents()), reportHtml: PINNED_HTML }))).toBe(expected);
   });
 
   it('makes the same bytes from the same input', () => {
     expect(createActionBundle(inputOf(verifiedUpdateDocuments()))).toEqual(createActionBundle(inputOf(verifiedUpdateDocuments())));
+  });
+
+  // T40d: API の書き込みの HTML とバンドルも、同じ表示用モデルから 1 回だけ組み立てる（バンドルの中の HTML に API の節がある）。
+  it('puts the HTML with the API section, made from the same view model, in the bundle of an API write', () => {
+    const documents = verifiedApiCreateDocuments();
+    const presentation = createActionPresentation({
+      actionRun: { text: textOf(documents.actionRun), value: documents.actionRun },
+      evidence: { text: textOf(documents.evidence), value: documents.evidence },
+      approvalSummary: { text: textOf(documents.approvalSummary), value: documents.approvalSummary },
+    });
+    expect(presentation.reportHtml).toBe(renderActionReport(buildActionViewModel(documents)));
+    const html = decoder.decode(unzipSync(presentation.bundleBytes)[ACTION_REPORT_ARTIFACT_FILE_NAME]);
+    expect(html).toBe(presentation.reportHtml);
+    expect(html).toContain(`>${escapeHtml(ACTION_REPORT_TEXT.sections.api)}</h2>`);
   });
 
   it('makes the HTML report and the bundle from the prepared files once (the HTML inside the bundle is the same)', () => {

@@ -14,6 +14,7 @@ import {
   AUDIT_RUN_RESUME_DECISION_KINDS,
 } from '../../src/cli/audit-run.js';
 import { CLI_FAILURE_KINDS } from '../../src/cli/failure.js';
+import { MAX_ADDITIONAL_NAVIGATION_WAIT_MS } from '../../src/crawl/navigation-pacer.js';
 import {
   MAX_WORKER_EXIT_CODE,
   MAX_WORKER_FAILURE_DETAIL_LENGTH,
@@ -82,6 +83,8 @@ const VALID_PARENT_MESSAGES: readonly (readonly [string, ParentToWorkerMessage])
 const VALID_WORKER_MESSAGES: readonly (readonly [string, WorkerToParentMessage])[] = [
   ['READY', { protocol: WORKER_PROTOCOL_VERSION, type: 'READY' }],
   ['HEARTBEAT', { protocol: WORKER_PROTOCOL_VERSION, type: 'HEARTBEAT' }],
+  // DEF-143: 「Run の終わり」の段（集計・成果物の書き出し・止めたときの片付け）に入る知らせ。
+  ['RUN_FINALIZING', { protocol: WORKER_PROTOCOL_VERSION, type: 'RUN_FINALIZING' }],
   ['RUN_STARTED (new)', {
     protocol: WORKER_PROTOCOL_VERSION, type: 'RUN_STARTED', runId: RUN_ID, runDirectory: RUN_ID, resumeDecision: { kind: 'NEW_RUN', completedPages: null },
   }],
@@ -103,6 +106,12 @@ const VALID_WORKER_MESSAGES: readonly (readonly [string, WorkerToParentMessage])
     notice: { kind: 'SITE_UNAVAILABLE_RECHECK', url: 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH), delayMs: 0, attempt: 1, maxAttempts: 1 },
   }],
   ['NOTICE (slowdown)', { protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 10_000 } }],
+  // DEF-141: 承認したサービスへの要求の 1 分あたりの上限で、次の読み込みの前に待つ（待つ時間は 1 分まで）。
+  ['NOTICE (service request pacing)', {
+    protocol: WORKER_PROTOCOL_VERSION,
+    type: 'NOTICE',
+    notice: { kind: 'SERVICE_REQUEST_PACING_WAIT', waitMs: 60_000, waitCount: 2, totalWaitMs: 75_000 },
+  }],
   ['FINISHED (RAN)', {
     protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', outcome: { kind: 'RAN', exitCode: 2, runId: RUN_ID, runDirectory: RUN_ID, runStatus: 'PARTIAL' },
   }],
@@ -252,6 +261,7 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
     ['a parent message (START) sent to the parent', start],
     ['an extra property on READY', { ...workerExample('READY'), pid: 1 }],
     ['an extra property on HEARTBEAT', { ...workerExample('HEARTBEAT'), at: 1 }],
+    ['an extra property on RUN_FINALIZING', { ...workerExample('RUN_FINALIZING'), pages: 1 }],
     ['an invalid run id', changed(runStarted, ['runId'], 'RUN-1')],
     ['a run directory with ..', changed(runStarted, ['runDirectory'], `${RUN_ID}/..`)],
     ['a run directory that goes up', changed(runStarted, ['runDirectory'], `../${RUN_ID}`)],
@@ -273,6 +283,11 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
     ['a notice url that is too long', changed(recheck, ['notice', 'url'], 'u'.repeat(MAX_WORKER_NOTICE_URL_LENGTH + 1))],
     ['a notice url with a lone surrogate', changed(recheck, ['notice', 'url'], 'http://127.0.0.1/\ud800')],
     ['a slowdown notice with a url', { ...workerExample('NOTICE (slowdown)'), notice: { kind: 'SITE_UNAVAILABLE_SLOWDOWN', minIntervalMs: 1, url: 'x' } }],
+    // DEF-141: 待つ時間は 1 分（`MAX_ADDITIONAL_NAVIGATION_WAIT_MS`）まで。0 の待ちは知らせない。URL は持たない。
+    ['a pacing notice over one minute', changed(workerExample('NOTICE (service request pacing)'), ['notice', 'waitMs'], 60_001)],
+    ['a pacing notice of no wait', changed(workerExample('NOTICE (service request pacing)'), ['notice', 'waitMs'], 0)],
+    ['a pacing notice with a url', changed(workerExample('NOTICE (service request pacing)'), ['notice', 'url'], 'x')],
+    ['a pacing notice without the total', changed(workerExample('NOTICE (service request pacing)'), ['notice', 'totalWaitMs'], REMOVE)],
     ['an unknown outcome kind', changed(ran, ['outcome', 'kind'], 'DONE')],
     ['an unknown run status', changed(ran, ['outcome', 'runStatus'], 'DONE')],
     ['a RAN outcome without a run status', changed(ran, ['outcome', 'runStatus'], null)],
@@ -338,6 +353,8 @@ describe('worker protocol: value lists, limits and the schema', () => {
     expect(pointerValue(SCHEMA, '/$defs/failed/properties/detail/maxLength')).toBe(MAX_WORKER_FAILURE_DETAIL_LENGTH);
     expect(pointerValue(SCHEMA, '/$defs/siteUnavailableRecheck/properties/url/maxLength')).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
     expect(MAX_WORKER_NOTICE_URL_LENGTH).toBe(MAX_URL_LENGTH);
+    // DEF-141: 待ちの知らせの待つ時間の上限は、読み込みの前の別の待ちの上限（1 分）と同じ。
+    expect(pointerValue(SCHEMA, '/$defs/serviceRequestPacingWait/properties/waitMs/maximum')).toBe(MAX_ADDITIONAL_NAVIGATION_WAIT_MS);
     expect(pointerValue(SCHEMA, '/$defs/outcome/properties/exitCode/maximum')).toBe(MAX_WORKER_EXIT_CODE);
     expect(pointerValue(SCHEMA, '/$defs/count/maximum')).toBe(Number.MAX_SAFE_INTEGER);
     // Run の ID の形は、run.json のスキーマと同じ。

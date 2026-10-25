@@ -1,13 +1,15 @@
 // T18b: Safety の Gate（GATE-S01〜S10。Task 18 の設計書 4.2、実装タスク指示 第11章）。
 // どの Gate も、fixture のサーバの側で「届かなかった」ことを数えて確かめる（`openServerWindow` の差分。Ledger の記録は補助の確認）。
-// 各 Gate には、対照の確認（Guard のない Context では、同じ操作がサーバに届くこと）を置き、確認が空振りしないことを示す。
+// 各 Gate の対照の確認（Guard のない Context では、同じ操作がサーバに届くこと。確認が空振りしないことを示す）は、`gate-fixtures.test.ts`
+// に 1 か所にまとめる（TS-f。設計書 `2026-10-24-beaksight-test-suite-tiers-design.md` 3.6・3.7.4）。GATE-S10 の対照は CLI の Run なので、ここに残す。
+// 同じ確かめを受け持っていた別のファイルの Guard のテスト（`external-scheme-navigation`・`oopif-guard`・`isolated-interaction-cases`・
+// `passive-session-close`・`guard-unload-requests`・`guard-worker-websocket`）の重なりも、ここに寄せた（TS-f。Task 18 の設計書の決まり）。
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium, type Browser, type Page } from 'playwright';
+import type { Browser, BrowserContext, Page, Request } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory, type InteractionGuardedSession } from '../../src/browser/context-factory.js';
 import { EXIT_CODES, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
 import type { AuditConfig, Viewport } from '../../src/config/types.js';
@@ -20,12 +22,19 @@ import {
   InteractionOwnerCleanupError,
   type InteractionAuditResult,
 } from '../../src/interaction/isolated-auditor.js';
-import { isPassiveRequestGuardClosed, SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE } from '../../src/safety/passive-request-guard.js';
+import {
+  SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+  SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS,
+  serviceWorkerRegistrationBlockedMessageOf,
+} from '../../src/core/guard-page-exceptions.js';
+import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { browserFailingNewContext, browserStallingContextClose } from '../helpers/browser-proxies.js';
 import {
   BROWSER_DEFAULT_FAVICON_PATH,
+  isCliChromiumSelected,
+  launchCliChromium,
   launchHeadlessChromium,
   oopifTargetUrls,
   SITE_PER_PROCESS_ARGS,
@@ -54,29 +63,32 @@ import {
   SELF_NAVIGATING_FRAME_PAGE,
   selfNavigatingFramePath,
   stoppedRedirectRecord,
-  type ExternalSchemeKey,
 } from '../helpers/external-scheme-fixture.js';
 import {
-  closeUnguardedUnloadBeaconPage,
+  attemptPostNavigationAndFetch,
   createGateFactory,
   discoverInteractionCandidate,
   expectedWorkerWebSocketState,
   FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
   GATE_INTERACTION_TIMING,
   interactionAuditInput,
-  leaveUnguardedUnloadBeaconPage,
+  LOADED_GATE_INTERACTION_TIMING,
+  LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS,
+  logSelfNavigationRounds,
+  logWorkerWebSocketRounds,
   NO_NON_READ_REQUESTS,
   openGuardedPassiveSession,
   openGuardedServiceWorkerBypassPage,
   openGuardedSharedWorkerPostsPage,
   openInteractionSessionBeforeFreeze,
   openServerWindow,
-  openUnguardedWorkerWebSocketPage,
   pageUrlIs,
+  POPUP_SELF_CLOSE_BEACON_PAGE,
+  POPUP_SELF_CLOSE_SAME_TASK_BUTTON,
   QUIET_PERIOD_MS,
-  readWorkerWebSocketState,
   RECORDED_WORKER_WEBSOCKET_KINDS,
   runGuardedSelfNavigationRounds,
+  runGuardedWorkerWebSocketRounds,
   SERVICE_WORKER_BYPASS_FRAMES,
   SERVICE_WORKER_BYPASS_WAYS,
   SERVICE_WORKER_BYPASS_WORKER_PATH,
@@ -84,16 +96,17 @@ import {
   runGuardedUnloadBeaconRounds,
   SHARED_WORKER_DISABLED_FIXTURE_STATE,
   SHARED_WORKER_POST_KINDS,
-  UNAVAILABLE_WORKER_WEBSOCKET_KINDS,
   UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
   UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS,
   UNLOAD_BEACON_TARGET_PATH,
   unloadBeaconSelfNavigationPath,
   withGuardedPassivePage,
-  withUnguardedPage,
+  WORKER_WEBSOCKET_BUTTON,
   WORKER_WEBSOCKET_KINDS,
+  WORKER_WEBSOCKET_PAGE,
   WORKER_WEBSOCKET_PASSIVE_PAGE,
-  workerWebSocketPassivePath,
+  WORKER_WEBSOCKET_ROUNDS,
+  WORKER_WEBSOCKET_TEST_TIMEOUT_MS,
   workerWebSocketScriptRequestLines,
   type ServerWindow,
 } from '../helpers/gate-harness.js';
@@ -112,6 +125,7 @@ import {
   type RunLauncher,
 } from '../helpers/run-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 
 const viewport: Viewport = Object.freeze({ width: 900, height: 700 });
 /** 実際の Run（Run Coordinator と CLI）のテストの上限。 */
@@ -120,63 +134,84 @@ const RUN_TEST_TIMEOUT_MS = 120_000;
 const SHORT_FREEZE_TIMEOUT_MS = 300;
 
 /**
- * S04（DEF-036）: 凍結中のポップアップの中のフォームの POST を確かめる Gate で、同じ監査をくり返す回数。届く場面は毎回は
- * 起きない（修正の前の調査で 40 回中 37 回）ので複数回くり返す。網羅のくり返し（10 回）は `isolated-interaction.test.ts` の
- * DEF-036 のテストが受け持ち、Gate では所要時間を抑えるため回数を減らす。
+ * S04（DEF-036）: 凍結中のポップアップの要求（フォームの POST と、ポップアップの先の GET）を確かめる Gate で、同じ監査をくり返す回数。届く場面は
+ * 毎回は起きない（修正の前の調査で 40 回中 37 回）ので複数回くり返す。TS-f: 網羅のくり返し（全部の組で 10 回）を受け持っていた
+ * `isolated-interaction-cases.ts` の DEF-036 のテストを、この Gate にまとめたので、その回数（`frozenPopupAudit`）を使う。値は `test-rounds.ts`
+ * （TS-b。ふだんの組と全部の組）。
  */
-const S04_POPUP_FORM_POST_AUDIT_ROUNDS = 5;
+const S04_FROZEN_POPUP_AUDIT_ROUNDS = roundsOf('frozenPopupAudit');
 /**
  * S04（DEF-036）のくり返しの Gate のテストの期限（ms）。回ごとに、候補の探索の読み込み（`GATE_INTERACTION_TIMING.navigationTimeoutMs`）、
  * 1回の監査の期限（`GATE_INTERACTION_TIMING.overallMs`）、待ち時間（`QUIET_PERIOD_MS`）の分と、最後の待ち時間。
  */
-const S04_POPUP_FORM_POST_TEST_TIMEOUT_MS = S04_POPUP_FORM_POST_AUDIT_ROUNDS
+const S04_FROZEN_POPUP_TEST_TIMEOUT_MS = S04_FROZEN_POPUP_AUDIT_ROUNDS
   * (GATE_INTERACTION_TIMING.navigationTimeoutMs + GATE_INTERACTION_TIMING.overallMs + QUIET_PERIOD_MS)
   + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
 /**
  * S04（DEF-039）: 凍結中にページ自身が開いて閉じるポップアップの、ページを離れるときの送信（`pagehide` の beacon と keepalive の
  * POST）を確かめる Gate で、同じ監査をくり返す回数。修正の前の調査では毎回届いた（5/5、8/8）ので、少ない回数でも修正の前には
- * 失敗する。3 つの場面のくり返しは `isolated-interaction.test.ts` の DEF-039 のテストが受け持ち、Gate では同じ処理の中で閉じる
- * 場面だけを、所要時間を抑えた回数で確かめる。
+ * 失敗する。3 つの場面のくり返しは `isolated-interaction-cases.ts`（`isolated-interaction-audit.test.ts` が流す）の DEF-039 のテストが受け持ち、
+ * Gate では同じ処理の中で閉じる場面だけを、所要時間を抑えた回数で確かめる。値は `test-rounds.ts`（TS-b）。
  */
-const S04_POPUP_SELF_CLOSE_AUDIT_ROUNDS = 3;
-/** S04（DEF-039）のくり返しの Gate のテストの期限（ms）。考え方は `S04_POPUP_FORM_POST_TEST_TIMEOUT_MS` と同じ。 */
+const S04_POPUP_SELF_CLOSE_AUDIT_ROUNDS = roundsOf('gateS04PopupSelfClose');
+/** S04（DEF-039）のくり返しの Gate のテストの期限（ms）。考え方は `S04_FROZEN_POPUP_TEST_TIMEOUT_MS` と同じ。 */
 const S04_POPUP_SELF_CLOSE_TEST_TIMEOUT_MS = S04_POPUP_SELF_CLOSE_AUDIT_ROUNDS
   * (GATE_INTERACTION_TIMING.navigationTimeoutMs + GATE_INTERACTION_TIMING.overallMs + QUIET_PERIOD_MS)
   + FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS;
-/** DEF-039: ページ自身が開いて閉じるポップアップの fixture（`fixtures/site/`）と、同じ処理の中で閉じる場面のボタンの名前。 */
-const POPUP_SELF_CLOSE_BEACON_PAGE = '/popup-self-close-beacon.html';
-const POPUP_SELF_CLOSE_SAME_TASK_BUTTON = 'Close popup in the same task';
-/** DEF-040: Worker の中で WebSocket の接続を開く fixture（`fixtures/site/`）と、そのボタンの名前。 */
-const WORKER_WEBSOCKET_PAGE = '/worker-websocket.html';
-const WORKER_WEBSOCKET_BUTTON = 'Open WebSocket in worker';
 
 /** page の中の click を数えるスクリプト（S03）。 */
 const COUNT_CLICKS_SCRIPT = `globalThis.__gateClicks = 0;
 document.addEventListener('click', () => { globalThis.__gateClicks += 1; }, { capture: true });`;
+
 /**
- * 対照の確認で使う、click を数えて既定の動作を止めるスクリプト（S03）。Guard のない Context で `mailto:` や `tel:` を実際に開くと、
- * 端末の外部のアプリが起動しうるので、対照の確認では既定の動作を止める。
+ * TS-f（7c）: ファイルの中の `describe.each` で、テストの既定の headless shell と CLI の Chromium の両方を流す組（DEF-044・DEF-049）は、
+ * CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では飛ばす。CLI の回では、既定の Chromium も CLI の Chromium になるので、同じ CLI の
+ * Chromium を 2 回流すだけで、新しく確かめるものがないためである（両方の Chromium は、既定の回で、このファイルの中で確かめる）。
  */
-const COUNT_CLICKS_PREVENTING_DEFAULT_SCRIPT = `globalThis.__gateClicks = 0;
-document.addEventListener('click', (event) => { globalThis.__gateClicks += 1; event.preventDefault(); }, { capture: true });`;
+const describeBothChromiums = describe.skipIf(isCliChromiumSelected());
 
 /**
  * page の中の `navigator.serviceWorker.register` の呼び出しを数えるスクリプト（S08。R18 の M2）。
- * 呼び出しは、元の関数（Context の `serviceWorkers: 'block'` による置き換えを含む）にそのまま渡す。
+ * 呼び出しは、元の関数（Guard が `ServiceWorkerContainer.prototype` に固定した、拒否する Promise を返す関数）にそのまま渡し、その Promise を
+ * そのまま返す。
+ * UPG-SW: Playwright 1.64.1 の `serviceWorkers: 'block'` は、インスタンスに `register` を付けず、`ServiceWorkerContainer.prototype.register` を
+ * 置き換える（その後に Guard が `writable: false` で固定する）。書き込めない継承のプロパティには代入できない（初期化のスクリプトでは黙って
+ * 無視される）ので、インスタンスの自身のプロパティとして `defineProperty` で付ける。あわせて、Guard の拒否（`DOMException` の
+ * `SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME`、文言は `SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS` の始まりと終わり。T44R2 の M-2）で
+ * 終わった呼び出しの数も数える（止めた証拠）。
  */
 const COUNT_SERVICE_WORKER_REGISTER_CALLS_SCRIPT = `globalThis.__gateServiceWorkerRegisterCalls = 0;
+globalThis.__gateServiceWorkerRegisterBlocked = 0;
 if (globalThis.navigator.serviceWorker !== undefined) {
   const container = globalThis.navigator.serviceWorker;
   const register = container.register;
-  container.register = function (...args) {
-    globalThis.__gateServiceWorkerRegisterCalls += 1;
-    return register.apply(this, args);
-  };
+  Object.defineProperty(container, 'register', {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: function (...args) {
+      globalThis.__gateServiceWorkerRegisterCalls += 1;
+      const pending = register.apply(this, args);
+      Promise.resolve(pending).then(undefined, (error) => {
+        if (error?.name === ${JSON.stringify(SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME)} && typeof error?.message === 'string'
+          && error.message.startsWith(${JSON.stringify(SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS.beforeScope)})
+          && error.message.endsWith(${JSON.stringify(SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS.end)})) {
+          globalThis.__gateServiceWorkerRegisterBlocked += 1;
+        }
+      });
+      return pending;
+    },
+  });
 }`;
 
 /** `COUNT_SERVICE_WORKER_REGISTER_CALLS_SCRIPT` が数えた回数（スクリプトが働いていなければ -1）。 */
 const readServiceWorkerRegisterCalls = (page: Page): Promise<number> => page.evaluate(() => (
   (globalThis as { __gateServiceWorkerRegisterCalls?: number }).__gateServiceWorkerRegisterCalls ?? -1
+));
+
+/** `COUNT_SERVICE_WORKER_REGISTER_CALLS_SCRIPT` が数えた、Guard の例外で終わった呼び出しの回数（スクリプトが働いていなければ -1）。 */
+const readServiceWorkerRegisterBlockedCalls = (page: Page): Promise<number> => page.evaluate(() => (
+  (globalThis as { __gateServiceWorkerRegisterBlocked?: number }).__gateServiceWorkerRegisterBlocked ?? -1
 ));
 
 /**
@@ -230,6 +265,8 @@ interface PassiveGateOutcome {
   readonly pageUrl: string;
   /** 待ち終えた時点（後片付けの前）に、Guard が Context を閉じていたか。 */
   readonly guardClosed: boolean;
+  /** 待ち終えた時点（後片付けの前）の、page のすべての frame の URL（Guard が閉じた page では空）。 */
+  readonly frameUrls: readonly string[];
 }
 
 /** `openGuardedPassivePage` の追加の指定（C18b）。 */
@@ -260,8 +297,31 @@ async function openGuardedPassivePage(
     await options.act?.(page);
     await expect.poll(() => until(page, ledger)).toBe(true);
     await wait(QUIET_PERIOD_MS);
-    return { window, ledger, pageUrl: page.url(), guardClosed: isPassiveRequestGuardClosed(context) };
+    return {
+      window,
+      ledger,
+      pageUrl: page.url(),
+      guardClosed: isPassiveRequestGuardClosed(context),
+      frameUrls: page.isClosed() ? [] : page.frames().map((frame) => frame.url()),
+    };
   });
+}
+
+/**
+ * frame の URL のうち、外部スキームのもの（TS-f。`external-scheme-navigation.test.ts` の C18g から移した観測の条件）。止めた iframe は Chromium の
+ * エラーのページ（`chrome-error://`）になるので、それは外部スキームへの移動として数えない（`NON_EXTERNAL_NAVIGATION_SCHEMES` とは別の、
+ * テストの観測の条件である）。`externalSchemeTargetFrameUrls`（fixture の宛先だけ）より広く、どの外部スキームの frame も見つける。
+ */
+const externalSchemeFrameUrls = (frameUrls: readonly string[]): string[] =>
+  frameUrls.filter((url) => url !== '' && !/^(https?|about|chrome-error):/u.test(url));
+
+/** Context の、失敗したリクエストを `<URL> <errorText>` で集める（TS-f。`oopif-guard.test.ts` の C18i から移した）。 */
+function collectFailedRequests(context: BrowserContext): string[] {
+  const failed: string[] = [];
+  context.on('requestfailed', (request) => {
+    failed.push(`${request.url()} ${request.failure()?.errorText ?? ''}`);
+  });
+  return failed;
 }
 
 interface InteractionGateOutcome {
@@ -280,6 +340,8 @@ interface SessionHooks {
 /**
  * 候補を探したうえで、サーバに印を付け、本物の Guard の付いた session で `auditInteraction` を行う（Interaction の段階）。
  * 印の後にサーバに届くのは、隔離した session が `path` を読み込む GET だけのはずである。
+ * DF-2b（DEF-169・DEF-148）: ここの場面は、押す操作を止めること・届かないことを確かめ、期限の切れ方は確かめないので、期限は混雑の倍率を掛けた
+ * `LOADED_GATE_INTERACTION_TIMING` にする（強い混雑の下で、ページの GET を出す前に全体の期限 5 秒が切れた回があった）。
  */
 async function auditGuardedInteraction(path: string, name: string, hooks: SessionHooks = {}): Promise<InteractionGateOutcome> {
   const candidate = await discoverInteractionCandidate(factory, server.origin, viewport, path, name);
@@ -306,28 +368,10 @@ async function auditGuardedInteraction(path: string, name: string, hooks: Sessio
     path,
     candidate,
     sessionFactory,
+    timing: LOADED_GATE_INTERACTION_TIMING,
   }));
   await wait(QUIET_PERIOD_MS);
   return { window, result };
-}
-
-/** Guard のない Context で `path` を開き、名前が `name` のボタンを押す（対照の確認）。`initScript` は、読み込みの前に加える。 */
-async function clickUnguarded(
-  path: string,
-  name: string,
-  until: (window: ServerWindow, page: Page) => Promise<boolean> | boolean,
-  initScript?: string,
-): Promise<ServerWindow> {
-  return withUnguardedPage(browser, viewport, async (page) => {
-    if (initScript !== undefined) {
-      await page.addInitScript({ content: initScript });
-    }
-    await page.goto(urlOf(path), { waitUntil: 'load' });
-    const window = openServerWindow(server);
-    await page.getByRole('button', { name }).click();
-    await expect.poll(() => until(window, page)).toBe(true);
-    return window;
-  });
 }
 
 const blockedMethodsOf = (entries: readonly { readonly method: string }[]): string[] =>
@@ -376,56 +420,30 @@ describe('GATE-S01 / GATE-S02: non-read methods never reach the server (Passive 
     expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   }, UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS);
 
-  it('GATE-S01 control: without the Guard, closing the same page with page.close() delivers POST /__mutation (DEF-038)', async () => {
-    const window = await closeUnguardedUnloadBeaconPage(browser, server, viewport);
-
-    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
-  });
-
   /**
    * DEF-042（設計書 `2026-10-08-beaksight-def-042-guard-fetch-all-design.md` 4）: ページ自身が `location.href` で別の文書へ移るときの
    * `pagehide` の `sendBeacon` と keepalive の `fetch` の POST は、Playwright の route を通らずに出るが、Guard の CDP の横取り（すべての
    * 要求の Request の段階）で止まり、サーバに届かず、`blockedRequests` に残る。`UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS` 回くり返し、
    * 全部の回の後に `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ってから、改めて確かめる。
+   * TS-f: `guard-unload-requests.test.ts` の同じ場面（両方の Chromium の `describe.each`）をここにまとめた。回ごとの `blockedRequests` が、
+   * どれも POST /__mutation の `NON_READ_METHOD` であることも確かめる。CLI の Chromium では、CLI の回で確かめる。
    */
   it('GATE-S01 Passive: POST sent while the page leaves by itself (location.href; pagehide beacon, keepalive fetch) does not reach the server (DEF-042)', async () => {
-    const { failedRounds, allRoundsWindow } = await runGuardedSelfNavigationRounds(
+    const result = await runGuardedSelfNavigationRounds(
       () => openGuardedPassiveSession(factory, viewport),
       server,
       unloadBeaconSelfNavigationPath('same-site'),
       pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
     );
+    logSelfNavigationRounds('GATE-S01 Passive same-site', result);
 
-    expect(failedRounds).toEqual([]);
-    expect(allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
-    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+    expect(result.failedRounds).toEqual([]);
+    expect(result.rounds.every((round) => round.blockedRequests.every((entry) => (
+      entry.method === 'POST' && entry.url === urlOf(UNLOAD_BEACON_TARGET_PATH) && entry.reason === 'NON_READ_METHOD'
+    )))).toBe(true);
+    expect(result.allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
+    expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   }, UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS);
-
-  it('GATE-S01 control: without the Guard, the same page leaving by itself delivers POST /__mutation (DEF-042)', async () => {
-    const window = await leaveUnguardedUnloadBeaconPage(
-      browser,
-      server,
-      viewport,
-      unloadBeaconSelfNavigationPath('same-site'),
-      pageUrlIs(urlOf(NAVIGATION_TARGET_PAGE)),
-    );
-
-    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
-  });
-
-  it('GATE-S01 GATE-S02 control: without the Guard, the same pages deliver POST, PUT, PATCH and DELETE to the server', async () => {
-    const window = openServerWindow(server);
-    await withUnguardedPage(browser, viewport, async (page) => {
-      await page.goto(urlOf('/page-auditor-non-read-requests.html'), { waitUntil: 'load' });
-      // DELETE は、読み込みの後に遅れて送られるので、届くのを待ってから次のページに移る。
-      await expect.poll(() => {
-        const counters = window.nonReadCounters();
-        return counters.post > 0 && counters.put > 0 && counters.delete > 0;
-      }).toBe(true);
-      await page.goto(urlOf('/passive-patch-request.html'), { waitUntil: 'load' });
-      await expect.poll(() => window.nonReadCounters().patch).toBeGreaterThan(0);
-    });
-  });
 
   /**
    * DEF-044（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 1）: Shared Worker の中の要求は、Playwright の route も
@@ -433,10 +451,12 @@ describe('GATE-S01 / GATE-S02: non-read methods never reach the server (Passive 
    * テストの既定の headless shell と、CLI の起動の設定（`chromiumLaunchOptions`）の両方で、Passive の Context と凍結の前の Interaction の
    * session で、Shared Worker が作れず（`typeof SharedWorker === 'undefined'`）、fetch・XHR・keepalive の POST が届かず、違反 0（factory の
    * 自己検査 `SHARED_WORKER_OBSERVED` も出ない）ことを確かめる。対照（引数を外した Chromium で届く）は `gate-fixtures.test.ts`。
+   * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeBothChromiums`）。
    */
-  describe.each([
+  describeBothChromiums.each([
     { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => chromium.launch(chromiumLaunchOptions({ headless: true })) },
+    // EL-12: 製品と同じ起動の部品（`launchCliChromium`。外部のアプリの起動を止める一時のプロファイルと自己検査）で起動する。
+    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
   ])('GATE-S01 Shared Worker (DEF-044), with $name', ({ launch }) => {
     let sharedWorkerBrowser: Browser;
     let sharedWorkerFactory: BrowserContextFactory;
@@ -481,24 +501,13 @@ describe('GATE-S01 / GATE-S02: non-read methods never reach the server (Interact
 
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
     expect(window.requestLines()).toEqual([`GET ${path}`]);
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: ダウンロードと WebSocket の Upgrade も含めて、読み取りでない要求は届かない。
+    expectOnlyReadRequests(window.counters(), window.observations());
     // 補助: 押した操作が試みたリクエストを、凍結が遮断として記録した。
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
     expect(blockedMethodsOf(result.safety.blockedInteractionRequests)).toContain(method);
     expect(result.safety.invariantViolations).toEqual([]);
-  });
-
-  it.each([
-    ['POST', '/mutation-button.html', 'Attempt mutation'],
-    ['PUT', '/put-request.html', 'Send PUT'],
-    ['PATCH', '/patch-request.html', 'Send PATCH'],
-    ['DELETE', '/delete-request.html', 'Send DELETE'],
-  ] as const)('GATE-S01 GATE-S02 control: without the Guard, clicking the same control delivers %s to the server', async (
-    method,
-    path,
-    name,
-  ) => {
-    await clickUnguarded(path, name, (window) => window.count(method, '/__mutation') > 0);
-  });
+  }, LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -525,30 +534,18 @@ describe('GATE-S03: mailto:, tel: and external application launches are not perf
       },
     });
 
+    // 読み取りでない要求は届かない（DF-2b: 落ちた回にも確かめが残るよう、届いた要求の一覧より先に確かめる）。
+    expectOnlyReadRequests(window.counters(), window.observations());
     // サーバには、そのページへの GET だけが届く。
     expect(window.requestLines()).toEqual([`GET ${path}`]);
-    expectOnlyReadRequests(window.counters(), window.observations());
     // 外部のアプリを起動しうる操作（click）は、行われない。ページも開かない。
     expect(observed).toEqual({ clicks: 0, pages: 1 });
     // 補助: Ledger に遮断が記録される。
     expect(result.status).toBe('REJECTED_UNSAFE');
     expect(result.safety.blockedExternalActions).toEqual([expect.objectContaining({ url: href, reason: 'EXTERNAL_ACTION' })]);
-  });
-
-  it.each([
-    ['/mailto-link.html', 'Email fixture'],
-    ['/tel-link.html', 'Call fixture'],
-  ] as const)('GATE-S03 control: without the Guard, the click on %s reaches the link (the default action is prevented by the test)', async (
-    path,
-    name,
-  ) => {
-    await clickUnguarded(
-      path,
-      name,
-      async (_window, page) => (await page.evaluate(() => (globalThis as { __gateClicks?: number }).__gateClicks ?? 0)) === 1,
-      COUNT_CLICKS_PREVENTING_DEFAULT_SCRIPT,
-    );
-  });
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: 拒否は、押す前に、同じ要素（identity が一致した要素）に対して行った。
+    expect(result.evidence.identityStatus).toBe('MATCHED');
+  }, LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS);
 });
 
 // C18b（DEF-012。Task 19 の前の整理の設計書 4.2）: ページのスクリプトによる外部スキーム（`tel:`、`mailto:`、独自のスキーム）への
@@ -682,7 +679,7 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
     const path = externalSchemeRedirectFramePath(key);
     let externalFrames: string[] | null = null;
 
-    const { window, ledger, pageUrl, guardClosed } = await openGuardedPassivePage(
+    const { window, ledger, pageUrl, guardClosed, frameUrls } = await openGuardedPassivePage(
       path,
       async (page, pageLedger) => {
         externalFrames = externalSchemeTargetFrameUrls(page);
@@ -700,6 +697,8 @@ describe('GATE-S03: server redirects to external schemes are stopped before they
     expectOnlyReadRequests(window.counters(), window.observations());
     expect(pageUrl).toBe(urlOf(path));
     expect(externalFrames).toEqual([]);
+    // TS-f（`external-scheme-navigation.test.ts` の C18g から寄せた）: 待ち終えた後にも、どの外部スキームの frame もない。
+    expect(externalSchemeFrameUrls(frameUrls)).toEqual([]);
   });
 
   it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive: the main frame redirect to %s is stopped and recorded without a violation; the navigation fails and only the redirect source reaches the server', async (
@@ -807,9 +806,10 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
     const passiveFactory = isolatedFactory;
     const crossSiteOrigin = crossSiteOriginOf(server.origin);
     const path = crossSiteFramePath(selfNavigatingFramePath(key));
+    // TS-f（`oopif-guard.test.ts` の C18i から寄せた）: サーバの記録は、Context を閉じた後にも確かめる（印は page を開く前に付ける）。
+    const window = openServerWindow(server);
+    let failed: string[] = [];
     await withGuardedPassivePage(passiveFactory, viewport, async (page, context, ledger) => {
-      const window = openServerWindow(server);
-
       await page.goto(urlOf(path), { waitUntil: 'load' });
       await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
       await wait(QUIET_PERIOD_MS);
@@ -820,6 +820,8 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
       expect(snapshot.externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
       expect(snapshot.invariantViolations).toEqual([]);
       expect(isPassiveRequestGuardClosed(context)).toBe(false);
+      // TS-f（同上）: 元のリクエストは、Guard が止めた失敗（`net::ERR_BLOCKED_BY_CLIENT`）になる（止めなければ `net::ERR_ABORTED`）。
+      expect(failed).toEqual([`${crossSiteOrigin}${externalSchemeRedirectPath(key)} net::ERR_BLOCKED_BY_CLIENT`]);
       // サーバには、ページ、iframe のページ、リダイレクトの元のリクエストだけが届き、外部スキームへの移動は起きない。
       expect(window.requestLines()).toEqual([
         `GET ${CROSS_SITE_FRAME_PAGE}`,
@@ -829,15 +831,28 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
       expectOnlyReadRequests(window.counters(), window.observations());
       expect(page.url()).toBe(urlOf(path));
       expect(externalSchemeTargetFrameUrls(page)).toEqual([]);
+    }, {
+      prepare: (context) => {
+        failed = collectFailedRequests(context);
+      },
     });
+    expect(window.requestLines()).toEqual([
+      `GET ${CROSS_SITE_FRAME_PAGE}`,
+      `GET ${SELF_NAVIGATING_FRAME_PAGE}`,
+      `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`,
+    ]);
+    expectOnlyReadRequests(window.counters(), window.observations());
   });
 
-  it('GATE-S03 Passive OOPIF (headless): the redirect started by a nested OOPIF (127.0.0.1 in localhost) is stopped and recorded without a violation', async () => {
+  // TS-f（B4）: `oopif-guard.test.ts` の C18i の入れ子の OOPIF の場面（すべての外部スキームの宛先、止めた失敗の記録、閉じた後のサーバの記録）を
+  // ここにまとめた。
+  it.each(EXTERNAL_SCHEME_KEYS)('GATE-S03 Passive OOPIF (headless): the redirect to %s started by a nested OOPIF (127.0.0.1 in localhost) is stopped and recorded without a violation', async (
+    key,
+  ) => {
     const passiveFactory = isolatedFactory;
-    const key: ExternalSchemeKey = 'custom';
-    await withGuardedPassivePage(passiveFactory, viewport, async (page, _context, ledger) => {
-      const window = openServerWindow(server);
-
+    const window = openServerWindow(server);
+    let failed: string[] = [];
+    await withGuardedPassivePage(passiveFactory, viewport, async (page, context, ledger) => {
       await page.goto(urlOf(crossSiteFramePath(crossSiteFramePath(selfNavigatingFramePath(key)))), { waitUntil: 'load' });
       await expect.poll(() => ledger.snapshot().externalSchemeNavigations.length).toBeGreaterThan(0);
       await wait(QUIET_PERIOD_MS);
@@ -849,6 +864,9 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
       expect(targets.some((url) => url.startsWith(`${server.origin}/`))).toBe(true);
       expect(ledger.snapshot().externalSchemeNavigations).toEqual([stoppedRedirectRecord(key, 'SUB')]);
       expect(ledger.snapshot().invariantViolations).toEqual([]);
+      expect(isPassiveRequestGuardClosed(context)).toBe(false);
+      // 元のリクエスト（2つ目の OOPIF の 127.0.0.1 の Origin）は、Guard が止めた失敗になる。
+      expect(failed).toEqual([`${server.origin}${externalSchemeRedirectPath(key)} net::ERR_BLOCKED_BY_CLIENT`]);
       expect(window.requestLines()).toEqual([
         `GET ${CROSS_SITE_FRAME_PAGE}`,
         `GET ${CROSS_SITE_FRAME_PAGE}`,
@@ -856,7 +874,18 @@ describe('GATE-S03: server redirects to external schemes inside an out-of-proces
         `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`,
       ]);
       expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+    }, {
+      prepare: (context) => {
+        failed = collectFailedRequests(context);
+      },
     });
+    expect(window.requestLines()).toEqual([
+      `GET ${CROSS_SITE_FRAME_PAGE}`,
+      `GET ${CROSS_SITE_FRAME_PAGE}`,
+      `GET ${SELF_NAVIGATING_FRAME_PAGE}`,
+      `GET ${EXTERNAL_SCHEME_REDIRECT_PATH}`,
+    ]);
+    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   });
 
   // RC18c の M2: Interaction の段階（凍結の後）でも、OOPIF が自分で始めた移動は、凍結で止まり、サーバに届かない。
@@ -910,37 +939,126 @@ describe('GATE-S04: popups during Interaction are blocked', () => {
     expect(window.count(null, '/popup-target.html')).toBe(0);
     expect(window.requestLines()).toEqual(['GET /popup-button.html']);
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: ダウンロードと WebSocket の Upgrade も含めて、読み取りでない要求は届かず、違反もない。
+    expectOnlyReadRequests(window.counters(), window.observations());
+    expect(result.safety.invariantViolations).toEqual([]);
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
     expect(result.safety.blockedPopups.length).toBeGreaterThan(0);
   });
 
-  it('GATE-S04 control: without the Guard, the same click delivers GET /popup-target.html', async () => {
-    await clickUnguarded('/popup-button.html', 'Open popup', (window) => window.count('GET', '/popup-target.html') > 0);
-  });
-
   /**
-   * DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 4）: 凍結の後に開いたポップアップの中のフォームの POST は、
-   * サーバに届かない。届く場面は毎回は起きないので、`S04_POPUP_FORM_POST_AUDIT_ROUNDS` 回くり返し、どの回も確かめる。
-   * 回ごとの結果をまとめてから確かめるので、失敗したときは、失敗した回とその内容がすべて分かる。全部の回の後に
-   * `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ち、Context を閉じた後に遅れて届いた要求がないことを改めて確かめる。
+   * DEF-036（設計書 `2026-10-08-beaksight-def-036-frozen-popup-design.md` 2.1、2.3、4、5 の変更履歴）: 凍結の後に開いたポップアップの中の要求
+   * （フォームの POST と、ポップアップの先の GET）は、Guard がポップアップを先に閉じる処理と競合せず、サーバに届かない。届く場面は毎回は
+   * 起きないので、`S04_FROZEN_POPUP_AUDIT_ROUNDS` 回くり返し、どの回も確かめる。
+   * TS-f（B12）: `isolated-interaction-cases.ts` の DEF-036 のテスト（この Gate を含む確かめ）を、ここにまとめた。
+   * - すべての回: `BLOCKED_BY_SAFETY`、`blockedPopups` が1件以上、違反 0 件、その回の直後にサーバに禁止のパスが届いていない、
+   *   GET・HEAD 以外のカウンタが 0。
+   * - すべての回で、次のどれか（`FrozenPopupRoundKind`）:
+   *   - `ROUTED`: route で止めて `blockedInteractionRequests` に記録した。
+   *   - `NOT_ISSUED`: ポップアップの要求そのものが出なかった（auditor は凍結の事象で直ちに Context を閉じるので、フォームが要求を
+   *     出す前に閉じることがある）。
+   *   - `ABORTED_WITHOUT_ROUTE`: 要求は出たが、route の記録がなく、出た要求のどれもが応答を受けずに失敗した（Context の
+   *     `requestfailed` があり、`response` も `requestfinished` もない。閉じ始めた Context の要求は route の処理が呼ばれず、Context
+   *     ごと破棄される。設計書 2.3）。
+   *   どれでもない回（`UNSETTLED_OR_RESPONDED`。要求が出て、応答を受けたか、終わり方が分からない）は失敗にする。
+   * - 場面ごとに、`ROUTED` の回が少なくとも1回ある（route で止める経路が実際に働いた証拠）。
+   * - 全部の回の後に `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS` 待ち、Context を閉じた後に遅れて届いた禁止のパスへの要求がないことを改めて確かめる。
+   * 回ごとの結果をまとめてから確かめるので、失敗したときは、失敗した回とその内容がすべて分かる。区分の内訳は、テストの出力に残す。
    */
-  it('GATE-S04 Interaction: POST /__mutation from a frozen popup form never reaches the server (DEF-036)', async () => {
+  it.each([
+    ['POST /__mutation from a frozen popup form', '/popup-form-post.html', 'Open popup form', 'POST', '/__mutation'],
+    ['GET /popup-target.html from a frozen popup', '/popup-button.html', 'Open popup', 'GET', '/popup-target.html'],
+  ] as const)('GATE-S04 Interaction: %s never reaches the server (DEF-036)', async (
+    _label,
+    path,
+    name,
+    forbiddenMethod,
+    forbiddenPath,
+  ) => {
+    type FrozenPopupRoundKind = 'ROUTED' | 'NOT_ISSUED' | 'ABORTED_WITHOUT_ROUTE' | 'UNSETTLED_OR_RESPONDED';
     const allRoundsWindow = openServerWindow(server);
     const failedRounds: unknown[] = [];
+    const roundKinds: FrozenPopupRoundKind[] = [];
+    const isForbidden = (request: Request): boolean => (
+      request.method() === forbiddenMethod && new URL(request.url()).pathname === forbiddenPath
+    );
 
-    for (let round = 0; round < S04_POPUP_FORM_POST_AUDIT_ROUNDS; round += 1) {
-      const { window, result } = await auditGuardedInteraction('/popup-form-post.html', 'Open popup form');
+    for (let round = 0; round < S04_FROZEN_POPUP_AUDIT_ROUNDS; round += 1) {
+      // Context の事象で観測した、禁止の要求とその終わり方（`request` は route より前に出る）。
+      const issued = new Set<Request>();
+      const failed = new Map<Request, string>();
+      const responded = new Set<Request>();
+      const finished = new Set<Request>();
+      // 診断: 要求の事象が、owner の close（Context を閉じる処理）を始めた後に来たか。区分の判定には使わない
+      // （Playwright の事象の順に左右されるため）。
+      const issuedTiming: string[] = [];
+      let ownerCloseStarted = false;
+      const { window, result } = await auditGuardedInteraction(path, name, {
+        prepare: async (session) => {
+          const context = session.page.context();
+          context.on('request', (request) => {
+            if (isForbidden(request)) {
+              issued.add(request);
+              issuedTiming.push(ownerCloseStarted ? 'AFTER_OWNER_CLOSE_STARTED' : 'BEFORE_OWNER_CLOSE');
+            }
+          });
+          context.on('requestfailed', (request) => {
+            if (isForbidden(request)) {
+              failed.set(request, request.failure()?.errorText ?? '');
+            }
+          });
+          context.on('response', (response) => {
+            if (isForbidden(response.request())) {
+              responded.add(response.request());
+            }
+          });
+          context.on('requestfinished', (request) => {
+            if (isForbidden(request)) {
+              finished.add(request);
+            }
+          });
+        },
+        beforeClose: async () => {
+          ownerCloseStarted = true;
+        },
+      });
+
+      const routedPopupRequests = result.safety.blockedInteractionRequests.filter((entry) => (
+        entry.method === forbiddenMethod && new URL(entry.url).pathname === forbiddenPath
+      ));
+      const abortedWithoutResponse = issued.size > 0
+        && [...issued].every((request) => failed.has(request))
+        && responded.size === 0
+        && finished.size === 0;
+      let kind: FrozenPopupRoundKind;
+      if (routedPopupRequests.length > 0) {
+        kind = 'ROUTED';
+      } else if (issued.size === 0) {
+        kind = 'NOT_ISSUED';
+      } else if (abortedWithoutResponse) {
+        kind = 'ABORTED_WITHOUT_ROUTE';
+      } else {
+        kind = 'UNSETTLED_OR_RESPONDED';
+      }
+      roundKinds.push(kind);
       const summary = {
         round,
+        kind,
         status: result.status,
         blockedPopups: result.safety.blockedPopups.length,
-        delivered: window.count(null, '/__mutation'),
+        routedPopupRequests: routedPopupRequests.length,
+        delivered: window.count(null, forbiddenPath),
         nonReadCounters: window.nonReadCounters(),
         invariantViolations: result.safety.invariantViolations,
+        issuedTiming,
+        failedPopupRequests: [...failed.values()],
+        respondedPopupRequests: responded.size,
+        finishedPopupRequests: finished.size,
       };
       if (
         summary.status !== 'BLOCKED_BY_SAFETY'
         || summary.blockedPopups === 0
+        || kind === 'UNSETTLED_OR_RESPONDED'
         || summary.delivered !== 0
         || Object.values(summary.nonReadCounters).some((count) => count !== 0)
         || summary.invariantViolations.length !== 0
@@ -949,15 +1067,14 @@ describe('GATE-S04: popups during Interaction are blocked', () => {
       }
     }
     await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
+    // 回ごとの区分の内訳（検証の記録のため。既定の報告では、PASS したテストの出力は表示されない）。
+    console.info(`DEF-036 GATE-S04 ${forbiddenMethod} ${forbiddenPath} rounds: ${roundKinds.join(',')}`);
 
     expect(failedRounds).toEqual([]);
-    expect(allRoundsWindow.count(null, '/__mutation')).toBe(0);
+    expect(roundKinds).toContain('ROUTED');
+    expect(allRoundsWindow.count(null, forbiddenPath)).toBe(0);
     expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  }, S04_POPUP_FORM_POST_TEST_TIMEOUT_MS);
-
-  it('GATE-S04 control: without the Guard, the same popup form delivers POST /__mutation', async () => {
-    await clickUnguarded('/popup-form-post.html', 'Open popup form', (window) => window.count('POST', '/__mutation') > 0);
-  });
+  }, S04_FROZEN_POPUP_TEST_TIMEOUT_MS);
 
   /**
    * DEF-039（設計書 `2026-10-08-beaksight-def-039-040-egress-design.md` 2.1.4）: 凍結の後にページ自身が開いて、同じ処理の中で閉じる
@@ -1017,14 +1134,6 @@ describe('GATE-S04: popups during Interaction are blocked', () => {
     expect(allRoundsWindow.count(null, '/__mutation')).toBe(0);
     expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
   }, S04_POPUP_SELF_CLOSE_TEST_TIMEOUT_MS);
-
-  it('GATE-S04 control: without the Guard, the same self-closing popup delivers POST /__mutation (DEF-039)', async () => {
-    await clickUnguarded(
-      POPUP_SELF_CLOSE_BEACON_PAGE,
-      POPUP_SELF_CLOSE_SAME_TASK_BUTTON,
-      (window) => window.count('POST', '/__mutation') > 0,
-    );
-  });
 });
 
 describe('GATE-S05: downloads during Interaction are blocked', () => {
@@ -1038,14 +1147,16 @@ describe('GATE-S05: downloads during Interaction are blocked', () => {
     expect(window.counters().download).toBe(0);
     expect(window.requestLines()).toEqual(['GET /download-button.html']);
     expect(result.status).toBe(status);
-  });
-
-  it('GATE-S05 control: without the Guard, the same click delivers GET /__download', async () => {
-    await clickUnguarded(
-      '/download-button.html',
-      'Attempt HTTP download',
-      (window) => window.count('GET', '/__download') > 0 && window.counters().download > 0,
-    );
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: POST と WebSocket の Upgrade も含めて、読み取りでない要求は届かない。
+    expectOnlyReadRequests(window.counters(), window.observations());
+    if (status === 'BLOCKED_BY_SAFETY') {
+      // 押した操作のダウンロードの要求は、凍結が遮断として記録した。
+      expect(result.safety.blockedInteractionRequests.length).toBeGreaterThan(0);
+    } else {
+      // 直接のダウンロードは、押す前に、同じ要素（identity が一致した要素）を外部の操作として拒否した。
+      expect(result.evidence.identityStatus).toBe('MATCHED');
+      expect(result.safety.blockedExternalActions).toHaveLength(1);
+    }
   });
 });
 
@@ -1055,16 +1166,11 @@ describe('GATE-S06: navigation during Interaction is blocked', () => {
 
     expect(window.count(null, '/navigation-target.html')).toBe(0);
     expect(window.requestLines()).toEqual(['GET /navigation-button.html']);
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: 読み取りでない要求は届かず、違反もない。
+    expectOnlyReadRequests(window.counters(), window.observations());
+    expect(result.safety.invariantViolations).toEqual([]);
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
     expect(result.safety.blockedInteractionNavigations.length).toBeGreaterThan(0);
-  });
-
-  it('GATE-S06 control: without the Guard, the same click delivers GET /navigation-target.html', async () => {
-    await clickUnguarded(
-      '/navigation-button.html',
-      'Attempt navigation',
-      (window) => window.count('GET', '/navigation-target.html') > 0,
-    );
   });
 
   // RP18 の指摘4（設計書 4.2）: 凍結の失敗の後の無効化（Context を閉じる処理）が終わらず、`auditInteraction` が待つのをやめた後も、
@@ -1135,37 +1241,7 @@ describe('GATE-S06: navigation during Interaction is blocked', () => {
       await stalling.release();
     }
   });
-
-  it('GATE-S06 (RP18-4) control: without the Guard, the same POST, navigation and fetch reach the server', async () => {
-    const window = openServerWindow(server);
-    await withUnguardedPage(browser, viewport, async (page) => {
-      await page.goto(urlOf('/navigation-button.html'), { waitUntil: 'load' });
-      const attempts = await attemptPostNavigationAndFetch(page);
-      expect(attempts).toEqual({ post: 'sent', fetch: 'sent' });
-    });
-    await expect.poll(() => window.count('GET', '/navigation-target.html')).toBeGreaterThan(0);
-    expect(window.count('POST', '/__mutation')).toBe(1);
-    expect(window.count('GET', '/popup-target.html')).toBe(1);
-  });
 });
-
-/**
- * page から、POST（fetch）、読み取りの fetch（`/popup-target.html`）、メインフレームの移動（`/navigation-target.html`）を試みる。
- * fetch の結果（届いたか、失敗したか）を返す。移動は結果を待たず、`QUIET_PERIOD_MS` の後に戻る。
- */
-async function attemptPostNavigationAndFetch(page: Page): Promise<{ readonly post: string; readonly fetch: string }> {
-  const result = await page.evaluate(async () => {
-    const outcome = (request: Promise<Response>): Promise<string> => request.then(() => 'sent', () => 'failed');
-    const post = await outcome(fetch('/__mutation', { method: 'POST', body: 'gate' }));
-    const read = await outcome(fetch('/popup-target.html'));
-    return { post, fetch: read };
-  });
-  await page.evaluate(() => {
-    location.href = '/navigation-target.html';
-  }).catch(() => undefined);
-  await wait(QUIET_PERIOD_MS);
-  return result;
-}
 
 describe('GATE-S07: WebSockets during Interaction are blocked', () => {
   it('GATE-S07 Interaction: the WebSocket upgrade never reaches the server', async () => {
@@ -1173,12 +1249,11 @@ describe('GATE-S07: WebSockets during Interaction are blocked', () => {
 
     expect(window.counters().webSocketUpgrade).toBe(0);
     expect(window.requestLines()).toEqual(['GET /websocket.html']);
+    // TS-f（`isolated-interaction-cases.ts` から寄せた）: 読み取りでない要求は届かず、違反もない。
+    expectOnlyReadRequests(window.counters(), window.observations());
+    expect(result.safety.invariantViolations).toEqual([]);
     expect(result.status).toBe('BLOCKED_BY_SAFETY');
     expect(result.safety.blockedInteractionWebSockets.length).toBeGreaterThan(0);
-  });
-
-  it('GATE-S07 control: without the Guard, the same click delivers the WebSocket upgrade', async () => {
-    await clickUnguarded('/websocket.html', 'Open WebSocket', (window) => window.counters().webSocketUpgrade > 0);
   });
 
   /**
@@ -1203,49 +1278,38 @@ describe('GATE-S07: WebSockets during Interaction are blocked', () => {
     ))).toBe(true);
   });
 
-  it('GATE-S07 control: without the Guard, the same click delivers the WebSocket upgrade from inside the Worker (DEF-040)', async () => {
-    await clickUnguarded(WORKER_WEBSOCKET_PAGE, WORKER_WEBSOCKET_BUTTON, (window) => window.counters().webSocketUpgrade > 0);
-  });
-
   /**
    * DEF-040 の Passive（設計書 2.2。NP3）: Passive の段階で、読み込みのときに Worker（blob、http の script、Shared、module、入れ子、srcdoc の
    * iframe）の中で開く WebSocket の接続も、同じ CSP で止まり、サーバに届かない。Dedicated の Worker は `blockedWebSockets` に理由
    * `WORKER_CONNECT_POLICY` で残る。Worker の script の GET は、今までどおり届く（Guard は script を止めず、応答にヘッダを加えるだけ）。
    * DEF-044（NP5）: テストの Chromium は Shared Worker を無効にして起動するので、Shared の場面は、Shared Worker が作れず（fixture が
    * `unavailable` を残す）、接続も script の GET も起きず、違反 0 であることを確かめる（`expectedWorkerWebSocketState`）。
+   * TS-f（B11）: `guard-worker-websocket.test.ts` の Passive の場面（`WORKER_WEBSOCKET_ROUNDS` 回のくり返し、製品の手順で閉じた後と、全部の回の後の
+   * 待ちの後の確かめ）を、ここにまとめた。CLI の Chromium では、CLI の回で確かめる。
    */
   it.each(WORKER_WEBSOCKET_KINDS)('GATE-S07 Passive: the WebSocket upgrade from inside the %s Worker never reaches the server, and Dedicated Workers are recorded as WORKER_CONNECT_POLICY (DEF-040)', async (kind) => {
-    const recorded = RECORDED_WORKER_WEBSOCKET_KINDS.includes(kind);
-    const { window, ledger } = await openGuardedPassivePage(
-      workerWebSocketPassivePath(kind),
-      async (page, pageLedger) => (await readWorkerWebSocketState(page)) === expectedWorkerWebSocketState(kind)
-        && (!recorded || pageLedger.snapshot().blockedWebSockets.length > 0),
-    );
+    const socketUrl = urlOf('/socket').replace(/^http/, 'ws');
+    const expectedRequestLines = [`GET ${WORKER_WEBSOCKET_PASSIVE_PAGE}`, ...workerWebSocketScriptRequestLines(kind)];
+    const result = await runGuardedWorkerWebSocketRounds(() => openGuardedPassiveSession(factory, viewport), server, kind);
+    logWorkerWebSocketRounds(`GATE-S07 Passive ${kind}`, result);
 
-    expect(window.counters().webSocketUpgrade).toBe(0);
-    expect(window.requestLines()).toEqual([`GET ${WORKER_WEBSOCKET_PASSIVE_PAGE}`, ...workerWebSocketScriptRequestLines(kind)]);
-    expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-    const snapshot = ledger.snapshot();
-    expect(snapshot.invariantViolations).toEqual([]);
-    if (recorded) {
-      expect(snapshot.blockedWebSockets.length).toBeGreaterThan(0);
+    // 回ごとに、Upgrade が届かず、記録が残るはずの種類では記録があり、違反 0、閉じる処理の失敗 0（`failedRounds` の条件）。
+    expect(result.failedRounds).toEqual([]);
+    expect(result.allRoundsWindow.counters().webSocketUpgrade).toBe(0);
+    expect(result.allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
+    // サーバに届いたのは、どの回も、ページと Worker の script の GET だけ（全部の回の後の待ちの後に、ブラウザ自身の要求も除かずに確かめる）。
+    expect(result.allRoundsWindow.requestLines()).toEqual(result.rounds.flatMap(() => expectedRequestLines));
+    expect(result.rounds.map((round) => round.requestLines)).toEqual(result.rounds.map(() => expectedRequestLines));
+    expect(result.rounds).toHaveLength(WORKER_WEBSOCKET_ROUNDS);
+    expect(result.rounds.every((round) => round.workerState === expectedWorkerWebSocketState(kind))).toBe(true);
+    if (RECORDED_WORKER_WEBSOCKET_KINDS.includes(kind)) {
+      expect(result.rounds.every((round) => round.blockedWebSockets.length > 0)).toBe(true);
     }
-    expect(snapshot.blockedWebSockets.every((entry) => (
-      entry.url === urlOf('/socket').replace(/^http/, 'ws') && entry.reason === 'WORKER_CONNECT_POLICY'
-    ))).toBe(true);
-  });
-
-  // DEF-044（NP5）: Shared の場面は、Guard がなくても Shared Worker を作れないので、Upgrade は届かない（Shared Worker の中の通信の対照は、
-  // 引数を外した Chromium で行う。`gate-fixtures.test.ts`）。
-  it.each(WORKER_WEBSOCKET_KINDS)('GATE-S07 control: without the Guard, the %s Worker delivers the WebSocket upgrade while the page loads, except the Shared Worker that cannot be created (DEF-040, DEF-044)', async (kind) => {
-    const window = await openUnguardedWorkerWebSocketPage(browser, server, viewport, kind);
-
-    if (UNAVAILABLE_WORKER_WEBSOCKET_KINDS.includes(kind)) {
-      expect(window.counters().webSocketUpgrade).toBe(0);
-    } else {
-      expect(window.counters().webSocketUpgrade).toBeGreaterThan(0);
-    }
-  });
+    // 残った記録は、どの種類でも、理由と URL が同じ形である。
+    expect(result.rounds.every((round) => round.blockedWebSockets.every((entry) => (
+      entry.url === socketUrl && entry.reason === 'WORKER_CONNECT_POLICY'
+    )))).toBe(true);
+  }, WORKER_WEBSOCKET_TEST_TIMEOUT_MS);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1258,9 +1322,11 @@ describe('GATE-S08: a Service Worker cannot bypass the blocking', () => {
 
   it('GATE-S08 Passive: the worker registered on load is never fetched and its POST never reaches the server', async () => {
     let registerCalls = 0;
+    let blockedCalls = 0;
     const { window } = await openGuardedPassivePage(path, async (page) => {
       // 登録の試み（`navigator.serviceWorker.register` の呼び出し）が、読み込みの時に起きたことを確かめる（R18 の M2）。
       registerCalls = await readServiceWorkerRegisterCalls(page);
+      blockedCalls = await readServiceWorkerRegisterBlockedCalls(page);
       // Service Worker の登録がないことを、ページの読み込みの後に確かめる（登録の試みは、読み込みの時に行われる）。
       const registrations = await page.evaluate(async () => (
         navigator.serviceWorker === undefined ? 0 : (await navigator.serviceWorker.getRegistrations()).length
@@ -1269,53 +1335,54 @@ describe('GATE-S08: a Service Worker cannot bypass the blocking', () => {
     }, { initScript: COUNT_SERVICE_WORKER_REGISTER_CALLS_SCRIPT });
 
     expect(registerCalls).toBe(1);
+    // UPG-SW: 試みは、Guard の例外で止まった（止めた証拠）。
+    expect(blockedCalls).toBe(1);
     expect(window.count(null, workerPath)).toBe(0);
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
     expect(window.requestLines()).toEqual([`GET ${path}`]);
   });
 
   it('GATE-S08 Interaction: clicking "Register posting worker" neither fetches the worker nor lets its POST reach the server', async () => {
-    const observed: { registerCalls: number | null } = { registerCalls: null };
+    const observed: { registerCalls: number | null; blockedCalls: number | null } = { registerCalls: null, blockedCalls: null };
     const { window, result } = await auditGuardedInteraction(path, 'Register posting worker', {
       prepare: async (session) => {
         await session.page.addInitScript({ content: COUNT_SERVICE_WORKER_REGISTER_CALLS_SCRIPT });
       },
       beforeClose: async (session) => {
         observed.registerCalls = await readServiceWorkerRegisterCalls(session.page);
+        observed.blockedCalls = await readServiceWorkerRegisterBlockedCalls(session.page);
       },
     });
 
     // click は行われた（候補は、方針で拒否されていない。R18 の M2）。登録の試みは、読み込みの時と click の時の2回である。
     expect(result.status).not.toBe('REJECTED_UNSAFE');
     expect(observed.registerCalls).toBe(2);
+    // UPG-SW: 2 回とも、Guard の例外で止まった（止めた証拠）。
+    expect(observed.blockedCalls).toBe(2);
     expect(window.count(null, workerPath)).toBe(0);
     expect(window.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
     expect(window.requestLines()).toEqual([`GET ${path}`]);
     expect(result.safety.invariantViolations).toEqual([]);
   });
 
-  it('GATE-S08 control: without the Guard, the worker is fetched and its POST reaches the server', async () => {
-    const window = openServerWindow(server);
-    await withUnguardedPage(browser, viewport, async (page) => {
-      await page.goto(urlOf(path), { waitUntil: 'load' });
-      await expect.poll(() => window.count('POST', '/__mutation')).toBeGreaterThan(0);
-    });
-    expect(window.count('GET', workerPath)).toBeGreaterThan(0);
-  });
-
   /**
-   * DEF-049（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 5 と変更履歴の NP6 の Blocker の行）: Playwright の
-   * `serviceWorkers: 'block'` は、`navigator.serviceWorker` のインスタンスの `register` を置き換えるだけなので、ページは
-   * `ServiceWorkerContainer.prototype.register.call` や、インスタンスの `register` を `delete` した後の呼び出しで迂回できる。Guard の
-   * 初期化のスクリプト（主）が、すべての frame の `ServiceWorkerContainer.prototype.register` を、例外を投げる関数に置き換えて固定するので、
-   * 2 つの迂回は、ページの文書でも、同じ Origin の iframe でも、about:blank の iframe でも、例外になり、登録 0、Service Worker の script の
+   * DEF-049（設計書 `2026-10-08-beaksight-def-044-046-review-fixes-design.md` 5 と変更履歴の NP6 の Blocker の行）: Playwright 1.62.1 までの
+   * `serviceWorkers: 'block'` は、`navigator.serviceWorker` のインスタンスの `register` を置き換えるだけだったので、ページは
+   * `ServiceWorkerContainer.prototype.register.call` や、インスタンスの `register` を `delete` した後の呼び出しで迂回できた。Guard の
+   * 初期化のスクリプト（主）が、すべての frame の `ServiceWorkerContainer.prototype.register` を、拒否する Promise を返す関数に置き換えて固定するので、
+   * 2 つの迂回は、ページの文書でも、同じ Origin の iframe でも、about:blank の iframe でも、Guard の拒否になり、登録 0、Service Worker の script の
    * GET も POST も届かず、違反 0（factory の自己検査 `SERVICE_WORKER_OBSERVED` も出ない）。テストの既定の headless shell と、CLI の起動の
-   * 設定（`chromiumLaunchOptions`）の両方で、Passive の Context と凍結の前の Interaction の session で確かめる。対照（Guard がなければ
+   * 設定（`chromiumLaunchOptions`）の両方で、Passive の Context と凍結の前の Interaction の session で確かめる。対照（ブラウザが登録を許せば
    * 登録され、POST が届く）は `gate-fixtures.test.ts`。
+   * UPG-SW: Playwright 1.64.1（Chromium 156）の `serviceWorkers: 'block'` は、インスタンスではなく `ServiceWorkerContainer.prototype.register` を
+   * 置き換える（microsoft/playwright の PR #43134）。その後に Guard の初期化のスクリプトが原型を固定するので、迂回も Guard の拒否になる
+   * （`rejected:NotSupportedError:<文言>`。同期では投げない。形は T44R2 の M-2 で Chromium に寄せた）。
+   * TS-f（7c）: 両方の Chromium をこの中で流すので、CLI の回では飛ばす（`describeBothChromiums`）。
    */
-  describe.each([
+  describeBothChromiums.each([
     { name: 'the headless shell (test default)', launch: (): Promise<Browser> => launchHeadlessChromium() },
-    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => chromium.launch(chromiumLaunchOptions({ headless: true })) },
+    // EL-12: 製品と同じ起動の部品（`launchCliChromium`。外部のアプリの起動を止める一時のプロファイルと自己検査）で起動する。
+    { name: 'the CLI Chromium (chromiumLaunchOptions, headless)', launch: (): Promise<Browser> => launchCliChromium() },
   ])('GATE-S08 bypass of the instance override (DEF-049), with $name', ({ name, launch }) => {
     let bypassBrowser: Browser;
     let bypassFactory: BrowserContextFactory;
@@ -1332,7 +1399,7 @@ describe('GATE-S08: a Service Worker cannot bypass the blocking', () => {
     it.each(SERVICE_WORKER_BYPASS_WAYS.flatMap((way) => SERVICE_WORKER_BYPASS_FRAMES.flatMap((where) => [
       { way, where, phase: 'Passive', open: () => openGuardedPassiveSession(bypassFactory, viewport) },
       { way, where, phase: 'Interaction (before the freeze)', open: () => openInteractionSessionBeforeFreeze(bypassFactory, viewport) },
-    ])))('GATE-S08 $phase: the $way bypass in the $where frame throws, registers nothing, and neither the worker script nor its POST reaches the server, without a violation', async ({ way, where, phase, open }) => {
+    ])))('GATE-S08 $phase: the $way bypass in the $where frame is rejected, registers nothing, and neither the worker script nor its POST reaches the server, without a violation', async ({ way, where, phase, open }) => {
       const outcome = await openGuardedServiceWorkerBypassPage(open, server, way, where);
       console.info(`GATE-S08 DEF-049 ${name} ${phase} ${way} ${where}: ${JSON.stringify({
         state: outcome.state,
@@ -1342,7 +1409,10 @@ describe('GATE-S08: a Service Worker cannot bypass the blocking', () => {
         invariantViolations: outcome.invariantViolations,
       })}`);
 
-      expect(outcome.state).toBe(`threw:${SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE}`);
+      expect(outcome.state).toBe(`rejected:${SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME}:${serviceWorkerRegistrationBlockedMessageOf(
+        `${server.origin}/`,
+        `${server.origin}${SERVICE_WORKER_BYPASS_WORKER_PATH}`,
+      )}`);
       expect(outcome.registrations).toBe(0);
       expect(outcome.window.count(null, SERVICE_WORKER_BYPASS_WORKER_PATH)).toBe(0);
       expect(outcome.window.count(null, '/__mutation')).toBe(0);

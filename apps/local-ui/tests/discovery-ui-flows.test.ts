@@ -16,13 +16,20 @@
  */
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { AUDIT_JOB_STATE_CATALOG, CANDIDATE_CLASSIFICATION_CATALOG, READ_CHECK_EXPECTATION_KIND_CATALOG } from '../../../src/presentation/catalog.js';
+import {
+  AUDIT_JOB_STATE_CATALOG,
+  CANDIDATE_CLASSIFICATION_CATALOG,
+  DISCOVERY_END_REASON_CATALOG,
+  READ_CHECK_EXPECTATION_KIND_CATALOG,
+  SUBMISSION_PROBE_RESULT_CATALOG,
+} from '../../../src/presentation/catalog.js';
 import {
   AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
   LOCAL_UI_DISCOVERY_TEXT,
   LOCAL_UI_READ_CHECK_TEXT,
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
 } from '../../../src/presentation/messages.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import {
   DISCOVERY_SITE_LOGIN_FIELDS,
@@ -31,6 +38,7 @@ import {
   startDiscoverySite,
   type DiscoverySite,
 } from '../../../tests/helpers/discovery-site-fixture.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   installTestAuthWorkerEntry,
@@ -201,8 +209,7 @@ const openNewDefinition = async (path: string): Promise<Page> => {
 };
 
 /** fixture のサイトに届いた、GET と HEAD 以外の要求。 */
-const nonReadRequests = (): readonly string[] =>
-  siteOf().requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+const nonReadRequests = (): readonly string[] => nonReadRequestsOf(siteOf().requests);
 
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
@@ -266,7 +273,7 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     const fixture = siteOf();
     expect(await valueOf('saveAuthSetupFn', 'POST', {
       setup: {
-        schemaVersion: 'beaksight-auth-setup/2',
+        ...FORM_NAVIGATION_SETUP_ITEMS,
         profileId: PROFILE_ID,
         profileRevision: FIRST_REVISION,
         loginStartUrl: `${fixture.origin}${DISCOVERY_SITE_PATHS.login}`,
@@ -293,6 +300,11 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     await waitForFinished(page);
     expect(await page.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('COMPLETE');
     expect(await page.locator('[data-artifact="DISCOVERY_JSON"]').count()).toBe(1);
+    // T44e（Task 44 の設計書 P2-7）: ジョブの画面にも、発見の終わり方を表示のカタログの文で出す（最後まで読んだので、次にできることはない）。
+    const endReason = page.getByTestId('job-end-reason');
+    expect(await endReason.getAttribute('data-reason')).toBe('COMPLETED');
+    expect(await endReason.textContent()).toContain(DISCOVERY_END_REASON_CATALOG.COMPLETED.label);
+    expect(await page.getByTestId('job-end-reason-next').count()).toBe(0);
     await screenshot(page, '03-discovery-job-finished');
 
     await tabTo(page, page.getByTestId('job-open-discovery'));
@@ -330,6 +342,15 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
       ['q', 'true'],
       ['status', 'true'],
     ]);
+    // T37c（Task 37 の設計書 3.6）: JS の結び付きの候補（NEEDS_BINDING）の詳しい内容に、送らずに観察した結果を出す（fixture の JS の画面は、押しても
+    // 何も送らないので「要求なし」）。表示は表示のカタログのラベル。
+    const bound = candidateRow(page, p.js, 'NEEDS_BINDING').first();
+    const boundDetail = bound.locator('xpath=following-sibling::tr[1]').getByTestId('candidate-detail');
+    await boundDetail.locator('summary').click();
+    const probes = boundDetail.getByTestId('candidate-submission-probes');
+    expect(await probes.locator('[data-probe-result]').first().getAttribute('data-probe-result')).toBe('NO_REQUEST');
+    expect(await probes.getByText(SUBMISSION_PROBE_RESULT_CATALOG.NO_REQUEST.label).count()).toBeGreaterThan(0);
+    expect(await probes.getByText(text.submissionProbe.heading).count()).toBe(1);
     await screenshot(page, '04-discovery-candidates');
   }, SCENARIO_TIMEOUT_MS);
 

@@ -1,7 +1,7 @@
 // 書き込みのジョブの報告の確かめ（T32g。Task 32 の設計書 4.1 の「親の確かめと画面の配布」「報告の確かめの記録」）。ジョブの管理
 // （`audit-job-manager.ts`）が、書き込みの結果の締めと同じ時点で呼び、結果（`WRITE_REPORT_CHECKS` の 1 つ）を `recordWriteReportCheck` で記録する。
 // - 照らす: 報告の 2 つの JSON（`action-evidence.json`・`approval-summary.json`）が成果物のスキーマに合う。ジョブ・Run・プロファイル・シナリオと版・
-//   許可・結果と理由が、使えた `action-run.json` と同じ。組み立て直しに使う `action-run.json` のバイト列（2 回目の読み取り）が、締めに使った文書
+//   許可・結果と理由（T40c: 送り方と API の要約）が、使えた `action-run.json` と同じ。組み立て直しに使う `action-run.json` のバイト列（2 回目の読み取り）が、締めに使った文書
 //   （1 回目に読んで確かめたもの）と同じ内容（JSON でなければ `REPORT_INVALID`、違えば `REPORT_MISMATCH`。T32R3 Minor-1）。承認の要約の事実が、`START` で送った承認の要約の事実と同じ（`START` の値は親のメモリにだけ
 //   あるので、ここでしか照らせない）。書き込みのバンドルは、ディスクの 4 つのファイル（`action-run.json`・`action-evidence.json`・
 //   `approval-summary.json`・`action-report.html`）から同じ手順（`actionBundleBytesOf`。ワーカーと同じ部品）で組み立て直したバイト列と、ディスクの
@@ -71,9 +71,14 @@ const sortedJsonOfBytes = (bytes: Uint8Array): string | null => {
   }
 };
 
-/** 報告のジョブ・Run・プロファイル・シナリオと版・許可・結果と理由が、`action-run.json` と同じか。 */
+/** T40c: 証拠の送り方と API の要約が、`action-run.json` と同じか（LG-4 で前の版 1.0 を捨てたので、どちらも必ず持つ）。 */
+const transportMatches = (run: ActionRunDocument, evidence: ActionEvidenceDocument): boolean =>
+  run.transport === evidence.transport && sortedKeysJsonOf(run.api) === sortedKeysJsonOf(evidence.api);
+
+/** 報告のジョブ・Run・プロファイル・シナリオと版・許可・結果と理由（T40c: 送り方と API の要約）が、`action-run.json` と同じか。 */
 const identityMatches = (run: ActionRunDocument, evidence: ActionEvidenceDocument, summary: ApprovalSummaryDocument): boolean =>
-  evidence.jobId === run.jobId
+  transportMatches(run, evidence)
+  && evidence.jobId === run.jobId
   && evidence.runId === run.runId
   && evidence.profileId === run.profileId
   && evidence.scenarioId === run.scenarioId

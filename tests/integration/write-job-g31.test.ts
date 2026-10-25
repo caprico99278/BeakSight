@@ -20,6 +20,7 @@
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import type { ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { readWriteResult } from '../../src/control/actions/write-result-facts.js';
 import {
@@ -164,7 +165,7 @@ async function waitForWriteStageFormGet(since: number): Promise<void> {
     if (Date.now() > deadline) {
       throw new Error('the form GET of the write stage did not arrive');
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
 }
 
@@ -329,7 +330,7 @@ describe('T31i: the G31 conditions end to end with the real worker', () => {
   }, STEP_TIMEOUT_MS);
 
   it('after all the runs: no POST arrives late, and no secret marker or kept value is outside its places', async () => {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, LATE_DELIVERY_SETTLE_MS));
+    await wait(LATE_DELIVERY_SETTLE_MS);
     expect(harness.updatePosts()).toHaveLength(expectedUpdatePosts);
     // サーバが状態を変える 1、副作用の 2、重複の場面の 2（同時の開始の 1 と切断の 1）、累積の 1、`UNKNOWN` の後の 2。
     expect(expectedUpdatePosts).toBe(8);

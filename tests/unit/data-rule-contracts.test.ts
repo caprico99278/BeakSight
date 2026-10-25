@@ -1,8 +1,10 @@
 // T29a（Task 29 の設計書 4.1）: 入力の規則の契約（`src/control/data-rules/rule-contracts.ts`）と、JSON Schema
-// （`schemas/control/data-rule.schema.json`）と、保存の前の確かめ直し（`rule-set-policy.ts` の `assertStorableRuleSet`）の検査。
+// （`schemas/control/data-rule-v2.schema.json`）と、保存の前の確かめ直し（`rule-set-policy.ts` の `assertStorableRuleSet`）の検査。
 // - 閉じた一覧: 凍結、重なりがない、細分はどのコードの一覧にも 1 回だけ。
 // - 合成のメールアドレスと電話番号の形の判定（`example.invalid` だけ、`090-0XXX-XXXX` とハイフンなしの形だけ）。
 // - スキーマ: 上限・形・分岐の const と名前つきの定数の一致（enum の一致は `schema-enum-consistency.test.ts`）、受ける形と拒む形。
+// - FM2c: 契約の今の版は版 2（`data-rule-v2.schema.json`。版 2 の検査は `data-rule-origin-v2.test.ts`）。LG-3（2026-10-24 の設計 3.7.2）: 版 1 の
+//   スキーマ（`data-rule.schema.json`）は捨てた。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -29,6 +31,9 @@ import {
   RULE_CONFLICT_DETAILS,
   RULE_PROBLEM_CODES,
   RULE_PROBLEM_DETAILS,
+  MAX_BASE_DATE_WINDOW_DAYS,
+  MAX_DIGIT_CODE_DIGITS,
+  RULE_ORIGINS,
   RULE_SET_ID_PATTERN,
   RULE_SET_SCHEMA_VERSION,
   RULE_SOURCES,
@@ -56,7 +61,8 @@ type JsonSchema = Record<string, unknown> & {
   readonly required?: readonly string[];
 };
 
-const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'data-rule.schema.json'), 'utf8')) as JsonSchema;
+// FM2c: 契約の今の版（版 2）のスキーマ。
+const schema = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'data-rule-v2.schema.json'), 'utf8')) as JsonSchema;
 const defs = schema.$defs ?? {};
 const prop = (node: JsonSchema | undefined, key: string): JsonSchema => node?.properties?.[key] ?? {};
 
@@ -186,9 +192,21 @@ describe('synthetic email addresses and phone numbers (T29a)', () => {
 });
 
 describe('data rule schema (T29a)', () => {
+  // LG-3: 版 1 のスキーマの名前は捨てた（版 2 だけ）。
   it('is registered in the control schema names', () => {
-    expect(CONTROL_SCHEMA_NAMES).toContain('data-rule');
-    expect(schema.$id).toBe('urn:beaksight:schema:control:data-rule:1');
+    expect(CONTROL_SCHEMA_NAMES).not.toContain('data-rule');
+    expect(CONTROL_SCHEMA_NAMES).toContain('data-rule-v2');
+    expect(schema.$id).toBe('urn:beaksight:schema:control:data-rule:2');
+  });
+
+  it('has the origin, the window and the digit count in the version 2 field rule (FM2c)', () => {
+    expect(Object.keys(defs.fieldRule?.properties ?? {})).toEqual(
+      ['fieldName', 'semanticKind', 'method', 'range', 'fixedValues', 'origin', 'baseDateWindow', 'digitCount'],
+    );
+    expect(defs.origin?.enum).toEqual([...RULE_ORIGINS]);
+    expect(defs.digitCount?.maximum).toBe(MAX_DIGIT_CODE_DIGITS);
+    expect(defs.windowDays?.maximum).toBe(MAX_BASE_DATE_WINDOW_DAYS);
+    expect(defs.windowDays?.minimum).toBe(0);
   });
 
   it('matches the limits, shapes and branch constants with the named constants', () => {
@@ -204,20 +222,22 @@ describe('data rule schema (T29a)', () => {
     const fixedValues = prop(defs.fieldRule, 'fixedValues');
     expect(fixedValues.maxItems).toBe(MAX_FIXED_VALUES);
     expect(fixedValues.items?.maxLength).toBe(MAX_FIXED_VALUE_LENGTH);
-    expect((defs.fieldRule?.if as JsonSchema | undefined)?.properties?.method?.const).toBe(FIXED_LIST_GENERATION_METHOD);
+    expect(((defs.fieldRule?.allOf as readonly JsonSchema[] | undefined)?.[0]?.if as JsonSchema | undefined)?.properties?.method?.const)
+      .toBe(FIXED_LIST_GENERATION_METHOD);
     expect(Object.keys(defs.range?.properties ?? {})).toEqual(['min', 'max', 'step']);
     const branches = (defs.relation?.oneOf ?? []).map((branch) => defs[String(branch.$ref).replace('#/$defs/', '')]);
     expect(branches.map((branch) => prop(branch, 'kind').const)).toEqual([...FIELD_RELATION_KINDS]);
     for (const [index, kind] of FIELD_RELATION_KINDS.entries()) {
       expect(branches[index]?.required).toEqual(['kind', ...FIELD_RELATION_ROLES[kind]]);
-      expect(Object.keys(branches[index]?.properties ?? {})).toEqual(['kind', ...FIELD_RELATION_ROLES[kind]]);
+      // FM2c fix round 1: 関係の出どころの印（任意）。
+      expect(Object.keys(branches[index]?.properties ?? {})).toEqual(['kind', ...FIELD_RELATION_ROLES[kind], 'origin']);
     }
   });
 
   it('accepts the examples of the contract', () => {
-    expect(validateControlDocument('data-rule', sampleRuleSet())).toEqual({ ok: true });
-    expect(validateControlDocument('data-rule', sampleRuleSet({ fieldRules: [], relations: [], uniqueKeyFieldNames: [] }))).toEqual({ ok: true });
-    expect(validateControlDocument('data-rule', sampleRuleSet({
+    expect(validateControlDocument('data-rule-v2', sampleRuleSet())).toEqual({ ok: true });
+    expect(validateControlDocument('data-rule-v2', sampleRuleSet({ fieldRules: [], relations: [], uniqueKeyFieldNames: [] }))).toEqual({ ok: true });
+    expect(validateControlDocument('data-rule-v2', sampleRuleSet({
       fieldRules: [sampleFieldRule('phone', { semanticKind: 'PHONE', method: 'FROM_FIXED_LIST', fixedValues: ['090-0000-0001'] })],
       relations: [],
       uniqueKeyFieldNames: ['phone'],
@@ -250,9 +270,10 @@ describe('data rule schema (T29a)', () => {
     ['a bad rule set id', sampleRuleSet({ ruleSetId: 'Rules_1' })],
     ['a revision of 0', sampleRuleSet({ revision: 0 })],
     ['a bad timestamp', sampleRuleSet({ createdAt: '2026-10-13' })],
-    ['another schema version', sampleRuleSet({ schemaVersion: 'beaksight-data-rule/2' as never })],
+    // LG-3: 捨てた版 1 の印。
+    ['another schema version', sampleRuleSet({ schemaVersion: 'beaksight-data-rule/1' as never })],
   ])('rejects a rule set with %s', (_label, document) => {
-    expect(validateControlDocument('data-rule', document).ok).toBe(false);
+    expect(validateControlDocument('data-rule-v2', document).ok).toBe(false);
   });
 });
 

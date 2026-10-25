@@ -21,7 +21,7 @@ import {
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { overrideBrowser } from '../helpers/browser-proxies.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGuardHarness, createHarnessPage, type GuardHarness } from '../helpers/passive-guard-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
@@ -187,7 +187,7 @@ describe.each([
       ]);
       expect(isPassiveRequestGuardClosed(context)).toBe(false);
       expect(real.isConnected()).toBe(true);
-      expect(real.contexts()).toContain(context);
+      expect(testContextsOf(real)).toContain(context);
     } finally {
       await rejecting.closeStalledForReal();
       await factory.close();

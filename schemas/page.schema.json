@@ -13,7 +13,10 @@
     "incompleteReasons"
   ],
   "properties": {
-    "schemaVersion": { "const": "page-schema/1.0" },
+    "schemaVersion": {
+      "description": "BN-a (BeakSight block noise design 3.1, item 5): page-schema/1.1 has the marks of the BeakSight blocks (the phase and resource type of the stopped events, the requests stopped while closing, the network failure marks, and the load of each safety evidence). LG-4: a page.json of page-schema/1.0 (without the marks) and a checkpoint holding one are no longer read.",
+      "enum": ["page-schema/1.1"]
+    },
     "pageId": { "type": "string", "pattern": "^PAGE-[0-9]{6,}$" },
     "pageUrl": { "type": "string", "minLength": 1 },
     "status": { "enum": ["AUDITED", "PARTIAL", "SKIPPED", "FAILED"] },
@@ -47,7 +50,22 @@
           "type": "array",
           "items": { "$ref": "urn:beaksight:schema:run:1.0#/$defs/incompleteReason" }
         },
-        "navigationOutcome": { "enum": ["OK", "TIMEOUT", "FAILED", "BLOCKED_EXTERNAL_REDIRECT", null] }
+        "navigationOutcome": { "enum": ["OK", "TIMEOUT", "FAILED", "BLOCKED_EXTERNAL_REDIRECT", null] },
+        "documentRequests": {
+          "description": "Optional (DEF-129): the main frame document requests that the Guard sent in the context of the viewport (the load of BeakSight, the redirects and the loads started by the page).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "childFrameDocumentRequests": {
+          "description": "Optional (T37R2-fix): the child frame document requests that the Guard sent in the context of the viewport (a separate count).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "subresourceRequests": {
+          "description": "Optional (DEF-130-fix): the requests other than documents (images, fetch, xhr and so on) that the Guard sent in the context of the viewport (a separate count).",
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "evidence": {
@@ -324,7 +342,9 @@
         "resourceType",
         "errorText",
         "timing",
-        "truncated"
+        "truncated",
+        "blockedByBeakSight",
+        "phase"
       ],
       "properties": {
         "isNavigationRequest": { "type": "boolean" },
@@ -335,7 +355,12 @@
         "resourceType": { "type": "string" },
         "errorText": { "type": "string" },
         "timing": { "$ref": "#/$defs/networkTiming" },
-        "truncated": { "type": "boolean" }
+        "truncated": { "type": "boolean" },
+        "blockedByBeakSight": {
+          "description": "BN-a (BeakSight block noise design 3.1, item 3): whether the failure is a request BeakSight stopped (the error text before truncation, matched with the block failure texts of src/core/blocked-by-client-failures.ts).",
+          "type": "boolean"
+        },
+        "phase": { "$ref": "#/$defs/blockedEventPhase" }
       }
     },
     "networkEvidence": {
@@ -2489,34 +2514,99 @@
         }
       ]
     },
+    "blockedEventPhase": {
+      "description": "BN-a (BeakSight block noise design 3.1): when the Guard stopped the event. LOAD: during the load of the Context (for the page audit, before and while measuring). CLOSING: while closing the Context, or after BeakSight began leaving the page before closing it. Required (LG-4: the records without it are no longer read).",
+      "enum": ["LOAD", "CLOSING"]
+    },
+    "blockedResourceType": {
+      "description": "BN-a: the resource type of the stopped request, normalized by the Guard (the closed list of the Guard). Required.",
+      "type": "string",
+      "minLength": 1
+    },
     "blockedRequestEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["method", "url", "reason"],
+      "required": ["method", "url", "reason", "resourceType", "phase"],
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
-        "reason": { "enum": ["NON_READ_METHOD"] }
+        "reason": { "enum": ["NON_READ_METHOD", "SERVICE_REQUEST_LIMIT_REACHED", "SERVICE_ORIGIN_REVISIT", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "AUDIT_SEND_OVER_LIMIT", "PAGE_LEAVE_REQUEST_LIMIT_REACHED"] },
+        "resourceType": { "$ref": "#/$defs/blockedResourceType" },
+        "phase": { "$ref": "#/$defs/blockedEventPhase" },
+        "speculative": { "$ref": "#/$defs/blockedSpeculativeMark" }
       }
+    },
+    "blockedSpeculativeMark": {
+      "description": "BN-R1 M-2: the mark of a speculative (prefetch or prerender) request, whose Sec-Purpose or Purpose header includes prefetch. Present only on such a request.",
+      "const": true
     },
     "blockedNavigationEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["method", "url", "reason"],
+      "required": ["method", "url", "reason", "phase"],
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
-        "reason": { "enum": ["EXTERNAL_MAIN_FRAME_NAVIGATION"] }
+        "reason": { "enum": ["EXTERNAL_MAIN_FRAME_NAVIGATION"] },
+        "phase": { "$ref": "#/$defs/blockedEventPhase" }
       }
     },
     "blockedWebSocketEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["url", "reason"],
+      "required": ["url", "reason", "phase"],
       "properties": {
         "url": { "type": "string" },
-        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY"] }
+        "reason": { "enum": ["PASSIVE_WEBSOCKET", "WORKER_CONNECT_POLICY", "AUDIT_SEND_OVER_LIMIT"] },
+        "phase": { "$ref": "#/$defs/blockedEventPhase" }
       }
+    },
+    "blockedClosingRequests": {
+      "description": "BN-a (BeakSight block noise design 3.1, item 2): the requests the Guard stopped while closing the Context (the stopping is unchanged; only the record is new). Only when at least one was stopped. count also counts the requests beyond the event limit and the ones whose method and URL could not be read. Not in blockedRequestsByMethod, blockedRequests or the SAFETY findings.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "events"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "url", "resourceType", "phase"],
+            "properties": {
+              "method": { "type": "string" },
+              "url": { "type": "string" },
+              "resourceType": { "$ref": "#/$defs/blockedResourceType" },
+              "phase": { "const": "CLOSING" },
+              "speculative": { "$ref": "#/$defs/blockedSpeculativeMark" }
+            }
+          }
+        }
+      }
+    },
+    "safetyEvidenceLoad": {
+      "description": "BN-a (BeakSight block noise design 3.1, item 4): the load of the Ledger of the safety evidence. PAGE_AUDIT: the page audit load (desktop and mobile). STRESS_WIDTH: one width of the width scan (CSS px). INTERACTION: one Interaction candidate (its index in the discovery order, from 0). Required.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "PAGE_AUDIT" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "width"],
+          "properties": { "kind": { "const": "STRESS_WIDTH" }, "width": { "type": "integer", "minimum": 1 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "candidateIndex"],
+          "properties": { "kind": { "const": "INTERACTION" }, "candidateIndex": { "type": "integer", "minimum": 0 } }
+        }
+      ]
     },
     "blockedExternalActionEvent": {
       "type": "object",
@@ -2612,12 +2702,15 @@
     "blockedAuditExclusionEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["method", "url", "mainFrameNavigation", "reason"],
+      "required": ["method", "url", "mainFrameNavigation", "reason", "resourceType", "phase"],
       "properties": {
         "method": { "type": "string" },
         "url": { "type": "string" },
         "mainFrameNavigation": { "type": "boolean" },
-        "reason": { "enum": ["AUDIT_EXCLUDED_URL"] }
+        "reason": { "enum": ["AUDIT_EXCLUDED_URL"] },
+        "resourceType": { "$ref": "#/$defs/blockedResourceType" },
+        "phase": { "$ref": "#/$defs/blockedEventPhase" },
+        "speculative": { "$ref": "#/$defs/blockedSpeculativeMark" }
       }
     },
     "blockedAuditExclusions": {
@@ -2627,6 +2720,77 @@
       "properties": {
         "count": { "type": "integer", "minimum": 0 },
         "events": { "type": "array", "items": { "$ref": "#/$defs/blockedAuditExclusionEvent" } }
+      }
+    },
+    "passedAuditSendRequests": {
+      "description": "AS-a and AS-b (audit send policy design 2.3): the non-read requests that the Guard let through with the audit send policy PASS_EXCEPT_DELETE (method, origin, path with value-like segments hidden, and count; no query, body or value). Only when at least one was let through.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "byMethod", "requests", "unlisted", "otherOrigins"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "byMethod": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 1 } },
+        "requests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "origin", "path", "count"],
+            "properties": {
+              "method": { "type": "string" },
+              "origin": { "type": "string" },
+              "path": { "type": "string" },
+              "count": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "unlisted": { "type": "integer", "minimum": 0 },
+        "otherOrigins": {
+          "description": "AS-c: the number of the passed requests to another Origin (neither an allowed Origin nor an approved service Origin). Required (LG-4: the records without it are no longer read).",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "passedAuditSendWebSockets": {
+      "description": "AS-c (audit send policy design, chapter 5): the WebSocket connections that the Guard let through with the audit send policy PASS_EXCEPT_DELETE (ws/wss origin, path with value-like segments hidden, and count; no query, no message and no value). Only when at least one was let through. AS-c fix round 1: counted from the connections the browser opened (CDP events), with marks for the ones opened without the Guard route and the dangerous ones.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "connections", "unlisted", "outsideGuard", "dangerous"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 1 },
+        "connections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["origin", "path", "count"],
+            "properties": {
+              "origin": { "type": "string" },
+              "path": { "type": "string" },
+              "count": { "type": "integer", "minimum": 1 },
+              "outsideGuard": {
+                "description": "AS-c fix round 1: the mark of the connections opened without the Guard route (a page script bypassed the WebSocket mock, or a Worker).",
+                "const": true
+              },
+              "dangerous": {
+                "description": "AS-c fix round 1: the mark of the connections whose URL hits a dangerous term.",
+                "const": true
+              }
+            }
+          }
+        },
+        "unlisted": { "type": "integer", "minimum": 0 },
+        "outsideGuard": {
+          "description": "AS-c fix round 1: the number of the connections opened without the Guard route. Required (LG-4).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "dangerous": {
+          "description": "AS-c fix round 1: the number of the connections whose URL hits a dangerous term. Required (LG-4).",
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "safetyLedgerRecordLimits": {
@@ -2646,6 +2810,7 @@
       "additionalProperties": false,
       "required": [
         "scope",
+        "load",
         "blockedRequestsByMethod",
         "blockedRequests",
         "blockedNavigations",
@@ -2662,6 +2827,7 @@
       ],
       "properties": {
         "scope": { "enum": ["PASSIVE", "INTERACTION"] },
+        "load": { "$ref": "#/$defs/safetyEvidenceLoad" },
         "blockedRequestsByMethod": {
           "type": "object",
           "additionalProperties": { "type": "integer", "minimum": 0 }
@@ -2687,7 +2853,10 @@
           "items": { "$ref": "#/$defs/externalSchemeNavigationEvent" }
         },
         "recordLimits": { "$ref": "#/$defs/safetyLedgerRecordLimits" },
-        "blockedAuditExclusions": { "$ref": "#/$defs/blockedAuditExclusions" }
+        "blockedAuditExclusions": { "$ref": "#/$defs/blockedAuditExclusions" },
+        "passedAuditSendRequests": { "$ref": "#/$defs/passedAuditSendRequests" },
+        "passedAuditSendWebSockets": { "$ref": "#/$defs/passedAuditSendWebSockets" },
+        "blockedClosingRequests": { "$ref": "#/$defs/blockedClosingRequests" }
       }
     }
   }

@@ -11,6 +11,7 @@ import type {
   NetworkResponseEvidence,
   RequestOriginFlags,
 } from '../core/evidence-types.js';
+import { isGuardBlockedPageError } from '../core/guard-page-exceptions.js';
 import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
@@ -415,6 +416,8 @@ const IMAGE_LOAD_FAILED = defineRule({
 /**
  * 捕捉されない例外（pageerror）を、同じ message・source・stack のものを1つにまとめる。
  * pageerror の Evidence は source を別に持たず、stack が source（URL と行・列）を含むので、name・message・stack で比べる。
+ * T44R2 の I-4: Guard の守りが起こした例外（Service Worker の登録の拒否、WebRTC の構築子の例外。`isGuardBlockedPageError`）は、サイトの欠陥では
+ * ないので、Finding にしない（Evidence には残る）。
  */
 const PAGE_ERROR = defineRule({
   ruleId: 'PAGE_ERROR',
@@ -424,6 +427,9 @@ const PAGE_ERROR = defineRule({
     const groups = new DetectionGroups<Readonly<{ name: string; message: string; stack: string }>>();
     for (const record of evidenceOfType(input, 'console')) {
       for (const pageError of record.payload.pageErrors) {
+        if (isGuardBlockedPageError(pageError)) {
+          continue;
+        }
         const fact = { name: pageError.name, message: pageError.message, stack: pageError.stack ?? '' };
         groups.add(JSON.stringify([fact.name, fact.message, fact.stack]), record.evidenceId, fact);
       }

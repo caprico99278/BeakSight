@@ -63,7 +63,7 @@ describe('CCX-15: loginAttemptsExceeded keeps its results (CC-064)', () => {
   const ledgerWith = (requests: readonly { method: string; url: string }[]): SafetyLedger => {
     const ledger = new SafetyLedger();
     for (const { method, url } of requests) {
-      ledger.recordBlockedRequest({ method, url, reason: 'NON_READ_METHOD' });
+      ledger.recordBlockedRequest({ method, url, reason: 'NON_READ_METHOD', resourceType: 'document', phase: 'LOAD' });
     }
     return ledger;
   };

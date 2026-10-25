@@ -13,6 +13,7 @@ import {
 import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, truncateText } from '../core/text.js';
 import { formatDecimal, formatPercent, formatPixels } from '../presentation/format.js';
+import { stressWidthFindingMessageText } from '../presentation/messages.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
 import { evidenceOfType } from './rule-helpers.js';
 
@@ -197,7 +198,8 @@ const layoutFactRule = (
     judge(layout).map(({ message, identityFields }) => (stressWidth === null
       ? draft({ message, evidenceId, identityFields })
       : draft({
-        message: `レスポンシブの幅 ${formatPixels(stressWidth)} の確認で、${message}`,
+        // BN-c: 文の形は `stressWidthFindingMessageText` の 1 か所（幅の読み込みと指摘の結び付けも、同じ関数で照らす）。
+        message: stressWidthFindingMessageText(formatPixels(stressWidth), message),
         evidenceId,
         identityFields: [...identityFields, { name: STRESS_WIDTH_IDENTITY_FIELD_NAME, value: String(stressWidth) }],
       })))));

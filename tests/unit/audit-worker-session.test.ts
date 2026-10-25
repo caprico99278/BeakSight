@@ -6,7 +6,7 @@
 // - 止め方: `STOP`（止める印）、`force` の `STOP` と 2 回目の `STOP`（終了コード 5）、Ctrl+C、IPC の切断、`START` の前の止め方。
 // - 信頼の境界: 形の違う `START`、2 回目の `START`、形の違うメッセージ、`START` が来ない、ワーカー自身が作った形の違うメッセージ。
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuditRunDependencies, AuditRunObserver, AuditRunOptions, AuditRunOutcome } from '../../src/cli/audit-run.js';
 import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { ConfigError } from '../../src/config/config-error.js';
@@ -22,7 +22,14 @@ import {
 import type { RunId, RunProgressReport } from '../../src/core/contracts.js';
 import type { RunSummaryView } from '../../src/report/view-model.js';
 import { CLI_TEXT } from '../../src/presentation/messages.js';
-import { startAuditWorker, WORKER_CONFIG_OVERRIDES, type AuditWorker, type WorkerChannel } from '../../src/worker/audit-worker-session.js';
+import {
+  startAuditWorker,
+  WORKER_CONFIG_OVERRIDES,
+  WORKER_SHOWN_BROWSER_CONFIG_OVERRIDES,
+  type AuditWorker,
+  type WorkerChannel,
+} from '../../src/worker/audit-worker-session.js';
+import { HEADED_CONFIG_OVERRIDES, withAuditSendPolicyOverride } from '../../src/config/config-overrides.js';
 import { createDeferred, type Deferred } from '../helpers/deferred.js';
 
 const OUTPUT_DIRECTORY = resolve('worker-session-output');
@@ -200,6 +207,59 @@ const onlyRunCall = (harness: Harness): Harness['runCalls'][number] => {
 const failedOf = (harness: Harness): Extract<WorkerToParentMessage, { readonly type: 'FAILED' }>[] =>
   harness.channel.sent.filter((message): message is Extract<WorkerToParentMessage, { readonly type: 'FAILED' }> => message.type === 'FAILED');
 
+// FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: `START` の `showJobBrowser` が真なら、ジョブのブラウザを表示する上書き
+// （`WORKER_SHOWN_BROWSER_CONFIG_OVERRIDES`。設定の owner の `HEADED_CONFIG_OVERRIDES`）で設定を読む。偽か省略は今どおり headless。
+describe('audit worker session (FM-2): the job browser display', () => {
+  it.each<[string, Record<string, unknown>, boolean]>([
+    ['shown', { showJobBrowser: true }, true],
+    ['not shown', { showJobBrowser: false }, false],
+    ['absent (as before)', {}, false],
+  ])('reads the configuration with the headed override when the job browser is %s', async (_label, item, headed) => {
+    const harness = startHarness();
+    harness.channel.emit({ ...START, ...item });
+    await harness.runStarted;
+    // AS-b: 監査の段の送信の扱いの上書きも一緒に渡す（項目がなければ読み取りだけ）。
+    expect(harness.loadConfigCalls).toEqual([[TARGET_CONFIG_PATH, { browser: { headed }, audit: { sendPolicy: 'READ_ONLY' } }]]);
+    expect(WORKER_SHOWN_BROWSER_CONFIG_OVERRIDES).toBe(HEADED_CONFIG_OVERRIDES);
+    expect(HEADED_CONFIG_OVERRIDES).toEqual({ browser: { headed: true } });
+    expect(Object.isFrozen(HEADED_CONFIG_OVERRIDES)).toBe(true);
+  });
+});
+
+// AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: `START` の `auditSendPolicy` を、実効の設定の上書き（`audit.sendPolicy`）として
+// 当てて読む。項目がない `START`（書き込み・ログインの確かめ・入口の確かめと、項目を持たない監査）は、ターゲット JSON の値によらず `READ_ONLY` で読む
+// （fail-closed。書き込みとログインの段には口を渡さない）。上書きの形は設定の owner の部品（`withAuditSendPolicyOverride`）が作る。
+describe('audit worker session (AS-b): the audit send policy', () => {
+  it.each<[string, Record<string, unknown>, string]>([
+    ['PASS_EXCEPT_DELETE', { auditSendPolicy: 'PASS_EXCEPT_DELETE' }, 'PASS_EXCEPT_DELETE'],
+    ['READ_ONLY', { auditSendPolicy: 'READ_ONLY' }, 'READ_ONLY'],
+    ['absent', {}, 'READ_ONLY'],
+  ])('reads the configuration with the audit send policy %s', async (_label, item, sendPolicy) => {
+    const harness = startHarness();
+    harness.channel.emit({ ...START, showJobBrowser: true, ...item });
+    await harness.runStarted;
+    expect(harness.loadConfigCalls).toEqual([[TARGET_CONFIG_PATH, { browser: { headed: true }, audit: { sendPolicy } }]]);
+    const [[, overrides] = []] = harness.loadConfigCalls;
+    expect(Object.isFrozen(overrides)).toBe(true);
+    expect(withAuditSendPolicyOverride(HEADED_CONFIG_OVERRIDES, 'PASS_EXCEPT_DELETE')).toEqual({ browser: { headed: true }, audit: { sendPolicy: 'PASS_EXCEPT_DELETE' } });
+    expect(HEADED_CONFIG_OVERRIDES).toEqual({ browser: { headed: true } });
+  });
+});
+
+// PRE42-BN（2026-10-24 のユーザーの判断）: `START` の `profileName` を、監査の中核の指定（`AuditRunOptions.profileName`）にそのまま渡す（ChatGPT 用
+// バンドルのファイル名だけに使う）。項目のない `START` は、指定に項目を入れない（名前の部分のない今の形）。
+describe('audit worker session (PRE42-BN): the profile name for the bundle name', () => {
+  it.each<[string, Record<string, unknown>, AuditRunOptions]>([
+    ['given', { profileName: '管理画面' }, { startNew: true, profileName: '管理画面' }],
+    ['absent', {}, { startNew: true }],
+  ])('passes the profile name to the audit core when it is %s', async (_label, item, options) => {
+    const harness = startHarness();
+    harness.channel.emit({ ...START, ...item });
+    await harness.runStarted;
+    expect(onlyRunCall(harness).options).toEqual(options);
+  });
+});
+
 describe('audit worker session: from READY to FINISHED', () => {
   it('sends READY, reads the configuration with the headless override only, runs the core, relays the observer and finishes', async () => {
     const harness = startHarness();
@@ -208,7 +268,7 @@ describe('audit worker session: from READY to FINISHED', () => {
     harness.channel.emit(START);
     await harness.runStarted;
     const call = onlyRunCall(harness);
-    expect(harness.loadConfigCalls).toEqual([[TARGET_CONFIG_PATH, { browser: { headed: false } }]]);
+    expect(harness.loadConfigCalls).toEqual([[TARGET_CONFIG_PATH, { browser: { headed: false }, audit: { sendPolicy: 'READ_ONLY' } }]]);
     expect(WORKER_CONFIG_OVERRIDES).toEqual({ browser: { headed: false } });
     expect(Object.isFrozen(WORKER_CONFIG_OVERRIDES)).toBe(true);
     expect(call.options).toEqual({ startNew: true });
@@ -271,18 +331,44 @@ describe('audit worker session: from READY to FINISHED', () => {
     expect(JSON.stringify(harness.channel.sent)).not.toContain('secret');
   });
 
-  it('sends heartbeats at the interval while it lives, and stops them after it exits', async () => {
+  // DEF-143（設計書 `2026-10-20-beaksight-worker-heartbeat-heavy-steps-design.md` 4 章の判断）: 中核が「Run の終わり」の段に入ったら、親へ段の知らせ
+  // （`RUN_FINALIZING`）を送る（親は、その段の間だけ途絶えの上限を延ばす）。
+  it('relays the start of the finalizing stage of the core as RUN_FINALIZING, before FINISHED', async () => {
     const harness = startHarness();
     harness.channel.emit(START);
     await harness.runStarted;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, HEARTBEAT_OBSERVATION_MS));
-    const heartbeats = harness.channel.sent.filter(({ type }) => type === 'HEARTBEAT').length;
-    expect(heartbeats).toBeGreaterThanOrEqual(2);
+    const call = onlyRunCall(harness);
+    call.observer.onRunStarted?.({ runId: RUN_ID, runDirectory: RUN_DIRECTORY, resumeDecision: { kind: 'NEW_RUN' } });
+    call.observer.onProgress?.(PROGRESS);
+    call.observer.onFinalizing?.();
     harness.outcome.resolve(ranOutcome());
-    await harness.worker.exited;
-    const afterExit = harness.channel.sent.length;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, HEARTBEAT_OBSERVATION_MS));
-    expect(harness.channel.sent).toHaveLength(afterExit);
+
+    expect(await harness.worker.exited).toBe(EXIT_CODES.COMPLETE);
+    expect(typesOf(harness.channel.sent)).toEqual(['READY', 'RUN_STARTED', 'PROGRESS', 'RUN_FINALIZING', 'FINISHED']);
+    expect(harness.channel.sent.find(({ type }) => type === 'RUN_FINALIZING')).toEqual({ protocol: WORKER_PROTOCOL_VERSION, type: 'RUN_FINALIZING' });
+    expect(harness.channel.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+    expect(harness.stderr).toEqual([]);
+  });
+
+  it('sends heartbeats at the interval while it lives, and stops them after it exits', async () => {
+    // DEF-149（TS-d）: 間隔と待つ時間を壁時計で待たず、偽のタイマー（注入した時計）で進める。混雑でタイマーが遅れると、待ちの終わりと合図の
+    // タイマーが同じ回に並び、数える前に合図が 1 つしか出ていないことがあった。偽のタイマーでは、進めた時間の分だけ合図が出る。
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      const harness = startHarness();
+      harness.channel.emit(START);
+      await harness.runStarted;
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_OBSERVATION_MS);
+      const heartbeats = harness.channel.sent.filter(({ type }) => type === 'HEARTBEAT').length;
+      expect(heartbeats).toBeGreaterThanOrEqual(2);
+      harness.outcome.resolve(ranOutcome());
+      await harness.worker.exited;
+      const afterExit = harness.channel.sent.length;
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_OBSERVATION_MS);
+      expect(harness.channel.sent).toHaveLength(afterExit);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

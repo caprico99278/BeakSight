@@ -32,9 +32,11 @@ import { closePassivePageAndContext, type PassiveSessionCloseFailure } from '../
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { BROWSER_DEFAULT_FAVICON_PATH } from './chromium.js';
+import { withoutBrowserFaviconRequestLines } from './chromium.js';
 import { closePassiveResources } from './passive-cleanup.js';
+import { LOADED_DEADLINE_FACTOR } from './loaded-deadline.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from './test-config.js';
+import { roundsOf } from './test-rounds.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 待つ時間
@@ -49,7 +51,7 @@ export const QUIET_PERIOD_MS = 300;
 /**
  * DEF-036: 凍結中のポップアップの要求を確かめるくり返しの監査を全部終えた後に、サーバの記録を改めて確かめる前に待つ時間（ms）。
  * Context を閉じた後に遅れて届く要求を見逃さないためである（修正の前の漏れは、閉じた数 ms 後に届いた）。期限の値ではなく、
- * 確かめる前の余裕である。`isolated-interaction.test.ts` の DEF-036 のテストと、`safety-gates.test.ts` の GATE-S04 で共有する。
+ * 確かめる前の余裕である。`isolated-interaction-cases.ts` の DEF-036 のテストと、`safety-gates.test.ts` の GATE-S04 で共有する。
  * ページを離れるときの送信の確かめ（DEF-038。`runGuardedUnloadBeaconRounds`）でも、同じ考えで使う。
  */
 export const FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS = 1_000;
@@ -66,9 +68,10 @@ export const UNLOAD_BEACON_TARGET_PATH = '/__mutation';
 
 /**
  * DEF-038: Guard の付いた Passive の page を開き、製品の閉じる手順で閉じる場面を、くり返す回数。修正の前の実験では、page を
- * 先に閉じる手順で 5 回中 5 回届いた。届く場面が毎回は起きない場合にも見逃しにくくするため、複数回くり返す。
+ * 先に閉じる手順で 5 回中 5 回届いた。届く場面が毎回は起きない場合にも見逃しにくくするため、複数回くり返す。値は `test-rounds.ts`
+ * （TS-b。ふだんの組と全部の組）。
  */
-export const UNLOAD_BEACON_CLOSE_ROUNDS = 5;
+export const UNLOAD_BEACON_CLOSE_ROUNDS = roundsOf('unloadBeaconClose');
 
 /** `runGuardedUnloadBeaconRounds` の1回（Context と page を開き、fixture を読み込み、閉じる）の上限の見積もり（ms）。期限の値ではない。 */
 const UNLOAD_BEACON_ROUND_BUDGET_MS = 5_000;
@@ -191,9 +194,9 @@ export const unloadBeaconSelfNavigationPath = (to: UnloadBeaconSelfNavigationTar
 
 /**
  * DEF-042: ページ自身の移動の場面を、くり返す回数。修正の前の調査では、どの Chromium でも毎回届いた（5/5、3/3）ので、少ない回数でも
- * 修正の前に失敗する。
+ * 修正の前に失敗する。値は `test-rounds.ts`（TS-b。ふだんの組と全部の組）。
  */
-export const UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS = 3;
+export const UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS = roundsOf('unloadBeaconSelfNavigation');
 
 /** `runGuardedSelfNavigationRounds` を使うテストの期限（ms）。考え方は `UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS` と同じ。 */
 export const UNLOAD_BEACON_SELF_NAVIGATION_TEST_TIMEOUT_MS = UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS
@@ -276,14 +279,23 @@ export interface SelfNavigationRounds {
 export interface SelfNavigationRoundOptions {
   /** ページ自身の移動が終わった後（閉じる前）に行う観測。 */
   readonly inspect?: (page: Page, ledger: SafetyLedger) => Promise<void>;
+  /**
+   * 回ごとの止めた証拠（既定は `blockedRequests` に少なくとも 1 件残ること）。DEF-095: 許可 Origin の外への main frame の移動を止める場面では、
+   * 混雑の下でページが離れる POST を出す前にエラーの画面へ移る回があるので、移動を止めた記録（`blockedNavigations`）も証拠に数える。
+   * 届かないこと・GET と HEAD 以外が届かないこと・違反 0・閉じる処理の失敗 0 の条件は、この指定で変わらない。
+   */
+  readonly evidence?: (round: Pick<SelfNavigationRound, 'blockedRequests' | 'blockedNavigations'>) => boolean;
 }
+
+/** `runGuardedSelfNavigationRounds` の既定の止めた証拠（`blockedRequests` に少なくとも 1 件残る）。 */
+const hasBlockedRequest = (round: Pick<SelfNavigationRound, 'blockedRequests'>): boolean => round.blockedRequests.length > 0;
 
 /**
  * DEF-042（設計書 `2026-10-08-beaksight-def-042-guard-fetch-all-design.md` 4）: `open` で Guard の付いた session を開き、`path` を
  * 読み込み、ページ自身の移動が終わる（`settled` が真になる）まで待ち、`QUIET_PERIOD_MS` 待ってから製品の手順で閉じ、さらに
  * `QUIET_PERIOD_MS` 待つ。これを `UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS` 回くり返し、全部の回の後に `FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS`
- * 待つ。条件は、ページを離れるときの送信が /__mutation に届かない、GET・HEAD 以外が届かない、`blockedRequests` に少なくとも 1 件残る、
- * 違反 0、閉じる処理の失敗 0 である。
+ * 待つ。条件は、ページを離れるときの送信が /__mutation に届かない、GET・HEAD 以外が届かない、止めた証拠が残る（既定は `blockedRequests` に
+ * 少なくとも 1 件。`options.evidence`）、違反 0、閉じる処理の失敗 0 である。
  */
 export async function runGuardedSelfNavigationRounds(
   open: () => Promise<SelfNavigationSession>,
@@ -295,6 +307,7 @@ export async function runGuardedSelfNavigationRounds(
   const allRoundsWindow = openServerWindow(server);
   const rounds: SelfNavigationRound[] = [];
   const failedRounds: SelfNavigationRound[] = [];
+  const evidence = options.evidence ?? hasBlockedRequest;
   for (let round = 0; round < UNLOAD_BEACON_SELF_NAVIGATION_ROUNDS; round += 1) {
     const session = await open();
     const window = openServerWindow(server);
@@ -320,7 +333,7 @@ export async function runGuardedSelfNavigationRounds(
     if (
       summary.delivered !== 0
       || Object.values(summary.nonReadCounters).some((count) => count !== 0)
-      || summary.blockedRequests.length === 0
+      || !evidence(summary)
       || summary.invariantViolations.length !== 0
       || summary.closeFailures.length !== 0
     ) {
@@ -329,6 +342,21 @@ export async function runGuardedSelfNavigationRounds(
   }
   await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
   return { rounds, failedRounds, allRoundsWindow };
+}
+
+/**
+ * `runGuardedSelfNavigationRounds` の回ごとの結果を、検証の記録のために出力する（既定の報告では、PASS したテストの出力は表示されない）。
+ * TS-f: `guard-unload-requests.test.ts` と `safety-gates.test.ts` の GATE-S01（DEF-042）で共有する。
+ */
+export function logSelfNavigationRounds(label: string, { rounds }: SelfNavigationRounds): void {
+  console.info(`DEF-042 ${label}: ${JSON.stringify(rounds.map((round) => ({
+    round: round.round,
+    delivered: round.delivered,
+    blockedRequests: round.blockedRequests.map((entry) => `${entry.method} ${entry.url} ${entry.reason}`),
+    blockedNavigations: round.blockedNavigations.map((entry) => `${entry.method} ${entry.url} ${entry.reason}`),
+    violations: round.invariantViolations,
+    pageUrl: round.pageUrl,
+  })))}`);
 }
 
 /** `leaveUnguardedUnloadBeaconPage` の追加の指定。 */
@@ -364,6 +392,13 @@ export async function leaveUnguardedUnloadBeaconPage(
 // ---------------------------------------------------------------------------------------------------------------
 // Worker の中の WebSocket（DEF-040。NP3）
 // ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * DEF-040: ボタンを押すと Worker の中で WebSocket の接続を開く fixture のページ（`fixtures/site/`）と、そのボタンの名前。GATE-S07 の Gate
+ * （`safety-gates.test.ts`）と、その対照（`gate-fixtures.test.ts`。TS-f）で共有する。
+ */
+export const WORKER_WEBSOCKET_PAGE = '/worker-websocket.html';
+export const WORKER_WEBSOCKET_BUTTON = 'Open WebSocket in worker';
 
 /**
  * DEF-040（NP3）: 読み込みのとき（クリックなし）に Worker を作り、その中で同じサーバの `/socket` へ WebSocket の接続を開く fixture の
@@ -514,7 +549,7 @@ export async function runGuardedWorkerWebSocketRounds(
     const summary: WorkerWebSocketRound = {
       round,
       upgrades: window.counters().webSocketUpgrade,
-      requestLines: window.requestLines().filter((line) => line !== `GET ${BROWSER_DEFAULT_FAVICON_PATH}`),
+      requestLines: withoutBrowserFaviconRequestLines(window.requestLines()),
       blockedWebSockets: snapshot.blockedWebSockets,
       invariantViolations: snapshot.invariantViolations,
       closeFailures: closeFailures.map(({ step, error }) => ({ step, error: String(error) })),
@@ -532,6 +567,21 @@ export async function runGuardedWorkerWebSocketRounds(
   }
   await wait(FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS);
   return { rounds, failedRounds, allRoundsWindow };
+}
+
+/**
+ * `runGuardedWorkerWebSocketRounds` の回ごとの結果を、検証の記録のために出力する（既定の報告では、PASS したテストの出力は表示されない）。
+ * TS-f: `guard-worker-websocket.test.ts` と `safety-gates.test.ts` の GATE-S07（DEF-040）で共有する。
+ */
+export function logWorkerWebSocketRounds(label: string, { rounds }: WorkerWebSocketRounds): void {
+  console.info(`DEF-040 ${label}: ${JSON.stringify(rounds.map((round) => ({
+    round: round.round,
+    upgrades: round.upgrades,
+    requestLines: round.requestLines,
+    blockedWebSockets: round.blockedWebSockets.map((entry) => `${entry.url} ${entry.reason}`),
+    violations: round.invariantViolations,
+    workerState: round.workerState,
+  })))}`);
 }
 
 /**
@@ -639,8 +689,10 @@ export async function openGuardedSharedWorkerPostsPage(
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * DEF-049: 読み込みのときに、Playwright の `serviceWorkers: 'block'` の置き換えを迂回して Service Worker を登録する fixture のページ
- * （`fixtures/site/`）と、その Service Worker の script（install と activate で /__mutation へ POST を送る）。
+ * DEF-049: 読み込みのときに、Playwright 1.62.1 までの `serviceWorkers: 'block'` の置き換え（インスタンスの `register`）を迂回して Service Worker を
+ * 登録する fixture のページ（`fixtures/site/`）と、その Service Worker の script（install と activate で /__mutation へ POST を送る）。
+ * UPG-SW: Playwright 1.64.1 の `block` は `ServiceWorkerContainer.prototype.register` を置き換えるので、迂回で登録できるのは、ブラウザが登録を許す
+ * Context（`serviceWorkers: 'allow'`）だけである。Guard の付いた Context では、どの迂回も Guard の拒否（`rejected:NotSupportedError:<文言>`。T44R2 の M-2）になる。
  */
 export const SERVICE_WORKER_BYPASS_PAGE = '/service-worker-bypass.html';
 export const SERVICE_WORKER_BYPASS_WORKER_PATH = '/service-worker-bypass-worker.js';
@@ -799,6 +851,17 @@ export function openServerWindow(server: FixtureServer): ServerWindow {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// 凍結中にページ自身が開いて閉じるポップアップ（DEF-039）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * DEF-039: ページ自身が開いて閉じるポップアップの fixture（`fixtures/site/`）と、同じ処理の中で閉じる場面のボタンの名前。GATE-S04 の Gate
+ * （`safety-gates.test.ts`）、その対照（`gate-fixtures.test.ts`。TS-f）、`isolated-interaction-cases.ts` の DEF-039 のテストで共有する。
+ */
+export const POPUP_SELF_CLOSE_BEACON_PAGE = '/popup-self-close-beacon.html';
+export const POPUP_SELF_CLOSE_SAME_TASK_BUTTON = 'Close popup in the same task';
+
+// ---------------------------------------------------------------------------------------------------------------
 // 対照の確認（Guard のない Context）
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -888,12 +951,38 @@ export function createGateFactory(browser: Browser, origin: string): BrowserCont
 // Interaction の段階
 // ---------------------------------------------------------------------------------------------------------------
 
+/** Gate の Interaction の確認の期限の組（ms）。 */
+export interface GateInteractionTiming {
+  readonly navigationTimeoutMs: number;
+  readonly timeoutMs: number;
+  readonly overallMs: number;
+}
+
 /** Gate の Interaction の確認の期限（ms）。製品の値ではなく、fixture の小さなページに合わせた、テストの値である。 */
 export const GATE_INTERACTION_TIMING = Object.freeze({
   navigationTimeoutMs: 5_000,
   timeoutMs: 2_000,
   overallMs: 5_000,
 });
+
+/**
+ * DF-2b（DEF-169・DEF-093・DEF-148）: 期限が確かめる判定に関わらない場面の、Gate の Interaction の期限（`GATE_INTERACTION_TIMING` の各値に、
+ * 名前つきの混雑の倍率 `LOADED_DEADLINE_FACTOR` を掛けたもの）。強い混雑の下で、session を開いて読み込むまでに全体の期限（5 秒）が切れ、
+ * ページの GET を出す前に監査が終わる回があった（DEF-169。その回は 5.6 秒）。押す操作を止めること・届かないことを確かめる場面と、期限の内に
+ * 確かめ終わる場面（VERIFIED）が使う。期限の切れ方そのものを確かめる場面は、`GATE_INTERACTION_TIMING` か、注入した短い期限のままにする。
+ */
+export const LOADED_GATE_INTERACTION_TIMING = Object.freeze({
+  navigationTimeoutMs: GATE_INTERACTION_TIMING.navigationTimeoutMs * LOADED_DEADLINE_FACTOR,
+  timeoutMs: GATE_INTERACTION_TIMING.timeoutMs * LOADED_DEADLINE_FACTOR,
+  overallMs: GATE_INTERACTION_TIMING.overallMs * LOADED_DEADLINE_FACTOR,
+});
+
+/**
+ * DF-2b: 期限が `LOADED_GATE_INTERACTION_TIMING` の監査を 1 回行うテストの期限（ms）。候補の探索の読み込み（`GATE_INTERACTION_TIMING.navigationTimeoutMs`）、
+ * 1 回の監査の全体の期限（`overallMs`）と後片付けの期限（`timeoutMs`）、待ち時間（`QUIET_PERIOD_MS`）の分。
+ */
+export const LOADED_INTERACTION_AUDIT_TEST_TIMEOUT_MS = GATE_INTERACTION_TIMING.navigationTimeoutMs + LOADED_GATE_INTERACTION_TIMING.overallMs
+  + LOADED_GATE_INTERACTION_TIMING.timeoutMs + QUIET_PERIOD_MS;
 
 /** `discoverInteractionCandidate` の追加の指定。 */
 export interface InteractionCandidateDiscoveryOptions {
@@ -943,18 +1032,40 @@ export interface InteractionGateInputOptions {
   readonly sessionFactory?: InteractionAuditInput['sessionFactory'];
   /** 凍結を待つ上限（ms）。期限のテストで、短い期限を注入する。 */
   readonly freezeActivationTimeoutMs?: number;
+  /** 期限の組（省略すると `GATE_INTERACTION_TIMING`。期限が判定に関わらない場面は `LOADED_GATE_INTERACTION_TIMING`）。 */
+  readonly timing?: GateInteractionTiming;
 }
 
-/** `auditInteraction` の入力（期限は `GATE_INTERACTION_TIMING`）。 */
+/** `auditInteraction` の入力（期限は `options.timing`。既定は `GATE_INTERACTION_TIMING`）。 */
 export function interactionAuditInput(options: InteractionGateInputOptions): InteractionAuditInput {
+  const timing: GateInteractionTiming = options.timing ?? GATE_INTERACTION_TIMING;
   return {
     sessionFactory: options.sessionFactory ?? ((sessionViewport) => options.factory.createInteractionSession(sessionViewport)),
     targetUrl: `${options.origin}${options.path}`,
     candidate: options.candidate,
     viewport: options.viewport,
-    navigationTimeoutMs: GATE_INTERACTION_TIMING.navigationTimeoutMs,
-    timeoutMs: GATE_INTERACTION_TIMING.timeoutMs,
-    deadlineAtMs: Date.now() + GATE_INTERACTION_TIMING.overallMs,
+    navigationTimeoutMs: timing.navigationTimeoutMs,
+    timeoutMs: timing.timeoutMs,
+    deadlineAtMs: Date.now() + timing.overallMs,
     ...(options.freezeActivationTimeoutMs === undefined ? {} : { freezeActivationTimeoutMs: options.freezeActivationTimeoutMs }),
   };
+}
+
+/**
+ * RP18 の指摘4: page から、POST（fetch）、読み取りの fetch（`/popup-target.html`）、メインフレームの移動（`/navigation-target.html`）を試みる。
+ * fetch の結果（届いたか、失敗したか）を返す。移動は結果を待たず、`QUIET_PERIOD_MS` の後に戻る。GATE-S06 の Gate（`safety-gates.test.ts`）と、
+ * その対照（`gate-fixtures.test.ts`。TS-f）で共有する。
+ */
+export async function attemptPostNavigationAndFetch(page: Page): Promise<{ readonly post: string; readonly fetch: string }> {
+  const result = await page.evaluate(async () => {
+    const outcome = (request: Promise<Response>): Promise<string> => request.then(() => 'sent', () => 'failed');
+    const post = await outcome(fetch('/__mutation', { method: 'POST', body: 'gate' }));
+    const read = await outcome(fetch('/popup-target.html'));
+    return { post, fetch: read };
+  });
+  await page.evaluate(() => {
+    location.href = '/navigation-target.html';
+  }).catch(() => undefined);
+  await wait(QUIET_PERIOD_MS);
+  return result;
 }

@@ -11,7 +11,7 @@
  *   この部品の型の名前には `ResourceDelivery` を付ける。
  */
 import { isPositiveSafeInteger } from '../core/guards.js';
-import { hasAllowedOrigin } from '../safety/request-policy.js';
+import { hasAllowedOrigin, isReadMethod } from '../safety/request-policy.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // キャッシュの条件と上限（設計書 4.6、4.10.3）
@@ -378,7 +378,8 @@ export class ResourceCache {
  * Context の役割（閉じた一覧）。
  * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml。キャッシュにあるものはキャッシュから返し、キャッシュに
  *   ないものは、許可 Origin の外でもネットワークから取る（DEF-031。設計書 4.10.3。ふつうの利用者がサイトを見て回るのと同じ）。
- * - `REVISIT`: 幅の走査、Interaction。キャッシュにあるものはキャッシュから返し、許可 Origin の外へは送らない。
+ * - `REVISIT`: 幅の走査、Interaction。キャッシュにあるものはキャッシュから返し、許可 Origin の外へは送らない（T44b: 送信の扱い
+ *   `PASS_EXCEPT_DELETE` の幅の走査は、`ResourceDeliveryInput.revisitSends` の要求を送る）。
  */
 export const RESOURCE_DELIVERY_ROLES = Object.freeze(['PRIMARY', 'REVISIT'] as const);
 export type ResourceDeliveryRole = (typeof RESOURCE_DELIVERY_ROLES)[number];
@@ -409,6 +410,14 @@ export interface ResourceDeliveryInput {
   readonly cache: ResourceCache;
   readonly allowedOrigins: ReadonlySet<string>;
   readonly request: ResourceDeliveryRequestFacts;
+  /**
+   * T44b（Task 44 の設計書 3.1 の P1-1）: 読み込み直しの Context（`REVISIT`）でも、許可 Origin の外へ送る要求（監査の段の送信の扱い `PASS_EXCEPT_DELETE`
+   * の幅の走査だけ。factory が渡す）。省略は今のまま。
+   * - `serviceOrigins`: 承認したサービスの Origin（スクリプトで送るログインの監査の段の口の値。そこへの要求は、上限の部品で数えたうえで Guard が通す）。
+   * - 読み取りでない要求（Guard が送信の扱いの口で通した、ページが出す送信）も送る。
+   * どちらも、キャッシュにある GET はキャッシュから返す（ほかの役割と同じ）。ほかの許可 Origin の外への読み取りは、今どおり送らない。
+   */
+  readonly revisitSends?: { readonly serviceOrigins: ReadonlySet<string> } | undefined;
 }
 
 const NETWORK_DECISION: ResourceDeliveryDecision = Object.freeze({ kind: 'NETWORK' });
@@ -421,9 +430,10 @@ const WITHHOLD_DECISION: ResourceDeliveryDecision = Object.freeze({ kind: 'WITHH
  *   動画も、要求に `Range` があっても、キャッシュにある全体を返す（入力に `Range` は含めない）。
  * - それ以外は、`REVISIT` の役割では、許可 Origin の外なら `WITHHOLD`、中なら `NETWORK`。`PRIMARY` の役割では、許可 Origin の
  *   外でも `NETWORK`（`PRIMARY` では `WITHHOLD` を選ばない。ふつうの利用者の初めての読み込みと同じく送る）。
+ * - T44b: `REVISIT` でも、`revisitSends` があれば、読み取りでない要求と、承認したサービスの Origin への要求は `NETWORK`。
  */
 export function decideResourceDelivery(input: ResourceDeliveryInput): ResourceDeliveryDecision {
-  const { role, cache, allowedOrigins, request } = input;
+  const { role, cache, allowedOrigins, request, revisitSends } = input;
   if (request.isNavigationRequest) {
     return NETWORK_DECISION;
   }
@@ -432,6 +442,10 @@ export function decideResourceDelivery(input: ResourceDeliveryInput): ResourceDe
     if (resource !== undefined) {
       return Object.freeze({ kind: 'FROM_RUN_CACHE', resource });
     }
+  }
+  // T44b: 読み込み直しの Context でも送る要求（送信の扱い `PASS_EXCEPT_DELETE` の幅の走査の、ページが出す送信とサービスの Origin への要求）。
+  if (revisitSends !== undefined && (!isReadMethod(request.method) || hasAllowedOrigin(request.url, revisitSends.serviceOrigins))) {
+    return NETWORK_DECISION;
   }
   // 送らないことを選ぶのは、読み込み直しの Context（`REVISIT`）で、許可 Origin の外の要求だけである。
   return role === 'REVISIT' && !hasAllowedOrigin(request.url, allowedOrigins) ? WITHHOLD_DECISION : NETWORK_DECISION;

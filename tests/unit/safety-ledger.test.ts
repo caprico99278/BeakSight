@@ -16,6 +16,7 @@ import {
   type InteractionRejectionReasonEvidence,
   type SafetyEventKind,
   type SafetyEventsEvidence,
+  type SafetyEvidenceLoad,
   type SafetyEvidenceScope,
   type SafetyLedgerRecordLimits,
 } from '../../src/core/evidence-types.js';
@@ -27,6 +28,7 @@ import {
   safetyEventsEvidenceFromSnapshot,
   summarizePageSafety,
   type InvariantViolationEvent,
+  type InvariantViolationInput,
   type SafetyLedgerReachedCategory,
   type SafetyLedgerRecordCategory,
   type SafetyLedgerSnapshot,
@@ -43,9 +45,9 @@ const runStatusFromLedger = (snapshot: SafetyLedgerSnapshot) => deriveRunStatus(
 describe('SafetyLedger', () => {
   it('keeps blocked events distinct from invariant violations and counts request methods canonically', () => {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedRequest({ method: 'post', url: 'https://example.test/submit', reason: 'NON_READ_METHOD' });
-    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
-    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' });
+    ledger.recordBlockedRequest({ method: 'post', url: 'https://example.test/submit', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
+    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
 
     expect(ledger.snapshot()).toMatchObject({
       blockedRequestsByMethod: { POST: 1 },
@@ -64,7 +66,7 @@ describe('SafetyLedger', () => {
   // 凍結の後は `blockedInteractionWebSockets` に、理由 `WORKER_CONNECT_POLICY` で残る（記録の種類は増えない）。
   it('records the WebSockets stopped inside Workers by the connect policy with the WORKER_CONNECT_POLICY reason, in both phases', () => {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedWebSocket({ url: 'ws://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY' });
+    ledger.recordBlockedWebSocket({ url: 'ws://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY', phase: 'LOAD' });
     ledger.recordBlockedInteractionWebSocket({ url: 'wss://example.test/worker-live', reason: 'WORKER_CONNECT_POLICY' });
 
     expect(ledger.snapshot()).toMatchObject({
@@ -76,7 +78,7 @@ describe('SafetyLedger', () => {
 
   it('returns deeply immutable copies that cannot alter later snapshots', () => {
     const ledger = new SafetyLedger();
-    const event = { method: 'PATCH', url: 'https://example.test/mutate', reason: 'NON_READ_METHOD' as const };
+    const event = { method: 'PATCH', url: 'https://example.test/mutate', reason: 'NON_READ_METHOD' as const, resourceType: 'fetch', phase: 'LOAD' as const };
     ledger.recordBlockedRequest(event);
 
     const first = ledger.snapshot();
@@ -112,6 +114,8 @@ describe('SafetyLedger', () => {
       method: '__proto__',
       url: 'https://example.test/unknown-method',
       reason: 'NON_READ_METHOD',
+      resourceType: 'fetch',
+      phase: 'LOAD',
     });
 
     expect(ledger.snapshot().blockedRequestsByMethod.__PROTO__).toBe(1);
@@ -148,9 +152,9 @@ describe('SafetyLedger', () => {
     const ledger = new SafetyLedger();
     const longText = 'x'.repeat(3_000);
     for (let index = 0; index < 300; index += 1) {
-      ledger.recordBlockedRequest({ method: longText, url: longText, reason: 'NON_READ_METHOD' });
-      ledger.recordBlockedNavigation({ method: longText, url: longText, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
-      ledger.recordBlockedWebSocket({ url: longText, reason: 'PASSIVE_WEBSOCKET' });
+      ledger.recordBlockedRequest({ method: longText, url: longText, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+      ledger.recordBlockedNavigation({ method: longText, url: longText, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
+      ledger.recordBlockedWebSocket({ url: longText, reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
       ledger.recordInvariantViolation({ code: longText, message: longText });
     }
 
@@ -191,6 +195,8 @@ describe('SafetyLedger', () => {
         method: `custom-method-${index}`,
         url: `https://example.test/${index}`,
         reason: 'NON_READ_METHOD',
+        resourceType: 'fetch',
+        phase: 'LOAD',
       });
     }
 
@@ -208,7 +214,7 @@ describe('SafetyLedger', () => {
   it('saturates a method counter and records the saturation once', () => {
     const ledger = new SafetyLedger();
     for (let index = 0; index < 65_540; index += 1) {
-      ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD' });
+      ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     }
 
     const snapshot = ledger.snapshot();
@@ -225,7 +231,7 @@ describe('SafetyLedger', () => {
     it('keeps 257 blocked POST requests out of invariantViolations and derives PARTIAL', () => {
       const ledger = new SafetyLedger();
       for (let index = 0; index < 257; index += 1) {
-        ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       }
 
       const snapshot = ledger.snapshot();
@@ -246,7 +252,7 @@ describe('SafetyLedger', () => {
     it('reports a complete record at exactly the event limit', () => {
       const ledger = new SafetyLedger();
       for (let index = 0; index < 256; index += 1) {
-        ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: `https://example.test/${index}`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       }
 
       expect(ledger.snapshot().recordLimits).toEqual({
@@ -263,7 +269,7 @@ describe('SafetyLedger', () => {
       const ledger = new SafetyLedger();
       ledger.recordInvariantViolation({ code: 'HTTP_ABORT_FAILED', message: 'abort failed' });
       for (let index = 0; index < 300; index += 1) {
-        ledger.recordBlockedRequest({ method: `M${index}`, url: 'https://example.test/', reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: `M${index}`, url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
         ledger.recordBlockedDownload({
           url: 'https://example.test/file',
           suggestedFilename: 'file',
@@ -282,7 +288,7 @@ describe('SafetyLedger', () => {
       const ledger = new SafetyLedger();
       for (let index = 0; index < 300; index += 1) {
         ledger.recordInvariantViolation({ code: 'GUARD_FAILURE', message: `violation ${index}` });
-        ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       }
 
       const snapshot = ledger.snapshot();
@@ -302,8 +308,8 @@ describe('SafetyLedger', () => {
       const ledger = new SafetyLedger();
       const method = 'X'.repeat(33);
 
-      ledger.recordBlockedRequest({ method, url: 'https://example.test/', reason: 'NON_READ_METHOD' });
-      ledger.recordBlockedNavigation({ method, url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+      ledger.recordBlockedRequest({ method, url: 'https://example.test/', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+      ledger.recordBlockedNavigation({ method, url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
       ledger.recordBlockedInteractionRequest({ method, url: 'https://example.test/', reason: 'INTERACTION_FROZEN' });
 
       const snapshot = ledger.snapshot();
@@ -476,9 +482,9 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
   /** すべての種類の事象と、不変条件の違反と、記録の上限の到達を持つ Ledger。 */
   function ledgerWithEveryRecord(): SafetyLedger {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedRequest({ method: 'post', url: 'https://example.test/submit', reason: 'NON_READ_METHOD' });
-    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
-    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' });
+    ledger.recordBlockedRequest({ method: 'post', url: 'https://example.test/submit', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
+    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
     ledger.recordBlockedExternalAction({ candidateId, url: 'tel:0000', reason: 'EXTERNAL_ACTION' });
     ledger.recordExcludedInteractionCandidate({ candidateId, reason: 'SUBMISSION_CONTROL' });
     ledger.recordBlockedInteractionRequest({ method: 'GET', url: 'https://example.test/api', reason: 'INTERACTION_FROZEN' });
@@ -503,10 +509,11 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
   it('keeps every page event record and the record limits, and leaves out the invariant violations', () => {
     const snapshot = ledgerWithEveryRecord().snapshot();
 
-    const evidence = safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE');
+    const evidence = safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE', { kind: 'PAGE_AUDIT' });
 
     expect(evidence).toEqual({
       scope: 'PASSIVE',
+      load: { kind: 'PAGE_AUDIT' },
       blockedRequestsByMethod: snapshot.blockedRequestsByMethod,
       blockedRequests: snapshot.blockedRequests,
       blockedNavigations: snapshot.blockedNavigations,
@@ -532,14 +539,18 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
   });
 
   it.each(['PASSIVE', 'INTERACTION'] as const)('attaches the %s scope', (scope) => {
-    const evidence = safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), scope);
+    const evidence = safetyEventsEvidenceFromSnapshot(
+      new SafetyLedger().snapshot(),
+      scope,
+      scope === 'INTERACTION' ? { kind: 'INTERACTION', candidateIndex: 0 } : { kind: 'PAGE_AUDIT' },
+    );
 
     expect(evidence.scope).toBe(scope);
     expect(Object.keys(evidence)[0]).toBe('scope');
   });
 
   it('returns a deeply frozen payload', () => {
-    const evidence = safetyEventsEvidenceFromSnapshot(ledgerWithEveryRecord().snapshot(), 'INTERACTION');
+    const evidence = safetyEventsEvidenceFromSnapshot(ledgerWithEveryRecord().snapshot(), 'INTERACTION', { kind: 'INTERACTION', candidateIndex: 0 });
 
     expect(Object.isFrozen(evidence)).toBe(true);
     expect(Object.isFrozen(evidence.blockedRequestsByMethod)).toBe(true);
@@ -568,12 +579,16 @@ describe('T12d0: safety Evidence from a Safety Ledger snapshot', () => {
   });
 
   it('types the payload as the safety Evidence and the snapshot as the payload fields plus the violations', () => {
+    // BN-a: 読み込みの印（`load`）を 3 つ目の引数で受け取る（page.json の書き手はいつも渡す）。LG-4: 必須の引数。
     expectTypeOf(safetyEventsEvidenceFromSnapshot).parameters
-      .toEqualTypeOf<[SafetyLedgerSnapshot, SafetyEvidenceScope]>();
+      .toEqualTypeOf<[SafetyLedgerSnapshot, SafetyEvidenceScope, SafetyEvidenceLoad]>();
     expectTypeOf(safetyEventsEvidenceFromSnapshot).returns.toEqualTypeOf<SafetyEventsEvidence>();
     expectTypeOf<EvidencePayloadByType['safety']>().toEqualTypeOf<SafetyEventsEvidence>();
+    // AS-b: 通した読み取りでない要求の記録（`passedAuditSendRequests`）は、止めた要求と同じく Evidence の項目（AS-a では Ledger だけの項目だった）。
+    // BN-a: 読み込みの印（`load`）は Evidence だけの項目（snapshot は持たない）。
     expectTypeOf<Omit<SafetyLedgerSnapshot, 'invariantViolations' | 'invariantViolationCount'>>()
-      .toEqualTypeOf<Omit<SafetyEventsEvidence, 'scope'>>();
+      .toEqualTypeOf<Omit<SafetyEventsEvidence, 'scope' | 'load'>>();
+    expectTypeOf<SafetyLedgerSnapshot>().not.toHaveProperty('load');
     expectTypeOf<SafetyLedgerSnapshot['invariantViolations']>().toEqualTypeOf<readonly InvariantViolationEvent[]>();
     expectTypeOf<SafetyLedgerSnapshot['invariantViolationCount']>().toEqualTypeOf<number>();
     expectTypeOf<SafetyLedgerSnapshot>().not.toHaveProperty('scope');
@@ -702,7 +717,8 @@ describe('P18b: Safety Ledger types (CC-015, CC-028)', () => {
   // CC-015: 不変条件の違反の型は、core（`src/core/contracts.ts`）の1つにする。Ledger の型は、その別名にする。
   it('types the Ledger invariant violation as the core type and rejects a wrongly shaped violation (CC-015)', () => {
     expectTypeOf<InvariantViolationEvent>().toEqualTypeOf<SafetyInvariantViolationSummary>();
-    expectTypeOf<Parameters<SafetyLedger['recordInvariantViolation']>[0]>().toEqualTypeOf<SafetyInvariantViolationSummary>();
+    // DEF-144: 記録の入力は、結びつく要求を method と URL で受ける（Ledger が Origin と path だけを残す）。
+    expectTypeOf<Parameters<SafetyLedger['recordInvariantViolation']>[0]>().toEqualTypeOf<InvariantViolationInput>();
     expectTypeOf<SafetyLedgerSnapshot['invariantViolations']>().toEqualTypeOf<PageSafetySummary['invariantViolations']>();
     expectTypeOf<SafetyLedgerSnapshot['invariantViolations']>().toEqualTypeOf<RunSafetySummary['invariantViolations']>();
 
@@ -738,7 +754,9 @@ describe('P18b: Safety Ledger types (CC-015, CC-028)', () => {
   // T25b round 1（Task 25 の設計書 4.2）: 監査の段の除外の記録（`blockedAuditExclusions`。省略できる項目で、事象の種類の一覧には
   // 含めない）も、記録の上限の分類の名前に加える。
   it('narrows the names of the Ledger record categories to the Safety event kinds and the invariant violations (CC-028)', () => {
-    expectTypeOf<SafetyLedgerRecordCategory>().toEqualTypeOf<SafetyEventKind | 'blockedAuditExclusions' | 'invariantViolations'>();
+    // BN-a: 閉じる途中に止めた要求の記録（`blockedClosingRequests`。省略できる項目で、事象の種類の一覧には含めない）も加える。
+    expectTypeOf<SafetyLedgerRecordCategory>()
+      .toEqualTypeOf<SafetyEventKind | 'blockedAuditExclusions' | 'blockedClosingRequests' | 'invariantViolations'>();
 
     // @ts-expect-error 書き間違えた分類の名前は、型のエラーになる。
     const misspelled: SafetyLedgerRecordCategory = 'blockedRequest';

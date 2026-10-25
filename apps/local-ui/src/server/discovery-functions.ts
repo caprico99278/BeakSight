@@ -9,6 +9,10 @@
  * - 発見のジョブは進み具合（`PROGRESS`）を送らない（T27d の申し送り 5）。ジョブの画面は、種類と状態だけを示す。
  * - T28e（Task 28 の設計書 4.6）: シナリオを使うプロファイルの、最後の発見の結果の登録（CREATE）・更新（UPDATE）の候補に、シナリオを作れる印
  *   （`scenarioCreatable`）を付ける。画面は、その候補にだけ「シナリオを作る」を出す（作成の確かめは、シナリオの保存の部品が行う）。
+ * - T38f（Task 38 の設計書 3.7）: API の候補（probe の結果が `API_CREATE`・`API_UPDATE` で欄の範囲を持つ行）には、probe の行ごとに「API のシナリオを
+ *   作る」を出す（`apiScenarioRows`。型の digest で行を選んで、作成の画面に渡す）。
+ * - T41e-2（Task 41 の設計書 3.3）: 型から API のシナリオを作れない行（欄として識別できないページが決める鍵を持つ更新の型）には、その理由を添える
+ *   （`apiScenarioShapeRejectionOf`。下書きの確かめと同じ判定）。
  */
 import { createServerFn } from '@tanstack/react-start';
 import type { ConfigErrorKind } from '../../../../src/config/config-error.js';
@@ -21,12 +25,14 @@ import type {
   FormMethod,
   IncompleteReason,
   MethodOverride,
+  SubmissionProbeRecord,
 } from '../../../../src/control/discovery-view.js';
-import { discoverySummaryOf } from '../../../../src/control/discovery-view.js';
-import { SCENARIO_KINDS } from '../../../../src/control/approval-view.js';
+import { discoverySummaryOf, submissionProbeWriteOf } from '../../../../src/control/discovery-view.js';
+import { SCENARIO_KINDS, apiScenarioShapeRejectionOf, type ScenarioDraftRejectionReason } from '../../../../src/control/approval-view.js';
 import { usesDiscovery, usesScenarios } from '../display/labels';
 import type { DiscoveryIndexDrift } from '../../../../src/control/job/discovery-index-store.js';
-import type { AuditJobKind } from '../../../../src/control/job/job-records.js';
+// T44g（Task 44 の設計書 P4-8 の CC-105）: ジョブの種類の値は、IPC の契約の名前つきの定数から読む（画面のサーバに同じ定数を置かない）。
+import { WORKER_DISCOVERY_JOB_KIND } from '../../../../src/control/worker-protocol.js';
 import type { RunStatus } from '../../../../src/core/contracts.js';
 import type { AuditJobStartView, AuditStartCheckView } from './audit-job-functions';
 import { auditStartCheckOf, startRejectionViewOf } from './audit-start-check';
@@ -38,6 +44,7 @@ import {
   isReadCheckTarget,
   readDiscoveryDocuments,
   showsOriginsOf,
+  submissionProbesOfDocument,
   type DiscoveryCandidateDetailView,
   type DiscoveryProfileView,
 } from './discovery-documents';
@@ -71,9 +78,38 @@ export interface DiscoveryCandidateView {
    * シナリオを使う（`usesScenarios`）。ほかの分類には「シナリオを作る」を出さない）。
    */
   readonly scenarioCreatable: boolean;
+  /**
+   * T38f（Task 38 の設計書 3.7）: API のシナリオを作れる probe の行（結果が `API_CREATE`・`API_UPDATE` で、欄の範囲 `inputFields` を持つ行。型の
+   * digest と、型の method・path の型。シナリオを使うプロファイルの、最後の発見の結果の候補だけ。作成の確かめは、シナリオの保存の部品が行う）。
+   */
+  readonly apiScenarioRows: readonly DiscoveryApiScenarioRowView[];
   /** 詳しい内容（候補を最後に見た発見のジョブの `discovery.json` を読めなければ null）。 */
   readonly detail: DiscoveryCandidateDetailView | null;
 }
+
+/** T38f: API のシナリオを作れる probe の行 1 つ。 */
+export interface DiscoveryApiScenarioRowView {
+  readonly shapeDigest: string;
+  readonly method: string;
+  readonly pathShape: string;
+  /**
+   * T41e-2（Task 41 の設計書 3.3）: その型から API のシナリオを作れない理由（下書きの確かめと同じ判定 `apiScenarioShapeRejectionOf`。作れるなら null）。
+   * 理由があれば、画面は作成の画面へのリンクの代わりに理由を出す。
+   */
+  readonly rejection: ScenarioDraftRejectionReason | null;
+}
+
+/**
+ * T38f: API のシナリオを作れる probe の行（型の digest の重なりなし。行の順）。T38R-fix の M-2: 書き込みの probe の結果は、契約の 1 か所
+ * （`submissionProbeWriteOf`）。作成の確かめは下書きの確かめ。
+ */
+const apiScenarioRowsOf = (probes: readonly SubmissionProbeRecord[]): readonly DiscoveryApiScenarioRowView[] => {
+  const rows = probes.flatMap((probe) => (submissionProbeWriteOf(probe.result) !== null && probe.inputFields !== undefined && probe.shapeDigest !== null
+    && probe.shape !== null
+    ? [{ shapeDigest: probe.shapeDigest, method: probe.shape.method, pathShape: probe.shape.pathShape, rejection: apiScenarioShapeRejectionOf(probe) }]
+    : []));
+  return rows.filter((row, index) => rows.findIndex(({ shapeDigest }) => shapeDigest === row.shapeDigest) === index);
+};
 
 /** 読まなかった理由ごとの数。 */
 export interface DiscoveryUnreadCountView {
@@ -123,8 +159,6 @@ export interface DiscoveryPageView {
   readonly candidates: readonly DiscoveryCandidateView[];
 }
 
-/** 発見のジョブの種類。 */
-const DISCOVERY_JOB_KIND = 'DISCOVERY' satisfies AuditJobKind;
 
 /** 最後の発見のジョブの結果の要点を作る。 */
 const resultViewOf = (document: DiscoveryDocument): DiscoveryResultView => {
@@ -179,13 +213,14 @@ export const discoveryPageFn = createServerFn({ method: 'GET' })
       return null;
     }
     const { stored } = reading;
-    const check = auditStartCheckOf({ ...reading.checkInput, jobKind: DISCOVERY_JOB_KIND });
+    const check = auditStartCheckOf({ ...reading.checkInput, jobKind: WORKER_DISCOVERY_JOB_KIND });
     const documents = await readDiscoveryDocuments(stored.profile.profileId);
     const { index, latest } = documents;
     const scenarioProfile = usesScenarios(stored.profile.mode, stored.profile.auth);
     const candidates: DiscoveryCandidateView[] = [];
     for (const entry of index.candidates) {
-      const candidate = candidateOfDocument(await documents.documentOf(entry.lastSeenJobId), entry.identityDigest);
+      const lastSeen = await documents.documentOf(entry.lastSeenJobId);
+      const candidate = candidateOfDocument(lastSeen, entry.identityDigest);
       const inLatest = entry.lastSeenJobId === index.latestJobId && candidateOfDocument(latest, entry.identityDigest) !== null;
       candidates.push({
         identityDigest: entry.identityDigest,
@@ -202,7 +237,10 @@ export const discoveryPageFn = createServerFn({ method: 'GET' })
         lastSeenJobId: entry.lastSeenJobId,
         readCheckable: inLatest && isReadCheckTarget(entry),
         scenarioCreatable: scenarioProfile && inLatest && SCENARIO_KINDS.some((kind) => kind === entry.classification),
-        detail: candidate === null ? null : candidateDetailViewOf(candidate),
+        // T38f: API のシナリオは、最後の発見の結果の probe の行ごとに作れる。
+        apiScenarioRows: scenarioProfile && inLatest ? apiScenarioRowsOf(submissionProbesOfDocument(latest, entry.identityDigest)) : [],
+        // T37c: 同じ識別の digest の行の、送らずに観察する probe の結果（型ごと）も添える。
+        detail: candidate === null ? null : candidateDetailViewOf(candidate, submissionProbesOfDocument(lastSeen, entry.identityDigest)),
       });
     }
     return {

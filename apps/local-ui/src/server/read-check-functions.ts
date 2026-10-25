@@ -11,10 +11,14 @@
  * - 結果: 最近の結果（`readRecentReadCheckResults`）を、ジョブごとにまとめ、そのジョブの `read-evidence.json`（スキーマとジョブの ID を確かめる）から、
  *   詳しい理由と、期待ごとの結果の要約（件数と照らした項目と取れた値だけ）を足す。READ のジョブは進み具合を送らない（T27d の申し送り 5）。
  * - 送る値（テスト環境のテスト用の値）は、設計どおり、この画面に出す（設計書 4.5）。資格情報・Cookie・トークンの口はない。
+ * - T37d（Task 37 の設計書 3.5）: 画面の path を読む定義。選べる画面の path は、直近の発見のジョブの結果の読めた画面（開始の URL と同じ Origin）から
+ *   返す（読めなければ空。画面は入力の欄だけ）。保存の検証には、開始の URL・許可 Origin・認証の設定の除外の文脈（`read-check-page-context.ts` の `readCheckPageContextOf`）を渡す。結果には、
+ *   成果物の対象の種類と画面の path を足す。
  */
 import { randomUUID } from 'node:crypto';
 import { createServerFn } from '@tanstack/react-start';
 import type { ConfigErrorKind } from '../../../../src/config/config-error.js';
+import { RECORD_ID_PLACEHOLDER } from '../../../../src/control/approval-view.js';
 import {
   MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
   MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
@@ -22,7 +26,11 @@ import {
   MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
   MAX_READ_CHECK_PARAMETER_VALUE_LENGTH,
   MAX_READ_CHECK_ROW_COUNT,
+  MAX_READ_CHECK_PAGE_PATH_LENGTH,
   READ_CHECK_EXPECTATION_KINDS,
+  READ_CHECK_TARGET_KINDS,
+  readCheckTargetKindOf,
+  type ReadCheckTargetKind,
   type CandidateFieldTag,
   type CandidateFieldType,
   type DiscoveryCandidate,
@@ -38,6 +46,8 @@ import {
   type ReadExpectationUndeterminedReason,
   type ReadRowSource,
 } from '../../../../src/control/discovery-view.js';
+// PRE42-CC 組 3（N4-8b）: 終わったジョブの状態は、owner の `job-records.ts` の名前つきの定数から読む。
+import { FINISHED_AUDIT_JOB_STATE } from '../../../../src/control/job/job-records.js';
 import {
   cancelReadCheck,
   createReadCheck,
@@ -48,12 +58,13 @@ import {
   type ReadCheckResultView,
   type ReadCheckStoreResult,
 } from '../../../../src/control/job/read-check-store.js';
-import type { AuditJobKind } from '../../../../src/control/job/job-records.js';
+// T44g（Task 44 の設計書 P4-8 の CC-105）: ジョブの種類の値は、IPC の契約の名前つきの定数から読む（画面のサーバに同じ定数を置かない）。
+import { WORKER_READ_CHECK_JOB_KIND } from '../../../../src/control/worker-protocol.js';
 import { validateReadCheckDefinition, type ReadCheckDefinitionRejectionReason } from '../../../../src/control/read-check-policy.js';
 import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { READ_EVIDENCE_ARTIFACT_FILE_NAME } from '../../../../src/core/artifact-layout.js';
 import { isRecord } from '../../../../src/core/guards.js';
-import { formatCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
+import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
 import { usesReadCheck } from '../display/labels';
 import { artifactRoutePath } from '../security/artifact-route';
 import type { AuditJobStartView, AuditStartCheckView } from './audit-job-functions';
@@ -72,8 +83,9 @@ import {
   type DiscoveryProfileView,
 } from './discovery-documents';
 import { requestOf } from './request-validation';
+import { readCheckPageContextOf, readCheckPagePathsOf } from './read-check-page-context';
 import { readProfileStart } from './start-check-inputs';
-import { isoTimestampOf } from './timestamps';
+import { isoTimestampOf, nowCompactTimestamp } from './timestamps';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 画面に返す値
@@ -113,8 +125,11 @@ export interface ReadCheckDefinitionView {
   /** 日時は ISO 8601。 */
   readonly createdAt: string;
   readonly updatedAt: string;
-  /** 対象の候補（最後の発見のジョブの結果になければ null）。 */
+  /** 対象の候補（最後の発見のジョブの結果になければ null。画面の path の定義は null）。 */
   readonly candidate: ReadCheckCandidateView | null;
+  /** T37d: 対象の種類（候補を読む・画面を読む）と、画面の path（画面のときだけ）。 */
+  readonly targetKind: ReadCheckTargetKind;
+  readonly targetPagePath: string | null;
 }
 
 /** 期待 1 件の結果の要約（照らした項目と取れた値だけ）。 */
@@ -137,6 +152,9 @@ export interface ReadCheckResultItemView {
   readonly recordedAt: string;
   /** 詳しい理由（`read-evidence.json` を読めなければ null）。 */
   readonly detail: ReadCheckDetail | null;
+  /** T37d: 対象の種類と画面の path（`read-evidence.json` から。読めなければ null）。 */
+  readonly targetKind: ReadCheckTargetKind | null;
+  readonly targetPagePath: string | null;
   readonly httpStatus: number | null;
   readonly expectations: readonly ReadExpectationResultView[];
 }
@@ -169,6 +187,11 @@ export interface ReadCheckFormView {
   readonly maxExpectedTextLength: number;
   readonly maxDetailFieldLength: number;
   readonly maxDefinitions: number;
+  /** T37d: 定義の対象の種類（表示の順）と、画面の path の最大長。 */
+  readonly targetKinds: readonly ReadCheckTargetKind[];
+  readonly maxPagePathLength: number;
+  /** T38f: 画面の path の型のレコードの ID の区切りの印（契約の値。`{id}` つきの型の案内に使う）。 */
+  readonly pageTemplatePlaceholder: string;
 }
 
 /** READ の確かめの画面の値。 */
@@ -184,6 +207,11 @@ export interface ReadCheckPageView {
   readonly showOrigins: boolean;
   readonly latestDiscoveryJobId: string | null;
   readonly candidates: readonly ReadCheckCandidateView[];
+  /**
+   * T37d: 画面を読む定義で選べる画面の path（直近の発見のジョブの結果の、読めた画面のうち、開始の URL と同じ Origin のもの。文書の順で重なりなし。
+   * 読めなければ空。画面は入力の欄だけを出す）。
+   */
+  readonly pagePaths: readonly string[];
   readonly definitions: readonly ReadCheckDefinitionView[];
   readonly results: readonly ReadCheckJobResultsView[];
   readonly form: ReadCheckFormView;
@@ -203,11 +231,8 @@ export type ReadCheckSaveView =
 /** 定義の削除の結果。 */
 export type ReadCheckCancelView = { readonly ok: true } | { readonly ok: false; readonly reason: ReadCheckDefinitionRejectionReason };
 
-/** READ の確かめのジョブの種類。 */
-const READ_CHECK_JOB_KIND = 'READ_CHECK' satisfies AuditJobKind;
 
-/** 定義を作り・変えてよいプロファイルの状態。 */
-const ACTIVE_PROFILE_STATUS = 'ACTIVE';
+// 定義を作り・変えてよいプロファイルの状態（`ACTIVE_PROFILE_STATUS`）は、owner の `profile-records.ts` から読む（FM2R の Minor 13）。
 
 const FORM_VIEW: ReadCheckFormView = Object.freeze({
   expectationKinds: READ_CHECK_EXPECTATION_KINDS,
@@ -217,7 +242,12 @@ const FORM_VIEW: ReadCheckFormView = Object.freeze({
   maxExpectedTextLength: MAX_READ_CHECK_EXPECTED_TEXT_LENGTH,
   maxDetailFieldLength: MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
   maxDefinitions: MAX_READ_CHECK_DEFINITIONS_PER_PROFILE,
+  targetKinds: READ_CHECK_TARGET_KINDS,
+  maxPagePathLength: MAX_READ_CHECK_PAGE_PATH_LENGTH,
+  pageTemplatePlaceholder: RECORD_ID_PLACEHOLDER,
 });
+
+// T37d: 画面の path の定義を確かめる文脈と、選べる画面の path は、`read-check-page-context.ts`（FM2b でシナリオの下書きの自動の作成と共用するために移した）。
 
 /** READ の確かめに使える候補を、画面に返す値にする（値を送れる欄だけ。同じ名前の欄は最初の 1 つ）。 */
 const readCheckCandidateViewOf = (candidate: DiscoveryCandidate): ReadCheckCandidateView => {
@@ -253,6 +283,37 @@ const expectationViewOf = (evidence: ReadExpectationEvidence): ReadExpectationRe
   observedValue: 'observedValue' in evidence ? evidence.observedValue : null,
 });
 
+/** T44e（Task 44 の設計書 P2-5）: 結果の記録が 1 件もない READ の確かめのジョブを、結果の一覧に足す数の上限（新しい順）。 */
+const MAX_UNRECORDED_READ_CHECK_JOBS = 5;
+
+/**
+ * T44e（Task 44 の設計書 P2-5）: 最初の定義の前に止まった（結果の記録が 1 件もない）、終わった READ の確かめのジョブ（新しい順。上限
+ * `MAX_UNRECORDED_READ_CHECK_JOBS`）。`read-evidence.json` を読めたものだけを、止まった理由と確かめなかった定義つきで並べる。
+ */
+const unrecordedJobsViewOf = async (profileId: string, recordedJobIds: ReadonlySet<string>): Promise<readonly ReadCheckJobResultsView[]> => {
+  const jobs = localUiAuditJobs().listAuditJobs()
+    .filter((job) => job.profileId === profileId && job.jobKind === WORKER_READ_CHECK_JOB_KIND && job.state === FINISHED_AUDIT_JOB_STATE && !recordedJobIds.has(job.jobId))
+    .slice(0, MAX_UNRECORDED_READ_CHECK_JOBS);
+  const views: ReadCheckJobResultsView[] = [];
+  for (const job of jobs) {
+    const evidence: ReadEvidenceDocument | null = await readEvidenceDocumentOfJob(job.jobId);
+    if (evidence === null) {
+      continue;
+    }
+    views.push({
+      jobId: job.jobId,
+      recordedAt: isoTimestampOf(job.finishedAt ?? job.createdAt),
+      evidenceHref: artifactRoutePath(job.jobId, READ_EVIDENCE_ARTIFACT_FILE_NAME),
+      endReason: evidence.endReason,
+      results: [],
+      notExecuted: evidence.checks.flatMap((check) => (check.state === 'NOT_EXECUTED'
+        ? [{ readCheckId: check.readCheckId, readCheckRevision: check.readCheckRevision, reason: check.reason }]
+        : [])),
+    });
+  }
+  return views;
+};
+
 /** 最近の結果を、ジョブごとにまとめ（新しい順）、`read-evidence.json` の詳しい理由を足す。 */
 const resultsViewOf = async (results: readonly ReadCheckResultView[]): Promise<readonly ReadCheckJobResultsView[]> => {
   const byJob = new Map<string, ReadCheckResultView[]>();
@@ -279,6 +340,8 @@ const resultsViewOf = async (results: readonly ReadCheckResultView[]): Promise<r
           result: result.result,
           recordedAt: isoTimestampOf(result.recordedAt),
           detail: check?.detail ?? null,
+          targetKind: check?.targetKind ?? null,
+          targetPagePath: check?.targetPagePath ?? null,
           httpStatus: check?.httpStatus ?? null,
           expectations: check === null ? [] : check.expectations.map(expectationViewOf),
         };
@@ -289,6 +352,13 @@ const resultsViewOf = async (results: readonly ReadCheckResultView[]): Promise<r
     });
   }
   return views;
+};
+
+/** T44e: 記録のある結果と、記録のないジョブを、記録した日時の新しい順に並べる。 */
+const allResultsViewOf = async (profileId: string, results: readonly ReadCheckResultView[]): Promise<readonly ReadCheckJobResultsView[]> => {
+  const recorded = await resultsViewOf(results);
+  const unrecorded = await unrecordedJobsViewOf(profileId, new Set(results.map(({ jobId }) => jobId)));
+  return [...recorded, ...unrecorded].sort((left, right) => right.recordedAt.localeCompare(left.recordedAt));
 };
 
 /** 保存の拒否（理由のコードと、項目ごとの誤り）。 */
@@ -312,7 +382,10 @@ const checkedDefinitionOf = async (
   definition: unknown,
 ): Promise<{ readonly ok: true; readonly definition: ReadCheckDefinition } | Extract<ReadCheckSaveView, { ok: false }>> => {
   const { latest } = await readDiscoveryDocuments(profileId);
-  const validation = validateReadCheckDefinition(definition, candidateOfDocument(latest, targetDigestOf(definition)));
+  // T37d: 画面の path の定義は、開始の URL・許可 Origin・認証の設定の除外に照らす（候補は見ない）。
+  const reading = await readProfileStart(profileId);
+  const page = reading === null ? null : readCheckPageContextOf(reading);
+  const validation = validateReadCheckDefinition(definition, candidateOfDocument(latest, targetDigestOf(definition)), page);
   if (validation.ok) {
     return { ok: true, definition: validation.definition };
   }
@@ -324,8 +397,8 @@ const checkedDefinitionOf = async (
   };
 };
 
-/** 今の時刻（管理データの UTC の 14 桁）。 */
-const nowStamp = (label: string): string => formatCompactUtcTimestamp(new Date(), label);
+/** 今の時刻（管理データの UTC の 14 桁。owner は `timestamps.ts`）。 */
+const nowStamp = nowCompactTimestamp;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 入力（形は `requestOf` でスキーマを使って確かめる）
@@ -368,7 +441,7 @@ export const readCheckPageFn = createServerFn({ method: 'GET' })
     const { profileId } = stored.profile;
     const database = localUiStore();
     const definitions = listReadChecks(database, profileId);
-    const check = auditStartCheckOf({ ...reading.checkInput, jobKind: READ_CHECK_JOB_KIND, readCheckDefinitionCount: definitions.length });
+    const check = auditStartCheckOf({ ...reading.checkInput, jobKind: WORKER_READ_CHECK_JOB_KIND, readCheckDefinitionCount: definitions.length });
     const { index, latest } = await readDiscoveryDocuments(profileId);
     const eligible = usesReadCheck(stored.profile.mode, stored.profile.auth);
     return {
@@ -380,8 +453,10 @@ export const readCheckPageFn = createServerFn({ method: 'GET' })
       showOrigins: showsOriginsOf(stored),
       latestDiscoveryJobId: index.latestJobId,
       candidates: mergedCandidatesOf(latest).filter(isReadCheckTarget).map(readCheckCandidateViewOf),
+      pagePaths: readCheckPagePathsOf(latest, reading),
       definitions: definitions.map((view) => {
-        const candidate = candidateOfDocument(latest, view.definition.targetIdentityDigest);
+        const { targetIdentityDigest, targetPagePath } = view.definition;
+        const candidate = targetIdentityDigest === undefined ? null : candidateOfDocument(latest, targetIdentityDigest);
         return {
           readCheckId: view.readCheckId,
           revision: view.revision,
@@ -389,9 +464,11 @@ export const readCheckPageFn = createServerFn({ method: 'GET' })
           createdAt: isoTimestampOf(view.createdAt),
           updatedAt: isoTimestampOf(view.updatedAt),
           candidate: candidate === null || !isReadCheckTarget(candidate) ? null : readCheckCandidateViewOf(candidate),
+          targetKind: readCheckTargetKindOf(view.definition),
+          targetPagePath: targetPagePath ?? null,
         };
       }),
-      results: await resultsViewOf(readRecentReadCheckResults(database, profileId)),
+      results: await allResultsViewOf(profileId, readRecentReadCheckResults(database, profileId)),
       form: FORM_VIEW,
     };
   });

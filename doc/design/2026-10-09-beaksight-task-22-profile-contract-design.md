@@ -69,7 +69,7 @@ export interface SiteProfile {
 1. `validateSiteProfile(input: unknown, context: ProfileValidationContext): ProfileValidationResult`
    - 戻り値は `{ ok: true, profile }` か `{ ok: false, errors: readonly ProfileValidationError[] }`。`errors` は閉じた一覧のコード（4.4）と、英語の技術的な詳細の組。
    - `context` は、参照するターゲット JSON を読み込んだ結果（`AuditConfig`。既存の `loadConfig` の結果）を、呼び出し側が渡す。`profile-policy.ts` はファイルを読まない（入出力を持たない判定の部品にする）。
-2. `resolveLegacyTargetProfile(config: AuditConfig, targetConfigPath: string): SiteProfile`
+2. `resolveLegacyTargetProfile(config: AuditConfig, targetConfigPath: string): SiteProfile`（2026-10-24 LG-3 で消した。製品で呼ぶ所がなかった。テストの組の設計書 3.7.2）
    - プロファイルのない旧ターゲット JSON を、`environment: 'PUBLIC'`、`mode: 'PUBLIC_PASSIVE'`、`auth: 'NONE'`、`approvedTestOrigins: []`、`environmentEvidenceRef: null`、`revision: 1`、`profileId` は `target.id` から 4.3 の規則で作った値、として解決する（I01）。権限を増やす入力を受けない。
 3. `assertProfileRevisionAdvance(previous: SiteProfile | null, next: ValidatedSiteProfile): ProfileValidationResult`
    - `next` は `validateSiteProfile` が受けた値だけ（型の印 `ValidatedSiteProfile` と、`profile-policy.ts` の中の実行時の印）。印のない値（写し、型を変換した値、Proxy）は `PROFILE_SCHEMA_INVALID`。保存から読んだ値は、もう一度 `validateSiteProfile` を通してから渡す（Task 23）。

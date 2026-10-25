@@ -23,8 +23,10 @@ import {
   activateInteractionFreeze,
   closePassiveGuardedContext,
   closePassiveGuardedPage,
+  externalSchemeNavigationViolationMessage,
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
+  MAX_GUARD_PAGE_LISTENER_GROUPS,
   WORKER_CONNECT_POLICY,
   workerConnectPolicyViolationUrl,
   type GuardResourceDelivery,
@@ -38,8 +40,9 @@ import {
   DIAGNOSTIC_REASON_PATTERN,
   parseCanceledEvidenceMessage,
 } from '../helpers/canceled-evidence-diagnostic.js';
-import { launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium, useHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { fakeFrame, fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS, NO_NON_READ_REQUESTS, openServerWindow } from '../helpers/gate-harness.js';
 import { adaptFakePage } from '../helpers/interaction-candidate-reads.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
@@ -53,10 +56,16 @@ import {
   type GuardHarness,
 } from '../helpers/passive-guard-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
 
 /** Chromium がナビゲーションの失敗の後に表示するエラーのページの URL。 */
 const CHROMIUM_ERROR_PAGE_URL = 'chrome-error://chromewebdata/';
+/**
+ * DEF-145（設計書 `2026-10-21-beaksight-probe-navigation-and-dialog-design.md` 2.1）: `HTTP_MAIN_FRAME_DELIVERY_FAILED` の違反は、失敗した main frame の要求の
+ * method と path（と Origin）を持つ。
+ */
+const FAILED_MAIN_FRAME_REQUEST = expect.objectContaining({ method: expect.any(String), path: expect.any(String) });
 /** Playwright の Context の close の事象の名前（DEF-110: Guard は、ほかの何より先にこれを聞き始める）。 */
 const CONTEXT_CLOSE_EVENT = 'close';
 const servers: FixtureServer[] = [];
@@ -176,14 +185,10 @@ function emitFailedMainFrameRequest(
   page: Page,
   facts: { readonly method: string; readonly url: string; readonly errorText: string },
 ): void {
-  const frame = { parentFrame: () => null, page: () => page };
-  harness.requestFailedHandler?.({
-    method: () => facts.method,
-    url: () => facts.url,
-    isNavigationRequest: () => true,
-    frame: () => frame,
-    failure: () => ({ errorText: facts.errorText }),
-  } as unknown as Request);
+  // CC-094: 偽の要求は共通の補助で作る（DEF-120: 本物と同じく要求の種類を持つ。main frame のナビゲーションは `document`）。
+  harness.requestFailedHandler?.(fakePlaywrightRequest({
+    method: facts.method, url: facts.url, navigation: true, frame: fakeFrame(page), failureText: facts.errorText,
+  }));
 }
 
 async function flushGuardProtocolCallbacks(): Promise<void> {
@@ -204,13 +209,8 @@ function createHarnessRoute(
   },
 ): { readonly route: Route; readonly abortCalls: () => number } {
   let abortCalls = 0;
-  const frame = { parentFrame: () => null, page: () => page };
-  const request = {
-    method: () => facts.method,
-    url: () => facts.url,
-    isNavigationRequest: () => facts.navigation,
-    frame: () => frame,
-  } as unknown as Request;
+  // CC-094: 偽の要求は共通の補助で作る（DEF-120: 種類は、ナビゲーションは `document`、ほかは `other`）。
+  const request = fakePlaywrightRequest({ method: facts.method, url: facts.url, navigation: facts.navigation, frame: fakeFrame(page) });
   return {
     route: {
       request: () => request,
@@ -481,12 +481,7 @@ describe('installPassiveRequestGuard installation', () => {
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
     const route = {
-      request: () => ({
-        method: () => 'GET',
-        url: () => 'https://example.test/failed-frozen-abort',
-        isNavigationRequest: () => true,
-        frame: () => ({ parentFrame: () => null, page: () => page }),
-      } as unknown as Request),
+      request: () => fakePlaywrightRequest({ method: 'GET', url: 'https://example.test/failed-frozen-abort', navigation: true, frame: fakeFrame(page) }),
       abort: async (): Promise<never> => { throw new Error('frozen abort failed'); },
     } as unknown as Route;
 
@@ -724,13 +719,9 @@ describe('installPassiveRequestGuard installation', () => {
     const page = await readyHarnessPage(harness);
     Object.defineProperty(page, 'url', { value: () => 'https://example.test/fixture' });
     await activateInteractionFreeze(page);
-    const failure = {
-      method: () => 'GET',
-      url: () => 'https://example.test/failed-owner',
-      isNavigationRequest: () => true,
-      frame: () => ({ parentFrame: () => null, page: () => page }),
-      failure: () => ({ errorText: 'net::ERR_FAILED' }),
-    } as unknown as Request;
+    const failure = fakePlaywrightRequest({
+      method: 'GET', url: 'https://example.test/failed-owner', navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_FAILED',
+    });
 
     harness.requestFailedHandler?.(failure);
     harness.requestFailedHandler?.(failure);
@@ -763,13 +754,9 @@ describe('installPassiveRequestGuard installation', () => {
         if (page === undefined || handler === undefined) {
           throw new Error('re-entrant requestfailed handler was unavailable');
         }
-        const request = {
-          method: () => 'GET',
-          url: () => 'https://example.test/reentrant-requestfailed',
-          isNavigationRequest: () => true,
-          frame: () => ({ parentFrame: () => null, page: () => page }),
-          failure: () => ({ errorText: 'net::ERR_FAILED' }),
-        } as unknown as Request;
+        const request = fakePlaywrightRequest({
+          method: 'GET', url: 'https://example.test/reentrant-requestfailed', navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_FAILED',
+        });
         listenerReturn = handler(request);
       },
     });
@@ -963,6 +950,47 @@ describe('installPassiveRequestGuard installation', () => {
     expect(() => assertPassiveRequestGuardActive(harness.context)).toThrow(/invalidated/i);
   });
 
+  // EL-F2（EL-R2 の N3）: 凍結の後のポップアップの外部スキームの検出の listener の組は、page の組と同じ上限（`MAX_GUARD_PAGE_LISTENER_GROUPS`）で数え、超えたら
+  // page の組と同じく `GUARD_LISTENER_GROUP_LIMIT_REACHED` で閉じる（fail-closed）。ポップアップが閉じたら組を外す（閉じた分は数えない）。
+  it('counts the frozen popup watches against the page listener group limit, and releases a watch when its popup closes', async () => {
+    const harness = createGuardHarness();
+    const ledger = new SafetyLedger();
+    const handlers = new Map<string, (...arguments_: unknown[]) => void>();
+    await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
+    const page = createHarnessPage(harness, { url: 'https://example.test/fixture', onEvent: (event, handler) => handlers.set(event, handler) });
+    await awaitPassiveRequestGuardReady(page);
+    await activateInteractionFreeze(page);
+    const popupCloseHandlers: (() => void)[] = [];
+    const openPopup = (index: number): void => {
+      handlers.get('popup')?.({
+        url: () => `https://example.test/popup-${String(index)}`,
+        isClosed: () => false,
+        on: (event: string, handler: () => void) => {
+          if (event === 'close') popupCloseHandlers.push(handler);
+        },
+        off: () => undefined,
+        close: async () => undefined,
+      } as unknown as Page);
+    };
+    const limitViolations = (): number =>
+      ledger.snapshot().invariantViolations.filter(({ code }) => code === 'GUARD_LISTENER_GROUP_LIMIT_REACHED').length;
+
+    // 開いた頁の組が 1 つあるので、ポップアップは上限より 1 つ少ない数まで付く。
+    for (let index = 0; index < MAX_GUARD_PAGE_LISTENER_GROUPS - 1; index += 1) openPopup(index);
+    await wait(20);
+    expect(limitViolations()).toBe(0);
+    // 1 つ閉じると、その組を外すので、もう 1 つ付く。
+    popupCloseHandlers[0]?.();
+    openPopup(MAX_GUARD_PAGE_LISTENER_GROUPS);
+    await wait(20);
+    expect(limitViolations()).toBe(0);
+    expect(isPassiveRequestGuardClosed(harness.context)).toBe(false);
+    // 上限を超えると、page の組と同じ扱い（違反を 1 回記録し、Context を閉じる）。
+    openPopup(MAX_GUARD_PAGE_LISTENER_GROUPS + 1);
+    await expect.poll(limitViolations).toBe(1);
+    await expect.poll(() => isPassiveRequestGuardClosed(harness.context)).toBe(true);
+  });
+
   it('records popup download frame and WebSocket activity while frozen owner close is pending', async () => {
     const closeGate = createDeferred<void>();
     const harness = createGuardHarness({ contextCloseGate: closeGate.promise });
@@ -998,7 +1026,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(snapshot.blockedInteractionWebSockets).toHaveLength(1);
   });
 
-  it('installs the connect policy and the Service Worker registration block init scripts, then WebSocket and HTTP interception before resolving', async () => {
+  it('installs the connect policy, the Service Worker registration block and the WebRTC block init scripts, then WebSocket and HTTP interception before resolving', async () => {
     const harness = createGuardHarness();
     // T32k: Guard が Context に付ける listener の一覧（付ける順）は、Guard のコードから導く（数と名前をここに書き写さない）。
     const listenerEvents = await guardContextListenerEvents();
@@ -1008,6 +1036,7 @@ describe('installPassiveRequestGuard installation', () => {
 
     // DEF-040: 初期化のスクリプト（meta の CSP）は、ページの事象を受け始める前（ページを作る前）に付ける。
     // DEF-049: Service Worker の登録の入口を塞ぐ初期化のスクリプトも、同じく、ページを作る前に付ける。
+    // DEF-124: WebRTC の入口を塞ぐ初期化のスクリプトも、同じく、ページを作る前に付ける。
     // DEF-110 fix: Context の close の事象は、ほかの何より先に聞き始める（close の reject の後に、Context がもう存在しないことの証し）。
     expect(firstListenerEvent).toBe(CONTEXT_CLOSE_EVENT);
     expect(laterListenerEvents.length).toBeGreaterThan(0);
@@ -1015,6 +1044,7 @@ describe('installPassiveRequestGuard installation', () => {
       `ON:${firstListenerEvent}`,
       'INIT_SCRIPT:WORKER_CONNECT_POLICY',
       'INIT_SCRIPT:SERVICE_WORKER_REGISTRATION_BLOCK',
+      'INIT_SCRIPT:WEBRTC_BLOCK',
       ...laterListenerEvents.map((event) => `ON:${event}`),
       'WEBSOCKET',
       'HTTP',
@@ -2139,10 +2169,9 @@ describe('installPassiveRequestGuard installation', () => {
       const ledger = new SafetyLedger();
       await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       await readyHarnessPage(harness);
-      void harness.requestFailedHandler?.({
-        isNavigationRequest: () => true,
+      void harness.requestFailedHandler?.(fakePlaywrightRequest({ navigation: true }, {
         frame: () => { throw new Error('frame unavailable'); },
-      } as unknown as Request);
+      }));
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(unhandled).toEqual([]);
@@ -2311,14 +2340,9 @@ describe('installPassiveRequestGuard installation', () => {
       const ledger = new SafetyLedger();
       await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
-      const frame = { parentFrame: () => null, page: () => page };
-      harness.requestFailedHandler?.({
-        method: () => 'GET',
-        url: () => 'https://example.test/catalog',
-        isNavigationRequest: () => true,
-        frame: () => frame,
-        failure: () => ({ errorText: 'net::ERR_FAILED' }),
-      } as unknown as Request);
+      harness.requestFailedHandler?.(fakePlaywrightRequest({
+        method: 'GET', url: 'https://example.test/catalog', navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_FAILED',
+      }));
       await expect.poll(() => harness.closeCount).toBe(1);
 
       if (phase === 'complete') {
@@ -2346,7 +2370,7 @@ describe('installPassiveRequestGuard installation', () => {
       expect(harness.closeCount).toBe(1);
       expect(ledger.snapshot().blockedNavigations).toEqual([]);
       expect(ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
         message: 'net::ERR_FAILED',
       }]);
       closeGate?.resolve();
@@ -2381,7 +2405,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(ledger.snapshot().invariantViolations).toEqual([
       { code: 'GUARDED_CONTEXT_CLOSE_FAILED', message: 'context close failed' },
       { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: 'Fetch.failRequest failed' },
-      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
     ]);
   });
 
@@ -2409,7 +2433,7 @@ describe('installPassiveRequestGuard installation', () => {
     });
     await flushGuardProtocolCallbacks();
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_BLOCKED_BY_CLIENT',
     }]);
     expect(harness.closeCount).toBe(1);
@@ -2428,8 +2452,8 @@ describe('installPassiveRequestGuard installation', () => {
     });
     await flushGuardProtocolCallbacks();
     expect(ledger.snapshot().invariantViolations).toEqual([
-      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
-      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
+      { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
     ]);
     expect(harness.closeCount).toBe(1);
     expect(ledger.snapshot().blockedNavigations).toEqual([]);
@@ -2506,7 +2530,7 @@ describe('installPassiveRequestGuard installation', () => {
       await vi.advanceTimersByTimeAsync(0);
 
       await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+        code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
         message: 'net::ERR_BLOCKED_BY_CLIENT',
       }]);
       expect(harness.closeCount).toBe(1);
@@ -2522,11 +2546,7 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let abortCount = 0;
-    const request = {
-      method: () => 'GET',
-      url: () => 'https://cdn.test/asset.js',
-      isNavigationRequest: () => false,
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({ method: 'GET', url: 'https://cdn.test/asset.js', navigation: false });
     const route = {
       request: () => request,
       async fallback(): Promise<void> {
@@ -2597,21 +2617,17 @@ describe('installPassiveRequestGuard installation', () => {
       method: 'GET',
       url: 'https://external.test/catalog',
       reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION',
+      phase: 'LOAD',
     }]);
-    const frame = { parentFrame: () => null, page: () => page };
-    const failedAllowedRequest = {
-      method: () => 'GET',
-      url: () => 'https://example.test/catalog',
-      isNavigationRequest: () => true,
-      frame: () => frame,
-      failure: () => ({ errorText: 'net::ERR_FAILED' }),
-    } as unknown as Request;
+    const failedAllowedRequest = fakePlaywrightRequest({
+      method: 'GET', url: 'https://example.test/catalog', navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_FAILED',
+    });
 
     harness.requestFailedHandler?.(failedAllowedRequest);
 
     await expect.poll(() => harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_FAILED',
     }]);
   });
@@ -2637,7 +2653,7 @@ describe('installPassiveRequestGuard installation', () => {
     });
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_FAILED',
     }]);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2664,7 +2680,7 @@ describe('installPassiveRequestGuard installation', () => {
     emitFailedMainFrameRequest(harness, page, { method: 'GET', url: 'https://example.test/unlisted', errorText });
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: errorText,
     }]);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2683,7 +2699,7 @@ describe('installPassiveRequestGuard installation', () => {
     });
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_CONNECTION_REFUSED',
     }]);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2706,7 +2722,7 @@ describe('installPassiveRequestGuard installation', () => {
     emitFailedMainFrameRequest(harness, page, { method, url: 'https://example.test/network-layer', errorText });
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: errorText,
     }]);
     await expect.poll(() => harness.closeCount).toBe(1);
@@ -2796,10 +2812,9 @@ describe('installPassiveRequestGuard installation', () => {
         url: () => 'data:text/plain,pending', suggestedFilename: () => 'pending.txt',
         cancel: () => cancelGate.promise,
       } as unknown as Download);
-      void harness.requestFailedHandler?.({
-        isNavigationRequest: () => true,
+      void harness.requestFailedHandler?.(fakePlaywrightRequest({ navigation: true }, {
         frame: () => { throw new Error('round 5 frame unavailable'); },
-      } as unknown as Request);
+      }));
       const publicOutcome = closePassiveGuardedContext(harness.context).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(1_001);
       const timeout = await publicOutcome;
@@ -2825,13 +2840,11 @@ describe('installPassiveRequestGuard installation', () => {
     let listenerReturn: Promise<unknown> | unknown;
     harness = createGuardHarness({
       onContextClose: () => {
-        listenerReturn = harness.requestFailedHandler?.({
-          isNavigationRequest: () => true,
-          frame: () => ({ parentFrame: () => null, page: () => page }),
-          method: () => 'GET',
-          url: () => 'https://example.test/during-close',
+        listenerReturn = harness.requestFailedHandler?.(fakePlaywrightRequest({
+          method: 'GET', url: 'https://example.test/during-close', navigation: true, frame: fakeFrame(page),
+        }, {
           failure: (): never => { throw new Error('requestfailed classification failed during close'); },
-        } as unknown as Request);
+        }));
         void Promise.resolve(listenerReturn).catch(() => undefined);
       },
     });
@@ -2856,13 +2869,9 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
-    const request = {
-      isNavigationRequest: () => false,
-      frame: () => ({ parentFrame: () => null, page: () => page }),
-      method: () => 'GET',
-      url: () => 'https://example.test/subresource.png',
-      failure: () => ({ errorText: 'net::ERR_ABORTED' }),
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({
+      method: 'GET', url: 'https://example.test/subresource.png', navigation: false, frame: fakeFrame(page), failureText: 'net::ERR_ABORTED',
+    });
 
     const returns = Array.from({ length: 257 }, () => harness.requestFailedHandler?.(request));
     expect(returns.every((value) => value === undefined)).toBe(true);
@@ -2889,12 +2898,9 @@ describe('installPassiveRequestGuard installation', () => {
       const ledger = new SafetyLedger();
       await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
       const page = await readyHarnessPage(harness);
-      const returned = harness.requestFailedHandler?.({
-        isNavigationRequest: () => true,
-        frame: () => ({ parentFrame: () => null, page: () => page }),
-        failure: () => ({ errorText: 'net::ERR_FAILED' }),
+      const returned = harness.requestFailedHandler?.(fakePlaywrightRequest({ navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_FAILED' }, {
         method: (): never => { throw new Error('requestfailed task exploded'); },
-      } as unknown as Request);
+      }));
 
       void Promise.resolve(returned).catch(() => undefined);
       expect(returned).toBeUndefined();
@@ -3375,13 +3381,9 @@ describe('installPassiveRequestGuard installation', () => {
         throw new Error('requestfailed page unavailable');
       },
     };
-    const request = {
-      method: () => 'GET',
-      url: () => 'https://example.test/catalog',
-      isNavigationRequest: () => true,
-      frame: () => frame,
-      failure: () => ({ errorText: 'net::ERR_FAILED' }),
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({
+      method: 'GET', url: 'https://example.test/catalog', navigation: true, frame, failureText: 'net::ERR_FAILED',
+    });
 
     harness.requestFailedHandler?.(request);
 
@@ -3397,20 +3399,15 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     const page = await readyHarnessPage(harness);
-    const frame = { parentFrame: () => null, page: () => page };
-    const request = {
-      method: () => 'GET',
-      url: () => 'https://example.test/catalog',
-      isNavigationRequest: () => true,
-      frame: () => frame,
-      failure: () => ({ errorText: 'net::ERR_ABORTED' }),
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({
+      method: 'GET', url: 'https://example.test/catalog', navigation: true, frame: fakeFrame(page), failureText: 'net::ERR_ABORTED',
+    });
 
     harness.requestFailedHandler?.(request);
 
     await expect.poll(() => harness.closeCount).toBe(1);
     expect(ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_ABORTED',
     }]);
   });
@@ -3429,12 +3426,7 @@ describe('installPassiveRequestGuard installation', () => {
         throw new Error('route page unavailable');
       },
     };
-    const request = {
-      method: () => 'GET',
-      url: () => 'https://example.test/catalog',
-      isNavigationRequest: () => true,
-      frame: () => frame,
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({ method: 'GET', url: 'https://example.test/catalog', navigation: true, frame });
     const route = {
       request: () => request,
       async abort(): Promise<void> {
@@ -3450,6 +3442,8 @@ describe('installPassiveRequestGuard installation', () => {
       code: 'PASSIVE_GUARD_PAGE_NOT_READY',
       message: 'Navigation started before explicit page readiness: GET https://example.test/catalog '
         + '(no page is available for the request: route page unavailable)',
+      // DEF-144: 違反に結びつく要求の method と Origin と path。
+      request: { method: 'GET', origin: 'https://example.test', path: '/catalog' },
     }]);
   });
 
@@ -3457,11 +3451,7 @@ describe('installPassiveRequestGuard installation', () => {
     const harness = createGuardHarness();
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
-    const request = {
-      method: () => 'POST',
-      url: () => 'https://example.test/mutation',
-      isNavigationRequest: () => false,
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({ method: 'POST', url: 'https://example.test/mutation', navigation: false });
     const route = {
       request: () => request,
       async abort(): Promise<void> {
@@ -3486,14 +3476,11 @@ describe('installPassiveRequestGuard installation', () => {
     const ledger = new SafetyLedger();
     await installPassiveRequestGuard(harness.context, ledger, new Set(['https://example.test']));
     let abortCount = 0;
-    const request = {
-      method: () => 'GET',
-      url: () => 'https://example.test/catalog',
-      isNavigationRequest: () => true,
+    const request = fakePlaywrightRequest({ method: 'GET', url: 'https://example.test/catalog', navigation: true }, {
       frame(): never {
         throw new Error('frame unavailable');
       },
-    } as unknown as Request;
+    });
     const route = {
       request: () => request,
       async abort(): Promise<void> {
@@ -3509,6 +3496,8 @@ describe('installPassiveRequestGuard installation', () => {
       code: 'PASSIVE_GUARD_PAGE_NOT_READY',
       message: 'Navigation started before explicit page readiness: GET https://example.test/catalog '
         + '(no page is available for the request: frame unavailable)',
+      // DEF-144: 違反に結びつく要求の method と Origin と path。
+      request: { method: 'GET', origin: 'https://example.test', path: '/catalog' },
     }]);
   });
 
@@ -3534,6 +3523,7 @@ describe('installPassiveRequestGuard installation', () => {
     expect(ledger.snapshot().blockedWebSockets).toEqual([{
       url: 'wss://example.test/socket',
       reason: 'PASSIVE_WEBSOCKET',
+      phase: 'LOAD',
     }]);
     expect(ledger.snapshot().invariantViolations).toEqual([{
       code: 'WEBSOCKET_CLOSE_FAILED',
@@ -3631,9 +3621,7 @@ describe('passive request guard server boundary', () => {
     }]));
     const { CANCELED_DOCUMENT_EVIDENCE_WAIT_MS } = await import('../../src/safety/passive-request-guard.js');
     await wait(CANCELED_DOCUMENT_EVIDENCE_WAIT_MS * 2);
-    expect(ledger.snapshot().invariantViolations).not.toContainEqual(expect.objectContaining({
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
-    }));
+    expect(ledger.snapshot().invariantViolations).not.toContainEqual(expect.objectContaining({ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED' }));
   });
 
   it('ledgers an unmarked context close while an allowed navigation is pending', async () => {
@@ -3821,10 +3809,12 @@ describe('passive request guard server boundary', () => {
     expect(primary.getCounters().get).toBe(0);
     expect(external.getCounters().get).toBe(0);
     expect(ledger.snapshot().blockedNavigations).toEqual([]);
-    expect(ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([{
+    // DEF-144: 違反は、結びつく要求（method・Origin・path）も持つ。
+    expect(ledger.snapshot().invariantViolations).toEqual(expect.arrayContaining([expect.objectContaining({
       code: 'PASSIVE_GUARD_PAGE_NOT_READY',
       message: expect.stringContaining('before explicit page readiness'),
-    }]));
+      request: expect.objectContaining({ method: 'GET' }),
+    })]));
     await expect(awaitPassiveRequestGuardReady(pageFromEvent as Page)).rejects.toThrow(/invalidated/i);
   });
 
@@ -3878,7 +3868,7 @@ describe('passive request guard server boundary', () => {
     await expect(page.goto(`${server.origin}/index.html`)).rejects.toThrow();
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: 'net::ERR_FAILED',
     }]);
     await expect.poll(() => page.isClosed()).toBe(true);
@@ -3935,7 +3925,7 @@ describe('passive request guard server boundary', () => {
 
     expect(await hangFailure).toMatch(LISTED_SOCKET_CLOSE_FAILURE);
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([{
-      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+      code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST,
       message: expect.stringMatching(LISTED_SOCKET_CLOSE_FAILURE),
     }]);
     await expect.poll(() => page.isClosed()).toBe(true);
@@ -4026,6 +4016,7 @@ describe('passive request guard server boundary', () => {
     await expect.poll(() => ledger.snapshot().blockedWebSockets).toEqual([{
       url: webSocketUrl,
       reason: 'PASSIVE_WEBSOCKET',
+      phase: 'LOAD',
     }]);
     expect(ledger.snapshot().invariantViolations).toHaveLength(0);
   });
@@ -4044,23 +4035,20 @@ describe('C18a: external scheme navigation detection', () => {
     readonly frame?: 'MAIN' | 'SUB';
   }): Request {
     const parent = { parentFrame: () => null };
-    return {
-      method: () => 'GET',
-      url: () => facts.url,
-      isNavigationRequest: () => facts.navigation ?? true,
+    return fakePlaywrightRequest({ method: 'GET', url: facts.url, navigation: facts.navigation ?? true }, {
       frame(): unknown {
         if (facts.frame === undefined) {
           throw new Error('Frame for this navigation request is not available');
         }
         return { parentFrame: () => (facts.frame === 'MAIN' ? null : parent) };
       },
-    } as unknown as Request;
+    });
   }
 
   /** 外部スキームへの移動の試みの、不変条件の違反（R7d。中断した Run の再開の設計書 4.10）。 */
   const attemptedViolation = (scheme: string): { readonly code: string; readonly message: string } => ({
     code: 'EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
-    message: `Navigation to the external scheme ${scheme} was attempted; the browser may have launched an external application`,
+    message: externalSchemeNavigationViolationMessage(scheme),
   });
 
   it('installs the request listener and detaches it on close', async () => {
@@ -4441,7 +4429,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
 
       await expect.poll(() => harness.closeCount).toBe(1);
       expect(ledger.snapshot().invariantViolations).toEqual([
-        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
       ]);
     });
 
@@ -4452,7 +4440,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
 
       await expect.poll(() => harness.closeCount).toBe(1);
       expect(ledger.snapshot().invariantViolations).toEqual([
-        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_ABORTED' },
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_ABORTED' },
       ]);
     });
 
@@ -4465,7 +4453,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
 
       await expect.poll(() => harness.closeCount).toBe(1);
       expect(ledger.snapshot().invariantViolations).toEqual([
-        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
       ]);
     });
 
@@ -4483,7 +4471,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
 
       await expect.poll(() => harness.closeCount).toBe(1);
       expect(ledger.snapshot().invariantViolations).toEqual([
-        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_BLOCKED_BY_CLIENT' },
+        { code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_BLOCKED_BY_CLIENT' },
       ]);
     });
 
@@ -4631,7 +4619,7 @@ describe('C18g: server redirects to an external scheme are stopped at the Docume
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('redirect-current')]);
     expect(ledger.snapshot().blockedNavigations).toEqual([
-      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
     ]);
     expect(ledger.snapshot().externalSchemeNavigations).toEqual([]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
@@ -4895,13 +4883,13 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
     },
   ): { readonly route: Route; readonly request: Request; readonly fulfilled: unknown[] } {
     const fulfilled: unknown[] = [];
-    const request = {
-      method: () => facts.method ?? 'GET',
-      url: () => facts.url,
-      resourceType: () => facts.resourceType ?? 'image',
-      isNavigationRequest: () => facts.navigationPage !== undefined,
-      frame: () => ({ parentFrame: () => null, page: () => facts.navigationPage }),
-    } as unknown as Request;
+    const request = fakePlaywrightRequest({
+      method: facts.method ?? 'GET',
+      url: facts.url,
+      resourceType: facts.resourceType ?? 'image',
+      navigation: facts.navigationPage !== undefined,
+      frame: fakeFrame(facts.navigationPage),
+    });
     const route = {
       request: () => request,
       fulfill: async (options: unknown): Promise<void> => {
@@ -5072,7 +5060,7 @@ describe('resource delivery of the requests the Guard allowed (L5b)', () => {
     expect(late.fulfilled).toEqual([]);
     expect(ledger.snapshot().blockedRequests).toEqual([]);
     expect(ledger.snapshot().invariantViolations).toEqual(
-      phase === 'closing' ? [] : [{ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: 'net::ERR_FAILED' }],
+      phase === 'closing' ? [] : [{ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', request: FAILED_MAIN_FRAME_REQUEST, message: 'net::ERR_FAILED' }],
     );
   });
 
@@ -5380,7 +5368,7 @@ describe('DEF-026: a Guard command that fails because the browser canceled the p
     await settleGuard();
 
     expect(ledger.snapshot().blockedNavigations).toEqual([
-      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+      { method: 'GET', url: 'https://outside.example.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
     ]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
     expect(harness.closeCount).toBe(0);
@@ -5742,7 +5730,10 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
     expect(commandsOf(harness, 'Fetch.continueRequest')).toEqual([]);
-    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    // BN-a: 要求の種類（CDP の種類を正規化した値）と時点も記録する。
+    expect(ledger.snapshot().blockedRequests).toEqual([{
+      method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD', resourceType: resourceType.toLowerCase(), phase: 'LOAD',
+    }]);
     expect(ledger.snapshot().blockedRequestsByMethod).toEqual({ POST: 1 });
     expect(ledger.snapshot().blockedNavigations).toEqual([]);
     expect(ledger.snapshot().blockedInteractionRequests).toEqual([]);
@@ -5763,7 +5754,9 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
     harness.cdpRequestPausedHandler?.(withoutNetworkId);
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
-    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    expect(ledger.snapshot().blockedRequests).toEqual([{
+      method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD', resourceType: 'ping', phase: 'LOAD',
+    }]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
   });
 
@@ -5795,7 +5788,7 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
     expect(ledger.snapshot().blockedNavigations).toEqual([
-      { method: 'GET', url: `${OTHER_ORIGIN}/page`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+      { method: 'GET', url: `${OTHER_ORIGIN}/page`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
     ]);
     expect(ledger.snapshot().blockedRequests).toEqual([]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
@@ -5842,7 +5835,9 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
 
     harness.cdpRequestPausedHandler?.(subresourceEvent());
 
-    await expect.poll(() => ledger.snapshot().blockedRequests).toEqual([{ method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD' }]);
+    await expect.poll(() => ledger.snapshot().blockedRequests).toEqual([{
+      method: 'POST', url: `${ORIGIN}/__mutation`, reason: 'NON_READ_METHOD', resourceType: 'ping', phase: 'LOAD',
+    }]);
     await wait(10);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
     expect(harness.closeCount).toBe(0);
@@ -5897,7 +5892,7 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
     const closing = closePassiveGuardedContext(harness.context);
     await expect.poll(() => harness.closeCount).toBe(1);
 
-    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}/favicon.ico` } }));
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}${BROWSER_DEFAULT_FAVICON_PATH}` } }));
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
     closeGate.resolve();
@@ -5913,7 +5908,7 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
     const closing = closePassiveGuardedContext(harness.context);
     await expect.poll(() => harness.closeCount).toBe(1);
 
-    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}/favicon.ico` } }));
+    harness.cdpRequestPausedHandler?.(subresourceEvent({ resourceType: 'Other', request: { method: 'GET', url: `${ORIGIN}${BROWSER_DEFAULT_FAVICON_PATH}` } }));
 
     await expect.poll(() => ledger.snapshot().invariantViolations).toEqual([
       { code: 'CDP_LIFECYCLE_FAIL_REQUEST_FAILED', message: 'Fetch.failRequest failed' },
@@ -6186,7 +6181,9 @@ describe('DEF-042: the CDP interception covers every request at the Request stag
 
     await expect.poll(() => commandsOf(harness, 'Fetch.failRequest')).toEqual([failed('subresource-1')]);
     expect(commandsOf(harness, 'Fetch.fulfillRequest')).toEqual([]);
-    expect(ledger.snapshot().blockedRequests).toEqual([{ method: 'OPTIONS', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD' }]);
+    expect(ledger.snapshot().blockedRequests).toEqual([{
+      method: 'OPTIONS', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD',
+    }]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
   });
 
@@ -6435,8 +6432,8 @@ describe('DEF-040: the Other responses receive the Worker connect policy header,
     harness.cdpLogEntryAddedHandler?.(workerLogEntry(violationText('ws://example.test/plain')));
 
     expect(ledger.snapshot().blockedWebSockets).toEqual([
-      { url: SOCKET_URL, reason: 'WORKER_CONNECT_POLICY' },
-      { url: 'ws://example.test/plain', reason: 'WORKER_CONNECT_POLICY' },
+      { url: SOCKET_URL, reason: 'WORKER_CONNECT_POLICY', phase: 'LOAD' },
+      { url: 'ws://example.test/plain', reason: 'WORKER_CONNECT_POLICY', phase: 'LOAD' },
     ]);
     expect(ledger.snapshot().blockedInteractionWebSockets).toEqual([]);
     expect(ledger.snapshot().invariantViolations).toEqual([]);
@@ -6501,9 +6498,10 @@ const IFRAME_SRC_CHURN_PAGE = '/iframe-src-churn.html';
 const viewportForChurn: Viewport = Object.freeze({ width: 800, height: 600 });
 /**
  * DEF-050 の実機の確かめで、読み込み → Context を閉じる処理をくり返す回数。NPR2 の再現の実験では、修正の前に、Passive の Context を
- * 閉じる場面で、headless shell は 20 回のうち 3 回、CLI の Chromium は 20 回のうち 4 回、違反が出た。
+ * 閉じる場面で、headless shell は 20 回のうち 3 回、CLI の Chromium は 20 回のうち 4 回、違反が出た。値は `test-rounds.ts`（TS-b。ふだんの組と
+ * 全部の組）。
  */
-const IFRAME_SRC_CHURN_CLOSE_ROUNDS = 20;
+const IFRAME_SRC_CHURN_CLOSE_ROUNDS = roundsOf('iframeSrcChurnClose');
 /** 読み込みから閉じる処理（Passive）か凍結（Interaction）までの待ちの、基本の時間と、回ごとにずらす幅・種類の数。 */
 const IFRAME_SRC_CHURN_BEFORE_CLOSE_MS = 100;
 const IFRAME_SRC_CHURN_BEFORE_CLOSE_STEP_MS = 37;

@@ -8,7 +8,12 @@
 import type { Page } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import type { BlockedAuditExclusionEvent } from '../../src/core/evidence-types.js';
-import { sessionLostUrlOf } from '../../src/orchestration/authenticated-run.js';
+import {
+  SESSION_LOSS_CHECK_POINTS,
+  sessionLossStageDetailOf,
+  sessionLostUrlAt,
+  sessionLostUrlOf,
+} from '../../src/orchestration/authenticated-run.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 
 const ORIGIN = 'https://example.com';
@@ -21,7 +26,9 @@ const pageAt = (url: string): Page => ({ url: () => url }) as unknown as Page;
 function ledgerWith(events: readonly Pick<BlockedAuditExclusionEvent, 'url' | 'mainFrameNavigation'>[]): SafetyLedger {
   const ledger = new SafetyLedger();
   for (const { url, mainFrameNavigation } of events) {
-    ledger.recordBlockedAuditExclusion({ method: 'GET', url, mainFrameNavigation, reason: 'AUDIT_EXCLUDED_URL' });
+    ledger.recordBlockedAuditExclusion({
+      method: 'GET', url, mainFrameNavigation, reason: 'AUDIT_EXCLUDED_URL', resourceType: mainFrameNavigation ? 'document' : 'fetch', phase: 'LOAD',
+    });
   }
   return ledger;
 }
@@ -77,5 +84,33 @@ const cases: readonly {
 describe('sessionLostUrlOf: the session lost judgement after a navigation (fixed before CCX-6)', () => {
   it.each(cases)('$name', ({ pageUrl, events, expected }) => {
     expect(sessionLostUrlOf(pageAt(pageUrl), ledgerWith(events), PREFIX)).toBe(expected);
+  });
+});
+
+// DF-3（DEF-167）: 確かめる時機の一覧と、時機を付けて判定を呼ぶ補助。判定の条件は、どの時機でも `sessionLostUrlOf` と同じ。
+describe('DF-3: sessionLostUrlAt and the check points of the session loss', () => {
+  const points = Object.values(SESSION_LOSS_CHECK_POINTS);
+
+  it('lists the four check points (the load, after settling, before the next load, the page end)', () => {
+    expect(SESSION_LOSS_CHECK_POINTS).toEqual({ navigation: 'navigation', settled: 'settled', beforeNextLoad: 'before-next-load', pageEnd: 'page-end' });
+    expect(Object.isFrozen(SESSION_LOSS_CHECK_POINTS)).toBe(true);
+  });
+
+  it.each(cases)('gives the same judgement as sessionLostUrlOf at every point: $name', ({ pageUrl, events, expected }) => {
+    for (const point of points) {
+      const check = sessionLostUrlAt(point, pageAt(pageUrl), ledgerWith(events), PREFIX);
+      expect(check).toEqual(expected === null ? null : { point, url: expected });
+      if (check !== null) {
+        expect(Object.isFrozen(check)).toBe(true);
+      }
+    }
+  });
+
+  it('keeps the stage of the load as it was, and adds the point after the load', () => {
+    expect(sessionLossStageDetailOf('passive', SESSION_LOSS_CHECK_POINTS.navigation)).toBe('passive');
+    expect(sessionLossStageDetailOf('stress-layout', SESSION_LOSS_CHECK_POINTS.navigation)).toBe('stress-layout');
+    expect(sessionLossStageDetailOf('passive', SESSION_LOSS_CHECK_POINTS.settled)).toBe('passive:settled');
+    expect(sessionLossStageDetailOf('stress-layout', SESSION_LOSS_CHECK_POINTS.beforeNextLoad)).toBe('stress-layout:before-next-load');
+    expect(sessionLossStageDetailOf('passive', SESSION_LOSS_CHECK_POINTS.pageEnd)).toBe('passive:page-end');
   });
 });

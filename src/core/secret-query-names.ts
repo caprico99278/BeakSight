@@ -11,6 +11,15 @@
 // 4. 書き込みの照合で名前だけを照らす、ページが読み込みごとに作る値の欄の名前の語（T31R2-fix-1。DEF-108 の残り）:
 //    `PAGE_ISSUED_TOKEN_FIELD_WORDS`。比べ方（欄の名前の語の単位）は、欄の名前の語の分け方の owner に依るので、判定
 //    `isPageIssuedTokenFieldName` は `src/discovery/read-check-contracts.ts` に置く（このファイルは import を持たないため。一覧はここにだけ書く）。
+// 5. ログインの段の観察の、成功の鍵の名前の案に残してよい端の部分の語（T43R2-fix。Task 43 の設計書 7 章の最後の行）:
+//    `LOGIN_STORAGE_KEY_GENERAL_WORDS`。比べ方（NFKC と大文字小文字を畳んだ部分の完全一致）は `src/discovery/login-observation.ts`
+//    （このファイルは import を持たず、NFKC の正規化は `src/core/text.ts` の部品だけが書くため。一覧はここにだけ書く）。
+// 6. API の書き込みの本文の鍵の名前（部分一致。fail-closed。T38R-fix の I-2）: `API_WRITE_SECRET_LIKE_KEY_WORDS`、
+//    `API_WRITE_SECRET_LIKE_KEY_SEGMENTS`。ページが決める鍵と、登録の ID を読む応答の鍵（値を照らさない鍵）を拒む
+//    （`src/control/approval/scenario-policy.ts`）。T38R2-fix の M-1: 比べ方（NFKC と大文字小文字を畳んだ形の部分一致と、欄の名前の語の単位の一致）は
+//    `src/discovery/classify.ts` の `isApiWriteKeyNameSecretLike`（このファイルは import を持たず、NFKC の正規化は `src/core/text.ts` の部品だけが書き、
+//    欄の名前の語の分け方の owner は `classify.ts` のため。方針 4・5 と同じ。一覧はここにだけ書く）。T41a: 語を足し、結合文字を除いた形（NFD の後。
+//    `src/core/text.ts` の `stripCombiningMarks`）でも比べる。
 // - `src/control/` と `src/discovery/` は `src/safety/` を import できない（`tests/architecture/control-boundary.test.ts` の (b) など）ので、
 //   ここを直接使う。純粋な定義と関数だけのファイル（import なし。`tests/architecture/secret-name-policies.test.ts` の (b)）。
 // - 秘密に見える語の一覧（配列のリテラル）は、`src/**` の中で、ここにだけ書く（同じ Gate の (a)）。
@@ -161,6 +170,101 @@ export const SECRET_LIKE_HEADER_NAME_WORDS = Object.freeze([
  * （方針 1 の `code`・`key`・`ticket` など）は含めない（値を読めず照らせないので、その欄がある画面の書き込みは止める）。
  */
 export const PAGE_ISSUED_TOKEN_FIELD_WORDS = Object.freeze(['csrf', 'xsrf', 'token', 'nonce', 'csrfmiddlewaretoken'] as const);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 方針 5: ログインの段の観察の、成功の鍵の名前の案に残してよい端の部分の語（T43R2-fix。Task 43 の設計書 7 章の最後の行。設計者の既定）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 鍵の名前を区切りで分けた最初か最後の部分が、この語（NFKC と大文字小文字を畳んだ形の完全一致。比べ方は `src/discovery/login-observation.ts`）に
+ * 当たるときだけ、その側を成功の鍵の名前の接頭辞か接尾辞の案にする（利用者の名前や ID が端に来る形を残さない。当たらない側は空にし、利用者が入れる）。
+ * 小文字の、鍵の名前によく書かれる、利用者に固有でない語だけ。
+ */
+export const LOGIN_STORAGE_KEY_GENERAL_WORDS = Object.freeze([
+  'token',
+  'tokens',
+  'auth',
+  'session',
+  'idtoken',
+  'accesstoken',
+  'refreshtoken',
+  'authtoken',
+  'access',
+  'refresh',
+  'jwt',
+  'credentials',
+] as const);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 方針 6: API の書き込みの本文の鍵の名前（部分一致。fail-closed。T38R-fix の I-2。Task 38 の設計書 7 章の最後の行）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 秘密に見える API の本文の鍵の語（閉じた一覧。NFKC と大文字小文字を畳み、文字と数字以外を除いた形で書く）。ページが決める鍵と、登録の ID を読む
+ * 応答の鍵（値を照らさない鍵）に使う。鍵の名前を同じ形にした文字列が、この語のどれかを含めば当たる（fail-closed なので、`author` のような語も当たる）。
+ * 比べ方は `src/discovery/classify.ts` の `isApiWriteKeyNameSecretLike`。T38R2-fix の M-1 で、CSRF のトークン・暗証の語・カードの確かめの番号・署名の鍵・
+ * 確かめの番号の語と、日本語の語（NFKC で英字にならない。半角カナは NFKC で全角になる）を足した。
+ */
+export const API_WRITE_SECRET_LIKE_KEY_WORDS = Object.freeze([
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'session',
+  'auth',
+  'apikey',
+  'credential',
+  'privatekey',
+  'bearer',
+  'otp',
+  'cookie',
+  'jwt',
+  'signature',
+  'csrf',
+  'xsrf',
+  'passcode',
+  'passphrase',
+  'pincode',
+  'cvv',
+  'cvc',
+  'signingkey',
+  'verificationcode',
+  'パスワード',
+  'トークン',
+  '暗証番号',
+  // T41a（Task 41 の設計書 3.1）: 秘密の鍵・ドイツ語のパスワード・暗号の鍵・ライセンスの鍵・HMAC・確かめの番号と、日本語の語。`refresh`・`card_number` は
+  // 正当な欄に当たるので足さない。
+  'privkey',
+  'passwort',
+  'encryptionkey',
+  'licensekey',
+  'hmac',
+  'securitycode',
+  '秘密鍵',
+  '暗証',
+  'セッション',
+] as const);
+
+/**
+ * 秘密に見える API の本文の鍵の、語の単位の語（閉じた一覧。部分一致にすると、ふつうの語（`shipping`・`inside` など）にも当たる短い語）。鍵の名前を
+ * 欄の名前の語（`src/discovery/classify.ts` の `fieldNameWordsOf`。区切り、文字と数字の境、camelCase と頭字語の境で分け、NFKC と大文字小文字を畳む）に
+ * 分け、どれかがこの語と一致すれば当たる（`pin1` は `pin`・`1`、`PINCode` は `pin`・`code`）。
+ */
+export const API_WRITE_SECRET_LIKE_KEY_SEGMENTS = Object.freeze([
+  'pin', 'pwd', 'sid', 'mfa', 'pass',
+  // T41a（Task 41 の設計書 3.1）: パスワードの略・ハッシュの塩・社会保障番号（部分一致にすると `power`・`basalt`・`classname` などに当たる）。
+  'pw', 'salt', 'ssn',
+] as const);
+
+/**
+ * T44g（Task 44 の設計書 P4-2。設計者の判断）: 方針 6 の部分一致の誤検知として除く、鍵の名前（名前つきの閉じた一覧。比べる形で書く）。鍵の名前の比べる形
+ * （NFKC と大文字小文字を畳み、文字と数字以外を除いた形。結合文字を除いた形も）が、この語にちょうど当たる鍵だけを除く（`author_token` などは今どおり当たる）。
+ * `author` は `auth`、`footprint` は `otp` の部分一致に当たっていた。`session_count`・`hmac_ok` は、`session`・`hmac` の語そのものを含むので除かない。
+ */
+export const API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES = Object.freeze([
+  'author',
+  'footprint',
+] as const);
 
 /** header の名前の比べで除く区切り。 */
 const HEADER_NAME_SEPARATORS = /[-_]/gu;

@@ -11,13 +11,16 @@ import type {
   NavigationOutcomeKind,
   NetworkEvidence,
   NormalizedHttpUrlEvidence,
+  PageSchemaVersion,
   PerformanceEvidence,
   SafetyEventsEvidence,
   ScreenshotEvidence,
   ScrollEvidence,
+  SessionLossEvidence,
 } from './evidence-types.js';
 // 型だけの import（実行時の依存はない。`status.ts` は、このファイルの型と値を使う）。
 import type { RunStatusInput } from './status.js';
+import type { AuditSendPolicyName } from './audit-send-policy.js';
 // 未完了の理由の確かめ（`isIncompleteReason`）が使う。`guards.ts` は何も import しない。
 import { isRecord } from './guards.js';
 
@@ -85,6 +88,17 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
   'RESOURCE_LIMIT_REACHED',
   /** performance: ブラウザから返った値が不正だった。 */
   'INVALID_BROWSER_DATA',
+  /**
+   * DEF-129: ビューポートの Context で、ページが始めた文書の読み込み（main frame か子の frame の、JS の読み込み直しや移動、meta の転送）を、Guard が
+   * frame ごとの上限（`src/safety/passive-request-guard.ts` の `PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）で止めた（画面が落ち着かず、読み切れて
+   * いない）。`detail` は `null`。
+   */
+  'PAGE_NAVIGATION_LIMIT_REACHED',
+  /**
+   * DEF-130-fix: ビューポートの Context で、1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・`xhr` など）を、Guard が上限
+   * （`src/safety/passive-request-guard.ts` の `PAGE_SUBRESOURCE_REQUEST_LIMIT`）で止めた（画面がデータを描き切れず、読み切れていない）。`detail` は `null`。
+   */
+  'PAGE_SUBRESOURCE_LIMIT_REACHED',
   /** Run Status の入力 `preflightFailed`。 */
   'PREFLIGHT_FAILED',
   /**
@@ -182,6 +196,15 @@ export const INCOMPLETE_REASON_CODES = Object.freeze([
    * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
    */
   'AUTH_SESSION_LOST',
+  /**
+   * スクリプトで送るログインの監査の Run（Task 35 の設計書 3.4。T35a で値を足し、記録の流れは T35c）で、承認したサービスの Origin への要求の上限
+   * （1 分あたりか、1 回の Run あたり。認証の設定の `serviceRequestLimits`）に届いたため、その後の監査を始めなかった。公開監査とフォームの送信の
+   * ログインの監査では現れない。止めた要求は、Guard の止めた理由 `SERVICE_REQUEST_LIMIT_REACHED`（`BLOCKED_REQUEST_REASONS`）で記録する。
+   * - 始めなかったページ（`SKIPPED`）の理由。`detail` は `null`。Run の理由にも 1 件残す（SKIPPED のページから、最後の処理で導く）。
+   * - 再開のときは、この理由の SKIPPED の URL を、待ち行列に戻す（`RESUME_REQUEUE_SKIP_REASON_CODES`。T35c。再開の実行は新しい上限で数える）。
+   * Run Status は、SKIPPED のページがあるので、`deriveRunStatus` が `PARTIAL` と導く（このコードでは決めない）。
+   */
+  'SERVICE_REQUEST_LIMIT_REACHED',
 ] as const);
 export type IncompleteReasonCode = (typeof INCOMPLETE_REASON_CODES)[number];
 
@@ -351,10 +374,20 @@ export interface ViewportAuditResult {
    * Cross-page rule は、これでリンク先を検証したかと、ナビゲーションの失敗の種類を判断する。
    */
   readonly navigationOutcome: NavigationOutcomeKind | null;
+  /**
+   * DEF-129: そのビューポートの Context で、Guard が通した（サーバへ送った）main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、
+   * ページが始めた読み込みを含む）。読み込まなかったビューポートと、Guard のない読み込み・前の書き手の成果物にはない。
+   */
+  readonly documentRequests?: number;
+  /** T37R2-fix: 同じ Context で、Guard が通した子の frame の文書の要求の数（別の数）。`documentRequests` と同じときに書く。 */
+  readonly childFrameDocumentRequests?: number;
+  /** DEF-130-fix: 同じ Context で、Guard が通した文書でない要求の数（別の数）。`documentRequests` と同じときに書く。 */
+  readonly subresourceRequests?: number;
 }
 
 export interface PageAuditResult {
-  readonly schemaVersion: 'page-schema/1.0';
+  /** BN-a: 書くのはいつも最新の版（`PAGE_SCHEMA_VERSION`）。前の版（保存から読んだ結果）も読める（`PAGE_READABLE_SCHEMA_VERSIONS`）。 */
+  readonly schemaVersion: PageSchemaVersion;
   readonly pageId: PageId;
   /**
    * ページの identity のURL。クロールのキューで使う、要求した正規化済みのURL（`normalizeUrl` の結果）。
@@ -493,6 +526,11 @@ export interface PageAuditOutcome {
    */
   readonly authSessionLostDetail?: string | null;
   /**
+   * DEF-138（設計書 `2026-10-19-beaksight-session-loss-evidence-design.md` 2.1）: `authSessionLostDetail` を返したときの、セッションの切れの証拠（値を
+   * 持たない）。組み立てられなかったときと、検知しなかったときは `null`。省略は `null` と同じ。Page の結果の JSON には含めない。
+   */
+  readonly authSessionLoss?: SessionLossEvidence | null;
+  /**
    * 各ビューポートの読み込み（Passive、幅の走査の各幅、Interaction の各候補）の間の、ページ本体の要求の観察の結果（サイトの不調で止めた
    * ときの診断の記録の設計書 2.1、2.2。2026-10-07 の改訂）。始めなかったビューポート（SKIPPED のビューポート）は `null`。
    * ページの結果（`PageAuditResult`）と Evidence には含めない（診断の記録だけに使う）。
@@ -590,6 +628,54 @@ export interface SafetyBlockedActionCounts {
 export interface SafetyInvariantViolationSummary {
   readonly code: string;
   readonly message: string;
+  /**
+   * DEF-144: 違反が 1 つの要求に結びつくとき（Guard の判定の段階の誤り、CDP の付いていない page のナビゲーション）の、その要求の method と Origin と path
+   * （Safety Ledger が URL から取り出す。query・fragment・本文・値は持たない。path の値に見える区切りは伏せる）。結びつかない違反は持たない。
+   */
+  readonly request?: SafetyInvariantViolationRequest;
+}
+
+/** DEF-144: 違反に結びつく要求（値を持たない）。`origin` は正規の Origin（http(s) でない・読めない URL は `null`）。 */
+export interface SafetyInvariantViolationRequest {
+  readonly method: string;
+  readonly origin: string | null;
+  readonly path: string;
+}
+
+/**
+ * DEF-144: 発見と READ の確かめのジョブで、違反が起きた段（最初に違反を見た段）。組み立ては `src/safety/job-safety-violation.ts` の
+ * `jobSafetyViolationOf`（形はここが owner。`src/discovery/` と `src/control/` が型を参照するため core に置く）。
+ * - `CONTEXT_OPEN`: Context と page を作る間（読み込みの前）。
+ * - `PAGE_LOAD`: 読み込みと読み取り（発見の候補の読み取り、凍結、リンクの抽出。READ の確かめの読み取り）。
+ * - `SUBMISSION_PROBE`: 発見の、送らずに観察する probe の押下の中（押した候補は `press`）。
+ * - `CONTEXT_CLOSE`: 読み取りの後、Context を閉じる間（閉じた後の Ledger で初めて見た）。
+ */
+export const JOB_SAFETY_VIOLATION_STAGES = Object.freeze(['CONTEXT_OPEN', 'PAGE_LOAD', 'SUBMISSION_PROBE', 'CONTEXT_CLOSE'] as const);
+export type JobSafetyViolationStage = (typeof JOB_SAFETY_VIOLATION_STAGES)[number];
+
+/** DEF-144: 残す違反の一覧の最大の数（IPC の 1 通に収める。数 `invariantViolationCount` は全体）。スキーマの `maxItems` と同じ。 */
+export const MAX_JOB_SAFETY_VIOLATION_ENTRIES = 16;
+/** DEF-144: 違反の文の最大の長さ（文字。IPC の `FAILED` の詳細と同じ大きさ）。スキーマの `maxLength` と同じ。 */
+export const MAX_JOB_SAFETY_VIOLATION_MESSAGE_LENGTH = 1_024;
+
+/** DEF-144: probe の押下の中の違反の、押した候補（値を持たない）。 */
+export interface JobSafetyViolationPress {
+  /** 送信ボタンの語（閉じた一覧の語。候補の `submitterWords`）。 */
+  readonly submitterWords: readonly string[];
+  /** 候補の識別の digest（候補の `identityDigest`）。 */
+  readonly identityDigest: string;
+}
+
+/**
+ * DEF-144: 発見と READ の確かめのジョブの違反の中身（`discovery.json`・`read-evidence.json` の `safetyViolation`、IPC の `FINISHED` の要約、ジョブの画面）。
+ * 違反の一覧と数と記録の不完全は、`run.json` の `safety` と同じ形（`PageSafetySummary`）。値（本文、query の値、Cookie、token）を持たない。
+ */
+export interface JobSafetyViolation extends PageSafetySummary {
+  /** 違反が起きた画面の path（query・fragment は持たない。値に見える区切りは伏せる。読めない URL は空）。 */
+  readonly pagePath: string;
+  readonly stage: JobSafetyViolationStage;
+  /** probe の押下の中なら押した候補（押す前・押していない段は `null`）。 */
+  readonly press: JobSafetyViolationPress | null;
 }
 
 /** run.json の Safety Ledger の要約（設計書 第35章）。 */
@@ -609,6 +695,34 @@ export interface RunSafetySummary {
   readonly invariantViolations: readonly SafetyInvariantViolationSummary[];
   /** Safety Ledger の記録が上限で不完全になったか。 */
   readonly recordTruncated: boolean;
+  /**
+   * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.3）: 実効の監査の段の送信の扱いと、Guard が通した読み取りでない要求の数。新しい Run は
+   * 必ず持つ。任意の項目で、持たない古い `run.json` は `READ_ONLY`（通した数 0）と読む。
+   */
+  readonly auditSend?: RunAuditSendSummary;
+}
+
+/** AS-b: `run.json` の `safety.auditSend`（扱いと通した数。値は持たない）。集計は `summarizeRunSafety` の 1 か所。 */
+export interface RunAuditSendSummary {
+  readonly policy: AuditSendPolicyName;
+  /** 通した読み取りでない要求の総数（Ledger の snapshot の `passedAuditSendRequests.count` の合計）。 */
+  readonly passedRequests: number;
+  /** method ごとの通した数（Ledger の snapshot の `byMethod` の合計。method のコード単位の順）。 */
+  readonly passedRequestsByMethod: Readonly<Record<string, number>>;
+  /**
+   * AS-c: 通した要求のうち、ほかの Origin（許可 Origin と承認したサービスの Origin のほか）へのものの数（snapshot の `otherOrigins` の合計）。新しい Run は必ず持つ。
+   * 持たない Run（AS-c の前）は 0 と読む。
+   */
+  readonly passedOtherOriginRequests?: number;
+  /** AS-c: 通した WebSocket の接続の数（snapshot の `passedAuditSendWebSockets.count` の合計）。新しい Run は必ず持つ。持たない Run は 0 と読む。 */
+  readonly passedWebSockets?: number;
+  /**
+   * AS-c fix round 1（C-1・C-2）: そのうち Guard の route を通らずに開いた接続の数（snapshot の `passedAuditSendWebSockets.outsideGuard` の合計）。新しい Run は
+   * 必ず持つ。持たない Run は 0 と読む。
+   */
+  readonly passedWebSocketsOutsideGuard?: number;
+  /** AS-c fix round 1: そのうち危険な語に当たる接続の数（snapshot の `passedAuditSendWebSockets.dangerous` の合計）。新しい Run は必ず持つ。持たない Run は 0 と読む。 */
+  readonly passedDangerousWebSockets?: number;
 }
 
 /**
@@ -655,7 +769,47 @@ export interface RunLoad {
   readonly pacingWaitMs: number;
   /** 監査対象のサイトに送った要求の実績（`LoadMeter.snapshot()`）。 */
   readonly requests: RunLoadRequests;
+  /**
+   * 承認したサービスの Origin への要求（T35a。Task 35 の設計書 3.4。任意の項目）。`requests.otherOrigins` の内数。スクリプトで送るログインの監査の
+   * Run だけが持つ（公開監査とフォームの送信のログインの監査は持たない。出力は変えない）。
+   */
+  readonly approvedServiceOrigins?: RunLoadOriginRequests;
 }
+
+/**
+ * スクリプトで送るログインの監査の段の数（T35a。Task 35 の設計書 3.7。run.json の任意の項目 `authentication`）。数だけで、URL・値を持たない。
+ * - `registeredReadRequestsAllowed`: 通した、登録した読み取りの手続きの呼び出しの数。
+ * - `tokenRefreshBlocked`: 止めた、token の送信先への送信（token の更新など）の数。
+ * - `otherNonReadBlocked`: 止めた、そのほかの読み取りでない要求の数（Safety Ledger にもある）。
+ * - `serviceUnauthorizedResponses`: 承認したサービスの Origin からの 401 の応答の数（値は読まない。記録だけで、セッションの切れとはみなさない）。
+ * - `serviceRequestLimitReached`: 承認したサービスの Origin への要求の上限に届いたか。
+ */
+export interface RunAuthenticationSummary {
+  readonly registeredReadRequestsAllowed: number;
+  readonly tokenRefreshBlocked: number;
+  readonly otherNonReadBlocked: number;
+  readonly serviceUnauthorizedResponses: number;
+  readonly serviceRequestLimitReached: boolean;
+  /**
+   * T37R-fix-B2（Task 37 の設計書 8 章の最後の行）: 許可 Origin への読み取りでない要求のうち、要求の種類が `fetch`・`xhr` のものを止めた数（記録だけで、
+   * 描けなかった画面の判定には使わない）。今の書き手は必ず書く。前の版の成果物にはない。
+   */
+  readonly allowedOriginDataRequestsBlocked?: number;
+  /**
+   * DEF-141（設計書 `2026-10-20-beaksight-service-request-pacing-design.md` 2.2）: 承認したサービスの Origin への要求の 1 分あたりの上限で、次の読み込み
+   * （ページ・ビューポート・幅）の前に待った回数と、待った時間の合計（ms）。`run.json` では Run の全体（再開をまたいで足す）。今の書き手は必ず書く。前の版の
+   * 成果物にはない。
+   */
+  readonly serviceRequestPacingWaits?: number;
+  readonly serviceRequestPacingWaitMs?: number;
+}
+
+/**
+ * ログインの状態の鍵がなくなったことで、セッションの切れとみなした場所（T35c。Run の理由 `AUTH_SESSION_LOST` の `detail`。T37a: 発見と READ の確かめの
+ * 成果物の、終わり方の詳しい理由 `endReasonDetail` にも使う。この値の owner。URL・鍵の名前・値は入れない）。
+ */
+export const SESSION_KEY_LOST_DETAIL = 'session-key';
+export type SessionKeyLostDetail = typeof SESSION_KEY_LOST_DETAIL;
 
 /**
  * 区分ごとの、直近の1分（`LOAD_PEAK_WINDOW_MS`、`src/crawl/load-meter.ts`）に終わった要求の件数（サイトへの負荷の制御の設計書 4.8）。
@@ -762,9 +916,34 @@ export interface RunSummary {
   readonly retries: readonly RunRetryRecord[];
   readonly crawlLimits: CrawlLimitState;
   readonly incompleteReasons: readonly IncompleteReason[];
+  /**
+   * T44c（Task 44 の設計書 P1-4。設計者の判断）: ページの未完了の理由ごとの、その理由を持つページの数（任意の項目。監査したページ（SKIPPED でない）の、ページと
+   * ビューポートの理由。理由のコードの一覧の順。1 ページは理由ごとに 1 回）。理由を持つページがなければ持たない。前の書き手の `run.json` にもない。
+   */
+  readonly pageIncompleteReasonCounts?: readonly PageIncompleteReasonCount[];
   /** サイトへの負荷の記録（サイトへの負荷の制御の設計書 4.5）。PREFLIGHT の失敗などで早く終わった Run にも入れる。 */
   readonly load: RunLoad;
+  /**
+   * スクリプトで送るログインの監査の段の数（T35a。Task 35 の設計書 3.7。任意の項目）。スクリプトで送るログインの監査の Run だけが持つ（公開監査と
+   * フォームの送信のログインの監査は持たない。出力は変えない）。
+   * DEF-138: セッションの切れで止まった実行は、その証拠（`sessionLoss`）も持つ（フォームの送信のログインの監査は、証拠だけを持つ）。
+   */
+  readonly authentication?: RunAuthenticationRecord;
 }
+
+/** T44c: ページの未完了の理由ごとのページの数（`RunSummary.pageIncompleteReasonCounts` の 1 件）。 */
+export interface PageIncompleteReasonCount {
+  readonly code: IncompleteReasonCode;
+  readonly pages: number;
+}
+
+/**
+ * `run.json` の `authentication`（DEF-138）: 監査の段の数（スクリプトで送るログインの Run）に、セッションの切れの証拠（任意）を足したものか、証拠だけ
+ * （フォームの送信のログインの Run）。証拠は、この実行がセッションの切れで止まったときの 1 件（Run は最初の切れで止まる）。
+ */
+export type RunAuthenticationRecord =
+  | (RunAuthenticationSummary & { readonly sessionLoss?: SessionLossEvidence })
+  | ({ readonly sessionLoss: SessionLossEvidence } & { readonly [Key in keyof RunAuthenticationSummary]?: never });
 
 /**
  * 再試行の前の、失敗した1回の試行の記録（Task 14〜17 の設計書 5.6.4）。Run Coordinator は、Desktop のナビゲーションが一時的な失敗
@@ -836,6 +1015,9 @@ export type RunCheckpointState = (typeof RUN_CHECKPOINT_STATES)[number];
  * - `INTERRUPTED_ABNORMALLY`: プロセスが途中で終わった（終わりの時刻は、最後の保存の時刻とする）。
  * - `STOPPED_BY_AUTH_SESSION_LOST`: 認証つきの Run で、セッションの切れ（理由 `AUTH_SESSION_LOST`）を検知して止まった（Task 25 の設計書
  *   4.3。T25c）。再開できる（再開のときは、もう一度ログインする。T25d）。既存の値の表示の順を変えないよう、一覧の最後に加えた。
+ * - `STOPPED_BY_SERVICE_REQUEST_LIMIT`: スクリプトで送るログインの監査の Run で、承認したサービスの Origin への要求の上限（理由
+ *   `SERVICE_REQUEST_LIMIT_REACHED`）に届いて止まった（Task 35 の設計書 3.4。T35c。サイトの不調で止めた前例と同じ形）。再開できる（再開の実行は、
+ *   新しい上限で数える）。既存の値の表示の順を変えないよう、一覧の最後に加えた。
  */
 export const RUN_EXECUTION_END_REASONS = Object.freeze([
   'COMPLETED',
@@ -845,6 +1027,7 @@ export const RUN_EXECUTION_END_REASONS = Object.freeze([
   'STOPPED_BY_SITE_UNAVAILABLE',
   'INTERRUPTED_ABNORMALLY',
   'STOPPED_BY_AUTH_SESSION_LOST',
+  'STOPPED_BY_SERVICE_REQUEST_LIMIT',
 ] as const);
 export type RunExecutionEndReason = (typeof RUN_EXECUTION_END_REASONS)[number];
 

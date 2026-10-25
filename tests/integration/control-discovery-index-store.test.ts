@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from 'vites
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import {
   DISCOVERY_INDEX_DRIFTS,
+  MAX_INDEX_SHAPE_DIGESTS,
   discoveryIndexEntryOf,
   noDiscoveryJobRecordedAfterIn,
   readDiscoveryIndex,
@@ -24,6 +25,8 @@ import { closeControlDatabase, openControlDatabase, type ControlDatabase } from 
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { withReadTransaction } from '../../src/control/store/transaction.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import { ControlStoreError } from '../../src/control/store/store-errors.js';
+import { notObservedSubmissionProbeOf, type SubmissionProbeRecord } from '../../src/discovery/submission-probe-contracts.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import { MAX_DISCOVERY_READ_PAGE_PATHS } from '../../src/discovery/discovery-result.js';
@@ -137,6 +140,10 @@ describe('discovery index entries (T27c)', () => {
       hasStateField: false,
       // T31e: 型にした識別の digest の一覧（画面と送信先の `1` の区切りの組 1 つ）。
       templatedIdentityDigests: templatedIdentityDigestsOf(UPDATE, isRecordIdValue),
+      // T38d: probe のない候補は、型を持たない（空の一覧）。
+      shapeDigests: [],
+      // T38R-fix の I-1: 鍵と欄の対応の digest の一覧も、probe のない候補は空。
+      keyFieldDigests: [],
     });
     // 区切りの組は、値が登録の ID の形に合う同じ値の組すべて（`admin`・`items`・`1` の 3 組）。
     expect(discoveryIndexEntryOf(UPDATE).templatedIdentityDigests).toHaveLength(3);
@@ -148,7 +155,7 @@ describe('discovery index entries (T27c)', () => {
   it('has no input for values, tokens, labels, button texts or field names in the types', () => {
     expectTypeOf<keyof DiscoveryIndexEntry>().toEqualTypeOf<
       'identityDigest' | 'ruleDigest' | 'classification' | 'reasonCode' | 'pagePath' | 'actionPath' | 'formMethod' | 'methodOverride' | 'hasStateField'
-      | 'templatedIdentityDigests'
+      | 'templatedIdentityDigests' | 'shapeDigests' | 'keyFieldDigests'
     >();
     expectTypeOf<keyof DiscoveryIndexUpdate>().toEqualTypeOf<'profileId' | 'jobId' | 'at' | 'entries' | 'readPagePaths'>();
   });
@@ -440,5 +447,118 @@ describe('T31e: the templated identity digests of the discovery index', () => {
       })).toThrow(RangeError);
     }
     expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
+  });
+});
+
+describe('T38d: the shape digests of the discovery index', () => {
+  const SHAPE_A = `sha256:${'1'.repeat(64)}`;
+  const SHAPE_B = `sha256:${'2'.repeat(64)}`;
+  const SHAPE_C = `sha256:${'3'.repeat(64)}`;
+  const SHAPE_D = `sha256:${'4'.repeat(64)}`;
+
+  /**
+   * probe の結果を付けた候補（型の digest だけを使う。T38a の後の probe は `inputFields` を持つ）。T38R-fix の C-1: 索引に入れるのは書き込みの probe
+   * （`API_CREATE`・`API_UPDATE`）の型だけなので、結果は `API_UPDATE`（`result` で変えられる）。
+   */
+  const probed = (
+    candidate: DiscoveryCandidate,
+    shapeDigest: string | null,
+    withInputFields = true,
+    result: SubmissionProbeRecord['result'] = 'API_UPDATE',
+  ): DiscoveryCandidate => {
+    const { inputFields: _inputFields, ...withoutFields } = notObservedSubmissionProbeOf('PRESS_FAILED');
+    const written = { ...withoutFields, result, reason: null };
+    const probe: SubmissionProbeRecord = withInputFields ? { ...written, inputFields: [], shapeDigest } : { ...written, shapeDigest };
+    return { ...candidate, submissionProbe: probe };
+  };
+
+  const shapeDigestsOf = (identityDigest: string): readonly string[] | null | undefined =>
+    readDiscoveryIndex(database, PROFILE_ID).candidates.find((candidate) => candidate.identityDigest === identityDigest)?.shapeDigests;
+
+  it('takes the shape digest of a probe with the input fields, and no shape from a probe without them (before T38a) or without a shape', () => {
+    expect(discoveryIndexEntryOf(probed(UPDATE, SHAPE_A)).shapeDigests).toEqual([SHAPE_A]);
+    expect(discoveryIndexEntryOf(probed(UPDATE, SHAPE_A, false)).shapeDigests).toEqual([]);
+    expect(discoveryIndexEntryOf(probed(UPDATE, null)).shapeDigests).toEqual([]);
+    expect(discoveryIndexEntryOf(UPDATE).shapeDigests).toEqual([]);
+    expect(Object.isFrozen(discoveryIndexEntryOf(probed(UPDATE, SHAPE_A)).shapeDigests)).toBe(true);
+    // T38R-fix の C-1: 書き込みの probe でない結果（2 つの要求の `NOT_EXECUTABLE` など）の型は入れない。I-1: 鍵と欄の対応の digest も同じ行だけ。
+    expect(discoveryIndexEntryOf(probed(UPDATE, SHAPE_A, true, 'NOT_EXECUTABLE'))).toMatchObject({ shapeDigests: [], keyFieldDigests: [] });
+    expect(discoveryIndexEntryOf(probed(UPDATE, SHAPE_A)).keyFieldDigests).toHaveLength(1);
+  });
+
+  it('joins the shapes of the rows of one identity in a job (sorted, distinct), and rewrites them at the next discovery without a drift', () => {
+    const first = recordDiscoveryCandidates(database, {
+      ...update('job-1', FIRST_AT, [UPDATE]),
+      entries: entries(probed(UPDATE, SHAPE_B), probed(UPDATE, SHAPE_A), probed(UPDATE, SHAPE_B), UPDATE, BUTTON),
+      readPagePaths: ['/admin', '/admin/items/1'],
+    });
+    expect(first.NEW).toEqual(sorted(UPDATE.identityDigest, BUTTON.identityDigest));
+    expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([SHAPE_A, SHAPE_B]);
+    expect(shapeDigestsOf(BUTTON.identityDigest)).toEqual([]);
+    // 次の発見で、今回の一覧に書き直す（型の違いはドリフトに数えない）。
+    const second = recordDiscoveryCandidates(database, {
+      ...update('job-2', SECOND_AT, [UPDATE]), entries: entries(probed(UPDATE, SHAPE_C)), readPagePaths: ['/admin/items/1'],
+    });
+    expect(second.UNCHANGED).toEqual([UPDATE.identityDigest]);
+    expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([SHAPE_C]);
+    // 変わった候補（規則の digest が違う）も、今回の一覧で書く。
+    expect(recordDiscoveryCandidates(database, {
+      ...update('job-3', THIRD_AT, [SEARCH]), entries: entries(probed(SEARCH, SHAPE_A)),
+    }).NEW).toEqual([SEARCH.identityDigest]);
+    expect(recordDiscoveryCandidates(database, {
+      ...update('job-4', THIRD_AT, [SEARCH_REQUIRED]), entries: entries(probed(SEARCH_REQUIRED, SHAPE_B)),
+    }).CHANGED).toEqual([SEARCH.identityDigest]);
+    expect(shapeDigestsOf(SEARCH.identityDigest)).toEqual([SHAPE_B]);
+  });
+
+  it('still rejects two entries of one identity whose other contents differ', () => {
+    expect(() => recordDiscoveryCandidates(database, {
+      ...update('job-1', FIRST_AT, [SEARCH]), entries: entries(probed(SEARCH, SHAPE_A), probed(SEARCH_REQUIRED, SHAPE_B)),
+    })).toThrow(RangeError);
+    expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
+  });
+
+  it('rejects shape digests of another form, unsorted, repeated, or more than the limit after the join, and writes nothing', () => {
+    const entry = discoveryIndexEntryOf(UPDATE);
+    for (const shapeDigests of [
+      ['not a digest'],
+      [SHAPE_A, SHAPE_A],
+      [SHAPE_B, SHAPE_A],
+      [SHAPE_A, SHAPE_B, SHAPE_C, SHAPE_D],
+    ]) {
+      expect(() => recordDiscoveryCandidates(database, {
+        profileId: PROFILE_ID, jobId: 'job-1', at: FIRST_AT, entries: [{ ...entry, shapeDigests }], readPagePaths: ['/admin/items/1'],
+      }), JSON.stringify(shapeDigests)).toThrow(RangeError);
+    }
+    expect(MAX_INDEX_SHAPE_DIGESTS).toBe(3);
+    expect(() => recordDiscoveryCandidates(database, {
+      profileId: PROFILE_ID, jobId: 'job-1', at: FIRST_AT, readPagePaths: ['/admin/items/1'],
+      entries: [{ ...entry, shapeDigests: [SHAPE_A, SHAPE_B] }, { ...entry, shapeDigests: [SHAPE_C, SHAPE_D] }],
+    })).toThrow(RangeError);
+    expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
+  });
+
+  it('reads the rows without shape digests (written before version 13) as null, and writes them at the next discovery', () => {
+    recordDiscoveryCandidates(database, { ...update('job-1', FIRST_AT, [UPDATE]), entries: entries(probed(UPDATE, SHAPE_A)) });
+    const raw = new DatabaseSync(resolveControlDatabasePath(workDirectory));
+    try {
+      raw.prepare('UPDATE discovery_candidates SET shape_digests = NULL').run();
+    } finally {
+      raw.close();
+    }
+    expect(shapeDigestsOf(UPDATE.identityDigest)).toBeNull();
+    recordDiscoveryCandidates(database, { ...update('job-2', SECOND_AT, [UPDATE]), entries: entries(probed(UPDATE, SHAPE_B)) });
+    expect(shapeDigestsOf(UPDATE.identityDigest)).toEqual([SHAPE_B]);
+  });
+
+  it('fails as a broken database when the stored shape digests are not a sorted list of digests', () => {
+    recordDiscoveryCandidates(database, { ...update('job-1', FIRST_AT, [UPDATE]), entries: entries(probed(UPDATE, SHAPE_A)) });
+    const raw = new DatabaseSync(resolveControlDatabasePath(workDirectory));
+    try {
+      raw.prepare('UPDATE discovery_candidates SET shape_digests = ?').run(JSON.stringify([SHAPE_B, SHAPE_A]));
+    } finally {
+      raw.close();
+    }
+    expect(() => readDiscoveryIndex(database, PROFILE_ID)).toThrow(ControlStoreError);
   });
 });

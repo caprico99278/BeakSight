@@ -10,6 +10,8 @@ import {
   type AutoLoginWorkerEntryOptions,
   type ManualLoginStageOfEntry,
 } from '../helpers/auto-login-worker-entry.js';
+import { CHROMIUM_SHARED_WORKERS_DISABLED_ARGS, CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS } from '../../src/browser/chromium-launch.js';
+import { TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from '../helpers/test-chromium-args.js';
 
 const KEY = 'ab'.repeat(32);
 const RECORD = 'C:\\work\\manual-login-stage.log';
@@ -59,9 +61,15 @@ describe('the test entry of a worker that uses the automated login (CC-091)', ()
 
   it('replaces the automated login Browser only for the test default launch, and the credential store only when it is portable', () => {
     expect(sourceOf({ launch: 'test-default' })).toContain('automatedLoginStage: { launchAutomatedLoginBrowser: launchLoginBrowser },');
-    expect(sourceOf({ launch: 'test-default' })).toContain('chromium.launch({ headless: true, args: [...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS] })');
+    // CC-098: テストの既定の起動は 1 か所の式（`TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE`）で、WebRTC と Shared Worker の引数を含む。
+    expect(sourceOf({ launch: 'test-default' })).toContain(TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE);
+    for (const arg of [...CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS, ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS]) {
+      expect(TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE).toContain(JSON.stringify(arg));
+    }
     expect(sourceOf({ launch: 'cli' })).not.toContain('automatedLoginStage');
-    expect(sourceOf({ launch: 'cli' })).toContain('chromium.launch(chromiumLaunchOptions({ headless: true }))');
+    // EL-12: CLI の起動は、本番と同じ起動の部品（`launchChromium`）で行う。
+    expect(sourceOf({ launch: 'cli' })).toContain('launchChromium({ headless: true })');
+    expect(sourceOf({ launch: 'cli' })).toContain("import { launchChromium } from './dist/browser/chromium-launch.js';");
     expect(sourceOf({ portableCredentialStore: true })).toContain('protector: portableProtector,');
     expect(sourceOf({ portableCredentialStore: false })).not.toContain('openCredentialStore');
   });

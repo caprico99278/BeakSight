@@ -30,7 +30,7 @@ import { PageAuditor, type PageAuditorDependencies } from '../../src/orchestrati
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS, type TestConfigOverrides } from '../helpers/test-config.js';
 
@@ -55,7 +55,7 @@ useHeadlessChromium((launched) => {
 
 afterEach(async () => {
   // テストが失敗しても、次のテストに Context を残さない。ただし、黙って閉じるだけにせず、残っていたらテストを失敗にする（R14 の m4）。
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -147,7 +147,7 @@ async function auditFixture(pathname: string, options: AuditOptions = {}): Promi
   const startedAtMs = Date.now();
   const outcome = await auditor.audit(url, allocator.allocatePageId());
   const elapsedMs = Date.now() - startedAtMs;
-  const remainingContextCount = browser.contexts().length;
+  const remainingContextCount = testContextsOf(browser).length;
   // どの監査の後にも、ブラウザに Context が残っていない（R14 の m4）。
   expect(remainingContextCount, 'Contexts left in the browser after audit()').toBe(0);
   return { outcome, config, factory, remainingContextCount, elapsedMs };

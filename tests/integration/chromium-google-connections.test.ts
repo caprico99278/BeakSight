@@ -19,13 +19,14 @@
 // （スクリーンショット、DOM の Evidence、Guard の判定と記録）が変わらないことを、引数を足す前と後の起動で比べて確かめる。
 // 公開監査の不変の一部として、Playwright の既定で止めている HttpsUpgrades が効き出していないこと（`http://` の名前を開いて `:443` への
 // 試みがないこと）も確かめる。対照（Playwright の既定の `--disable-features` を上書きする起動）で `:443` への試みが出ることを先に確かめる。
-import { chromium, type Browser } from 'playwright';
+import type { Browser } from 'playwright';
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
   CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
   CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
   chromiumLaunchOptions,
+  launchChromiumWith,
 } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
@@ -136,7 +137,9 @@ async function recordCliChromium(
   try {
     const options = chromiumLaunchOptions({ headless: true });
     const removeArgs = variation.removeArgs ?? [];
-    const browser = await chromium.launch({
+    // EL-12: 本番と同じ起動の部品（一時のプロファイルの外部のアプリの起動を止める設定と自己検査）で起動する（persistent のプロファイルでも、Chromium 自身の
+    // Google への接続が増えないことを確かめる）。
+    const browser = await launchChromiumWith({
       ...options,
       args: [
         ...(options.args ?? []).filter((arg) => !removeArgs.includes(arg)),

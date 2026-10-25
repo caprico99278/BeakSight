@@ -20,7 +20,7 @@ import type { RunCommandDependencies } from '../../src/cli/run-command.js';
 import { artifactFilePath, checkpointArtifactRelativePath, isBundleFileName, runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import { createRunId } from '../../src/core/ids.js';
 import { readToolVersion } from '../../src/orchestration/environment.js';
-import { createRunLock, currentProcessRunLockHost } from '../../src/orchestration/run-checkpoint.js';
+import { createRunLock, currentProcessRunLockHost } from '../../src/core/process-lock.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
 import { CLI_TEXT, countWithPeakPerMinuteText, countWithRecentAndPeakPerMinuteText } from '../../src/presentation/messages.js';
 import { ArtifactWriter } from '../../src/report/artifact-writer.js';

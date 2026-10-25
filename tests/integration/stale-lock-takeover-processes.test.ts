@@ -23,15 +23,16 @@ import {
   outputStartLockPath,
 } from '../../src/core/artifact-layout.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
-import { createRunLock, currentProcessRunLockHost, isProcessRunning } from '../../src/orchestration/run-checkpoint.js';
+import { createRunLock, currentProcessRunLockHost, isProcessRunning } from '../../src/core/process-lock.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
 import { launchCliChromium } from '../helpers/chromium.js';
 import { runCliProcess, type CliProcessResult } from '../helpers/cli-process.js';
 import { captureCliOutput, cliTargetConfig } from '../helpers/run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 
-/** 場面ごとの回の数（レビュー担当の確かめでは、直す前に 4 回中 1 回、両方が再開した）。 */
-const ROUNDS_PER_SCENARIO = 20;
+/** 場面ごとの回の数（レビュー担当の確かめでは、直す前に 4 回中 1 回、両方が再開した）。値は `test-rounds.ts`（TS-b。ふだんの組と全部の組）。 */
+const ROUNDS_PER_SCENARIO = roundsOf('staleLockTakeoverPerScenario');
 const SUITE_TIMEOUT_MS = 1_800_000;
 const START_PATH = '/crawl/index.html';
 /** 中断した Run を作るときに、止める印を付ける前に監査を終えるページの数。 */

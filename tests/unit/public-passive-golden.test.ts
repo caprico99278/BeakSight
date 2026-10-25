@@ -90,11 +90,16 @@ describe('T22c golden: classifyPassiveRequest for PUBLIC_PASSIVE (design 4.5 I02
   });
 });
 
-/** 成果物のスキーマの版の golden（`schemas/<name>.schema.json` の `$id` と `properties.schemaVersion.const`）。作成の時点の値。 */
-const SCHEMA_VERSION_GOLDEN: readonly (readonly [name: string, id: string, schemaVersion: string])[] = [
+/**
+ * 成果物のスキーマの版の golden（`schemas/<name>.schema.json` の `$id` と `properties.schemaVersion.const`。読める版が複数のスキーマは
+ * `properties.schemaVersion.enum`）。作成の時点の値。
+ * BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 5。BeakSight の遮断の記録の印を足すため、page.json の版を上げた）: page は、
+ * `page-schema/1.1` を書く（`$id` は変えない）。LG-4（テストの組の設計書 3.7.3）: 前の版 `page-schema/1.0` は読まなくなった（読める版は 1.1 だけ）。
+ */
+const SCHEMA_VERSION_GOLDEN: readonly (readonly [name: string, id: string, schemaVersion: string | readonly string[]])[] = [
   ['run', 'urn:beaksight:schema:run:1.0', 'run-schema/1.0'],
   ['audit', 'urn:beaksight:schema:audit:1.0', 'audit-schema/1.0'],
-  ['page', 'urn:beaksight:schema:page:1.0', 'page-schema/1.0'],
+  ['page', 'urn:beaksight:schema:page:1.0', ['page-schema/1.1']],
   ['checkpoint', 'urn:beaksight:schema:checkpoint:1.0', 'checkpoint-schema/1.0'],
   ['checkpoint-page', 'urn:beaksight:schema:checkpoint-page:1.0', 'checkpoint-page-schema/1.0'],
   ['finding', 'urn:beaksight:schema:finding:1.0', 'finding-schema/1.0'],
@@ -103,7 +108,7 @@ const SCHEMA_VERSION_GOLDEN: readonly (readonly [name: string, id: string, schem
 
 interface SchemaVersionFacts {
   readonly $id: unknown;
-  readonly properties?: { readonly schemaVersion?: { readonly const?: unknown } };
+  readonly properties?: { readonly schemaVersion?: { readonly const?: unknown; readonly enum?: unknown } };
 }
 
 const readSchemaVersionFacts = (name: string): SchemaVersionFacts =>
@@ -113,6 +118,10 @@ describe('T22c golden: artifact schema versions (design 4.5 I02)', () => {
   it.each(SCHEMA_VERSION_GOLDEN)('schemas/%s.schema.json keeps $id %s and schemaVersion %s', (name, id, schemaVersion) => {
     const schema = readSchemaVersionFacts(name);
     expect(schema.$id).toBe(id);
-    expect(schema.properties?.schemaVersion?.const).toBe(schemaVersion);
+    if (typeof schemaVersion === 'string') {
+      expect(schema.properties?.schemaVersion?.const).toBe(schemaVersion);
+    } else {
+      expect(schema.properties?.schemaVersion?.enum).toEqual(schemaVersion);
+    }
   });
 });

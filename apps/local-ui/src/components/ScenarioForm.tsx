@@ -8,15 +8,21 @@
  *   照らす READ の定義の誤りはその定義に、ほかは上のお知らせに）。画面の確かめ（数の範囲）は補助だけ。
  * - T31h-1: UPDATE の候補では、送る欄の選択の代わりに、UPDATE の指定の入力（`ScenarioUpdateFields`。台帳、path の型、欄の役割）を出す。変える欄が
  *   送る欄（`fieldNames`）、保つ欄が UPDATE の指定の `keepFieldNames` になる。UPDATE の指定の誤りは、その入力の近くに出す。
+ * - T38f: 型の digest で選んだ API の候補では、送る欄の選択と UPDATE の指定の代わりに、API の指定の入力（`ScenarioApiFields`）を出す。送る鍵が
+ *   送る欄（`fieldNames`）になり、送り方 `API` と API の指定を下書きに足す。照合の READ には、`{id}` つきの画面の path の READ の定義も選べる。
  */
 import { useState } from 'react';
 import type {
   ReadCheckReference,
+  ScenarioApiSpec,
   ScenarioDraftRejectionReason,
   ScenarioVerification,
   SideEffectConfirmation,
   SideEffectConfirmations,
 } from '../../../../src/control/approval-view.js';
+// PRE42-CC 組 UI-K（組 2 の引き継ぎ。CC-106）: シナリオの種類の値は、管理データに触れない純粋な owner から読む（文字列で比べない）。
+import { UPDATE_SCENARIO_KIND } from '../../../../src/core/scenario-kind.js';
+import { API_SCENARIO_TRANSPORT } from '../../../../src/core/scenario-transport.js';
 import { SIDE_EFFECT_CONFIRMATION_CATALOG, sortByDisplayOrder } from '../../../../src/presentation/catalog.js';
 import { formatCount, formatInteger } from '../../../../src/presentation/format.js';
 import {
@@ -29,6 +35,7 @@ import {
 import { candidateFieldConstraintsText, candidateFieldFlagsText } from '../display/candidate-fields';
 import { sideEffectConfirmationDisplay } from '../display/labels';
 import type {
+  ScenarioApiFormView,
   ScenarioCandidateView,
   ScenarioChangeView,
   ScenarioFormRulesView,
@@ -39,6 +46,7 @@ import type {
 } from '../server/scenario-functions';
 import { FieldFrame } from './FieldFrame';
 import { Notice } from './Notice';
+import { API_PLACED_REASONS, ScenarioApiFields, apiDraftOf, apiStateOf } from './ScenarioApiFields';
 import { ScenarioUpdateFields, UPDATE_PLACED_REASONS, updateDraftOf, updateStateOf } from './ScenarioUpdateFields';
 import { ScenarioVerificationFields, verificationInputOf, verificationStateOf } from './ScenarioVerificationFields';
 
@@ -56,6 +64,8 @@ export interface ScenarioFormInitial {
   readonly verification: ScenarioVerification;
   /** T31h-1: UPDATE の指定（作成の画面と CREATE は null）。 */
   readonly update: ScenarioUpdateView | null;
+  /** T38f: API の指定（作成の画面と FORM のシナリオは null）。 */
+  readonly api: ScenarioApiSpec | null;
 }
 
 /** 検証の指定の誤りの理由（T30g。検証の指定の欄の近くに出す）。 */
@@ -63,6 +73,8 @@ const VERIFICATION_REJECTION_REASONS: ReadonlySet<ScenarioDraftRejectionReason> 
   'SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS',
   'SCENARIO_VERIFICATION_PARAMETER_UNKNOWN',
   'SCENARIO_VERIFICATION_FIELD_NOT_SENT',
+  // T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の I-2）: API のシナリオの照合の READ の期待（T40R2-fix: 登録の ID の型は注意にした）。
+  'SCENARIO_API_READ_VERIFICATION_NOT_BOUND',
 ]);
 
 /** 送る内容（プロファイルと候補は、呼び出し側が足すか、サーバがシナリオから取る）。数の欄は、整数の文字でなければ文字のまま送る。 */
@@ -76,18 +88,23 @@ export interface ScenarioDraftContentInput {
   readonly verification: Readonly<Record<string, unknown>>;
   /** T31h-1: UPDATE の指定（UPDATE の候補だけ。形の確かめはサーバ）。 */
   readonly update?: Readonly<Record<string, unknown>>;
+  /** T38f: 送り方と API の指定（API の候補だけ。形の確かめはサーバ）。 */
+  readonly transport?: typeof API_SCENARIO_TRANSPORT;
+  readonly api?: Readonly<Record<string, unknown>>;
 }
 
 /** 数の欄の値（0 以上の整数の文字だけを数にする。ほかは文字のまま送り、サーバの形の確かめが拒む）。 */
 const NON_NEGATIVE_INTEGER = /^[0-9]+$/u;
 const numberValueOf = (value: string): number | string => (NON_NEGATIVE_INTEGER.test(value) ? Number(value) : value);
 
-export function ScenarioForm({ candidate, readChecks, rules, update, initial, onSave, onSaved, onReload }: Readonly<{
+export function ScenarioForm({ candidate, readChecks, rules, update, api, initial, onSave, onSaved, onReload }: Readonly<{
   candidate: ScenarioCandidateView;
   readChecks: readonly ScenarioReadCheckOptionView[];
   rules: ScenarioFormRulesView;
   /** T31h-1: UPDATE の候補のフォームの値（UPDATE の候補でなければ null）。 */
   update: ScenarioUpdateFormView | null;
+  /** T38f: API の候補のフォームの値（型の digest で選んだ API の候補だけ。ほかは null）。 */
+  api: ScenarioApiFormView | null;
   initial: ScenarioFormInitial;
   onSave: (content: ScenarioDraftContentInput) => Promise<ScenarioChangeView>;
   onSaved: (scenarioId: string) => void;
@@ -103,8 +120,11 @@ export function ScenarioForm({ candidate, readChecks, rules, update, initial, on
   const [saving, setSaving] = useState(false);
   const [rejection, setRejection] = useState<ScenarioRejectionView | null>(null);
   const [verification, setVerification] = useState(() => verificationStateOf(initial.verification));
+  // T38f: API の指定の入力（API の候補だけ。FORM の送る欄と UPDATE の指定の入力の代わり）。
+  const [apiState, setApiState] = useState(() => (api === null ? null : apiStateOf(api, initial.api)));
+  const apiDraft = api === null || apiState === null ? null : apiDraftOf(api, apiState);
   // T31h-1: UPDATE の指定の入力（UPDATE の候補だけ）。
-  const updateView = candidate.scenarioKind === 'UPDATE' ? update : null;
+  const updateView = candidate.scenarioKind === UPDATE_SCENARIO_KIND && api === null ? update : null;
   const [updateState, setUpdateState] = useState(() =>
     (updateView === null ? null : updateStateOf(candidate, updateView, initial.fieldNames, initial.update)));
   const updateDraft = updateView === null || updateState === null ? null : updateDraftOf(candidate, updateView, updateState);
@@ -119,7 +139,8 @@ export function ScenarioForm({ candidate, readChecks, rules, update, initial, on
   const generalCodes = rejection === null
     ? []
     : [...new Set(rejection.errors
-      .filter((error) => error.fieldName === null && error.readCheckId === null && !(updateDraft !== null && UPDATE_PLACED_REASONS.has(error.code)))
+      .filter((error) => error.fieldName === null && error.readCheckId === null && !(updateDraft !== null && UPDATE_PLACED_REASONS.has(error.code))
+        && !(apiDraft !== null && API_PLACED_REASONS.has(error.code)))
       .map((error) => error.code))];
   const toggle = (values: readonly string[], value: string, on: boolean): readonly string[] =>
     (on ? [...values.filter((current) => current !== value), value] : values.filter((current) => current !== value));
@@ -131,14 +152,17 @@ export function ScenarioForm({ candidate, readChecks, rules, update, initial, on
       onSubmit={(event) => {
         event.preventDefault();
         setSaving(true);
+        const formFieldNames = updateDraft === null ? candidate.fields.map((field) => field.name).filter((name) => fieldNames.includes(name)) : updateDraft.fieldNames;
         void onSave({
-          fieldNames: updateDraft === null ? candidate.fields.map((field) => field.name).filter((name) => fieldNames.includes(name)) : updateDraft.fieldNames,
+          fieldNames: apiDraft === null ? formFieldNames : apiDraft.fieldNames,
           readChecks: readChecks.filter(({ readCheckId }) => selectedChecks.includes(readCheckId)).map(({ readCheckId, revision }) => ({ readCheckId, revision })),
           sideEffectConfirmations: Object.fromEntries(items.map((item) => [item, confirmations[item]])) as Record<SideEffectConfirmation, boolean>,
           limits: { maxCreatesPerRun: numberValueOf(perRun), maxCumulativeCreates: numberValueOf(cumulative) },
           approvalTtlDays: numberValueOf(ttlDays),
-          verification: verificationInputOf(verification, readChecks),
+          // T40a-fix: API のシナリオは、成否の条件と入力の誤りの条件を送らない（null。使わない）。
+          verification: verificationInputOf(verification, readChecks, api !== null),
           ...(updateDraft === null ? {} : { update: updateDraft.update }),
+          ...(apiDraft === null ? {} : { transport: API_SCENARIO_TRANSPORT, api: apiDraft.api }),
         })
           .then((result) => {
             if (result.ok) {
@@ -180,7 +204,9 @@ export function ScenarioForm({ candidate, readChecks, rules, update, initial, on
         />
       )}
 
-      {updateView !== null ? null : <fieldset className="field-group" data-testid="scenario-fields">
+      {api === null || apiState === null ? null : <ScenarioApiFields view={api} state={apiState} onChange={setApiState} rejection={rejection} />}
+
+      {updateView !== null || api !== null ? null : <fieldset className="field-group" data-testid="scenario-fields">
         <legend className="field-group-heading">{text.fieldsHeading}</legend>
         <p className="field-hint">{text.fieldsNote}</p>
         {candidate.fields.length === 0 ? <p>{text.noFields}</p> : candidate.fields.map((field) => {
@@ -239,8 +265,13 @@ export function ScenarioForm({ candidate, readChecks, rules, update, initial, on
         state={verification}
         onChange={setVerification}
         readChecks={readChecks}
-        fieldNames={candidate.fields.filter((field) => field.rejection === null && (updateView === null || field.roleRequired)).map((field) => field.name)}
+        fieldNames={apiDraft !== null
+          ? apiDraft.fieldNames
+          : candidate.fields.filter((field) => field.rejection === null && (updateView === null || field.roleRequired)).map((field) => field.name)}
         errors={verificationErrors}
+        allowPageTemplate={api !== null}
+        api={api !== null}
+        writePagePath={candidate.pagePath}
       />
 
       <fieldset className="field-group" data-testid="scenario-limits">

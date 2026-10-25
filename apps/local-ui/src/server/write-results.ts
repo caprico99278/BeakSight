@@ -8,6 +8,7 @@
  *   新しい値と一致、保つ欄の一致だけ。保つ欄の値は記録にないので返さない）を足した。取れた ID は `recordId`。
  * - T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: 書き込みの報告（親の確かめの結果と、配るときだけ報告の HTML と書き込みのバンドルの
  *   URL のパス）を足した。配るかと URL は、成果物の一覧（`artifact-files.ts` の `listJobArtifacts`。親の確かめが `VALID` のジョブだけ）から決める。
+ * - T40d（Task 40 の設計書 3.5）: 送り方と API の型の要約（台帳の版 14 の `WriteResultView.transport`・`api`。値を持たない）を足した。
  */
 import type {
   ActionBlockReason,
@@ -17,8 +18,13 @@ import type {
   SettledReservationState,
   SubmissionState,
 } from '../../../../src/control/actions/action-contracts.js';
-import { readWriteResult, readWriteResults, type WriteResultView } from '../../../../src/control/actions/write-result-facts.js';
-import type { ScenarioKind } from '../../../../src/control/approval-view.js';
+import {
+  readWriteResult,
+  readWriteResults,
+  type WriteResultApiShape,
+  type WriteResultView,
+} from '../../../../src/control/actions/write-result-facts.js';
+import type { ScenarioKind, ScenarioTransport } from '../../../../src/control/approval-view.js';
 import type { ReadCheckResult } from '../../../../src/control/discovery-view.js';
 import type { WriteReportCheck } from '../../../../src/control/job/job-records.js';
 import { compareCodeUnits } from '../../../../src/core/text.js';
@@ -92,6 +98,10 @@ export interface WriteResultSummaryView {
   readonly submittedValues: readonly SubmittedValueView[];
   /** T32g: 書き込みの報告。 */
   readonly report: WriteReportView;
+  /** T40d: 送り方（版 14 の前の行は `FORM`）。 */
+  readonly transport: ScenarioTransport;
+  /** T40d: API の型の要約（型の digest、method、送り先の Origin、path の型。API の行だけ。FORM は null）。 */
+  readonly api: WriteResultApiShape | null;
 }
 
 /** 欄の名前の順（並べ方は core の比べ方 `compareCodeUnits`）。 */
@@ -155,6 +165,8 @@ const summaryOf = async (view: WriteResultView): Promise<WriteResultSummaryView>
     .map(([name, value]) => ({ name, value }))
     .sort((left, right) => compareCodeUnits(left.name, right.name)),
   report: await writeReportOf(view.jobId),
+  transport: view.transport,
+  api: view.api === null ? null : { ...view.api },
 });
 
 /** 書き込みのジョブの結果（なければ null）。 */

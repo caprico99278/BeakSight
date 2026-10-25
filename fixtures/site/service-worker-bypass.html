@@ -5,15 +5,18 @@
     <h1>Fixture Service Worker Bypass</h1>
     <p>This page registers a Service Worker on load, avoiding the instance override of the registration (DEF-049).</p>
     <script>
-      // DEF-049: 読み込みのときに、Playwright の `serviceWorkers: 'block'` の置き換え（`navigator.serviceWorker` のインスタンスの
+      // DEF-049: 読み込みのときに、Playwright 1.62.1 までの `serviceWorkers: 'block'` の置き換え（`navigator.serviceWorker` のインスタンスの
       // `register`）を迂回して、Service Worker を登録する。Service Worker の script は、install と activate で /__mutation へ POST を送る。
+      // UPG-SW: Playwright 1.64.1 の `block` は `ServiceWorkerContainer.prototype.register` を置き換えるので、Guard がなくても `block` の
+      // Context では、どの迂回も登録せずに解決する（`resolved-without-registration`）。Guard の付いた Context では、Guard の拒否になる
+      // （`rejected:NotSupportedError:<文言>`。T44R2 の M-2）。登録できるのは、ブラウザが登録を許す Context（`serviceWorkers: 'allow'`）だけである。
       // - クエリ `way`: 迂回の方法。`prototype`（`ServiceWorkerContainer.prototype.register.call`）、`delete`（インスタンスの `register` を
       //   消した後の呼び出し）。
       // - クエリ `where`: 呼び出す場所。`top`（この文書）、`iframe`（同じ Origin の iframe の文書。その iframe の `navigator.serviceWorker`
       //   と `ServiceWorkerContainer` を使う）、`blank`（動的に作った about:blank の iframe の realm の `register` を、この文書の
       //   `navigator.serviceWorker` に対して呼ぶ。about:blank の文書は、自分の `navigator.serviceWorker` では登録できない（InvalidStateError）
       //   ので、関数だけを借りる）。
-      // 結果は、html 要素の data-service-worker-bypass に残す（`registered`、`threw:<文言>`、`rejected:<文言>`、`unavailable`、
+      // 結果は、html 要素の data-service-worker-bypass に残す（`registered`、`threw:<文言>`、`rejected:<名前>:<文言>`、`unavailable`、
       // `unknown-way`、`unknown-where`）。ページのスクリプト自身は、GET・HEAD 以外の要求を送らない。
       const params = new URLSearchParams(location.search);
       const way = params.get('way');
@@ -54,7 +57,7 @@
         }
         Promise.resolve(pending).then(
           (registration) => report(registration ? 'registered' : 'resolved-without-registration'),
-          (error) => report(`rejected:${messageOf(error)}`),
+          (error) => report(`rejected:${error?.name}:${messageOf(error)}`),
         );
       };
       if (where === 'top') {

@@ -231,7 +231,9 @@ describe('audit worker in a child process (Task 24 design 4.2, 4.3)', () => {
     expect(types[0]).toBe('READY');
     expect(types[1]).toBe('RUN_STARTED');
     expect(types.at(-1)).toBe('FINISHED');
-    expect(types.slice(2, -1).every((type) => type === 'PROGRESS' || type === 'NOTICE')).toBe(true);
+    // DEF-143: 「Run の終わり」の段に入る知らせ（`RUN_FINALIZING`）は、`FINISHED` の直前に 1 回。
+    expect(types.at(-2)).toBe('RUN_FINALIZING');
+    expect(types.slice(2, -2).every((type) => type === 'PROGRESS' || type === 'NOTICE')).toBe(true);
     expect(types.filter((type) => type === 'PROGRESS').length).toBeGreaterThan(0);
     expect(types).not.toContain('INVALID');
     expect(worker.messages.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);

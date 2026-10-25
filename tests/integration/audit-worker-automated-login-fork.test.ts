@@ -14,7 +14,7 @@
 // 自動ログインは Windows だけで動く（サーバの開始の確かめで強制する。round 1）ので、この端から端は Windows だけで行い、ほかでは理由を出して飛ばす。
 // サーバは 127.0.0.1 だけで待ち受ける。作業のディレクトリ、
 // 管理データ、資格情報のフォルダ、出力先は、一時のフォルダだけ。
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -23,11 +23,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { loadConfig } from '../../src/config/load-config.js';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION } from '../../src/control/contracts.js';
 import { createCredentialStore, type CredentialStore } from '../../src/control/credentials/credential-store.js';
 import { createAuditJobManager, type AuditJobManager, type AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
@@ -38,6 +37,8 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import { wait } from '../../src/core/deadline.js';
+import { createRecordingFork, hideJobBrowser } from '../helpers/worker-fork-support.js';
 import {
   AUTH_SITE_LOGIN_FIELDS,
   AUTH_SITE_PATHS,
@@ -214,22 +215,19 @@ async function writeEntry(launch: Launch, portable: boolean, key: string): Promi
 }
 
 /** IPC と標準出力・標準エラーを記録しながら fork する。 */
-const recordingFork: AuditWorkerForker = (modulePath, args, options: ForkOptions) => {
+const recordingFork: AuditWorkerForker = (modulePath, args, options) => {
   const space = current();
-  const child = fork(modulePath, [...args], { ...options, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-  children.push(child);
-  if (child.pid !== undefined) {
-    space.workerPids.push(child.pid);
-  }
-  child.on('message', (message: unknown) => space.received.push(message));
-  child.stdout?.setEncoding('utf8').on('data', (chunk: string) => { space.workerOutput += chunk; });
-  child.stderr?.setEncoding('utf8').on('data', (chunk: string) => { space.workerOutput += chunk; });
-  const send = child.send.bind(child) as (...sendArgs: unknown[]) => boolean;
-  child.send = ((message: unknown, ...rest: unknown[]): boolean => {
-    space.sent.push(message);
-    return send(message, ...rest);
-  }) as typeof child.send;
-  return child;
+  return createRecordingFork({
+    onChild: (child) => {
+      children.push(child);
+      if (child.pid !== undefined) {
+        space.workerPids.push(child.pid);
+      }
+    },
+    onReceived: (message) => space.received.push(message),
+    onOutput: (chunk) => { space.workerOutput += chunk; },
+    onSent: (message) => space.sent.push(message),
+  })(modulePath, args, options);
 };
 
 /** ターゲット設定を書き、プロファイルと認証の設定を保存する。 */
@@ -256,6 +254,8 @@ async function prepareProfile(origin: string, startPath: string, setup: AuthSetu
     environmentEvidenceRef: 'evidence/example-auto-fork/isolation-check-1',
   }, { resolveContext });
   expect(created.ok, JSON.stringify(created)).toBe(true);
+  // FM-2: テストのジョブのブラウザは今どおり headless。
+  hideJobBrowser(space.database, PROFILE_ID);
   const saved = saveAuthSetup(space.database, setup, { resolveContext });
   expect(saved.ok, JSON.stringify(saved)).toBe(true);
 }
@@ -298,7 +298,7 @@ async function expectNoProcessLeft(): Promise<void> {
       expect(workersDone).toBe(true);
       return;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
 }
 
@@ -330,7 +330,7 @@ const workerTypes = (space: Workspace): readonly string[] => space.received
 
 /** ログインの画面の fixture の認証の設定。 */
 const fixtureSetupOf = (variant: AutomatedLoginFormVariant, outcome: AutomatedLoginOutcome): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: fixture.formUrl(variant, outcome),
@@ -445,7 +445,7 @@ describe.skipIf(!IS_WINDOWS)(`T26d-2: the automated login jobs end to end${IS_WI
 
   /** 認証つきの fixture のサイトの、自動ログインの認証の設定。 */
   const siteSetupOf = (site: AuthenticatedSite): AuthSetup => ({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: PROFILE_ID,
     profileRevision: MIN_PROFILE_REVISION,
     loginStartUrl: `${site.originA}${AUTH_SITE_PATHS.login}`,

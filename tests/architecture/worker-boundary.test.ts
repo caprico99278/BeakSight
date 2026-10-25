@@ -13,14 +13,16 @@
  * - CCX-9（台帳の CC-054、CC-056）: 指定子の取り出し（`findModuleSpecifiers`）、import のたどり（`findImportChains`）、相対の指定子の
  *   解決（`resolveRelativeSpecifier`）は、`source-scan.ts` の共通の部品を使う（指定子を取り出す正規表現は、このファイルに書かない）。
  */
-import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  REPOSITORY_ROOT,
+  LOCAL_UI_APP_DIRECTORY,
   findImportChains,
+  isPathUnderAny,
+  loadLocalUiAppFiles,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  modulePattern,
+  pathReferenceCandidatesOf,
+  refersUnderAny,
   resolveRelativeSpecifier,
   scanSource,
   type ScannedSource,
@@ -30,31 +32,22 @@ import { WORKER_ALLOWED_CONTROL_FILES, WORKER_DIRECTORY, isAllowedWorkerControlR
 const CONTROL_DIRECTORY = 'src/control/';
 /** (k): ワーカーから、間接にも届いてはならないもの。 */
 const WORKER_FORBIDDEN_DIRECTORIES: readonly string[] = ['src/control/store/', 'src/control/job/'];
-const NODE_SQLITE_PATTERN = /^node:sqlite$/u;
-const APP_DIRECTORY = 'apps/local-ui/';
-const APP_TESTS_DIRECTORY = 'apps/local-ui/tests/';
-/** 読まないフォルダ（ビルドの出力と依存）。 */
-const APP_SKIPPED_DIRECTORIES: readonly string[] = ['apps/local-ui/dist/', 'apps/local-ui/node_modules/'];
-const APP_SOURCE_EXTENSION = /\.tsx?$/u;
+/** `node:sqlite`（`source-scan.ts` の `modulePattern`。`node:` のない形、下位のパス、文字列の中の `node:sqlite` も当てる。PRE42-CC 組 G）。 */
+const NODE_SQLITE_PATTERN = modulePattern(['sqlite']);
+const APP_TESTS_DIRECTORY = `${LOCAL_UI_APP_DIRECTORY}tests/`;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 参照の候補（指定子のすべてと、相対パスの文字列リテラル。同じ文字列は 1 つにまとめる）。 */
-const referencesOf = (source: ScannedSource): readonly string[] => moduleReferenceCandidatesOf(source, [NODE_SQLITE_PATTERN]);
+/** 参照の候補（指定子のすべてと、相対パス・`src/` のパス・`node:sqlite` の文字列リテラル。同じ文字列は 1 つにまとめる）。 */
+const referencesOf = (source: ScannedSource): readonly string[] => pathReferenceCandidatesOf(source, [NODE_SQLITE_PATTERN]);
 
-const isUnder = (path: string, directories: readonly string[]): boolean => directories.some((directory) => `${path}/`.startsWith(directory));
-
-/** `text`（指定子かリテラル）が、`directory`（`src/control/` など）の中を指すか。相対でない指定子は、パスの中の `src/<名前>/` で判定する。 */
-const pointsInto = (fromPath: string, text: string, directory: string): boolean => {
-  const resolved = resolveRelativeSpecifier(fromPath, text);
-  if (resolved !== null) {
-    return isUnder(resolved, [directory]);
-  }
-  const normalized = text.replaceAll('\\', '/');
-  return new RegExp(`(?:^|/)${directory.replace(/\/$/u, '')}(?:/|$)`, 'u').test(normalized);
-};
+/**
+ * `text`（指定子かリテラル）が、`directory`（`src/control/` など）の中を指すか。相対でない参照は、文字列の中の `src/` からのパス（区切りの `\` を
+ * 含む）で判定する（`source-scan.ts` の `refersUnderAny`。PRE42-CC 組 G）。
+ */
+const pointsInto = (fromPath: string, text: string, directory: string): boolean => refersUnderAny(fromPath, text, [directory]);
 
 /** (j): `src/worker/` のファイルの、許さない `src/control/` への参照。 */
 const findWorkerControlViolations = (path: string, source: ScannedSource): readonly string[] =>
@@ -78,7 +71,7 @@ const findTransitiveViolations = (
   if (sqlite && NODE_SQLITE_PATTERN.test(specifier)) {
     return specifier;
   }
-  return resolved !== null && isUnder(resolved, forbidden) ? resolved : undefined;
+  return resolved !== null && isPathUnderAny(resolved, forbidden) ? resolved : undefined;
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -174,19 +167,11 @@ describe('Worker boundary detectors', () => {
 // Gate
 // ---------------------------------------------------------------------------------------------------------------
 
-interface AppFile extends ScannedSource {
-  readonly path: string;
-}
-
 const SOURCE_FILES = loadSourceFiles();
 const WORKER_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(WORKER_DIRECTORY));
 const CONTROL_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(CONTROL_DIRECTORY));
-/** `apps/local-ui/` の `.ts`・`.tsx` を、1 回だけ列挙して読み込み、走査する（`dist/` と `node_modules/` を除く）。 */
-const APP_CODE_FILES: readonly AppFile[] = readdirSync(join(REPOSITORY_ROOT, APP_DIRECTORY), { recursive: true, encoding: 'utf8' })
-  .map((relativePath) => `${APP_DIRECTORY}${relativePath.replaceAll('\\', '/')}`)
-  .filter((path) => APP_SOURCE_EXTENSION.test(path) && !isUnder(path, APP_SKIPPED_DIRECTORIES) && !path.startsWith(APP_TESTS_DIRECTORY))
-  .sort()
-  .map((path) => ({ path, ...scanSource(readFileSync(join(REPOSITORY_ROOT, path), 'utf8')) }));
+/** `apps/local-ui/` の TypeScript（`dist/` と `node_modules/` を除く。`source-scan.ts` の `loadLocalUiAppFiles`）のうち、`tests/` の外。 */
+const APP_CODE_FILES = loadLocalUiAppFiles().filter((file) => !file.path.startsWith(APP_TESTS_DIRECTORY));
 
 describe('Worker boundary (Task 24 design 4.3)', () => {
   it('reads src/worker/, src/control/ and apps/local-ui/ once, and the worker uses the IPC contract', () => {

@@ -1,7 +1,7 @@
 // T27e（Task 27 の設計書 3 章、4.5、4.8、6 章）: READ の確かめのジョブの流れ（`src/worker/read-check-run.ts` の `executeReadCheckRun`）を、同じ
 // process の中で、本物の Chromium（headless だけ。テストの既定と、CLI の起動の設定の両方）と 127.0.0.1 の fixture のサーバ
 // （`discovery-site-fixture.ts` の `readCheckPages`）で確かめる結合テスト。ログインの段は通さず、fixture が作ったセッションを、認証つきの Run の
-// 指定（メモリの状態）で渡す（ログインの段からの端から端は `read-check-job-fork.test.ts`）。
+// 指定（メモリの状態）で渡す（ログインの段からの端から端は `discovery-job-fork.test.ts` の「T27e」の describe）。
 // - 対象の候補は、先に同じ fixture で発見の流れ（`executeDiscoveryRun`）を動かし、その `discovery.json` の候補から取る（識別の digest を手で
 //   書かない）。
 // - 照合: 各期待の種類の `MATCHED`・`NOT_MATCHED`、構造がないときの `UNDETERMINED`、HTTP の 4xx・5xx の `UNDETERMINED`。
@@ -24,7 +24,7 @@ import type { Browser } from 'playwright';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { WorkerStartReadCheck } from '../../src/control/worker-protocol.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, READ_EVIDENCE_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
@@ -48,6 +48,7 @@ import {
   type DiscoverySite,
   type DiscoverySiteRequest,
 } from '../helpers/discovery-site-fixture.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { createTestNavigationPacer, forwardingNavigationPacer } from '../helpers/navigation-pacer.js';
 import { TEST_FACTORY_OPTIONS, createTestConfig } from '../helpers/test-config.js';
 
@@ -60,7 +61,6 @@ const TEST_TIMEOUT_MS = 240_000;
 const NAVIGATION_INTERVAL_MS = 400;
 /** 発見で読む画面の数より大きい上限。 */
 const ENOUGH_PAGES = 50;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 const WAIT_POLL_MS = 20;
 const R = DISCOVERY_SITE_READ_CHECK_PATHS;
 
@@ -207,6 +207,8 @@ describe.each(LAUNCHERS)('T27e: the READ check job flow (%s)', (_name, launch) =
     const text = readFileSync(artifactFilePath(outcome.runDirectory, READ_EVIDENCE_ARTIFACT_FILE_NAME), 'utf8');
     const document = JSON.parse(text) as ReadEvidenceDocument;
     expect((await validateArtifact('read-evidence', document)).ok).toBe(true);
+    // AS-b: 結果の記録に、実効の監査の段の送信の扱いを残す（このファイルの設定は既定の読み取りだけ）。
+    expect(document.auditSendPolicy).toBe('READ_ONLY');
     return { outcome, document, text, sessionLost, starts };
   };
 
@@ -288,6 +290,28 @@ describe.each(LAUNCHERS)('T27e: the READ check job flow (%s)', (_name, launch) =
     const run = await runReadChecks(checks);
     expect(run.document.checks.map((check) => (check.state === 'EXECUTED' ? [check.result, check.detail, check.httpStatus, check.expectations] : [])))
       .toEqual([['UNDETERMINED', 'HTTP_ERROR_STATUS', 404, []], ['UNDETERMINED', 'HTTP_ERROR_STATUS', 500, []]]);
+  }, TEST_TIMEOUT_MS);
+
+  // PRE42-CC 組 R（CC-042）: 600 以上の決まっていない status も、今どおり誤りとして扱う（対象の画面の候補を読まない）。
+  it('treats a non-standard HTTP status of 600 or more of the target page as an error, and does not read its candidates', async () => {
+    site = await startDiscoverySite({ readCheckPages: true });
+    const broken = formOn(await discover(), R.brokenSearch);
+    // 対象の画面が 600 を返す（候補を読まないので、読めなかった画面として扱う。読めば候補が見つからない、になる）。
+    site.setPageFault(R.brokenSearch, { kind: 'STATUS', status: 600, times: 1 });
+    const target = await runReadChecks([readCheckOf(broken, { kind: 'missing' }, [{ kind: 'TEXT_CONTAINS', text: '誤り' }])]);
+    expect(target.document.checks.map((check) => (check.state === 'EXECUTED' ? [check.result, check.detail] : [check.state])))
+      .toEqual([['UNDETERMINED', 'TARGET_PAGE_UNREADABLE']]);
+  }, TEST_TIMEOUT_MS);
+
+  // DEF-164: READ の URL の画面が 600 以上の status を返しても、観察した status を捨てずに成果物を書く（判定は今どおり誤り）。成果物の `httpStatus` の
+  // 範囲は、Chromium が渡しうる値（`OBSERVABLE_HTTP_STATUS_RANGE`）。
+  it('writes the evidence with HTTP_ERROR_STATUS and the observed status when the READ URL returns 600 (DEF-164)', async () => {
+    site = await startDiscoverySite({ readCheckPages: true });
+    const broken = formOn(await discover(), R.brokenSearch);
+    site.setPageFault(R.broken, { kind: 'STATUS', status: 600 });
+    const run = await runReadChecks([readCheckOf(broken, { kind: 'missing' }, [{ kind: 'TEXT_CONTAINS', text: '誤り' }])]);
+    expect(run.document.checks.map((check) => (check.state === 'EXECUTED' ? [check.result, check.detail, check.httpStatus, check.expectations] : [check.state])))
+      .toEqual([['UNDETERMINED', 'HTTP_ERROR_STATUS', 600, []]]);
   }, TEST_TIMEOUT_MS);
 
   it('blocks a READ by the request policy before reading: an excluded path, a dangerous value and a secret-like name', async () => {

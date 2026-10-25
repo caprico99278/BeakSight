@@ -212,7 +212,8 @@ describe('RunCoordinator: the Safety summary of the Run counts every Ledger of t
     const marker = 'PROPFIND';
     const result = await runCrawl({ crawl: { maxPages: 1 } }, () => {
       const ledger = new SafetyLedger();
-      ledger.recordBlockedRequest({ method: marker, url: urlOf('/__ledger-marker'), reason: 'NON_READ_METHOD' });
+      // BN-a: 本物の Guard と同じく、要求の種類と時点も記録する（page.json の `page-schema/1.1` の形）。
+      ledger.recordBlockedRequest({ method: marker, url: urlOf('/__ledger-marker'), reason: 'NON_READ_METHOD', resourceType: 'other', phase: 'LOAD' });
       created.push(ledger);
       return ledger;
     });

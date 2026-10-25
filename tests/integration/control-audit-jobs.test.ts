@@ -15,30 +15,33 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { wait as pause } from '../../src/core/deadline.js';
 import { EXIT_CODES, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import {
   createAuditJobManager,
   type AuditJobContextResolver,
   type AuditJobManager,
+  type AuditJobManagerOptions,
   type AuditJobTiming,
   type AuditWorkerForker,
 } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
-import { createProfile, retireProfile } from '../../src/control/store/profile-store.js';
+import { createProfile, retireProfile, saveProfileDisplaySettings } from '../../src/control/store/profile-store.js';
 import { WORKER_PROTOCOL_VERSION, targetConfigDigestOf } from '../../src/control/worker-protocol.js';
-import { isProcessRunning } from '../../src/orchestration/run-checkpoint.js';
+import { isProcessRunning } from '../../src/core/process-lock.js';
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode } from '../helpers/fake-audit-worker.js';
 import { blockingAfterStartFork, createCountingFork } from '../helpers/worker-fork.js';
 import {
   CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   JOB_WAIT_LIMIT_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
   expectWorkersExited,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
 } from '../helpers/job-test-support.js';
@@ -74,18 +77,8 @@ const countingResolver = (resolver: AuditJobContextResolver = resolveTestContext
   return resolver(path);
 };
 
-const fakeWorker = (mode: FakeWorkerMode): FakeWorker => writeFakeWorker(workDirectory, mode, {
-  protocolVersion: WORKER_PROTOCOL_VERSION,
-  runId: FAKE_RUN_ID,
-  otherRunId: OTHER_RUN_ID,
-  heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-  exitCodes: {
-    complete: EXIT_CODES.COMPLETE,
-    partial: EXIT_CODES.PARTIAL,
-    interrupted: INTERRUPTED_EXIT_CODE,
-    configError: EXIT_CODES.CONFIG_ERROR,
-  },
-});
+const fakeWorker = (mode: FakeWorkerMode): FakeWorker =>
+  writeFakeWorker(workDirectory, mode, fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }));
 
 const managerWith = (
   worker: FakeWorker,
@@ -93,15 +86,18 @@ const managerWith = (
     readonly resolver?: AuditJobContextResolver;
     readonly forkWorker?: AuditWorkerForker;
     readonly timing?: Partial<AuditJobTiming>;
+    /** DEF-146: 結果の前に終わったワーカーの終わり方の受け手。 */
+    readonly onUnexpectedWorkerExit?: AuditJobManagerOptions['onUnexpectedWorkerExit'];
   } = {},
 ): AuditJobManager => {
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
+    workDirectory,
+    worker,
     resolveContext: countingResolver(options.resolver),
     forkWorker: options.forkWorker ?? countingFork,
-    timing: { ...CONTROL_JOB_TEST_TIMING, ...options.timing },
+    ...(options.timing === undefined ? {} : { timing: options.timing }),
+    ...(options.onUnexpectedWorkerExit === undefined ? {} : { onUnexpectedWorkerExit: options.onUnexpectedWorkerExit }),
   });
   return manager;
 };
@@ -326,10 +322,39 @@ describe('audit jobs: the messages of the worker', () => {
     expect(finished.lastProgress?.pagesFinished).toBe(2);
     expect(finished.startedAt).not.toBeNull();
     expect(finished.lastHeartbeatAt).not.toBeNull();
+    // FM-2: 表示の設定（既定は表示）を、ジョブの開始のときに読んで `START` に入れる。
     expect(worker.received()).toEqual([{
       protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: job.jobId, jobKind: 'AUDIT', targetConfigPath: PUBLIC_TARGET_PATH, startNew: true,
-      targetConfigSha256: targetConfigDigestOf(new TextEncoder().encode(TARGET_CONFIG_TEXT)),
+      targetConfigSha256: targetConfigDigestOf(new TextEncoder().encode(TARGET_CONFIG_TEXT)), showJobBrowser: true,
+      // AS-b: 監査の段の送信の扱い（既定は読み取りだけ）も、ジョブの開始のときに読んで入れる。
+      auditSendPolicy: 'READ_ONLY',
+      // PRE42-BN: 監査のジョブは、プロファイルの名前（画面の「名前（profileId）」）を入れる（ChatGPT 用バンドルのファイル名だけに使う）。
+      profileName: PROFILE_ID,
     }]);
+    await expectWorkersExited(children, { requireExitEvent: true });
+  }, TEST_TIMEOUT_MS);
+
+  // FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: 表示の設定を切ったプロファイルのジョブは、`START` で表示しないと渡す。
+  it('sends START with the display setting of the profile (not shown)', async () => {
+    expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false }).ok).toBe(true);
+    const worker = fakeWorker('finish');
+    const jobManager = managerWith(worker);
+    const job = await startedJob(jobManager);
+    await waitForJob(jobManager, job.jobId, isJobEnded);
+    expect(worker.received().find((message) => message['type'] === 'START')?.['showJobBrowser']).toBe(false);
+    await expectWorkersExited(children, { requireExitEvent: true });
+  }, TEST_TIMEOUT_MS);
+
+  // AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査の段の送信の扱いを切り替えたプロファイルの監査のジョブは、`START` でその扱いを渡す。
+  it('sends START with the audit send policy of the profile (PASS_EXCEPT_DELETE)', async () => {
+    expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' }).ok).toBe(true);
+    const worker = fakeWorker('finish');
+    const jobManager = managerWith(worker);
+    const job = await startedJob(jobManager);
+    await waitForJob(jobManager, job.jobId, isJobEnded);
+    const start = worker.received().find((message) => message['type'] === 'START');
+    expect(start?.['auditSendPolicy']).toBe('PASS_EXCEPT_DELETE');
+    expect(start?.['showJobBrowser']).toBe(false);
     await expectWorkersExited(children, { requireExitEvent: true });
   }, TEST_TIMEOUT_MS);
 
@@ -405,7 +430,7 @@ describe('audit jobs: the messages of the worker', () => {
     };
     const jobManager = managerWith(fakeWorker('malformed'), { forkWorker: slowKillFork });
     const job = await startedJob(jobManager);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, VIOLATION_SETTLE_MS));
+    await pause(VIOLATION_SETTLE_MS);
 
     expect(jobManager.getAuditJob(job.jobId)?.finishedAt).toBeNull();
     expect(jobManager.runningWorkerCount()).toBe(1);
@@ -483,10 +508,11 @@ class ScriptedChild extends EventEmitter {
     this.emit('message', { protocol: WORKER_PROTOCOL_VERSION, ...message });
   }
 
-  /** process が終わった（IPC は切らない）。 */
-  exit(code: number): void {
+  /** process が終わった（IPC は切らない）。DEF-146: シグナルで終わった形も出せる。 */
+  exit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code;
-    this.emit('exit', code, null);
+    this.signalCode = signal;
+    this.emit('exit', code, signal);
   }
 
   /** IPC が切れた。 */
@@ -505,10 +531,11 @@ const SCRIPTED_FINISHED = Object.freeze({
   outcome: { kind: 'RAN', exitCode: EXIT_CODES.COMPLETE, runId: FAKE_RUN_ID, runDirectory: FAKE_RUN_ID, runStatus: 'COMPLETE' },
 });
 
-const pause = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-
 /** 偽の子でジョブを始める（DEF-084）。起動のたびに、新しい偽の子を `scripted` に足す。 */
-async function startScriptedJob(timing: Partial<AuditJobTiming>): Promise<{
+async function startScriptedJob(
+  timing: Partial<AuditJobTiming>,
+  onUnexpectedWorkerExit?: AuditJobManagerOptions['onUnexpectedWorkerExit'],
+): Promise<{
   readonly jobManager: AuditJobManager;
   readonly job: AuditJobView;
   readonly scripted: readonly ScriptedChild[];
@@ -522,6 +549,7 @@ async function startScriptedJob(timing: Partial<AuditJobTiming>): Promise<{
       return child as unknown as ChildProcess;
     },
     timing,
+    ...(onUnexpectedWorkerExit === undefined ? {} : { onUnexpectedWorkerExit }),
   });
   const job = await startedJob(jobManager);
   return { jobManager, job, scripted };
@@ -616,6 +644,155 @@ describe('audit jobs: waiting for the last messages after the worker exits (DEF-
     await pause(DRAIN_TEST_TIMER_LIMIT_MS);
     expect(jobManager.getAuditJob(next.jobId)).toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_EXITED' });
     expect(jobManager.runningWorkerCount()).toBe(0);
+  }, TEST_TIMEOUT_MS);
+});
+
+/** DEF-143 のテストの時間（ms）。途絶えの上限は短く、見張りの間隔はさらに短くする。 */
+const FINALIZING_TEST_HEARTBEAT_TIMEOUT_MS = 300;
+const FINALIZING_TEST_WATCHDOG_INTERVAL_MS = 50;
+/** 段の知らせの後の、途絶えの上限（テストの値。途絶えの時間より十分に長い）。 */
+const FINALIZING_TEST_LONG_TIMEOUT_MS = 60_000;
+/** 段の知らせの後の、途絶えの上限（上限を過ぎることを確かめるテストの値）。 */
+const FINALIZING_TEST_SHORT_TIMEOUT_MS = 600;
+/** 合図が途絶える時間（ms。ふだんの上限の 3 倍以上）。 */
+const FINALIZING_TEST_SILENCE_MS = 1_000;
+/** 段の知らせの後の上限を過ぎるまで待つ時間（ms）。 */
+const FINALIZING_TEST_LONG_SILENCE_MS = 1_500;
+/** process の終わりを見つけるまでの上限（ms。段の知らせの後の上限より、ずっと短い）。 */
+const FINALIZING_TEST_EXIT_LIMIT_MS = 5_000;
+
+const SCRIPTED_HEARTBEAT = Object.freeze({ type: 'HEARTBEAT' });
+const SCRIPTED_RUN_FINALIZING = Object.freeze({ type: 'RUN_FINALIZING' });
+
+/** 見張りが、ワーカーを応答しないとして止めると決めたか（止める要求の kill の後、終わりの記録はワーカーが終わった後）。 */
+const endedWith = async (jobManager: AuditJobManager, jobId: string, child: ScriptedChild | undefined): Promise<AuditJobView> => {
+  endScripted(child);
+  return await waitForJob(jobManager, jobId, isJobEnded);
+};
+
+// DEF-143（設計書 `2026-10-20-beaksight-worker-heartbeat-heavy-steps-design.md` 4 章の判断）: ワーカーが「Run の終わり」の段の知らせ（`RUN_FINALIZING`）を
+// 送った後は、その段の間だけ、途絶えの上限を名前つきの長い時間にする。段の外の途絶えは、今どおりの上限で止める。process の終わりは、今どおりすぐ見つける。
+describe('audit jobs (DEF-143): the longer heartbeat limit of the finalizing stage', () => {
+  const finalizingTiming = (finalizingHeartbeatTimeoutMs: number): Partial<AuditJobTiming> => ({
+    heartbeatTimeoutMs: FINALIZING_TEST_HEARTBEAT_TIMEOUT_MS,
+    watchdogIntervalMs: FINALIZING_TEST_WATCHDOG_INTERVAL_MS,
+    watchdogLagLimitMs: FINALIZING_TEST_HEARTBEAT_TIMEOUT_MS / 2,
+    finalizingHeartbeatTimeoutMs,
+  });
+
+  it('does not stop the worker whose heartbeats stop after RUN_FINALIZING, and records the result', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob(finalizingTiming(FINALIZING_TEST_LONG_TIMEOUT_MS));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    child?.deliver(SCRIPTED_RUN_FINALIZING);
+    await pause(FINALIZING_TEST_SILENCE_MS);
+
+    expect(jobManager.getAuditJob(job.jobId)).toMatchObject({ state: 'RUNNING', finishedAt: null });
+    child?.deliver(SCRIPTED_FINISHED);
+    expect(await endedWith(jobManager, job.jobId, child)).toMatchObject({
+      state: 'FINISHED', runId: FAKE_RUN_ID, resultRunStatus: 'COMPLETE', exitCode: EXIT_CODES.COMPLETE, failureReason: null,
+    });
+  }, TEST_TIMEOUT_MS);
+
+  it('stops the worker as before when the heartbeats stop outside the finalizing stage', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob(finalizingTiming(FINALIZING_TEST_LONG_TIMEOUT_MS));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    await pause(FINALIZING_TEST_SILENCE_MS);
+
+    child?.deliver(SCRIPTED_FINISHED);
+    expect(await endedWith(jobManager, job.jobId, child)).toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_UNRESPONSIVE' });
+  }, TEST_TIMEOUT_MS);
+
+  it('stops the worker when the heartbeats stop longer than the limit of the finalizing stage', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob(finalizingTiming(FINALIZING_TEST_SHORT_TIMEOUT_MS));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    child?.deliver(SCRIPTED_RUN_FINALIZING);
+    await pause(FINALIZING_TEST_LONG_SILENCE_MS);
+
+    child?.deliver(SCRIPTED_FINISHED);
+    expect(await endedWith(jobManager, job.jobId, child)).toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_UNRESPONSIVE' });
+  }, TEST_TIMEOUT_MS);
+
+  it('finds the end of the worker process in the finalizing stage as before', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob(finalizingTiming(FINALIZING_TEST_LONG_TIMEOUT_MS));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    child?.deliver(SCRIPTED_RUN_FINALIZING);
+    endScripted(child);
+
+    expect(await waitForJob(jobManager, job.jobId, isJobEnded, { limitMs: FINALIZING_TEST_EXIT_LIMIT_MS }))
+      .toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_EXITED' });
+    expect(jobManager.runningWorkerCount()).toBe(0);
+  }, TEST_TIMEOUT_MS);
+
+  it('does not trust RUN_FINALIZING before READY', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob(finalizingTiming(FINALIZING_TEST_LONG_TIMEOUT_MS));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_RUN_FINALIZING);
+
+    expect(await endedWith(jobManager, job.jobId, child)).toMatchObject({ state: 'FAILED', failureReason: 'PROTOCOL_VIOLATION' });
+  }, TEST_TIMEOUT_MS);
+});
+
+/** DEF-143 の見張りの遅れのテストの時間（ms）。 */
+const LAG_TEST_HEARTBEAT_TIMEOUT_MS = 1_500;
+const LAG_TEST_WATCHDOG_INTERVAL_MS = 100;
+const LAG_TEST_LAG_LIMIT_MS = 750;
+/** 親（このテストの process）が main thread を止める時間（ms。途絶えの上限より長い）。 */
+const LAG_TEST_PARENT_BLOCK_MS = 2_000;
+/** 合図を届ける間隔（ms。偽の子の代わり）。 */
+const LAG_TEST_HEARTBEAT_INTERVAL_MS = 100;
+/** 親が止まった後に、見張りが何回か回るのを待つ時間（ms）。 */
+const LAG_TEST_SETTLE_MS = 500;
+
+/** main thread を `ms` の間止める（親自身が重い処理で止まった場面）。 */
+const blockMainThread = (ms: number): void => {
+  const until = performance.now() + ms;
+  while (performance.now() < until) {
+    // 止める。
+  }
+};
+
+// DEF-143（設計書 4 章の判断）: 親自身の main thread が止まっていた後は、見張りの回が、溜まった `HEARTBEAT` を受ける前に来ることがある（timers の段は、
+// IPC を読む段より先）。見張りの間隔が名前つきの量より大きく遅れた回は、判定しない（溜まった合図を受けてから、次の回で判定する）。
+describe('audit jobs (DEF-143): the watchdog after the parent itself was blocked', () => {
+  it('does not stop the worker when the watchdog runs late before the heartbeat that arrived during the block', async () => {
+    const { jobManager, job, scripted } = await startScriptedJob({
+      heartbeatTimeoutMs: LAG_TEST_HEARTBEAT_TIMEOUT_MS,
+      watchdogIntervalMs: LAG_TEST_WATCHDOG_INTERVAL_MS,
+      watchdogLagLimitMs: LAG_TEST_LAG_LIMIT_MS,
+    });
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    let heartbeats = setInterval(() => child?.deliver(SCRIPTED_HEARTBEAT), LAG_TEST_HEARTBEAT_INTERVAL_MS);
+    await pause(LAG_TEST_SETTLE_MS);
+
+    // 止まる直前に合図を受け、その後の合図は、止まっている間に届いて溜まったものとして、次の check の段（見張りの timers の段の後）で届ける。
+    clearInterval(heartbeats);
+    await new Promise<void>((resolvePromise) => {
+      setImmediate(() => {
+        child?.deliver(SCRIPTED_HEARTBEAT);
+        blockMainThread(LAG_TEST_PARENT_BLOCK_MS);
+        setImmediate(() => {
+          child?.deliver(SCRIPTED_HEARTBEAT);
+          resolvePromise();
+        });
+      });
+    });
+    heartbeats = setInterval(() => child?.deliver(SCRIPTED_HEARTBEAT), LAG_TEST_HEARTBEAT_INTERVAL_MS);
+    await pause(LAG_TEST_SETTLE_MS);
+    clearInterval(heartbeats);
+
+    expect(jobManager.getAuditJob(job.jobId)).toMatchObject({ state: 'RUNNING', finishedAt: null });
+    child?.deliver(SCRIPTED_FINISHED);
+    expect(await endedWith(jobManager, job.jobId, child)).toMatchObject({ state: 'FINISHED', resultRunStatus: 'COMPLETE' });
   }, TEST_TIMEOUT_MS);
 });
 
@@ -732,6 +909,45 @@ describe('audit jobs: the start and the end of the UI server', () => {
     expect(await jobManager.shutdownAuditJobs({ waitMs: CONTROL_JOB_TEST_TIMING.watchdogIntervalMs })).toEqual({ stopRequested: 1, killed: 1 });
     expect(jobManager.getAuditJob(job.jobId)).toMatchObject({ state: 'INTERRUPTED', failureReason: 'SERVER_SHUTDOWN' });
     await expectWorkersExited(children, { requireExitEvent: true });
+  }, TEST_TIMEOUT_MS);
+});
+
+// DEF-146: ワーカーが結果の前に終わった（落ちた）ときは、親が分かる終わり方（終了コード・シグナル）を受け手に 1 回だけ渡す（画面のサーバが記録のファイルに
+// 書く）。結果を受けた後の、ふつうの終わりでは渡さない。
+describe('audit jobs (DEF-146): the end of a worker that exited before its result', () => {
+  it('passes the exit code of a worker that exited without its result, once', async () => {
+    const exits: unknown[] = [];
+    const { jobManager, job, scripted } = await startScriptedJob({ ipcDrainWaitMs: DRAIN_TEST_WAIT_MS }, (event) => exits.push(event));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    child?.disconnect();
+    child?.exit(3);
+    expect(await waitForJob(jobManager, job.jobId, isJobEnded)).toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_EXITED' });
+    expect(exits).toEqual([{ jobId: job.jobId, jobKind: 'AUDIT', exitCode: 3, signal: null }]);
+  }, TEST_TIMEOUT_MS);
+
+  it('passes the signal of a worker that was ended by a signal', async () => {
+    const exits: unknown[] = [];
+    const { jobManager, job, scripted } = await startScriptedJob({ ipcDrainWaitMs: DRAIN_TEST_WAIT_MS }, (event) => exits.push(event));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.disconnect();
+    child?.exit(null, 'SIGKILL');
+    await waitForJob(jobManager, job.jobId, isJobEnded);
+    expect(exits).toEqual([{ jobId: job.jobId, jobKind: 'AUDIT', exitCode: null, signal: 'SIGKILL' }]);
+  }, TEST_TIMEOUT_MS);
+
+  it('does not pass the end of a worker that sent its result', async () => {
+    const exits: unknown[] = [];
+    const { jobManager, job, scripted } = await startScriptedJob({ ipcDrainWaitMs: DRAIN_TEST_WAIT_MS }, (event) => exits.push(event));
+    const child = scripted[0];
+    child?.deliver(SCRIPTED_READY);
+    child?.deliver(SCRIPTED_RUN_STARTED);
+    child?.deliver(SCRIPTED_FINISHED);
+    endScripted(child);
+    expect(await waitForJob(jobManager, job.jobId, isJobEnded)).toMatchObject({ state: 'FINISHED' });
+    expect(exits).toEqual([]);
   }, TEST_TIMEOUT_MS);
 });
 

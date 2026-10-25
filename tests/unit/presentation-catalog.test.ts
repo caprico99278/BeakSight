@@ -256,6 +256,13 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         tone: 'caution',
         description: 'ログインの状態が切れた（ログインの画面に移った）ため、そのページを監査せず、残りのページも監査せずに止めました。',
       },
+      // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いて止まった。core の一覧の並び（最後）に合わせる。
+      STOPPED_BY_SERVICE_REQUEST_LIMIT: {
+        label: 'API の要求の上限で停止',
+        order: 8,
+        tone: 'caution',
+        description: '承認したサービスの Origin（API など）への要求の上限に届いたため、残りのページを監査せずに止めました。1 分あたりの上限なら、再開すると続きを監査します。Run の全体の上限に届いたときは、再開してもすぐに止まります。',
+      },
     });
     expect(sortByDisplayOrder(RUN_EXECUTION_END_REASONS, RUN_EXECUTION_END_REASON_CATALOG)).toEqual([...RUN_EXECUTION_END_REASONS]);
   });

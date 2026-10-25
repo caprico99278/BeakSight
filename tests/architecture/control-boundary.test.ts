@@ -22,8 +22,11 @@ import {
   PLAYWRIGHT_PACKAGE_PATTERN,
   findModuleSpecifiers,
   findTransitiveForbiddenReferences,
+  isPathUnderAny,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  pathReferenceCandidatesOf,
+  referencedPathsOf,
+  refersUnderAny,
   resolveRelativeSpecifier,
   scanSource,
   withoutModuleExtension,
@@ -41,20 +44,17 @@ const CONTROL_DIRECTORY = 'src/control/';
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * ファイルが参照するモジュールの候補（指定子のすべてと、相対パスの文字列リテラル。同じ文字列は1つにまとめる）。指定子は、
+ * ファイルが参照するモジュールの候補（指定子のすべてと、相対パス・`src/` のパスの文字列リテラル。同じ文字列は1つにまとめる）。指定子は、
  * `source-scan.ts` の `findModuleSpecifiers`（CCX-9。import・`export … from`・動的 import・`require`・`createRequire`・テンプレート・
- * `getBuiltinModule`・`new URL(…, import.meta.url)`）から取る。
+ * `getBuiltinModule`・`new URL(…, import.meta.url)`）から取る（`pathReferenceCandidatesOf`。PRE42-CC 組 G）。
  */
-const moduleReferencesOf = (source: ScannedSource): readonly string[] => moduleReferenceCandidatesOf(source);
+const moduleReferencesOf = (source: ScannedSource): readonly string[] => pathReferenceCandidatesOf(source);
 
-/** (a): `text` が `src/control/` を指すか。 */
-const pointsIntoControl = (fromPath: string, text: string): boolean => {
-  const resolved = resolveRelativeSpecifier(fromPath, text);
-  if (resolved !== null) {
-    return `${resolved}/`.startsWith(CONTROL_DIRECTORY);
-  }
-  return /(?:^|[\\/])src[\\/]control(?:[\\/]|$)/u.test(text);
-};
+/**
+ * (a): `text` が `src/control/` を指すか（相対でない参照は、文字列の中の `src/` からのパス。区切りの `\` を含む。`source-scan.ts` の
+ * `refersUnderAny`）。
+ */
+const pointsIntoControl = (fromPath: string, text: string): boolean => refersUnderAny(fromPath, text, [CONTROL_DIRECTORY]);
 
 /** (a): `src/control/` を指す参照（`<参照>` の形）。監査のワーカーから許すファイルへの相対の参照（T24d）は除く。 */
 const findControlReferences = (path: string, source: ScannedSource): readonly string[] =>
@@ -67,26 +67,19 @@ const FORBIDDEN_FILES: readonly string[] = ['src/config/validate-config'];
 
 /** (b): リポジトリの根からのパスが、禁止の対象か。 */
 const isForbiddenPath = (path: string): boolean =>
-  FORBIDDEN_DIRECTORIES.some((directory) => `${path}/`.startsWith(directory)) || FORBIDDEN_FILES.includes(withoutModuleExtension(path));
+  isPathUnderAny(path, FORBIDDEN_DIRECTORIES) || FORBIDDEN_FILES.includes(withoutModuleExtension(path));
 
-/** (b): `text`（指定子かリテラル）が禁止の対象を指すか。 */
-const pointsToForbidden = (fromPath: string, text: string): boolean => {
-  const resolved = resolveRelativeSpecifier(fromPath, text);
-  if (resolved !== null) {
-    return isForbiddenPath(resolved);
-  }
-  // Playwright のパッケージ（`playwright`、`playwright-core`、`@playwright/*` とその下のパス、`@axe-core/playwright`。T22d、T22R の M3）の
-  // 名前は、`source-scan.ts` の `PLAYWRIGHT_PACKAGE_PATTERN`（CCX-27）。
-  return PLAYWRIGHT_PACKAGE_PATTERN.test(text)
-    || /(?:^|\/)src\/(?:browser|safety|orchestration)(?:\/|$)/u.test(text)
-    || /(?:^|\/)src\/config\/validate-config(?:\.[cm]?[jt]s)?$/u.test(text);
-};
+/**
+ * (b): `text`（指定子かリテラル）が禁止の対象を指すか。Playwright のパッケージ（`playwright`、`playwright-core`、`@playwright/*` とその下の
+ * パス、`@axe-core/playwright`。T22d、T22R の M3）の名前は、`source-scan.ts` の `PLAYWRIGHT_PACKAGE_PATTERN`（CCX-27）。指す先は、相対なら
+ * 解決したパス、相対でなければ文字列の中の `src/` からのパス（`referencedPathsOf`。PRE42-CC 組 G で最も広い形にそろえた）。
+ */
+const pointsToForbidden = (fromPath: string, text: string): boolean =>
+  PLAYWRIGHT_PACKAGE_PATTERN.test(text) || referencedPathsOf(fromPath, text).some(isForbiddenPath);
 
-/** (b): 禁止の対象を指す参照（`<参照>` の形）。文字列リテラルは、相対パスと、Playwright のパッケージの名前を数える。 */
-const findForbiddenReferences = (path: string, source: ScannedSource): readonly string[] => [...new Set([
-  ...moduleReferencesOf(source),
-  ...source.literals.filter((literal) => PLAYWRIGHT_PACKAGE_PATTERN.test(literal)),
-])].filter((text) => pointsToForbidden(path, text));
+/** (b): 禁止の対象を指す参照（`<参照>` の形）。文字列リテラルは、相対パスと、`src/` のパスと、Playwright のパッケージの名前を数える。 */
+const findForbiddenReferences = (path: string, source: ScannedSource): readonly string[] =>
+  pathReferenceCandidatesOf(source, [PLAYWRIGHT_PACKAGE_PATTERN]).filter((text) => pointsToForbidden(path, text));
 
 /**
  * (b) の間接の検査: `starts` から、実行時に読み込む相対の import を、`source-scan.ts` の `findImportChains`（CCX-9）でたどり、
@@ -182,6 +175,9 @@ describe('Control boundary detectors', () => {
       "import { AxeBuilder } from '@axe-core/playwright';",
       "import type { AxeBuilder } from '@axe-core/playwright';",
       "const axe = await import('@axe-core/playwright');",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスの文字列リテラル（`\` の区切りを含む）も見る。
+      "const entry = 'beaksight/src/safety/request-policy.js';",
+      "const entry = 'src\\\\config\\\\validate-config.ts';",
     ]) {
       expect(findForbiddenReferences(path, scanSource(line)), line).toHaveLength(1);
     }

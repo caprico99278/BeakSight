@@ -35,7 +35,10 @@ process.stdout.write(JSON.stringify(results));
 `;
 
 /** 成果物の検証の名前（`ArtifactSchemaName`）のすべて。 */
-const ARTIFACT_SCHEMA_NAMES = ['run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic', 'discovery'] as const;
+// T43c: 入口の確かめの成果物（`entry-check`。ジョブの管理と画面が、ワーカーの書いた `entry-check.json` を確かめる）を足した。
+const ARTIFACT_SCHEMA_NAMES = [
+  'run', 'audit', 'page', 'finding', 'checkpoint', 'checkpoint-page', 'site-unavailable-diagnostic', 'discovery', 'entry-check',
+] as const;
 
 const DISCOVERY_DOCUMENT = Object.freeze({
   schemaVersion: DISCOVERY_ARTIFACT_SCHEMA_VERSION,

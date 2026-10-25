@@ -54,6 +54,7 @@ import {
   INTERACTION_LIFECYCLE_REASON_CODES,
   INTERACTION_REASON_CODES,
   INTERACTION_REASON_CODES_BY_STATUS,
+  PAGE_SCHEMA_VERSION,
   SCROLL_INCOMPLETE_REASONS,
   URL_REJECTION_REASONS,
 } from '../../src/core/evidence-types.js';
@@ -91,7 +92,7 @@ import {
 import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger, safetyEventsEvidenceFromSnapshot } from '../../src/safety/safety-ledger.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
-import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
+import { NO_PACING_WAIT, NO_SETTLING_WAIT } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { sampleRunCheckpoint } from '../helpers/run-checkpoint-samples.js';
 import { buildIntoTemporaryDirectory, snapshotDirectory } from '../helpers/temporary-build.js';
@@ -168,6 +169,8 @@ const networkPayload = {
     method: 'GET',
     resourceType: 'script',
     errorText: 'net::ERR_FAILED',
+    blockedByBeakSight: false,
+    phase: 'LOAD',
     timing: networkTiming,
     isNavigationRequest: false,
     isMainFrame: null,
@@ -766,13 +769,14 @@ const sitemapMetadataPayload = {
 const safetyCandidateId = `interaction-candidate:${createSha256Fingerprint('safety')}`;
 const safetyPayload = {
   scope: 'PASSIVE',
+  load: { kind: 'PAGE_AUDIT' },
   blockedRequestsByMethod: { POST: 2 },
   blockedRequests: [
-    { method: 'POST', url: 'https://example.test/submit', reason: 'NON_READ_METHOD' },
-    { method: 'POST', url: 'https://example.test/submit', reason: 'NON_READ_METHOD' },
+    { method: 'POST', url: 'https://example.test/submit', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
+    { method: 'POST', url: 'https://example.test/submit', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
   ],
-  blockedNavigations: [{ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' }],
-  blockedWebSockets: [{ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' }],
+  blockedNavigations: [{ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' }],
+  blockedWebSockets: [{ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' }],
   blockedExternalActions: [
     { candidateId: safetyCandidateId, url: 'tel:0000', reason: 'EXTERNAL_ACTION' },
     { candidateId: safetyCandidateId, url: null, reason: 'DOWNLOAD' },
@@ -837,7 +841,7 @@ const evidenceTypes = Object.keys(evidenceSamples) as EvidenceType[];
 const validEvidence = evidenceSamples.network;
 
 const validPage = {
-  schemaVersion: 'page-schema/1.0',
+  schemaVersion: PAGE_SCHEMA_VERSION,
   pageId,
   pageUrl: 'https://example.test/catalog' as NormalizedHttpUrlEvidence,
   status: 'PARTIAL',
@@ -2092,11 +2096,11 @@ describe('T12d0: safety Evidence', () => {
 
   function ledgerWithEveryRecord(): SafetyLedger {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedRequest({ method: 'put', url: 'https://example.test/item', reason: 'NON_READ_METHOD' });
-    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
-    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET' });
+    ledger.recordBlockedRequest({ method: 'put', url: 'https://example.test/item', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+    ledger.recordBlockedNavigation({ method: 'GET', url: 'https://external.test/', reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
+    ledger.recordBlockedWebSocket({ url: 'wss://example.test/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
     // DEF-040（NP3）: Worker の中の WebSocket を CSP で止めた記録（Passive と凍結の後）。
-    ledger.recordBlockedWebSocket({ url: 'wss://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY' });
+    ledger.recordBlockedWebSocket({ url: 'wss://example.test/worker-socket', reason: 'WORKER_CONNECT_POLICY', phase: 'LOAD' });
     ledger.recordBlockedExternalAction({ candidateId: safetyCandidateId, url: null, reason: 'DOWNLOAD' });
     ledger.recordExcludedInteractionCandidate({ candidateId: safetyCandidateId, reason: 'NAVIGATION_HREF' });
     ledger.recordBlockedInteractionRequest({ method: 'POST', url: 'https://example.test/api', reason: 'INTERACTION_FROZEN' });
@@ -2127,7 +2131,11 @@ describe('T12d0: safety Evidence', () => {
   it.each(['PASSIVE', 'INTERACTION'] as const)(
     'accepts the %s payload that safetyEventsEvidenceFromSnapshot builds from a Ledger snapshot',
     async (scope) => {
-      const payload = safetyEventsEvidenceFromSnapshot(ledgerWithEveryRecord().snapshot(), scope);
+      const payload = safetyEventsEvidenceFromSnapshot(
+        ledgerWithEveryRecord().snapshot(),
+        scope,
+        scope === 'INTERACTION' ? { kind: 'INTERACTION', candidateIndex: 0 } : { kind: 'PAGE_AUDIT' },
+      );
 
       await expect(validateArtifact('page', withSafetyPayload(JSON.parse(JSON.stringify(payload)) as unknown)))
         .resolves.toEqual({ ok: true });
@@ -2135,7 +2143,7 @@ describe('T12d0: safety Evidence', () => {
   );
 
   it('accepts the payload of an empty Ledger', async () => {
-    const payload = safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE');
+    const payload = safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' });
 
     await expect(validateArtifact('page', withSafetyPayload(JSON.parse(JSON.stringify(payload)) as unknown)))
       .resolves.toEqual({ ok: true });
@@ -2154,15 +2162,15 @@ describe('T12d0: safety Evidence', () => {
     ['a fractional method count', { ...safetyPayload, blockedRequestsByMethod: { POST: 1.5 } }],
     ['a blocked request reason outside its closed list', {
       ...safetyPayload,
-      blockedRequests: [{ method: 'POST', url: 'https://example.test/', reason: 'INTERACTION_FROZEN' }],
+      blockedRequests: [{ method: 'POST', url: 'https://example.test/', reason: 'INTERACTION_FROZEN', resourceType: 'fetch', phase: 'LOAD' }],
     }],
     ['a blocked navigation reason outside its closed list', {
       ...safetyPayload,
-      blockedNavigations: [{ method: 'GET', url: 'https://external.test/', reason: 'NON_READ_METHOD' }],
+      blockedNavigations: [{ method: 'GET', url: 'https://external.test/', reason: 'NON_READ_METHOD', phase: 'LOAD' }],
     }],
     ['a blocked WebSocket reason outside its closed list', {
       ...safetyPayload,
-      blockedWebSockets: [{ url: 'wss://example.test/', reason: 'INTERACTION_FROZEN' }],
+      blockedWebSockets: [{ url: 'wss://example.test/', reason: 'INTERACTION_FROZEN', phase: 'LOAD' }],
     }],
     ['an excluded candidate reason outside the Interaction rejection reasons', {
       ...safetyPayload,
@@ -2326,7 +2334,7 @@ describe('C8: real collector output from local fixtures', () => {
             await factory.closePassiveContext(stressContext);
           },
         };
-      }, url, [320], { deadlineAtMs, beforeNavigation: NO_PACING_WAIT });
+      }, url, [320], { deadlineAtMs, beforeNavigation: NO_PACING_WAIT, settleBeforeLayout: NO_SETTLING_WAIT });
       const color = await collectColorEvidence(page);
       const networkEvidence = await network.snapshot();
       const performance = await performanceCollector.collect(page, networkEvidence, { deadlineAtMs });
@@ -2385,7 +2393,7 @@ describe('C8: real collector output from local fixtures', () => {
           evidence.push(evidenceRecord(
             'safety',
             (index + 1) * 100 + 50,
-            safetyEventsEvidenceFromSnapshot(pageLedger.snapshot(), 'PASSIVE'),
+            safetyEventsEvidenceFromSnapshot(pageLedger.snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' }),
           ));
         }
       }
@@ -2413,7 +2421,7 @@ describe('C8: real collector output from local fixtures', () => {
         });
         const { safety, ...interactionEvidence } = interaction;
         evidence.push(evidenceRecord('interaction', 900, interactionEvidence));
-        evidence.push(evidenceRecord('safety', 901, safetyEventsEvidenceFromSnapshot(safety, 'INTERACTION')));
+        evidence.push(evidenceRecord('safety', 901, safetyEventsEvidenceFromSnapshot(safety, 'INTERACTION', { kind: 'INTERACTION', candidateIndex: 0 })));
       }
 
       expect(new Set(evidence.map((record) => record.type))).toEqual(

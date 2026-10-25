@@ -63,6 +63,8 @@ const ALLOWED_LINK_QUERY_PARAMETERS: ReadonlySet<string> = new Set(['page']);
 const EXPECTED_LINK_PATHS = [
   '/crawl/next-page?page=2', '/relative-page', '/after-shadow-host', '/shadow-page', '/nested-shadow-page',
 ] as const;
+/** `EXPECTED_LINK_PATHS` のうち、文書の light DOM の link（shadow root の中でないもの。文書の順）。 */
+const LIGHT_DOM_LINK_PATHS = ['/crawl/next-page?page=2', '/relative-page', '/after-shadow-host'] as const;
 
 let server: FixtureServer;
 
@@ -241,6 +243,29 @@ describe.each(LAUNCHERS)('DEF-072 and DEF-073: collectors on clobbered forms and
       EXPECTED_LINK_PATHS.map((path) => ({ ok: true, url: `${server.origin}${path}` })),
     );
     expect(clobbered).toEqual(control);
+  });
+
+  it('discovers the links of the document, skipping the shadow roots, when the page deletes the shadowRoot getter (PRE42-CC 5b, CC-099)', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.goto(`${server.origin}${LINKS_CONTROL_PATH}`);
+      const deleted = await page.evaluate(() => {
+        Reflect.deleteProperty(Element.prototype, 'shadowRoot');
+        return Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot') === undefined;
+      });
+      expect(deleted).toBe(true);
+      const found = await discoverLinks(page, createPageId(1), {
+        allowedOrigins: new Set([server.origin]),
+        allowedQueryParameters: ALLOWED_LINK_QUERY_PARAMETERS,
+      });
+      // 前の振る舞いのまま: 例外にせず、文書（light DOM）の link を文書の順に拾い、shadow root の中は飛ばす。
+      expect(found.links.map(({ normalized }) => normalized)).toEqual(
+        LIGHT_DOM_LINK_PATHS.map((path) => ({ ok: true, url: `${server.origin}${path}` })),
+      );
+      expect(found.omittedLinkCount).toBe(0);
+    } finally {
+      await page.close();
+    }
   });
 
   it('inspects the login form as on the control page', async () => {

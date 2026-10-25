@@ -8,8 +8,10 @@
 //   ワーカーから import できるようにするため。`tests/architecture/discovery-boundary.test.ts`）。
 // - CCX-12（CC-076）: `_method` の欄の名前の判定（`isMethodOverrideFieldName`）と、実際の method の式（`effectiveFormMethodOf`）は、この
 //   ファイルだけに書く（発見の分類とシナリオの下書きの確かめが共用する。`tests/architecture/core-small-parts-ownership.test.ts` の (f)）。
+import { CANDIDATE_FIELD_TYPES, CONTACT_CANDIDATE_FIELD_TYPES, type CandidateFieldType } from '../core/candidate-field-types.js';
 import { MAX_URL_LENGTH } from '../core/limits.js';
 import { foldNfkcCase } from '../core/text.js';
+import type { SubmissionProbeRecord } from './submission-probe-contracts.js';
 
 /**
  * 候補の種類（設計書 4.1）。`FORM` は form の送信ボタン 1 つ（ボタンがなければ form）ごと、`BUTTON` はボタンの役割の要素のうち送信ボタンで
@@ -34,6 +36,12 @@ export const CANDIDATE_CLASSIFICATIONS = Object.freeze([
   'DISPLAY_ONLY',
 ] as const);
 export type CandidateClassification = (typeof CANDIDATE_CLASSIFICATIONS)[number];
+
+/**
+ * 読み取りの候補の分類（PRE42-CC 組 4。N4-8e）。READ の確かめの対象にできる分類は、これだけ。保存の確かめ（`src/control/read-check-policy.ts`）と、
+ * READ の確かめの評価（`read-check-evaluation.ts`）が読む（`tests/architecture/read-check-ssot.test.ts` の (d)）。
+ */
+export const READ_CANDIDATE_CLASSIFICATION = 'READ' satisfies CandidateClassification;
 
 /** 分類の理由のコード（閉じた一覧。設計書 4.3 の表の各段）。分類との対応は `CANDIDATE_REASON_CLASSIFICATIONS`。 */
 export const CANDIDATE_REASON_CODES = Object.freeze([
@@ -134,31 +142,10 @@ export type CandidateFieldTag = (typeof CANDIDATE_FIELD_TAGS)[number];
 /**
  * 入力の欄の型。`input` は HTML の `type` の正規の値（未知の値は、ブラウザが `text` として扱う）。送信ボタンとリセット
  * （`submit`・`image`・`reset`・`button`）は欄に含めない。`select` は `select-one`・`select-multiple`、`textarea` は `textarea`。
+ * PRE42-CC 組 UI-K2（CC-113）: 一覧の定義は、画面のブラウザ側からも読める純粋なファイル `src/core/candidate-field-types.ts` に移し、ここは同じ名前で
+ * 公開し直す（連絡先の欄の型 `CONTACT_CANDIDATE_FIELD_TYPES` も）。
  */
-export const CANDIDATE_FIELD_TYPES = Object.freeze([
-  'text',
-  'search',
-  'email',
-  'url',
-  'tel',
-  'password',
-  'number',
-  'range',
-  'date',
-  'month',
-  'week',
-  'time',
-  'datetime-local',
-  'color',
-  'checkbox',
-  'radio',
-  'file',
-  'hidden',
-  'select-one',
-  'select-multiple',
-  'textarea',
-] as const);
-export type CandidateFieldType = (typeof CANDIDATE_FIELD_TYPES)[number];
+export { CANDIDATE_FIELD_TYPES, CONTACT_CANDIDATE_FIELD_TYPES, type CandidateFieldType };
 
 /**
  * 値を送れない欄の型（閉じた一覧。DEF-094）: `password`（秘密）と `file`（ファイルの中身）。名前が秘密に見えなくても、この型の欄には値を
@@ -246,6 +233,18 @@ export type ListenerKind = (typeof LISTENER_KINDS)[number];
  *   対応しなかった（読み取りの間に DOM が変わった）。結び付きの分からない候補を出さないので、候補は 0 件。
  * - `INCOMPLETE_LIMIT_REACHED`: 走査した要素の数、画面の候補の数、候補の欄の数、query の名前の数、URL の長さのどれかの上限に達し、
  *   読み切れなかった（読めた分の候補は出す）。
+ * - `INCOMPLETE_PAGE_NAVIGATION_LIMIT`（DEF-129）: その画面の Context で、ページが始めた文書の読み込み（main frame か、T37R2-fix で子の frame の、
+ *   JS の読み込み直しや移動、meta の転送）を、Guard が frame ごとの上限（`PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）で止めた（画面が落ち着かず、
+ *   読んだ内容が途中のものかもしれない。読めた分の候補は出す）。
+ *   ジョブの流れが、画面を閉じた後に付ける。
+ * - `INCOMPLETE_PAGE_SUBRESOURCE_LIMIT`（DEF-130-fix）: その画面の Context で、1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・
+ *   `xhr` など）を、Guard が上限（`PAGE_SUBRESOURCE_REQUEST_LIMIT`）で止めた（画面がデータを描き切れなかったかもしれない。読めた分の候補は出す）。
+ *   ジョブの流れが、画面を閉じた後に付ける。
+ * - `SERVICE_READ_REFUSED`（T37a。Task 37 の設計書 3.1。T37R-fix-B2 で数える項目を更新）: その画面の Context で、承認したサービスの Origin への要求を
+ *   上限で断った、サービスの Origin から 401 を受けた、登録した読み取りの手続きの呼び出しを回数の上限か送り方で止めた、承認したサービスの Origin への
+ *   読み取りでない要求を止めた、のどれかがあった（画面がデータを描けなかったかもしれない。読めた分の候補は出す）。判定は
+ *   `src/orchestration/audit-stage-run.ts` の `isAuditStageReadObstructed`（READ の確かめと共有）。許可 Origin への `fetch`・`xhr` を止めたことは
+ *   数えない（記録だけ）。ジョブの流れが、画面を閉じた後に付ける（`discovery-result.ts` の `withServiceReadRefused`）。
  */
 export const INCOMPLETE_REASONS = Object.freeze([
   'INCOMPLETE_SETTLE_TIMEOUT',
@@ -253,6 +252,9 @@ export const INCOMPLETE_REASONS = Object.freeze([
   'INCOMPLETE_FREEZE_UNAVAILABLE',
   'INCOMPLETE_READ_FAILED',
   'INCOMPLETE_LIMIT_REACHED',
+  'INCOMPLETE_PAGE_NAVIGATION_LIMIT',
+  'INCOMPLETE_PAGE_SUBRESOURCE_LIMIT',
+  'SERVICE_READ_REFUSED',
 ] as const);
 export type IncompleteReason = (typeof INCOMPLETE_REASONS)[number];
 
@@ -383,8 +385,13 @@ export interface CandidateDigests {
   readonly ruleDigest: string;
 }
 
-/** 成果物（`discovery.json`）の候補 1 件。`schemas/control/candidate.schema.json` の形。 */
-export interface DiscoveryCandidate extends DiscoveredCandidate, CandidateClassificationResult, CandidateDigests {}
+/**
+ * 成果物（`discovery.json`）の候補 1 件。`schemas/control/candidate.schema.json` の形。T37c（Task 37 の設計書 3.4）: 送らずに観察する probe の結果
+ * （任意の項目 `submissionProbe`。probe の対象にした候補だけ。契約は `submission-probe-contracts.ts`）。識別の digest と規則の digest には入れない。
+ */
+export interface DiscoveryCandidate extends DiscoveredCandidate, CandidateClassificationResult, CandidateDigests {
+  readonly submissionProbe?: SubmissionProbeRecord;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // 同じ名前の hidden と checkbox の組（T31b fix round 1。Task 31 の設計書 3 章の「同じ名前の hidden と checkbox の組（Rails 型）」）

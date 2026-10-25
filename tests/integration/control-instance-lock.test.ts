@@ -4,6 +4,7 @@
 // - (c) 古いロック（死んだ PID、ハートビートが古い）は取り直し、終わっていないジョブを中断に直す。
 // - (d) 2 つの管理をほぼ同時に作ると、1 つだけが作れる（名前つきの回数）。
 // - (e) `close()` の後に、もう一度作れる。他人のロックを消さない。ロックを失ったら、新しいジョブを始めない。
+// - (f) SR-1-F（DEF-168 と同じ形）: ほかの管理がロックを書き換えている途中に別の管理を作っても、書き換えた管理だけが持つ。
 // 一時のフォルダだけを使い、終わったら消す。起動した子 process と偽のワーカーは、すべて止める。
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -11,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
+import { wait } from '../../src/core/deadline.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import { createAuditJobManager, type AuditJobManager, type AuditJobTiming } from '../../src/control/job/audit-job-manager.js';
 import {
@@ -23,9 +24,9 @@ import {
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
-import { WORKER_PROTOCOL_VERSION } from '../../src/control/worker-protocol.js';
 import { RUN_LOCK_STALE_AFTER_MS, currentProcessRunLockHost, isProcessRunning } from '../../src/core/process-lock.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
+import { fakeWorkerValuesOf } from '../helpers/job-test-support.js';
 import { INSTANCE_CHILD_PROTOCOL, startInstanceChild, type InstanceChild } from './control-instance-fixtures.js';
 import { PUBLIC_TARGET_PATH, SECOND_PUBLIC_TARGET_PATH, publicProfile, resolveTestContext } from './control-profile-fixtures.js';
 
@@ -41,15 +42,14 @@ const WAIT_LIMIT_MS = 30_000;
 const WAIT_POLL_MS = 100;
 /** テストのハートビートの間隔（ms。本番の名前つきの間隔の代わり）。 */
 const TEST_INSTANCE_HEARTBEAT_INTERVAL_MS = 100;
+/** ほかの管理がロックを書き換えている途中のまま待つ時間（ms。管理データの待ちの上限 `CONTROL_DB_BUSY_TIMEOUT_MS` の 5 秒より短い）。 */
+const LOCK_WRITE_HOLD_MS = 3_000;
 
 /** 偽のワーカーに埋め込む値。 */
-const fakeWorkerValues = (): FakeWorkerValues => ({
-  protocolVersion: WORKER_PROTOCOL_VERSION,
-  runId: 'RUN-20261009000000',
-  otherRunId: 'RUN-20261009000999',
-  heartbeatIntervalMs: TEST_INSTANCE_HEARTBEAT_INTERVAL_MS,
-  exitCodes: { complete: EXIT_CODES.COMPLETE, partial: EXIT_CODES.PARTIAL, interrupted: INTERRUPTED_EXIT_CODE, configError: EXIT_CODES.CONFIG_ERROR },
-});
+const fakeWorkerValues = (): FakeWorkerValues => fakeWorkerValuesOf(
+  { runId: 'RUN-20261009000000', otherRunId: 'RUN-20261009000999' },
+  { heartbeatIntervalMs: TEST_INSTANCE_HEARTBEAT_INTERVAL_MS },
+);
 
 let workDirectory = '';
 let databasePath = '';
@@ -109,7 +109,7 @@ const waitForJobs = async (
     if (predicate(jobs) || Date.now() > deadline) {
       return jobs;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
 };
 
@@ -193,7 +193,7 @@ const stallInstanceLock = (): void => {
 const waitUntil = async (predicate: () => boolean): Promise<boolean> => {
   const deadline = Date.now() + WAIT_LIMIT_MS;
   while (!predicate() && Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
   return predicate();
 };
@@ -333,6 +333,38 @@ describe('the control instance lock: stale locks, concurrency, release', () => {
     }
   }, TEST_TIMEOUT_MS);
 
+  // SR-1-F（DEF-168 と同じ形）: ほかの管理が古いロックを自分のものに書き換えている途中（書き込みのトランザクションを開いたまま、まだ確定して
+  // いない）に、別の管理を作っても、取り直さない（ロックはファイルでなく、管理データの 1 行をトランザクションの中で書くので、作りかけの行は
+  // 外から見えない）。確定の後は、書き換えた管理だけが持つ。
+  it('lets only the manager that is writing its lock hold it when another manager is created during the write', async () => {
+    writeLeftovers({ processId: deadProcessId(), heartbeatAtMs: Date.now() });
+    const host = currentProcessRunLockHost(Date.now());
+    const raw = new DatabaseSync(databasePath);
+    let open = false;
+    try {
+      raw.exec('BEGIN IMMEDIATE');
+      open = true;
+      raw.prepare('INSERT OR REPLACE INTO control_instance (slot, process_id, booted_at_ms, acquired_at_ms, heartbeat_at_ms, port) VALUES (1, ?, ?, ?, ?, NULL)')
+        .run(process.pid, host.bootedAtMs, host.nowMs, host.nowMs);
+      const pending = startChild();
+      // 子の管理が作られる間（管理データの待ちの上限 `CONTROL_DB_BUSY_TIMEOUT_MS` より短く）、書き換えを確定しない。
+      await wait(LOCK_WRITE_HOLD_MS);
+      raw.exec('COMMIT');
+      open = false;
+      const child = await pending;
+
+      expect(child.first).toBe(`${INSTANCE_CHILD_PROTOCOL.locked} ${String(process.pid)} -`);
+    } finally {
+      if (open) {
+        raw.exec('ROLLBACK');
+      }
+      raw.close();
+    }
+    expect(readControlInstanceLock(openInProcess())).toEqual({
+      processId: process.pid, bootedAtMs: host.bootedAtMs, acquiredAtMs: host.nowMs, heartbeatAtMs: host.nowMs, port: null,
+    });
+  }, TEST_TIMEOUT_MS);
+
   it('can be created again after close(), and does not delete the lock of another manager', async () => {
     const first = createInProcess();
     await first.close();
@@ -369,7 +401,7 @@ describe('the control instance lock: stale locks, concurrency, release', () => {
     const acquired = readControlInstanceLock(openInProcess());
     const deadline = Date.now() + WAIT_LIMIT_MS;
     while ((readControlInstanceLock(openInProcess())?.heartbeatAtMs ?? 0) <= (acquired?.heartbeatAtMs ?? 0) && Date.now() < deadline) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+      await wait(WAIT_POLL_MS);
     }
     expect(readControlInstanceLock(openInProcess())?.heartbeatAtMs).toBeGreaterThan(acquired?.heartbeatAtMs ?? 0);
 
@@ -377,7 +409,7 @@ describe('the control instance lock: stale locks, concurrency, release', () => {
     const raw = new DatabaseSync(databasePath);
     raw.prepare('UPDATE control_instance SET process_id = ?, acquired_at_ms = acquired_at_ms + 1').run(deadProcessId());
     raw.close();
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, TEST_INSTANCE_HEARTBEAT_INTERVAL_MS * 5));
+    await wait(TEST_INSTANCE_HEARTBEAT_INTERVAL_MS * 5);
 
     expect(await manager.startAuditJob({ profileId: PROFILE_ONE, expectedRevision: MIN_PROFILE_REVISION, startNew: true }))
       .toMatchObject({ ok: false, reason: 'CONTROL_INSTANCE_LOCK_LOST' });

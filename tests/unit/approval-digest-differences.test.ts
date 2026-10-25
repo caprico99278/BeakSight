@@ -13,7 +13,7 @@ import {
   computeApprovalDigest,
   type ApprovalDigestFacts,
 } from '../../src/control/approval/approval-digest.js';
-import { AUTH_SETUP_DIGEST, FULL_VERIFICATION, INPUT_RULES, TARGET_CONFIG_DIGEST, sampleScenario } from './approval-samples.js';
+import { AUTH_SETUP_DIGEST, FULL_VERIFICATION, INPUT_RULES, TARGET_CONFIG_DIGEST, sampleScenario, sampleUpdateScenario } from './approval-samples.js';
 
 const FACTS: ApprovalDigestFacts = Object.freeze({
   profileRevision: 4,
@@ -24,11 +24,14 @@ const FACTS: ApprovalDigestFacts = Object.freeze({
 const BASE = sampleScenario();
 
 /**
- * `BASE` と `FACTS` の承認の digest の固定の値（T31b で、印の版 `/3` と UPDATE の指定の 5 項目の後の値に置き換えた（意図した変化。今までの承認は
- * すべて再承認になる）。T30a で固定した版 2 の値は `sha256:507afae414e11d364561252083f6422c76a1b4827afdd0fffa91be8ce4c31903`、T28e で固定した
- * 版 1 の値は `sha256:63aff959e3e6e29a5c00246f1579469ff072bd046b3ee97bb8d0cac4e00dd226`）。
+ * `BASE` と `FACTS` の承認の digest の固定の値（T38c で、印の版 `/4` と送り方・API の指定の 9 項目の後の値に置き換えた（意図した変化。今までの承認は
+ * すべて再承認になる）。T31b で固定した版 3 の値は `sha256:f1d363c24e761a844bd54a540f2d39769201813176a94b484b91410eb0f269c0`、T30a で固定した版 2 の
+ * 値は `sha256:507afae414e11d364561252083f6422c76a1b4827afdd0fffa91be8ce4c31903`、T28e で固定した版 1 の値は
+ * `sha256:63aff959e3e6e29a5c00246f1579469ff072bd046b3ee97bb8d0cac4e00dd226`）。T41a: v4 は未公開なので、印の版を上げずに保つ鍵の項目（`apiKeptKeys`。
+ * FORM は null）を末尾に足し、その後の値に置き換えた（意図した変化。T38c で固定した値は
+ * `sha256:a71c0a185e739a326bfc25136e4f96ca08b2253e130919398c7b55c0c82fad73`）。
  */
-const BASE_DIGEST_BEFORE_ITEMS = 'sha256:f1d363c24e761a844bd54a540f2d39769201813176a94b484b91410eb0f269c0';
+const BASE_DIGEST_BEFORE_ITEMS = 'sha256:7b3e2118cfb5b83335824e3dbdf6a06d2441d0615108cb45a0319bd524bc8018';
 
 describe('approval digest items and differences (T28e)', () => {
   it('lists the items of the digest in the order of the digest, once each', () => {
@@ -59,12 +62,29 @@ describe('approval digest items and differences (T28e)', () => {
       'updateActionPathTemplate',
       'updateKeepFieldNames',
       'updateTemplatedIdentityDigest',
+      // T38c: 送り方と API の指定（`approval-api-v4.test.ts`）。
+      'transport',
+      'apiShapeDigest',
+      'apiRequest',
+      'apiKeyFields',
+      'apiPageKeys',
+      'apiHeaderNames',
+      'apiFilterName',
+      'apiRecordId',
+      'apiLedger',
+      // T41a: API の UPDATE の保つ鍵（`scenario-api-update-contract.test.ts`）。
+      'apiKeptKeys',
     ]);
     expect(Object.isFrozen(APPROVAL_DIGEST_ITEMS)).toBe(true);
   });
 
   it('keeps the digest value of the same content (fixed value)', () => {
     expect(computeApprovalDigest(BASE, FACTS)).toBe(BASE_DIGEST_BEFORE_ITEMS);
+  });
+
+  // LG-3（2026-10-24 の設計 3.7.2）: シナリオの版の前の形を捨てる前のコードで求めた、form の UPDATE の見本の値（捨てた後も変わらない）。
+  it('keeps the digest value of the form UPDATE sample (fixed value, LG-3)', () => {
+    expect(computeApprovalDigest(sampleUpdateScenario(), FACTS)).toBe('sha256:2e426539c3ca129b94bb1ff3461aef817ec09dc900be052f6953adff787a15fb');
   });
 
   it('gives the values of the digest by item, sorted where the order does not matter, and frozen', () => {

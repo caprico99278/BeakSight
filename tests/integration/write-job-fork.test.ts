@@ -9,6 +9,7 @@
 //   残らない。
 import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { ACTION_RUN_SCHEMA_VERSION, type ActionRunDocument } from '../../src/control/actions/action-contracts.js';
 import { readWriteResult } from '../../src/control/actions/write-result-facts.js';
 import { readExecutionGrant } from '../../src/control/approval/scenario-store.js';
@@ -125,7 +126,7 @@ describe('T30f: the write job end to end with the real worker', () => {
     expect(messages.filter((message) => message.type === 'WRITE_RECHECK_REQUEST')).toHaveLength(2);
 
     // 全部の回の後に待って、遅れて届く POST がないことを数え直す。秘密の目印がどこにも出ない。process が残らない。
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, LATE_DELIVERY_SETTLE_MS));
+    await wait(LATE_DELIVERY_SETTLE_MS);
     expect(harness.createPosts()).toEqual([WRITE_SITE_PATHS.create]);
     expect(site.successfulLogins).toBe(3);
     expect(harness.leakedPlaces()).toEqual([]);

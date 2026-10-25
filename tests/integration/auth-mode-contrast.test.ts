@@ -25,7 +25,7 @@
 //   2 秒待って、サーバの記録を数え直す。
 // 自動ログインは Windows だけで動く（サーバの開始の確かめで強制する）ので、この端から端は Windows だけで行い、ほかでは理由を出して飛ばす。
 // サーバは 127.0.0.1 だけで待ち受ける。作業のディレクトリ、管理データ、資格情報のフォルダ、出力先は、一時のフォルダだけ。
-import { fork, type ChildProcess, type ForkOptions } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -35,11 +35,10 @@ import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { FAILURE_EXIT_CODE, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
 import { loadConfig } from '../../src/config/load-config.js';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION, SITE_PROFILE_SCHEMA_VERSION, type AuthStrategy } from '../../src/control/contracts.js';
 import { createAuditJobManager, type AuditJobManager, type AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
@@ -48,9 +47,11 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import { createRecordingFork, hideJobBrowser } from '../helpers/worker-fork-support.js';
 import { validateWorkerToParentMessage, type WorkerToParentMessage } from '../../src/control/worker-protocol.js';
 import { PAGE_ARTIFACT_FILE_NAMES, RUN_ARTIFACT_FILE_NAMES } from '../../src/core/artifact-layout.js';
 import type { RunStatus } from '../../src/core/contracts.js';
+import { wait } from '../../src/core/deadline.js';
 import {
   AUTH_SITE_LOGIN_FIELDS,
   AUTH_SITE_PATHS,
@@ -165,7 +166,7 @@ const outputDirectoryOf = (space: Workspace, key: ProfileKey): string => join(sp
 
 /** プロファイルの認証の設定（手動は `automatedLogin` が null、自動は欄と失敗の条件を持つ）。 */
 const setupOf = (site: AuthenticatedSite, key: ProfileKey): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILES[key].profileId,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${site.originA}${AUTH_SITE_PATHS.login}`,
@@ -223,6 +224,8 @@ async function prepareProfile(space: Pick<Workspace, 'directory' | 'database' | 
     environmentEvidenceRef: `evidence/${PROFILES[key].profileId}/isolation-check-1`,
   }, { resolveContext });
   expect(created.ok, JSON.stringify(created)).toBe(true);
+  // FM-2: テストのジョブのブラウザは今どおり headless。
+  hideJobBrowser(space.database, PROFILES[key].profileId);
   const saved = saveAuthSetup(space.database, setupOf(space.site, key), { resolveContext });
   expect(saved.ok, JSON.stringify(saved)).toBe(true);
 }
@@ -285,7 +288,7 @@ async function expectNoChromiumLeft(space: Workspace): Promise<void> {
       expect(descendants.map(({ name }) => name), 'processes left after the worker exited').toEqual([]);
       return;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+    await wait(WAIT_POLL_MS);
   }
 }
 
@@ -446,23 +449,18 @@ describe.skipIf(!IS_WINDOWS)(`T32i: the manual session handoff and the automated
       const sent: unknown[] = [];
       const workerPids: number[] = [];
       // IPC と標準出力・標準エラーを記録し、手動のジョブには引き継ぐセッションを標準入力で渡して fork する。
-      const contrastFork: AuditWorkerForker = (modulePath, args, options: ForkOptions) => {
-        const child = fork(modulePath, [...args], { ...options, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
-        children.push(child);
-        if (child.pid !== undefined) {
-          workerPids.push(child.pid);
-        }
-        child.on('message', (message: unknown) => received.push(message));
-        child.stdout?.setEncoding('utf8').on('data', (chunk: string) => { current().workerOutput += chunk; });
-        child.stderr?.setEncoding('utf8').on('data', (chunk: string) => { current().workerOutput += chunk; });
-        child.stdin?.end(current().nextHandoff);
-        const send = child.send.bind(child) as (...sendArgs: unknown[]) => boolean;
-        child.send = ((message: unknown, ...rest: unknown[]): boolean => {
-          sent.push(message);
-          return send(message, ...rest);
-        }) as typeof child.send;
-        return child;
-      };
+      const contrastFork: AuditWorkerForker = createRecordingFork({
+        stdinText: () => current().nextHandoff,
+        onChild: (child) => {
+          children.push(child);
+          if (child.pid !== undefined) {
+            workerPids.push(child.pid);
+          }
+        },
+        onReceived: (message) => received.push(message),
+        onOutput: (chunk) => { current().workerOutput += chunk; },
+        onSent: (message) => sent.push(message),
+      });
       const manager = createAuditJobManager({
         database,
         repositoryRoot: directory,
@@ -561,7 +559,7 @@ describe.skipIf(!IS_WINDOWS)(`T32i: the manual session handoff and the automated
 
     it('counts the server record again after 2 seconds: only the two login POSTs of the automated login stages arrived', async () => {
       const work = current();
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, LATE_DELIVERY_SETTLE_MS));
+      await wait(LATE_DELIVERY_SETTLE_MS);
       expect(nonReadRequestsOf(work.site.requests)).toEqual([LOGIN_POST, LOGIN_POST]);
       expect(work.site.successfulLogins).toBe(1);
       expect(manualStageCalls(work)).toEqual(['launchLoginBrowser', 'onLoginPageReady']);
@@ -577,7 +575,7 @@ describe.skipIf(!IS_WINDOWS)(`T32i: the manual session handoff and the automated
         await page.goto(`${control.originA}${AUTH_SITE_PATHS.adminRelogin}`);
         const deadline = Date.now() + CONTROL_DELIVERY_LIMIT_MS;
         while (nonReadRequestsOf(control.requests).length === 0 && Date.now() < deadline) {
-          await new Promise((resolvePromise) => setTimeout(resolvePromise, WAIT_POLL_MS));
+          await wait(WAIT_POLL_MS);
         }
         expect(nonReadRequestsOf(control.requests)).toEqual([LOGIN_POST]);
       } finally {

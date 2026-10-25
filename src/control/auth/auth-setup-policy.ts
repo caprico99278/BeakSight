@@ -5,9 +5,12 @@
 //   2. 形（スキーマ）。合わなければ `AUTH_SETUP_SCHEMA_INVALID` だけを返す。
 //   3. 値の規則（プロファイルとの結びつき、モード、Origin の包含、URL と path の形、秘密に見える値、IdP、セレクタ、成功の条件の
 //      あいまいさ、自動ログインの設定）。すべて確かめる。
-// - 受けるのは版 2（`beaksight-auth-setup/2`。Task 26 の設計書 4.3。T26b）だけ。版 1 の文書は形の誤り（管理データの版 1 の文書を版 2 に
-//   直すのは、読むときの `auth-setup-store.ts` だけ）。`automatedLogin` の要否は、プロファイルの認証の方式で決める（自動ログインなら必須で、
+// - 受けるのは版 3（`beaksight-auth-setup/3`。Task 34 の設計書 3.2）だけ。形は版 3 のスキーマ（`AUTH_SETUP_SCHEMA_NAME`）で確かめる（LG-3b: 版 1・
+//   版 2 と知らない版の文書は形の誤り）。`automatedLogin`（T26b）の要否は、プロファイルの認証の方式で決める（自動ログインなら必須で、
 //   回数は `AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS` だけ。手動のログインなら null だけ）。
+// - 版 3 の決まり（T34a）: ログインの送り方（`loginTransport`）で要る項目と持てない項目、スクリプトの送信先の Origin（プロファイルの承認したサービスの
+//   Origin）と path と必須の query、ログインに伴う送信の Origin（承認したテストの Origin かサービスの Origin）・path・重なり、成功のローカル ストレージの
+//   鍵の Origin（承認したテストの Origin）と形。上限（件数・長さ・回数）は、ほかの項目と同じく、スキーマの前に確かめる。
 // - プロファイルは `ValidatedSiteProfile` の型で受けるが、型の変換で印を付けた値もありうるので、渡された文脈で `validateSiteProfile` を
 //   通し直す（通らなければ `AUTH_SETUP_PROFILE_INVALID`）。プロファイルの値は、その写しから読む。
 // - 誤りの文（`detail`）には、項目の名前と位置だけを書き、設定の値（URL、path、セレクタ、query の値）を入れない。
@@ -18,23 +21,28 @@
 //   条件が同時に当たりうるか（`mayMatchTogether`）を、Task 26 の判定の owner として公開する（中身は変えない）。シナリオの検証の指定の確かめ
 //   （`src/control/approval/scenario-policy.ts`）が使う（書き写さない）。
 // 入出力を持たない。Playwright と監査エンジン（`src/browser/`、`src/safety/`、`src/orchestration/`）を import しない。
+import { exclusionMatchPathFormsOf } from '../../core/audit-exclusion-forms.js';
+import { hitsDangerousTermIn, hitsExcludedPathPrefix } from '../../core/audit-exclusion-match.js';
 import { isRecord } from '../../core/guards.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { jsonPointerOf } from '../../core/json-pointer.js';
 import { schemaIssuePointerOf } from '../../core/schema-validator.js';
 import { isSecretLikeQueryName } from '../../core/secret-query-names.js';
+import { isValueLikeText } from '../../core/url-path-redaction.js';
 import { hasControlOrLineSeparator, hasLoneSurrogate } from '../../core/text.js';
+import { hasUrlFragment } from '../../core/url-fragment.js';
 import {
   canonicalHttpOriginOf,
   hasUrlCredentials,
   isHttpProtocol,
   isOriginInAllowedOrigins,
 } from '../../crawl/normalize-url.js';
-import type { AuthStrategy, ValidatedSiteProfile } from '../contracts.js';
-import { validateControlDocument, type ControlSchemaName } from '../control-schema-validator.js';
+import { AUTOMATED_LOGIN_AUTH_STRATEGY, type AuthStrategy, type ValidatedSiteProfile } from '../contracts.js';
+import { validateControlDocument } from '../control-schema-validator.js';
 import { PROFILE_OPERATION_POLICY, isProfileOperationAllowed, type ProfileOperation } from '../execution-policy.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../profile-policy.js';
 import {
+  AUTH_SETUP_SCHEMA_NAME,
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   MAX_ALLOWED_IDP_ORIGINS,
@@ -42,15 +50,35 @@ import {
   MAX_AUTH_SETUP_URL_LENGTH,
   MAX_LOGIN_ATTEMPTS,
   MAX_LOGIN_POST_ENDPOINTS,
+  MAX_AUDIT_READ_REQUESTS,
+  MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
+  MAX_LOGIN_SIDE_REQUESTS,
+  MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
+  MAX_SERVICE_REQUESTS_PER_MINUTE,
+  MAX_SERVICE_REQUESTS_PER_RUN,
+  MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD,
+  MIN_SERVICE_REQUESTS_PER_MINUTE,
+  MIN_SERVICE_REQUESTS_PER_RUN,
+  MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH,
+  MAX_SCRIPT_LOGIN_REQUIRED_QUERY,
   MAX_SUCCESS_SELECTOR_LENGTH,
+  MAX_SUCCESS_STORAGE_KEY_PART_LENGTH,
   MIN_LOGIN_ATTEMPTS,
+  MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
+  SCRIPT_REQUEST_TRANSPORT,
   type AuthSetup,
+  type AuditReadRequest,
+  type AuthSetupV3,
   type AuthSetupValidationError,
   type AuthSetupValidationErrorCode,
   type AuthSetupValidationResult,
   type AutomatedLoginSetup,
   type LoginResultCondition,
+  type LoginSideRequest,
+  type ScriptLoginTarget,
+  type SuccessStorageKey,
 } from './auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../core/default-excluded-url-words.js';
 
 /**
  * 認証の設定を受ける操作（T28b）。受けるモードと認証の方式は、`src/control/execution-policy.ts` の閉じた一覧（`PROFILE_OPERATION_POLICY` の
@@ -67,11 +95,20 @@ const AUTH_SETUP_ACCEPTED_TEXT = Object.entries(PROFILE_OPERATION_POLICY[AUTH_SE
 /** 手動のログインの方式（Task 25。`automatedLogin` は null だけ）。 */
 const MANUAL_STRATEGY: AuthStrategy = 'MANUAL_SESSION';
 
-/** 自動ログインの方式（Task 26 の設計書 4.3。`automatedLogin` が必須で、回数は `AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS` だけ）。 */
-const AUTOMATED_STRATEGY: AuthStrategy = 'AUTOMATED_LOGIN';
+/**
+ * 自動ログインの方式（Task 26 の設計書 4.3。`automatedLogin` が必須で、回数は `AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS` だけ）。CC-108: 値は owner の
+ * `AUTOMATED_LOGIN_AUTH_STRATEGY`（`contracts.ts`）から読む。
+ */
+const AUTOMATED_STRATEGY: AuthStrategy = AUTOMATED_LOGIN_AUTH_STRATEGY;
 
-/** 版 2 のスキーマの名前（検証が受けるのは版 2 だけ。T26b）。 */
-const AUTH_SETUP_SCHEMA_NAME: ControlSchemaName = 'auth-setup-v2';
+/** 版 3 の項目の名前（誤りの文と位置の項目の名前）。 */
+const SCRIPT_LOGIN_LABEL = 'scriptLogin';
+const LOGIN_SIDE_REQUESTS_LABEL = 'loginSideRequests';
+const SUCCESS_STORAGE_KEY_LABEL = 'successStorageKey';
+const LOGIN_TRANSPORT_LABEL = 'loginTransport';
+/** T35a: 版 3 の任意の項目の名前。 */
+const AUDIT_READ_REQUESTS_LABEL = 'auditReadRequests';
+const SERVICE_REQUEST_LIMITS_LABEL = 'serviceRequestLimits';
 
 /** 自動ログインの 3 つのセレクタの項目（`AutomatedLoginSetup` の名前。誤りの文の項目の名前にも使う）。 */
 const AUTOMATED_LOGIN_SELECTOR_FIELDS = Object.freeze(['usernameSelector', 'passwordSelector', 'submitSelector'] as const);
@@ -99,8 +136,7 @@ const ENCODED_DOT = /%2e/iu;
 /** 正しくない百分率の符号化（`%` の後に 16 進の 2 桁がない）。 */
 const MALFORMED_PERCENT_ENCODING = /%(?![0-9A-Fa-f]{2})/u;
 
-/** fragment の区切り。URL の中のどこにあっても拒む（空の fragment を含む）。 */
-const FRAGMENT_SEPARATOR = '#';
+// fragment の判定（URL の中のどこにあっても拒む。空の fragment を含む）は、`src/core/url-fragment.ts` の `hasUrlFragment`（T43b fix round 1）。
 
 /** 位置の区切り 1 つ（項目の名前か、配列の位置）。 */
 type LocationSegment = string | number;
@@ -146,6 +182,12 @@ const PROFILE_ID_LOCATION = locationOf('profileId');
 const PROFILE_REVISION_LOCATION = locationOf('profileRevision');
 const AUTOMATED_LOGIN_LOCATION = locationOf(AUTOMATED_LOGIN_LABEL);
 const FAILURE_CONDITIONS_LOCATION = childOf(AUTOMATED_LOGIN_LOCATION, FAILURE_CONDITIONS_FIELD);
+const SCRIPT_LOGIN_LOCATION = locationOf(SCRIPT_LOGIN_LABEL);
+const REQUIRED_QUERY_LOCATION = childOf(SCRIPT_LOGIN_LOCATION, 'requiredQuery');
+const LOGIN_SIDE_REQUESTS_LOCATION = locationOf(LOGIN_SIDE_REQUESTS_LABEL);
+const SUCCESS_STORAGE_KEY_LOCATION = locationOf(SUCCESS_STORAGE_KEY_LABEL);
+const AUDIT_READ_REQUESTS_LOCATION = locationOf(AUDIT_READ_REQUESTS_LABEL);
+const SERVICE_REQUEST_LIMITS_LOCATION = locationOf(SERVICE_REQUEST_LIMITS_LABEL);
 
 const rejected = (errors: readonly AuthSetupValidationError[]): AuthSetupValidationResult =>
   Object.freeze({ ok: false, errors: Object.freeze([...errors]) });
@@ -201,6 +243,88 @@ const automatedLoginLimitErrorsOf = (automatedLogin: unknown): readonly AuthSetu
   ];
 };
 
+/** 整数の値が、下限と上限の外か（整数でない値は、形の誤りとしてスキーマに任せる）。 */
+const isIntegerOutside = (value: unknown, minimum: number, maximum: number): boolean =>
+  Number.isInteger(value) && ((value as number) < minimum || (value as number) > maximum);
+
+/** 範囲の外の整数の誤り（`AUTH_SETUP_LIMIT_EXCEEDED`）。範囲の中か、整数でなければ空。 */
+const rangeErrorsOf = (location: FieldLocation, value: unknown, minimum: number, maximum: number): readonly AuthSetupValidationError[] =>
+  (isIntegerOutside(value, minimum, maximum)
+    ? [errorOf('AUTH_SETUP_LIMIT_EXCEEDED', `${location.label} must be from ${minimum} to ${maximum}`, location.pointer)]
+    : []);
+
+/**
+ * 版 3 の任意の項目の上限の誤り（T35a。Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出し（件数、Origin・path の長さ、1 回の読み込みあたりの
+ * 上限）と、承認したサービスの Origin への要求の上限（1 分あたり、1 回の Run あたり）。
+ */
+const auditStageLimitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
+  const reads = arrayOf(ownFieldOf(copy, AUDIT_READ_REQUESTS_LABEL));
+  const errors: AuthSetupValidationError[] = [...itemCountErrorsOf(AUDIT_READ_REQUESTS_LOCATION, reads, MAX_AUDIT_READ_REQUESTS)];
+  reads.slice(0, MAX_AUDIT_READ_REQUESTS).forEach((read, index) => {
+    const location = childOf(AUDIT_READ_REQUESTS_LOCATION, index);
+    errors.push(
+      ...lengthErrorsOf(childOf(location, 'origin'), ownFieldOf(read, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
+      ...lengthErrorsOf(childOf(location, 'path'), ownFieldOf(read, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
+      ...rangeErrorsOf(childOf(location, 'maxPerPageLoad'), ownFieldOf(read, 'maxPerPageLoad'),
+        MIN_AUDIT_READ_REQUESTS_PER_PAGE_LOAD, MAX_AUDIT_READ_REQUESTS_PER_PAGE_LOAD),
+    );
+  });
+  const limits = ownFieldOf(copy, SERVICE_REQUEST_LIMITS_LABEL);
+  errors.push(
+    ...rangeErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perMinute'), ownFieldOf(limits, 'perMinute'),
+      MIN_SERVICE_REQUESTS_PER_MINUTE, MAX_SERVICE_REQUESTS_PER_MINUTE),
+    ...rangeErrorsOf(childOf(SERVICE_REQUEST_LIMITS_LOCATION, 'perRun'), ownFieldOf(limits, 'perRun'),
+      MIN_SERVICE_REQUESTS_PER_RUN, MAX_SERVICE_REQUESTS_PER_RUN),
+  );
+  return errors;
+};
+
+/**
+ * 版 3 の項目の上限の誤り（T34a。Task 34 の設計書 3.2）: スクリプトの送信先の Origin・path・必須の query（件数と名前・値の長さ）、ログインに伴う送信
+ * （件数、Origin・path の長さ、ログインの段 1 回あたりの上限）、成功のローカル ストレージの鍵（Origin・接頭辞・接尾辞の長さ）。項目がない文書の
+ * 形の誤りは、スキーマに任せる。
+ */
+const version3LimitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
+  const scriptLogin = ownFieldOf(copy, SCRIPT_LOGIN_LABEL);
+  const queries = arrayOf(ownFieldOf(scriptLogin, 'requiredQuery'));
+  const errors: AuthSetupValidationError[] = [
+    ...lengthErrorsOf(childOf(SCRIPT_LOGIN_LOCATION, 'origin'), ownFieldOf(scriptLogin, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
+    ...lengthErrorsOf(childOf(SCRIPT_LOGIN_LOCATION, 'path'), ownFieldOf(scriptLogin, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
+    ...itemCountErrorsOf(REQUIRED_QUERY_LOCATION, queries, MAX_SCRIPT_LOGIN_REQUIRED_QUERY),
+    ...queries.slice(0, MAX_SCRIPT_LOGIN_REQUIRED_QUERY).flatMap((query, index) => [
+      ...lengthErrorsOf(childOf(childOf(REQUIRED_QUERY_LOCATION, index), 'name'), ownFieldOf(query, 'name'), MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH),
+      ...lengthErrorsOf(childOf(childOf(REQUIRED_QUERY_LOCATION, index), 'value'), ownFieldOf(query, 'value'), MAX_SCRIPT_LOGIN_QUERY_PART_LENGTH),
+    ]),
+  ];
+  const sideRequests = arrayOf(ownFieldOf(copy, LOGIN_SIDE_REQUESTS_LABEL));
+  errors.push(...itemCountErrorsOf(LOGIN_SIDE_REQUESTS_LOCATION, sideRequests, MAX_LOGIN_SIDE_REQUESTS));
+  sideRequests.slice(0, MAX_LOGIN_SIDE_REQUESTS).forEach((sideRequest, index) => {
+    const location = childOf(LOGIN_SIDE_REQUESTS_LOCATION, index);
+    errors.push(
+      ...lengthErrorsOf(childOf(location, 'origin'), ownFieldOf(sideRequest, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
+      ...lengthErrorsOf(childOf(location, 'path'), ownFieldOf(sideRequest, 'path'), MAX_AUTH_SETUP_URL_LENGTH),
+    );
+    const limit = ownFieldOf(sideRequest, 'maxPerLoginStage');
+    if (Number.isInteger(limit)
+      && ((limit as number) < MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE || (limit as number) > MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE)) {
+      const limitLocation = childOf(location, 'maxPerLoginStage');
+      errors.push(errorOf(
+        'AUTH_SETUP_LIMIT_EXCEEDED',
+        `${limitLocation.label} must be from ${MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE} to ${MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE}`,
+        limitLocation.pointer,
+      ));
+    }
+  });
+  errors.push(...auditStageLimitErrorsOf(copy));
+  const storageKey = ownFieldOf(copy, SUCCESS_STORAGE_KEY_LABEL);
+  errors.push(
+    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'origin'), ownFieldOf(storageKey, 'origin'), MAX_AUTH_SETUP_URL_LENGTH),
+    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'prefix'), ownFieldOf(storageKey, 'prefix'), MAX_SUCCESS_STORAGE_KEY_PART_LENGTH),
+    ...lengthErrorsOf(childOf(SUCCESS_STORAGE_KEY_LOCATION, 'suffix'), ownFieldOf(storageKey, 'suffix'), MAX_SUCCESS_STORAGE_KEY_PART_LENGTH),
+  );
+  return errors;
+};
+
 /** 上限の誤り（設計書 4.1。長さ・件数・回数）。 */
 const limitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
   const errors: AuthSetupValidationError[] = [
@@ -236,7 +360,7 @@ const limitErrorsOf = (copy: unknown): readonly AuthSetupValidationError[] => {
       MAX_LOGIN_ATTEMPTS_LOCATION.pointer,
     ));
   }
-  errors.push(...automatedLoginLimitErrorsOf(ownFieldOf(copy, AUTOMATED_LOGIN_LABEL)));
+  errors.push(...automatedLoginLimitErrorsOf(ownFieldOf(copy, AUTOMATED_LOGIN_LABEL)), ...version3LimitErrorsOf(copy));
   return errors;
 };
 
@@ -264,7 +388,7 @@ const pathErrorsOf = (location: FieldLocation, path: string): readonly AuthSetup
 
 /** 解析した URL（http(s)、userinfo なし、fragment なし、正規の形）。受けなければ `undefined`。 */
 const acceptedUrlOf = (value: string): URL | undefined => {
-  if (value.includes(FRAGMENT_SEPARATOR)) {
+  if (hasUrlFragment(value)) {
     return undefined;
   }
   let url: URL;
@@ -476,7 +600,8 @@ const isSupportedProfile = (profile: unknown): boolean =>
 
 /**
  * プロファイルの方式で決まる誤り（Task 26 の設計書 4.3。T26b）。受けないモードと方式（`AUTH_SETUP_MODE_UNSUPPORTED`）では確かめない。
- * - 自動ログイン: `automatedLogin` が必須。`maxLoginAttempts` は `AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS` だけ（回数の上限の誤り）。
+ * - 自動ログイン: `automatedLogin` が必須。`maxLoginAttempts` は `AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS` だけ（回数の上限の誤り）。ログインの送り方は、
+ *   フォームの送信もスクリプトで送るログインも受ける（T36a。Task 36 の設計書 3.1。T34R-fix-b の M-3 の拒否を外した）。
  * - 手動のログイン: `automatedLogin` は null だけ。
  */
 const strategyErrorsOf = (setup: AuthSetup, profile: unknown): readonly AuthSetupValidationError[] => {
@@ -539,6 +664,240 @@ const profileSideOf = (profile: ValidatedSiteProfile, context: ProfileValidation
 /** 写しの文字列の配列（配列でなければ空。文字列でない項目は除く）。 */
 const stringsOf = (value: unknown): readonly string[] => arrayOf(value).filter((item): item is string => typeof item === 'string');
 
+// ---------------------------------------------------------------------------------------------------------------
+// 版 3 の値の規則（T34a。Task 34 の設計書 3.2）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 正規の直列化の HTTP(S) の Origin か（`canonicalHttpOriginOf` の結果と完全に一致する。末尾の `/`、path、大文字などは受けない）。 */
+const isCanonicalOrigin = (origin: string): boolean => canonicalHttpOriginOf(origin) === origin;
+
+/** 版 3 の Origin の誤り（正規の Origin でない → `AUTH_SETUP_URL_INVALID`、`approved` に含まれない → `notApprovedCode`）。 */
+const version3OriginErrorsOf = (
+  location: FieldLocation,
+  origin: string,
+  approved: readonly string[],
+  notApprovedCode: AuthSetupValidationErrorCode,
+  approvedText: string,
+): readonly AuthSetupValidationError[] => {
+  if (!isCanonicalOrigin(origin)) {
+    return [errorOf('AUTH_SETUP_URL_INVALID', `${location.label} must be the canonical serialization of an http(s) origin`, location.pointer)];
+  }
+  return isOriginInAllowedOrigins(approved, origin)
+    ? []
+    : [errorOf(notApprovedCode, `the origin of ${location.label} is not in ${approvedText} of the profile`, location.pointer)];
+};
+
+/** 書けない文字（制御文字・行と段落の区切り・対でないサロゲート）を含むか。 */
+const hasUnwritableCharacter = (value: string): boolean => hasControlOrLineSeparator(value) || hasLoneSurrogate(value);
+
+/** スクリプトの送信先の誤り（Origin は承認したサービスの Origin、path の形、必須の query の組）。 */
+const scriptLoginErrorsOf = (scriptLogin: ScriptLoginTarget, services: readonly string[]): readonly AuthSetupValidationError[] => {
+  const errors: AuthSetupValidationError[] = [
+    ...version3OriginErrorsOf(
+      childOf(SCRIPT_LOGIN_LOCATION, 'origin'),
+      scriptLogin.origin,
+      services,
+      'AUTH_SETUP_SERVICE_ORIGIN_NOT_APPROVED',
+      'approvedServiceOrigins',
+    ),
+    ...pathErrorsOf(childOf(SCRIPT_LOGIN_LOCATION, 'path'), scriptLogin.path),
+  ];
+  const seen = new Set<string>();
+  scriptLogin.requiredQuery.forEach(({ name, value }, index) => {
+    const location = childOf(REQUIRED_QUERY_LOCATION, index);
+    if (name.trim().length === 0 || hasUnwritableCharacter(name) || hasUnwritableCharacter(value) || seen.has(name)) {
+      errors.push(errorOf(
+        'AUTH_SETUP_REQUIRED_QUERY_INVALID',
+        `${location.label} must have a non-blank name that is not used before, and no control characters, line breaks or lone surrogates`,
+        location.pointer,
+      ));
+    } else if (isSecretLikeQueryName(name)) {
+      errors.push(errorOf('AUTH_SETUP_SECRET_LIKE_VALUE', `${location.label} must not have a name that looks like a secret`, location.pointer));
+    } else if (isValueLikeText(value)) {
+      // T34R-fix-b（M-6）: 値に見える値（長い base64url・16 進・標準の base64・JWT の形・メールアドレスの形。`src/core/url-path-redaction.ts`）は持てない。
+      errors.push(errorOf('AUTH_SETUP_SECRET_LIKE_VALUE', `${location.label} must not have a value that looks like a secret or personal data`,
+        location.pointer));
+    }
+    seen.add(name);
+  });
+  return errors;
+};
+
+/** 送信先の鍵（Origin と path。重なりの判定）。 */
+const endpointKeyOf = (origin: string, path: string): string => JSON.stringify([origin, path]);
+
+/** ログインに伴う送信の誤り（Origin は承認したテストの Origin かサービスの Origin、path の形、送信先の重なり）。 */
+const loginSideRequestErrorsOf = (
+  sideRequests: readonly LoginSideRequest[],
+  approvedOrigins: readonly string[],
+  scriptLogin: ScriptLoginTarget | null,
+): readonly AuthSetupValidationError[] => {
+  const seen = new Set<string>(scriptLogin === null ? [] : [endpointKeyOf(scriptLogin.origin, scriptLogin.path)]);
+  return sideRequests.flatMap((sideRequest, index) => {
+    const location = childOf(LOGIN_SIDE_REQUESTS_LOCATION, index);
+    const key = endpointKeyOf(sideRequest.origin, sideRequest.path);
+    const duplicated = seen.has(key);
+    seen.add(key);
+    return [
+      ...version3OriginErrorsOf(
+        childOf(location, 'origin'),
+        sideRequest.origin,
+        approvedOrigins,
+        'AUTH_SETUP_ORIGIN_NOT_APPROVED',
+        'approvedTestOrigins or approvedServiceOrigins',
+      ),
+      ...pathErrorsOf(childOf(location, 'path'), sideRequest.path),
+      ...(duplicated
+        ? [errorOf(
+          'AUTH_SETUP_LOGIN_SIDE_REQUEST_DUPLICATED',
+          `${location.label} must not have the origin and the path of another login side request or of ${SCRIPT_LOGIN_LABEL}`,
+          location.pointer,
+        )]
+        : []),
+    ];
+  });
+};
+
+/** 成功のローカル ストレージの鍵の誤り（Origin は承認したテストの Origin、接頭辞と接尾辞の形）。 */
+const successStorageKeyErrorsOf = (storageKey: SuccessStorageKey, approved: readonly string[]): readonly AuthSetupValidationError[] => {
+  const errors: AuthSetupValidationError[] = [
+    ...version3OriginErrorsOf(
+      childOf(SUCCESS_STORAGE_KEY_LOCATION, 'origin'),
+      storageKey.origin,
+      approved,
+      'AUTH_SETUP_ORIGIN_NOT_APPROVED',
+      'approvedTestOrigins',
+    ),
+  ];
+  if (storageKey.prefix.length === 0 && storageKey.suffix.length === 0) {
+    errors.push(errorOf(
+      'AUTH_SETUP_STORAGE_KEY_INVALID',
+      `${SUCCESS_STORAGE_KEY_LOCATION.label} must have a prefix or a suffix (it must not match every key)`,
+      SUCCESS_STORAGE_KEY_LOCATION.pointer,
+    ));
+  }
+  for (const part of ['prefix', 'suffix'] as const) {
+    if (hasUnwritableCharacter(storageKey[part])) {
+      const location = childOf(SUCCESS_STORAGE_KEY_LOCATION, part);
+      errors.push(errorOf('AUTH_SETUP_STORAGE_KEY_INVALID', `${location.label} must not contain control characters, line breaks or lone surrogates`,
+        location.pointer));
+    }
+  }
+  return errors;
+};
+
+/**
+ * 登録した読み取りの手続きの呼び出しの path が、読まないパス（`excludedPaths`。前方一致）か、危険な語（`DEFAULT_EXCLUDED_URL_WORDS`）に当たるか
+ * （T35R-fix の M-1、T35R2-fix の M-4）。比べ方は Guard と同じ core の部品（`hitsExcludedPathPrefix`・`hitsDangerousTermIn`。小文字の形と、NFKC と
+ * 大文字・小文字を畳んだ形で比べる）。Guard は、監査の段でも、読まないパスと危険な語に当たる呼び出しを止めるので、登録の時点で拒む。
+ * CC-100: 比べる path の形は、Guard と同じ core の `exclusionMatchPathFormsOf`（`%XX` を戻した形、`/` をまとめた形、引数を外した形、`.` と `..`
+ * を解決した形と、その畳み込み）。前は生の値とその畳み込みだけだったので、Guard が止める形（例: `/%6Cogout`）を登録で拒むようになった。形を作れない
+ * 値は、当たるものとして拒む（fail-closed）。ML-a: 手動のログインの成功から認証の設定を組み立てる部品（`src/control/manual-login-registration.ts`）も、
+ * 登録する送信先の path を同じ判定で除く（書き写さない）。
+ */
+export const isExcludedReadPath = (path: string, excludedPaths: readonly string[]): boolean => {
+  const pathForms = exclusionMatchPathFormsOf(path);
+  return pathForms === null || hitsExcludedPathPrefix(pathForms, excludedPaths) || hitsDangerousTermIn(pathForms, DEFAULT_EXCLUDED_URL_WORDS);
+};
+
+/**
+ * 監査の段の読み取りの手続きの呼び出しの誤り（T35a。Task 35 の設計書 3.1）: Origin は承認したテストの Origin かサービスの Origin、path の形、Origin と
+ * path の組の重なり（読み取りの手続きの呼び出しの間だけ。ログインに伴う送信・スクリプトの送信先との重なりは許す。段が違い、数え方も違うため）。
+ * T35R-fix・T35R2-fix: path が読まないパスか危険な語に当たれば拒む（`isExcludedReadPath`）。
+ */
+const auditReadRequestErrorsOf = (
+  reads: readonly AuditReadRequest[],
+  approvedOrigins: readonly string[],
+  excludedPaths: readonly string[],
+): readonly AuthSetupValidationError[] => {
+  const seen = new Set<string>();
+  return reads.flatMap((read, index) => {
+    const location = childOf(AUDIT_READ_REQUESTS_LOCATION, index);
+    const key = endpointKeyOf(read.origin, read.path);
+    const duplicated = seen.has(key);
+    seen.add(key);
+    return [
+      ...version3OriginErrorsOf(
+        childOf(location, 'origin'),
+        read.origin,
+        approvedOrigins,
+        'AUTH_SETUP_ORIGIN_NOT_APPROVED',
+        'approvedTestOrigins or approvedServiceOrigins',
+      ),
+      ...pathErrorsOf(childOf(location, 'path'), read.path),
+      ...(isExcludedReadPath(read.path, excludedPaths)
+        ? [errorOf('AUTH_SETUP_PATH_INVALID', `${location.label} must not start with one of ${EXCLUDED_PATHS_LOCATION.label} or contain a dangerous term`,
+          childOf(location, 'path').pointer)]
+        : []),
+      ...(duplicated
+        ? [errorOf('AUTH_SETUP_AUDIT_READ_REQUEST_DUPLICATED', `${location.label} must not have the origin and the path of another audit read request`,
+          location.pointer)]
+        : []),
+    ];
+  });
+};
+
+/**
+ * 版 3 の値の規則の誤り（T34a）。ログインの送り方で、要る項目と持てない項目を確かめ、項目があれば中身を確かめる。
+ * - `SCRIPT_REQUEST`: `scriptLogin` と `successStorageKey` が要る（`AUTH_SETUP_SCRIPT_LOGIN_REQUIRED`）。`loginPostEndpoints` は空でよい。
+ *   T44e（Task 44 の設計書 P2-8）: 認証の方式が手動のログインのプロファイル（`requiresScriptTargets` が偽）では、どちらもなくてよい（手動のログインの段は
+ *   ページの送信を通して記録し、成功の後の自動の登録 `manualLoginRegistrationOf` が埋める）。自動ログインのプロファイルは今どおり求める。項目があるときの
+ *   中身の確かめは、どちらの方式でも同じ。
+ * - `FORM_NAVIGATION`: `scriptLogin`・`successStorageKey` を持てず、`loginSideRequests` は空（`AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED`。今の形の振る舞いを
+ *   変えない）。`loginPostEndpoints` は 1 つ以上（`AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED`）。
+ */
+const version3ErrorsOf = (
+  setup: AuthSetupV3,
+  approved: readonly string[],
+  services: readonly string[],
+  requiresScriptTargets: boolean,
+): readonly AuthSetupValidationError[] => {
+  const errors: AuthSetupValidationError[] = [];
+  if (setup.loginTransport === SCRIPT_REQUEST_TRANSPORT) {
+    for (const [value, location] of [[setup.scriptLogin, SCRIPT_LOGIN_LOCATION], [setup.successStorageKey, SUCCESS_STORAGE_KEY_LOCATION]] as const) {
+      if (value === null && requiresScriptTargets) {
+        errors.push(errorOf(
+          'AUTH_SETUP_SCRIPT_LOGIN_REQUIRED',
+          `${location.label} is required for ${LOGIN_TRANSPORT_LABEL} ${SCRIPT_REQUEST_TRANSPORT}`,
+          location.pointer,
+        ));
+      }
+    }
+  } else {
+    const present = [
+      [setup.scriptLogin !== null, SCRIPT_LOGIN_LOCATION],
+      [setup.successStorageKey !== null, SUCCESS_STORAGE_KEY_LOCATION],
+      [setup.loginSideRequests.length > 0, LOGIN_SIDE_REQUESTS_LOCATION],
+      // T35a: 監査の段の項目（任意）は、スクリプトで送るログインのときだけ持てる（空の一覧を含め、項目そのものを持てない）。
+      [setup.auditReadRequests !== undefined, AUDIT_READ_REQUESTS_LOCATION],
+      [setup.serviceRequestLimits !== undefined, SERVICE_REQUEST_LIMITS_LOCATION],
+    ] as const;
+    for (const [isPresent, location] of present) {
+      if (isPresent) {
+        errors.push(errorOf(
+          'AUTH_SETUP_SCRIPT_LOGIN_NOT_ALLOWED',
+          `${location.label} must be null or empty for ${LOGIN_TRANSPORT_LABEL} ${setup.loginTransport}`,
+          location.pointer,
+        ));
+      }
+    }
+    if (setup.loginPostEndpoints.length === 0) {
+      errors.push(errorOf(
+        'AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED',
+        `${LOGIN_POST_ENDPOINTS_LOCATION.label} must have at least one endpoint for ${LOGIN_TRANSPORT_LABEL} ${setup.loginTransport}`,
+        LOGIN_POST_ENDPOINTS_LOCATION.pointer,
+      ));
+    }
+  }
+  return [
+    ...errors,
+    ...(setup.scriptLogin === null ? [] : scriptLoginErrorsOf(setup.scriptLogin, services)),
+    ...loginSideRequestErrorsOf(setup.loginSideRequests, [...approved, ...services], setup.scriptLogin),
+    ...(setup.successStorageKey === null ? [] : successStorageKeyErrorsOf(setup.successStorageKey, approved)),
+    ...auditReadRequestErrorsOf(setup.auditReadRequests ?? [], [...approved, ...services], setup.excludedPaths),
+  ];
+};
+
 /** プロファイルとの結びつきと、モードと、Origin の包含の誤り。 */
 const profileBindingErrorsOf = (
   setup: AuthSetup,
@@ -583,6 +942,8 @@ const ruleErrorsOf = (
 ): readonly AuthSetupValidationError[] => {
   const profileSide = profileSideOf(profile, context);
   const approved = stringsOf(ownFieldOf(profileSide.copy, 'approvedTestOrigins'));
+  // T34a: 承認したサービスの Origin（項目がなければ空）。版 3 のスクリプトの送信先とログインに伴う送信が使う。
+  const services = stringsOf(ownFieldOf(profileSide.copy, 'approvedServiceOrigins'));
   const errors: AuthSetupValidationError[] = [
     ...profileSide.errors,
     ...profileBindingErrorsOf(setup, profileSide.copy, context),
@@ -598,6 +959,8 @@ const ruleErrorsOf = (
       : pathErrorsOf(SESSION_LOST_PATH_PREFIX_LOCATION, setup.sessionLostCondition.pathPrefix)),
     ...pathListErrorsOf(EXCLUDED_PATHS_LOCATION, setup.excludedPaths),
     ...pathListErrorsOf(AUDIT_PATH_PREFIXES_LOCATION, setup.auditPathPrefixes),
+    // T44e（P2-8）: 手動のログインのプロファイルだけ、スクリプトで送るログインの送信先と成功の鍵を後から自動の登録で埋めてよい。
+    ...version3ErrorsOf(setup, approved, services, ownFieldOf(profileSide.copy, 'auth') !== MANUAL_STRATEGY),
   ];
   if (setup.allowedIdpOrigins.length > 0) {
     errors.push(errorOf(
@@ -629,6 +992,7 @@ export const validateAuthSetup = (
   if (limitErrors.length > 0) {
     return rejected(limitErrors);
   }
+  // LG-3b: 版 3 のスキーマだけで確かめる（版 1・版 2 と知らない版は、形の誤り）。
   const shape = validateControlDocument(AUTH_SETUP_SCHEMA_NAME, copy);
   if (!shape.ok) {
     // 位置は、スキーマの検証の部品が構造で返す位置から作る（文から読み取らない。CC-086。CCX-24）。文は `errors` と同じ。

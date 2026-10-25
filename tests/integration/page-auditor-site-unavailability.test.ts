@@ -33,7 +33,7 @@ import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor, type PageAuditAttempt, type PageAuditorDependencies } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { LOOPBACK_HOST, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
@@ -134,7 +134,7 @@ useHeadlessChromium((launched) => {
 
 afterEach(async () => {
   // テストが失敗しても、次のテストに Context を残さない。残っていたらテストを失敗にする（`page-auditor.test.ts` と同じ）。
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -260,7 +260,7 @@ async function auditSite(server: SiteServer, options: SiteAuditOptions = {}): Pr
   const pageUrl = normalized(`${server.origin}${PAGE_PATH}`, config);
   const outcome = await auditor.audit(pageUrl, allocator.allocatePageId(), options.attempt);
   // どの監査の後にも、ブラウザに Context が残っていない。
-  expect(browser.contexts(), 'Contexts left in the browser after audit()').toHaveLength(0);
+  expect(testContextsOf(browser), 'Contexts left in the browser after audit()').toHaveLength(0);
   return { outcome, pageUrl, pacer };
 }
 

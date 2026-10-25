@@ -1,12 +1,19 @@
-import type { Browser, BrowserContext, BrowserContextOptions, CDPSession, Page, Request } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, CDPSession, Page, Request, Response } from 'playwright';
 import type { AuditConfig, Viewport } from '../config/types.js';
-import { awaitBeforeDeadline } from '../core/deadline.js';
+import { awaitBeforeDeadline, wait } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { BlockedInteractionRequestEvent } from '../core/evidence-types.js';
 import { isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import {
+  AUTHENTICATED_STATE_SAME_SITE_VALUES,
+  type AuthenticatedIndexedDBDatabase,
+  type AuthenticatedStorageState,
+} from '../core/authenticated-storage-state.js';
+import { deepFreeze } from '../core/immutable.js';
 import { AUTHENTICATED_STATE_READ_TIMEOUT_MS, MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import type { LoadMeter } from '../crawl/load-meter.js';
 import type { NavigationPacer } from '../crawl/navigation-pacer.js';
+import type { ServiceRequestBudget } from '../crawl/service-request-budget.js';
 import {
   ALLOW_ALL_EGRESS_UPSTREAMS,
   startEgressProxy,
@@ -17,6 +24,7 @@ import {
   type EgressUpstreamPolicy,
 } from '../safety/egress-proxy.js';
 import {
+  announcePageLeave,
   assertPassiveRequestGuardActive,
   activateInteractionFreeze,
   awaitPassiveRequestGuardReady,
@@ -24,11 +32,19 @@ import {
   closePassiveGuardedPage,
   installPassiveRequestGuard,
   isAcceptableGuardWriteStage,
+  isGuardApiWriteStage,
+  isGuardAuditSend,
   isPassiveRequestGuardClosed,
+  AuditStageMonitor,
   LoginStageMonitor,
   type EgressFreezeCause,
+  type GuardAuditSend,
+  type GuardAuditStage,
   type GuardLoginStage,
   type GuardResourceDelivery,
+  type GuardApiWriteStage,
+  type GuardFormWriteStage,
+  type GuardScriptLogin,
   type GuardWriteStage,
   type PassiveRequestGuardOptions,
 } from '../safety/passive-request-guard.js';
@@ -36,11 +52,23 @@ import {
   SUBMISSION_POST_METHOD,
   canonicalPassiveAllowedOrigins,
   classifyPassiveRequest,
+  hasAllowedOrigin,
+  isApiWriteCheckTarget,
+  isApiWriteEndpointUrl,
+  isReadMethod,
   isWriteEndpointUrl,
   type AuditExclusionPolicy,
+  type AuditSendPolicy,
+  type AuditStagePolicy,
+  type HttpRequestFacts,
   type PassiveRequestPolicyOptions,
+  type ScriptRequestLoginPolicy,
+  type SubmissionEndpoint,
 } from '../safety/request-policy.js';
+import { isLoginCredentialGuard } from '../safety/login-credential-guard.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
+import { SubmissionObservation } from '../safety/submission-observation.js';
+import { ensureElementPathEngine } from './element-path-engine.js';
 import { registerEgressUpstreamAddressSource } from './navigation-diagnostics.js';
 import {
   decideResourceDelivery,
@@ -94,28 +122,77 @@ export interface BrowserContextFactoryOptions {
    * 読み込みの開始だけで数える）。`recordDocumentRequestSent` の関数を持たなければ `TypeError`。
    */
   readonly navigationPacer?: Pick<NavigationPacer, 'recordDocumentRequestSent'> | undefined;
+  /**
+   * T35b（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限の部品（実行で 1 つ。`src/crawl/service-request-budget.ts`。作って渡すのは
+   * T35c）。認証の指定の監査の段の口（`authentication.auditStage`）があるときだけ使い、T35R-fix（T35R の C-1）からは、どの役割の Context の Guard にも
+   * 渡す（幅の走査と Interaction の `REVISIT` はサービスの Origin へ送らないが、数える側にも置いて守りを重ねる）。`tryConsume` の関数を持たなければ
+   * `TypeError`。
+   */
+  readonly serviceRequestBudget?: Pick<ServiceRequestBudget, 'tryConsume'> | undefined;
+  /**
+   * T35b: スクリプトで送るログインの監査の段の記録（Run で 1 つ。`AuditStageMonitor`）。監査の段の口があるときだけ、すべての Context の Guard に渡す。
+   */
+  readonly auditStageMonitor?: AuditStageMonitor | undefined;
+  /**
+   * T35c（Task 35 の設計書 3.5）: 承認したサービスの Origin からの 401 の応答を受けた（監査の段の口があるときだけ。`requestfinished` の観察）。値・URL を
+   * 渡さない。記録だけで、それだけでセッションが切れたとはみなさない。
+   */
+  readonly onServiceUnauthorizedResponse?: (() => void) | undefined;
+  /** T35c: Context の状態を読み直したときに、ログインの状態の鍵がなくなっていた（`AuthenticatedContextOptions.sessionKeyPresent` が偽）。 */
+  readonly onSessionKeyLost?: (() => void) | undefined;
+  /**
+   * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の指定（`GuardAuditSend`。設定から作って渡すのは
+   * AS-b）。渡すと、Passive の Context（`createPassiveContext`。役割によらない）の Guard と中継の要求の方針に渡す（今の `auditStage` などと同じ道）。ログインの段・
+   * 書き込みの段の Context と、Isolated Interaction Context（`createInteractionSession`）には渡さない（今のまま読み取りだけ）。形が違えば `TypeError`。
+   * 省略すると、今と同じ（読み取りだけ。`READ_ONLY`）。
+   */
+  readonly auditSend?: GuardAuditSend | undefined;
 }
 
 /**
- * 認証済みの状態（Playwright の `storageState` と同じ形。Cookie と、Origin ごとの localStorage）。秘密を含むので、値をログ、誤りの文、
- * 成果物、Evidence、保存に入れない（Task 25 の設計書 4.6）。
+ * 認証済みの状態（Playwright の `storageState` と同じ形。Cookie と、Origin ごとの localStorage と、DEF-139 からは IndexedDB）。秘密を含むので、値をログ、
+ * 誤りの文、成果物、Evidence、保存に入れない（Task 25 の設計書 4.6）。形の定義は core の 1 か所（`src/core/authenticated-storage-state.ts`。CC-060 の B）で、
+ * ここは同じ名前で公開し直す（呼ぶ側の import を変えない）。
  */
-export interface AuthenticatedStorageState {
-  readonly cookies: readonly {
-    readonly name: string;
-    readonly value: string;
-    readonly domain: string;
-    readonly path: string;
-    readonly expires: number;
-    readonly httpOnly: boolean;
-    readonly secure: boolean;
-    readonly sameSite: 'Strict' | 'Lax' | 'None';
-  }[];
-  readonly origins: readonly {
-    readonly origin: string;
-    readonly localStorage: readonly { readonly name: string; readonly value: string }[];
-  }[];
+export type { AuthenticatedStorageState } from '../core/authenticated-storage-state.js';
+
+/**
+ * DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 2.2）: Context の状態を、IndexedDB を含めて読む唯一の口（ログインの段の終わり、
+ * T25c の Context を閉じるときと受け継ぐとき、probe の前の読み出しが、どれもこれを使う）。値はメモリの中だけに置く（ファイルに書かない）。Playwright の
+ * 型は IndexedDB の項目を持たないので、同じ形の型にして返す。
+ */
+export const readContextStorageState = async (context: BrowserContext): Promise<AuthenticatedStorageState> =>
+  await context.storageState({ indexedDB: true }) as AuthenticatedStorageState;
+
+/**
+ * 認証済みの状態の、名前だけの写し（DEF-138。セッションの切れの証拠の鍵の名前の違いに使う）。Cookie はドメインと名前、localStorage は Origin と鍵の
+ * 名前、DEF-139 からは IndexedDB の Origin とデータベースの名前だけを持ち、値と中身は持たない。
+ */
+export interface AuthenticatedStateNames {
+  readonly cookies: readonly { readonly domain: string; readonly name: string }[];
+  readonly origins: readonly { readonly origin: string; readonly names: readonly string[] }[];
+  /** DEF-139: IndexedDB のデータベースの名前（Origin ごと。データベースのない Origin は持たない）。 */
+  readonly indexedDB: readonly { readonly origin: string; readonly names: readonly string[] }[];
 }
+
+/**
+ * Context の状態の名前（DEF-138）。`given` は Context を作るときに渡した状態、`read` はその Context の状態を最後に読んだとき（閉じるとき・受け継ぐとき・
+ * probe の前。絞り込みの前の状態）の名前。読めなかったか、まだ読んでいなければ `null`。
+ */
+export interface AuthenticatedContextStateNames {
+  readonly given: AuthenticatedStateNames;
+  readonly read: AuthenticatedStateNames | null;
+}
+
+/** 状態から、名前だけの写しを作る（値は写さない。凍結する）。 */
+const authenticatedStateNamesOf = (state: Pick<AuthenticatedStorageState, 'cookies' | 'origins'>): AuthenticatedStateNames => Object.freeze({
+  cookies: Object.freeze(state.cookies.map(({ domain, name }) => Object.freeze({ domain, name }))),
+  origins: Object.freeze(state.origins.map(({ origin, localStorage }) =>
+    Object.freeze({ origin, names: Object.freeze(localStorage.map(({ name }) => name)) }))),
+  indexedDB: Object.freeze(state.origins.flatMap(({ origin, indexedDB }) => (indexedDB === undefined || indexedDB.length === 0
+    ? []
+    : [Object.freeze({ origin, names: Object.freeze(indexedDB.map(({ name }) => name)) })]))),
+});
 
 /**
  * factory の認証の指定（T25c）。平らなデータと関数だけで、`src/control/` を読まない（Task 22 の Gate）。
@@ -128,6 +205,41 @@ export interface AuthenticatedContextOptions {
   readonly initialState: AuthenticatedStorageState;
   readonly filterState: (state: AuthenticatedStorageState) => AuthenticatedStorageState;
   readonly auditExclusions: AuditExclusionPolicy;
+  /**
+   * T35a（Task 35 の設計書 3.2）: スクリプトで送るログインの監査の段の口（`AuditStageServiceRequests`）。スクリプトで送るログインの Run だけが持つ。
+   * T35a では型と受け渡しだけで、Guard への取り付けは T35b。
+   */
+  readonly auditStage?: AuditStageServiceRequests | undefined;
+  /**
+   * T35c（Task 35 の設計書 3.5）: ログインの状態の鍵があるかの判定（スクリプトで送るログインの Run だけ。ワーカーが、認証の設定の成功の鍵の形と
+   * `hasSuccessStorageKey` で作る。factory は control を読まないので関数で受ける）。factory は、Context の状態を読み直したときに（`storageState`。
+   * 絞り込みの後）、偽なら `BrowserContextFactoryOptions.onSessionKeyLost` を呼ぶ。値は読まない（判定の関数も鍵の名前だけを見る）。
+   */
+  readonly sessionKeyPresent?: ((state: AuthenticatedStorageState) => boolean) | undefined;
+}
+
+/**
+ * スクリプトで送るログインの監査の段の口（T35a。Task 35 の設計書 3.2、3.4。平らなデータ。`src/control/` を読まない）。値は、ワーカーが認証の設定 v3 と
+ * プロファイルから作る（`src/worker/audit-stage-requests.ts`）。
+ * - `approvedServiceOrigins`: 承認したサービスの Origin（数える区分。上限の対象）。
+ * - `auditReadRequests`: 監査の段で通す、読み取りのための手続きの呼び出し（`POST`。1 回の読み込みあたりの回数の上限つき。既定は空）。
+ * - `scriptLogin`: token の送信先（更新などの token の送信を見分けて止める）。
+ * - `serviceRequestLimits`: 承認したサービスの Origin への要求の上限（1 分あたり、1 回の Run あたり。項目がなければ上限の値）。
+ */
+export interface AuditStageServiceRequests {
+  readonly approvedServiceOrigins: readonly string[];
+  readonly auditReadRequests: readonly {
+    readonly origin: string;
+    readonly path: string;
+    readonly method: string;
+    readonly maxPerPageLoad: number;
+  }[];
+  readonly scriptLogin: {
+    readonly origin: string;
+    readonly path: string;
+    readonly requiredQuery: readonly { readonly name: string; readonly value: string }[];
+  };
+  readonly serviceRequestLimits: { readonly perMinute: number; readonly perRun: number };
 }
 
 /** 受け継ぐ状態と、その状態を取り出した Context の世代（最初の状態は 0）。 */
@@ -171,10 +283,66 @@ function egressRejectionReason(
     // DEF-099 fix: 書き込みの段の、承認の送信先への 2 回目の POST（Guard は 1 回だけ送り手に送らせるので、Guard を迂回した要求）。
     case 'REQUEST_BUDGET':
       return 'GUARD_BYPASS_EGRESS';
+    // DEF-125: Guard が通していない宛先への CONNECT（Guard を通らずに出ようとした接続。記録は CONNECT と `host:port` だけで、値は残らない）。
+    case 'TUNNEL_NOT_ADMITTED':
+      return 'GUARD_BYPASS_EGRESS';
     case 'FROZEN':
       return freeze.frozenByInteraction ? 'INTERACTION_FROZEN_EGRESS' : null;
   }
 }
+
+/**
+ * DEF-125: 中継の CONNECT の受け入れ（`tunnelAdmission`）の、知らせのない CONNECT が知らせを待つ時間（ms）。
+ * 値の根拠（DEF-125-fix の実験。Chromium 151、Playwright 1.62.1）: CLI の `channel: 'chromium'` の `chrome.exe` は、ナビゲーションの宛先への CONNECT を、
+ * Guard がその文書の要求を判定して進める約 2〜5 ms 前に始める（テストの既定の headless shell は、判定の後に始める）。待たずに拒むと（0 ms）、読み込みは
+ * 新しい CONNECT で成功したが、拒んだ CONNECT が記録に残った（6 場面の 6 回）。1 秒待つと、記録は残らなかった。Guard が判定しないナビゲーション
+ * （Guard が止めた、許可 Origin の外への main frame の移動）の先への CONNECT は、待った後に拒んで記録する。
+ */
+export const EGRESS_TUNNEL_ADMISSION_WAIT_MS = 1_000;
+/** DEF-125: factory が作るすべての中継（Passive・ログインの段・書き込みの段・Interaction）に渡す CONNECT の受け入れ。 */
+const EGRESS_TUNNEL_ADMISSION = Object.freeze({ waitMs: EGRESS_TUNNEL_ADMISSION_WAIT_MS });
+
+/**
+ * T44b（Task 44 の設計書 3.1 の P1-2 と、設計の変更の履歴の「T44b の報告」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の、ページの監査の読み込みの
+ * Context（`PRIMARY` で印 `pageAuditLoad` のあるもの。Desktop と Mobile）を、持ち主が閉じる（`closePassiveContext`）ときの手順の、ページを離れた後に待つ時間
+ * （ms。1 回の閉じ方あたりの上限）。
+ * 手順: 認証の状態を読む → ページを離れる（`AUDIT_SEND_PAGE_LEAVE_URL` へ移る。人がページを閉じるのと同じ自然な動き）→ この時間だけ待つ → 閉じる。
+ * ページを離れるときに出る送信（`pagehide`・`visibilitychange`・`unload` の beacon、keepalive の fetch など）を、Guard の今の判定（`DELETE`・危険な語などは
+ * 止める）で通して自然に終えさせる。その間も Guard の段階は `PASSIVE_ACTIVE` のまま（閉じ方の段の順は変えない）。閉じ始めた後の送信は、今どおり止める。
+ * 待たず、ページも離れないもの: `READ_ONLY`（口のない Context）、印のない `PRIMARY` の Context（robots.txt・sitemap.xml・準備の読み込みなど）、幅の走査の
+ * Context（`REVISIT`。同じページの送信の繰り返しのため）、Interaction・ログインの段・書き込みの段の Context、factory が自分で閉じる（違反などの）Context。
+ * ページを離れた後の要求は、そのページの読み取りの判定の数（DEF-130 の文書でない要求の数と上限）に入れない（Guard の `announcePageLeave`）。
+ */
+export const AUDIT_SEND_CLOSE_SETTLE_MS = 1_000;
+
+/**
+ * T44b（設計者の判断の (1)）: `createPassiveContext` の省略できる指定。
+ * - `pageAuditLoad`: ページの監査の読み込み（Desktop と Mobile）の印。付けるのは、ページの監査の読み込みの作り手（`page-auditor.ts`）だけ。役割が
+ *   `PRIMARY` で、監査の段の送信の扱いの口がある factory のときだけ働く（持ち主が閉じるときに、ページを離れて `AUDIT_SEND_CLOSE_SETTLE_MS` だけ待つ）。
+ */
+export interface PassiveContextOptions {
+  readonly pageAuditLoad?: true | undefined;
+}
+
+/** T44b: 閉じる前にページを離れる先（サイトへの要求ではない。読み込みの間隔とページの移動の上限（DEF-129）には数えない）。 */
+export const AUDIT_SEND_PAGE_LEAVE_URL = 'about:blank';
+
+/**
+ * T44b: ページを離れる移動を待つ上限（ms）。過ぎたら離れずに進む（待ちと閉じる処理は続ける）。値の根拠: 閉じる処理を待つ上限
+ * （`CONTEXT_CLOSE_TIMEOUT_MS` = 5 秒）の中に、認証の状態の読み出しの上限（2 秒）、この上限、待つ時間（1 秒）、閉じる処理（ふだん 1 秒程度）が収まる値。
+ * 移動はふだん数十 ms で終わる。
+ */
+export const AUDIT_SEND_PAGE_LEAVE_TIMEOUT_MS = 500;
+
+/** T44b: Context の Guard が、閉じる途中でも無効化の途中でもないか（投げない。確かめは Guard の `assertPassiveRequestGuardActive`）。 */
+const isGuardActive = (context: BrowserContext): boolean => {
+  try {
+    assertPassiveRequestGuardActive(context);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /** 中継を、凍結の理由を記録してから凍結する（DEF-085 fix round 3）。最初の凍結の理由だけを残す（凍結は一方向）。 */
 function freezeEgressFor(egress: EgressProxy, freeze: EgressFreezeRecord, cause: EgressFreezeCause): void {
@@ -187,12 +355,16 @@ function freezeEgressFor(egress: EgressProxy, freeze: EgressFreezeRecord, cause:
 /**
  * 中継から見た要求の形（DEF-085）。中継は、main frame のナビゲーションかどうかを区別できないので、Guard の判定（`classifyPassiveRequest`）を
  * main frame のナビゲーションの形と、それ以外の形の両方で行い、どちらかで許すなら通す（Guard が許すものを中継が拒まない。Guard より広くは
- * 通さない）。
+ * 通さない）。T34b: 中継は要求の種類も区別できないので、ナビゲーションの形は `document`、それ以外の形はスクリプトの送信の種類（`fetch`）とする
+ * （Guard が許すスクリプトの送信を拒まない。種類で止める beacon などは、Guard が止める）。
  */
 const EGRESS_REQUEST_SHAPES = Object.freeze([
-  Object.freeze({ isNavigationRequest: true, isMainFrame: true }),
-  Object.freeze({ isNavigationRequest: false, isMainFrame: false }),
-]);
+  Object.freeze({ isNavigationRequest: true, isMainFrame: true, resourceType: 'document' }),
+  Object.freeze({ isNavigationRequest: false, isMainFrame: false, resourceType: 'fetch' }),
+  // T35b（Task 35 の設計書 3.3）: 静的な資源の形。スクリプトで送るログインの監査の段では、読む範囲を「ナビゲーションの形」だけに当てる（範囲の確かめは
+  // Guard が先に行う。読まないパスと危険な語は、この形でも当たる）。ほかの段では、fetch の形と同じ判定になる。
+  Object.freeze({ isNavigationRequest: false, isMainFrame: false, resourceType: 'script' }),
+] as const satisfies readonly Pick<HttpRequestFacts, 'isNavigationRequest' | 'isMainFrame' | 'resourceType'>[]);
 
 /**
  * 中継の要求の方針の、送信の段（ログインの段と書き込みの段）の残りの回数（DEF-085。T30b で書き込みの段にも使う）。回数の上限は Guard が数える
@@ -214,6 +386,10 @@ function passiveEgressRequestPolicy(
   allowedOrigins: ReadonlySet<string>,
   stage: SubmissionStageOptions,
   auditExclusions: AuditExclusionPolicy | undefined,
+  auditStage: AuditStageServiceRequests | undefined,
+  role: ResourceDeliveryRole,
+  auditSend: GuardAuditSend | undefined,
+  readAdmissions: EgressReadAdmissions,
 ): EgressRequestPolicy {
   const copy = (values: readonly string[]): readonly string[] => Object.freeze(values.map((value) => String(value)));
   const { loginStage, writeStage } = stage;
@@ -224,15 +400,31 @@ function passiveEgressRequestPolicy(
         authSetup: Object.freeze({
           loginPostEndpoints: Object.freeze(loginStage.loginPostEndpoints.map(({ origin, path }) => Object.freeze({ origin, path }))),
           remainingPosts: EGRESS_LOGIN_POST_REMAINING,
+          // T34b: スクリプトで送るログインの口（token の送信先、ログインに伴う送信、承認したサービスの Origin）。回数は Guard が数える。
+          ...(loginStage.scriptRequest === undefined ? {} : { scriptRequest: egressScriptRequestPolicy(loginStage.scriptRequest) }),
+          // ML-a: 手動のログインの段は、中継も Guard と同じく、ページの送信を止めずに通す（Guard より広くは通さない）。
+          ...(loginStage.manualPassThrough === true && loginStage.credentialGuard === undefined ? { manualPassThrough: true as const } : {}),
+          // T44R の M-1: 手動のログインの段の、token の送信先がまだない設定の承認したサービスの Origin への読み取り（Guard と同じ口。スクリプトの口があれば使わない）。
+          ...(loginStage.manualPassThrough === true && loginStage.credentialGuard === undefined
+            && loginStage.scriptRequest === undefined && loginStage.manualServiceReadOrigins !== undefined
+            ? { manualServiceReadOrigins: copy(loginStage.manualServiceReadOrigins) }
+            : {}),
         }),
       }),
     ...(writeStage === undefined
       ? {}
       : {
-        writeStage: Object.freeze({
-          writeEndpoint: Object.freeze({ origin: writeStage.expectation.request.origin, path: writeStage.expectation.request.path }),
-          remainingPosts: EGRESS_LOGIN_POST_REMAINING,
-        }),
+        writeStage: isGuardApiWriteStage(writeStage)
+          // T39b: API の書き込みの段。中継は、ページのスクリプトの要求かを知らないので、判定の API の分岐は通らない（送り手の 1 回は、下の T39c の口で通す）。
+          ? Object.freeze({
+            writeEndpoint: Object.freeze({ origin: writeStage.expectation.spec.request.origin, path: writeStage.expectation.spec.request.pathShape }),
+            remainingPosts: EGRESS_LOGIN_POST_REMAINING,
+            apiOrigin: writeStage.expectation.spec.request.origin,
+          })
+          : Object.freeze({
+            writeEndpoint: Object.freeze({ origin: writeStage.expectation.request.origin, path: writeStage.expectation.request.path }),
+            remainingPosts: EGRESS_LOGIN_POST_REMAINING,
+          }),
       }),
     ...(auditExclusions === undefined
       ? {}
@@ -243,23 +435,169 @@ function passiveEgressRequestPolicy(
           dangerousTerms: copy(auditExclusions.dangerousTerms),
         }),
       }),
+    // T35b: スクリプトで送るログインの監査の段の口（登録した読み取りの手続きの呼び出しの回数は Guard が数える。中継はどの項目も残り 1 とする）。
+    // T35R2-fix（T35R2 の M-3）: 最初の読み込みでない Context（幅の走査の `REVISIT`）では、中継でも承認したサービスの Origin へ送らない。
+    // T44b（P1-1）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の Context は、役割によらず送る（Guard と同じ。`servesServiceOrigin`）。
+    ...(auditStage === undefined ? {} : { auditStage: egressAuditStagePolicy(auditStage, servesServiceOrigin(role, auditSend)) }),
+    // AS-a: 監査の段の送信の扱いの口（通す数は Guard が数える。中継は残り 1 とする。Guard より広くは通さない）。
+    ...(auditSend === undefined ? {} : { auditSend: egressAuditSendPolicy(auditSend) }),
   });
   const origins: ReadonlySet<string> = new Set(allowedOrigins);
-  return (method: string, url: string): boolean => EGRESS_REQUEST_SHAPES.some((shape) =>
-    classifyPassiveRequest({ kind: 'HTTP', method, url, ...shape }, origins, policy).action === 'ALLOW');
+  // T39c: API の書き込みの段では、送り手の 1 回の送信（承認した API の Origin と path の型への `POST`・`PATCH`。query は問わない）も通す。中継は、
+  // ページのスクリプトの要求か・送信の窓・照合を知らないので、送信先の形だけを要求の判定の owner の部品で見て、回数は予算（`apiWriteStageEgressBudget`）が
+  // 1 回に限る（Guard が照合して送り手に送らせる 1 回のほかは、Guard を迂回した要求）。
+  const apiWrite = writeStage !== undefined && isGuardApiWriteStage(writeStage) ? apiWriteEndpointOf(writeStage) : null;
+  // BN-R0 fix round 1（I-1）: 中継は、要求の種類も main frame の移動かも分からないので、監査の段の除外は、ページの文書でない読み取りにも当てる形（BN-0 の前と同じ。
+  // `applyToPageSubresourceReads`）で判定する。その形で通さない GET・HEAD のうち、BN-0 の決まりの形（ページの文書でない読み取りには当てない）なら通すものは、
+  // この Context の Guard が通した（`readAdmissions` に知らせた）要求だけを通す（Guard を迂回した要求の 2 段目の守り）。
+  const strictPolicy: PassiveRequestPolicyOptions = policy.auditExclusions === undefined
+    ? policy
+    : Object.freeze({ ...policy, auditExclusions: Object.freeze({ ...policy.auditExclusions, applyToPageSubresourceReads: true as const }) });
+  const allowedBy = (target: PassiveRequestPolicyOptions, method: string, url: string): boolean => EGRESS_REQUEST_SHAPES.some((shape) =>
+    classifyPassiveRequest({ kind: 'HTTP', method, url, ...shape }, origins, target).action === 'ALLOW');
+  return (method: string, url: string): boolean => allowedBy(strictPolicy, method, url)
+    || (apiWrite !== null && isApiWriteEndpointRequest(method, url, apiWrite))
+    || (isReadMethod(method) && readAdmissions.has(method, url) && allowedBy(policy, method, url));
+}
+
+/**
+ * BN-R0 fix round 1（I-1）: その Context の Guard が通した（`decideGuardRequest` の `ALLOW`）、読み取り（GET・HEAD）の要求の method と URL の写し（中継の要求の
+ * 方針が使う。`passiveEgressRequestPolicy`）。Guard の口（`onEgressDestinationAdmitted`）が、命令を送る前に同期で知らせる。URL は fragment を外した正規の形で比べる。
+ * 数は上限（`MAX_EGRESS_READ_ADMISSIONS`）までで、超えたら古いものから捨てる（捨てた要求の 2 回目は、中継が拒んで記録する。fail-closed の側）。
+ */
+export const MAX_EGRESS_READ_ADMISSIONS = 4_096;
+
+class EgressReadAdmissions {
+  readonly #keys = new Set<string>();
+
+  admit(method: string | undefined, url: string): void {
+    if (method === undefined || !isReadMethod(method)) {
+      return;
+    }
+    const key = egressReadAdmissionKeyOf(method, url);
+    if (key === null) {
+      return;
+    }
+    this.#keys.delete(key);
+    this.#keys.add(key);
+    while (this.#keys.size > MAX_EGRESS_READ_ADMISSIONS) {
+      const oldest = this.#keys.values().next();
+      if (oldest.done === true) {
+        break;
+      }
+      this.#keys.delete(oldest.value);
+    }
+  }
+
+  has(method: string, url: string): boolean {
+    const key = egressReadAdmissionKeyOf(method, url);
+    return key !== null && this.#keys.has(key);
+  }
+}
+
+/** 読み取りの知らせの鍵（大文字の method と、fragment を外した正規の URL）。読めない URL は `null`（知らせにも、照らしにも使わない）。 */
+function egressReadAdmissionKeyOf(method: string, url: string): string | null {
+  try {
+    // fragment はサーバに送られないので、`#` から後を外してから正規の形にする（Guard の URL と中継の要求の行を同じ形で比べる）。
+    return `${method.toUpperCase()} ${new URL(url.split('#', 1)[0] ?? url).href}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * T44b（Task 44 の設計書 3.1 の P1-1）: その Context が、スクリプトで送るログインの監査の段で承認したサービスの Origin へ送るか（Guard の口の
+ * `readRequestsAllowed` と、中継の口の写し）。最初の読み込み（`PRIMARY`）と、監査の段の送信の扱い `PASS_EXCEPT_DELETE` の Context（幅の走査の `REVISIT` を
+ * 含む。`auditSend` を渡すのは Passive の Context だけ）。送る要求は、どの役割でも上限の部品（`service-request-budget`）で数える。`READ_ONLY` の幅の走査と、
+ * Isolated Interaction Context（`auditSend` を渡さない）は、今どおり送らない（T35R-fix の C-1）。
+ */
+const servesServiceOrigin = (role: ResourceDeliveryRole, auditSend: GuardAuditSend | undefined): boolean =>
+  role === 'PRIMARY' || auditSend !== undefined;
+
+/**
+ * 中継の要求の方針の、スクリプトで送るログインの監査の段の口（T35b。写しを取る。登録した読み取りの手続きの呼び出しは、サービスの Origin へ送る Context では
+ * どの項目も残り 1）。T35R2-fix（T35R2 の M-3）: 送らない Context（`servesServiceOrigin` が偽）では、Guard と同じく承認したサービスの Origin へ送らず
+ * （`serviceOriginRequestsWithheld`）、登録した呼び出しの残りも 0 にする。
+ */
+function egressAuditStagePolicy(stage: AuditStageServiceRequests, servesService: boolean): AuditStagePolicy {
+  return Object.freeze({
+    approvedServiceOrigins: Object.freeze([...stage.approvedServiceOrigins]),
+    auditReadRequests: Object.freeze(stage.auditReadRequests.map(({ origin, path, method }) =>
+      Object.freeze({ origin, path, method, remainingPosts: servesService ? EGRESS_LOGIN_POST_REMAINING : 0 }))),
+    serviceOriginRequestsWithheld: !servesService,
+    scriptLogin: Object.freeze({
+      origin: stage.scriptLogin.origin,
+      path: stage.scriptLogin.path,
+      requiredQuery: Object.freeze(stage.scriptLogin.requiredQuery.map(({ name, value }) => Object.freeze({ name, value }))),
+    }),
+  });
+}
+
+/** 中継の要求の方針の、監査の段の送信の扱いの口（AS-a。写しを取る。通す数は Guard が数えるので、中継は残り 1 とする）。 */
+function egressAuditSendPolicy(send: GuardAuditSend): AuditSendPolicy {
+  return Object.freeze({
+    approvedServiceOrigins: Object.freeze([...send.approvedServiceOrigins]),
+    dangerousTerms: Object.freeze([...send.dangerousTerms]),
+    remainingPasses: EGRESS_LOGIN_POST_REMAINING,
+  });
+}
+
+/**
+ * 中継の要求の方針の、スクリプトで送るログインの口（T34b）。中継は回数を数えないので、token の送信とログインに伴う送信のどの項目も、Guard が
+ * 許しうるものとして残りを 1 にする（Guard が数えて止める）。写しを取る。
+ */
+function egressScriptRequestPolicy(script: GuardScriptLogin): ScriptRequestLoginPolicy {
+  const { scriptLogin } = script;
+  return Object.freeze({
+    scriptLogin: Object.freeze({
+      origin: scriptLogin.origin,
+      path: scriptLogin.path,
+      requiredQuery: Object.freeze(scriptLogin.requiredQuery.map(({ name, value }) => Object.freeze({ name, value }))),
+    }),
+    loginSideRequests: Object.freeze(script.loginSideRequests.map(({ origin, path, method }) =>
+      Object.freeze({ origin, path, method, remainingPosts: EGRESS_LOGIN_POST_REMAINING }))),
+    approvedServiceOrigins: Object.freeze([...script.approvedServiceOrigins]),
+  });
 }
 
 /** DEF-099 fix: 書き込みの段の中継が通す、承認の送信先への POST の回数（承認された 1 回の CREATE）。 */
 const WRITE_STAGE_EGRESS_POSTS = 1;
 
 /** DEF-099 fix: 書き込みの段の中継の、承認の送信先への POST の数え方（絶対形の HTTP の要求だけ。送信先の比べ方は要求の判定の owner）。 */
-const writeStageEgressBudget = (writeStage: GuardWriteStage): EgressRequestBudget => {
+/** T39R-fix（M-1）: API の書き込みの段の、承認の endpoint（承認した API の Origin と path の型）。 */
+const apiWriteEndpointOf = (writeStage: GuardApiWriteStage): SubmissionEndpoint =>
+  Object.freeze({ origin: writeStage.expectation.spec.request.origin, path: writeStage.expectation.spec.request.pathShape });
+
+/**
+ * T39R-fix（M-1）: 要求が、承認の endpoint への `POST`・`PATCH` か（query は問わない）。中継の方針（送り手の 1 回を通す）と予算（その回数を数える）が
+ * 同じ形を使う（要求の判定の owner の部品 `isApiWriteCheckTarget`・`isApiWriteEndpointUrl`）。
+ */
+const isApiWriteEndpointRequest = (method: string, url: string, endpoint: SubmissionEndpoint): boolean =>
+  isApiWriteCheckTarget(method, url, endpoint.origin) && isApiWriteEndpointUrl(url, endpoint);
+
+/**
+ * T39c（Task 39 の設計書 3.4）: API の書き込みの段の中継の、承認の endpoint への `POST`・`PATCH` の数え方（絶対形の HTTP の要求だけ。https の
+ * CONNECT の中身は数えない。宛先は DEF-125 の受け入れで Guard が知らせたものだけ）。送り手の 1 回のほかは止めて記録する。T39R-fix（M-1）: 数えるのは
+ * 承認の endpoint（Origin と path）への要求だけ（窓の外で通した登録した読み取りの手続きの呼び出しは数えない。方針の側と同じ形）。
+ */
+const apiWriteStageEgressBudget = (writeStage: GuardApiWriteStage): EgressRequestBudget => {
+  const endpoint = apiWriteEndpointOf(writeStage);
+  return Object.freeze({
+    matches: (method: string, url: string): boolean => isApiWriteEndpointRequest(method, url, endpoint),
+    limit: WRITE_STAGE_EGRESS_POSTS,
+  });
+};
+
+const writeStageEgressBudget = (writeStage: GuardFormWriteStage): EgressRequestBudget => {
   const endpoint = Object.freeze({ origin: writeStage.expectation.request.origin, path: writeStage.expectation.request.path });
   return Object.freeze({
     matches: (method: string, url: string): boolean => method.toUpperCase() === SUBMISSION_POST_METHOD && isWriteEndpointUrl(url, endpoint),
     limit: WRITE_STAGE_EGRESS_POSTS,
   });
 };
+
+/** 承認したサービスの Origin からの、認証の失敗の応答の status（T35c。数えるだけ）。 */
+const HTTP_UNAUTHORIZED_STATUS = 401;
 
 /** Shared Worker の、CDP の target の種類（`Target.TargetInfo.type`。DEF-044）。 */
 const SHARED_WORKER_TARGET_TYPE = 'shared_worker';
@@ -349,6 +687,30 @@ function viewportSnapshot(viewport: Viewport): Viewport {
 const isStringArray = (value: unknown): value is readonly string[] =>
   Array.isArray(value) && value.every((item) => typeof item === 'string');
 
+
+/**
+ * 監査の段の口の形か（T35c。`assertRunAuthentication` と factory の `isAuthenticatedContextOptions` が使う唯一の確かめ）: 承認したサービスの Origin が
+ * 文字列の配列、読み取りの手続きの呼び出しが `{ origin, path, method, maxPerPageLoad }`（文字列と正の整数）の配列、token の送信先が
+ * `{ origin, path, requiredQuery: { name, value }[] }`、上限が `{ perMinute, perRun }`（正の整数）。
+ */
+export function isAuditStageServiceRequests(value: unknown): value is AuditStageServiceRequests {
+  if (!isRecord(value) || !isStringArray(value.approvedServiceOrigins) || !Array.isArray(value.auditReadRequests)) {
+    return false;
+  }
+  const { scriptLogin, serviceRequestLimits } = value;
+  return value.auditReadRequests.every((request: unknown) => isRecord(request)
+      && isStringArray([request['origin'], request['path'], request['method']])
+      && isPositiveSafeInteger(request['maxPerPageLoad']))
+    && isRecord(scriptLogin)
+    && isStringArray([scriptLogin['origin'], scriptLogin['path']])
+    && Array.isArray(scriptLogin['requiredQuery'])
+    && (scriptLogin['requiredQuery'] as readonly unknown[]).every((parameter) =>
+      isRecord(parameter) && isStringArray([parameter['name'], parameter['value']]))
+    && isRecord(serviceRequestLimits)
+    && isPositiveSafeInteger(serviceRequestLimits['perMinute'])
+    && isPositiveSafeInteger(serviceRequestLimits['perRun']);
+}
+
 /** 認証の指定の形か（T25c。値の中身は見ない。最初の状態の形は、絞った後の写しで確かめる）。 */
 function isAuthenticatedContextOptions(value: unknown): value is AuthenticatedContextOptions {
   if (!isRecord(value) || typeof value.filterState !== 'function' || !isRecord(value.initialState)) {
@@ -358,28 +720,80 @@ function isAuthenticatedContextOptions(value: unknown): value is AuthenticatedCo
   return isRecord(auditExclusions)
     && isStringArray(auditExclusions.excludedPathPrefixes)
     && isStringArray(auditExclusions.auditPathPrefixes)
-    && isStringArray(auditExclusions.dangerousTerms);
+    && isStringArray(auditExclusions.dangerousTerms)
+    // T35c: 監査の段の口（省略か、形の正しい口）と、ログインの状態の鍵の判定（省略か、関数）。
+    && (value.auditStage === undefined || isAuditStageServiceRequests(value.auditStage))
+    && (value.sessionKeyPresent === undefined || typeof value.sessionKeyPresent === 'function');
 }
 
 /**
  * ログインの段の指定の形か（T25d）: 送信先が 1 件以上の `{ origin, path }`（どちらも文字列）で、上限が 0 以上の安全な整数。値の意味（Origin の
  * 正規の形、path の形）は、要求の判定の owner（`classifyPassiveRequest` の `authSetup` の口）が判定する（合わない送信先には許さない）。
  * T26g-1: ログインの段の記録と送信の窓の口（`monitor`）は、省略するか `LoginStageMonitor` だけを受ける。
+ * T34b: スクリプトで送るログインの指定（`scriptRequest`）は、省略するか `isGuardScriptLogin` の形だけを受ける。ある場合は、フォームの送信先
+ * （`loginPostEndpoints`）は空でよい（使わない）。
  */
 function isGuardLoginStage(value: unknown): value is GuardLoginStage {
-  if (!isRecord(value) || !Array.isArray(value.loginPostEndpoints) || value.loginPostEndpoints.length === 0) {
+  if (!isRecord(value) || !Array.isArray(value.loginPostEndpoints)) {
     return false;
   }
-  const { maxLoginPosts } = value;
-  return typeof maxLoginPosts === 'number'
-    && Number.isSafeInteger(maxLoginPosts)
-    && maxLoginPosts >= 0
+  const { maxLoginPosts, scriptRequest } = value;
+  // T44e（Task 44 の設計書 P2-8）: 手動のログインの段（`manualPassThrough`）だけは、送信先もスクリプトの指定もない口を受ける（スクリプトで送るログインの設定の
+  // token の送信先がまだない形。今の決まりでは止める送信を、手動の段の口が通して記録する。通し方は変えない）。自動ログインの段は今どおり拒む。
+  const manualWithoutTargets = value.manualPassThrough === true && value.credentialGuard === undefined && value.loginPostEndpoints.length === 0;
+  if (scriptRequest === undefined ? value.loginPostEndpoints.length === 0 && !manualWithoutTargets : !isGuardScriptLogin(scriptRequest)) {
+    return false;
+  }
+  // T36b（Task 36 の設計書 3.3）: 自動ログインの資格情報の部品は、スクリプトで送るログインの指定と一緒にだけ受ける（部品の作り方で作ったものだけ）。
+  const { credentialGuard } = value;
+  if (credentialGuard !== undefined && (scriptRequest === undefined || !isLoginCredentialGuard(credentialGuard))) {
+    return false;
+  }
+  // ML-a: 手動のログインの段の印は `true` だけを受け、自動ログインの資格情報の部品とは一緒に受けない（自動ログインの段は今の厳しさのまま）。
+  const { manualPassThrough } = value;
+  if (manualPassThrough !== undefined && (manualPassThrough !== true || credentialGuard !== undefined)) {
+    return false;
+  }
+  // T44R（Task 44 のレビューの M-1）: 手動のログインの段の、token の送信先がまだない設定の承認したサービスの Origin は、文字列の配列だけを、手動の段の印と
+  // 一緒に、スクリプトの指定がないときだけ受ける（自動ログインの段は受けない）。
+  const { manualServiceReadOrigins } = value;
+  if (
+    manualServiceReadOrigins !== undefined
+    && (!isStringArray(manualServiceReadOrigins) || manualPassThrough !== true || scriptRequest !== undefined)
+  ) {
+    return false;
+  }
+  return isNonNegativeSafeInteger(maxLoginPosts)
     && (value.monitor === undefined || value.monitor instanceof LoginStageMonitor)
     && value.loginPostEndpoints.every((endpoint: unknown) => isRecord(endpoint) && isStringArray([endpoint['origin'], endpoint['path']]));
 }
 
-/** Cookie の `SameSite` の値（Playwright の `storageState` の形）。 */
-const STORAGE_STATE_SAME_SITE_VALUES: readonly unknown[] = Object.freeze(['Strict', 'Lax', 'None']);
+/** 0 以上の安全な整数か。 */
+const isNonNegativeSafeInteger = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * スクリプトで送るログインの指定の形か（T34b）: token の送信先が `{ origin, path, requiredQuery: { name, value }[] }`（どれも文字列）、ログインに伴う
+ * 送信が `{ origin, path, method, maxPerLoginStage }`（文字列と、0 以上の安全な整数）の配列、承認したサービスの Origin が文字列の配列。値の意味
+ * （Origin の正規の形、path の形、method）は、要求の判定の owner（`classifyPassiveRequest` の `authSetup.scriptRequest` の口）が判定する（合わない
+ * 送信先には許さない）。
+ */
+function isGuardScriptLogin(value: unknown): value is GuardScriptLogin {
+  if (!isRecord(value) || !isRecord(value.scriptLogin) || !Array.isArray(value.loginSideRequests)) {
+    return false;
+  }
+  const { scriptLogin } = value;
+  return isStringArray([scriptLogin['origin'], scriptLogin['path']])
+    && Array.isArray(scriptLogin['requiredQuery'])
+    && (scriptLogin['requiredQuery'] as readonly unknown[]).every((parameter) =>
+      isRecord(parameter) && isStringArray([parameter['name'], parameter['value']]))
+    && value.loginSideRequests.every((side: unknown) =>
+      isRecord(side) && isStringArray([side['origin'], side['path'], side['method']]) && isNonNegativeSafeInteger(side['maxPerLoginStage']))
+    && isStringArray(value.approvedServiceOrigins);
+}
+
+/** Cookie の `SameSite` の値（Playwright の `storageState` の形。一覧は core の 1 か所。CC-060 の B）。 */
+const STORAGE_STATE_SAME_SITE_VALUES: readonly unknown[] = AUTHENTICATED_STATE_SAME_SITE_VALUES;
 
 /**
  * 認証済みの状態の、知っている項目だけを写した、凍結した写し（T25c）。形が正しくなければ投げる（誤りの文に値を入れない）。絞り込みの関数が
@@ -425,19 +839,46 @@ function authenticatedStateCopy(value: unknown): AuthenticatedStorageState {
       }
       return Object.freeze({ name: item.name, value: item.value });
     });
-    return Object.freeze({ origin: entryOrigin, localStorage: Object.freeze(localStorage) });
+    const indexedDB = indexedDBCopyOf(entry['indexedDB']);
+    return Object.freeze({ origin: entryOrigin, localStorage: Object.freeze(localStorage), ...(indexedDB === undefined ? {} : { indexedDB }) });
   });
   return Object.freeze({ cookies: Object.freeze(cookies), origins: Object.freeze(origins) });
+}
+
+/**
+ * DEF-139: IndexedDB のデータベースの、凍結した深い写し（なければ `undefined`）。形が正しくなければ投げる（誤りの文に値を入れない）。中身は読まない。
+ */
+function indexedDBCopyOf(value: unknown): readonly AuthenticatedIndexedDBDatabase[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new TypeError('Authenticated state has a malformed IndexedDB');
+  }
+  const databases = (value as readonly unknown[]).map((database) => {
+    if (!isRecord(database) || typeof database['name'] !== 'string' || typeof database['version'] !== 'number' || !Array.isArray(database['stores'])) {
+      throw new TypeError('Authenticated state has a malformed IndexedDB database');
+    }
+    return { name: database['name'], version: database['version'], stores: structuredClone(database['stores'] as readonly unknown[]) };
+  });
+  return databases.length === 0 ? undefined : deepFreeze(databases);
 }
 
 /** Playwright の `newContext` の `storageState` に渡す、書き換えのできる写し（T25c。メモリのまま渡す。ファイルに書かない）。 */
 function playwrightStorageState(state: AuthenticatedStorageState): Exclude<BrowserContextOptions['storageState'], string | undefined> {
   return {
     cookies: state.cookies.map((cookie) => ({ ...cookie })),
-    origins: state.origins.map((entry) => ({
-      origin: entry.origin,
-      localStorage: entry.localStorage.map((item) => ({ ...item })),
-    })),
+    origins: state.origins.map((entry) => {
+      // DEF-139: IndexedDB も渡す（Playwright の型は持たないが、`newContext` の `storageState` は受ける）。
+      const origin: { origin: string; localStorage: { name: string; value: string }[]; indexedDB?: unknown[] } = {
+        origin: entry.origin,
+        localStorage: entry.localStorage.map((item) => ({ ...item })),
+      };
+      if (entry.indexedDB !== undefined && entry.indexedDB.length > 0) {
+        origin.indexedDB = structuredClone(entry.indexedDB) as unknown[];
+      }
+      return origin;
+    }),
   };
 }
 
@@ -450,6 +891,19 @@ export class BrowserContextFactory {
   readonly #allowedOrigins: ReadonlySet<string>;
   readonly #ledgerFactory: SafetyLedgerFactory;
   readonly #contextLedgers = new WeakMap<BrowserContext, SafetyLedger>();
+  /** T37b: Context ごとの送らずに観察する probe の口（PRIMARY の Passive の Context だけ。`submissionObservationOf`）。 */
+  readonly #submissionObservations = new WeakMap<BrowserContext, SubmissionObservation>();
+  /**
+   * T37R-fix-B（T37R の I-1）: probe を行う Context の、押す前に読んだ状態（`pinAuthenticatedStateBeforeProbe`）。閉じるときに次の Context へ渡す状態と、
+   * 鍵の消失の判定は、Context を読み直さずにこの状態を使う（押下でページが書き換えた localStorage・Cookie を受け継がない）。読めなかったら `null`
+   * （閉じるときも受け継がず、失敗に数える。fail-closed）。
+   */
+  readonly #pinnedAuthenticatedStates = new WeakMap<BrowserContext, AuthenticatedStorageState | null>();
+  /**
+   * DEF-138: Context ごとの、渡した状態と最後に読んだ状態の名前（値を持たない。`authenticatedStateNamesOf`）。認証つきの Context だけ。Context と一緒に
+   * 捨てる（WeakMap）。
+   */
+  readonly #contextStateNames = new WeakMap<BrowserContext, { given: AuthenticatedStateNames; read: AuthenticatedStateNames | null }>();
   /**
    * factory が所有する（閉じる責任を持つ）Context。Worker の自己検査（DEF-044、DEF-049）が、所有するすべての Context をたどるので、
    * `Set` にする（以前は `WeakSet`）。所有を解放するとき（`#releaseContext`）に外すので、閉じた Context を持ち続けない（漏れない）。
@@ -465,6 +919,13 @@ export class BrowserContextFactory {
    * `egressFreeze`）、Context が閉じたら閉じる（`close` の事象と `closePassiveContext`）。
    */
   readonly #contextEgress = new WeakMap<BrowserContext, EgressProxy>();
+  /** BN-R0 fix round 1（I-1）: Passive の Context の中継ごとの、Guard が通した読み取りの写し（`EgressReadAdmissions`）。 */
+  readonly #egressReadAdmissions = new WeakMap<EgressProxy, EgressReadAdmissions>();
+  /**
+   * T44b（P1-2）: 監査の段の送信の扱いの口（`auditSend`）を Guard に渡した、ページの監査の読み込みの Context（`PRIMARY` で、`createPassiveContext` の印
+   * `pageAuditLoad` のあるもの。Desktop と Mobile）。持ち主が閉じるときに、ページを離れてから `AUDIT_SEND_CLOSE_SETTLE_MS` だけ待つ。
+   */
+  readonly #pageLeaveContexts = new WeakSet<BrowserContext>();
   /**
    * Worker の自己検査の Browser の CDP の session（DEF-044、DEF-049）。constructor で開き始め、Context を作る前に完了を待つ
    * （`#createGuardedContext`）。開けなければ、その例外のまま reject する（Context を作らない）。
@@ -492,7 +953,17 @@ export class BrowserContextFactory {
    */
   readonly #servedFromRunCache = new WeakSet<Request>();
   /** 認証つきの Run の指定（T25c）。なければ `null`（公開監査。今のまま）。 */
-  readonly #authentication: Pick<AuthenticatedContextOptions, 'filterState' | 'auditExclusions'> | null;
+  readonly #authentication: Pick<AuthenticatedContextOptions, 'filterState' | 'auditExclusions' | 'auditStage' | 'sessionKeyPresent'> | null;
+  /** T35b: 承認したサービスの Origin への要求の上限の部品（`BrowserContextFactoryOptions.serviceRequestBudget`）。なければ `null`。 */
+  readonly #serviceRequestBudget: Pick<ServiceRequestBudget, 'tryConsume'> | null;
+  /** T35b: スクリプトで送るログインの監査の段の記録（`BrowserContextFactoryOptions.auditStageMonitor`）。なければ `null`。 */
+  readonly #auditStageMonitor: AuditStageMonitor | null;
+  /** T35c: 承認したサービスの Origin からの 401 の応答の知らせ（`BrowserContextFactoryOptions.onServiceUnauthorizedResponse`）。なければ `null`。 */
+  readonly #onServiceUnauthorizedResponse: (() => void) | null;
+  /** T35c: ログインの状態の鍵がなくなったことの知らせ（`BrowserContextFactoryOptions.onSessionKeyLost`）。なければ `null`。 */
+  readonly #onSessionKeyLost: (() => void) | null;
+  /** AS-a: 監査の段の送信の扱いの指定（`BrowserContextFactoryOptions.auditSend` の写し）。なければ `null`（読み取りだけ）。 */
+  readonly #auditSend: GuardAuditSend | null;
   /**
    * 受け継ぐ認証済みの状態と、その世代（T25c。Task 25 の設計書 4.3 の 2026-10-10 の Blocker の行）。Run の中で 1 つだけ持ち、Context を作る
    * とき（生きている、より新しい世代の Context から読む）と、閉じるとき（その世代が今の世代以上なら置き換える）に更新する。認証の指定が
@@ -518,7 +989,26 @@ export class BrowserContextFactory {
     if (typeof options !== 'object' || options === null) {
       throw new TypeError('BrowserContextFactory options must be an object');
     }
-    const { loadMeter, resourceCache, egressUpstreamPolicy, authentication, writeSubmissionCertificates, navigationPacer } = options;
+    const {
+      loadMeter, resourceCache, egressUpstreamPolicy, authentication, writeSubmissionCertificates, navigationPacer, serviceRequestBudget, auditStageMonitor,
+      onServiceUnauthorizedResponse, onSessionKeyLost, auditSend,
+    } = options;
+    // AS-a: 監査の段の送信の扱いの指定は、Guard と同じ確かめ（`isGuardAuditSend`）で受ける。
+    if (auditSend !== undefined && !isGuardAuditSend(auditSend)) {
+      throw new TypeError('BrowserContextFactory audit send policy is malformed');
+    }
+    if (onServiceUnauthorizedResponse !== undefined && typeof onServiceUnauthorizedResponse !== 'function') {
+      throw new TypeError('BrowserContextFactory service unauthorized response observer must be a function');
+    }
+    if (onSessionKeyLost !== undefined && typeof onSessionKeyLost !== 'function') {
+      throw new TypeError('BrowserContextFactory session key lost observer must be a function');
+    }
+    if (serviceRequestBudget !== undefined && (!isRecord(serviceRequestBudget) || typeof serviceRequestBudget.tryConsume !== 'function')) {
+      throw new TypeError('BrowserContextFactory service request budget must count a request');
+    }
+    if (auditStageMonitor !== undefined && !(auditStageMonitor instanceof AuditStageMonitor)) {
+      throw new TypeError('BrowserContextFactory audit stage monitor must be an AuditStageMonitor');
+    }
     if (loadMeter !== undefined && !recordsRequestEnds(loadMeter)) {
       throw new TypeError('BrowserContextFactory load meter must record request end events');
     }
@@ -559,7 +1049,28 @@ export class BrowserContextFactory {
     this.#writeSubmissionCertificates = writeSubmissionCertificates === undefined ? undefined : Object.freeze([...writeSubmissionCertificates]);
     this.#authentication = authentication === undefined
       ? null
-      : Object.freeze({ filterState: authentication.filterState, auditExclusions: authentication.auditExclusions });
+      : Object.freeze({
+        filterState: authentication.filterState,
+        auditExclusions: authentication.auditExclusions,
+        // T35b: スクリプトで送るログインの監査の段の口（ある場合だけ。Guard と中継が写しを取る）。
+        ...(authentication.auditStage === undefined ? {} : { auditStage: authentication.auditStage }),
+        // T35c: ログインの状態の鍵があるかの判定（ある場合だけ）。
+        ...(authentication.sessionKeyPresent === undefined ? {} : { sessionKeyPresent: authentication.sessionKeyPresent }),
+      });
+    this.#serviceRequestBudget = serviceRequestBudget ?? null;
+    this.#auditStageMonitor = auditStageMonitor ?? null;
+    this.#onServiceUnauthorizedResponse = onServiceUnauthorizedResponse ?? null;
+    this.#onSessionKeyLost = onSessionKeyLost ?? null;
+    this.#auditSend = auditSend === undefined
+      ? null
+      : Object.freeze({
+        policy: auditSend.policy,
+        approvedServiceOrigins: Object.freeze([...auditSend.approvedServiceOrigins]),
+        dangerousTerms: Object.freeze([...auditSend.dangerousTerms]),
+        ...(auditSend.maxPassedPerContext === undefined ? {} : { maxPassedPerContext: auditSend.maxPassedPerContext }),
+        // AS-c: WebSocket の接続の上限（あるときだけ）。
+        ...(auditSend.maxWebSocketsPerContext === undefined ? {} : { maxWebSocketsPerContext: auditSend.maxWebSocketsPerContext }),
+      });
     this.#authenticatedState = initialState === null
       ? null
       : Object.freeze({ state: initialState, generation: INITIAL_AUTHENTICATED_STATE_GENERATION });
@@ -624,7 +1135,8 @@ export class BrowserContextFactory {
     if (this.#factoryInitiatedCloses.has(context) || !this.#activeContexts.has(context)) {
       return;
     }
-    const closing = this.closePassiveContext(context);
+    // T44b: factory が自分で閉じる処理は、送信の扱いの待ち（`AUDIT_SEND_CLOSE_SETTLE_MS`）をしない（fail-closed の閉じ方を遅らせない）。
+    const closing = this.#closeContextNow(context, false);
     closing.catch(() => undefined);
     this.#factoryInitiatedCloses.set(context, closing);
   }
@@ -651,16 +1163,24 @@ export class BrowserContextFactory {
    * - `PRIMARY`: Passive の Desktop と Mobile、robots.txt と sitemap.xml、PREFLIGHT、環境の記録。キャッシュにあるものはキャッシュから
    *   返し、キャッシュにないものは、許可 Origin の外でもネットワークから取る（DEF-031。設計書 4.10.3）。
    * - `REVISIT`: 幅の走査と Interaction。キャッシュにあるものはキャッシュから返し、許可 Origin の外へは、キャッシュになければ送らない。
+   *   T44b（P1-1）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の factory では、幅の走査でも、ページが出す送信と、承認したサービスの Origin への要求
+   *   （上限の部品で数える）を送る（`servesServiceOrigin`・`revisitSends`）。
    * キャッシュがなければ、どちらの役割でも、Guard に届け方の部品を渡さない（すべてネットワーク。今のまま）。役割が閉じた一覧
    * （`RESOURCE_DELIVERY_ROLES`）になければ、何も作らずに `TypeError` を投げる。
    * DEF-085: 出口の中継を付ける（`#createPassiveGuardedContext`）。
    */
-  async createPassiveContext(viewport: Viewport, role: ResourceDeliveryRole = 'PRIMARY'): Promise<BrowserContext> {
+  async createPassiveContext(viewport: Viewport, role: ResourceDeliveryRole = 'PRIMARY', options: PassiveContextOptions = {}): Promise<BrowserContext> {
     if (!isResourceDeliveryRole(role)) {
       throw new TypeError('Passive browser Context role must be one of RESOURCE_DELIVERY_ROLES');
     }
     const ledger = this.#issueSafetyLedger();
-    return this.#createPassiveGuardedContext(ledger, viewport, role);
+    const context = await this.#createPassiveGuardedContext(ledger, viewport, role);
+    // T44b（設計者の判断の (1)）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の、ページの監査の読み込み（`PRIMARY` で印 `pageAuditLoad` のある Context）だけ、
+    // 持ち主が閉じるときにページを離れて待つ。robots.txt・sitemap.xml・準備の読み込みなどの `PRIMARY` の Context（印なし）と、幅の走査（`REVISIT`）は当てない。
+    if (options.pageAuditLoad === true && role === 'PRIMARY' && this.#auditSend !== null) {
+      this.#pageLeaveContexts.add(context);
+    }
+    return context;
   }
 
   /**
@@ -669,6 +1189,10 @@ export class BrowserContextFactory {
    * ログインの段の指定（`loginStage`。許した送信先への main frame のナビゲーションの POST を、回数の上限まで許す）だけを加える。
    * - 認証つきの factory（監査の段。`authentication` あり）では作らない（`TypeError`。ログインの段の許可を、監査の段に持ち込まない）。
    * - 指定の形（送信先が 1 件以上の `{ origin, path }` の文字列の組、上限が 0 以上の安全な整数）が正しくなければ、何も作らずに `TypeError`。
+   * - T34b（Task 34 の設計書 3.3）: 認証の設定 v3 のスクリプトで送るログイン（`SCRIPT_REQUEST`）では、`loginStage.scriptRequest` に、token の
+   *   送信先（`scriptLogin`）、登録したログインに伴う送信（`loginSideRequests`）、承認したサービスの Origin（`approvedServiceOrigins`）を渡す
+   *   （このとき送信先 `loginPostEndpoints` は空でよい）。Guard と中継は、それらだけを通す（判定は `classifyPassiveRequest`）。監査の段の Context
+   *   の振る舞いは変えない。
    * - 役割は `PRIMARY`（キャッシュを渡した factory では、届け方の部品も渡す。ワーカーのログインの段の factory には、キャッシュを渡さない）。
    * page は `createPassivePage`、閉じるのは `closePassiveContext`（Passive の Context と同じ）。
    * DEF-085: 出口の中継を付ける（`#createPassiveGuardedContext`。中継の要求の方針は、ログインの段の送信先への POST も通す）。
@@ -678,7 +1202,7 @@ export class BrowserContextFactory {
       throw new TypeError('An authenticated BrowserContextFactory (the audit stage) cannot create a login stage Context');
     }
     if (!isGuardLoginStage(loginStage)) {
-      throw new TypeError('Login stage Context requires login POST endpoints ({ origin, path }) and a non-negative safe integer limit');
+      throw new TypeError('Login stage Context requires login POST endpoints ({ origin, path }) or a script login, and a non-negative safe integer limit');
     }
     const ledger = this.#issueSafetyLedger();
     return this.#createPassiveGuardedContext(ledger, viewport, 'PRIMARY', { loginStage });
@@ -692,6 +1216,10 @@ export class BrowserContextFactory {
    * - 指定の形が正しくない、部品（`WriteStageMonitor`）がすでに別の Guard に付いている、は何も作らずに `TypeError`（`isAcceptableGuardWriteStage`）。
    * - 中継の要求の方針には、承認の要求の形の送信先を渡す（http の二重の守り。https の CONNECT の中身は見えないので、強制は Guard）。
    * - 役割は `PRIMARY`。page は `createPassivePage`、閉じるのは `closePassiveContext`（Passive の Context と同じ）。
+   * - T39b（Task 39 の設計書 3.1）: 送り方は指定の `transport` で受ける（省略は `FORM`）。API のシナリオ（`transport: 'API'`）の書き込みの段の Context には、
+   *   認証の指定の監査の段の口（承認したサービスの Origin への読み取りと、登録した読み取りの手続きの呼び出し。今の監査の段と同じ判定と上限）も渡す
+   *   （SPA の画面を描くため。送信の窓の中のサービスの Origin への読み取りも、上限の中で通す。ユーザーの判断）。FORM の書き込みの段は今のまま（サービスの
+   *   Origin へ送らない）。
    * 呼ぶのは、ワーカーの書き込みの流れだけ（Gate `write-stage-boundary` の (c)）。
    */
   async createWriteStageContext(viewport: Viewport, writeStage: GuardWriteStage): Promise<BrowserContext> {
@@ -728,14 +1256,31 @@ export class BrowserContextFactory {
   ): Promise<BrowserContext> {
     let context: BrowserContext | undefined;
     const freeze: EgressFreezeRecord = { frozenByInteraction: false };
+    // AS-a: 監査の段の送信の扱いは、Passive の Context（ログインの段と書き込みの段でない）だけに渡す（Guard と中継の両方）。
+    const auditSend = stage.loginStage === undefined && stage.writeStage === undefined ? this.#auditSend ?? undefined : undefined;
+    // BN-R0 fix round 1（I-1）: この Context の Guard が通した読み取りの写し（中継の要求の方針が使う。Guard の口が知らせる）。
+    const readAdmissions = new EgressReadAdmissions();
     const egress = await startEgressProxy({
       upstreamPolicy: this.#egressUpstreamPolicy,
-      requestPolicy: passiveEgressRequestPolicy(this.#allowedOrigins, stage, this.#authentication?.auditExclusions),
+      requestPolicy: passiveEgressRequestPolicy(
+        this.#allowedOrigins,
+        stage,
+        this.#authentication?.auditExclusions,
+        // T39b: API の書き込みの段も、監査の段の口を渡す（承認したサービスの Origin への読み取り）。
+        stage.writeStage === undefined || isGuardApiWriteStage(stage.writeStage) ? this.#authentication?.auditStage : undefined,
+        role,
+        auditSend,
+        readAdmissions,
+      ),
       // DEF-099 fix: 書き込みの段の Context では、承認の送信先への POST を 1 回だけ通し、2 回目は止めて記録する（http の重ねの守り。送り手の
-      // 1 回だけが通るはず。https はトンネルなので数えない）。
-      ...(stage.writeStage === undefined ? {} : { requestBudget: writeStageEgressBudget(stage.writeStage) }),
+      // 1 回だけが通るはず。https はトンネルなので数えない）。T39c: API の書き込みの段は、承認した API の Origin への `POST`・`PATCH` を 1 回。
+      ...(stage.writeStage === undefined
+        ? {}
+        : { requestBudget: isGuardApiWriteStage(stage.writeStage) ? apiWriteStageEgressBudget(stage.writeStage) : writeStageEgressBudget(stage.writeStage) }),
       // DEF-085 fix round 1: 上流の失敗を、応答を作らずにそのまま伝える（接続できない相手と、本文の途中の切断の結果を、中継なしと同じに保つ）。
       upstreamFailureMode: 'PASS_THROUGH',
+      // DEF-125: CONNECT は、この Context の Guard が通した要求の宛先だけを通す（Guard が `admitTunnelDestinationOf` で知らせる）。
+      tunnelAdmission: EGRESS_TUNNEL_ADMISSION,
       onRejected: ({ method, url, phase }): void => {
         const reason = egressRejectionReason(phase, freeze);
         if (reason !== null) {
@@ -749,8 +1294,10 @@ export class BrowserContextFactory {
         }
       },
     });
+    // BN-R0 fix round 1（I-1）: Guard の知らせの口（`#createGuardedContext`）が、この中継の読み取りの写しに書く。
+    this.#egressReadAdmissions.set(egress, readAdmissions);
     try {
-      context = await this.#createGuardedContext(ledger, viewport, role, egress, freeze, stage);
+      context = await this.#createGuardedContext(ledger, viewport, role, egress, freeze, stage, auditSend);
     } catch (error) {
       if (!(error instanceof ContextConstructionError)) {
         await egress.close();
@@ -764,6 +1311,42 @@ export class BrowserContextFactory {
       upstreamAddressOf: (host: string, port: number) => egress.upstreamAddressOf(host, port),
     }));
     return context;
+  }
+
+  /**
+   * Guard の取り付けの指定の、スクリプトで送るログインの監査の段（T35b。Task 35 の設計書 3.2、3.4）。認証の指定に監査の段の口があり、書き込みの段の
+   * Context でないときだけ持つ。登録した読み取りの手続きの呼び出しは、最初の読み込み（`PRIMARY`）だけ。T35R-fix（T35R の C-1）: 幅の走査と Interaction
+   * の `REVISIT` は、承認したサービスの Origin へ送らない（Guard の口の `readRequestsAllowed` が偽）。上限の部品は、どの役割の Context にも渡す（数える側
+   * にも置いて、守りを重ねる）。T35R2-fix（T35R2 の C-1 の (a)）: 監査の段の口があって上限の部品がなければ、数えずに通さず、投げる（呼び出し側は、
+   * Context を作る前にこれを呼ぶ。fail-closed）。
+   * T39b（Task 39 の設計書 3.1）: API のシナリオの書き込みの段の Context にも渡す（FORM の書き込みの段とログインの段には渡さない）。
+   * T44b（Task 44 の設計書 3.1 の P1-1）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の Context（`auditSend` あり。幅の走査の `REVISIT` を含む）は、最初の
+   * 読み込みと同じく送る（`servesServiceOrigin`。上限の部品で数える）。
+   */
+  #guardAuditStageOf(
+    role: ResourceDeliveryRole,
+    stage: SubmissionStageOptions,
+    auditSend: GuardAuditSend | undefined,
+  ): { readonly auditStage?: GuardAuditStage } {
+    const auditStage = this.#authentication?.auditStage;
+    if (auditStage === undefined || (stage.writeStage !== undefined && !isGuardApiWriteStage(stage.writeStage)) || stage.loginStage !== undefined) {
+      return {};
+    }
+    const budget = this.#serviceRequestBudget;
+    if (budget === null) {
+      throw new Error('BrowserContextFactory requires a service request budget for the audit stage of a script login audit');
+    }
+    const monitor = this.#auditStageMonitor;
+    return {
+      auditStage: Object.freeze({
+        approvedServiceOrigins: auditStage.approvedServiceOrigins,
+        auditReadRequests: auditStage.auditReadRequests,
+        scriptLogin: auditStage.scriptLogin,
+        readRequestsAllowed: servesServiceOrigin(role, auditSend),
+        serviceRequestBudget: budget,
+        ...(monitor === null ? {} : { monitor }),
+      }),
+    };
   }
 
   /** Context ごとの Safety Ledger を、factory の依存から作る。作れないか、使い回しなら投げる（Context は作らない）。 */
@@ -786,6 +1369,8 @@ export class BrowserContextFactory {
    * 指定に、中継を凍結する口（`egressFreeze`。閉じる直前と、凍結の段に入った直後。`freeze` に最初の凍結の理由を残す）を渡す。中継は、Context の `close` の事象で閉じる（何度閉じてもよい）。
    * `stage` は、ログインの段の Context（`createLoginStageContext`。T25d）の Guard のログインの段の指定（`loginStage`）か、書き込みの段の Context
    * （`createWriteStageContext`。T30b）の Guard の書き込みの段の指定（`writeStage`）。どちらか 1 つだけ。
+   * `auditSend`（AS-a）は、Passive の Context（`#createPassiveGuardedContext` の、送信の段でない Context）だけが渡す監査の段の送信の扱いの指定。
+   * Isolated Interaction Context（`createInteractionSession`）は渡さない。送信の段の指定と一緒なら、何も作らずに `TypeError`（Guard も同じに拒む）。
    */
   async #createGuardedContext(
     ledger: SafetyLedger,
@@ -794,7 +1379,13 @@ export class BrowserContextFactory {
     egress: EgressProxy,
     freeze: EgressFreezeRecord,
     stage: SubmissionStageOptions = {},
+    auditSend: GuardAuditSend | undefined = undefined,
+    /** BN-0: Context の種類（Isolated Interaction Context は `INTERACTION`。監査の段の除外の当て方が違う）。 */
+    contextKind: 'PASSIVE' | 'INTERACTION' = 'PASSIVE',
   ): Promise<BrowserContext> {
+    if (auditSend !== undefined && (stage.loginStage !== undefined || stage.writeStage !== undefined)) {
+      throw new TypeError('The audit send policy is only for a Passive Context');
+    }
     // DEF-044、DEF-049: Worker の自己検査が始まってから Context を作る。始められなければ、その例外のまま投げる（Context は作らない）。
     if (this.#closed) {
       throw new Error('BrowserContextFactory was closed');
@@ -803,6 +1394,8 @@ export class BrowserContextFactory {
     if (this.#closed) {
       throw new Error('BrowserContextFactory was closed');
     }
+    // T35R2-fix（T35R2 の C-1 の (a)）: 監査の段の Guard の指定は、Context を作る前に組み立てる（上限の部品がなければ、Context を作らずに投げる）。
+    const guardAuditStage = this.#guardAuditStageOf(role, stage, auditSend);
     // T25c: 認証の指定があれば、受け継ぐ状態（世代の最も新しいもの）を、メモリのまま `storageState` で渡す（ファイルに書かない）。
     const storageState = await this.#inheritedAuthenticatedState();
     const context = await this.#browser.newContext({
@@ -823,22 +1416,62 @@ export class BrowserContextFactory {
     if (this.#authentication !== null) {
       this.#lastAuthenticatedGeneration += 1;
       this.#authenticatedGenerations.set(context, this.#lastAuthenticatedGeneration);
+      // DEF-138: 渡した状態の名前を残す（値は残さない）。
+      if (storageState !== undefined) {
+        this.#contextStateNames.set(context, { given: authenticatedStateNamesOf(storageState), read: null });
+      }
     }
     // 要求の終わりの事象は、Guard の取り付けより前（最初の要求より前）に、meter に渡し始める（サイトへの負荷の制御の設計書 4.5）。
     this.#observeRequestEnds(context);
+    // T35c: 承認したサービスの Origin からの 401 の応答を数えさせる（監査の段の口があるときだけ。最初の要求より前から）。
+    this.#observeServiceUnauthorizedResponses(context);
     // 成功して終わった要求の応答の事実も、同じく最初の要求より前から、Run 全体のキャッシュに渡し始める（設計書 4.6、4.10.3）。
     this.#observeResponses(context);
 
     // Context と Ledger の対応は、構築に失敗しても消さない（`getSafetyLedger` で後から取り出せるようにする。設計書 4.3）。
     this.#contextLedgers.set(context, ledger);
     this.#activeContexts.add(context);
-    // 届け方の部品は、Run 全体のキャッシュがある場合に、役割によらず渡す（設計書 4.7、4.10.3）。
-    const resourceDelivery = this.#createResourceDelivery(role);
+    // 届け方の部品は、Run 全体のキャッシュがある場合に、役割によらず渡す（設計書 4.7、4.10.3）。T44b（P1-1）: 監査の段の送信の扱いの口があれば、読み込み
+    // 直しの Context でも、承認したサービスの Origin への要求とページが出す送信を送る（`revisitSends`）。
+    const resourceDelivery = this.#createResourceDelivery(role, auditSend);
     // T25c: 認証つきの Run の Guard には、監査の段の除外を渡す（ログインの段の指定は渡さない。監査の段では POST を許さない）。
     const navigationPacer = this.#navigationPacer;
+    // T37b: PRIMARY の Passive の Context（ログインの段と書き込みの段を除く）だけに、送らずに観察する probe の口（既定は無効）を渡す。承認した API の
+    // Origin は、認証の指定の監査の段の口の承認したサービスの Origin（なければ空）。
+    const submissionObservation = role === 'PRIMARY' && stage.loginStage === undefined && stage.writeStage === undefined
+      ? new SubmissionObservation({
+        approvedApiOrigins: this.#authentication?.auditStage?.approvedServiceOrigins ?? [],
+        allowedOrigins: [...this.#allowedOrigins],
+      })
+      : undefined;
+    if (submissionObservation !== undefined) {
+      this.#submissionObservations.set(context, submissionObservation);
+    }
     const guardOptions: PassiveRequestGuardOptions = Object.freeze({
       ...(resourceDelivery === undefined ? {} : { resourceDelivery }),
-      ...(this.#authentication === null ? {} : { auditExclusions: this.#authentication.auditExclusions }),
+      // BN-0（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.0）: Isolated Interaction Context だけは、ページが出す文書でない読み取りにも
+      // 監査の段の除外を当てる（印 `applyToPageSubresourceReads`）。監査の段の Passive の Context は当てない（ログインの段・書き込みの段は判定の口が当てる）。
+      ...(this.#authentication === null
+        ? {}
+        : {
+          auditExclusions: contextKind === 'INTERACTION'
+            ? Object.freeze({ ...this.#authentication.auditExclusions, applyToPageSubresourceReads: true as const })
+            : this.#authentication.auditExclusions,
+        }),
+      // T35b: スクリプトで送るログインの監査の段（認証つきの factory の、書き込みの段でない Context だけ）。
+      ...guardAuditStage,
+      // AS-a: 監査の段の送信の扱い（Passive の Context だけ。Isolated Interaction Context には渡さない）。
+      ...(auditSend === undefined ? {} : { auditSend }),
+      // AS-c fix round 1（I-1）: ほかの Origin への CORS の事前確認を、Guard がこの Context の中継を通してサーバへ送る送り手（送信の扱いの口と一緒だけ）。
+      ...(auditSend === undefined
+        ? {}
+        : {
+          auditSendPreflight: Object.freeze({
+            proxy: Object.freeze({ host: new URL(egress.server).hostname, port: egress.port }),
+            acceptLanguage: this.#locale,
+            ...(this.#writeSubmissionCertificates === undefined ? {} : { additionalTrustedCertificates: this.#writeSubmissionCertificates }),
+          }),
+        }),
       // T25d: ログインの段の Context だけ（認証つきの factory では作らない）。
       ...(stage.loginStage === undefined ? {} : { loginStage: stage.loginStage }),
       // T30b: 書き込みの段の Context だけ（認証つきの factory だけが作る）。
@@ -857,8 +1490,18 @@ export class BrowserContextFactory {
       egressFreeze: (cause: EgressFreezeCause): void => {
         freezeEgressFor(egress, freeze, cause);
       },
+      // DEF-125: Guard が通した要求の宛先を、この Context の中継に知らせる（中継は、知らせた宛先への CONNECT だけを通す）。
+      onEgressDestinationAdmitted: (url: string, method?: string): void => {
+        egress.admitTunnelDestinationOf(url);
+        // BN-R0 fix round 1（I-1）: Guard が通した読み取りを、中継の要求の方針に知らせる（Passive の Context の中継だけが写しを持つ）。
+        this.#egressReadAdmissions.get(egress)?.admit(method, url);
+      },
       // DEF-100 fix: main frame の文書の要求を送った時刻を、Run の読み込みの間隔の部品に記録する（サイトに届く間隔を設定以上にする）。
       ...(navigationPacer === null ? {} : { onMainFrameDocumentSent: (): void => navigationPacer.recordDocumentRequestSent() }),
+      // T37b: 送らずに観察する probe の口（PRIMARY の Passive の Context だけ）。
+      ...(submissionObservation === undefined ? {} : { submissionObservation }),
+      // DEF-129: Passive の Context（ログインの段と書き込みの段を除く）では、ページが始めた main frame の読み込みの回数に上限を置く。
+      ...(stage.loginStage === undefined && stage.writeStage === undefined ? { pageNavigationLimit: true } : {}),
     });
     try {
       await installPassiveRequestGuard(context, ledger, this.#allowedOrigins, guardOptions);
@@ -910,6 +1553,8 @@ export class BrowserContextFactory {
     const freeze: EgressFreezeRecord = { frozenByInteraction: false };
     const proxy = await startEgressProxy({
       upstreamPolicy: this.#egressUpstreamPolicy,
+      // DEF-125: CONNECT は、この Context の Guard が通した要求の宛先だけを通す（Passive の Context と同じ）。
+      tunnelAdmission: EGRESS_TUNNEL_ADMISSION,
       onRejected: ({ method, url, phase }): void => {
         const reason = egressRejectionReason(phase, freeze);
         if (reason !== null) {
@@ -926,7 +1571,8 @@ export class BrowserContextFactory {
     });
     let page: Page;
     try {
-      context = await this.#createGuardedContext(ledger, viewport, 'REVISIT', proxy, freeze);
+      // BN-0: Interaction の Context は、ページが出す文書でない読み取りにも監査の段の除外を当てる。
+      context = await this.#createGuardedContext(ledger, viewport, 'REVISIT', proxy, freeze, {}, undefined, 'INTERACTION');
       try {
         page = await this.createPassivePage(context);
       } catch (error) {
@@ -971,6 +1617,14 @@ export class BrowserContextFactory {
     });
   }
 
+  /**
+   * T37b（Task 37 の設計書 3.2 の「Guard の観察の形」）: その Context の送らずに観察する probe の口（既定は無効）。PRIMARY の Passive の Context
+   * （ログインの段と書き込みの段の Context を除く）だけが持ち、ほかの Context と、この factory が作っていない Context は `null`。
+   */
+  submissionObservationOf(context: BrowserContext): SubmissionObservation | null {
+    return this.#submissionObservations.get(context) ?? null;
+  }
+
   getSafetyLedger(context: BrowserContext): SafetyLedger {
     const ledger = this.#contextLedgers.get(context);
     if (ledger === undefined) {
@@ -981,6 +1635,13 @@ export class BrowserContextFactory {
 
   async createPassivePage(context: BrowserContext): Promise<Page> {
     this.#requireActiveGuardedContext(context);
+    // DEF-134: 要素の位置の engine（合図つきの Locator）は、page で Playwright のセレクタを最初に使う前に登録しておく必要がある（後から登録すると、
+    // その page の Playwright の読み取りの部品が engine を知らない）。page を作る唯一の口で、作る前に登録する（1 回だけ。2 回目からは同じ約束を返す）。
+    try {
+      await ensureElementPathEngine();
+    } catch (error) {
+      throw this.#constructionFailure(context, error);
+    }
     const page = await context.newPage();
     try {
       await awaitPassiveRequestGuardReady(page);
@@ -1013,6 +1674,16 @@ export class BrowserContextFactory {
     this.#releasePage(page, context);
   }
 
+  /**
+   * 持ち主が Context を閉じる。T44b（Task 44 の設計書 3.1 の P1-2 と、設計の変更の履歴の「T44b の報告」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の
+   * 最初の読み込みの Context（`#pageLeaveContexts`）で、Guard がまだ有効（`PASSIVE_ACTIVE`）なら、閉じ始める前に次を行う（1 回の閉じ方あたり、待つのは
+   * `AUDIT_SEND_CLOSE_SETTLE_MS` まで。移動は `AUDIT_SEND_PAGE_LEAVE_TIMEOUT_MS` まで）。
+   * 1. 認証つきの Context は、認証の状態を読む（ページを離れる前。離れた後のページには、サイトの Origin の状態がない）。
+   * 2. その Context の page を、about:blank へ移す（`#leavePagesBeforeClose`。ページを離れるときの送信を、Guard の今の判定で通す）。
+   * 3. 名前つきの時間だけ待つ（送信を自然に終えさせる）。
+   * 待つ間に factory が閉じ始めた（違反など）なら、その閉じる処理に合流する。factory が自分で閉じる処理（`#beginFactoryClose`）は、待たずページも離れない
+   * （`#closeContextNow`）。
+   */
   async closePassiveContext(context: BrowserContext): Promise<void> {
     // DEF-044、DEF-049、DEF-085: factory が自分で閉じ始めた Context は、その閉じる処理に合流する。
     const factoryClose = this.#factoryInitiatedCloses.get(context);
@@ -1020,9 +1691,49 @@ export class BrowserContextFactory {
       return factoryClose;
     }
     this.#requireActiveContext(context);
+    if (!this.#pageLeaveContexts.has(context) || !isGuardActive(context)) {
+      return this.#closeContextNow(context, false);
+    }
+    const generation = this.#authenticatedGenerations.get(context);
+    if (generation !== undefined) {
+      await this.#captureAuthenticatedState(context, generation);
+    }
+    await this.#leavePagesBeforeClose(context);
+    await wait(AUDIT_SEND_CLOSE_SETTLE_MS);
+    const closingByFactory = this.#factoryInitiatedCloses.get(context);
+    if (closingByFactory !== undefined) {
+      return closingByFactory;
+    }
+    return this.#closeContextNow(context, true);
+  }
+
+  /**
+   * T44b: Context の page（factory が作ったもの）を、閉じる前に about:blank（`AUDIT_SEND_PAGE_LEAVE_URL`）へ移す（人がページを閉じるのと同じく、ページの
+   * `pagehide`・`visibilitychange`・`unload` を起こす）。サイトへの要求ではないので、Guard は判定せず、読み込みの間隔とページの移動の上限（DEF-129）にも
+   * 数えない（BeakSight 自身の読み込みの知らせ `announceOwnMainFrameNavigation` も呼ばない）。移動の失敗と期限切れは投げない（離れずに閉じる側へ進む）。
+   */
+  async #leavePagesBeforeClose(context: BrowserContext): Promise<void> {
+    const pages = [...(this.#contextPages.get(context) ?? [])].filter((page) => !page.isClosed());
+    await Promise.all(pages.map(async (page): Promise<void> => {
+      // 設計者の判断の (2): ページを離れた後の要求は、そのページの読み取りの判定の数（DEF-130）に入れない（移動の前に知らせる）。
+      announcePageLeave(page);
+      try {
+        await page.goto(AUDIT_SEND_PAGE_LEAVE_URL, { timeout: AUDIT_SEND_PAGE_LEAVE_TIMEOUT_MS, waitUntil: 'commit' });
+      } catch {
+        // 離れられなくても、待ってから閉じる（閉じた後の送信は、今どおり Guard が止める）。
+      }
+    }));
+  }
+
+  /**
+   * Context を、待たずに閉じる（持ち主の閉じ方の手順の後と、factory が自分で閉じる処理。`closePassiveContext` の今までの中身）。`stateCaptured` が真なら、
+   * 認証の状態はページを離れる前に読んだので、読み直さない（T44b）。
+   */
+  async #closeContextNow(context: BrowserContext, stateCaptured: boolean): Promise<void> {
+    this.#requireActiveContext(context);
     // T25c: 認証つきの Context は、閉じる前に状態を取り出し、絞ってから、その世代が今の世代以上なら受け継ぐ状態にする（失敗は数えて進む）。
     const generation = this.#authenticatedGenerations.get(context);
-    if (generation !== undefined && !isPassiveRequestGuardClosed(context)) {
+    if (!stateCaptured && generation !== undefined && !isPassiveRequestGuardClosed(context)) {
       await this.#captureAuthenticatedState(context, generation);
     }
     try {
@@ -1041,6 +1752,15 @@ export class BrowserContextFactory {
    */
   authenticatedStateReadFailureCount(): number {
     return this.#authenticatedStateReadFailures;
+  }
+
+  /**
+   * FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: 今持っている、受け継ぐ認証済みの状態（絞り込んで凍結した写し。世代の最も
+   * 新しいもの）を読むだけの口。まとめて実行のワーカーが、段の終わりに次の段の factory へ渡すためだけに使う（メモリの中だけ。成果物・管理データ・
+   * ログ・IPC に出さない）。生きている Context を読み直さない（サイトへの要求を出さない。閉じた Context までの状態）。認証の指定がなければ `null`。
+   */
+  latestAuthenticatedState(): AuthenticatedStorageState | null {
+    return this.#authenticatedState?.state ?? null;
   }
 
   /**
@@ -1069,6 +1789,59 @@ export class BrowserContextFactory {
     return this.#authenticatedState.state;
   }
 
+  /** `context` の状態を、期限（`AUTHENTICATED_STATE_READ_TIMEOUT_MS`）までに取り出し、絞り込み、形を確かめた写しにする（投げない）。 */
+  async #readAuthenticatedState(
+    context: BrowserContext,
+  ): Promise<{ readonly status: 'FULFILLED'; readonly value: AuthenticatedStorageState } | { readonly status: 'FAILED' }> {
+    const authentication = this.#authentication;
+    if (authentication === null) {
+      return { status: 'FAILED' };
+    }
+    const names = this.#contextStateNames.get(context);
+    const outcome = await awaitBeforeDeadline(
+      (async (): Promise<AuthenticatedStorageState> => {
+        // DEF-139: IndexedDB を含めて読む（唯一の読み口）。
+        const raw = await readContextStorageState(context);
+        // DEF-138: 絞り込みの前の状態の名前を残す（承認したサービスの Origin の名前も見るため。値は残さない）。
+        if (names !== undefined) {
+          names.read = authenticatedStateNamesOf(raw);
+        }
+        return authenticatedStateCopy(authentication.filterState(raw));
+      })(),
+      Date.now() + AUTHENTICATED_STATE_READ_TIMEOUT_MS,
+    );
+    return outcome.status === 'FULFILLED' ? { status: 'FULFILLED', value: outcome.value } : { status: 'FAILED' };
+  }
+
+  /**
+   * DEF-138: Context の状態の名前（渡した状態と、最後に読んだ状態。値は持たない）。認証の指定のない factory と、この factory の認証つきの Context でない
+   * ものは `null`。サイトへの要求を出さない（読み直さない。閉じるときなどに factory が読んだ名前を返すだけ）。
+   */
+  authenticatedStateNamesOf(context: BrowserContext): AuthenticatedContextStateNames | null {
+    const names = this.#contextStateNames.get(context);
+    return names === undefined ? null : Object.freeze({ given: names.given, read: names.read });
+  }
+
+  /** 押す前に読んだ状態（読めなかったなら失敗）。 */
+  #pinnedOutcomeOf(context: BrowserContext): { readonly status: 'FULFILLED'; readonly value: AuthenticatedStorageState } | { readonly status: 'FAILED' } {
+    const pinned = this.#pinnedAuthenticatedStates.get(context) ?? null;
+    return pinned === null ? { status: 'FAILED' } : { status: 'FULFILLED', value: pinned };
+  }
+
+  /**
+   * T37R-fix-B（T37R の I-1。Task 37 の設計書 8 章の T37R の行）: 送らずに観察する probe を行う Context で、押す前に、閉じるときに次の Context へ渡す
+   * 状態を読んでおく（発見の流れが、probe の直前に呼ぶ）。以後、その Context を閉じるとき（と、生きている Context から受け継ぐとき）は、この状態を使い、
+   * 押下でページが書き換えた localStorage・Cookie（token を消す、下書きを保存するなど）を受け継がない。鍵の消失の判定も、この状態で行う。認証の指定の
+   * ない factory と、この factory の Context でないものでは、何もしない。読めなければ、閉じるときに受け継がず、失敗に数える（fail-closed）。投げない。
+   */
+  async pinAuthenticatedStateBeforeProbe(context: BrowserContext): Promise<void> {
+    if (this.#authentication === null || !this.#authenticatedGenerations.has(context) || isPassiveRequestGuardClosed(context)) {
+      return;
+    }
+    const outcome = await this.#readAuthenticatedState(context);
+    this.#pinnedAuthenticatedStates.set(context, outcome.status === 'FULFILLED' ? outcome.value : null);
+  }
+
   /**
    * `context`（世代 `generation`）の状態を、期限（`AUTHENTICATED_STATE_READ_TIMEOUT_MS`）までに取り出し、絞り込み（`filterState`）、形を
    * 確かめた写しにする。世代が今の状態の世代以上なら、今の状態を置き換える（古い世代の状態で、新しい状態を上書きしない）。取り出し・絞り込み・
@@ -1079,18 +1852,48 @@ export class BrowserContextFactory {
     if (authentication === null || this.#authenticatedState === null) {
       return;
     }
-    const outcome = await awaitBeforeDeadline(
-      (async (): Promise<AuthenticatedStorageState> =>
-        authenticatedStateCopy(authentication.filterState(await context.storageState())))(),
-      Date.now() + AUTHENTICATED_STATE_READ_TIMEOUT_MS,
-    );
+    // T37R-fix-B（T37R の I-1）: probe を行った Context は、押す前に読んだ状態を使う（読み直さない）。
+    const outcome = this.#pinnedAuthenticatedStates.has(context)
+      ? this.#pinnedOutcomeOf(context)
+      : await this.#readAuthenticatedState(context);
     if (outcome.status !== 'FULFILLED') {
       this.#authenticatedStateReadFailures += 1;
+      return;
+    }
+    // T35c（Task 35 の設計書 3.5）: 読み直した状態に、ログインの状態の鍵がなければ、知らせる（値は読まない。判定は渡された関数）。
+    // AS-c の Blocker の判断 B2（監査の段の送信の扱いの設計書 5 章）: そのときは、監査の段の送信の扱いによらず、次の Context に渡す状態を置き換えない（切れた
+    // 状態で上書きしない）。鍵の判定のない設定は、今どおり置き換える（状態で切れを見分けられない。path によるセッションの切れで止まる）。
+    const { sessionKeyPresent } = authentication;
+    if (sessionKeyPresent !== undefined && !sessionKeyPresent(outcome.value)) {
+      this.#onSessionKeyLost?.();
       return;
     }
     if (generation >= this.#authenticatedState.generation) {
       this.#authenticatedState = Object.freeze({ state: outcome.value, generation });
     }
+  }
+
+  /**
+   * T35c（Task 35 の設計書 3.5）: `context` の応答の事象（`response`。応答のヘッダを受けた時点）で、承認したサービスの Origin からの 401 の応答を
+   * 知らせる（`onServiceUnauthorizedResponse`。値・URL は渡さない）。監査の段の口と知らせの口がなければ、何もしない。`requestfinished` は、画面が
+   * 失敗の応答の本文を読まないと来ない（読まないまま Context を閉じる）ので使わない。例外は外に出さない。
+   */
+  #observeServiceUnauthorizedResponses(context: BrowserContext): void {
+    const notify = this.#onServiceUnauthorizedResponse;
+    const serviceOrigins = this.#authentication?.auditStage?.approvedServiceOrigins;
+    if (notify === null || serviceOrigins === undefined) {
+      return;
+    }
+    const origins = canonicalPassiveAllowedOrigins(new Set(serviceOrigins));
+    context.on('response', (response: Response): void => {
+      try {
+        if (response.status() === HTTP_UNAUTHORIZED_STATUS && hasAllowedOrigin(response.url(), origins)) {
+          notify();
+        }
+      } catch {
+        // 閉じた Context の応答などは、数えない。
+      }
+    });
   }
 
   /**
@@ -1168,8 +1971,11 @@ export class BrowserContextFactory {
    * なければ作らない（`undefined`。Guard は今のまま）。判断は `decideResourceDelivery` だけが `role` で行い、許可 Origin は Guard に
    * 渡すものと同じ値を使う。キャッシュから返した要求の印と、負荷の記録は、役割によらず同じに扱う。どの口も例外を投げない
    * （meter の例外も、ここで封じ込める）。
+   * T44b（Task 44 の設計書 3.1 の P1-1）: 監査の段の送信の扱いの口（`auditSend`）がある Context は、読み込み直しの役割でも、ページが出す送信と、スクリプトで
+   * 送るログインの監査の段の承認したサービスの Origin への要求を送る（`revisitSends`。サービスの Origin の要求は Guard が上限の部品で数える。監査の段の口が
+   * なければ、サービスの Origin の区別はない）。
    */
-  #createResourceDelivery(role: ResourceDeliveryRole): GuardResourceDelivery | undefined {
+  #createResourceDelivery(role: ResourceDeliveryRole, auditSend: GuardAuditSend | undefined): GuardResourceDelivery | undefined {
     const cache = this.#resourceCache;
     if (cache === null) {
       return undefined;
@@ -1177,9 +1983,12 @@ export class BrowserContextFactory {
     const allowedOrigins = this.#allowedOrigins;
     const servedFromRunCache = this.#servedFromRunCache;
     const loadMeter = this.#loadMeter;
+    const revisitSends = auditSend === undefined
+      ? undefined
+      : Object.freeze({ serviceOrigins: new Set(this.#authentication?.auditStage?.approvedServiceOrigins ?? []) as ReadonlySet<string> });
     return Object.freeze({
       decide: (request: ResourceDeliveryRequestFacts) =>
-        decideResourceDelivery({ role, cache, allowedOrigins, request }),
+        decideResourceDelivery({ role, cache, allowedOrigins, request, ...(revisitSends === undefined ? {} : { revisitSends }) }),
       beforeServeFromRunCache: (request: Request): void => {
         servedFromRunCache.add(request);
         try {

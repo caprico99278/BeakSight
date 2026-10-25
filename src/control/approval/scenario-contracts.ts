@@ -16,8 +16,7 @@
 //   `missingVerificationItemsOf`）。結果の条件は Task 26 の結果の条件と同じ型（`LoginResultCondition`。書き写さない）。
 // - T31b（Task 31 の設計書 3 章の「UPDATE の指定」、4 章の「契約」、11 章の T31b の Blocker の判断）: シナリオの中身に、UPDATE の指定
 //   （`ScenarioUpdateSpec`。台帳の参照、更新の画面と送信先の path の型、保つ欄、候補から求めた型にした識別の digest）を足した。kind が `UPDATE` の
-//   下書きでは必須、`CREATE` は持てない（null）。UPDATE の指定の前に保存した UPDATE の版は null として読め、承認と発行はできない
-//   （`SCENARIO_UPDATE_SPEC_MISSING`）。変える欄は今の送る欄（`fieldNames`）、保つ欄は `keepFieldNames`。path の型の `{id}` の印は、候補の識別の
+//   下書きでは必須、`CREATE` は持てない（null）。LG-3: UPDATE の指定の前に保存した UPDATE の版（null）は、スキーマが拒むので読まない。変える欄は今の送る欄（`fieldNames`）、保つ欄は `keepFieldNames`。path の型の `{id}` の印は、候補の識別の
 //   owner（`src/discovery/fingerprint.ts` の `PATH_TEMPLATE_ID_SEGMENT`）と同じ値（登録の ID の取り方の path の型と共用）。
 import { WRITE_AUDIT_MODE } from '../contracts.js';
 import {
@@ -27,12 +26,38 @@ import {
 } from '../auth/auth-setup-contracts.js';
 import type { ReadCheckView } from '../job/read-check-store.js';
 import { WORKER_JOB_ID_PATTERN } from '../worker-protocol.js';
+import { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT, type ScenarioTransport } from '../../core/scenario-transport.js';
+import { SCENARIO_KINDS as CORE_SCENARIO_KINDS, type ScenarioKind } from '../../core/scenario-kind.js';
+import { isPublicationStateKeyName } from '../../discovery/classify.js';
 import { PATH_TEMPLATE_ID_SEGMENT } from '../../discovery/fingerprint.js';
+import {
+  API_WRITE_METHODS,
+  MAX_API_SHAPE_BODY_KEYS,
+  MAX_API_SHAPE_HEADER_NAMES,
+  MAX_API_SHAPE_MEDIA_TYPE_LENGTH,
+  MAX_API_SHAPE_NAME_LENGTH,
+  MAX_API_SHAPE_PATH_LENGTH,
+  type API_SELECTION_QUERY_NAMES,
+  type ApiJsonValueType,
+  type ApiPreferShape,
+} from '../../core/api-request-shape.js';
+import {
+  MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH,
+  submissionProbeKeyFieldsOf,
+  type SubmissionProbeInputField,
+  type SubmissionProbeRecord,
+} from '../../discovery/submission-probe-contracts.js';
+import { createSha256Fingerprint } from '../../core/ids.js';
+// PRE42-CC 組 UI-K3（台帳の CC-113）: 照合の READ の期待の種類の値（画面のブラウザ側も読む、import を持たない純粋な core のファイル）。ここは公開し直す。
+import { VERIFICATION_EXPECTATION_KINDS, type VerificationExpectationKind } from '../../core/read-check-expectation-kinds.js';
+import { compareCodeUnits } from '../../core/text.js';
 import { DAY_MS, MINUTE_MS } from '../../core/time-units.js';
+import { API_FIELD_IDENTITY_KINDS, apiFieldIdentityValueOf, type ApiFieldIdentity, type ApiFieldIdentityKind } from '../../core/api-field-identity.js';
 import {
   MAX_CANDIDATE_FIELDS,
   MAX_CANDIDATE_URL_PART_LENGTH,
   type CandidateClassification,
+  type CandidateFieldType,
   type FormEnctype,
   type FormMethod,
   type MethodOverride,
@@ -42,7 +67,7 @@ import {
   MAX_READ_CHECK_EXPECTATIONS,
   MAX_READ_CHECK_PARAMETERS,
   MAX_READ_CHECK_ROW_COUNT,
-  type ReadCheckExpectationKind,
+  type ReadCheckTargetKind,
 } from '../../discovery/read-check-contracts.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -55,12 +80,20 @@ export const SCENARIO_SCHEMA_VERSION = 'beaksight-scenario/1';
 /** 承認と撤回の記録の文書の形の印（スキーマの `schemaVersion` の const）。 */
 export const APPROVAL_RECEIPT_SCHEMA_VERSION = 'beaksight-approval-receipt/1';
 
-/** シナリオの種類（候補の分類のうち、書き込みの 2 つ）。 */
-export const SCENARIO_KINDS = Object.freeze(['CREATE', 'UPDATE'] as const satisfies readonly CandidateClassification[]);
-export type ScenarioKind = (typeof SCENARIO_KINDS)[number];
+/**
+ * シナリオの種類の値の名前つきの定数（登録 `CREATE_SCENARIO_KIND`・更新 `UPDATE_SCENARIO_KIND`）。CC-106: 契約の owner は `src/core/scenario-kind.ts`
+ * （PRE42-CC の組 2。IPC の契約と画面のブラウザ側も読めるように core に置いた）。ここは公開し直すだけ。`'CREATE' satisfies ScenarioKind` を書き写さない。
+ */
+export { CREATE_SCENARIO_KIND, UPDATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
+export type { ScenarioKind };
+
+/** シナリオの種類（候補の分類のうち、書き込みの 2 つ。core の一覧と同じ凍結した配列。候補の分類の一部であることを、ここで型で確かめる）。 */
+export const SCENARIO_KINDS = CORE_SCENARIO_KINDS satisfies readonly CandidateClassification[];
 
 /** シナリオの保存する状態（管理データの行）。`EXPIRED` は保存しない（読むときに時計から求める）。 */
-export const SCENARIO_STATES = Object.freeze(['DRAFT', 'APPROVED', 'REVOKED'] as const);
+/** 下書きの状態（`SCENARIO_STATES` の値の名前つきの定数。FM2R の Minor 13: ほかのファイルは、ここから読む）。 */
+export const DRAFT_SCENARIO_STATE = 'DRAFT';
+export const SCENARIO_STATES = Object.freeze([DRAFT_SCENARIO_STATE, 'APPROVED', 'REVOKED'] as const);
 export type ScenarioState = (typeof SCENARIO_STATES)[number];
 
 /**
@@ -182,6 +215,18 @@ export const SCENARIO_VERIFICATION_ITEMS = Object.freeze(['successCondition', 'i
 export type ScenarioVerificationItem = (typeof SCENARIO_VERIFICATION_ITEMS)[number];
 
 /**
+ * T40a-fix（Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」）: API のシナリオの検証の指定で求める項目（`SCENARIO_VERIFICATION_ITEMS` の
+ * 部分。同じ順）。結果の判定は送り手の応答の状態と ID で行うので、成否の条件と入力の誤りの条件は求めず、使わない。`recordId` は、API の指定の
+ * `recordId`（応答の本文の鍵）か検証の指定の `recordId` のどちらかがあればよい（判定は `scenario-policy.ts` の `missingVerificationItemsOf`）。
+ */
+export const API_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['recordId', 'readVerification'] as const satisfies readonly ScenarioVerificationItem[]);
+/**
+ * T41e-2（T41b の申し送り。Task 41 の設計書 3.4 の 3）: API の更新（台帳の参照 `api.ledger` を持つ）で求める項目（照合の READ だけ。登録の ID は許可が
+ * 台帳から選ぶ対象の ID）。
+ */
+export const API_UPDATE_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['readVerification'] as const satisfies readonly ScenarioVerificationItem[]);
+
+/**
  * 登録の ID の取り方（閉じた一覧）。
  * - `URL_PATH_PATTERN`: 成功の後の URL の path を、型（例 `/items/{id}`）に当てて取る。
  * - `ELEMENT`: 成功の画面の要素（CSS セレクタ）の文字から取る。
@@ -206,12 +251,10 @@ export const MAX_VERIFICATION_SELECTOR_LENGTH = MAX_SUCCESS_SELECTOR_LENGTH;
 
 /**
  * 照合の READ で使える期待の種類（Task 27 の期待の種類のうち、1 件の登録を確かめられるもの）。`ROW_COUNT_AT_LEAST` は、二重の登録を見分け
- * られないので使わない。`TEXT_CONTAINS`・`DETAIL_FIELD_EQUALS` の比べる値は、生成した値（送る欄の名前で指す）。
+ * られないので使わない。`TEXT_CONTAINS`・`DETAIL_FIELD_EQUALS` の比べる値は、生成した値（送る欄の名前で指す）。PRE42-CC 組 UI-K3: 一覧の値は
+ * `src/core/read-check-expectation-kinds.ts` に移し、ここは同じ名前で公開し直す。
  */
-export const VERIFICATION_EXPECTATION_KINDS = Object.freeze(
-  ['ROW_COUNT_EQUALS', 'TEXT_CONTAINS', 'DETAIL_FIELD_EQUALS'] as const satisfies readonly ReadCheckExpectationKind[],
-);
-export type VerificationExpectationKind = (typeof VERIFICATION_EXPECTATION_KINDS)[number];
+export { VERIFICATION_EXPECTATION_KINDS, type VerificationExpectationKind };
 
 /** 照合の READ の行の数の期待の最小（登録した 1 件が見えること）と最大（Task 27 の期待の上限）。 */
 export const MIN_VERIFICATION_ROW_COUNT = 1;
@@ -251,6 +294,249 @@ export interface ScenarioUpdateSpec extends ScenarioUpdateDraft {
   readonly templatedIdentityDigest: string;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// 送り方と API のシナリオ（T38b。Task 38 の設計書 3.2、7 章の履歴のユーザーの判断）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * シナリオの送り方（閉じた一覧 `SCENARIO_TRANSPORTS`）と、送り方の値の名前つきの定数（`FORM_SCENARIO_TRANSPORT`・`API_SCENARIO_TRANSPORT`）。
+ * - `FORM`: form の送信（Task 28〜32 の今のシナリオ。送り方の項目のない前の文書も `FORM`）。
+ * - `API`: ページのスクリプトが承認した API の Origin へ送る要求（Task 37 の probe の `API_CREATE`・`API_UPDATE` の候補）。
+ * T40R-fix-B（Task 40 の設計書 7 章の「T40R」の行の M-2）: 定義は core の `scenario-transport.ts`（IPC の契約がこのファイルを読めない（循環する）ため。
+ * CC-102 の欄の識別と同じ置き方）。ここは公開し直すだけ。記録の要約・台帳・承認の要約の項目・IPC・書き込みの流れ・画面のサーバは、この定数を使う。
+ */
+export { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT, SCENARIO_TRANSPORTS } from '../../core/scenario-transport.js';
+export type { ScenarioTransport } from '../../core/scenario-transport.js';
+
+/** API のシナリオの method（`POST` は CREATE、`PATCH` は UPDATE。probe の分類と同じ組。T39a: 一覧は core の `API_WRITE_METHODS`）。 */
+export const SCENARIO_API_METHODS = API_WRITE_METHODS;
+export type ScenarioApiMethod = (typeof SCENARIO_API_METHODS)[number];
+
+/**
+ * 欄の識別の種類（`name` があれば名前、なければその画面で一意な CSS。T38a の申し送り）。CC-102: 契約の owner は `src/core/api-field-identity.ts`
+ * （書き込みの入力の部品と共有する）。ここは公開し直すだけ。
+ */
+export const SCENARIO_API_FIELD_IDENTITY_KINDS = API_FIELD_IDENTITY_KINDS;
+export type ScenarioApiFieldIdentityKind = ApiFieldIdentityKind;
+
+/** API のシナリオの登録の ID の取り方（応答の本文の鍵。指定しなければ、検証の指定の今の取り方）。 */
+export const SCENARIO_API_RECORD_ID_SOURCES = Object.freeze(['RESPONSE_BODY_KEY'] as const);
+export type ScenarioApiRecordIdSource = (typeof SCENARIO_API_RECORD_ID_SOURCES)[number];
+
+/**
+ * ブラウザ（Chromium）が要求に付けるヘッダの名前の閉じた一覧と、ページが付けた名前かの判定（ユーザーの判断「ヘッダの名前は結ぶ。ブラウザが付ける名前は
+ * 除く」）。T39a で、書き込みの段の照合（`src/safety/`）も読めるよう `src/core/api-request-shape.ts` へ移した。ここは、今までの呼び出し側のために
+ * 再び export する（第二の一覧を持たない）。
+ */
+export { BROWSER_SUPPLIED_HEADER_NAMES, BROWSER_SUPPLIED_HEADER_NAME_PREFIXES, isPageSuppliedHeaderName } from '../../core/api-request-shape.js';
+
+/** API のシナリオの鍵（本文の鍵、ページが決める鍵）の最大の件数（probe の型の鍵の上限と同じ）。 */
+export const MAX_SCENARIO_API_KEYS = MAX_API_SHAPE_BODY_KEYS;
+/** 許すヘッダの名前の最大の件数（probe の型のヘッダの名前の上限と同じ）。 */
+export const MAX_SCENARIO_API_HEADER_NAMES = MAX_API_SHAPE_HEADER_NAMES;
+/** 鍵・ヘッダ・filter・query の名前の最大長（probe の型の名前の上限と同じ）。 */
+export const MAX_SCENARIO_API_KEY_LENGTH = MAX_API_SHAPE_NAME_LENGTH;
+/** path の型の最大長（probe の型の path の上限と同じ）。 */
+export const MAX_SCENARIO_API_PATH_LENGTH = MAX_API_SHAPE_PATH_LENGTH;
+/** `Content-Type` の媒体の型の最大長（probe の型の上限と同じ）。 */
+export const MAX_SCENARIO_API_MEDIA_TYPE_LENGTH = MAX_API_SHAPE_MEDIA_TYPE_LENGTH;
+/** 欄の CSS の最大長（probe の欄の識別の上限と同じ）。 */
+export const MAX_SCENARIO_API_FIELD_SELECTOR_LENGTH = MAX_SUBMISSION_PROBE_FIELD_SELECTOR_LENGTH;
+
+/** 欄の識別（値は持たない。CC-102: 契約の owner `src/core/api-field-identity.ts` の公開し直し）。 */
+export type ScenarioApiFieldIdentity = ApiFieldIdentity;
+
+/**
+ * 欄の型ごとの、受ける値の JSON の型（目印を入れる欄だけ。ほかの欄は鍵に対応しない）。T38b の下書きの確かめと、T38e の入力の規則の判定
+ * （`field-evaluation.ts`）が使う唯一の表。
+ */
+export const SCENARIO_API_FIELD_JSON_TYPES: Readonly<Partial<Record<CandidateFieldType, readonly ApiJsonValueType[]>>> = Object.freeze({
+  text: ['string'],
+  search: ['string'],
+  email: ['string'],
+  url: ['string'],
+  tel: ['string'],
+  date: ['string'],
+  textarea: ['string'],
+  number: ['number'],
+});
+
+/**
+ * 送る鍵の欄の型（T38R2-fix の M-2。`SCENARIO_API_FIELD_JSON_TYPES` の欄の型。そこから作る。スキーマの `$defs/apiFieldType` の enum と一致する）。
+ * 下書きは、この型の欄の鍵だけを送れる（ほかの型は `SCENARIO_API_FIELD_TYPE_MISMATCH`）。
+ */
+export const SCENARIO_API_FIELD_TYPES: readonly CandidateFieldType[] = Object.freeze(Object.keys(SCENARIO_API_FIELD_JSON_TYPES) as CandidateFieldType[]);
+
+/** 欄の型と鍵の JSON の型の組が、`SCENARIO_API_FIELD_JSON_TYPES` の組か。 */
+export const isScenarioApiFieldJsonTypePair = (fieldType: CandidateFieldType, jsonType: ApiJsonValueType): boolean =>
+  (SCENARIO_API_FIELD_JSON_TYPES[fieldType] ?? []).includes(jsonType);
+
+/** probe の欄の識別（`name` があれば名前、なければ CSS。どちらもなければ null）。下書きの確かめと入力の規則の判定が使う唯一の決まり。 */
+export const scenarioApiFieldIdentityOf = (field: SubmissionProbeInputField): ScenarioApiFieldIdentity | null => {
+  if (field.name !== null && field.name.length > 0) {
+    return { kind: 'NAME', name: field.name };
+  }
+  return field.selector !== null && field.selector.length > 0 ? { kind: 'SELECTOR', selector: field.selector } : null;
+};
+
+/**
+ * probe の型の、欄に対応する鍵と、その欄の識別と型（T38R-fix の I-1、T38R2-fix の M-2。`submissionProbeKeyFieldsOf` の鍵のうち、欄を持ち、欄の識別
+ * （`scenarioApiFieldIdentityOf`）を作れるもの。鍵の UTF-16 のコード単位の順。値は持たない）。索引の鍵と欄の digest と、画面の案が使う。
+ */
+export const scenarioApiKeyFieldsOfProbe = (probe: SubmissionProbeRecord): readonly ScenarioApiKeyField[] =>
+  Object.freeze(submissionProbeKeyFieldsOf(probe)
+    .flatMap(({ key, type, field }) => {
+      const identity = field === null ? null : scenarioApiFieldIdentityOf(field);
+      return field === null || identity === null ? [] : [Object.freeze({ key, type, field: identity, fieldType: field.type })];
+    })
+    .sort((left, right) => compareCodeUnits(left.key, right.key)));
+
+/** 鍵と欄の対応の digest の形の印（版つき。T38R-fix の I-1。T38R2-fix の M-2 で欄の型を足して 2 にした。版 13 とともに未公開）。 */
+export const API_KEY_FIELDS_DIGEST_FORMAT = 'beaksight:api-key-fields/2';
+
+/**
+ * 鍵と欄の対応の digest（T38R-fix の I-1。索引（`discovery-index-store.ts`）と、承認の有効性（`approval-validity.ts`）が照らす唯一の作り方）。型の digest と、
+ * 鍵ごとの `[鍵, JSON の型, 欄の識別の種類, 名前か CSS, 欄の型]` を鍵の順に並べた JSON の SHA-256。欄の識別か欄の型（T38R2-fix の M-2。text と number の
+ * 入れ替えなど）が変われば、型が同じでも digest が変わる。
+ */
+export const apiKeyFieldsDigestOf = (shapeDigest: string, keyFields: readonly ScenarioApiKeyField[]): string =>
+  createSha256Fingerprint(JSON.stringify([
+    API_KEY_FIELDS_DIGEST_FORMAT,
+    shapeDigest,
+    [...keyFields]
+      .sort((left, right) => compareCodeUnits(left.key, right.key))
+      .map(({ key, type, field, fieldType }) => [key, type, field.kind, apiFieldIdentityValueOf(field), fieldType]),
+  ]));
+
+/** 2 つの欄の識別が同じか。 */
+export const isSameScenarioApiFieldIdentity =(left: ScenarioApiFieldIdentity, right: ScenarioApiFieldIdentity): boolean =>
+  (left.kind === 'NAME' ? right.kind === 'NAME' && left.name === right.name : right.kind === 'SELECTOR' && left.selector === right.selector);
+
+/** 送る鍵 1 つ（本文の鍵、値の JSON の型、目印を入れた欄、その欄の型）。 */
+export interface ScenarioApiKeyField {
+  readonly key: string;
+  readonly type: ApiJsonValueType;
+  readonly field: ScenarioApiFieldIdentity;
+  /** 目印を入れた欄の型（T38R2-fix の M-2。probe の欄の型。`SCENARIO_API_FIELD_TYPES` のどれか）。 */
+  readonly fieldType: CandidateFieldType;
+}
+
+/** ページが決める鍵 1 つ（欄に対応しない鍵のうち、承認で名前を示したもの。登録では値は照らさない）。 */
+export interface ScenarioApiPageKey {
+  readonly key: string;
+  readonly type: ApiJsonValueType;
+  /**
+   * T41a（Task 41 の設計書 3.3、ユーザーの判断 2）: 更新の画面の欄としての識別（UPDATE だけ。probe が選んだ欄（目印なし）のうち、名前が鍵と同じ欄が
+   * ちょうど 1 つ）。Guard は前の読み取りで読んだ値と照らす（T41c）。登録は持たない。
+   */
+  readonly field?: ScenarioApiFieldIdentity;
+}
+
+/** API の要求の型（値を持たない。probe の型から作る）。 */
+export interface ScenarioApiRequestShape {
+  readonly method: ScenarioApiMethod;
+  /** 送り先の Origin（承認したサービスの Origin の文字列。probe の型の番号でなく文字列で持つ）。 */
+  readonly origin: string;
+  /** path の型（probe の型の `pathShape`）。 */
+  readonly pathShape: string;
+  /** 許す query の名前（`select` だけ。filter の名前は `filterName`）。 */
+  readonly queryNames: readonly (typeof API_SELECTION_QUERY_NAMES)[number][];
+  readonly contentType: string | null;
+  readonly prefer: readonly ApiPreferShape[];
+}
+
+/** API のシナリオの登録の ID の取り方（応答の本文の鍵）。 */
+export interface ScenarioApiRecordId {
+  readonly source: ScenarioApiRecordIdSource;
+  readonly key: string;
+}
+
+/** API の UPDATE の台帳の参照（同じプロファイルの CREATE のシナリオと、更新の画面の path の型。`{id}` が台帳の ID）。 */
+export interface ScenarioApiLedger {
+  readonly targetCreateScenarioId: string;
+  readonly formPathTemplate: string;
+}
+
+/** 人が決める API の指定（下書きの入力。ほかの項目は、候補の probe から作る）。 */
+export interface ScenarioApiDraft {
+  /** 候補の行を選ぶ型の digest（`candidateOfDiscoveryDocumentByShape`）。 */
+  readonly shapeDigest: string;
+  /** ページが決める鍵（欄に対応しない鍵のうち、承認で名前を示すもの）の名前。 */
+  readonly pageKeys: readonly string[];
+  /** UPDATE の filter の名前（型の filter と同じであること。CREATE は null）。 */
+  readonly filterName: string | null;
+  readonly recordId: ScenarioApiRecordId | null;
+  /** UPDATE の台帳の参照（CREATE は null）。 */
+  readonly ledger: ScenarioApiLedger | null;
+  /**
+   * T41a（Task 41 の設計書 3.1）: UPDATE の保つ鍵（目印の付いた欄の鍵のうち、変える鍵（`fieldNames`）でないもの）の名前。省けば、目印の付いた欄の鍵の
+   * うち変える鍵でないものをすべて保つ（既定は保つ。メールと電話も保つ）。登録は持てない（持つなら空）。
+   */
+  readonly keptKeys?: readonly string[];
+}
+
+/** API の指定（シナリオの中身。承認の digest v4 の項目は T38c）。 */
+export interface ScenarioApiSpec {
+  readonly shapeDigest: string;
+  readonly request: ScenarioApiRequestShape;
+  /** 送る鍵（鍵の UTF-16 のコード単位の順）。T41a: UPDATE では変える鍵（生成した値を作る鍵）だけ。 */
+  readonly keyFields: readonly ScenarioApiKeyField[];
+  /**
+   * T41a（Task 41 の設計書 3.1）: UPDATE の保つ鍵（鍵の順。生成した値を作らない。Guard は本文にあれば前の値と完全一致を求め、なければ通す）。UPDATE は
+   * 必ず持つ（空でもよい）。登録は持たない。目印の付いた欄の鍵は、`keyFields` か `keptKeys` のどちらかにちょうど 1 回ある（`scenarioApiMarkedKeyFieldsOf`）。
+   */
+  readonly keptKeys?: readonly ScenarioApiKeyField[];
+  /** ページが決める鍵（鍵の順）。T41a: UPDATE では、どれも欄の識別（`field`）を持つ。 */
+  readonly pageKeys: readonly ScenarioApiPageKey[];
+  /** 許すヘッダの名前（ページが付ける名前だけ。小文字の順）。 */
+  readonly headerNames: readonly string[];
+  readonly filterName: string | null;
+  readonly recordId: ScenarioApiRecordId | null;
+  readonly ledger: ScenarioApiLedger | null;
+  /**
+   * T41a（Task 41 の設計書 3.1）: UPDATE の候補の、画面の path の最後の ID を `{id}` にした識別の digest（`fingerprint.ts` の
+   * `pagePathTemplatedIdentityDigestOf`）。承認の有効性は、これが最新の索引にあることで判定し、ワーカー（T41d）は対象の ID の画面の候補で求め直して照らす。
+   * UPDATE は必ず持つ（LG-3: T41a の前に保存した、持たない版は、スキーマが拒むので読まない）。登録は持たない。
+   */
+  readonly templatedIdentityDigest?: string;
+}
+
+/**
+ * 目印の付いた欄の鍵の全体（T41a。変える鍵 `keyFields` と保つ鍵 `keptKeys` を合わせて鍵の順に並べた写し）。索引の鍵と欄の対応の digest
+ * （`apiKeyFieldsDigestOf`。probe の欄に対応する鍵の全体から作る）と照らすときに使う。
+ */
+export const scenarioApiMarkedKeyFieldsOf = (api: Pick<ScenarioApiSpec, 'keyFields' | 'keptKeys'>): readonly ScenarioApiKeyField[] =>
+  [...api.keyFields, ...(api.keptKeys ?? [])].sort((left, right) => compareCodeUnits(left.key, right.key));
+
+/**
+ * DEF-147（設計書 `2026-10-21-beaksight-api-state-keys-design.md` 2 章）: API のシナリオの鍵のうち、公開の状態にあたる鍵（status・is_published・
+ * published_at など。`isPublicationStateKeyName`）の名前（変える鍵、保つ鍵、ページが決める鍵から。重なりなし、鍵の順）。承認の画面と作成の画面が、注意の印を
+ * 出すために使う（判断は持たない。値は持たない）。
+ */
+export const scenarioApiPublicationStateKeysOf = (
+  api: Pick<ScenarioApiSpec, 'keyFields' | 'keptKeys' | 'pageKeys'>,
+): readonly string[] => Object.freeze([...new Set([...api.keyFields, ...(api.keptKeys ?? []), ...api.pageKeys]
+  .map(({ key }) => key)
+  .filter(isPublicationStateKeyName))]
+  .sort(compareCodeUnits));
+
+/** シナリオの送り方（項目のない前の文書と FORM の中身は `FORM`）。 */
+export const scenarioTransportOf = (content: Pick<ScenarioContent, 'transport'>): ScenarioTransport => content.transport ?? FORM_SCENARIO_TRANSPORT;
+
+/**
+ * UPDATE のシナリオの台帳の参照（T41b で `scenario-store.ts` に作り、T41R2-fix-B で同じ台帳のシナリオの集まり（`scenario-facts.ts` の
+ * `writeFamilyScenarioIdsIn`）と共用するためにここへ移した唯一の決まり）: form の UPDATE は UPDATE の指定の、API の UPDATE は API の指定の台帳
+ * （`api.ledger`）の CREATE のシナリオ。UPDATE でない・台帳の参照がないシナリオは null。
+ */
+export const updateLedgerScenarioIdOf = (scenario: Pick<ScenarioContent, 'kind' | 'transport' | 'update' | 'api'>): string | null => {
+  if (scenario.kind !== 'UPDATE') {
+    return null;
+  }
+  return scenarioTransportOf(scenario) === API_SCENARIO_TRANSPORT
+    ? scenario.api?.ledger?.targetCreateScenarioId ?? null
+    : scenario.update?.targetCreateScenarioId ?? null;
+};
+
 /** 下書きの確かめが見る、ほかのシナリオの事実（台帳の参照の確かめ。今の版の kind）。 */
 export interface ScenarioKindFact {
   readonly scenarioId: string;
@@ -261,6 +547,17 @@ export interface ScenarioKindFact {
    * 台帳の取り方に結ぶ確かめ（`scenario-policy.ts` の `isUpdatePathBoundToLedger`）が使う。
    */
   readonly recordId?: ScenarioRecordIdSpec | null;
+  /**
+   * T41a（Task 41 の設計書 3.1 の「台帳の ID と filter の結び付け」）: 今の版の API の指定の登録の ID の取り方（応答の本文の鍵。API の登録でないか未指定
+   * なら null。事実を持たない文脈は省く）。API の UPDATE の filter の名前を台帳の ID に結ぶ確かめ（`scenario-policy.ts` の
+   * `apiUpdateLedgerBindingRejectionOf`）が使う。
+   */
+  readonly apiRecordId?: ScenarioApiRecordId | null;
+  /**
+   * T41R-fix-B（Task 41 の設計書 8 章の「T41R の完全版」の I-1）: 今の版の API の要求の送り先（Origin の文字列と path の型。API のシナリオでなければ null。
+   * 事実を持たない文脈は省く）。API の更新の台帳が、同じ表（同じ Origin と path の型）の API の登録であることの確かめ（`apiUpdateLedgerBindingRejectionOf`）が使う。
+   */
+  readonly apiRequest?: Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'> | null;
 }
 
 /** 結果の条件（Task 26 の結果の条件と同じ型。`{ pathPrefix, selector }`）。 */
@@ -301,7 +598,7 @@ export interface ScenarioVerification {
   readonly readVerification: ScenarioReadVerification | null;
 }
 
-/** すべて未指定の検証の指定（下書きに検証の指定がないとき、検証の指定の前に保存した版を読むとき）。 */
+/** すべて未指定の検証の指定（下書きに検証の指定がないとき）。 */
 export const UNSPECIFIED_VERIFICATION: ScenarioVerification = Object.freeze({
   successCondition: null,
   inputErrorCondition: null,
@@ -354,8 +651,16 @@ export interface ScenarioContent {
   readonly profileId: string;
   readonly kind: ScenarioKind;
   readonly candidate: ScenarioCandidateDigests;
-  readonly request: ScenarioRequestShape;
-  /** 送る欄の名前（重複なし。UTF-16 のコード単位の順）。 */
+  /**
+   * T38b: 送り方（`scenarioTransportOf`）。FORM のシナリオは項目を持たない（送り方の項目の前に保存した文書と同じ形のまま。`FORM` を書いた文書も
+   * 読める）。API のシナリオは `API`。
+   */
+  readonly transport?: ScenarioTransport;
+  /** form の要求の形。T38b: API のシナリオは null（要求の型は `api`）。 */
+  readonly request: ScenarioRequestShape | null;
+  /** T38b: API の指定（API のシナリオだけ。FORM のシナリオは持たない）。 */
+  readonly api?: ScenarioApiSpec;
+  /** 送る欄の名前（重複なし。UTF-16 のコード単位の順）。T38b: API のシナリオは、送る本文の鍵（`api.keyFields` の鍵）。 */
   readonly fieldNames: readonly string[];
   /** 照らす READ の定義の参照（id の重複なし。id の UTF-16 のコード単位の順）。 */
   readonly readChecks: readonly ReadCheckReference[];
@@ -365,8 +670,8 @@ export interface ScenarioContent {
   /** 検証の指定（T30a）。 */
   readonly verification: ScenarioVerification;
   /**
-   * UPDATE の指定（T31b）。`CREATE` は null。`UPDATE` の下書きの確かめは必須にする（UPDATE の指定の前に保存した UPDATE の版だけが null で、
-   * 承認と発行はできない）。
+   * UPDATE の指定（T31b）。`CREATE` と API のシナリオは null。form の `UPDATE` は必須（下書きの確かめとスキーマ。LG-3: 前に保存した null の版は
+   * 読まない）。
    */
   readonly update: ScenarioUpdateSpec | null;
 }
@@ -436,4 +741,14 @@ export type ScenarioReadCheckFact = Pick<ReadCheckView, 'readCheckId' | 'profile
  */
 export interface ScenarioReadCheckDefinitionFact extends ScenarioReadCheckFact {
   readonly parameterNames: readonly string[];
+  /**
+   * T37d fix round 1: 定義の対象の種類（`read-check-contracts.ts` の `READ_CHECK_TARGET_KINDS`。省略は候補）。画面の path を読む定義は、照合の READ に
+   * 使わない（下書きの確かめが拒む）。
+   */
+  readonly targetKind?: ReadCheckTargetKind;
+  /**
+   * T38c: 画面の path の定義が `{id}` つきの型か（`read-check-contracts.ts` の `isReadCheckPageTemplatePath`。画面の path の定義だけが持つ。省略は型で
+   * ない）。API のシナリオだけ、型の定義を照合の READ に使える（結び付けは 0 件。`{id}` には台帳の ID だけを入れる。実際の照合は Task 40）。
+   */
+  readonly pageTemplate?: boolean;
 }

@@ -6,35 +6,67 @@
  *   `requireSchemaCheckedCopy` を使う（写しだけ、確かめだけのファイルは数えない）。
  * - (b) CC-078 の前半: 発見の索引（`discovery_candidates`・`discovery_jobs`）と READ の定義（`read_checks`・`read_check_results`）の表の名前を
  *   文字列リテラル（SQL）に書くのは、それぞれの owner（`src/control/job/discovery-index-store.ts`、`src/control/job/read-check-store.ts`）と、
- *   表を作る移行（`src/control/store/migrations.ts`）だけ。ほかの部品は、owner の読み出し（トランザクションの中で使える `readDiscoveryIndexIn`・
+ *   表を作る文（LG-2 で `src/control/store/migrations.ts` から移した基準の版 17 の `src/control/store/control-schema-v17.ts`）だけ。ほかの部品は、owner の読み出し（トランザクションの中で使える `readDiscoveryIndexIn`・
  *   `noDiscoveryJobRecordedAfterIn`・`listReadChecksIn` を含む）を使う。コメントの中の表の名前は数えない。
+ * - (c) CC-077 の残り（PRE42-CC 組 1b）: JSON の写し（`JSON.parse(JSON.stringify(…))`）は `src/core/json-copy.ts` の `jsonCopyOf` だけに書く。
+ *   ほかのファイルは `jsonCopyOf` を使う。閉じた例外は Guard の写し（`src/safety/passive-request-guard.ts`。Guard の写しは寄せない）の 1 つだけで、
+ *   例外のファイルが今も写しを持つことも確かめる（古い例外を残さない）。(a) の「写し」は、`jsonCopyOf(` の呼び出しも数える。
+ * - プロファイルの状態（`'ACTIVE'`・`'RETIRED'`）の書き写しは、`owner-constant-reuse.test.ts` の (a)(a′) が止める（PRE42-CC 組 1a・1b）。
+ * - (d) N4-8d（PRE42-CC 組 1b）: 書き込みの結果の `'VERIFIED'`（`ActionResult`）と、送信の状態の `'NOT_SENT'`（`SubmissionState`・
+ *   `ActionRunDocument['submission']`）の名前つきの定数は `src/control/actions/action-contracts.ts`（`VERIFIED_ACTION_RESULT`・
+ *   `NOT_SENT_SUBMISSION_STATE`）だけに書く。数える形は `satisfies` と型の注釈つきの代入。除くファイルはない（LG-2 で版ごとの写しの `migrations.ts` の除外を消した）。
+ *   判別の共用体の `case 'NOT_SENT':` や比べは数えない（型の絞り込みに使う書き方のため）。
  * - 対象は `src/**` と、画面の `apps/local-ui/src/**`（`.ts`、`.tsx`）。読み込みと走査は、このファイルの読み込み時に 1 回だけ。1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { loadLocalUiSourceFiles, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import { loadLocalUiSourceFiles, loadSourceFiles, scanSource, unusedExclusionsOf, type ScannedSource, type SourceFile } from './source-scan.js';
 
 const SOURCE_FILES: readonly SourceFile[] = [...loadSourceFiles(), ...loadLocalUiSourceFiles()];
 
 const SCHEMA_CHECKED_COPY_OWNER = 'src/control/schema-checked-copy.ts';
 const DISCOVERY_INDEX_OWNER = 'src/control/job/discovery-index-store.ts';
 const READ_CHECK_OWNER = 'src/control/job/read-check-store.ts';
-const MIGRATIONS_FILE = 'src/control/store/migrations.ts';
+/** LG-2: 表を作る文のファイル（管理データの基準の版 17 の凍結の文。前は `migrations.ts` が版ごとの文を持っていた）。 */
+const BASE_SCHEMA_FILE = 'src/control/store/control-schema-v17.ts';
 
 /** (b) 表ごとの、表の名前を SQL に書いてよいファイル。 */
 const TABLE_OWNERS: ReadonlyMap<string, readonly string[]> = new Map([
-  ['discovery_candidates', [DISCOVERY_INDEX_OWNER, MIGRATIONS_FILE]],
-  ['discovery_jobs', [DISCOVERY_INDEX_OWNER, MIGRATIONS_FILE]],
-  ['read_checks', [READ_CHECK_OWNER, MIGRATIONS_FILE]],
-  ['read_check_results', [READ_CHECK_OWNER, MIGRATIONS_FILE]],
+  ['discovery_candidates', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE]],
+  ['discovery_jobs', [DISCOVERY_INDEX_OWNER, BASE_SCHEMA_FILE]],
+  ['read_checks', [READ_CHECK_OWNER, BASE_SCHEMA_FILE]],
+  ['read_check_results', [READ_CHECK_OWNER, BASE_SCHEMA_FILE]],
 ]);
 
-/** (a) JSON の写しの形（`JSON.parse(JSON.stringify(`。空白を許す）と、管理の契約のスキーマの確かめの呼び出し。 */
-const JSON_COPY_PATTERN = /\bJSON\s*\.\s*parse\s*\(\s*JSON\s*\.\s*stringify\s*\(/u;
+/** (c) JSON の写しの owner と、閉じた例外（Guard の写し）。 */
+const JSON_COPY_OWNER = 'src/core/json-copy.ts';
+const JSON_COPY_EXCEPTIONS: readonly string[] = ['src/safety/passive-request-guard.ts'];
+/** (d) 書き込みの結果と送信の状態の owner。 */
+const ACTION_CONTRACTS_OWNER = 'src/control/actions/action-contracts.ts';
+
+/** (a)(c) JSON の写しの形（`JSON.parse(JSON.stringify(`。空白を許す）。 */
+const RAW_JSON_COPY_PATTERN = /\bJSON\s*\.\s*parse\s*\(\s*JSON\s*\.\s*stringify\s*\(/u;
+/** (a) 写しの形（生の写しか、`jsonCopyOf(` の呼び出し）と、管理の契約のスキーマの確かめの呼び出し。 */
+const JSON_COPY_PATTERN = /\bJSON\s*\.\s*parse\s*\(\s*JSON\s*\.\s*stringify\s*\(|(?<![\w$.])jsonCopyOf\s*\(/u;
 const CONTROL_VALIDATION_PATTERN = /\bvalidateControlDocument\s*\(/u;
 
 /** (a) 写しと確かめの組を持つか（コメントを除いた本文。文字列の中は数えない）。 */
 const hasSchemaCheckedCopy = (source: ScannedSource): boolean =>
   JSON_COPY_PATTERN.test(source.bare) && CONTROL_VALIDATION_PATTERN.test(source.bare);
+
+/** (c) 生の JSON の写しを持つか（コメントを除いた本文）。 */
+const hasRawJsonCopy = (source: ScannedSource): boolean => RAW_JSON_COPY_PATTERN.test(source.bare);
+
+/** (d) 値の名前つきの定数の書き写しの形（コメントを除き、文字列を残した本文で数える）。 */
+const ACTION_VALUE_COPY_PATTERNS: readonly RegExp[] = [
+  /['"]VERIFIED['"]\s+satisfies\s+ActionResult\b/u,
+  /:\s*ActionResult\s*=\s*['"]VERIFIED['"]/u,
+  /['"]NOT_SENT['"]\s+satisfies\s+(?:SubmissionState\b|ActionRunDocument\s*\[\s*['"]submission['"]\s*\])/u,
+  /:\s*SubmissionState\s*=\s*['"]NOT_SENT['"]/u,
+];
+
+/** (d) 書き写しの形に当たる行（1 から数えた行の番号と、その行の前後の空白を除いた本文）。 */
+const copiesIn = (source: ScannedSource, patterns: readonly RegExp[]): readonly string[] => source.code.split('\n').flatMap((line, index) =>
+  patterns.some((pattern) => pattern.test(line)) ? [`${index + 1}: ${line.trim()}`] : []);
 
 /** (b) 文字列リテラルの中の、表の名前（語の単位）。 */
 const tablesWrittenIn = (source: ScannedSource): readonly string[] => [...TABLE_OWNERS.keys()].filter((table) =>
@@ -56,6 +88,27 @@ describe('control read ownership detectors (CCX-17)', () => {
     expect(tablesWrittenIn(scanSource('// the rows of discovery_candidates and read_checks'))).toEqual([]);
     expect(tablesWrittenIn(scanSource("const name = 'read_checks_view';"))).toEqual([]);
   });
+
+  it('(a) counts a jsonCopyOf call as the copy, and (c) finds the raw JSON copy only outside comments', () => {
+    expect(hasSchemaCheckedCopy(scanSource("const copy = jsonCopyOf(value);\nvalidateControlDocument('scenario', copy);"))).toBe(true);
+    expect(hasSchemaCheckedCopy(scanSource("const copy = core.jsonCopyOf(value); validateControlDocument('scenario', copy);"))).toBe(false);
+    expect(hasRawJsonCopy(scanSource('const copy = JSON.parse(JSON.stringify(value)) as unknown;'))).toBe(true);
+    expect(hasRawJsonCopy(scanSource('const copy = JSON . parse( JSON . stringify (value));'))).toBe(true);
+    expect(hasRawJsonCopy(scanSource('const copy = jsonCopyOf(value);'))).toBe(false);
+    expect(hasRawJsonCopy(scanSource('// JSON.parse(JSON.stringify(value))'))).toBe(false);
+  });
+
+  it('(d) finds the named copies of VERIFIED and NOT_SENT, and ignores the switch cases and the comparisons', () => {
+    const copies = (text: string): readonly string[] => copiesIn(scanSource(text), ACTION_VALUE_COPY_PATTERNS);
+    expect(copies("const VERIFIED_RESULT = 'VERIFIED' satisfies ActionResult;")).toHaveLength(1);
+    expect(copies("const VERIFIED: ActionResult = 'VERIFIED';")).toHaveLength(1);
+    expect(copies("const NOT_SENT_SUBMISSION = 'NOT_SENT' satisfies SubmissionState;")).toHaveLength(1);
+    expect(copies("const NOT_SENT_SUBMISSION = 'NOT_SENT' satisfies ActionRunDocument['submission'];")).toHaveLength(1);
+    expect(copies("const NOT_SENT: SubmissionState = 'NOT_SENT';")).toHaveLength(1);
+    expect(copies("    case 'NOT_SENT':")).toEqual([]);
+    expect(copies("if (message.submission !== 'NOT_SENT') {")).toEqual([]);
+    expect(copies("// const VERIFIED_RESULT = 'VERIFIED' satisfies ActionResult;")).toEqual([]);
+  });
 });
 
 describe('control read ownership (CCX-17)', () => {
@@ -75,6 +128,27 @@ describe('control read ownership (CCX-17)', () => {
     const violations = SOURCE_FILES.flatMap((file) => tablesWrittenIn(file)
       .filter((table) => !(TABLE_OWNERS.get(table) ?? []).includes(file.path))
       .map((table) => `${file.path}: ${table}`));
+    expect(violations).toEqual([]);
+  });
+
+  it('(c) only json-copy.ts copies a value as JSON, besides the closed exception of the guard (src/ and apps/local-ui/)', () => {
+    const owner = SOURCE_FILES.find((file) => file.path === JSON_COPY_OWNER);
+    expect(owner !== undefined && hasRawJsonCopy(owner)).toBe(true);
+    const copiers = SOURCE_FILES.filter((file) => hasRawJsonCopy(file)).map((file) => file.path);
+    expect(unusedExclusionsOf(JSON_COPY_EXCEPTIONS, copiers)).toEqual([]);
+    const violations = SOURCE_FILES
+      .filter((file) => file.path !== JSON_COPY_OWNER && !JSON_COPY_EXCEPTIONS.includes(file.path) && hasRawJsonCopy(file))
+      .map((file) => file.path);
+    expect(violations).toEqual([]);
+  });
+
+  it('(d) only action-contracts.ts names VERIFIED and NOT_SENT (src/ and apps/local-ui/)', () => {
+    const owner = SOURCE_FILES.find((file) => file.path === ACTION_CONTRACTS_OWNER);
+    expect(/\bexport\s+const\s+VERIFIED_ACTION_RESULT\s*=\s*'VERIFIED'/u.test(owner?.code ?? ''), 'VERIFIED_ACTION_RESULT').toBe(true);
+    expect(/\bexport\s+const\s+NOT_SENT_SUBMISSION_STATE\s*=\s*'NOT_SENT'/u.test(owner?.code ?? ''), 'NOT_SENT_SUBMISSION_STATE').toBe(true);
+    const violations = SOURCE_FILES
+      .filter((file) => file.path !== ACTION_CONTRACTS_OWNER)
+      .flatMap((file) => copiesIn(file, ACTION_VALUE_COPY_PATTERNS).map((line) => `${file.path}:${line}`));
     expect(violations).toEqual([]);
   });
 });

@@ -18,6 +18,7 @@ import {
   type PartialFailureReason,
   type ViewportProfile,
 } from './contracts.js';
+import type { AuditSendPolicyName } from './audit-send-policy.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // スクロール位置（controlled scroll、DOM、layout、color、accessibility、screenshot）
@@ -260,6 +261,13 @@ export interface NetworkFailureEvidence extends RequestOriginFlags {
   readonly timing: NetworkTimingEvidence;
   /** URL・メソッド・エラー文のどれかを上限で切り詰めたか。 */
   readonly truncated: boolean;
+  /**
+   * BN-a（設計書 3.1 の 3）: BeakSight が止めた要求の失敗か（切り詰める前の `errorText` を、`src/core/blocked-by-client-failures.ts` の
+   * `isBlockedByClientFailure` で判定した値）。
+   */
+  readonly blockedByBeakSight: boolean;
+  /** BN-a: 失敗を記録した時点（`BLOCKED_EVENT_PHASES`）。 */
+  readonly phase: BlockedEventPhase;
 }
 
 export interface NetworkEvidence {
@@ -1622,8 +1630,37 @@ export type MetadataEvidence = RobotsTxtMetadataEvidence | SitemapXmlMetadataEvi
 // 事象の型は、`src/safety/safety-ledger.ts` の `SafetyLedger` が記録する形そのもの。Ledger は、ここの型を import して使い、
 // 同じ名前で re-export する。文字列は、Ledger の上限まで切り詰めて記録される。
 
-/** Passive の Guard が、読み取り以外のメソッドのリクエストを遮断した理由の閉じた一覧。 */
-export const BLOCKED_REQUEST_REASONS = Object.freeze(['NON_READ_METHOD'] as const);
+/**
+ * Passive の Guard が、リクエストを遮断した理由の閉じた一覧。
+ * - `NON_READ_METHOD`: 読み取り以外のメソッドのリクエスト。
+ * - `SERVICE_REQUEST_LIMIT_REACHED`（T35a。Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限（1 分あたりか、1 回の Run あたり）を超える
+ *   リクエスト（スクリプトで送るログインの監査の段だけ。公開監査とフォームの送信のログインの監査では現れない）。
+ * - `SERVICE_ORIGIN_REVISIT`（T35R-fix。Task 35 の設計書の履歴の T35R の行、C-1）: 幅の走査と Interaction の読み込み（`REVISIT` の Context）で、
+ *   承認したサービスの Origin へ送ろうとした読み取りのリクエスト（sub frame の文書を含む。API の読み取りは Desktop と Mobile の最初の読み込みだけ）。
+ *   スクリプトで送るログインの監査の段だけで現れる。
+ * - `PAGE_NAVIGATION_LIMIT_REACHED`（DEF-129）: ページが始めた文書の読み込み（JS の読み込み直しや移動、meta の転送）が、frame ごとの上限
+ *   （`src/safety/passive-request-guard.ts` の `PAGE_INITIATED_NAVIGATION_LIMIT_PER_FRAME`）を超えた（Passive の段だけ）。main frame は BeakSight 自身の
+ *   読み込みの後から、子の frame（T37R2-fix）はその frame の最初の文書の後から数える。
+ * - `PAGE_SUBRESOURCE_LIMIT_REACHED`（DEF-130-fix）: 1 画面の読み込みあたりの、ページが出す文書でない要求（画像・`fetch`・`xhr` など）が、上限
+ *   （`src/safety/passive-request-guard.ts` の `PAGE_SUBRESOURCE_REQUEST_LIMIT`）を超えた（Passive の段だけ。数え始めは BeakSight 自身の読み込みか、
+ *   その Context の最初の文書）。
+ * - `AUDIT_SEND_OVER_LIMIT`（AS-a。設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、通せる
+ *   読み取りでない要求が、その読み込み（Context）で通す数の上限（`src/safety/passive-request-guard.ts` の `AUDIT_SEND_MAX_PASSED_PER_CONTEXT`）を超えた
+ *   （その扱いを選んだ Passive の段だけ）。
+ * - `PAGE_LEAVE_REQUEST_LIMIT_REACHED`（T44R の I-1。Task 44 の設計書の履歴の「T44R …と設計者の判断」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、
+ *   閉じる前にページを離れ始めた後に、ページが出す文書でない要求が 1 回の離れ方あたりの上限（`src/safety/passive-request-guard.ts` の
+ *   `PAGE_LEAVE_REQUEST_LIMIT`）を超えたか、そのページの文書の読み込み（ページが始めた移動、ポップアップが opener を戻す移動）だった。そのページの読み取りの
+ *   判定は、離れる前に終わっている（読み切れない画面にはしない）。
+ */
+export const BLOCKED_REQUEST_REASONS = Object.freeze([
+  'NON_READ_METHOD',
+  'SERVICE_REQUEST_LIMIT_REACHED',
+  'SERVICE_ORIGIN_REVISIT',
+  'PAGE_NAVIGATION_LIMIT_REACHED',
+  'PAGE_SUBRESOURCE_LIMIT_REACHED',
+  'AUDIT_SEND_OVER_LIMIT',
+  'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+] as const);
 
 /** Passive の Guard が、許可Originの外へのメインフレームの遷移を遮断した理由の閉じた一覧。 */
 export const BLOCKED_NAVIGATION_REASONS = Object.freeze(['EXTERNAL_MAIN_FRAME_NAVIGATION'] as const);
@@ -1647,8 +1684,10 @@ export const WORKER_CONNECT_POLICY_REASON = 'WORKER_CONNECT_POLICY';
  * Passive の Guard が、WebSocket を遮断した理由の閉じた一覧。
  * - `PASSIVE_WEBSOCKET`: ページの中の WebSocket（Context の `routeWebSocket`）。
  * - `WORKER_CONNECT_POLICY`: Worker の中の WebSocket（CSP。`WORKER_CONNECT_POLICY_REASON`）。
+ * - `AUDIT_SEND_OVER_LIMIT`（AS-c）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で通せる接続が、その読み込み（Context）の上限
+ *   （`src/safety/passive-request-guard.ts` の `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT`）を超えた。
  */
-export const BLOCKED_WEBSOCKET_REASONS = Object.freeze(['PASSIVE_WEBSOCKET', WORKER_CONNECT_POLICY_REASON] as const);
+export const BLOCKED_WEBSOCKET_REASONS = Object.freeze(['PASSIVE_WEBSOCKET', WORKER_CONNECT_POLICY_REASON, 'AUDIT_SEND_OVER_LIMIT'] as const);
 
 /** Interaction の凍結中に、ページが起こした通信・遷移・popup・WebSocket を遮断した理由の閉じた一覧。 */
 export const INTERACTION_FROZEN_REASONS = Object.freeze(['INTERACTION_FROZEN'] as const);
@@ -1674,6 +1713,8 @@ export const BLOCKED_INTERACTION_WEBSOCKET_REASONS = Object.freeze([
  * - `EGRESS_UPSTREAM_DENIED`: 凍結の前に、中継の上流の方針で拒んだもの（production の方針はすべて許すので起きない。テストの方針で起きる）。
  * - `GUARD_BYPASS_EGRESS`（DEF-085）: Passive とログインの段の Context の出口の中継が、要求の方針（Guard の許可を中継から見た範囲。method と
  *   URL）で拒んだもの。Guard が許すはずのない要求が、Guard を通らずに出ようとした証拠である。Passive の Context の記録も、この一覧に置く。
+ *   DEF-125 から、中継が CONNECT の受け入れ（Guard が通した要求の宛先だけ）で拒んだ CONNECT も、この理由で記録する（`method` は `CONNECT`、`url` は
+ *   `host:port`。Guard の知らせを待った後に拒む。Interaction の Context の中継も同じ）。
  *   Guard が Context を閉じる直前に中継を凍結した後の拒否は、どの理由でも記録しない（DEF-085 fix round 3。閉じる途中の要求は、Guard が許した
  *   普通の要求か、横取りを外れた要求かを中継から区別できないため）。Passive の Context でも、Guard の凍結の段（発見の凍結）の後の中継の拒否は
  *   `INTERACTION_FROZEN_EGRESS` で記録する。
@@ -1712,6 +1753,17 @@ export type BlockedExternalActionReason = (typeof BLOCKED_EXTERNAL_ACTION_REASON
 export const NON_EXTERNAL_NAVIGATION_SCHEMES = Object.freeze(['http:', 'https:', 'about:', 'data:', 'blob:'] as const);
 
 /**
+ * EL-F（EL-R の I2。設計書 `2026-10-24-beaksight-external-launch-block-design.md`）: 外部スキームとみなさない、Chromium に組み込みの拡張の ID の閉じた一覧。
+ * PDF の頁（main frame・iframe・embed）を開くと、Chromium は組み込みの PDF の表示の拡張の frame（`chrome-extension://<この ID>/index.html`）を作る。これは
+ * OS の外部のアプリへ渡らない、Chromium の中の頁なので、外部スキームへの移動の試みにしない（前は違反になり、PDF の頁で Run が止まった）。ほかの
+ * `chrome-extension:` の URL は、今どおり外部スキームとする。
+ */
+export const CHROMIUM_PDF_VIEWER_EXTENSION_ID = 'mhjfbmdgcfjbbpaeojofohoefgiehjai';
+export const NON_EXTERNAL_CHROMIUM_EXTENSION_IDS = Object.freeze([CHROMIUM_PDF_VIEWER_EXTENSION_ID] as const);
+/** Chromium の拡張の URL のスキーム（`URL.protocol` の形）。 */
+export const CHROMIUM_EXTENSION_PROTOCOL = 'chrome-extension:';
+
+/**
  * 外部スキームへの移動の試みを記録した理由の閉じた一覧（C18a、C18g）。
  * - `EXTERNAL_SCHEME_NAVIGATION`: ページのスクリプトなどによる移動の試み。外部スキームはネットワークを通らないので、Guard は
  *   止められない。headed と headless を問わず、記録し、不変条件の違反（`EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED`）も記録する。
@@ -1737,21 +1789,83 @@ export const EXTERNAL_SCHEME_NAVIGATION_PHASES = Object.freeze(['PASSIVE', 'INTE
 export const SAFETY_EVIDENCE_SCOPES = Object.freeze(['PASSIVE', 'INTERACTION'] as const);
 export type SafetyEvidenceScope = (typeof SAFETY_EVIDENCE_SCOPES)[number];
 
-export interface BlockedRequestEvent {
+/**
+ * BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1）: Guard が止めた事象の時点の閉じた一覧。
+ * - `LOAD`: その Context の読み込みの間（ページの監査では、測りの前と最中）。
+ * - `CLOSING`: 閉じる途中（Guard の段階が閉じる途中・無効化・閉じた後）か、BeakSight が閉じる前にページを離れ始めた後（`announcePageLeave`）。
+ * 外部スキームへの移動の記録の `phase`（`EXTERNAL_SCHEME_NAVIGATION_PHASES`。凍結の前と後）とは別の値である。
+ */
+export const BLOCKED_EVENT_PHASES = Object.freeze(['LOAD', 'CLOSING'] as const);
+export type BlockedEventPhase = (typeof BLOCKED_EVENT_PHASES)[number];
+
+/**
+ * BN-a: page.json（`schemas/page.schema.json`）の版。`page-schema/1.1` から、止めた事象の時点（`phase`）と要求の種類（`resourceType`）、閉じる途中に止めた
+ * 要求（`blockedClosingRequests`）、network の失敗の印（`blockedByBeakSight`・`phase`）、safety の Evidence の読み込みの印（`load`）を持つ。書くのは、いつも最新の版。
+ * LG-4（テストの組の設計書 3.7.3、3.7.5）: 印のない `page-schema/1.0` と、その読み替えの口は捨てた（前の版の page.json を持つ保存は読まない）。
+ */
+export const PAGE_SCHEMA_VERSION = 'page-schema/1.1';
+/** BN-a: 読める page.json の版（スキーマの `schemaVersion` の値と同じ。LG-4 で今の版だけになった）。 */
+export const PAGE_READABLE_SCHEMA_VERSIONS = Object.freeze([PAGE_SCHEMA_VERSION] as const);
+export type PageSchemaVersion = (typeof PAGE_READABLE_SCHEMA_VERSIONS)[number];
+
+/**
+ * BN-a: 要求を止めた事象（止めた要求・止めた移動・止めた WebSocket・監査の段の除外）が持つ時点（`phase`）。必須（LG-4: 時点のない前の版の記録は読まない）。
+ */
+export interface BlockedEventPhaseFact {
+  readonly phase: BlockedEventPhase;
+}
+
+/**
+ * Guard が止めた要求。BN-a: `resourceType` は、Guard の記録の口の要求の種類（`src/safety/request-policy.ts` の `requestResourceTypeOf` で正規化した値。
+ * 閉じた一覧 `REQUEST_RESOURCE_TYPES` の値）。必須。
+ */
+export interface BlockedRequestEvent extends BlockedEventPhaseFact {
   readonly method: string;
   readonly url: string;
   readonly reason: (typeof BLOCKED_REQUEST_REASONS)[number];
+  readonly resourceType: string;
+  /**
+   * BN-R1 の M-2: 先読み（prefetch・prerender）の要求の印（要求の `Sec-Purpose`・`Purpose` に `prefetch` を含む。`src/safety/request-policy.ts` の
+   * `isSpeculativeRequestHeaders`）。先読みの要求のときだけ `true` を持つ（ない項目は、先読みでない要求か、前の版の記録）。区分の側は、この印の記録を
+   * 見えない種類として扱う（影響の可能性の元にしない）。
+   */
+  readonly speculative?: true;
 }
 
-export interface BlockedNavigationEvent {
+export interface BlockedNavigationEvent extends BlockedEventPhaseFact {
   readonly method: string;
   readonly url: string;
   readonly reason: (typeof BLOCKED_NAVIGATION_REASONS)[number];
 }
 
-export interface BlockedWebSocketEvent {
+export interface BlockedWebSocketEvent extends BlockedEventPhaseFact {
   readonly url: string;
   readonly reason: (typeof BLOCKED_WEBSOCKET_REASONS)[number];
+}
+
+/**
+ * BN-a（設計書 3.1 の 2）: Guard が、Context を閉じる途中（段階が閉じる途中・無効化・閉じた後か、持ち主が閉じ始めた page）に止めた要求の 1 件。止め方は今までどおり
+ * （記録を足しただけ）。判定の理由はない（閉じる途中の要求は、判定せずに止める）。時点は、いつも `CLOSING`。
+ */
+export interface BlockedClosingRequestEvent {
+  readonly method: string;
+  readonly url: string;
+  readonly resourceType: string;
+  readonly phase: Extract<BlockedEventPhase, 'CLOSING'>;
+  /** BN-R1 の M-2: 先読みの要求の印（`BlockedRequestEvent.speculative` と同じ。先読みのときだけ）。 */
+  readonly speculative?: true;
+}
+
+/**
+ * BN-a: 閉じる途中に止めた要求の記録（`SafetyEventsEvidence.blockedClosingRequests`）。1 件でも止めた Ledger の記録にだけ現れる。
+ * - `count`: 止めた要求の数（`events` の上限を超えた分と、要求の method・URL を読めなかった分も数える。飽和）。
+ * - `events`: 記録できた要求（上限は Ledger の事象の上限。超えた分は `recordLimits.droppedEventCount` に数え、`reachedCategories` に分類を残す）。
+ * `count` は正しく数えるので、この記録だけが上限を超えても `recordLimits.truncated` にしない（監査の段の除外の記録と同じ。Run を PARTIAL にしない）。
+ * 止めた要求の数（`blockedRequestsByMethod`）・止めた要求の一覧（`blockedRequests`）・SAFETY の Finding には入れない（閉じる途中の要求は、測りの後のもの）。
+ */
+export interface BlockedClosingRequestsRecord {
+  readonly count: number;
+  readonly events: readonly BlockedClosingRequestEvent[];
 }
 
 /**
@@ -1759,11 +1873,15 @@ export interface BlockedWebSocketEvent {
  * - `method`、`url`: 要求の method と URL（ほかの要求の記録と同じく、Ledger の上限の長さまで切り詰める）。
  * - `mainFrameNavigation`: main frame のナビゲーションか（偽は、サブの frame の要求と、ナビゲーションでない要求）。
  */
-export interface BlockedAuditExclusionEvent {
+export interface BlockedAuditExclusionEvent extends BlockedEventPhaseFact {
   readonly method: string;
   readonly url: string;
   readonly mainFrameNavigation: boolean;
   readonly reason: (typeof BLOCKED_AUDIT_EXCLUSION_REASONS)[number];
+  /** BN-a: 要求の種類（`BlockedRequestEvent.resourceType` と同じ）。 */
+  readonly resourceType: string;
+  /** BN-R1 の M-2: 先読みの要求の印（`BlockedRequestEvent.speculative` と同じ）。 */
+  readonly speculative?: true;
 }
 
 /**
@@ -1879,6 +1997,10 @@ export interface SafetyLedgerRecordLimits {
 export interface SafetyEventsEvidence {
   readonly scope: SafetyEvidenceScope;
   /**
+   * BN-a（設計書 3.1 の 4）: この Ledger の読み込みの種類（ページの監査、幅の走査の幅、Interaction の候補の番号）。Safety Ledger の snapshot には持たない。
+   */
+  readonly load: SafetyEvidenceLoad;
+  /**
    * メソッドごとの、遮断した読み取り以外のリクエストの件数。`blockedRequests` の記録の上限を超えた分も数える
    * （メソッドの種類や件数の上限で数えられなかった分は `recordLimits.uncountedBlockedRequestCount`）。
    */
@@ -1902,6 +2024,98 @@ export interface SafetyEventsEvidence {
    * （表示は、この Task では変えない）。
    */
   readonly blockedAuditExclusions?: BlockedAuditExclusionsRecord;
+  /**
+   * AS-a・AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.3）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、Guard が通した読み取りでない要求の
+   * 記録（method・Origin・path・回数だけ。値は持たない）。1 件でも通した Ledger の記録にだけ現れる（今の出力は変えない）。事象の一覧（配列）ではないので、
+   * `SAFETY_EVENT_KINDS` には含めない。
+   */
+  readonly passedAuditSendRequests?: PassedAuditSendRequestsRecord;
+  /**
+   * AS-c（設計書 5 章の「ユーザーの言葉と選択（AS-c）」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で、Guard が通した WebSocket の接続の記録（Origin・
+   * path・数だけ。query・接続の上の送受信・値は持たない）。1 本でも通した Ledger の記録にだけ現れる。
+   */
+  readonly passedAuditSendWebSockets?: PassedAuditSendWebSocketsRecord;
+  /**
+   * BN-a（設計書 3.1 の 2）: Context を閉じる途中に Guard が止めた要求の記録（`BlockedClosingRequestsRecord`）。1 件でも止めた Ledger の記録にだけ現れる。
+   * 事象の一覧（配列）ではないので、`SAFETY_EVENT_KINDS` には含めない（SAFETY の Finding にしない）。
+   */
+  readonly blockedClosingRequests?: BlockedClosingRequestsRecord;
+}
+
+/**
+ * BN-a（設計書 3.1 の 4）: safety の Evidence のもとになった読み込みの種類の閉じた一覧。
+ * - `PAGE_AUDIT`: ページの監査の読み込み（Desktop と Mobile の Passive の Context）。
+ * - `STRESS_WIDTH`: 幅の走査の 1 つの幅の読み込み（`width` は、その幅の CSS px）。
+ * - `INTERACTION`: Interaction の 1 つの候補の隔離した読み込み（`candidateIndex` は、候補の発見の順の番号で 0 から。診断の記録の候補の番号と同じ）。
+ */
+export const SAFETY_EVIDENCE_LOAD_KINDS = Object.freeze(['PAGE_AUDIT', 'STRESS_WIDTH', 'INTERACTION'] as const);
+export type SafetyEvidenceLoadKind = (typeof SAFETY_EVIDENCE_LOAD_KINDS)[number];
+
+/** BN-a: safety の Evidence の読み込みの印。 */
+export type SafetyEvidenceLoad =
+  | { readonly kind: Extract<SafetyEvidenceLoadKind, 'PAGE_AUDIT'> }
+  | { readonly kind: Extract<SafetyEvidenceLoadKind, 'STRESS_WIDTH'>; readonly width: number }
+  | { readonly kind: Extract<SafetyEvidenceLoadKind, 'INTERACTION'>; readonly candidateIndex: number };
+
+/** AS-c: 通した WebSocket の接続の 1 行（Origin・path・数）。 */
+export interface PassedAuditSendWebSocket {
+  /** `ws:`・`wss:` の Origin（`URL.origin`）。 */
+  readonly origin: string;
+  /** `/` で始まる path（値に見える区切りは伏せ、上限の長さで切ってある）。 */
+  readonly path: string;
+  /** 通した数（1 以上。飽和）。 */
+  readonly count: number;
+  /**
+   * AS-c fix round 1（C-1・C-2）: Guard の route を通らずに開いた接続（ページのスクリプトが Playwright の WebSocket の模擬を迂回した接続、Worker の中の接続）の
+   * 行の印。印のない行と別の行に数える。
+   */
+  readonly outsideGuard?: true;
+  /** AS-c fix round 1: 危険な語（か監査の段の除外）に当たる接続の行の印（Guard の route なら止めた接続）。印のない行と別の行に数える。 */
+  readonly dangerous?: true;
+}
+
+/**
+ * AS-c: 通した WebSocket の接続の記録（数は、一覧に入れなかった分も数える）。AS-c fix round 1 から、ブラウザが実際に開いた接続（CDP の事象）から作る
+ * （Guard の route が通した数ではない）。
+ */
+export interface PassedAuditSendWebSocketsRecord {
+  /** 開いた接続の総数（飽和）。 */
+  readonly count: number;
+  /** 同じ Origin・path・印を重ねた一覧（上限は Ledger の事象の上限。記録した順）。 */
+  readonly connections: readonly PassedAuditSendWebSocket[];
+  /** 一覧に入れなかった接続の数（上限を超えた新しい行と、Origin を作れない URL。飽和）。 */
+  readonly unlisted: number;
+  /** AS-c fix round 1: そのうち Guard の route を通らずに開いた接続の数（飽和。一覧に入れなかった分も数える）。 */
+  readonly outsideGuard: number;
+  /** AS-c fix round 1: そのうち危険な語に当たる接続の数（飽和。一覧に入れなかった分も数える）。 */
+  readonly dangerous: number;
+}
+
+/** AS-a: 通した読み取りでない要求の 1 行（method・Origin・path・回数。query・fragment・本文・値は持たない）。 */
+export interface PassedAuditSendRequest {
+  readonly method: string;
+  /** HTTP(S) の Origin の正規の直列化。 */
+  readonly origin: string;
+  /** `/` で始まる path（値に見える区切りは伏せ、上限の長さで切ってある）。 */
+  readonly path: string;
+  /** 通した回数（1 以上。飽和）。 */
+  readonly count: number;
+}
+
+/** AS-a: 通した読み取りでない要求の記録（件数は、一覧に入れなかった分も数える）。 */
+export interface PassedAuditSendRequestsRecord {
+  /** 通した要求の総数（飽和）。 */
+  readonly count: number;
+  /** method ごとの通した数（`blockedRequestsByMethod` と同じ上限の部品で数える）。 */
+  readonly byMethod: Readonly<Record<string, number>>;
+  /** 同じ method・Origin・path を重ねた一覧（上限は Ledger の事象の上限。記録した順）。 */
+  readonly requests: readonly PassedAuditSendRequest[];
+  /** 一覧に入れなかった、通した要求の数（上限を超えた新しい行と、Origin を作れない URL。飽和）。 */
+  readonly unlisted: number;
+  /**
+   * AS-c: 通した要求のうち、許可 Origin と承認したサービスの Origin のほか（ほかの Origin）へのものの数（飽和）。
+   */
+  readonly otherOrigins: number;
 }
 
 /**
@@ -2034,8 +2248,118 @@ export interface EffectiveAuditConfig {
     readonly accessibility: boolean;
     readonly interactions: boolean;
     readonly screenshots: boolean;
+    /**
+     * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査の段の送信の扱い（値の一覧は `src/core/audit-send-policy.ts`）。設定を読んだ
+     * 値（`loadConfig`）は既定を合わせて必ず持つ。項目のない値（AS-b の前の保存・`run.json`）は `READ_ONLY` と読む（`auditSendPolicyOf`）。
+     */
+    readonly sendPolicy?: AuditSendPolicyName;
   };
   readonly output: {
     readonly directory: string;
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// セッションの切れの証拠（DEF-138。設計書 `2026-10-19-beaksight-session-loss-evidence-design.md` 2.1）
+// ---------------------------------------------------------------------------------------------------------------
+// セッションの切れを判定した読み込み 1 回の記録の形の唯一の定義。作るのは `src/orchestration/authenticated-run.ts` の `sessionLossEvidenceOf` だけ。
+// `run.json` の `authentication.sessionLoss`、発見・READ の確かめの成果物、IPC の `AUTH_STATE`、管理データのジョブの行、ジョブの画面が同じ形を使う。
+// 値（token、Cookie の値、query の値、本文、ヘッダの値）は持たない。path は値に見える区切りを伏せ、query は名前だけ（値に見える名前は伏せる）。
+
+/** 証拠の Origin の区別（許可 Origin・承認したサービスの Origin・そのほか。Origin そのものは持たない）。 */
+export const SESSION_LOSS_ORIGIN_KINDS = Object.freeze(['ALLOWED', 'SERVICE', 'OTHER'] as const);
+export type SessionLossOriginKind = (typeof SESSION_LOSS_ORIGIN_KINDS)[number];
+
+/**
+ * 行き着いた先をどこで見たか。`PAGE_URL` は main frame の最後の URL、`BLOCKED_REDIRECT` は Guard が止めた main frame の移動の先（セッションの切れの
+ * 判定 `sessionLostUrlOf` と同じ順）。
+ */
+export const SESSION_LOSS_LANDED_BY = Object.freeze(['PAGE_URL', 'BLOCKED_REDIRECT'] as const);
+export type SessionLossLandedBy = (typeof SESSION_LOSS_LANDED_BY)[number];
+
+/** 止めた要求の理由（Safety Ledger の止めた要求・止めた main frame の移動・監査の段の除外の理由の和。一覧の owner はそれぞれの一覧）。 */
+export const SESSION_LOSS_BLOCKED_REQUEST_REASONS = Object.freeze([
+  ...BLOCKED_REQUEST_REASONS,
+  ...BLOCKED_NAVIGATION_REASONS,
+  ...BLOCKED_AUDIT_EXCLUSION_REASONS,
+] as const);
+export type SessionLossBlockedRequestReason = (typeof SESSION_LOSS_BLOCKED_REQUEST_REASONS)[number];
+
+/**
+ * 鍵の名前の置き場所（ローカル ストレージの鍵か、Cookie の名前か、DEF-139 からは IndexedDB のデータベースの名前か。DEF-139 で末尾に足した。前の値の順は
+ * 変えない）。
+ */
+export const SESSION_LOSS_STORAGE_KINDS = Object.freeze(['LOCAL_STORAGE', 'COOKIE', 'INDEXED_DB'] as const);
+export type SessionLossStorageKind = (typeof SESSION_LOSS_STORAGE_KINDS)[number];
+
+/** 鍵の名前の違いの向き（読み込みの前にあって後にない `REMOVED`、後にだけある `ADDED`）。 */
+export const SESSION_LOSS_KEY_CHANGES = Object.freeze(['REMOVED', 'ADDED'] as const);
+export type SessionLossKeyChange = (typeof SESSION_LOSS_KEY_CHANGES)[number];
+
+/** main frame の文書の要求の経路の記録の上限（リダイレクトの各段とクライアントの側の移動。超えた分は数だけ）。 */
+export const MAX_SESSION_LOSS_REDIRECT_PATHS = 10;
+/**
+ * 止めた要求の形の行の上限（ログインの段の止めた一覧 `MAX_LOGIN_STAGE_BLOCKED_REQUESTS` と同じ上限。一致は `tests/unit/session-loss-evidence.test.ts`。
+ * 超えた行は数だけ）。
+ */
+export const MAX_SESSION_LOSS_BLOCKED_REQUESTS = 8;
+/**
+ * 鍵の名前の違いの 1 行の、接頭辞と接尾辞の案の上限（ログインの段の観察の `MAX_LOGIN_OBSERVED_STORAGE_KEY_NAMES` と同じ上限。一致は同じテスト）。
+ */
+export const MAX_SESSION_LOSS_KEY_SHAPES = 4;
+/** path の表記（path と query の名前）の最大長（UTF-16 のコード単位。記録する URL の上限と同じ）。 */
+export const MAX_SESSION_LOSS_PATH_LENGTH = 2_048;
+/** 鍵の名前の違いの行の上限（置き場所 3（DEF-139 から）× Origin の区別 3 × 向き 2）。 */
+export const MAX_SESSION_LOSS_STORAGE_KEY_CHANGES = SESSION_LOSS_STORAGE_KINDS.length * SESSION_LOSS_ORIGIN_KINDS.length * SESSION_LOSS_KEY_CHANGES.length;
+
+/** 経路の 1 段（Origin の区別と、path の表記）。 */
+export interface SessionLossPathRecord {
+  readonly originKind: SessionLossOriginKind;
+  readonly path: string;
+}
+
+/** 止めた要求の形の 1 行（method、Origin の区別、path（query なし）、理由、回数）。 */
+export interface SessionLossBlockedRequest {
+  readonly method: string;
+  readonly originKind: SessionLossOriginKind;
+  readonly path: string;
+  readonly reason: SessionLossBlockedRequestReason;
+  /** 止めた回数（1 以上。飽和）。 */
+  readonly count: number;
+}
+
+/** 接頭辞と接尾辞の案 1 つ（ログインの段の観察の `storageKeyShapeOf` の形。名前の全体と間の部分は持たない）。 */
+export interface SessionLossKeyShape {
+  readonly prefix: string;
+  readonly suffix: string;
+}
+
+/** 鍵の名前の違いの 1 行（置き場所・Origin の区別・向きごと）。`count` は違った名前の数、`shapes` はそのうち案にできた名前の案（上限つき）。 */
+export interface SessionLossStorageKeyChange {
+  readonly storage: SessionLossStorageKind;
+  readonly originKind: SessionLossOriginKind;
+  readonly change: SessionLossKeyChange;
+  readonly count: number;
+  readonly shapes: readonly SessionLossKeyShape[];
+}
+
+/**
+ * セッションの切れの証拠（設計書 2.1）。
+ * - `stage`: 判定した段階（理由 `AUTH_SESSION_LOST` の `detail` と同じ値。例 `desktop:passive`。ワーカーの 1 画面の読み込みは、鍵の消失なら
+ *   `session-key`、path の切れなら `null`）。
+ * - `requestedPath`・`landedPath`: 頼んだ URL と行き着いた先の path の表記（読めない URL は `null`）。`landedBy` はどこで見たか。
+ * - `redirectPaths`: main frame の文書の要求の経路（読み込みの順。上限つき。超えた数は `redirectPathsOmitted`）。
+ * - `blockedRequests`: この読み込みの間に Guard が止めた要求の形（上限つき。一覧に入れなかった回数は `blockedRequestsUnlisted`）。
+ * - `storageKeyChange`: 読み込みの前（Context に入れた状態）と後（閉じるときに読んだ状態）の鍵の名前の違い。どちらかを読めなければ `null`。
+ */
+export interface SessionLossEvidence {
+  readonly stage: string | null;
+  readonly requestedPath: string | null;
+  readonly landedPath: string | null;
+  readonly landedBy: SessionLossLandedBy;
+  readonly redirectPaths: readonly SessionLossPathRecord[];
+  readonly redirectPathsOmitted: number;
+  readonly blockedRequests: readonly SessionLossBlockedRequest[];
+  readonly blockedRequestsUnlisted: number;
+  readonly storageKeyChange: readonly SessionLossStorageKeyChange[] | null;
 }

@@ -6,8 +6,9 @@
  * - `newContext` の直後に page を開く Proxy（`browserOpeningPageAfterNewContext`）は、多くのテストが使うので、
  *   `browser-opening-page.ts` に置いたまま、ここの `overrideBrowser` を使う。
  */
-import type { Browser, BrowserContext } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions } from 'playwright';
 import { wait } from '../../src/core/deadline.js';
+import { WEBRTC_BLOCK_INIT_SCRIPT } from '../../src/safety/passive-request-guard.js';
 import { createDeferred, type Deferred } from './deferred.js';
 
 /** 決して終わらない Promise（止まったままの処理を表す）。 */
@@ -34,6 +35,40 @@ export function overrideBrowser(real: Browser, overrides: BrowserOverrides): Bro
     },
   });
 }
+
+/**
+ * Context の初期化のスクリプトのうち、内容が `content` と同じものだけを、付けずに捨てる Browser の Proxy（CC-098。Guard が付ける守りの初期化の
+ * スクリプトを 1 つだけ外し、その奥の守り（factory の自己検査、起動の引数、中継）を確かめるテストだけが、明示して選ぶ）。
+ * - 製品のコードは変えない。`newContext` で作った本物の Context の `addInitScript` を、その Context の自身のプロパティで置き換える
+ *   （`page.context()` が同じ Context を返すので、Guard の Context と Ledger の対応は保たれる）。ほかの初期化のスクリプトは、そのまま付ける。
+ * - production の起動は Browser を Proxy にしないので、production では外せない。
+ */
+export function browserWithoutInitScript(real: Browser, content: string): Browser {
+  return overrideBrowser(real, {
+    newContext: async (options?: BrowserContextOptions): Promise<BrowserContext> => {
+      const context = await real.newContext(options);
+      const addInitScript = context.addInitScript.bind(context);
+      Object.defineProperty(context, 'addInitScript', {
+        configurable: true,
+        value: async (...args: Parameters<BrowserContext['addInitScript']>): Promise<void> => {
+          const [script] = args;
+          if (typeof script === 'object' && script !== null && 'content' in script && script.content === content) {
+            return;
+          }
+          await addInitScript(...args);
+        },
+      });
+      return context;
+    },
+  });
+}
+
+/**
+ * Guard が Context に付ける WebRTC の入口を塞ぐ初期化のスクリプト（`WEBRTC_BLOCK_INIT_SCRIPT`。DEF-124）だけを、付けずに捨てる Browser の Proxy
+ * （起動の引数の守りと中継の CONNECT の守りを確かめるテストだけが、明示して選ぶ。作りは `browserWithoutInitScript`。CC-098。PRE42-CC 組 S2 で
+ * `webrtc-egress-blocked.test.ts` と `egress-tunnel-admission.test.ts` の写しをここに寄せた）。
+ */
+export const browserWithoutWebRtcBlock = (real: Browser): Browser => browserWithoutInitScript(real, WEBRTC_BLOCK_INIT_SCRIPT);
 
 /** `newContext` が必ず失敗する Browser の Proxy（Guard の取り付けに進まずに、Context の作成が失敗する場合を作る）。 */
 export function browserFailingNewContext(real: Browser, message = 'newContext failed in the Safety Gate test'): Browser {

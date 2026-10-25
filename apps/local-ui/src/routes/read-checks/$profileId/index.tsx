@@ -1,12 +1,16 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
+// PRE42-CC 組 UI-K2（CC-113）: 期待の種類の値は、純粋な core の owner から読む（文字列で比べない）。
+import { DETAIL_FIELD_EQUALS_EXPECTATION_KIND } from '../../../../../../src/core/read-check-expectation-kinds.js';
 import { formatCount, formatDateTime } from '../../../../../../src/presentation/format.js';
 import {
   LOCAL_UI_DISCOVERY_TEXT,
+  LOCAL_UI_JOB_NEXT_STEPS,
   LOCAL_UI_READ_CHECK_TEXT,
   LOCAL_UI_TEXT,
   READ_CHECK_DETAIL_DESCRIPTIONS,
+  READ_CHECK_TARGET_KIND_LABELS,
   READ_EXPECTATION_UNDETERMINED_REASON_DESCRIPTIONS,
   READ_ROW_SOURCE_LABELS,
   listText,
@@ -26,6 +30,7 @@ import {
   readCheckPageFn,
   startReadCheckFn,
   type ReadCheckCandidateView,
+  type ReadCheckDefinitionView,
   type ReadCheckPageView,
   type ReadExpectationResultView,
 } from '../../../server/read-check-functions';
@@ -58,6 +63,19 @@ const pageTextOf = (candidate: ReadCheckCandidateView, showOrigins: boolean): st
 const actionTextOf = (candidate: ReadCheckCandidateView, showOrigins: boolean): string =>
   (candidate.actionPath === null ? LOCAL_UI_DISCOVERY_TEXT.noAction : `${showOrigins ? candidate.actionOrigin ?? '' : ''}${candidate.actionPath}`);
 
+/**
+ * T37d: 定義の対象の表示（候補を読む定義は候補の画面、画面を読む定義は画面の path。候補が最後の発見の結果にない定義は、その旨）。画面の path の Origin は
+ * 開始の URL の Origin なので示さない。
+ */
+const definitionTargetOf = (definition: ReadCheckDefinitionView, showOrigins: boolean): ReactNode => {
+  if (definition.targetPagePath !== null) {
+    return <code>{definition.targetPagePath}</code>;
+  }
+  return definition.candidate === null
+    ? <span className={toneClass('caution')}>{text.candidateMissing}</span>
+    : <code>{pageTextOf(definition.candidate, showOrigins)}</code>;
+};
+
 /** 期待 1 件の結果の要約（照らした項目と取れた値）。 */
 const expectationResultText = (view: ReadExpectationResultView): string => {
   const parts = [expectationText(view.expectation), readCheckResultDisplay(view.result).label];
@@ -67,7 +85,7 @@ const expectationResultText = (view: ReadExpectationResultView): string => {
   if (view.found !== null) {
     parts.push(view.found ? text.found : text.notFound);
   }
-  if (view.expectation.kind === 'DETAIL_FIELD_EQUALS') {
+  if (view.expectation.kind === DETAIL_FIELD_EQUALS_EXPECTATION_KIND) {
     parts.push(view.observedValue === null ? text.observedNone : text.observedValue(JSON.stringify(view.observedValue)));
   }
   if (view.undeterminedReason !== null) {
@@ -93,7 +111,17 @@ function Results({ page }: Readonly<{ page: ReadCheckPageView }>) {
             {job.endReason === null ? null : (
               <>
                 <dt>{text.endReason}</dt>
-                <dd>{readCheckEndReasonDisplay(job.endReason).label}</dd>
+                {/* DEF-136: 止まった理由と、次にすること（カタログの説明）。 */}
+                <dd data-testid="read-check-end-reason" data-reason={job.endReason}>
+                  {readCheckEndReasonDisplay(job.endReason).label}
+                  {readCheckEndReasonDisplay(job.endReason).description === null ? null : (
+                    <p className="muted">{readCheckEndReasonDisplay(job.endReason).description}</p>
+                  )}
+                  {/* T44e（Task 44 の設計書 P2-7）: 次にできること（カタログ。ジョブの画面と同じ文）。 */}
+                  {LOCAL_UI_JOB_NEXT_STEPS.readCheckEndReasons[job.endReason] === null ? null : (
+                    <p data-testid="read-check-end-reason-next">{LOCAL_UI_JOB_NEXT_STEPS.readCheckEndReasons[job.endReason]}</p>
+                  )}
+                </dd>
               </>
             )}
           </dl>
@@ -107,6 +135,7 @@ function Results({ page }: Readonly<{ page: ReadCheckPageView }>) {
               <thead>
                 <tr>
                   <th scope="col">{columns.definition}</th>
+                  <th scope="col">{text.page.targetHeading}</th>
                   <th scope="col">{columns.revision}</th>
                   <th scope="col">{columns.result}</th>
                   <th scope="col">{columns.detail}</th>
@@ -126,12 +155,16 @@ function Results({ page }: Readonly<{ page: ReadCheckPageView }>) {
                       data-read-check-id={result.readCheckId}
                       data-result={result.result}
                       data-detail={result.detail ?? ''}
+                      data-target-kind={result.targetKind ?? ''}
                     >
                       <th scope="row" className="cell-break">
-                        {definition === undefined || definition.candidate === null
-                          ? text.definitionRemoved
-                          : <code>{pageTextOf(definition.candidate, page.showOrigins)}</code>}
+                        {result.targetPagePath !== null
+                          ? <code>{result.targetPagePath}</code>
+                          : definition === undefined || definition.candidate === null
+                            ? text.definitionRemoved
+                            : <code>{pageTextOf(definition.candidate, page.showOrigins)}</code>}
                       </th>
+                      <td className="nowrap">{result.targetKind === null ? LOCAL_UI_DISCOVERY_TEXT.noFlags : READ_CHECK_TARGET_KIND_LABELS[result.targetKind]}</td>
                       <td className="nowrap">{LOCAL_UI_TEXT.profileForm.revisionText(result.readCheckRevision)}</td>
                       <td>
                         <span className={toneClass(display.tone)}>{display.label}</span>
@@ -271,12 +304,26 @@ function ReadChecksPage() {
         <h2 className="panel-heading">{text.definitionsHeading}</h2>
         <p className="muted">{text.definitionCount(formatCount(page.definitions.length), formatCount(page.form.maxDefinitions))}</p>
         <p className="muted">{text.valuesNote}</p>
+        {page.editable ? (
+          <p>
+            <Link
+              to="/read-checks/$profileId/new"
+              params={{ profileId: profile.profileId }}
+              search={{ target: 'PAGE' }}
+              className="button"
+              data-testid="read-check-create-page"
+            >
+              {text.page.create}
+            </Link>
+          </p>
+        ) : null}
         {page.definitions.length === 0 ? <p data-testid="read-check-no-definitions">{text.noDefinitions}</p> : (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th scope="col">{columns.page}</th>
+                  <th scope="col">{text.page.targetHeading}</th>
                   <th scope="col">{columns.parameters}</th>
                   <th scope="col">{columns.expectations}</th>
                   <th scope="col">{columns.revision}</th>
@@ -286,12 +333,16 @@ function ReadChecksPage() {
               </thead>
               <tbody>
                 {page.definitions.map((definition) => (
-                  <tr key={definition.readCheckId} data-testid="read-check-definition" data-read-check-id={definition.readCheckId}>
+                  <tr
+                    key={definition.readCheckId}
+                    data-testid="read-check-definition"
+                    data-read-check-id={definition.readCheckId}
+                    data-target-kind={definition.targetKind}
+                  >
                     <th scope="row" className="cell-break">
-                      {definition.candidate === null
-                        ? <span className={toneClass('caution')}>{text.candidateMissing}</span>
-                        : <code>{pageTextOf(definition.candidate, page.showOrigins)}</code>}
+                      {definitionTargetOf(definition, page.showOrigins)}
                     </th>
+                    <td className="nowrap">{READ_CHECK_TARGET_KIND_LABELS[definition.targetKind]}</td>
                     <td className="cell-break" data-testid="read-check-definition-parameters">{parametersText(definition.definition.parameters)}</td>
                     <td className="cell-break">
                       <ul>

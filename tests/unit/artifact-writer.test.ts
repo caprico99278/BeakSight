@@ -1,7 +1,7 @@
 // U16b（Task 14〜17 の設計書 6.1.1、6.1.2。ARCH05、ARCH08）: artifact の書き出しの唯一の owner（`ArtifactWriter.writeRun`）。
 // JSON をメモリの上で組み立てて検証し、スキーマに合わない場合は Run Status を `deriveRunStatus` で導き直してから、一時ファイルと
 // rename で書く。書き出すテキストは、UTF-8 と LF にする。
-import { lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, mkdtemp, open, readdir, readFile, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -14,21 +14,19 @@ import {
   runArtifactDirectory,
   siteUnavailableDiagnosticRelativePath,
 } from '../../src/core/artifact-layout.js';
-import type { AuditRunResult, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
+import { findingsOfAuditArtifact } from '../../src/core/audit-artifact-findings.js';
+import type { AuditRunResult, Finding, PageAuditResult, PageId, RunSummary } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { deriveRunStatus, type RunStatusInput } from '../../src/core/status.js';
+import { createRunLock, judgeRunLock, renewRunLock, type RunLockHost } from '../../src/core/process-lock.js';
 import {
   checkRunCheckpointConsistency,
   checkRunCheckpointPageConsistency,
   createRunCheckpoint,
   createRunCheckpointPage,
-  createRunLock,
-  judgeRunLock,
-  renewRunLock,
   type RunCheckpoint,
   type RunCheckpointPage,
-  type RunLockHost,
 } from '../../src/orchestration/run-checkpoint.js';
 import {
   SITE_UNAVAILABLE_DIAGNOSTIC_SCHEMA_VERSION,
@@ -51,6 +49,7 @@ import {
   PAGE_3,
   auditRun as buildAuditRun,
   dom,
+  edgeCaseAuditRun,
   finding,
   fixtureUrl as url,
   idOf,
@@ -190,6 +189,22 @@ describe('ArtifactWriter.writeRun: the layout (design 6.1.2)', () => {
     });
   });
 
+  // T44f（Task 44 の設計書 P3-1 の B）: audit.json の最上位の findings は、ページの結果の findings に入っていない Finding（Cross-page の規則の Finding。ページの
+  // ID を持つものを含む）だけにする。ページの Finding はページの中に残る。読む側は `findingsOfAuditArtifact` で、ページの Finding とあわせて読む。
+  it('writes only the Findings not in any page into the top-level findings of audit.json, and the reader gets all of them back (T44f)', async () => {
+    const root = await outputDirectory();
+    const result = edgeCaseAuditRun();
+    const written = await new ArtifactWriter().writeRun(result, { outputDirectory: root });
+    const audit = await readJson(join(written.runDirectory, 'audit.json')) as { readonly pages: readonly PageAuditResult[]; readonly findings: readonly Finding[] };
+    const pageFindingIds = new Set(result.pages.flatMap((page) => page.findings.map(({ findingId }) => findingId)));
+    expect(audit.findings).toEqual(result.findings.filter(({ findingId }) => !pageFindingIds.has(findingId)));
+    expect(audit.findings.length).toBeGreaterThan(0);
+    expect(audit.pages).toEqual(result.pages);
+    expect([...findingsOfAuditArtifact(audit)].sort((left, right) => left.findingId.localeCompare(right.findingId)))
+      .toEqual([...result.findings].sort((left, right) => left.findingId.localeCompare(right.findingId)));
+    await expect(validateArtifact('audit', audit)).resolves.toEqual({ ok: true });
+  });
+
   it('writes the run summary, the audit with its schema version and without statusInput, and each page as it is', async () => {
     const root = await outputDirectory();
     const result = auditRun();
@@ -199,7 +214,8 @@ describe('ArtifactWriter.writeRun: the layout (design 6.1.2)', () => {
     expect(await readJson(join(runDirectory, 'run.json'))).toEqual(result.run);
     const audit = await readJson(join(runDirectory, 'audit.json'));
     expect(Object.keys(audit as object)).toEqual(['schemaVersion', 'run', 'pages', 'findings']);
-    expect(audit).toEqual({ schemaVersion: 'audit-schema/1.0', run: result.run, pages: result.pages, findings: result.findings });
+    // T44f（Task 44 の設計書 P3-1 の B）: 最上位の findings は、ページの結果に入っていない Finding（Run の規則の Finding）だけ。この見本はページの Finding だけ。
+    expect(audit).toEqual({ schemaVersion: 'audit-schema/1.0', run: result.run, pages: result.pages, findings: [] });
     expect(JSON.stringify(audit)).not.toContain('statusInput');
     expect(await readJson(join(runDirectory, 'pages/PAGE-000001/page.json'))).toEqual(result.pages[0]);
     await expect(validateArtifact('audit', audit)).resolves.toEqual({ ok: true });
@@ -475,7 +491,8 @@ describe('ArtifactWriter.writePresentation: report.html and the bundle go throug
 });
 
 // BN1（バンドルのファイル名の設計書 2.2）: 新しい名前でバンドルを書き終えた後に、Run のディレクトリの直下の、ほかのバンドルの名前の
-// 普通のファイル（前の形と、日時の違う新しい形）を消す。Run のディレクトリには、最新のバンドルを1つだけ残す。
+// 普通のファイル（日時の違う形）を消す。Run のディレクトリには、最新のバンドルを1つだけ残す。LG-4（テストの組の設計書 3.7.5）: 日時のない前の形
+// （`beaksight-audit-bundle.zip`）は、もうバンドルの名前とみなさないので、消さない（ファイルは残る）。
 describe('ArtifactWriter.writePresentation: only the newest bundle is left in the run directory (bundle file name design 2.2)', () => {
   const BUNDLE_BYTES = new Uint8Array([0x50, 0x4b, 0x05, 0x06]);
   const NEW_NAME = 'beaksight-audit-bundle_20261008030930.zip';
@@ -497,11 +514,11 @@ describe('ArtifactWriter.writePresentation: only the newest bundle is left in th
   };
   const runDirectoryFiles = async (runDirectory: string): Promise<string[]> => (await readdir(runDirectory)).sort();
 
-  it('writes the bundle with the new name and removes the earlier-form bundle and the bundles of other times', async () => {
+  // LG-4: 日時の違うバンドルを消すことは、下の「名前が変わった再開」のテストが確かめる（重なりを除いた）。
+  it('writes report.html and the bundle with the new name, in this order, with the given bytes', async () => {
     const root = await outputDirectory();
     const writer = new ArtifactWriter();
     const written = await writer.writeRun(auditRun(), { outputDirectory: root });
-    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, OLDER_NAME]);
 
     const files = await writer.writePresentation(written, {
       reportHtml: '<p>レポート</p>',
@@ -509,17 +526,16 @@ describe('ArtifactWriter.writePresentation: only the newest bundle is left in th
     });
 
     expect(files).toEqual(['report.html', NEW_NAME]);
-    expect((await runDirectoryFiles(written.runDirectory)).filter((name) => name.endsWith('.zip'))).toEqual([NEW_NAME]);
     expect([...(await readFile(join(written.runDirectory, NEW_NAME)))]).toEqual([...BUNDLE_BYTES]);
   });
 
-  it('keeps report.html, run.json, audit.json, pages/ and files whose names only look like bundle names', async () => {
+  it('keeps report.html, run.json, audit.json, pages/, files whose names only look like bundle names and the earlier form without a time', async () => {
     const root = await outputDirectory();
     const writer = new ArtifactWriter();
     const written = await writer.writeRun(auditRun(), { outputDirectory: root });
-    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, ...SIMILAR_NAMES]);
+    await putEarlierFiles(written.runDirectory, [LEGACY_NAME, OLDER_NAME, ...SIMILAR_NAMES]);
     // 下のディレクトリの、バンドルの名前のファイルも消さない（消すのは Run のディレクトリの直下だけ）。
-    await writeFile(join(written.runDirectory, 'pages', LEGACY_NAME), 'nested', 'utf8');
+    await writeFile(join(written.runDirectory, 'pages', OLDER_NAME), 'nested', 'utf8');
 
     await writer.writePresentation(written, {
       reportHtml: '<p>レポート</p>',
@@ -527,9 +543,10 @@ describe('ArtifactWriter.writePresentation: only the newest bundle is left in th
     });
 
     expect(await runDirectoryFiles(written.runDirectory)).toEqual(
-      ['audit.json', NEW_NAME, ...SIMILAR_NAMES, 'pages', 'report.html', 'run.json'].sort(),
+      ['audit.json', LEGACY_NAME, NEW_NAME, ...SIMILAR_NAMES, 'pages', 'report.html', 'run.json'].sort(),
     );
-    expect(await readFile(join(written.runDirectory, 'pages', LEGACY_NAME), 'utf8')).toBe('nested');
+    expect(await readFile(join(written.runDirectory, LEGACY_NAME), 'utf8')).toBe(LEGACY_NAME);
+    expect(await readFile(join(written.runDirectory, 'pages', OLDER_NAME), 'utf8')).toBe('nested');
   });
 
   it('writes the same name again for the same Run, and leaves that one bundle', async () => {
@@ -634,6 +651,93 @@ describe('ArtifactWriter.writePresentation: only the newest bundle is left in th
   });
 });
 
+// PRE42-BN（2026-10-24 のユーザーの判断）: 画面のジョブのバンドルの名前に、プロファイルの名前を入れる。名前はファイル名だけに使い、中身（ZIP のバイト列、
+// run.json、audit.json）には入れない。再開でプロファイルの名前が変わった後も、前の名前のバンドルを消す。CLI（名前なし）は今の形のまま。
+describe('ArtifactWriter.writePresentation: the profile name in the bundle name (PRE42-BN)', () => {
+  const BUNDLE_BYTES = new Uint8Array([0x50, 0x4b, 0x05, 0x06]);
+  const NAMED = 'beaksight-audit-bundle_管理画面_20261008030930.zip';
+  const runDirectoryFiles = async (runDirectory: string): Promise<string[]> => (await readdir(runDirectory)).sort();
+  const bundlesIn = async (runDirectory: string): Promise<string[]> =>
+    (await runDirectoryFiles(runDirectory)).filter((name) => name.endsWith('.zip'));
+
+  it('writes the bundle under the name with the profile name, and puts the name in no file content', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+
+    const files = await writer.writePresentation(written, {
+      reportHtml: '<p>レポート</p>',
+      bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT, profileName: '管理画面' },
+    });
+
+    expect(files).toEqual(['report.html', NAMED]);
+    expect(await bundlesIn(written.runDirectory)).toEqual([NAMED]);
+    expect([...(await readFile(join(written.runDirectory, NAMED)))]).toEqual([...BUNDLE_BYTES]);
+    for (const name of ['run.json', 'audit.json', 'report.html']) {
+      expect(await readFile(join(written.runDirectory, name), 'utf8'), name).not.toContain('管理画面');
+    }
+  });
+
+  it('removes the bundles of an earlier profile name and of no name, when the name changed on a resume', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    const earlier = [
+      'beaksight-audit-bundle_前の名前_20261006010240.zip',
+      'beaksight-audit-bundle_a_b_20261006010240.zip',
+      'beaksight-audit-bundle_20261006010240.zip',
+    ];
+    /** 似ているが、バンドルの名前ではないファイル（消さない）。 */
+    const similar = [
+      'beaksight-audit-bundle_前の名前_20261006010240.zip.bak',
+      'beaksight-audit-bundle__20261006010240.zip',
+      'beaksight-audit-bundle_前の名前._20261006010240.zip',
+      'beaksight-audit-bundle_CON_20261006010240.zip',
+      'beaksight-action-bundle_前の名前_20261006010240.zip',
+      'メモ_beaksight-audit-bundle_前の名前_20261006010240.zip',
+    ];
+    for (const name of [...earlier, ...similar]) {
+      await writeFile(join(written.runDirectory, name), name, 'utf8');
+    }
+    // 名前の部分つきのバンドルの名前のリンクも、たどらず、消さない。
+    const outside = join(root, 'outside');
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, 'kept.txt'), 'outside', 'utf8');
+    const linkName = 'beaksight-audit-bundle_リンク_20261006010240.zip';
+    await symlink(outside, join(written.runDirectory, linkName), process.platform === 'win32' ? 'junction' : 'dir');
+
+    await writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT, profileName: '管理画面' } });
+
+    expect(await bundlesIn(written.runDirectory)).toEqual([NAMED, ...similar.filter((name) => name.endsWith('.zip')), linkName].sort());
+    expect((await lstat(join(written.runDirectory, linkName))).isSymbolicLink()).toBe(true);
+    expect(await readdir(outside)).toEqual(['kept.txt']);
+    for (const name of similar) {
+      expect(await readFile(join(written.runDirectory, name), 'utf8'), name).toBe(name);
+    }
+  });
+
+  it('keeps the current form when no profile name is given (the CLI), and removes a named bundle of an earlier run', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+    await writeFile(join(written.runDirectory, NAMED.replace('20261008030930', '20261006010240')), 'earlier', 'utf8');
+
+    await expect(writer.writePresentation(written, { bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT } }))
+      .resolves.toEqual(['beaksight-audit-bundle_20261008030930.zip']);
+    expect(await bundlesIn(written.runDirectory)).toEqual(['beaksight-audit-bundle_20261008030930.zip']);
+  });
+
+  it('uses the current form when the profile name becomes empty', async () => {
+    const root = await outputDirectory();
+    const writer = new ArtifactWriter();
+    const written = await writer.writeRun(auditRun(), { outputDirectory: root });
+
+    await expect(writer.writePresentation(written, {
+      bundle: { bytes: BUNDLE_BYTES, lastExecutionFinishedAt: LAST_FINISHED_AT, profileName: ' ... ' },
+    })).resolves.toEqual(['beaksight-audit-bundle_20261008030930.zip']);
+  });
+});
+
 // R3（中断した Run の再開の設計書 4.5）: 最後の書き出しは、前の回の出力が残っていても、中断しなかった場合と同じファイルの集まりにする。
 describe('ArtifactWriter.writeRun: no file of an earlier execution is left (resumable run design 4.5)', () => {
   it('removes visible-text.txt that an earlier execution left for a page that now has no visible text', async () => {
@@ -711,7 +815,7 @@ function sampleCheckpoint(finishedPages: 1 | 2): RunCheckpoint {
 const samplePageLedgerSnapshots = (blocked: number) => {
   const ledger = new SafetyLedger();
   for (let index = 0; index < blocked; index += 1) {
-    ledger.recordBlockedRequest({ method: 'POST', url: url(`/api/form-${String(index)}`), reason: 'NON_READ_METHOD' });
+    ledger.recordBlockedRequest({ method: 'POST', url: url(`/api/form-${String(index)}`), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
   }
   return [ledger.snapshot(), new SafetyLedger().snapshot()];
 };
@@ -810,6 +914,14 @@ function recordingFileOperations(runDirectory: string, calls: string[]): Checkpo
       calls.push(`rm ${name(path)}`);
       await rm(path, options);
     },
+    link: async (existingPath, newPath) => {
+      calls.push(`link ${name(existingPath)} -> ${name(newPath)}`);
+      await link(existingPath, newPath);
+    },
+    unlink: async (path) => {
+      calls.push(`unlink ${name(path)}`);
+      await unlink(path);
+    },
   };
 }
 
@@ -821,7 +933,8 @@ describe('ArtifactWriter: writing the checkpoint (resumable run design 4.1〜4.3
     const written = await new ArtifactWriter().writeCheckpointPage(runDirectory, value);
 
     expect(written).toBe('checkpoint/pages/PAGE-000002.json');
-    expect(await readFile(checkpointPageFile(runDirectory, PAGE_2), 'utf8')).toBe(`${JSON.stringify(value, null, 2)}\n`);
+    // T44f: artifact の JSON の書式は字下げなし（`serializeArtifactJson`）。
+    expect(await readFile(checkpointPageFile(runDirectory, PAGE_2), 'utf8')).toBe(`${JSON.stringify(value)}\n`);
     expect(await listTree(runDirectory)).toEqual(['checkpoint/', 'checkpoint/pages/', 'checkpoint/pages/PAGE-000002.json']);
   });
 
@@ -836,7 +949,7 @@ describe('ArtifactWriter: writing the checkpoint (resumable run design 4.1〜4.3
     await writer.writeCheckpointState(runDirectory, sampleCheckpoint(2));
     expect(await readJson(checkpointFile(runDirectory, 'state'))).toEqual(sampleCheckpoint(2));
     expect(await readJson(checkpointFile(runDirectory, 'previousState'))).toEqual(sampleCheckpoint(1));
-    expect(await readFile(checkpointFile(runDirectory, 'state'), 'utf8')).toBe(`${JSON.stringify(sampleCheckpoint(2), null, 2)}\n`);
+    expect(await readFile(checkpointFile(runDirectory, 'state'), 'utf8')).toBe(`${JSON.stringify(sampleCheckpoint(2))}\n`);
     expect(await listTree(runDirectory)).toEqual(['checkpoint/', 'checkpoint/state.json', 'checkpoint/state.prev.json']);
   });
 
@@ -1027,7 +1140,7 @@ describe('ArtifactWriter: writing the site-unavailable diagnostic (site-unavaila
 
     expect(written).toBe('diagnostics/site-unavailable-PAGE-000002-2-2.json');
     expect(written).toBe(siteUnavailableDiagnosticRelativePath(PAGE_2, 2, RECHECK_ATTEMPT));
-    expect(await readFile(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT), 'utf8')).toBe(`${JSON.stringify(value, null, 2)}\n`);
+    expect(await readFile(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT), 'utf8')).toBe(`${JSON.stringify(value)}\n`);
     await expect(validateArtifact('site-unavailable-diagnostic', await readJson(diagnosticFile(runDirectory, PAGE_2, 2, RECHECK_ATTEMPT))))
       .resolves.toEqual({ ok: true });
     // `diagnostics/`（と Run のディレクトリ）がなければ作る。一時ファイルは残らない。試行の番号は、記録の中に書かない。
@@ -1600,16 +1713,21 @@ describe('ArtifactWriter: the run lock (resumable run design 4.4)', () => {
     await expect(writer.acquireRunLock(runDirectory, lock)).resolves.toEqual({ acquired: true });
 
     expect(await readJson(checkpointFile(runDirectory, 'lock'))).toEqual(lock);
-    expect(calls).toEqual([
+    // SR-1-F（DEF-168）: 中身を書き終えた一時ファイルから `link` で作る（中身のないロックのファイルが外から見えない）。
+    const temporary = `checkpoint/.run.lock.new-${String(process.pid)}-<time>.<uuid>.tmp`;
+    expect(calls.map((call) => call.replace(/\.new-(\d+)-\d+\./gu, '.new-$1-<time>.'))).toEqual([
       'mkdir checkpoint',
-      'open checkpoint/run.lock wx',
-      'write checkpoint/run.lock',
-      'sync checkpoint/run.lock',
-      'close checkpoint/run.lock',
+      `open ${temporary} wx`,
+      `write ${temporary}`,
+      `sync ${temporary}`,
+      `close ${temporary}`,
+      `link ${temporary} -> checkpoint/run.lock`,
+      `unlink ${temporary}`,
       'open checkpoint r',
       'sync checkpoint',
       'close checkpoint',
     ]);
+    expect(await readdir(join(runDirectory, 'checkpoint'))).toEqual(['run.lock']);
   });
 
   it('does not take a lock that already exists, and returns its current content for judgeRunLock', async () => {

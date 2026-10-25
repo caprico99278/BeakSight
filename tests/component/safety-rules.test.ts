@@ -37,7 +37,11 @@ const safetyRecord = (
     pageId: PAGE_ID,
     viewport: options.viewport ?? 'desktop',
     observedAt: '2026-09-24T00:00:00.000Z',
-    payload: safetyEventsEvidenceFromSnapshot(ledger.snapshot(), options.scope ?? 'PASSIVE'),
+    payload: safetyEventsEvidenceFromSnapshot(
+      ledger.snapshot(),
+      options.scope ?? 'PASSIVE',
+      options.scope === 'INTERACTION' ? { kind: 'INTERACTION', candidateIndex: 0 } : { kind: 'PAGE_AUDIT' },
+    ),
   };
 };
 
@@ -131,8 +135,8 @@ describe('SAFETY_RULES', () => {
   describe('SAFETY_NON_READ_REQUEST_BLOCKED', () => {
     it('Passive で遮断した読み取り以外のリクエストの件数と、メソッドと URL を文言に含める', () => {
       const record = safetyRecord((ledger) => {
-        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/b`, reason: 'NON_READ_METHOD' });
-        ledger.recordBlockedRequest({ method: 'PUT', url: `${ORIGIN}/api/a`, reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/b`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+        ledger.recordBlockedRequest({ method: 'PUT', url: `${ORIGIN}/api/a`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       });
       const draft = onlyDraftOf('SAFETY_NON_READ_REQUEST_BLOCKED', [record]);
       expectSafetyDraft(draft, 'SAFETY_NON_READ_REQUEST_BLOCKED', [record]);
@@ -145,7 +149,7 @@ describe('SAFETY_RULES', () => {
 
     it('Interaction の凍結中に遮断したリクエストは、GET・HEAD 以外だけを数え、Passive と1つの Finding にまとめる', () => {
       const passive = safetyRecord((ledger) => {
-        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/passive`, reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/passive`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       }, { sequence: 1 });
       const interaction = safetyRecord((ledger) => {
         ledger.recordBlockedInteractionRequest({ method: 'GET', url: `${ORIGIN}/frozen-get`, reason: 'INTERACTION_FROZEN' });
@@ -184,7 +188,7 @@ describe('SAFETY_RULES', () => {
   describe('SAFETY_EXTERNAL_NAVIGATION_BLOCKED', () => {
     it('許可Originの外への遷移の遮断の件数と URL を文言に含める', () => {
       const record = safetyRecord((ledger) => {
-        ledger.recordBlockedNavigation({ method: 'GET', url: `${EXTERNAL}/landing`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+        ledger.recordBlockedNavigation({ method: 'GET', url: `${EXTERNAL}/landing`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
       });
       const draft = onlyDraftOf('SAFETY_EXTERNAL_NAVIGATION_BLOCKED', [record]);
       expectSafetyDraft(draft, 'SAFETY_EXTERNAL_NAVIGATION_BLOCKED', [record]);
@@ -194,7 +198,7 @@ describe('SAFETY_RULES', () => {
 
     it('遷移の遮断がなければ、Finding を作らない', () => {
       const record = safetyRecord((ledger) => {
-        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD' });
+        ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       });
       expect(ruleById('SAFETY_EXTERNAL_NAVIGATION_BLOCKED').evaluate(input([record]))).toEqual([]);
     });
@@ -268,7 +272,7 @@ describe('SAFETY_RULES', () => {
   describe('SAFETY_WEBSOCKET_BLOCKED', () => {
     it('Passive と Interaction の WebSocket の遮断を、1つの Finding にまとめて数える', () => {
       const passive = safetyRecord((ledger) => {
-        ledger.recordBlockedWebSocket({ url: 'ws://127.0.0.1:4173/socket', reason: 'PASSIVE_WEBSOCKET' });
+        ledger.recordBlockedWebSocket({ url: 'ws://127.0.0.1:4173/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
       }, { sequence: 1 });
       const interaction = safetyRecord((ledger) => {
         ledger.recordBlockedInteractionWebSocket({ url: 'ws://127.0.0.1:4173/live', reason: 'INTERACTION_FROZEN' });
@@ -282,7 +286,7 @@ describe('SAFETY_RULES', () => {
 
     it('WebSocket の遮断がなければ、Finding を作らない', () => {
       const record = safetyRecord((ledger) => {
-        ledger.recordBlockedNavigation({ method: 'GET', url: `${EXTERNAL}/`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' });
+        ledger.recordBlockedNavigation({ method: 'GET', url: `${EXTERNAL}/`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' });
       });
       expect(ruleById('SAFETY_WEBSOCKET_BLOCKED').evaluate(input([record]))).toEqual([]);
     });
@@ -461,7 +465,7 @@ describe('SAFETY_RULES', () => {
 
   it('入力のビューポートと異なるビューポートの Evidence は、判定に使わない', () => {
     const mobile = safetyRecord((ledger) => {
-      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD' });
+      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     }, { viewport: 'mobile' });
     expect(ruleById('SAFETY_NON_READ_REQUEST_BLOCKED').evaluate(input([mobile], 'desktop'))).toEqual([]);
     expect(ruleById('SAFETY_NON_READ_REQUEST_BLOCKED').evaluate(input([mobile], 'mobile'))).toHaveLength(1);
@@ -469,8 +473,8 @@ describe('SAFETY_RULES', () => {
 
   it('入力の Evidence の順序が変わっても、同じ下書きを作る', () => {
     const first = safetyRecord((ledger) => {
-      ledger.recordBlockedWebSocket({ url: 'ws://127.0.0.1:4173/b', reason: 'PASSIVE_WEBSOCKET' });
-      ledger.recordBlockedRequest({ method: 'PATCH', url: `${ORIGIN}/api/z`, reason: 'NON_READ_METHOD' });
+      ledger.recordBlockedWebSocket({ url: 'ws://127.0.0.1:4173/b', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' });
+      ledger.recordBlockedRequest({ method: 'PATCH', url: `${ORIGIN}/api/z`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
     }, { sequence: 1 });
     const second = safetyRecord((ledger) => {
       ledger.recordBlockedInteractionWebSocket({ url: 'ws://127.0.0.1:4173/a', reason: 'INTERACTION_FROZEN' });
@@ -485,8 +489,8 @@ describe('SAFETY_RULES', () => {
 
   it('既定の Rule Engine で、ページとビューポートと Rule の組ごとに1つの SAFETY の Finding になる', () => {
     const passive = safetyRecord((ledger) => {
-      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/1`, reason: 'NON_READ_METHOD' });
-      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/2`, reason: 'NON_READ_METHOD' });
+      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/1`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
+      ledger.recordBlockedRequest({ method: 'POST', url: `${ORIGIN}/api/2`, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
       ledger.recordBlockedDownload({ url: `${ORIGIN}/files/a.pdf`, suggestedFilename: 'a.pdf', reason: 'PASSIVE_DOWNLOAD' });
     }, { sequence: 1 });
     const interaction = safetyRecord((ledger) => {

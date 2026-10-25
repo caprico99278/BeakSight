@@ -133,12 +133,19 @@ export const ACCESSIBILITY_RULES: readonly AuditRule[] = Object.freeze([
   ),
   axeViolationRule(
     { ruleId: 'A11Y_AXE', ruleIdPrefix: AXE_VIOLATION_RULE_ID_PREFIX, severity: UNKNOWN_IMPACT_SEVERITY },
-    (axeRuleId) => {
-      if (axeRuleId === AXE_COLOR_CONTRAST_RULE_ID) {
-        return null;
-      }
-      const suffix = toUpperSnakeCase(axeRuleId);
-      return suffix === null ? null : `${AXE_VIOLATION_RULE_ID_PREFIX}${suffix}`;
-    },
+    (axeRuleId) => axeViolationFindingRuleIdOf(axeRuleId),
   ),
 ]);
+
+/**
+ * 接頭辞の Rule（`A11Y_AXE`）が、axe のルールの ID から作る Finding の ruleId（例: `document-title` → `A11Y_DOCUMENT_TITLE`）。色のコントラストは別の Rule が扱うので
+ * `null`、英数字を含まない ID も `null`。BN-c の fix: Rule の性質の表（`src/audit/rule-block-sensitivity.ts`）の名前つきの行の元の ID を確かめるテストも、この
+ * 変換を使う（変換を写さない）。
+ */
+export function axeViolationFindingRuleIdOf(axeRuleId: string): string | null {
+  if (axeRuleId === AXE_COLOR_CONTRAST_RULE_ID) {
+    return null;
+  }
+  const suffix = toUpperSnakeCase(axeRuleId);
+  return suffix === null ? null : `${AXE_VIOLATION_RULE_ID_PREFIX}${suffix}`;
+}

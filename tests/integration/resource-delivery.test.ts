@@ -10,10 +10,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium, type Browser, type BrowserContext, type Page, type Request } from 'playwright';
+import type { Browser, BrowserContext, Page, Request } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import {
   RESOURCE_CACHE_FULL_RANGE_REQUEST,
@@ -30,7 +29,7 @@ import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
@@ -83,7 +82,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -160,7 +159,7 @@ async function auditPage(
     throw new Error(`fixture URL must normalize: ${pathname}`);
   }
   const outcome = await auditor.audit(normalized.url, allocator.allocatePageId());
-  expect(browser.contexts(), 'Contexts left in the browser after audit()').toHaveLength(0);
+  expect(testContextsOf(browser), 'Contexts left in the browser after audit()').toHaveLength(0);
   return outcome;
 }
 
@@ -560,7 +559,8 @@ describe('Passive (PRIMARY) loads use the Run cache (DEF-031)', () => {
   beforeAll(async () => {
     video = await readFile(VIDEO_FIXTURE_URL);
     // CLI と同じ起動の設定（headless）。テストの既定の Chromium（headless shell）と、動画の取り方が違う可能性があるため（DEF-030）。
-    cliBrowser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+    // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+    cliBrowser = await launchCliChromium();
   });
 
   afterAll(async () => {
@@ -646,6 +646,6 @@ describe('Passive (PRIMARY) loads use the Run cache (DEF-031)', () => {
     } finally {
       await closePassiveResources({ factory, context: second, page: secondPage });
     }
-    expect(targetBrowser.contexts(), 'Contexts left in the browser after the test').toHaveLength(0);
+    expect(testContextsOf(targetBrowser), 'Contexts left in the browser after the test').toHaveLength(0);
   }, PRIMARY_CACHE_TEST_TIMEOUT_MS);
 });

@@ -20,7 +20,8 @@ import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js
 import { EXIT_CODES, INTERRUPTED_EXIT_CODE, SUCCESS_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath, checkpointArtifactRelativePath } from '../../src/core/artifact-layout.js';
 import type { IncompleteReason, RunId, RunSummary } from '../../src/core/contracts.js';
-import { isProcessRunning, type RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
+import { isProcessRunning } from '../../src/core/process-lock.js';
+import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { formatCount } from '../../src/presentation/format.js';
 import { CLI_TEXT, cliCountText, cliFieldText, resumingRunText } from '../../src/presentation/messages.js';
 import {

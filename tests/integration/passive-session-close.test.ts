@@ -1,8 +1,8 @@
 // CC-018: page と Context を閉じる手順（page を閉じてから Context を閉じる。Guard がすでに Context を閉じていれば、
 // Context は閉じ直さない）と、その失敗の一覧を返す部品。例外にするか理由にするかは、呼び出し側が決める。
 import type { Browser, BrowserContext, Page } from 'playwright';
-import { afterAll, afterEach, beforeAll, describe, expect, expectTypeOf, it, vi } from 'vitest';
-import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { BrowserContextFactory, ContextConstructionError } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { navigatePage } from '../../src/orchestration/page-navigation.js';
@@ -16,15 +16,7 @@ import {
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
-import {
-  closeUnguardedUnloadBeaconPage,
-  createGateFactory,
-  NO_NON_READ_REQUESTS,
-  runGuardedUnloadBeaconRounds,
-  UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
-  UNLOAD_BEACON_TARGET_PATH,
-} from '../helpers/gate-harness.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { closedLoopbackOrigin } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -39,7 +31,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  for (const context of browser.contexts()) {
+  for (const context of testContextsOf(browser)) {
     await context.close();
   }
   vi.restoreAllMocks();
@@ -47,12 +39,30 @@ afterEach(async () => {
 
 /** 注入する短い期限（ms）。実際の期限（`CONTEXT_CLOSE_TIMEOUT_MS`）を待たない（R15r-4）。 */
 const SHORT_CLOSE_TIMEOUT_MS = 200;
-/** 期限を過ぎてから戻るまでの余裕（偽の factory の場合）。 */
-const FAKE_CLOSE_MARGIN_MS = 1_000;
 /** 期限のテストの上限。注入した期限を守らない（既定の期限を待つ）場合は、この時間で失敗する。 */
 const SHORT_DEADLINE_TEST_TIMEOUT_MS = 3_000;
-/** タイマーが少し早く発火する場合の許容。 */
-const TIMER_TOLERANCE_MS = 50;
+
+/**
+ * DF-2b（TS-d の残り）: 偽の factory で期限切れを確かめる場面は、壁時計の差ではなく、偽のタイマー（`vi.useFakeTimers`。`Date.now` と
+ * `setTimeout` を進める）で確かめる。注入した期限の 1 ms 前には戻らず、ちょうど期限で戻ることを確かめる（前の壁時計の差の「期限の 50 ms 前より
+ * 後、期限の 1 秒後より前」より狭い）。並行の混雑で揺れない。`run` を始めてから時計を進め、戻った値を返す。
+ */
+async function settleAtInjectedDeadline<T>(run: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  try {
+    let settled = false;
+    const outcome = run().finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(SHORT_CLOSE_TIMEOUT_MS - 1);
+    expect(settled, 'returned before the injected deadline').toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled, 'returned at the injected deadline').toBe(true);
+    return await outcome;
+  } finally {
+    vi.useRealTimers();
+  }
+}
 /** 閉じる処理の呼び出しを記録する、偽の factory。Guard の状態を持たない偽の Context は、Guard が閉じていないと判定される。 */
 function fakeFactory(
   behavior: {
@@ -208,12 +218,8 @@ describe('closePassiveContextBeforeDeadline (DEF-008)', () => {
   it('returns the Context close deadline failure at the injected deadline when closing does not finish', async () => {
     const { factory, events } = fakeFactory({ contextHangs: true });
 
-    const startedAt = performance.now();
-    const failure = await closePassiveContextBeforeDeadline(factory, fakeContext, { timeoutMs: SHORT_CLOSE_TIMEOUT_MS });
-    const elapsedMs = performance.now() - startedAt;
+    const failure = await settleAtInjectedDeadline(() => closePassiveContextBeforeDeadline(factory, fakeContext, { timeoutMs: SHORT_CLOSE_TIMEOUT_MS }));
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
     expect(failure?.step).toBe('context');
     expect(failure?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
     expect((failure?.error as Error).message).toBe(PASSIVE_CONTEXT_CLOSE_DEADLINE_MESSAGE);
@@ -238,7 +244,7 @@ describe('closePassiveContextBeforeDeadline (DEF-008)', () => {
 
       const failure = await closePassiveContextBeforeDeadline(factory, fakeContext, { timeoutMs: SHORT_CLOSE_TIMEOUT_MS });
       rejectLate(new Error('late context close failure'));
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await wait(20);
 
       expect(failure?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
       expect(unhandled).toEqual([]);
@@ -286,13 +292,10 @@ describe('closePassivePageAndContext with deadlines (DEF-008)', () => {
   it('returns the Context close deadline failure when closing the Context does not finish', async () => {
     const { factory, events } = fakeFactory({ contextHangs: true });
 
-    const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, fakeContext, {
+    const failures = await settleAtInjectedDeadline(() => closePassivePageAndContext(factory, fakeContext, {
       contextCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
-    });
-    const elapsedMs = performance.now() - startedAt;
+    }));
 
-    expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
     expect(events).toEqual(['closeContext']);
     expect(failures).toHaveLength(1);
     expect(failures[0]?.step).toBe('context');
@@ -304,14 +307,10 @@ describe('closePassivePageAndContext with deadlines (DEF-008)', () => {
   it('waits only for the Context close deadline, not for a page close that would not finish (DEF-038)', async () => {
     const { factory, events } = fakeFactory({ pageHangs: true, contextHangs: true });
 
-    const startedAt = performance.now();
-    const failures = await closePassivePageAndContext(factory, fakeContext, {
+    const failures = await settleAtInjectedDeadline(() => closePassivePageAndContext(factory, fakeContext, {
       contextCloseTimeoutMs: SHORT_CLOSE_TIMEOUT_MS,
-    });
-    const elapsedMs = performance.now() - startedAt;
+    }));
 
-    expect(elapsedMs).toBeGreaterThanOrEqual(SHORT_CLOSE_TIMEOUT_MS - TIMER_TOLERANCE_MS);
-    expect(elapsedMs).toBeLessThan(SHORT_CLOSE_TIMEOUT_MS + FAKE_CLOSE_MARGIN_MS);
     expect(events).toEqual(['closeContext']);
     expect(failures.map(({ step }) => step)).toEqual(['context']);
     expect(failures[0]?.error).toBeInstanceOf(PassiveContextCloseDeadlineError);
@@ -399,34 +398,6 @@ describe('closePassivePageAndContext with a page that Chromium does not close (D
   }, TEST_TIMEOUT_MS);
 });
 
-// DEF-038（設計書 `2026-10-08-beaksight-def-038-passive-page-close-design.md` 4）: Guard の付いた Passive のページを閉じるときの
-// `pagehide`・`visibilitychange` の送信（`sendBeacon` と keepalive の `fetch` の POST）は、製品の閉じる手順
-// （`closePassivePageAndContext`）では、サーバに届かない。page を個別に閉じると、Playwright は閉じ始めたページの要求で Context の
-// route を呼ばないので、Guard を通らずに届く。Context だけを閉じる（page は Context と一緒に閉じる）と届かない。
-describe('closePassivePageAndContext with a page that sends POST requests while it is being left (DEF-038)', () => {
-  let server: FixtureServer;
-
-  beforeAll(async () => {
-    server = await startFixtureServer();
-  });
-
-  afterAll(async () => {
-    await server?.close();
-  });
-
-  it('delivers no POST to the server and records no violation, in every round and after the settle wait', async () => {
-    const factory = createGateFactory(browser, server.origin);
-
-    const { failedRounds, allRoundsWindow } = await runGuardedUnloadBeaconRounds(factory, server, VIEWPORT);
-
-    expect(failedRounds).toEqual([]);
-    expect(allRoundsWindow.count(null, UNLOAD_BEACON_TARGET_PATH)).toBe(0);
-    expect(allRoundsWindow.nonReadCounters()).toEqual(NO_NON_READ_REQUESTS);
-  }, UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS);
-
-  it('control: without the Guard, closing the same page with page.close() delivers the POST', async () => {
-    const window = await closeUnguardedUnloadBeaconPage(browser, server, VIEWPORT);
-
-    expect(window.count('POST', UNLOAD_BEACON_TARGET_PATH)).toBeGreaterThan(0);
-  });
-});
+// DEF-038（設計書 `2026-10-08-beaksight-def-038-passive-page-close-design.md` 4）: Guard の付いた Passive のページを閉じるときの送信が、製品の
+// 閉じる手順でサーバに届かないことの確かめ（くり返し）は、`safety-gates.test.ts` の GATE-S01（DEF-038）に、Guard のない対照は
+// `gate-fixtures.test.ts` の DEF-038 に、1 か所ずつまとめた（TS-f。同じ補助 `runGuardedUnloadBeaconRounds` で、同じ確かめをしていた）。

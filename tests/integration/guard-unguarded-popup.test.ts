@@ -23,6 +23,7 @@ import {
 import { SafetyLedger, type SafetyLedgerSnapshot } from '../../src/safety/safety-ledger.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 
@@ -57,7 +58,6 @@ const SCENARIO_TIMEOUT_MS = ROUNDS * (ROUND_BUDGET_MS + POPUP_SETTLE_MS + QUIET_
 const VIEWPORT = Object.freeze({ width: 1000, height: 700 });
 /** DEF-113: CDP の付いていない page の要求を止めた、明示の理由（違反のコード）。 */
 const UNGUARDED_PAGE_VIOLATION = 'PASSIVE_GUARD_PAGE_NOT_READY';
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 
 interface ObservedRequest {
   readonly server: 'opener' | 'other';

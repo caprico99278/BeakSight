@@ -12,8 +12,8 @@ import { createStressSessionFactory } from '../../src/orchestration/stress-sessi
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
-import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
+import { NO_PACING_WAIT, NO_SETTLING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const STRESS_DEADLINE_MS = 60_000;
@@ -33,7 +33,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  for (const context of browser.contexts()) {
+  for (const context of testContextsOf(browser)) {
     await context.close();
   }
   await server?.close();
@@ -122,6 +122,7 @@ describe('createStressSessionFactory with a real browser', () => {
     const results = await collectStressLayout(stress.createSession, `${server.origin}/overflow.html`, [320, 480], {
       deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     });
 
     expect(results.map(({ width, status }) => ({ width, status }))).toEqual([
@@ -136,7 +137,7 @@ describe('createStressSessionFactory with a real browser', () => {
       expect(ledger.snapshot().invariantViolationCount).toBe(0);
     }
     // セッションの Context は、すべて閉じられている。
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   });
 
   // P14f（R14r の Important-1、設計書 4.3）: Guard の取り付けの失敗で Guard が Context を閉じた場合も、その Ledger を一覧に含める。
@@ -156,7 +157,7 @@ describe('createStressSessionFactory with a real browser', () => {
     expect(ledgers).toHaveLength(1);
     expect(ledgers[0]).toBe((rejection as ContextConstructionError).ledger);
     expect(ledgers[0]?.snapshot().invariantViolations.map((violation) => violation.code)).toContain('GUARD_INSTALLATION_FAILED');
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   });
 
   it('returns a frozen copy of the Ledger list that does not change with later sessions', async () => {
@@ -218,6 +219,7 @@ describe('createStressSessionFactory with a real browser', () => {
     const results = await collectStressLayout(stress.createSession, pageUrl, [320, 480], {
       deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     });
 
     expect(results.map(({ width, status }) => ({ width, status }))).toEqual([
@@ -230,7 +232,7 @@ describe('createStressSessionFactory with a real browser', () => {
     for (const ledger of stress.ledgers()) {
       expect(ledger.snapshot().invariantViolationCount).toBe(0);
     }
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   });
 });
 
@@ -358,6 +360,7 @@ describe('createStressSessionFactory close and construction failures', () => {
     const rejection = await collectStressLayout(stress.createSession, 'http://127.0.0.1:9/', [320, 480], {
       deadlineAtMs: Date.now() + STRESS_DEADLINE_MS,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     }).then(() => undefined, (error: unknown) => error);
     const elapsedMs = performance.now() - startedAt;
 

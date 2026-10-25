@@ -9,9 +9,8 @@
 //   観察を始められない場合の一部は、偽の CDP の session で確かめる（`main-frame-load.test.ts` の偽の page と同じやり方）。
 import { EventEmitter } from 'node:events';
 import type { IncomingHttpHeaders, ServerResponse } from 'node:http';
-import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from 'playwright';
+import type { Browser, BrowserContext, CDPSession, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import {
   MAX_NAVIGATION_DIAGNOSTICS_DOCUMENT_REQUESTS,
   MAX_NAVIGATION_DIAGNOSTICS_EVENTS,
@@ -33,7 +32,7 @@ import {
   MAX_URL_LENGTH,
   SESSION_OPEN_TIMEOUT_MS,
 } from '../../src/core/limits.js';
-import { launchHeadlessChromium } from '../helpers/chromium.js';
+import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
 import { createGateFactory, withGuardedPassivePage, withUnguardedPage } from '../helpers/gate-harness.js';
 import { LOOPBACK_HOST, startLoopbackHttpServer } from '../helpers/loopback-server.js';
@@ -228,7 +227,8 @@ const CHROMIUM_BUILDS = [
   { name: 'the default test Chromium (headless shell)', launch: (): Promise<Browser> => launchHeadlessChromium() },
   {
     name: 'the Chromium of the CLI (chromiumLaunchOptions, headless)',
-    launch: (): Promise<Browser> => chromium.launch(chromiumLaunchOptions({ headless: true })),
+    // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+    launch: (): Promise<Browser> => launchCliChromium(),
   },
 ] as const;
 

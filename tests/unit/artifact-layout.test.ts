@@ -17,7 +17,8 @@ import {
   CHECKPOINT_ARTIFACT_FILE_NAMES,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
   DIAGNOSTICS_ARTIFACT_DIRECTORY,
-  LEGACY_BUNDLE_FILE_NAME,
+  ENTRY_CHECK_ARTIFACT_FILE_NAME,
+  MAX_BUNDLE_FILE_NAME_LABEL_LENGTH,
   PAGE_ARTIFACT_FILE_NAMES,
   PAGES_ARTIFACT_DIRECTORY,
   PREFLIGHT_TEMPORARY_FILE_PREFIX,
@@ -29,6 +30,8 @@ import {
   actionBundleFileName,
   artifactFilePath,
   bundleFileName,
+  bundleFileNameLabelOf,
+  bundleFileNameTimestampOf,
   checkpointArtifactRelativePath,
   checkpointPageArtifactRelativePath,
   checkpointPageIdOfFileName,
@@ -107,19 +110,10 @@ describe('artifact layout: the file name of the ChatGPT bundle (bundle file name
     expect(() => bundleFileName(null as unknown as string)).toThrow(RangeError);
   });
 
-  it('keeps the earlier name as a constant, to clean it up', () => {
-    expect(LEGACY_BUNDLE_FILE_NAME).toBe('beaksight-audit-bundle.zip');
-  });
-
-  it('recognizes the new names and the earlier name as bundle names', () => {
-    expect(isBundleFileName(bundleFileName('2026-10-08T03:09:30.000Z'))).toBe(true);
-    expect(isBundleFileName('beaksight-audit-bundle_20261006010240.zip')).toBe(true);
-    expect(isBundleFileName('beaksight-audit-bundle_00000000000000.zip')).toBe(true);
-    expect(isBundleFileName(LEGACY_BUNDLE_FILE_NAME)).toBe(true);
-  });
-
   it('does not recognize similar names: another extension, other digits, or extra characters before or after', () => {
     for (const similar of [
+      // LG-4（テストの組の設計書 3.7.3、3.7.5）: 日時のない前の形の名前は、もうバンドルの名前とみなさない（画面は配らず、書き手は片付けない）。
+      'beaksight-audit-bundle.zip',
       'beaksight-audit-bundle_20261008030930.zi',
       'beaksight-audit-bundle_20261008030930.zip.tmp',
       'beaksight-audit-bundle_20261008030930.ZIP',
@@ -146,7 +140,141 @@ describe('artifact layout: the file name of the ChatGPT bundle (bundle file name
 
   it('gives bundle names that are portable path segments', () => {
     expect(isPortableArtifactPathSegment(bundleFileName('2026-10-08T03:09:30.000Z'))).toBe(true);
-    expect(isPortableArtifactPathSegment(LEGACY_BUNDLE_FILE_NAME)).toBe(true);
+  });
+});
+
+// PRE42-BN（2026-10-24 のユーザーの判断）: 画面のジョブのバンドルの名前に、プロファイルの名前を入れる
+// （`beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`）。名前の部分は `bundleFileNameLabelOf` の1か所で作る。名前が空になったら、今の形のまま。
+describe('artifact layout: the profile name in the ChatGPT bundle name (PRE42-BN)', () => {
+  const FINISHED_AT = '2026-10-24T09:30:15.000Z';
+  const DIGITS = '20261024093015';
+
+  it('puts the profile name between the stem and the time, as it is (Japanese included)', () => {
+    expect(bundleFileName(FINISHED_AT, '管理画面')).toBe(`beaksight-audit-bundle_管理画面_${DIGITS}.zip`);
+    expect(bundleFileName(FINISHED_AT, 'example-public')).toBe(`beaksight-audit-bundle_example-public_${DIGITS}.zip`);
+    expect(bundleFileName(FINISHED_AT, 'テスト 環境 (2)')).toBe(`beaksight-audit-bundle_テスト 環境 (2)_${DIGITS}.zip`);
+    expect(bundleFileNameLabelOf('管理画面')).toBe('管理画面');
+    // 名前の部分を渡さない（CLI）と、空の名前は、今の形のまま。
+    expect(bundleFileName(FINISHED_AT)).toBe(`beaksight-audit-bundle_${DIGITS}.zip`);
+    expect(bundleFileName(FINISHED_AT, undefined)).toBe(`beaksight-audit-bundle_${DIGITS}.zip`);
+  });
+
+  it('replaces the characters Windows does not allow, and the control characters, with _', () => {
+    expect(bundleFileNameLabelOf('a<b>c:d"e/f\\g|h?i*j')).toBe('a_b_c_d_e_f_g_h_i_j');
+    expect(bundleFileNameLabelOf('tab\there\nline\u0000nul\u007fdel\u009fc1')).toBe('tab_here_line_nul_del_c1');
+    expect(bundleFileNameLabelOf('line separator paragraph')).toBe('line_separator_paragraph');
+    // 表示の向きを変える文字と、対のないサロゲートは除く（ファイル名の見た目を偽らない。URL に符号化できない）。
+    expect(bundleFileNameLabelOf('abc‮gpj.exe')).toBe('abcgpj.exe');
+    expect(bundleFileNameLabelOf('a\ud800b\udc00c')).toBe('abc');
+    expect(bundleFileNameLabelOf('絵文字😀あり')).toBe('絵文字😀あり');
+  });
+
+  it('removes the spaces before and after, and the dots at the end', () => {
+    expect(bundleFileNameLabelOf('  管理画面  ')).toBe('管理画面');
+    expect(bundleFileNameLabelOf('　管理画面　')).toBe('管理画面');
+    expect(bundleFileNameLabelOf('name...')).toBe('name');
+    expect(bundleFileNameLabelOf('name. . .')).toBe('name');
+    expect(bundleFileNameLabelOf('name.　.')).toBe('name');
+    expect(bundleFileNameLabelOf('.hidden')).toBe('.hidden');
+    expect(bundleFileNameLabelOf('a b')).toBe('a b');
+  });
+
+  it('avoids the Windows reserved device names (case-insensitive, also with an extension)', () => {
+    for (const reserved of ['CON', 'con', 'NUL', 'aux', 'PRN', 'COM1', 'lpt9', 'CONIN$', 'nul.txt', 'CON .txt']) {
+      const label = bundleFileNameLabelOf(reserved);
+      expect(label, reserved).not.toBe(reserved);
+      expect(label, reserved).toBe(`_${reserved}`);
+      expect(isPortableArtifactPathSegment(label), reserved).toBe(true);
+    }
+    expect(bundleFileNameLabelOf('CONSOLE')).toBe('CONSOLE');
+    expect(bundleFileNameLabelOf('COM10')).toBe('COM10');
+  });
+
+  it('limits the length to the named constant, by code points, without splitting a surrogate pair', () => {
+    expect(MAX_BUNDLE_FILE_NAME_LABEL_LENGTH).toBe(64);
+    expect(bundleFileNameLabelOf('a'.repeat(200))).toBe('a'.repeat(MAX_BUNDLE_FILE_NAME_LABEL_LENGTH));
+    expect(bundleFileNameLabelOf('管'.repeat(200))).toBe('管'.repeat(MAX_BUNDLE_FILE_NAME_LABEL_LENGTH));
+    const emoji = bundleFileNameLabelOf('😀'.repeat(200));
+    expect([...emoji]).toHaveLength(MAX_BUNDLE_FILE_NAME_LABEL_LENGTH);
+    expect(emoji.isWellFormed()).toBe(true);
+    // 切った後の末尾の空白と `.` も外す。
+    expect(bundleFileNameLabelOf(`${'a'.repeat(62)} .xyz`)).toBe('a'.repeat(62));
+    // 切った後に予約の名前になるものも避ける（長さは上限を超えない）。
+    const truncatedReserved = bundleFileNameLabelOf(`CON${' '.repeat(70)}x`);
+    expect(truncatedReserved).toBe('_CON');
+    expect([...bundleFileNameLabelOf(`nul.${'x'.repeat(100)}`)].length).toBeLessThanOrEqual(MAX_BUNDLE_FILE_NAME_LABEL_LENGTH);
+    expect(bundleFileNameLabelOf(`nul.${'x'.repeat(100)}`).startsWith('_nul.')).toBe(true);
+  });
+
+  it('omits the name part when the name becomes empty', () => {
+    for (const empty of ['', '   ', '...', ' . . ', '　', '‮', '\ud800']) {
+      expect(bundleFileNameLabelOf(empty), JSON.stringify(empty)).toBe('');
+      expect(bundleFileName(FINISHED_AT, empty), JSON.stringify(empty)).toBe(`beaksight-audit-bundle_${DIGITS}.zip`);
+    }
+  });
+
+  it('keeps _ in the name, and tells the name from the time even then', () => {
+    expect(bundleFileName(FINISHED_AT, 'a_b')).toBe(`beaksight-audit-bundle_a_b_${DIGITS}.zip`);
+    expect(bundleFileNameTimestampOf(bundleFileName(FINISHED_AT, 'a_b'))).toBe(DIGITS);
+    // 名前が 14 桁の数字でも、名前の後に `_` と 14 桁の数字があっても、日時は末尾の 14 桁。
+    expect(bundleFileName(FINISHED_AT, '20200101000000')).toBe(`beaksight-audit-bundle_20200101000000_${DIGITS}.zip`);
+    expect(bundleFileNameTimestampOf(`beaksight-audit-bundle_20200101000000_${DIGITS}.zip`)).toBe(DIGITS);
+    expect(bundleFileNameTimestampOf(`beaksight-audit-bundle_x_20200101000000_${DIGITS}.zip`)).toBe(DIGITS);
+    expect(bundleFileNameTimestampOf(`beaksight-audit-bundle_${DIGITS}.zip`)).toBe(DIGITS);
+    expect(bundleFileNameTimestampOf('beaksight-audit-bundle.zip')).toBeNull();
+    expect(bundleFileNameTimestampOf('report.html')).toBeNull();
+  });
+
+  it('gives a name part that is stable when made again (the recognition relies on it)', () => {
+    for (const name of ['管理画面', ' a<b> ', 'CON', 'nul.txt', `CON${' '.repeat(70)}x`, 'x'.repeat(100), 'a. .', '😀'.repeat(70), 'a_b', '_', '___']) {
+      const label = bundleFileNameLabelOf(name);
+      expect(bundleFileNameLabelOf(label), JSON.stringify(name)).toBe(label);
+    }
+  });
+
+  it('rejects a profile name that is not a string', () => {
+    expect(() => bundleFileNameLabelOf(1 as unknown as string)).toThrow(RangeError);
+    expect(() => bundleFileName(FINISHED_AT, null as unknown as string)).toThrow(RangeError);
+  });
+
+  it('gives bundle names with a profile name that are portable path segments', () => {
+    for (const name of ['管理画面', 'a<b>:c', 'CON', 'nul.txt', 'name...', 'x'.repeat(200), 'テスト 環境']) {
+      expect(isPortableArtifactPathSegment(bundleFileName(FINISHED_AT, name)), name).toBe(true);
+    }
+  });
+
+  it('recognizes both forms: with the name and without the name', () => {
+    for (const name of ['管理画面', 'example-public', 'a_b', '20200101000000', '_CON', 'x'.repeat(64), '😀'.repeat(64)]) {
+      expect(isBundleFileName(bundleFileName(FINISHED_AT, name)), name).toBe(true);
+    }
+    expect(isBundleFileName(bundleFileName(FINISHED_AT))).toBe(true);
+    expect(isBundleFileName(`beaksight-audit-bundle_${DIGITS}.zip`)).toBe(true);
+    expect(isBundleFileName('beaksight-audit-bundle_00000000000000.zip')).toBe(true);
+  });
+
+  it('does not recognize similar names with a name part (those are not removed)', () => {
+    for (const similar of [
+      `beaksight-audit-bundle_管理画面_${DIGITS}.zip.tmp`,
+      `beaksight-audit-bundle_管理画面_${DIGITS}.ZIP`,
+      `beaksight-audit-bundle_管理画面_${DIGITS}.zi`,
+      `beaksight-audit-bundle_管理画面_2026102409301.zip`,
+      `beaksight-audit-bundle_管理画面_202610240930150.zip`,
+      `beaksight-audit-bundle_管理画面-${DIGITS}.zip`,
+      `beaksight-audit-bundle_管理画面${DIGITS}.zip`,
+      `beaksight-audit-bundle__${DIGITS}.zip`,
+      `beaksight-audit-bundle_ 管理画面_${DIGITS}.zip`,
+      `beaksight-audit-bundle_管理画面 _${DIGITS}.zip`,
+      `beaksight-audit-bundle_管理画面._${DIGITS}.zip`,
+      `beaksight-audit-bundle_CON_${DIGITS}.zip`,
+      `beaksight-audit-bundle_${'x'.repeat(65)}_${DIGITS}.zip`,
+      `beaksight-audit-bundle_管理画面_${DIGITS}_1.zip`,
+      `copy of beaksight-audit-bundle_管理画面_${DIGITS}.zip`,
+      `Beaksight-audit-bundle_管理画面_${DIGITS}.zip`,
+      `.beaksight-audit-bundle_管理画面_${DIGITS}.zip.0b0e1f40-6a65-4c55-9d0e-3bd1a5c1d6a0.tmp`,
+      `beaksight-action-bundle_管理画面_${DIGITS}.zip`,
+    ]) {
+      expect(isBundleFileName(similar), similar).toBe(false);
+    }
   });
 });
 
@@ -192,7 +320,7 @@ describe('artifact layout: the write report files and the write bundle name (Tas
       'Beaksight-action-bundle_20261015030930.zip',
       'copy of beaksight-action-bundle_20261015030930.zip',
       'beaksight-audit-bundle_20261015030930.zip',
-      LEGACY_BUNDLE_FILE_NAME,
+      'beaksight-audit-bundle.zip',
       'action-report.html',
       '',
     ]) {
@@ -687,7 +815,6 @@ describe('artifact layout: names that mean something else on Windows (DEF-056)',
       bundleFileName('2026-10-08T03:09:30.000Z'),
       bundleFileName('9999-12-31T23:59:59.999Z'),
       bundleFileName(new Date().toISOString()),
-      LEGACY_BUNDLE_FILE_NAME,
       `${PREFLIGHT_TEMPORARY_FILE_PREFIX}${randomUUID()}${PREFLIGHT_TEMPORARY_FILE_SUFFIX}`,
     ];
     const checkpointFiles = Object.keys(CHECKPOINT_ARTIFACT_FILE_NAMES) as (keyof typeof CHECKPOINT_ARTIFACT_FILE_NAMES)[];
@@ -714,5 +841,14 @@ describe('artifact layout: names that mean something else on Windows (DEF-056)',
         expect(isPortableArtifactPathSegment(segment), `${segment} in ${path}`).toBe(true);
       }
     }
+  });
+});
+
+// T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブの成果物の名前（Run のディレクトリの直下。監査のバンドルの名前と見分ける）。
+describe('artifact layout: the entry check file (Task 43 design 4.3)', () => {
+  it('names the entry check file', () => {
+    expect(ENTRY_CHECK_ARTIFACT_FILE_NAME).toBe('entry-check.json');
+    expect(isPortableArtifactPathSegment(ENTRY_CHECK_ARTIFACT_FILE_NAME)).toBe(true);
+    expect(isBundleFileName(ENTRY_CHECK_ARTIFACT_FILE_NAME)).toBe(false);
   });
 });

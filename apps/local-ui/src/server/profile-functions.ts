@@ -10,9 +10,11 @@ import { readdirSync, type Dirent } from 'node:fs';
 import { join, posix } from 'node:path';
 import { createServerFn } from '@tanstack/react-start';
 import type { ConfigErrorKind } from '../../../../src/config/config-error.js';
+import type { TargetConfigCreationFailure, TargetSiteInput, TargetSiteProblem } from '../../../../src/config/target-config-draft.js';
 import type { AuditMode, AuthStrategy, EnvironmentKind, ProfileValidationErrorCode, SiteProfile } from '../../../../src/control/contracts.js';
 import { checkControlEnvironment } from '../../../../src/control/environment/control-environment.js';
 import { isAcceptedTargetConfigPath, type ProfileValidationContext } from '../../../../src/control/profile-policy.js';
+import { TARGET_CONFIG_DIRECTORIES, TARGET_CONFIG_EXTENSION } from '../../../../src/control/target-config-locations.js';
 import {
   createProfile,
   getProfile,
@@ -24,6 +26,7 @@ import {
   type StoredProfile,
 } from '../../../../src/control/store/profile-store.js';
 import type { ProfileStatus } from '../../../../src/control/store/profile-records.js';
+import { getAuthSetup, type AuthSetupFreshness } from '../../../../src/control/store/auth-setup-store.js';
 import { getStoreStatus } from '../../../../src/control/store/store-status.js';
 import { localUiRepositoryRoot, localUiStore, relativeDatabaseLocation } from './control-store';
 import { localUiCredentialServiceDependencies } from './credential-functions';
@@ -31,10 +34,12 @@ import { localUiCredentialEnvironment, type CredentialEnvironmentState } from '.
 import { credentialRemainsOf, removeCredentialOfRetiredProfile, type RetiredCredentialCleanup } from './credential-service';
 import { requestOf } from './request-validation';
 import { loadTargetContext } from './target-config';
+import { createProfileWithGeneratedTarget } from './target-config-writer';
 import { isoTimestampOf } from './timestamps';
+import { loginSetupViewOf, type LoginSetupView } from './login-setup-view';
 
-/** 設定のファイルの候補を探すフォルダ（リポジトリの root から。`isAcceptedTargetConfigPath` が受けるもの）。 */
-const TARGET_CONFIG_DIRECTORIES = Object.freeze(['config/targets', 'local/targets'] as const);
+// 設定のファイルの候補を探すフォルダは、`isAcceptedTargetConfigPath` が受けるもの（`target-config-locations.ts` の `TARGET_CONFIG_DIRECTORIES`。
+// T43b fix round 1 で写しをやめた）。
 
 // ---------------------------------------------------------------------------------------------------------------
 // 画面に返す値
@@ -62,6 +67,22 @@ export interface ProfileDetailView {
 /** プロファイルの詳細の画面の値（T26g-3: 資格情報のファイルが残っているか。値は持たない）。 */
 export interface ProfileDetailPageView extends ProfileDetailView {
   readonly credentialRemains: boolean;
+  /** ML-b（手動のログインの設計書 2.3）: 手動のログインの成功から自動で登録した設定（スクリプトで送るログインの設定があるときだけ。値を持たない）。 */
+  readonly loginSetup: LoginSetupView | null;
+  /**
+   * T44d（Task 44 の設計書 P2-2）: 保存してある認証の設定の、読む範囲と読まないパスと新しさ（認証の設定の画面への入り口の近くの要約。保存して
+   * いなければ null）。パスは秘密ではない（開始の画面も読む範囲を出す）。
+   */
+  readonly authSetupScope: ProfileAuthSetupScopeView | null;
+}
+
+/** プロファイルの画面の、認証の設定の要約（T44d）。 */
+export interface ProfileAuthSetupScopeView {
+  /** 読む範囲のパスの前方一致（空なら制限なし）。 */
+  readonly auditPathPrefixes: readonly string[];
+  /** 読まないパスの前方一致。 */
+  readonly excludedPaths: readonly string[];
+  readonly freshness: AuthSetupFreshness;
 }
 
 /** 変更の結果。拒否のときは、理由、検証の誤りのコード、設定のファイルの誤りの種類（あれば）。 */
@@ -78,6 +99,19 @@ export type ProfileChangeView =
     readonly errorCodes: readonly ProfileValidationErrorCode[];
     readonly configError: ConfigErrorKind | null;
   };
+
+/**
+ * T43b（Task 43 の設計書 4.2）: 開始の URL から対象の設定のファイルを作れなかったときの結果（プロファイルも作らない）。欄の誤りは
+ * `siteProblems`（開始の URL と許可 Origin の欄に出す）。
+ */
+export interface TargetConfigRejectionView {
+  readonly ok: false;
+  readonly reason: TargetConfigCreationFailure;
+  readonly siteProblems: readonly TargetSiteProblem[];
+}
+
+/** 作成の結果（すでにある設定のファイルを使うときは `ProfileChangeView` だけ）。 */
+export type ProfileCreateView = ProfileChangeView | TargetConfigRejectionView;
 
 /** 設定のファイルの確かめの結果。 */
 export type TargetConfigCheckView =
@@ -134,6 +168,8 @@ interface ProfileKeyRequest {
 }
 interface ProfileCreateRequest {
   readonly profile: Readonly<Record<string, unknown>>;
+  /** T43b: あれば、`local/targets/<profileId>.json` を作り、プロファイルはそれを指す（`profile.targetConfigPath` は使わない）。 */
+  readonly newTargetSite?: TargetSiteInput;
 }
 interface ProfileUpdateRequest {
   readonly profile: Readonly<Record<string, unknown>>;
@@ -165,13 +201,21 @@ const listJsonFiles = (directory: string): readonly string[] => {
     return [];
   }
   return entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(TARGET_CONFIG_EXTENSION))
     .map((entry) => posix.relative(root, `${entry.parentPath.replaceAll('\\', '/')}/${entry.name}`));
 };
 
 // ---------------------------------------------------------------------------------------------------------------
 // Server Functions
 // ---------------------------------------------------------------------------------------------------------------
+
+/** T44d: 保存してある認証の設定の、読む範囲と読まないパスと新しさ（なければ null）。 */
+const authSetupScopeOf = (profileId: string): ProfileAuthSetupScopeView | null => {
+  const stored = getAuthSetup(localUiStore(), profileId);
+  return stored === null
+    ? null
+    : { auditPathPrefixes: [...stored.setup.auditPathPrefixes], excludedPaths: [...stored.setup.excludedPaths], freshness: stored.freshness };
+};
 
 /** プロファイルの一覧（取り消したものを含む）。 */
 export const listProfilesFn = createServerFn({ method: 'GET' }).handler((): readonly ProfileRowView[] =>
@@ -189,13 +233,39 @@ export const getProfileFn = createServerFn({ method: 'GET' })
       return null;
     }
     const credentialRemains = await credentialRemainsOf(localUiCredentialServiceDependencies(), data.profileId);
-    return { ...detailOf(stored), credentialRemains };
+    return { ...detailOf(stored), credentialRemains, loginSetup: loginSetupViewOf(data.profileId), authSetupScope: authSetupScopeOf(data.profileId) };
   });
 
-/** プロファイルを作る。 */
+/**
+ * T43b（Task 43 の設計書 4.2）: 開始の URL から、対象の設定のファイル `local/targets/<profileId>.json` を作ってから、それを指すプロファイルを作る。
+ * 流れ（確かめ → 書く → 読み直して保存 → 失敗なら書いたファイルを消す）は `target-config-writer.ts` の `createProfileWithGeneratedTarget`。
+ * ここは、本番の部品（管理データ、リポジトリの root、`loadTargetContext`）を渡し、結果を画面の値にするだけ。
+ */
+const createProfileWithNewTarget = async (input: Readonly<Record<string, unknown>>, site: TargetSiteInput): Promise<ProfileCreateView> => {
+  const database = localUiStore();
+  const outcome = await createProfileWithGeneratedTarget(input, site, {
+    root: localUiRepositoryRoot(),
+    profileExists: (profileId) => getProfile(database, profileId) !== null,
+    loadContext: loadTargetContext,
+    saveProfile: (profile, resolveContext) => createProfile(database, profile, { resolveContext }),
+  });
+  switch (outcome.kind) {
+    case 'TARGET_REJECTED':
+      return { ok: false, reason: outcome.reason, siteProblems: outcome.siteProblems };
+    case 'PROFILE_REJECTED':
+      return { ok: false, reason: outcome.reason, errorCodes: outcome.errorCodes, configError: null };
+    default:
+      return changeViewOf(outcome.result, outcome.configError);
+  }
+};
+
+/** プロファイルを作る（T43b: `newTargetSite` があれば、対象の設定のファイルを作ってから）。 */
 export const createProfileFn = createServerFn({ method: 'POST' })
   .validator(requestOf<ProfileCreateRequest>('ui-profile-create'))
-  .handler(async ({ data }): Promise<ProfileChangeView> => {
+  .handler(async ({ data }): Promise<ProfileCreateView> => {
+    if (data.newTargetSite !== undefined) {
+      return createProfileWithNewTarget(data.profile, data.newTargetSite);
+    }
     const targetConfigPath = data.profile['targetConfigPath'];
     const { context, configError } = await loadTargetContext(targetConfigPath);
     const result = createProfile(localUiStore(), data.profile, { resolveContext: resolverFor(targetConfigPath, context) });

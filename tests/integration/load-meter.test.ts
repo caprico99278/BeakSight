@@ -17,7 +17,7 @@ import { normalizeUrl } from '../../src/crawl/normalize-url.js';
 import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig, type TestConfigOverrides } from '../helpers/test-config.js';
@@ -40,7 +40,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -99,7 +99,7 @@ async function auditWithMeter(
     throw new Error(`fixture URL must normalize: ${pathname}`);
   }
   const outcome = await auditor.audit(normalized.url, allocator.allocatePageId());
-  expect(browser.contexts(), 'Contexts left in the browser after audit()').toHaveLength(0);
+  expect(testContextsOf(browser), 'Contexts left in the browser after audit()').toHaveLength(0);
   return { outcome, meter, pacer };
 }
 

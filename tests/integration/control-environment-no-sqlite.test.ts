@@ -5,13 +5,14 @@
 // - `openControlDatabase()` が、同じ理由の `ControlStoreError` で止まり、フォルダもファイルも作らない（環境の確かめが最初の手順）。
 // - 管理データの部品を import しただけでは落ちない（`node:sqlite` を静的に import していない）。
 // 子 process は TypeScript のソースを直接読む（Node の型の除去）。`.js` の指定子は、同じ名前の `.ts` に読み替える
-// （`module.registerHooks` の resolve。子 process の中だけで使う）。
+// （`module.registerHooks` の resolve。子 process の中だけで使う。本文は `tests/helpers/typescript-source-hook.ts`）。
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
+import { TYPESCRIPT_SOURCE_RESOLVE_HOOK } from '../helpers/typescript-source-hook.js';
 
 /** 子 process の終わりを待つ上限（ミリ秒）。超えたら止める。 */
 const CHILD_TIMEOUT_MS = 20_000;
@@ -21,19 +22,7 @@ const DATABASE_MODULE_URL = new URL('../../src/control/store/control-database.ts
 
 /** 子 process で動かす本文。結果を 1 行の JSON で標準出力に書く。 */
 const CHILD_SCRIPT = `
-import { registerHooks } from 'node:module';
-registerHooks({
-  resolve(specifier, context, next) {
-    try {
-      return next(specifier, context);
-    } catch (error) {
-      if (/^\\.{1,2}\\//u.test(specifier) && specifier.endsWith('.js')) {
-        return next(specifier.slice(0, -'.js'.length) + '.ts', context);
-      }
-      throw error;
-    }
-  },
-});
+${TYPESCRIPT_SOURCE_RESOLVE_HOOK}
 const [environmentUrl, databaseUrl, databasePath] = process.argv.slice(1);
 const { checkControlEnvironment } = await import(environmentUrl);
 const { openControlDatabase } = await import(databaseUrl);

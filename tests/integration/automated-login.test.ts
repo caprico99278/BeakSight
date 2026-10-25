@@ -11,7 +11,9 @@
 import { randomBytes } from 'node:crypto';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { wait } from '../../src/core/deadline.js';
+import { AUTH_SETUP_SCHEMA_VERSION_3, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {
   runAutomatedLoginStage,
   type AutomatedLoginStageDependencies,
@@ -31,6 +33,7 @@ import {
   type AutomatedLoginOutcome,
 } from '../helpers/automated-login-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { nonReadRequestsOf } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 import { createTestCredentialStore, type TestCredentialStore } from '../helpers/test-credential-store.js';
 
@@ -52,12 +55,9 @@ const SHORT_FORM_STEP_TIMEOUT_MS = 1_000;
 const QUIET_PERIOD_MS = 300;
 const TEST_TIMEOUT_MS = 60_000;
 const SECOND_MS = 1_000;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
 /** 2 つの条件に当たる画面の場面の、ロックの条件。 */
 const AMBIGUOUS_LOCKED_CONDITION = Object.freeze({ pathPrefix: '/home/both', selector: '#locked' });
-
-const wait = (ms: number): Promise<void> => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 const marker = (prefix: string): string => `${prefix}${randomBytes(12).toString('hex')}`;
 
 /** 結果の条件ごとの、結果の区別。 */
@@ -133,7 +133,7 @@ describe.each(LAUNCHERS)('T26d-1: the automated login stage (%s)', (_name, launc
   });
 
   const setupFor = (variant: AutomatedLoginFormVariant, outcome: AutomatedLoginOutcome): AuthSetup => ({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: PROFILE_ID,
     profileRevision: 1,
     loginStartUrl: fixture.formUrl(variant, outcome),
@@ -210,8 +210,7 @@ describe.each(LAUNCHERS)('T26d-1: the automated login stage (%s)', (_name, launc
     return { result, thrown, requests: fixture.requests.slice(start), launches };
   }
 
-  const nonReadRequests = (run: StageRun): readonly string[] =>
-    run.requests.filter(({ method }) => !READ_METHODS.has(method)).map(({ method, path }) => `${method} ${path}`);
+  const nonReadRequests = (run: StageRun): readonly string[] => nonReadRequestsOf(run.requests);
 
   /** 目印が、許した POST の本文のほかに出ないこと（要求の URL と本文、返す値、投げた誤り、console）。 */
   const expectNoSecretLeak = (run: StageRun): void => {
@@ -250,6 +249,23 @@ describe.each(LAUNCHERS)('T26d-1: the automated login stage (%s)', (_name, launc
     expectNoSecretLeak(run);
   }, TEST_TIMEOUT_MS);
 
+  // T34c（T34d の申し送り）: 画面が新しく保存する、認証の設定の版 3 のフォームの送信（`FORM_NAVIGATION`）でも、自動ログインの段が今どおり動く。
+  it('logs in with a version 3 form navigation setup as before (only one POST reaches the server)', async () => {
+    const { schemaVersion: _version2, ...fields } = setupFor('standard', 'success');
+    const setup: AuthSetup = {
+      ...fields,
+      schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+      loginTransport: 'FORM_NAVIGATION',
+      scriptLogin: null,
+      loginSideRequests: [],
+      successStorageKey: null,
+    };
+    const run = await runStage({ request: { setup } });
+    expect(run.result.kind).toBe('AUTHENTICATED');
+    expectOneAllowedPost(run, 'success');
+    expectNoSecretLeak(run);
+  }, TEST_TIMEOUT_MS);
+
   it('drops the cookie of another Origin from the state (same filtering as Task 25)', async () => {
     const run = await runStage({ outcome: 'success-idp' });
     expect(run.result.kind).toBe('AUTHENTICATED');
@@ -264,7 +280,11 @@ describe.each(LAUNCHERS)('T26d-1: the automated login stage (%s)', (_name, launc
 
   it.each(DISTINGUISHED)('distinguishes the %s outcome as %s (submitted: YES)', async (outcome, kind) => {
     const run = await runStage({ outcome });
-    expect(run.result).toEqual({ kind, submitted: 'YES', retryAfterUntil: null });
+    // DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 2.1。意図して直した期待）: 状態を読んだ結果（`UNSUPPORTED_AUTH_STATE`）は、
+    // 状態の名前の記録（値を持たない）も持つ。状態を読まない結果は持たない。
+    const { stateNames, ...rest } = run.result as typeof run.result & { readonly stateNames?: unknown };
+    expect(rest).toEqual({ kind, submitted: 'YES', retryAfterUntil: null });
+    expect(stateNames === undefined).toBe(kind !== 'UNSUPPORTED_AUTH_STATE');
     expectOneAllowedPost(run, outcome);
     expectNoSecretLeak(run);
   }, TEST_TIMEOUT_MS);

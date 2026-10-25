@@ -45,6 +45,15 @@
  *    送信の報告を渡す。送るメッセージは READ の確かめと同じ（`RUN_STARTED`、`SESSION_LOST` の `AUTH_STATE`、`FINISHED`。結果は `action-run.json`）に、
  *    `WRITE_RECHECK_REQUEST` と `WRITE_SUBMISSION`（1 回）が加わる。流れが渡されていなければ、設定を読まずに `JOB_KIND_NOT_SUPPORTED` で拒む。
  *    再開しない。T31g-2: 更新の書き込みのジョブ（`WRITE_UPDATE`。UPDATE の指定 `write.update` を持つ）も、同じ流れと同じ送り方。
+ * 11. 入口の確かめのジョブ（`ENTRY_CHECK`。T43c。Task 43 の設計書 4.3）: 認証の指定を持たない `START` だけ（契約で確かめる）。設定を読んだ後、ログインの
+ *    段を通さずに、入口の確かめの流れ（`executeEntryCheck`。`entry-check-run.ts`）を行う。`RUN_STARTED`（新しい Run）と `FINISHED`（Run のディレクトリと
+ *    件数の要約 `entryCheck` だけ）を送る。流れが渡されていなければ、設定を読まずに `JOB_KIND_NOT_SUPPORTED` で拒む。再開しない。`FAILED` の詳細の
+ *    URL の秘密は、認証つきの Run と同じく伏せる。
+ * 12. まとめて実行（`START` の `chain`。FM2d。設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: ログインの段を 1 回だけ行い、段（監査・発見・
+ *    READ の確かめ）を並びの順に行う（`runChain`）。段ごとに `RUN_STARTED` と `FINISHED`（未完了の理由のコード `incompleteReasonCodes` つき）を送り、途中の段の後は
+ *    親の `NEXT_STAGE`（次の段のジョブの ID・種類・READ の定義）か `CHAIN_END` を待つ（上限 `WORKER_NEXT_STAGE_TIMEOUT_MS`）。factory の最新のログインの状態・
+ *    pacer・サービスの Origin への要求の 1 分の窓を、メモリの中だけで次の段へ渡す（`RunStageCarry`。IPC・成果物・ログに出さない）。止める要求・`FAILED`・
+ *    `CHAIN_END`・待つ上限では、次の段を始めずに、終えた段の終了コードで終える。待っていないときの `NEXT_STAGE`・`CHAIN_END` は契約の違反。
  *
  * 止め方（CLI のシグナルの受け方 `createInterruptHandler` を共用し、受けた回数を `STOP`・Ctrl+C・切断で共通に数える）:
  * - `STOP`: 1 回目は止める印（今のページを終えてから止まる。Run の終了コード）。`force` の `STOP` と 2 回目は、終了コード 5 ですぐに終える。
@@ -70,9 +79,9 @@ import { CONFIG_ERROR_EXIT_CODE, EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT
 import { classifyCliFailure, type CliFailureKind } from '../cli/failure.js';
 import { createInterruptHandler, type InterruptHandler } from '../cli/interrupt.js';
 import type { CliOutput } from '../cli/output-stream.js';
-import { HEADLESS_CONFIG_OVERRIDES } from '../config/config-overrides.js';
+import { HEADED_CONFIG_OVERRIDES, HEADLESS_CONFIG_OVERRIDES, withAuditSendPolicyOverride } from '../config/config-overrides.js';
 import type { AuditConfig, AuditConfigOverrides } from '../config/types.js';
-import { DEFAULT_EXCLUDED_URL_WORDS, type AuthSetup } from '../control/auth/auth-setup-contracts.js';
+import type { AuthSetup } from '../control/auth/auth-setup-contracts.js';
 import { sessionLostPathPrefixOf } from '../control/auth/auth-setup-policy.js';
 import { filterAuthenticatedState } from '../control/auth/authenticated-state.js';
 import {
@@ -88,15 +97,19 @@ import {
   MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_AUTOMATED_LOGIN_FAILED_STATE,
   WORKER_DISCOVERY_JOB_KIND,
+  WORKER_ENTRY_CHECK_JOB_KIND,
   WORKER_HEARTBEAT_INTERVAL_MS,
   WORKER_JOB_KIND_NOT_SUPPORTED_REASON,
   WORKER_LOGIN_CHECK_JOB_KIND,
   WORKER_PROTOCOL_VERSION,
   WORKER_READ_CHECK_JOB_KIND,
   WORKER_SESSION_LOST_STATE,
+  WORKER_STOPPED_LOGIN_STAGE_STATE,
   WORKER_WRITE_CREATE_JOB_KIND,
   WORKER_WRITE_UPDATE_JOB_KIND,
   WORKER_START_TIMEOUT_MS,
+  WORKER_NEXT_STAGE_TIMEOUT_MS,
+  WORKER_AUDIT_JOB_KIND,
   targetConfigDigestOf,
   toWorkerFailureDetail,
   validateParentToWorkerMessage,
@@ -105,6 +118,7 @@ import {
   type WorkerAuthState,
   type WorkerAutomatedLoginReport,
   type WorkerDiscoverySummary,
+  type WorkerEntryCheckSummary,
   type WorkerFailureReason,
   type WorkerJobKind,
   type WorkerLoginFormInvalidReason,
@@ -114,23 +128,45 @@ import {
   type WorkerResumeDecisionKind,
   type WorkerRunNotice,
   type WorkerRunOutcome,
+  type WorkerLoginObservation,
+  type WorkerLoginStateNames,
+  type WorkerLoginStageBlockedRequests,
+  type WorkerScriptLoginCounts,
   type WorkerStartAuthentication,
   type WorkerStartAutomatedLogin,
   type WorkerStartMessage,
+  type WorkerStartApiWrite,
+  type WorkerStartReadCheck,
+  type WorkerStartWrite,
   type WorkerToParentMessage,
+  type WorkerChainStageKind,
+  type WorkerChainStageSequence,
+  type WorkerNextStageJobKind,
+  type WorkerNextStageMessage,
 } from '../control/worker-protocol.js';
+import type { IncompleteReasonCode } from '../core/contracts.js';
+import type { DiscoveryEndReason } from '../discovery/discovery-result.js';
+import type { ReadCheckEndReason } from '../discovery/read-check-evaluation.js';
+import { nextStageNavigationPacerOf, type RunStageCarried, type RunStageCarry } from '../orchestration/audit-stage-run.js';
+import { AUDIT_SEND_READ_ONLY } from '../core/audit-send-policy.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../core/default-excluded-url-words.js';
 import type { RunProgressReport } from '../core/contracts.js';
+import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { wait } from '../core/deadline.js';
 import { deepFreeze } from '../core/immutable.js';
+import { truncateWellFormed } from '../core/text.js';
 import { formatCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { assertRunAuthentication, type RunAuthentication } from '../orchestration/authenticated-run.js';
 import type { RunNotice } from '../orchestration/run-coordinator.js';
-import { redactUrlSecretsInText } from '../safety/redact.js';
+import { redactRecordedRequestUrl, redactUrlSecretsInText } from '../safety/redact.js';
+import { auditStageItemOf } from './audit-stage-requests.js';
 import type { LoginStageRequest, LoginStageResult } from './authenticated-login.js';
 import type { AutomatedLoginStageResult } from './automated-login.js';
+import { LOGIN_BROWSER_LAUNCH_REFUSED, type LoginBrowserLaunchRefusal } from './login-stage-checks.js';
 import type { DiscoveryRunObserver, DiscoveryRunOutcome, DiscoveryRunRequest } from './discovery-run.js';
+import type { EntryCheckRunObserver, EntryCheckRunOutcome, EntryCheckRunRequest } from './entry-check-run.js';
 import type { ReadCheckRunObserver, ReadCheckRunOutcome, ReadCheckRunRequest } from './read-check-run.js';
 import type { WriteCreateRunObserver, WriteCreateRunOutcome, WriteCreateRunRequest } from './write-create-run.js';
 import { createWorkerWriteIpc } from './write-ipc.js';
@@ -149,6 +185,8 @@ export const WORKER_IMPLEMENTED_JOB_KINDS = Object.freeze(
     WORKER_WRITE_CREATE_JOB_KIND,
     // T31g-2: 更新の書き込みのジョブ（書き込みの流れ `executeWriteCreate` が、`write.update` を持つ指定で UPDATE を行う）。
     WORKER_WRITE_UPDATE_JOB_KIND,
+    // T43c: 入口の確かめのジョブ（入口の確かめの流れ `executeEntryCheck`。ログインの段を通さない）。
+    WORKER_ENTRY_CHECK_JOB_KIND,
   ] as const satisfies readonly WorkerJobKind[],
 );
 
@@ -165,6 +203,21 @@ const isImplementedJobKind = (jobKind: WorkerJobKind): boolean => (WORKER_IMPLEM
 export const WORKER_CONFIG_OVERRIDES: AuditConfigOverrides = HEADLESS_CONFIG_OVERRIDES;
 
 /**
+ * FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: `START` の `showJobBrowser` が真のときの設定の上書き（ジョブのブラウザを表示する）。
+ * 値は、設定の owner の `HEADED_CONFIG_OVERRIDES`。Guard・Context・中継・上限は変えない（起動の headless だけが変わる）。偽か省略は `WORKER_CONFIG_OVERRIDES`。
+ */
+export const WORKER_SHOWN_BROWSER_CONFIG_OVERRIDES: AuditConfigOverrides = HEADED_CONFIG_OVERRIDES;
+
+/**
+ * `START` から、監査の中核の指定を作る（`--new` に当たる `startNew` と、PRE42-BN のプロファイルの名前 `profileName`）。プロファイルの名前は、ChatGPT 用
+ * バンドルのファイル名だけに使う。項目のない `START` は、指定に項目を入れない（名前の部分のない今の形）。
+ */
+const auditRunOptionsOf = (start: WorkerStartMessage): AuditRunOptions => ({
+  startNew: start.startNew,
+  ...(start.profileName === undefined ? {} : { profileName: start.profileName }),
+});
+
+/**
  * 終える前に、送ったメッセージが送り終わるのを待つ上限（ms）。親が読まなくても、ワーカーが終われないままにしない。
  */
 const WORKER_EXIT_FLUSH_LIMIT_MS = 2_000;
@@ -174,6 +227,8 @@ const WORKER_CONFIG_CHANGED_EXIT_CODE = CONFIG_ERROR_EXIT_CODE;
 
 /** ログインの段で終わった（監査を始めなかった）ときの終了コード（T25d。`LOGIN_TIMEOUT` など。T26d-2 の自動ログインの成功以外も同じ）。 */
 const WORKER_LOGIN_FAILED_EXIT_CODE = FAILURE_EXIT_CODE;
+/** EL-3: ログイン用の Browser の起動を、起動の部品が閉じた理由で断ったときの `FAILED` の理由（今のワーカーの理由から選んだもの）。 */
+export const LOGIN_BROWSER_LAUNCH_REFUSED_FAILURE_REASON = 'UNEXPECTED_FAILURE' satisfies WorkerFailureReason;
 
 /** ログインの検証が成功したときの終了コード（T26d-2。Run を作らずに、成功で終えた）。 */
 const WORKER_LOGIN_CHECK_SUCCEEDED_EXIT_CODE = EXIT_CODES.COMPLETE;
@@ -187,6 +242,8 @@ export interface WorkerAutomatedLoginStageRequest {
   /** 親が検証し、SHA-256 を確かめた認証の設定（`automatedLogin` を持つ）。 */
   readonly setup: AuthSetup;
   readonly approvedTestOrigins: readonly string[];
+  /** T36c: プロファイルの承認したサービスの Origin（スクリプトで送るログインの口に渡す。`START` の項目がなければ空）。 */
+  readonly approvedServiceOrigins: readonly string[];
   /** `START` の自動ログインの指定（資格情報の改訂の番号と、資格情報のフォルダを決める根）。 */
   readonly automatedLogin: WorkerStartAutomatedLogin;
   readonly signal: AbortSignal;
@@ -300,10 +357,17 @@ export interface AuditWorkerDependencies {
    * 書き込みの `START` は、設定を読まずに `FAILED`（`JOB_KIND_NOT_SUPPORTED`）で拒む（fail-closed）。
    */
   readonly executeWriteCreate?: (request: WriteCreateRunRequest, observer: WriteCreateRunObserver) => Promise<WriteCreateRunOutcome>;
+  /**
+   * 入口の確かめのジョブの流れ（`ENTRY_CHECK` の `START` だけ。T43c。本番は入口が `executeEntryCheckRun`（`entry-check-run.ts`）を渡す）。省略すると、
+   * 入口の確かめの `START` は、設定を読まずに `FAILED`（`JOB_KIND_NOT_SUPPORTED`）で拒む（fail-closed）。
+   */
+  readonly executeEntryCheck?: (request: EntryCheckRunRequest, observer: EntryCheckRunObserver) => Promise<EntryCheckRunOutcome>;
   /** `START` を待つ時間（ms。省略すると `WORKER_START_TIMEOUT_MS`）。 */
   readonly startTimeoutMs?: number;
   /** 生きている合図の間隔（ms。省略すると `WORKER_HEARTBEAT_INTERVAL_MS`）。 */
   readonly heartbeatIntervalMs?: number;
+  /** FM2d: まとめて実行の途中の段の後に、親の `NEXT_STAGE`・`CHAIN_END` を待つ時間（ms。省略すると `WORKER_NEXT_STAGE_TIMEOUT_MS`）。 */
+  readonly nextStageTimeoutMs?: number;
 }
 
 /** 動いているワーカー。 */
@@ -344,6 +408,46 @@ const FAILURE_REASON: { readonly [Kind in CliFailureKind]: Kind & WorkerFailureR
   UNEXPECTED_FAILURE: 'UNEXPECTED_FAILURE',
 });
 
+/**
+ * FM2d: 発見の終わり方から、まとめて実行の `FINISHED` に載せる未完了の理由のコードへの対応（成果物の一覧に値が増え、ここにないと型のエラーになる）。止める理由
+ * の判定は親の決まり（`stage-chain-policy.ts`）。
+ */
+const DISCOVERY_END_REASON_CODES: { readonly [Reason in DiscoveryEndReason]: readonly IncompleteReasonCode[] } = Object.freeze({
+  COMPLETED: [],
+  MAX_PAGES_REACHED: ['MAX_PAGES_REACHED'],
+  MAX_RUNTIME_REACHED: ['MAX_RUNTIME_REACHED'],
+  STOPPED: ['RUN_INTERRUPTED'],
+  AUTH_SESSION_LOST: ['AUTH_SESSION_LOST'],
+  SERVICE_REQUEST_LIMIT_REACHED: ['SERVICE_REQUEST_LIMIT_REACHED'],
+  SITE_UNAVAILABLE: ['SITE_UNAVAILABLE'],
+  SAFETY_VIOLATION: ['SAFETY_INVARIANT_VIOLATION'],
+  PREFLIGHT_FAILED: ['PREFLIGHT_FAILED'],
+});
+
+/** FM2d: READ の確かめの終わり方から、未完了の理由のコードへの対応（発見と同じ決まり）。 */
+const READ_CHECK_END_REASON_CODES: { readonly [Reason in ReadCheckEndReason]: readonly IncompleteReasonCode[] } = Object.freeze({
+  COMPLETED: [],
+  MAX_RUNTIME_REACHED: ['MAX_RUNTIME_REACHED'],
+  STOPPED: ['RUN_INTERRUPTED'],
+  AUTH_SESSION_LOST: ['AUTH_SESSION_LOST'],
+  SERVICE_REQUEST_LIMIT_REACHED: ['SERVICE_REQUEST_LIMIT_REACHED'],
+  SITE_UNAVAILABLE: ['SITE_UNAVAILABLE'],
+  SAFETY_VIOLATION: ['SAFETY_INVARIANT_VIOLATION'],
+  PREFLIGHT_FAILED: ['PREFLIGHT_FAILED'],
+});
+
+/**
+ * FM2d: まとめて実行の段の `FINISHED` に載せる、重なりのない理由のコード（連鎖でない・Run を実行しなかった（`codesOf` が `null`）なら載せない）。コードは
+ * 連鎖のときだけ求める（連鎖でないジョブの振る舞いを変えない）。
+ */
+const chainReasonCodesPart = (
+  chained: boolean,
+  codesOf: () => readonly IncompleteReasonCode[] | null,
+): { readonly incompleteReasonCodes?: readonly IncompleteReasonCode[] } => {
+  const codes = chained ? codesOf() : null;
+  return codes === null ? {} : { incompleteReasonCodes: [...new Set(codes)] };
+};
+
 /** 出力先の中の Run のディレクトリの相対パス（区切りは `/`）。出力先の外なら、`..` から始まる値になり、契約の検証で拒まれる。 */
 const relativeRunDirectory = (outputDirectory: string, runDirectory: string): string =>
   relative(outputDirectory, runDirectory).split(sep).join('/');
@@ -354,7 +458,14 @@ const toWorkerResumeDecision = (decision: AuditRunResumeDecision): WorkerResumeD
     : { kind: RESUME_DECISION_KIND[decision.kind], completedPages: null };
 
 /** 知らせの URL を、契約の上限で切る（表示のためだけの値。切った後に対になっていないサロゲートを残さない）。 */
-const noticeUrlOf = (url: string): string => url.slice(0, MAX_WORKER_NOTICE_URL_LENGTH).toWellFormed();
+const noticeUrlOf = (url: string): string => truncateWellFormed(url, MAX_WORKER_NOTICE_URL_LENGTH);
+
+/**
+ * T44g（Task 44 の設計書 P4-1。設計の変更の履歴の「T44g の Blocker」の行）: セッションの切れの URL（`AUTH_STATE` の `sessionLostUrl`。IPC と管理データに残る）。
+ * 記録した要求の URL と同じ規則（`redactRecordedRequestUrl`。query のすべての値・値に見える path の区切り・fragment の値・userinfo を伏せる）を当ててから、
+ * 契約の上限で切る。
+ */
+const reportedSessionLostUrlOf = (url: string): string => noticeUrlOf(redactRecordedRequestUrl(url));
 
 /** `NOTICE` で送る知らせ（セッションの切れは `AUTH_STATE` で送る。T25d）。 */
 type WorkerForwardedNotice = Exclude<RunNotice, { readonly kind: 'AUTH_SESSION_LOST' }>;
@@ -372,6 +483,9 @@ const toWorkerNotice = (notice: WorkerForwardedNotice): WorkerRunNotice => {
       };
     case 'SITE_UNAVAILABLE_SLOWDOWN':
       return { kind: notice.kind, minIntervalMs: notice.minIntervalMs };
+    case 'SERVICE_REQUEST_PACING_WAIT':
+      // DEF-141: 1 分あたりの上限で次の読み込みの前に待つ（監査・発見・READ の確かめ。値は数だけ）。
+      return { kind: notice.kind, waitMs: notice.waitMs, waitCount: notice.waitCount, totalWaitMs: notice.totalWaitMs };
   }
 };
 
@@ -421,7 +535,7 @@ const toWorkerOutcome = (outcome: AuditRunOutcome, outputDirectory: string): Wor
 /**
  * 発見の流れの結果の、`FINISHED` に載せる値（T27d）。Run を実行した結果（`RAN`）だけ、件数の要約（`discovery`）を付ける。候補・URL は載せない。
  */
-const toDiscoveryFinished = (
+export const toDiscoveryFinished = (
   outcome: DiscoveryRunOutcome,
   outputDirectory: string,
 ): { readonly outcome: WorkerRunOutcome; readonly discovery?: WorkerDiscoverySummary } => {
@@ -439,6 +553,10 @@ const toDiscoveryFinished = (
           pagesRead: outcome.summary.pagesRead,
           pagesNotRead: outcome.summary.pagesNotRead,
           candidates: outcome.summary.candidates,
+          // T37a: 監査の段の数（成果物にあるときだけ。成果物と同じ値）。
+          ...(outcome.summary.authentication === undefined ? {} : { authentication: outcome.summary.authentication }),
+          // DEF-144: 違反の中身（成果物にあるときだけ。成果物と同じ値）。
+          ...(outcome.summary.safetyViolation === undefined ? {} : { safetyViolation: outcome.summary.safetyViolation }),
         },
       };
     case 'RUN_DIRECTORY_UNAVAILABLE':
@@ -462,7 +580,7 @@ const toDiscoveryFinished = (
  * READ の確かめの流れの結果の、`FINISHED` に載せる値（T27e）。Run を実行した結果（`RAN`）だけ、件数の要約（`readCheck`）を付ける。結果・URL は
  * 載せない。Run を実行しなかった結果は、発見と同じ形（`toDiscoveryFinished`）。
  */
-const toReadCheckFinished = (
+export const toReadCheckFinished = (
   outcome: ReadCheckRunOutcome,
   outputDirectory: string,
 ): { readonly outcome: WorkerRunOutcome; readonly readCheck?: WorkerReadCheckSummary } => {
@@ -477,7 +595,41 @@ const toReadCheckFinished = (
       runDirectory: relativeRunDirectory(outputDirectory, outcome.runDirectory),
       runStatus: outcome.runStatus,
     },
-    readCheck: { checks: outcome.summary.checks, executed: outcome.summary.executed },
+    readCheck: {
+      checks: outcome.summary.checks,
+      executed: outcome.summary.executed,
+      // T37a: 監査の段の数（成果物にあるときだけ。成果物と同じ値）。
+      ...(outcome.summary.authentication === undefined ? {} : { authentication: outcome.summary.authentication }),
+      // DEF-144: 違反の中身（成果物にあるときだけ。成果物と同じ値）。
+      ...(outcome.summary.safetyViolation === undefined ? {} : { safetyViolation: outcome.summary.safetyViolation }),
+    },
+  };
+};
+
+/**
+ * 入口の確かめの流れの結果の、`FINISHED` に載せる値（T43c）。Run を実行した結果（`RAN`）だけ、件数の要約（`entryCheck`）を付ける。読んだ事実・案・
+ * URL は載せない。Run を実行しなかった結果は、発見と同じ形（`toDiscoveryFinished`）。
+ */
+const toEntryCheckFinished = (
+  outcome: EntryCheckRunOutcome,
+  outputDirectory: string,
+): { readonly outcome: WorkerRunOutcome; readonly entryCheck?: WorkerEntryCheckSummary } => {
+  if (outcome.kind !== 'RAN') {
+    return { outcome: toDiscoveryFinished(outcome, outputDirectory).outcome };
+  }
+  return {
+    outcome: {
+      kind: OUTCOME_KIND.RAN,
+      exitCode: outcome.exitCode,
+      runId: outcome.runId,
+      runDirectory: relativeRunDirectory(outputDirectory, outcome.runDirectory),
+      runStatus: outcome.runStatus,
+    },
+    entryCheck: {
+      endReason: outcome.summary.endReason,
+      loginPage: outcome.summary.loginPage,
+      proposedSelectors: outcome.summary.proposedSelectors,
+    },
   };
 };
 
@@ -517,6 +669,7 @@ const failureDetailOf = (error: unknown): string => toWorkerFailureDetail(safeEr
 const runAuthenticationOf = (
   authentication: WorkerStartAuthentication,
   state: Extract<LoginStageResult, { readonly kind: 'AUTHENTICATED' }>['state'],
+  maxPages: number,
 ): RunAuthentication => ({
   initialState: state,
   approvedTestOrigins: authentication.approvedTestOrigins,
@@ -527,6 +680,9 @@ const runAuthenticationOf = (
   },
   sessionLostPathPrefix: sessionLostPathPrefixOf(authentication.setup),
   filterState: filterAuthenticatedState,
+  // T35a（Task 35 の設計書 3.2）: スクリプトで送るログインの監査の段の口（スクリプトで送るログインの設定だけ）。T44f: 要求の上限の既定は、設定のページの上限に
+  // 比べた値。
+  ...auditStageItemOf(authentication, maxPages),
 });
 
 /** ワーカーを始める（`READY` を送り、`START` を待つ）。 */
@@ -538,16 +694,25 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
   let parentDistrusted = false;
   /** `FAILED` を送った。以後、`FAILED` と `FINISHED` を送らない。 */
   let failureReported = false;
+  /** ML-a: 親から「ログインを終えた」（`LOGIN_CONFIRMED`）を受けた（手動のログインの段が成功として進む）。 */
+  let manualLoginConfirmed = false;
   /** 認証つきの `START` を受けた（T25f round 1。`FAILED` の詳細の URL の秘密を伏せる）。 */
   let authenticatedRun = false;
   /** 契約の違反で、止める印を付けた。 */
   let stoppedByViolation = false;
   /** 送ったメッセージの送り終わり（終える前に待つ）。 */
   let pendingSends: Promise<unknown> = Promise.resolve();
+  /**
+   * FM2d: まとめて実行の次の段の指定（`NEXT_STAGE`・`CHAIN_END`）を待つ受け手（途中の段の `FINISHED` を送った後だけ。ほかは `null`）。`expected` は次の段の種類。
+   */
+  let nextStageWaiter: { readonly expected: WorkerNextStageJobKind; readonly settle: (message: WorkerNextStageMessage | null) => void } | null = null;
   let resolveExited: (code: number) => void = () => undefined;
   const exited = new Promise<number>((resolvePromise) => {
     resolveExited = resolvePromise;
   });
+
+  /** 終わり始めたか（FM2d: 待った後に読み直す。型の絞り込みを残さない）。 */
+  const isExiting = (): boolean => stage === 'EXITING';
 
   /** 送る。終わり始めた後（`exit` を待つ間）は、何も送らない（強制の止め方の後に、`FINISHED` を送らない）。 */
   const transmit = (message: WorkerToParentMessage): void => {
@@ -595,6 +760,16 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
     transmit({ protocol: WORKER_PROTOCOL_VERSION, type: 'FAILED', reason, detail: toWorkerFailureDetail(shown) });
   };
 
+  /**
+   * EL-3（設計者の判断 2026-10-24）: ログインの段（手動と自動）のログイン用の Browser の起動を、起動の部品が閉じた理由（外部のアプリを開かせない設定が
+   * 効かない）で断った。管理データの版と IPC の閉じた一覧は変えず、`FAILED` の今の理由 `UNEXPECTED_FAILURE`（Browser を起動できなかった、に当たる
+   * ワーカーの理由）で終える。理由のコードは、詳細の文（利用者に見せない英語の短い詳細）に書く。`AUTH_STATE` は送らない（ログインの画面を開いていない）。
+   */
+  const reportLoginBrowserLaunchRefused = (refusal: LoginBrowserLaunchRefusal): void => {
+    reportFailure(LOGIN_BROWSER_LAUNCH_REFUSED_FAILURE_REASON, `the login browser was not launched (${refusal})`);
+    exitWith(WORKER_LOGIN_FAILED_EXIT_CODE);
+  };
+
   const interruptHandler = createInterruptHandler({ controller, stderr: dependencies.stderr, exit: exitWith });
 
   /** 止める要求（`STOP`・Ctrl+C・切断）。`START` の前なら、Run を始めずに終了コード 5 で終える。 */
@@ -603,6 +778,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       exitWith(INTERRUPTED_EXIT_CODE);
       return;
     }
+    // FM2d: 次の段の指定を待っている間の止める要求は、次の段を始めずに終える（連鎖の全体を止める）。
+    nextStageWaiter?.settle(null);
     interruptHandler();
   };
 
@@ -636,6 +813,14 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
    */
   const writeIpc = createWorkerWriteIpc({ send: sendChecked });
 
+  /**
+   * DEF-143（設計書 `2026-10-20-beaksight-worker-heartbeat-heavy-steps-design.md` 4 章の判断）: 流れが「Run の終わり」の段（集計・成果物の書き出し・
+   * 止めたときの片付け）に入る知らせを、親へ `RUN_FINALIZING` で送る（監査・発見・READ の確かめの流れが同じ口を使う）。
+   */
+  const sendRunFinalizing = (): void => {
+    sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'RUN_FINALIZING' });
+  };
+
   const observerFor = (outputDirectory: string): AuditRunObserver => ({
     onRunStarted: ({ runId, runDirectory, resumeDecision }) => {
       sendChecked({
@@ -652,18 +837,29 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
     onNotice: (notice) => {
       // T25d: セッションの切れは、止まったページの URL つきの `AUTH_STATE`（`SESSION_LOST`）で送る（ほかの知らせは `NOTICE`）。
       if (notice.kind === 'AUTH_SESSION_LOST') {
-        sendAuthState(WORKER_SESSION_LOST_STATE, noticeUrlOf(notice.url));
+        // DEF-138: セッションの切れの証拠も載せる（組み立てられたときだけ）。
+        sendSessionLost(notice.url, notice.sessionLoss);
         return;
       }
       sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: toWorkerNotice(notice) });
     },
+    // DEF-143: 「Run の終わり」の段に入る知らせ（親は、その段の間だけ途絶えの上限を延ばす）。
+    onFinalizing: sendRunFinalizing,
   });
 
-  /** 認証の状態の知らせ（値と秘密を含まない。T25d）。自動ログインの段の結果（T26d-2）は `automatedLogin` で送る。 */
+  /**
+   * 認証の状態の知らせ（値と秘密を含まない。T25d）。自動ログインの段の結果（T26d-2）は `automatedLogin` で、スクリプトで送るログインの段の結果の数
+   * （T34c）は `scriptLogin` で、ログインの段で止めた読み取りでない要求の一覧（T34e）は `blockedRequests` で送る。
+   */
   const sendAuthState = (
     state: WorkerAuthState,
     sessionLostUrl: string | null = null,
     automatedLogin: WorkerAutomatedLoginReport | null = null,
+    scriptLogin: WorkerScriptLoginCounts | undefined = undefined,
+    blockedRequests: WorkerLoginStageBlockedRequests | undefined = undefined,
+    loginObservation: WorkerLoginObservation | undefined = undefined,
+    passedRequests: WorkerLoginStageBlockedRequests | undefined = undefined,
+    loginStateNames: WorkerLoginStateNames | undefined = undefined,
   ): void => {
     sendChecked({
       protocol: WORKER_PROTOCOL_VERSION,
@@ -671,6 +867,28 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       state,
       sessionLostUrl,
       ...(automatedLogin === null ? {} : { automatedLogin }),
+      ...(scriptLogin === undefined ? {} : { scriptLogin }),
+      ...(blockedRequests === undefined ? {} : { blockedRequests }),
+      // T43d: ログインの段で観察したこと（成功の鍵の名前の案と、成功の画面のセレクタの案）。
+      ...(loginObservation === undefined ? {} : { loginObservation }),
+      // ML-a: 手動のログインの段で通した読み取りでない要求の一覧（形だけ）。
+      ...(passedRequests === undefined ? {} : { passedRequests }),
+      // DEF-139: ログインの後のブラウザの状態の名前の記録（値を持たない。状態を読んだときだけ）。
+      ...(loginStateNames === undefined ? {} : { loginStateNames }),
+    });
+  };
+
+  /**
+   * DEF-138: セッションの切れの知らせ（止まったページの URL と、組み立てられたときはセッションの切れの証拠。値を持たない）。監査・発見・READ の確かめの
+   * 流れが共通に使う。
+   */
+  const sendSessionLost = (url: string, sessionLoss: SessionLossEvidence | null | undefined): void => {
+    sendChecked({
+      protocol: WORKER_PROTOCOL_VERSION,
+      type: 'AUTH_STATE',
+      state: WORKER_SESSION_LOST_STATE,
+      sessionLostUrl: reportedSessionLostUrlOf(url),
+      ...(sessionLoss === null || sessionLoss === undefined ? {} : { sessionLoss }),
     });
   };
 
@@ -691,47 +909,64 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         config,
         setup: authentication.setup,
         approvedTestOrigins: authentication.approvedTestOrigins,
+        approvedServiceOrigins: authentication.approvedServiceOrigins ?? [],
         automatedLogin,
         signal: controller.signal,
         navigationPacer,
       });
+    // T36c: スクリプトで送るログインの自動ログインの段の数と止めた一覧（あるときだけ。自動ログインの結果と一緒に送る）。
+    // T43d: ログインの段で観察したこと（あるときだけ）も一緒に送る。
+    // DEF-139: 状態の名前の記録（状態を読んだときだけ）も一緒に送る。
+    const { scriptLogin, blockedRequests, loginObservation, stateNames } = result;
     switch (result.kind) {
       case 'AUTHENTICATED':
-        sendAuthState('AUTHENTICATED', null, SUCCEEDED_REPORT);
+        sendAuthState('AUTHENTICATED', null, SUCCEEDED_REPORT, scriptLogin, blockedRequests, loginObservation, undefined, stateNames);
         if (jobKind === WORKER_LOGIN_CHECK_JOB_KIND) {
           // ログインの検証: 状態は捨てる（監査に渡さない。保存しない）。Run を作らずに終える。
           exitWith(WORKER_LOGIN_CHECK_SUCCEEDED_EXIT_CODE);
           return null;
         }
-        return runAuthenticationOf(authentication, result.state);
+        return runAuthenticationOf(authentication, result.state, config.crawl.maxPages);
       case 'STOPPED':
         sendAuthState(
           WORKER_AUTOMATED_LOGIN_FAILED_STATE,
           null,
           failureReportOf(AUTOMATED_LOGIN_UNKNOWN_RESULT, result.submitted, result.responseAfterSubmission),
+          scriptLogin,
+          blockedRequests,
+          loginObservation,
         );
         exitWith(INTERRUPTED_EXIT_CODE);
         return null;
       case 'UNSUPPORTED_AUTH_STATE':
         if (result.submitted === AUTOMATED_LOGIN_SUBMISSION_SENT) {
           // ログインは成功した（成功の条件に当たった）が、許可 Origin の状態がなかった。
-          sendAuthState('UNSUPPORTED_AUTH_STATE', null, SUCCEEDED_REPORT);
+          sendAuthState('UNSUPPORTED_AUTH_STATE', null, SUCCEEDED_REPORT, scriptLogin, blockedRequests, loginObservation, undefined, stateNames);
           reportFailure('UNSUPPORTED_AUTH_STATE', 'the automated login ended without an authenticated state (UNSUPPORTED_AUTH_STATE)');
         } else {
           sendAuthState(
             WORKER_AUTOMATED_LOGIN_FAILED_STATE,
             null,
             failureReportOf(AUTOMATED_LOGIN_UNKNOWN_RESULT, result.submitted, result.responseAfterSubmission),
+            scriptLogin,
+            blockedRequests,
+            loginObservation,
+            undefined,
+            stateNames,
           );
           reportFailure(AUTOMATED_LOGIN_UNKNOWN_RESULT, `the automated login ended with ${AUTOMATED_LOGIN_UNKNOWN_RESULT}`);
         }
         exitWith(WORKER_LOGIN_FAILED_EXIT_CODE);
         return null;
+      case LOGIN_BROWSER_LAUNCH_REFUSED:
+        // EL-3: ログイン用の Browser の起動を、起動の部品が閉じた理由で断った（ログインの画面を開いていない。送信していない）。
+        reportLoginBrowserLaunchRefused(result.refusal);
+        return null;
       case 'LOGIN_FORM_INVALID':
         sendAuthState(WORKER_AUTOMATED_LOGIN_FAILED_STATE, null, {
           ...failureReportOf(result.kind, result.submitted),
           formInvalidReason: FORM_INVALID_REASON[result.formInvalidReason],
-        });
+        }, scriptLogin, blockedRequests, loginObservation);
         reportFailure(result.kind, `the automated login ended with ${result.kind}`);
         exitWith(WORKER_LOGIN_FAILED_EXIT_CODE);
         return null;
@@ -739,7 +974,7 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         sendAuthState(WORKER_AUTOMATED_LOGIN_FAILED_STATE, null, {
           ...failureReportOf(result.kind, result.submitted, result.responseAfterSubmission),
           retryAfterUntil: result.retryAfterUntil === null ? null : formatCompactUtcTimestamp(result.retryAfterUntil, 'retry after deadline'),
-        });
+        }, scriptLogin, blockedRequests, loginObservation, undefined, stateNames);
         reportFailure(result.kind, `the automated login ended with ${result.kind}`);
         exitWith(WORKER_LOGIN_FAILED_EXIT_CODE);
         return null;
@@ -763,7 +998,9 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
   ): Promise<RunAuthentication | null> => {
     const { setup, approvedTestOrigins, authenticationSha256 } = authentication;
     const automatedLogin = authentication.automatedLogin ?? null;
-    if (workerAuthenticationDigestOf(setup, approvedTestOrigins, { jobKind, automatedLogin }) !== authenticationSha256) {
+    // T34c: プロファイルの承認したサービスの Origin も、あるときだけ SHA-256 に入れて求め直す（親と同じ求め方）。
+    const approvedServiceOrigins = authentication.approvedServiceOrigins ?? [];
+    if (workerAuthenticationDigestOf(setup, approvedTestOrigins, { jobKind, automatedLogin, approvedServiceOrigins }) !== authenticationSha256) {
       reportFailure('AUTH_SETUP_CHANGED', 'the auth setup differs from the one the parent checked');
       exitWith(WORKER_CONFIG_CHANGED_EXIT_CODE);
       return null;
@@ -779,18 +1016,31 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         config,
         setup,
         approvedTestOrigins,
+        approvedServiceOrigins,
         signal: controller.signal,
         onAwaitingLogin: () => sendAuthState('AWAITING_LOGIN'),
+        // ML-a: 親の「ログインを終えた」（`LOGIN_CONFIRMED`）を受けたか。
+        loginConfirmed: () => manualLoginConfirmed,
       });
     switch (result.kind) {
       case 'AUTHENTICATED':
-        sendAuthState('AUTHENTICATED');
-        return runAuthenticationOf(authentication, result.state);
+        // DEF-139: 状態の名前の記録（値を持たない）も一緒に送る。
+        sendAuthState('AUTHENTICATED', null, null, result.scriptLogin, result.blockedRequests, result.loginObservation, result.passedRequests, result.stateNames);
+        return runAuthenticationOf(authentication, result.state, config.crawl.maxPages);
       case 'STOPPED':
+        // T34R-fix-a（T34R の I-1）: 止めたときも、それまでの数と止めた送信の一覧があれば、最後の状態（ログインを待っていた）に付けて親に渡してから
+        // 終わる（利用者が「まず空で試し、止めた記録を見る」ための材料を残す）。ML-a: 通した送信の一覧も同じ。
+        if (result.scriptLogin !== undefined || result.blockedRequests !== undefined || result.passedRequests !== undefined) {
+          sendAuthState(WORKER_STOPPED_LOGIN_STAGE_STATE, null, null, result.scriptLogin, result.blockedRequests, undefined, result.passedRequests);
+        }
         exitWith(INTERRUPTED_EXIT_CODE);
         return null;
+      case LOGIN_BROWSER_LAUNCH_REFUSED:
+        // EL-3: ログイン用の Browser の起動を、起動の部品が閉じた理由で断った（ログインの画面を開いていない）。
+        reportLoginBrowserLaunchRefused(result.refusal);
+        return null;
       default:
-        sendAuthState(result.kind);
+        sendAuthState(result.kind, null, null, result.scriptLogin, result.blockedRequests, result.loginObservation, result.passedRequests, result.stateNames);
         reportFailure(result.kind, `the login stage ended without an authenticated state (${result.kind})`);
         exitWith(WORKER_LOGIN_FAILED_EXIT_CODE);
         return null;
@@ -804,22 +1054,25 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
    * 終える。発見のジョブは再開しない（中断したら、もう一度始める）。
    */
   const discover = async (
-    start: WorkerStartMessage,
+    jobId: string,
     config: AuditConfig,
     authentication: RunAuthentication,
     executeDiscovery: NonNullable<AuditWorkerDependencies['executeDiscovery']>,
     navigationPacer: NavigationPacer | undefined,
-  ): Promise<void> => {
+    stageCarry: RunStageCarry | undefined = undefined,
+  ): Promise<number> => {
     const outputDirectory = resolve(config.output.directory);
     const outcome = await executeDiscovery({
       config,
-      jobId: start.jobId,
+      jobId,
       authentication,
       launchBrowser: dependencies.runDependencies.launchBrowser,
       clock: dependencies.runDependencies.clock,
       now: dependencies.runDependencies.now,
       stopSignal: controller.signal,
       ...(navigationPacer === undefined ? {} : { navigationPacer }),
+      // FM2d: まとめて実行の段の持ち越し（連鎖のときだけ）。
+      ...(stageCarry === undefined ? {} : { stageCarry }),
     }, {
       onRunStarted: ({ runId, runDirectory }) => {
         sendChecked({
@@ -830,12 +1083,23 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           resumeDecision: { kind: RESUME_DECISION_KIND.NEW_RUN, completedPages: null },
         });
       },
-      onSessionLost: (url) => sendAuthState(WORKER_SESSION_LOST_STATE, noticeUrlOf(url)),
+      // DEF-138: セッションの切れの証拠も載せる（組み立てられたときだけ）。
+      onSessionLost: (url, sessionLoss) => sendSessionLost(url, sessionLoss),
+      // DEF-136: サイトの不調の確かめ直しの待ちと減速を、監査と同じ `NOTICE` で送る（ジョブの画面に出る）。
+      onNotice: (notice) => sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: toWorkerNotice(notice) }),
+      // DEF-143: 成果物を組み立てて書く段に入る知らせ（監査と同じ口）。
+      onFinalizing: sendRunFinalizing,
     });
     if (!failureReported) {
-      sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', ...toDiscoveryFinished(outcome, outputDirectory) });
+      sendChecked({
+        protocol: WORKER_PROTOCOL_VERSION,
+        type: 'FINISHED',
+        ...toDiscoveryFinished(outcome, outputDirectory),
+        // FM2d: まとめて実行の段は、未完了の理由のコードを載せる（Run を実行した結果だけ）。
+        ...chainReasonCodesPart(stageCarry !== undefined, () => (outcome.kind === 'RAN' ? DISCOVERY_END_REASON_CODES[outcome.endReason] : null)),
+      });
     }
-    exitWith(outcome.exitCode);
+    return outcome.exitCode;
   };
 
   /**
@@ -843,17 +1107,18 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
    * 認証の指定と、`START` の定義の一覧と、止める印を渡す。`FINISHED` は件数の要約だけ（結果は載せない）。再開しない。
    */
   const readCheck = async (
-    start: WorkerStartMessage,
-    readChecks: NonNullable<WorkerStartMessage['readChecks']>,
+    jobId: string,
+    readChecks: readonly WorkerStartReadCheck[],
     config: AuditConfig,
     authentication: RunAuthentication,
     executeReadCheck: NonNullable<AuditWorkerDependencies['executeReadCheck']>,
     navigationPacer: NavigationPacer | undefined,
-  ): Promise<void> => {
+    stageCarry: RunStageCarry | undefined = undefined,
+  ): Promise<number> => {
     const outputDirectory = resolve(config.output.directory);
     const outcome = await executeReadCheck({
       config,
-      jobId: start.jobId,
+      jobId,
       authentication,
       readChecks,
       launchBrowser: dependencies.runDependencies.launchBrowser,
@@ -861,6 +1126,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       now: dependencies.runDependencies.now,
       stopSignal: controller.signal,
       ...(navigationPacer === undefined ? {} : { navigationPacer }),
+      // FM2d: まとめて実行の段の持ち越し（連鎖のときだけ）。
+      ...(stageCarry === undefined ? {} : { stageCarry }),
     }, {
       onRunStarted: ({ runId, runDirectory }) => {
         sendChecked({
@@ -871,12 +1138,161 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           resumeDecision: { kind: RESUME_DECISION_KIND.NEW_RUN, completedPages: null },
         });
       },
-      onSessionLost: (url) => sendAuthState(WORKER_SESSION_LOST_STATE, noticeUrlOf(url)),
+      // DEF-138: セッションの切れの証拠も載せる（組み立てられたときだけ）。
+      onSessionLost: (url, sessionLoss) => sendSessionLost(url, sessionLoss),
+      // DEF-136: サイトの不調の確かめ直しの待ちと減速を、監査と同じ `NOTICE` で送る（ジョブの画面に出る）。
+      onNotice: (notice) => sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'NOTICE', notice: toWorkerNotice(notice) }),
+      // DEF-143: 成果物を組み立てて書く段に入る知らせ（監査と同じ口）。
+      onFinalizing: sendRunFinalizing,
     });
     if (!failureReported) {
-      sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', ...toReadCheckFinished(outcome, outputDirectory) });
+      sendChecked({
+        protocol: WORKER_PROTOCOL_VERSION,
+        type: 'FINISHED',
+        ...toReadCheckFinished(outcome, outputDirectory),
+        ...chainReasonCodesPart(stageCarry !== undefined, () => (outcome.kind === 'RAN' ? READ_CHECK_END_REASON_CODES[outcome.endReason] : null)),
+      });
     }
-    exitWith(outcome.exitCode);
+    return outcome.exitCode;
+  };
+
+  /**
+   * 監査のジョブ（監査の中核 `executeAuditRun`。FM2d で関数に分けた。振る舞いは変えない）。結果の終了コードを返す（終えない）。FM2d: まとめて実行の段
+   * （`stageCarry` あり）では、外の pacer をいつも渡し（ログインの方式によらない）、持ち越しの口を渡し、`FINISHED` に未完了の理由のコードを載せる。
+   */
+  const audit = async (
+    runOptions: AuditRunOptions,
+    config: AuditConfig,
+    authentication: RunAuthentication | undefined,
+    navigationPacer: NavigationPacer | undefined,
+    automatedLogin: boolean,
+    stageCarry: RunStageCarry | undefined = undefined,
+  ): Promise<number> => {
+    const outputDirectory = resolve(config.output.directory);
+    const passPacer = navigationPacer !== undefined && (automatedLogin || stageCarry !== undefined);
+    const outcome = await dependencies.executeAuditRun(
+      config,
+      {
+        ...dependencies.runDependencies,
+        stopSignal: controller.signal,
+        ...(authentication === undefined ? {} : { authentication }),
+        // CCX-22（DEF-102 の続き）: 自動ログインの段と同じ pacer を、Run Coordinator に渡す（ログインの段の最後の要求から、Run の最初の読み込みまで、
+        // 設定の間隔以上空ける。再開のときは、Run Coordinator が保存の記録から自分で作る）。FM2d: まとめて実行の段は、方式によらず渡す。
+        ...(passPacer ? { navigationPacer } : {}),
+        ...(stageCarry === undefined ? {} : { stageCarry }),
+      },
+      runOptions,
+      observerFor(outputDirectory),
+    );
+    if (!failureReported) {
+      sendChecked({
+        protocol: WORKER_PROTOCOL_VERSION,
+        type: 'FINISHED',
+        outcome: toWorkerOutcome(outcome, outputDirectory),
+        ...chainReasonCodesPart(stageCarry !== undefined, () => (outcome.kind === 'RAN' ? outcome.summary.incompleteReasons.map(({ code }) => code) : null)),
+      });
+    }
+    return outcome.exitCode;
+  };
+
+  /** FM2d: まとめて実行の次の段の指定を待つ（`CHAIN_END`・止める要求・待つ上限なら `null`）。 */
+  const awaitNextStage = (expected: WorkerNextStageJobKind): Promise<WorkerNextStageMessage | null> =>
+    new Promise((resolvePromise) => {
+      // 待つ上限のタイマーは unref しない（待つ間にプロセスが終わらないようにする）。
+      const timer = setTimeout(() => settle(null), dependencies.nextStageTimeoutMs ?? WORKER_NEXT_STAGE_TIMEOUT_MS);
+      const settle = (message: WorkerNextStageMessage | null): void => {
+        clearTimeout(timer);
+        nextStageWaiter = null;
+        resolvePromise(message);
+      };
+      nextStageWaiter = { expected, settle };
+    });
+
+  /**
+   * FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行。ログイン 1 回の後に、段を `chain.stages` の順に行う。
+   * - 段ごとに、今のジョブの流れ（監査・発見・READ の確かめ）を行い、`RUN_STARTED`・`FINISHED` を送る（ジョブの ID は段ごと。最初の段は `START` のもの）。
+   * - 持ち越すもの（メモリの中だけ。IPC・成果物・ログに出さない）: factory の最新のログインの状態（次の段の認証の指定の初めの状態）、pacer（同じものを渡す）、
+   *   サービスの Origin への要求の 1 分の窓。1 回の Run あたりの上限は段ごと。
+   * - 途中の段の `FINISHED` の後に、親の `NEXT_STAGE`（次の段のジョブの ID・種類・READ の定義）か `CHAIN_END` を待つ。`CHAIN_END`・止める要求・待つ上限・
+   *   `FAILED` の後・止める印のある段の後は、次の段を始めずに、終えた段の終了コードで終える。
+   * - 前の段の最新の状態が持ち越されていなければ（factory を作らなかったなど）、次の段を始めずに `FAILED`（`UNEXPECTED_FAILURE`）で終える（fail-closed）。
+   */
+  const runChain = async (
+    start: WorkerStartMessage,
+    stages: WorkerChainStageSequence,
+    config: AuditConfig,
+    firstAuthentication: RunAuthentication,
+    navigationPacer: NavigationPacer,
+  ): Promise<void> => {
+    const carried: { value: RunStageCarried | null } = { value: null };
+    const stageCarry = (): RunStageCarry => Object.freeze({
+      serviceRequestWindowMs: carried.value?.serviceRequestWindowMs ?? [],
+      record: (value: RunStageCarried): void => {
+        carried.value = value;
+      },
+    });
+    const automatedLogin = start.authentication?.automatedLogin !== undefined;
+    let authentication = firstAuthentication;
+    // 段の読み込みの間隔の部品（最初の段は、ログインの段と同じもの。次の段からは、前の段の持ち越しから作る。FM2R の C-1）。
+    let stagePacer = navigationPacer;
+    let current: { readonly kind: WorkerChainStageKind; readonly jobId: string; readonly readChecks: readonly WorkerStartReadCheck[] | undefined } = {
+      kind: stages[0], jobId: start.jobId, readChecks: undefined,
+    };
+    for (let index = 0; ; index += 1) {
+      const exitCode = await runChainStage(current, auditRunOptionsOf(start), config, authentication, stagePacer, automatedLogin, stageCarry());
+      const nextKind = stages[index + 1] as WorkerNextStageJobKind | undefined;
+      if (nextKind === undefined || failureReported || isExiting() || controller.signal.aborted) {
+        exitWith(exitCode);
+        return;
+      }
+      const next = await awaitNextStage(nextKind);
+      if (next === null || failureReported || isExiting()) {
+        exitWith(exitCode);
+        return;
+      }
+      const latestState = carried.value?.latestState ?? null;
+      if (latestState === null) {
+        reportFailure('UNEXPECTED_FAILURE', 'the login state of the previous stage was not carried over');
+        exitWith(FAILURE_EXIT_CODE);
+        return;
+      }
+      authentication = { ...authentication, initialState: latestState };
+      // FM2R の C-1: 次の段の読み込みの間隔は、前の段の持ち越し（最後の読み込み・段の終わり・上げた間隔）から待つ（再開した監査の段は外の pacer を
+      // 使わないので、共有の pacer では足りない）。
+      const carriedNavigation = carried.value?.navigation;
+      if (carriedNavigation !== undefined) {
+        stagePacer = nextStageNavigationPacerOf(carriedNavigation, config.crawl.minNavigationIntervalMs, dependencies.runDependencies.now, wait);
+      }
+      current = { kind: next.jobKind, jobId: next.jobId, readChecks: next.readChecks };
+    }
+  };
+
+  /** FM2d: まとめて実行の段 1 つ（段の種類に対応する流れ。流れが渡されていない・定義がないなら `FAILED`（`JOB_KIND_NOT_SUPPORTED`））。 */
+  const runChainStage = async (
+    current: { readonly kind: WorkerChainStageKind; readonly jobId: string; readonly readChecks: readonly WorkerStartReadCheck[] | undefined },
+    runOptions: AuditRunOptions,
+    config: AuditConfig,
+    authentication: RunAuthentication,
+    navigationPacer: NavigationPacer,
+    automatedLogin: boolean,
+    stageCarry: RunStageCarry,
+  ): Promise<number> => {
+    switch (current.kind) {
+      case WORKER_AUDIT_JOB_KIND:
+        return audit(runOptions, config, authentication, navigationPacer, automatedLogin, stageCarry);
+      case WORKER_DISCOVERY_JOB_KIND:
+        if (dependencies.executeDiscovery !== undefined) {
+          return discover(current.jobId, config, authentication, dependencies.executeDiscovery, navigationPacer, stageCarry);
+        }
+        break;
+      case WORKER_READ_CHECK_JOB_KIND:
+        if (dependencies.executeReadCheck !== undefined && current.readChecks !== undefined) {
+          return readCheck(current.jobId, current.readChecks, config, authentication, dependencies.executeReadCheck, navigationPacer, stageCarry);
+        }
+        break;
+    }
+    reportFailure(WORKER_JOB_KIND_NOT_SUPPORTED_REASON, `the worker cannot run the chained stage ${current.kind}`);
+    return FAILURE_EXIT_CODE;
   };
 
   /**
@@ -885,7 +1301,7 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
    */
   const writeCreate = async (
     start: WorkerStartMessage,
-    write: NonNullable<WorkerStartMessage['write']>,
+    write: WorkerStartWrite | WorkerStartApiWrite,
     config: AuditConfig,
     authentication: RunAuthentication,
     executeWriteCreate: NonNullable<AuditWorkerDependencies['executeWriteCreate']>,
@@ -916,10 +1332,47 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           resumeDecision: { kind: RESUME_DECISION_KIND.NEW_RUN, completedPages: null },
         });
       },
-      onSessionLost: (url) => sendAuthState(WORKER_SESSION_LOST_STATE, noticeUrlOf(url)),
+      onSessionLost: (url) => sendAuthState(WORKER_SESSION_LOST_STATE, reportedSessionLostUrlOf(url)),
     });
     if (!failureReported) {
       sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', ...toWriteFinished(outcome, outputDirectory) });
+    }
+    exitWith(outcome.exitCode);
+  };
+
+  /**
+   * 入口の確かめのジョブ（T43c。Task 43 の設計書 4.3）。ログインの段を通さずに、入口の確かめの流れ（`executeEntryCheck`）に、設定と止める印を渡す。
+   * 送るメッセージは発見のジョブと同じ（`RUN_STARTED`、`FINISHED`。セッションの切れはない）。`FINISHED` は件数の要約だけ（事実と案は
+   * `entry-check.json`）。再開しない。
+   */
+  const entryCheck = async (
+    start: WorkerStartMessage,
+    config: AuditConfig,
+    executeEntryCheck: NonNullable<AuditWorkerDependencies['executeEntryCheck']>,
+  ): Promise<void> => {
+    const outputDirectory = resolve(config.output.directory);
+    const outcome = await executeEntryCheck({
+      config,
+      jobId: start.jobId,
+      launchBrowser: dependencies.runDependencies.launchBrowser,
+      clock: dependencies.runDependencies.clock,
+      now: dependencies.runDependencies.now,
+      stopSignal: controller.signal,
+    }, {
+      onRunStarted: ({ runId, runDirectory }) => {
+        sendChecked({
+          protocol: WORKER_PROTOCOL_VERSION,
+          type: 'RUN_STARTED',
+          runId,
+          runDirectory: relativeRunDirectory(outputDirectory, runDirectory),
+          resumeDecision: { kind: RESUME_DECISION_KIND.NEW_RUN, completedPages: null },
+        });
+      },
+      // T44g（Task 44 の設計書 P4-5。DEF-143 の残り）: 成果物を書く段に入る知らせ（監査・発見・READ の確かめと同じ口）。
+      onFinalizing: sendRunFinalizing,
+    });
+    if (!failureReported) {
+      sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', ...toEntryCheckFinished(outcome, outputDirectory) });
     }
     exitWith(outcome.exitCode);
   };
@@ -941,7 +1394,8 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
 
   const run = async (start: WorkerStartMessage): Promise<void> => {
     stage = 'RUNNING';
-    authenticatedRun = start.authentication !== undefined;
+    // T43c: 入口の確かめも、`FAILED` の詳細の URL の秘密を伏せる（認証の指定は持たないが、対象のサイトの URL を扱う）。
+    authenticatedRun = start.authentication !== undefined || start.jobKind === WORKER_ENTRY_CHECK_JOB_KIND;
     clearTimeout(startTimer);
     // T27c: 対応していない種類は、設定を読む前に拒む（ログインも監査もしない）。T27d: 発見の流れが渡されていなければ、発見も同じく拒む。
     // T27e: READ の確かめの流れが渡されていなければ、READ の確かめも同じく拒む。
@@ -950,19 +1404,46 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       || (start.jobKind === WORKER_DISCOVERY_JOB_KIND && dependencies.executeDiscovery === undefined)
       || (start.jobKind === WORKER_READ_CHECK_JOB_KIND && dependencies.executeReadCheck === undefined)
       || (isWriteJobKind(start.jobKind) && dependencies.executeWriteCreate === undefined)
+      // T43c: 入口の確かめの流れが渡されていなければ、入口の確かめも同じく拒む。
+      || (start.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && dependencies.executeEntryCheck === undefined)
+      // FM2d: まとめて実行は、どの段の流れも渡されているときだけ（ログインの前に拒む）。
+      || (start.chain?.stages.some((kind) => (kind === WORKER_DISCOVERY_JOB_KIND && dependencies.executeDiscovery === undefined)
+        || (kind === WORKER_READ_CHECK_JOB_KIND && dependencies.executeReadCheck === undefined)) ?? false)
     ) {
       reportFailure(WORKER_JOB_KIND_NOT_SUPPORTED_REASON, `the worker does not implement the job kind ${start.jobKind} yet`);
       exitWith(FAILURE_EXIT_CODE);
       return;
     }
+    // T40b-1（Task 40 の設計書 3.3）: 送り方 API の書き込み（T40a で早く拒んでいた）も、form と同じ口（設定の読み込み、ログイン、書き込みの流れ、
+    // 送信の報告、確かめ直しの往復）で行う。
     try {
       if (!(await targetConfigUnchanged(start))) {
         reportConfigChanged();
         return;
       }
-      const config = await dependencies.loadConfig(start.targetConfigPath, WORKER_CONFIG_OVERRIDES);
+      // FM-2: プロファイルの表示の設定（`START` の `showJobBrowser`）が真なら、ジョブのブラウザを表示する上書きで読む。
+      // AS-b: プロファイルの監査の段の送信の扱い（`START` の `auditSendPolicy`）を、実効の設定の上書きとして当てる。項目のない `START`（書き込み・ログインの
+      // 確かめ・入口の確かめを含む）は、ターゲット JSON の値によらず読み取りだけ（fail-closed）。
+      const config = await dependencies.loadConfig(
+        start.targetConfigPath,
+        withAuditSendPolicyOverride(
+          start.showJobBrowser === true ? WORKER_SHOWN_BROWSER_CONFIG_OVERRIDES : WORKER_CONFIG_OVERRIDES,
+          start.auditSendPolicy ?? AUDIT_SEND_READ_ONLY,
+        ),
+      );
       if (!(await targetConfigUnchanged(start))) {
         reportConfigChanged();
+        return;
+      }
+      // T43c: 入口の確かめは、ログインの段を通さずに入口の確かめの流れを行う（契約が、認証の指定を持たないことを確かめてある）。
+      if (start.jobKind === WORKER_ENTRY_CHECK_JOB_KIND) {
+        if (start.authentication !== undefined || dependencies.executeEntryCheck === undefined) {
+          // 契約で起きない（fail-closed。監査として扱わない）。
+          reportFailure(WORKER_JOB_KIND_NOT_SUPPORTED_REASON, `the worker cannot run ${WORKER_ENTRY_CHECK_JOB_KIND} with an authentication`);
+          exitWith(FAILURE_EXIT_CODE);
+          return;
+        }
+        await entryCheck(start, config, dependencies.executeEntryCheck);
         return;
       }
       // T25d: 認証つきなら、監査の前に（再開のときも）ログインする。状態は保存しない。
@@ -976,7 +1457,7 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         // `catch` が今と同じ `FAILED`（`CONFIG_ERROR`）で終える（`AWAITING_LOGIN` を送らない）。
         // T26d-2: ログインの検証は Run を作らないので、認証つきの Run の確かめをしない。
         if (start.jobKind !== WORKER_LOGIN_CHECK_JOB_KIND) {
-          assertRunAuthentication(runAuthenticationOf(start.authentication, PRE_LOGIN_STATE), config);
+          assertRunAuthentication(runAuthenticationOf(start.authentication, PRE_LOGIN_STATE, config.crawl.maxPages), config);
         }
         navigationPacer = createNavigationPacer({
           minIntervalMs: config.crawl.minNavigationIntervalMs,
@@ -989,9 +1470,20 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         }
         authentication = prepared;
       }
+      // FM2d: まとめて実行は、ログイン 1 回の後に段を続ける（契約が、認証つきで、閉じた一覧の並びであることを確かめてある）。
+      if (start.chain !== undefined) {
+        if (authentication === undefined || navigationPacer === undefined) {
+          // 契約で起きない（fail-closed）。
+          reportFailure(WORKER_JOB_KIND_NOT_SUPPORTED_REASON, 'the worker cannot run the chained run without its authentication');
+          exitWith(FAILURE_EXIT_CODE);
+          return;
+        }
+        await runChain(start, start.chain.stages, config, authentication, navigationPacer);
+        return;
+      }
       // T27d: 発見のジョブは、ログインの後に発見の流れを行う（監査の中核は呼ばない）。契約が、発見の `START` に認証の指定を求めている。
       if (start.jobKind === WORKER_DISCOVERY_JOB_KIND && authentication !== undefined && dependencies.executeDiscovery !== undefined) {
-        await discover(start, config, authentication, dependencies.executeDiscovery, navigationPacer);
+        exitWith(await discover(start.jobId, config, authentication, dependencies.executeDiscovery, navigationPacer));
         return;
       }
       // T27e: READ の確かめのジョブは、ログインの後に READ の確かめの流れを行う（監査の中核は呼ばない）。契約が、認証の指定と定義の一覧を求めている。
@@ -1002,11 +1494,12 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
           exitWith(FAILURE_EXIT_CODE);
           return;
         }
-        await readCheck(start, start.readChecks, config, authentication, dependencies.executeReadCheck, navigationPacer);
+        exitWith(await readCheck(start.jobId, start.readChecks, config, authentication, dependencies.executeReadCheck, navigationPacer));
         return;
       }
       // T30f: 書き込みのジョブは、ログインの後に書き込みの流れを行う（監査の中核は呼ばない）。契約が、認証の指定と書き込みの指定を求めている。
       // T31g-2: 更新の書き込みのジョブ（`WRITE_UPDATE`）も、同じ書き込みの流れ（契約が、UPDATE の指定を求めている）。
+      // T40b-1: 送り方 API の登録の書き込みの指定も、同じ書き込みの流れに渡す（流れが送り方で分ける）。
       if (isWriteJobKind(start.jobKind)) {
         if (authentication === undefined || start.write === undefined || dependencies.executeWriteCreate === undefined) {
           // 契約で起きない（fail-closed。監査として扱わない）。
@@ -1017,24 +1510,7 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
         await writeCreate(start, start.write, config, authentication, dependencies.executeWriteCreate, navigationPacer);
         return;
       }
-      const outputDirectory = resolve(config.output.directory);
-      const outcome = await dependencies.executeAuditRun(
-        config,
-        {
-          ...dependencies.runDependencies,
-          stopSignal: controller.signal,
-          ...(authentication === undefined ? {} : { authentication }),
-          // CCX-22（DEF-102 の続き）: 自動ログインの段と同じ pacer を、Run Coordinator に渡す（ログインの段の最後の要求から、Run の最初の読み込みまで、
-          // 設定の間隔以上空ける。再開のときは、Run Coordinator が保存の記録から自分で作る）。
-          ...(navigationPacer === undefined || (start.authentication?.automatedLogin ?? null) === null ? {} : { navigationPacer }),
-        },
-        { startNew: start.startNew },
-        observerFor(outputDirectory),
-      );
-      if (!failureReported) {
-        sendChecked({ protocol: WORKER_PROTOCOL_VERSION, type: 'FINISHED', outcome: toWorkerOutcome(outcome, outputDirectory) });
-      }
-      exitWith(outcome.exitCode);
+      exitWith(await audit(auditRunOptionsOf(start), config, authentication, navigationPacer, (start.authentication?.automatedLogin ?? null) !== null));
     } catch (error) {
       const failure = classifyCliFailure(error);
       reportFailure(FAILURE_REASON[failure.kind], failureDetailOf(error));
@@ -1061,12 +1537,33 @@ export function startAuditWorker(dependencies: AuditWorkerDependencies): AuditWo
       }
       return;
     }
+    if (message.type === 'LOGIN_CONFIRMED') {
+      // ML-a: 「ログインを終えた」。手動のログインの段が次の確かめで成功として進む（段の外では何もしない。`START` の前は信用しない）。
+      if (stage === 'WAITING') {
+        parentDistrusted = true;
+        violate('LOGIN_CONFIRMED was received before START');
+        return;
+      }
+      manualLoginConfirmed = true;
+      return;
+    }
     if (message.type === 'WRITE_RECHECK_RESULT') {
       // T30e: 待っている確かめ直しの依頼がなければ（依頼していない、上限の後、2 回目）、親を信用しない。
       if (!writeIpc.receiveRecheckResult(message)) {
         parentDistrusted = true;
         violate('a WRITE_RECHECK_RESULT was received without a pending recheck request');
       }
+      return;
+    }
+    if (message.type === 'NEXT_STAGE' || message.type === 'CHAIN_END') {
+      // FM2d: 次の段の指定は、途中の段の `FINISHED` の後に 1 回だけ。種類は `START` の並びの次の段。違えば親を信用しない。
+      const waiter = nextStageWaiter;
+      if (waiter === null || (message.type === 'NEXT_STAGE' && message.jobKind !== waiter.expected)) {
+        parentDistrusted = true;
+        violate(`${message.type} was received while the worker did not wait for the next stage`);
+        return;
+      }
+      waiter.settle(message.type === 'NEXT_STAGE' ? message : null);
       return;
     }
     if (stage !== 'WAITING') {

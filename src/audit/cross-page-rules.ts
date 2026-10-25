@@ -12,6 +12,7 @@ import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { deepFreeze } from '../core/immutable.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { classifyUrl, type UrlAdmission } from '../crawl/admission-policy.js';
+import { internalNavigableUrlsOf } from '../crawl/internal-navigable-links.js';
 import { canonicalizeAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
 import { listText, truncatedListText } from '../presentation/messages.js';
 import type { FindingDraft } from './rule.js';
@@ -366,11 +367,8 @@ const buildIndex = (input: CrossPageRuleInput): { readonly index: CrossPageIndex
       if (record.type !== 'link') {
         continue;
       }
-      for (const link of record.payload.links) {
-        if (link.admission.kind !== 'INTERNAL_NAVIGABLE' || !link.normalized.ok) {
-          continue;
-        }
-        const targetUrl = link.normalized.url;
+      // 巡回の候補と同じ取り出し（`INTERNAL_NAVIGABLE` で正規化が `ok` のもの。文書の順。CC-070 (b)）。
+      for (const targetUrl of internalNavigableUrlsOf(record.payload.links)) {
         discoveredUrls.add(targetUrl);
         const refs = targets.get(targetUrl) ?? new Set<EvidenceId>();
         refs.add(record.evidenceId);

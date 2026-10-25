@@ -4,6 +4,7 @@
  * - 認証の設定がない → 開始の画面は理由（`AUTH_SETUP_MISSING`）と案内（ログインの案内、認証の設定へのリンク）を出し、開始のボタンを出さない。
  * - 認証の設定の画面（プロファイルの詳細から、キーボードだけ）: 秘密の欄がない、既定で読まない語の一覧、保存の拒否の項目ごとの誤り、保存、
  *   `STALE`（プロファイルの改訂が変わった）の表示と開始の拒否、保存し直すと `CURRENT`。
+ * - T44d（Task 44 の設計書 P2-2）: プロファイルの画面の入り口（「認証の設定を開く」）の近くに、読む範囲・読まないパスの今の値と状態の要約。
  * - 認証つきの開始: 開始の画面のログインの案内と認証の設定の要点 → ジョブの画面の「ログイン待ち」→（人の操作の代わりに、テストだけの入口が
  *   資格情報を入れる）→「ログイン済み」と結果。画面（ページの HTML、Server Function の応答）に、Cookie と localStorage の目印が出ない。
  * - セッションが切れて止まった（`SESSION_LOST`）: 止まったページの URL と、読まないパスに足す案内と、認証の設定へのリンク。
@@ -15,7 +16,7 @@
  */
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../../src/core/default-excluded-url-words.js';
 import {
   AUDIT_JOB_AUTH_STATE_CATALOG,
   AUDIT_JOB_STATE_CATALOG,
@@ -35,7 +36,9 @@ import {
   startAuthenticatedSite,
   type AuthenticatedSite,
 } from '../../../tests/helpers/authenticated-site-fixture.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   installTestAuthWorkerEntry,
@@ -203,8 +206,7 @@ const fillSetup = async (page: Page, values: Readonly<Record<string, string>>): 
 };
 
 /** fixture のサイトに届いた、GET と HEAD 以外の要求（`<method> <path>`）。 */
-const nonReadRequests = (site: AuthenticatedSite): readonly string[] =>
-  site.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+const nonReadRequests = (site: AuthenticatedSite): readonly string[] => nonReadRequestsOf(site.requests);
 
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
@@ -263,6 +265,10 @@ describe('local UI: the authenticated audit (TEST_AUTH_PASSIVE)', () => {
   it('opens the auth setup from the profile, has no secret field, and shows the errors by field after a rejected save', async () => {
     const site = siteOf(mainSite);
     const profile = await openPage(`/profiles/${MAIN_PROFILE}`);
+    // T44d（Task 44 の設計書 P2-2）: 入り口の近くに、今の認証の設定の要約（まだ保存していない）を出す。
+    const summary = profile.getByTestId('profile-auth-setup-summary');
+    expect(await summary.getAttribute('data-saved')).toBe('no');
+    expect(await summary.textContent()).toBe(authText.setup.notSaved);
     await tabTo(profile, profile.getByTestId('profile-auth-setup').getByRole('link', { name: authText.profileDetail.open }));
     await profile.keyboard.press('Enter');
     await profile.waitForURL(new RegExp(`/auth-setup/${MAIN_PROFILE}$`, 'u'), { timeout: UI_TIMEOUT_MS });
@@ -314,6 +320,19 @@ describe('local UI: the authenticated audit (TEST_AUTH_PASSIVE)', () => {
     expect(await page.getByTestId('auth-setup-freshness').textContent()).toBe(AUTH_SETUP_FRESHNESS_CATALOG.CURRENT.label);
     expect(await field(page, setup.successSelector).inputValue()).toBe('#admin-ok');
     await screenshot(page, '03-auth-setup-saved');
+
+    // T44d（Task 44 の設計書 P2-2）: プロファイルの画面の入り口の近くに、読む範囲と読まないパスの今の値と、設定の状態を出す。
+    const detail = await openPage(`/profiles/${MAIN_PROFILE}`);
+    const saved = detail.getByTestId('profile-auth-setup-summary');
+    expect(await saved.getAttribute('data-saved')).toBe('yes');
+    expect(await detail.getByTestId('profile-auth-setup-audit-scope').locator('li').allTextContents()).toEqual([AUTH_SITE_PATHS.admin]);
+    expect(await detail.getByTestId('profile-auth-setup-excluded').locator('li').allTextContents()).toEqual([AUTH_SITE_PATHS.adminLogout]);
+    expect(await saved.textContent()).toContain(authText.start.auditScope);
+    expect(await saved.textContent()).toContain(authText.profileDetail.excludedPaths);
+    expect(await saved.textContent()).toContain(AUTH_SETUP_FRESHNESS_CATALOG.CURRENT.label);
+    expect(await detail.getByTestId('profile-auth-setup').getByRole('link', { name: authText.profileDetail.open }).getAttribute('href'))
+      .toBe(`/auth-setup/${MAIN_PROFILE}`);
+    await screenshot(detail, '03b-profile-auth-setup-summary');
   }, SCENARIO_TIMEOUT_MS);
 
   it('shows STALE after the profile changes, rejects the start with AUTH_SETUP_STALE, and becomes CURRENT after saving again', async () => {
@@ -399,7 +418,7 @@ describe('local UI: the authenticated audit (TEST_AUTH_PASSIVE)', () => {
       .toMatchObject({ ok: true });
     expect(await valueOf('saveAuthSetupFn', 'POST', {
       setup: {
-        schemaVersion: 'beaksight-auth-setup/2',
+        ...FORM_NAVIGATION_SETUP_ITEMS,
         profileId: LOST_PROFILE,
         profileRevision: FIRST_REVISION,
         loginStartUrl: `${site.originA}${AUTH_SITE_PATHS.login}`,

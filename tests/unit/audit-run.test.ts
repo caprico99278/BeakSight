@@ -5,7 +5,7 @@
 // 偽の Run Coordinator（`createRunCoordinator`）で確かめる（Browser を起動しない）。本物の Chromium での確かめは
 // `tests/integration/audit-run.test.ts`、CLI の出力が変わらないことは `tests/integration/cli-output-parity.test.ts`。
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -22,6 +22,7 @@ import {
 import { EXIT_CODES, RUN_UNAVAILABLE_EXIT_CODE, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
+  CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
   checkpointArtifactRelativePath,
@@ -30,7 +31,8 @@ import {
 import type { AuditRunResult, RunProgressReport } from '../../src/core/contracts.js';
 import { createRunId } from '../../src/core/ids.js';
 import { readPlaywrightVersion, readToolVersion } from '../../src/orchestration/environment.js';
-import { createRunLock, currentProcessRunLockHost } from '../../src/orchestration/run-checkpoint.js';
+import { createRunLock, currentProcessRunLockHost } from '../../src/core/process-lock.js';
+import { checkRunCheckpointConsistency } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
   RunDirectoryUnavailableError,
@@ -455,6 +457,69 @@ describe('executeAuditRun: the choice of the Run to resume', () => {
     const notices = [{ kind: 'CHECKPOINT_UNREADABLE', runId: FIXTURE_RUN_ID }];
     expect(calls[0]?.value).toEqual({ resumeDecision: { kind: 'NEW_RUN' }, notices });
     expect(outcome).toMatchObject({ kind: 'RAN', notices });
+  });
+
+  // LG-4（テストの組の設計書 3.7.3、3.7.5）: 再開に使う保存の前の形は捨てた。前の形の保存は、今の閉じた理由で知らせて、新しい Run として始める
+  // （読み替えて再開しない）。
+  describe('LG-4: a checkpoint of a previous form is not resumed', () => {
+    /** 保存のファイル（Run のディレクトリからの相対パス）の JSON を読み、`change` で書き換えて書き戻す（書き手の検証を通さない）。 */
+    const rewriteJson = async (path: string, change: (value: Record<string, unknown>) => Record<string, unknown>): Promise<void> => {
+      await writeFile(path, JSON.stringify(change(JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>)), 'utf8');
+    };
+    const statePathOf = (runDirectory: string): string => artifactFilePath(runDirectory, checkpointArtifactRelativePath('state'));
+    const startOf = async (config: AuditConfig): Promise<unknown> => {
+      const { observer, calls } = recordingObserver();
+      const { dependencies, created } = fakeDependencies();
+      await executeAuditRun(config, dependencies, { startNew: false }, observer);
+      expect(created[0]?.resumeFrom).toBeUndefined();
+      return calls[0]?.value;
+    };
+
+    it('starts a new Run with CHECKPOINT_UNREADABLE when the page checkpoint holds a page.json of page-schema/1.0', async () => {
+      const config = configFor('lg4-page-schema-10');
+      const runDirectory = await writeSampleCheckpoint(config.output.directory);
+      const pagesDirectory = artifactFilePath(runDirectory, CHECKPOINT_PAGES_ARTIFACT_DIRECTORY);
+      const [pageFile] = await readdir(pagesDirectory);
+      await rewriteJson(join(pagesDirectory, pageFile ?? ''), (page) => ({ ...page, result: { ...(page['result'] as object), schemaVersion: 'page-schema/1.0' } }));
+
+      expect(await startOf(config)).toEqual({ resumeDecision: { kind: 'NEW_RUN' }, notices: [{ kind: 'CHECKPOINT_UNREADABLE', runId: FIXTURE_RUN_ID }] });
+    });
+
+    it('starts a new Run with CHECKPOINT_UNREADABLE when the counts of the audit stage do not have the counts added later', async () => {
+      const full = {
+        registeredReadRequestsAllowed: 0, tokenRefreshBlocked: 0, otherNonReadBlocked: 0, serviceUnauthorizedResponses: 0, serviceRequestsAdmitted: 0,
+        serviceRequestLimitRefused: 0, allowedOriginDataRequestsBlocked: 0, serviceRequestPacingWaits: 0, serviceRequestPacingWaitMs: 0,
+      };
+      const { allowedOriginDataRequestsBlocked: _blocked, serviceRequestPacingWaits: _waits, serviceRequestPacingWaitMs: _waitMs, ...previous } = full;
+      const withCounts = (counts: object) => (state: Record<string, unknown>): Record<string, unknown> =>
+        ({ ...state, load: { ...(state['load'] as object), auditStageCounts: counts } });
+      // 対照: 今の形の数を持つ保存は、読めて再開の候補になる（読めない理由は、数がないことだけ）。
+      const control = configFor('lg4-counts-control');
+      const controlDirectory = await writeSampleCheckpoint(control.output.directory);
+      await rewriteJson(statePathOf(controlDirectory), withCounts(full));
+      expect(await new ArtifactWriter().readCheckpointState(controlDirectory, checkRunCheckpointConsistency)).toMatchObject({ ok: true });
+
+      const config = configFor('lg4-counts');
+      const runDirectory = await writeSampleCheckpoint(config.output.directory);
+      await rewriteJson(statePathOf(runDirectory), withCounts(previous));
+
+      expect(await startOf(config)).toEqual({ resumeDecision: { kind: 'NEW_RUN' }, notices: [{ kind: 'CHECKPOINT_UNREADABLE', runId: FIXTURE_RUN_ID }] });
+    });
+
+    it('starts a new Run with CONFIG_DIFFERS when the saved settings do not have the audit send policy (not read as READ_ONLY)', async () => {
+      const config = configFor('lg4-send-policy');
+      const runDirectory = await writeSampleCheckpoint(config.output.directory);
+      await rewriteJson(statePathOf(runDirectory), (state) => {
+        const effectiveConfig = state['effectiveConfig'] as { readonly audit: Record<string, unknown> };
+        const { sendPolicy: _sendPolicy, ...audit } = effectiveConfig.audit;
+        return { ...state, effectiveConfig: { ...effectiveConfig, audit } };
+      });
+
+      expect(await startOf(config)).toEqual({
+        resumeDecision: { kind: 'NEW_RUN' },
+        notices: [{ kind: 'CONFIG_DIFFERS', runId: FIXTURE_RUN_ID, differences: ['audit.sendPolicy'] }],
+      });
+    });
   });
 
   it('returns VERSION_MISMATCH with the differences of the versions, without creating the Run Coordinator', async () => {

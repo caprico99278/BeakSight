@@ -3,7 +3,7 @@
 // - `urlSecretRedaction: true` の書き手は、書く値（run.json、audit.json、page.json、visible-text.txt、保存のページと状態、診断の記録）の
 //   すべての文字列の URL に、伏せ字の部品（`redactUrlSecretsInValue`）を通す。`writeRun` が返す最終の Run（表示用モデル、HTML、バンドルの
 //   もと）も伏せ字の後の値。スキーマに合う。
-// - 既定（公開監査）の書き手は、今と 1 バイトも変わらない（値を通さない）。
+// - T44g（Task 44 の設計書 P4-1。案 2）: 既定（公開監査）の書き手も、同じく伏せる。名前で伏せる段を外した書き手（`urlSecretRedaction: false`）だけが値を通さない。
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -177,19 +177,25 @@ describe('ArtifactWriter: the URL secrets of an authenticated Run (Task 25 desig
     }
   });
 
-  it('keeps the outputs of the default writer (the public audit) byte for byte', async () => {
+  // T44g（Task 44 の設計書 P4-1。案 2）: 既定の書き手（公開の監査）も、認証つきの書き手と同じく伏せる（同じ 1 か所 `#outgoing`）。名前で伏せる段を外した
+  // 書き手（`urlSecretRedaction: false`。製品では使わない）だけが、値をそのまま書く。
+  it('redacts the same secrets with the default writer (the public audit), and keeps them only without the redaction', async () => {
     const root = await outputDirectory();
     const result = secretRun();
     const written = await new ArtifactWriter().writeRun(result, { outputDirectory: root });
 
-    expect(written.result).toEqual(result);
+    expect(written.result.pages[0]?.pageUrl).toBe(`${FIXTURE_ORIGIN}${REDACTED_PATH}`);
+    expect(leakedSecrets(JSON.stringify(written.result))).toEqual([]);
     const runDirectory = runArtifactDirectory(root, RUN_ID);
-    expect(await readFile(artifactFilePath(runDirectory, pageArtifactRelativePath(PAGE_1, 'page')), 'utf8'))
-      .toBe(serializeArtifactJson(result.pages[0]));
-    expect(await readFile(artifactFilePath(runDirectory, RUN_ARTIFACT_FILE_NAMES.run), 'utf8')).toBe(serializeArtifactJson(result.run));
-    const diagnostic = secretDiagnostic();
-    const path = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, diagnostic, 1);
-    expect(await readFile(artifactFilePath(runDirectory, path), 'utf8')).toBe(serializeArtifactJson(diagnostic));
+    expect(leakedSecrets(await readFile(artifactFilePath(runDirectory, pageArtifactRelativePath(PAGE_1, 'page')), 'utf8'))).toEqual([]);
+    const path = await new ArtifactWriter().writeSiteUnavailableDiagnostic(runDirectory, secretDiagnostic(), 1);
+    expect(leakedSecrets(await readFile(artifactFilePath(runDirectory, path), 'utf8'))).toEqual([]);
+
+    const plainRoot = await outputDirectory();
+    const plain = await new ArtifactWriter({ urlSecretRedaction: false }).writeRun(result, { outputDirectory: plainRoot });
+    expect(plain.result).toEqual(result);
+    expect(await readFile(artifactFilePath(runArtifactDirectory(plainRoot, RUN_ID), RUN_ARTIFACT_FILE_NAMES.run), 'utf8'))
+      .toBe(serializeArtifactJson(result.run));
     expect(leakedSecrets(serializeArtifactJson(result.pages[0]))).toEqual(Object.values(SECRETS));
   });
 });

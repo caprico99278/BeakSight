@@ -11,7 +11,8 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { approvalExternalFactsOf, type ApprovalExternalFactsDependencies } from '../../src/control/approval-external-facts.js';
 import { approveScenario, readScenarioApprovalStatus } from '../../src/control/approval/scenario-store.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import type { CredentialMetadata } from '../../src/control/credentials/credential-store.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
@@ -29,7 +30,7 @@ const APPROVED_AT = '20261012020000';
 const IN_TTL = new Date(Date.parse('2026-10-13T00:00:00Z'));
 
 const AUTOMATED_SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: GRANT_PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,

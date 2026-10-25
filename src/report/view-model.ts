@@ -5,7 +5,8 @@
  * - 判定しない。Run Status は `RunSummary.runStatus` を、ページの件数は `RunSummary` の件数を、そのまま使う。新しい Finding や
  *   severity は作らない。
  * - Finding の件数と一覧の出どころは、`AuditRunResult.findings` の1つだけ（`PageAuditResult.findings` は使わない）。
- * - Finding を severity や category で数えたり分けたりする処理（表示用の集計）は、このファイルだけで行う（GATE-UI04）。
+ * - Finding を severity や category で数えたり分けたりする処理（表示用の集計）は、このファイルだけで行う（GATE-UI04）。T44i（Task 44 の設計書 6 章の
+ *   2026-10-22 の行）: category の別・Rule の別の件数と、Rule ごとの要約（`ruleDigests`）も、ここだけで数える（ChatGPT 用バンドルは描くだけ）。
  * - ラベルと順は、カタログ（`src/presentation/catalog.ts`）から取る。モデルには値（severity や状態の値そのもの）を入れ、
  *   日本語のラベルは入れない（ラベルは、描画する側がカタログで引く）。理由の説明だけは、`messages.ts` の説明を入れる。
  * - 状態や severity の値の文字列を、直接書かない（GATE-UI01）。
@@ -19,7 +20,10 @@
  * - モデルは、入力のオブジェクトを参照せず、写しを持つ（入力を凍結したり、変えたりしない）。
  */
 import { pageArtifactRelativePath } from '../core/artifact-layout.js';
+import { DEFAULT_AUDIT_SEND_POLICY, hasAuditSendWebSocketCaution } from '../core/audit-send-policy.js';
+import { BEAKSIGHT_BLOCK_RELATIONS, type BeakSightBlockRelation } from '../core/beaksight-block-relation.js';
 import {
+  FINDING_CATEGORIES,
   INTERACTION_STATUSES,
   SEVERITIES,
   VIEWPORT_PROFILES,
@@ -39,6 +43,7 @@ import {
   type RunEnvironment,
   type RunExecution,
   type RunExecutionEndReason,
+  type RunAuditSendSummary,
   type RunId,
   type RunLoad,
   type RunSafetySummary,
@@ -50,6 +55,7 @@ import {
 import {
   INTERACTION_NOT_VERIFIABLE_KINDS,
   SAFETY_EVENT_KINDS,
+  type BlockedEventPhase,
   type InteractionNotVerifiableKind,
   type InteractionReasonCode,
   type NavigationOutcomeKind,
@@ -59,7 +65,12 @@ import {
   type ScreenshotCaptureType,
 } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
+import { REPORT_RULE_DIGEST_EXAMPLE_COUNT } from '../core/limits.js';
+import { lastRunExecutionOf } from '../core/run-executions.js';
+import { compareCodeUnits } from '../core/text.js';
 import {
+  AUDIT_SEND_POLICY_CATALOG,
+  FINDING_CATEGORY_CATALOG,
   REPORT_CATEGORY_SECTION_CATALOG,
   REPORT_CATEGORY_SECTIONS,
   SEVERITY_CATALOG,
@@ -71,8 +82,16 @@ import {
   type ReportCategorySection,
   type SeverityGroup,
 } from '../presentation/catalog.js';
-import { describeIncompleteReason, describeInteractionReason } from '../presentation/messages.js';
+import { describeIncompleteReason, describeInteractionReason, nextStepOfIncompleteReason } from '../presentation/messages.js';
 import { earlierAttemptEvidenceIds, retryRecordsOf, visibleTextOf } from './artifact-writer.js';
+import {
+  beaksightBlockRelationOf,
+  indexBeakSightBlocks,
+  safetyBlockPhaseCountsOf,
+  type BeakSightBlockRelationView,
+} from './beaksight-block-relation.js';
+
+export type { BeakSightBlockRefView, BeakSightBlockRelationView } from './beaksight-block-relation.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 型
@@ -87,6 +106,10 @@ export interface ReasonView<TCode extends string = IncompleteReasonCode> {
   readonly code: TCode;
   readonly detail: string | null;
   readonly description: string;
+  /**
+   * T44c（Task 44 の設計書 P1-4）: 次にできること（`messages.ts` の `nextStepOfIncompleteReason`。示せない理由と、Interaction の理由は `null`）。
+   */
+  readonly nextStep: string | null;
 }
 
 /**
@@ -97,6 +120,59 @@ export interface SeverityCountsView {
   readonly total: number;
   readonly bySeverity: Readonly<Record<Severity, number>>;
   readonly byGroup: Readonly<Record<SeverityGroup, number>>;
+}
+
+/** T44i: category の別の件数の 1 件（`RunSummaryView.findingCountsByCategory`）。 */
+export interface CategoryCountView {
+  readonly category: FindingCategory;
+  readonly count: number;
+}
+
+/** T44i: Rule の別の件数の 1 件（`RunSummaryView.findingCountsByRule`）。`category` は、その Rule の最初の Finding の category。 */
+export interface RuleCountView {
+  readonly ruleId: string;
+  readonly category: FindingCategory;
+  readonly count: number;
+}
+
+/**
+ * T44i: Rule ごとの要約の例の 1 件（Finding の一部の写し）。`message` は Rule の文のまま。`screenshots` は、その Finding のスクリーンショット
+ * （`FindingView.screenshots` と同じ。撮り方を問わない。ChatGPT 用バンドルは、入れる撮り方のものだけのパスを書く）。
+ */
+export interface RuleDigestExampleView {
+  readonly findingId: FindingId;
+  readonly pageId: PageId | null;
+  readonly viewport: ViewportProfile | null;
+  readonly message: string;
+  readonly screenshots: readonly ScreenshotView[];
+}
+
+/**
+ * T44i（Task 44 の設計書 6 章の 2026-10-22 の行。P2-9）: Rule ごとの要約（`ReportViewModel.ruleDigests`）。同じ指摘がページごとに並ぶので、全体の傾向を
+ * Rule の単位で見るためのもの。数えるのは、このファイルだけである（ChatGPT 用バンドルは描くだけ）。
+ */
+export interface RuleDigestView {
+  readonly ruleId: string;
+  /** その Rule の最初の Finding の category。 */
+  readonly category: FindingCategory;
+  /** severity ごとの件数（キーは `SEVERITIES` の順。0 件の severity も含む）。 */
+  readonly bySeverity: Readonly<Record<Severity, number>>;
+  readonly count: number;
+  /** 出たページの数（違う `pageId` の数。ページによらない Finding は数えない）。 */
+  readonly pageCount: number;
+  /** ビューポートごとの件数（キーはビューポートの表示の順。0 件のビューポートも含む）。 */
+  readonly byViewport: Readonly<Record<ViewportProfile, number>>;
+  /** ビューポートによらない Finding（`viewport` が `null`）の件数。 */
+  readonly viewportIndependentCount: number;
+  /**
+   * BN-d: BeakSight の遮断との関係の区分の別の件数（キーは `BEAKSIGHT_BLOCK_RELATIONS` の順。0 件の区分も含む）。SAFETY の Finding は区分の外なので、どの区分にも
+   * 数えない。
+   */
+  readonly byBlockRelation: Readonly<Record<BeakSightBlockRelation, number>>;
+  /**
+   * 例（`AuditRunResult.findings` の順で、ページの違うものを先に、`REPORT_RULE_DIGEST_EXAMPLE_COUNT` 件まで。足りなければ、残りを同じ順で足す）。
+   */
+  readonly examples: readonly RuleDigestExampleView[];
 }
 
 /** ページの網羅（`RunSummary` の件数のまま。数え直さない）。 */
@@ -151,7 +227,37 @@ export interface SiteUnavailableStopView {
   readonly detail: string | null;
 }
 
+/**
+ * BN-d（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.5）: 本体の Finding（BeakSight の遮断と結び付かない `NONE` のサイト品質）と、外した
+ * Finding（`CAUSED`・`POSSIBLE`・SAFETY）の件数（`RunSummaryView.beaksightBlockRelation`）。数えるのは表示用モデルだけ。
+ */
+export interface BeakSightBlockRelationSummaryView {
+  /** サイト品質の Finding の、区分の別の件数（キーは `BEAKSIGHT_BLOCK_RELATIONS` の順）。SAFETY の Finding は数えない。 */
+  readonly byRelation: Readonly<Record<BeakSightBlockRelation, number>>;
+  /** サイト品質の Finding のうち、BeakSight の遮断と結び付くもの（`CAUSED` と `POSSIBLE`）の件数。CLI の要約の行は、0 より大きいときだけ出す。 */
+  readonly linkedFindingCount: number;
+  /** 本体の Finding の件数（`NONE` のサイト品質）。 */
+  readonly mainFindingCounts: SeverityCountsView;
+  /** 外した Finding の件数（`CAUSED`・`POSSIBLE` のサイト品質と、SAFETY）。 */
+  readonly excludedFindingCounts: SeverityCountsView;
+}
+
 /** 要約（設計書 6.1.4 の節1）。 */
+/** AS-b: 監査の段の送信の扱いの表示（`RunSummaryView.auditSend`）。 */
+export interface AuditSendView extends RunAuditSendSummary {
+  /** 通したことを目立つ形で出すか（表示カタログの `prominent`）。 */
+  readonly prominent: boolean;
+  /** AS-c: ほかの Origin へ通した数（持たない Run は 0）。 */
+  readonly passedOtherOriginRequests: number;
+  /** AS-c: 通した WebSocket の接続の数（持たない Run は 0）。 */
+  readonly passedWebSockets: number;
+  /** AS-c fix round 1: そのうち Guard の route を通らずに開いた数と、危険な語に当たる数（持たない Run は 0）。 */
+  readonly passedWebSocketsOutsideGuard: number;
+  readonly passedDangerousWebSockets: number;
+  /** AS-c fix round 1: その知らせを出すか（`hasAuditSendWebSocketCaution` の 1 か所で決める）。 */
+  readonly webSocketCaution: boolean;
+}
+
 export interface RunSummaryView {
   readonly runId: RunId;
   /** `RunSummary.runStatus` のまま。 */
@@ -166,6 +272,14 @@ export interface RunSummaryView {
   readonly coverage: PageCoverageView;
   /** サイト品質（ERROR、WARN、INFO）と Safety の件数。出どころは `AuditRunResult.findings` だけ。 */
   readonly findingCounts: SeverityCountsView;
+  /** BN-d: 本体の Finding と外した Finding の件数と、区分の別の件数。 */
+  readonly beaksightBlockRelation: BeakSightBlockRelationSummaryView;
+  /**
+   * T44i（Task 44 の設計書 6 章の 2026-10-22 の行。P2-9）: category の別の件数（`FINDING_CATEGORIES` の全部を、表示カタログの順に。0 件の category も含む）。
+   */
+  readonly findingCountsByCategory: readonly CategoryCountView[];
+  /** T44i: Rule の別の件数（件数の多い順、同じ件数は `ruleId` の順（UTF-16 の符号単位の順））。 */
+  readonly findingCountsByRule: readonly RuleCountView[];
   /** 安全の不変条件の違反の件数（`RunSafetySummary.invariantViolationCount`）。 */
   readonly safetyInvariantViolationCount: number;
   readonly limits: RunLimitsView;
@@ -182,6 +296,12 @@ export interface RunSummaryView {
    * このモデルの組み立ての中で1回だけ決める。CLI の結果の行は、この値を使い、判断し直さない。
    */
   readonly siteUnavailableStop: SiteUnavailableStopView | null;
+  /**
+   * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.3）: 監査の段の送信の扱いと通した数（`run.json` の `safety.auditSend` の写し。持たない古い
+   * Run は `READ_ONLY`・0 件）。`prominent`（通したことを目立つ形で出すか）は、表示カタログ（`AUDIT_SEND_POLICY_CATALOG`）から、ここで 1 回だけ決める。HTML・
+   * CLI・`summary.json` は、この値を使い、数え直さない。
+   */
+  readonly auditSend: AuditSendView;
   /** Run の未完了の理由（`RunSummary.incompleteReasons` の順）。 */
   readonly incompleteReasons: readonly ReasonView[];
   readonly unverifiedInteractionCount: number;
@@ -239,6 +359,16 @@ export interface FindingView {
    * それぞれ `page.json` の中の順）。
    */
   readonly screenshots: readonly ScreenshotView[];
+  /**
+   * BN-c（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.3）: BeakSight の遮断との関係（区分・理由・結び付いた遮断）。判定は
+   * `src/report/beaksight-block-relation.ts` の 1 か所で、Finding ごとに 1 回だけ行う。SAFETY の Finding は区分の外なので `null`。
+   */
+  readonly beaksightBlockRelation: BeakSightBlockRelationView | null;
+  /**
+   * BN-R0 の M-3: SAFETY の Finding が数える止めた事象の、時点の別の件数（`CLOSING` は、閉じる途中とページを離れた後に止めたもの。測りの後）。サイト品質の Finding と、
+   * 時点を持つ事象を数えない SAFETY の Rule は `null`。
+   */
+  readonly safetyBlockPhaseCounts: Readonly<Record<BlockedEventPhase, number>> | null;
 }
 
 /**
@@ -289,6 +419,11 @@ export interface PageView {
   /** `AuditRunResult.findings` を `pageId` で絞ったもの（`PageAuditResult.findings` は使わない）。 */
   readonly findings: readonly FindingView[];
   readonly findingCounts: SeverityCountsView;
+  /** BN-d: このページの本体の Finding の ID と、外した Finding の ID（`AuditRunResult.findings` の順）と、それぞれの件数。 */
+  readonly mainFindingIds: readonly FindingId[];
+  readonly excludedFindingIds: readonly FindingId[];
+  readonly mainFindingCounts: SeverityCountsView;
+  readonly excludedFindingCounts: SeverityCountsView;
   readonly retryAttempts: readonly RetryAttemptView[];
 }
 
@@ -376,6 +511,19 @@ export interface ReportViewModel {
   readonly criticalFindings: readonly FindingView[];
   /** category の節（すべての節。Finding のない節も含む）。 */
   readonly categorySections: readonly FindingSectionView[];
+  /**
+   * T44i: Rule ごとの要約（severity の表示の順（その Rule のいちばん重い severity）、件数の多い順、`ruleId` の順（UTF-16 の符号単位の順））。
+   */
+  readonly ruleDigests: readonly RuleDigestView[];
+  /**
+   * BN-d（設計書 3.5）: 本体の Finding（BeakSight の遮断と結び付かない `NONE` のサイト品質。`AuditRunResult.findings` の順）と、外した Finding（`CAUSED`・`POSSIBLE`・
+   * SAFETY。同じ順）。ChatGPT 用バンドルの `findings.json` と `beaksight-related-findings.json` は、これを描くだけ。
+   */
+  readonly mainFindings: readonly FindingView[];
+  readonly excludedFindings: readonly FindingView[];
+  /** BN-d: 本体の Finding だけの Rule ごとの要約と、外した Finding だけの Rule ごとの要約（並びは `ruleDigests` と同じ決まり）。 */
+  readonly mainRuleDigests: readonly RuleDigestView[];
+  readonly excludedRuleDigests: readonly RuleDigestView[];
   readonly interactions: InteractionListView;
   /** Safety の一覧（`RunSummary.safety` の写し）と、Safety の事象の一覧（`events`）。 */
   readonly safety: SafetyView;
@@ -400,6 +548,8 @@ const reasonView = ({ code, detail }: IncompleteReason): ReasonView => ({
   code,
   detail,
   description: describeIncompleteReason(code),
+  // T44c: 次にできること（示せる理由だけ）。
+  nextStep: nextStepOfIncompleteReason(code),
 });
 
 /** Interaction の理由（Evidence の `reason` と `reasonDetail`）に、コードの日本語の説明を添える（C18o）。 */
@@ -407,6 +557,7 @@ const interactionReasonView = (code: InteractionReasonCode, detail: string | nul
   code,
   detail,
   description: describeInteractionReason(code),
+  nextStep: null,
 });
 
 /** Finding を severity ごと、区分ごとに数える（表示用の集計。このファイルだけで行う）。 */
@@ -430,15 +581,137 @@ const sortBySeverity = (findings: readonly FindingView[]): readonly FindingView[
 
 const copyFinding = (finding: Finding): Finding => ({ ...finding, evidenceRefs: [...finding.evidenceRefs] });
 
+/** T44i: category の別の件数（`FINDING_CATEGORIES` の全部を、表示カタログの順に。0 件も含む）。 */
+const countFindingsByCategory = (findings: readonly FindingView[]): readonly CategoryCountView[] => {
+  const counts = new Map<FindingCategory, number>();
+  for (const { finding } of findings) {
+    counts.set(finding.category, (counts.get(finding.category) ?? 0) + 1);
+  }
+  return sortByDisplayOrder(FINDING_CATEGORIES, FINDING_CATEGORY_CATALOG).map((category) => ({ category, count: counts.get(category) ?? 0 }));
+};
+
+/** T44i: 1 つの Rule の Finding（`AuditRunResult.findings` の順）。`category` は、最初の Finding の category。 */
+interface RuleFindingGroup {
+  readonly ruleId: string;
+  readonly category: FindingCategory;
+  readonly findings: FindingView[];
+}
+
+/** T44i: Finding を Rule ごとに分ける（Rule は最初に出た順、Rule の中は `AuditRunResult.findings` の順）。 */
+const groupFindingsByRule = (findings: readonly FindingView[]): readonly RuleFindingGroup[] => {
+  const groups = new Map<string, RuleFindingGroup>();
+  for (const view of findings) {
+    const { ruleId, category } = view.finding;
+    const group = groups.get(ruleId) ?? { ruleId, category, findings: [] };
+    group.findings.push(view);
+    groups.set(ruleId, group);
+  }
+  return [...groups.values()];
+};
+
+/** T44i: Rule の別の件数（件数の多い順、同じ件数は `ruleId` の順）。 */
+const countFindingsByRule = (groups: readonly RuleFindingGroup[]): readonly RuleCountView[] =>
+  groups
+    .map(({ ruleId, category, findings }) => ({ ruleId, category, count: findings.length }))
+    .sort((left, right) => right.count - left.count || compareCodeUnits(left.ruleId, right.ruleId));
+
+/**
+ * T44i: Rule ごとの要約の例。`AuditRunResult.findings` の順で、まだ選んでいないページ（ページによらない Finding は、1 つのページとして扱う）のものを
+ * `REPORT_RULE_DIGEST_EXAMPLE_COUNT` 件まで選び、足りなければ、残りを同じ順で足す。
+ */
+const ruleDigestExamples = (findings: readonly FindingView[]): readonly RuleDigestExampleView[] => {
+  const picked: FindingView[] = [];
+  const pickedPages = new Set<PageId | null>();
+  for (const view of findings) {
+    if (picked.length < REPORT_RULE_DIGEST_EXAMPLE_COUNT && !pickedPages.has(view.finding.pageId)) {
+      pickedPages.add(view.finding.pageId);
+      picked.push(view);
+    }
+  }
+  const pickedSet = new Set(picked);
+  for (const view of findings) {
+    if (picked.length < REPORT_RULE_DIGEST_EXAMPLE_COUNT && !pickedSet.has(view)) {
+      picked.push(view);
+    }
+  }
+  return picked.map(({ finding, screenshots }) => ({
+    findingId: finding.findingId,
+    pageId: finding.pageId,
+    viewport: finding.viewport,
+    message: finding.message,
+    screenshots,
+  }));
+};
+
+/** BN-c: サイト品質の severity か（SAFETY の Finding は、BeakSight の遮断との関係の区分の外）。 */
+const isSiteQualitySeverity = (severity: Severity): boolean => SEVERITY_CATALOG[severity].group === 'SITE_QUALITY';
+
+/** BN-d: 本体の Finding か（BeakSight の遮断と結び付かない `NONE` のサイト品質）。 */
+const isMainFinding = (view: FindingView): boolean => view.beaksightBlockRelation?.relation === 'NONE';
+
+/** BN-d: 区分の別の件数（キーは `BEAKSIGHT_BLOCK_RELATIONS` の順。区分を持たない SAFETY の Finding は数えない）。 */
+const countByBlockRelation = (findings: readonly FindingView[]): Readonly<Record<BeakSightBlockRelation, number>> => {
+  const counts = Object.fromEntries(BEAKSIGHT_BLOCK_RELATIONS.map((relation) => [relation, 0])) as Record<BeakSightBlockRelation, number>;
+  for (const { beaksightBlockRelation } of findings) {
+    if (beaksightBlockRelation !== null) {
+      counts[beaksightBlockRelation.relation] += 1;
+    }
+  }
+  return counts;
+};
+
+/** T44i: その Rule のいちばん重い severity の、表示の順（小さいほど先）。Rule の Finding は 1 件以上ある。 */
+const mostSevereOrder = (bySeverity: Readonly<Record<Severity, number>>): number =>
+  Math.min(...SEVERITIES.filter((severity) => bySeverity[severity] > 0).map((severity) => SEVERITY_CATALOG[severity].order));
+
+/**
+ * T44i: Rule ごとの要約（severity の表示の順（その Rule のいちばん重い severity）、件数の多い順、`ruleId` の順）。severity ごとの件数は
+ * `countFindings` で数える。
+ */
+const buildRuleDigests = (groups: readonly RuleFindingGroup[], viewportOrder: readonly ViewportProfile[]): readonly RuleDigestView[] =>
+  groups
+    .map(({ ruleId, category, findings }): RuleDigestView => {
+      const byViewport = Object.fromEntries(viewportOrder.map((viewport) => [viewport, 0])) as Record<ViewportProfile, number>;
+      let viewportIndependentCount = 0;
+      const pageIds = new Set<PageId>();
+      for (const { finding } of findings) {
+        if (finding.viewport === null) {
+          viewportIndependentCount += 1;
+        } else {
+          byViewport[finding.viewport] += 1;
+        }
+        if (finding.pageId !== null) {
+          pageIds.add(finding.pageId);
+        }
+      }
+      return {
+        ruleId,
+        category,
+        bySeverity: countFindings(findings).bySeverity,
+        count: findings.length,
+        pageCount: pageIds.size,
+        byViewport,
+        viewportIndependentCount,
+        byBlockRelation: countByBlockRelation(findings),
+        examples: ruleDigestExamples(findings),
+      };
+    })
+    .sort(
+      (left, right) =>
+        mostSevereOrder(left.bySeverity) - mostSevereOrder(right.bySeverity) ||
+        right.count - left.count ||
+        compareCodeUnits(left.ruleId, right.ruleId),
+    );
+
 /**
  * 実行の記録の表示（R6）。実行の回数と再開の回数を数えるのは、ここだけである。最初の実行の後の実行が、再開である。
  * この起動の終わり方（最後の実行の終わり方。中断した Run の再開の設計書 4.8 の 2026-10-08 の追補。R9）と、最後の実行の終わりの時刻
- * （CCX-19。CC-048）を決めるのも、ここだけである。
+ * （CCX-19。CC-048）を決めるのも、ここだけである（どれが最後の実行かは、core の `lastRunExecutionOf` で選ぶ。PRE42-CC 組 UI-K）。
  * 記録の値は、写して持つ（入力を凍結しない）。
  */
 const executionsView = (executions: RunSummary['executions']): RunExecutionsView => {
   const [first, ...resumedExecutions] = executions;
-  const lastExecution = resumedExecutions.at(-1) ?? first;
+  const lastExecution = lastRunExecutionOf(executions) ?? first;
   return {
     count: executions.length,
     resumeCount: resumedExecutions.length,
@@ -449,13 +722,35 @@ const executionsView = (executions: RunSummary['executions']): RunExecutionsView
 };
 
 /**
+ * AS-b: 監査の段の送信の扱いの表示。`run.json` の `safety.auditSend` の写しで、持たない古い Run は `READ_ONLY`・0 件と読む。目立つ形で出すかは表示カタログ
+ * （`AUDIT_SEND_POLICY_CATALOG`）の値（ここだけで決める）。
+ */
+const auditSendView = (run: RunSummary): AuditSendView => {
+  const auditSend = run.safety.auditSend ?? { policy: DEFAULT_AUDIT_SEND_POLICY, passedRequests: 0, passedRequestsByMethod: {} };
+  return {
+    policy: auditSend.policy,
+    prominent: AUDIT_SEND_POLICY_CATALOG[auditSend.policy].prominent,
+    passedRequests: auditSend.passedRequests,
+    passedRequestsByMethod: { ...auditSend.passedRequestsByMethod },
+    // AS-c: ほかの Origin へ通した数と、通した WebSocket の接続の数（持たない Run は 0）。
+    passedOtherOriginRequests: auditSend.passedOtherOriginRequests ?? 0,
+    passedWebSockets: auditSend.passedWebSockets ?? 0,
+    // AS-c fix round 1: Guard の route を通らずに開いた接続と、危険な語の接続の数（持たない Run は 0）と、その知らせを出すか。
+    passedWebSocketsOutsideGuard: auditSend.passedWebSocketsOutsideGuard ?? 0,
+    passedDangerousWebSockets: auditSend.passedDangerousWebSockets ?? 0,
+    webSocketCaution: hasAuditSendWebSocketCaution(auditSend),
+  };
+};
+
+/**
  * サイトの不調で止めたことの表示（サイトが応答しないときに Run を止める設計書 3.4）。出すかどうかを決めるのは、ここだけである。
  * - 実行の記録の最後の実行の終わり方が `STOPPED_BY_SITE_UNAVAILABLE` のときだけ、値を返す（Run の理由ではなく、終わり方で決める。
  *   前の実行が不調で止まっていても、最後の実行がほかの終わり方なら `null`）。
+ * - どの実行が最後かは決め直さず、実行の記録の表示（`executionsView`）の `lastEndReason` を読む（PRE42-CC 組 5a。CC-048）。
  * - `detail` は、Run の理由のうち、コード `SITE_UNAVAILABLE` の最初のものの `detail`（その理由がなければ `null`）。
  */
-const siteUnavailableStopView = (run: RunSummary): SiteUnavailableStopView | null => {
-  if (run.executions.at(-1)?.endReason !== 'STOPPED_BY_SITE_UNAVAILABLE') {
+const siteUnavailableStopView = (run: RunSummary, executions: RunExecutionsView): SiteUnavailableStopView | null => {
+  if (executions.lastEndReason !== 'STOPPED_BY_SITE_UNAVAILABLE') {
     return null;
   }
   const reason = run.incompleteReasons.find(({ code }) => code === 'SITE_UNAVAILABLE');
@@ -712,6 +1007,8 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
     }
   }
 
+  // BN-c: BeakSight の遮断との関係は、Run の索引を 1 回だけ作り、サイト品質の Finding ごとに 1 回だけ判定する（SAFETY の Finding は区分の外）。
+  const blockIndex = indexBeakSightBlocks(result);
   const findings: readonly FindingView[] = result.findings.map((finding, index) => ({
     finding: copyFinding(finding),
     evidence: finding.evidenceRefs.map((evidenceId) => ({ evidenceId, location: locationById.get(evidenceId) ?? null })),
@@ -719,7 +1016,12 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
       const screenshot = screenshotById.get(evidenceId);
       return screenshot === undefined ? [] : [screenshot];
     }),
+    beaksightBlockRelation: isSiteQualitySeverity(finding.severity) ? beaksightBlockRelationOf(blockIndex, finding) : null,
+    safetyBlockPhaseCounts: isSiteQualitySeverity(finding.severity) ? null : safetyBlockPhaseCountsOf(blockIndex, finding),
   }));
+  // BN-d: 本体の Finding と外した Finding（`AuditRunResult.findings` の順）。
+  const mainFindings = findings.filter(isMainFinding);
+  const excludedFindings = findings.filter((view) => !isMainFinding(view));
 
   const categorySections: readonly FindingSectionView[] = sortByDisplayOrder(
     REPORT_CATEGORY_SECTIONS,
@@ -731,8 +1033,12 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
   });
 
   const viewportOrder = sortByDisplayOrder(VIEWPORT_PROFILES, VIEWPORT_PROFILE_CATALOG);
+  // T44i: Rule の別の件数と、Rule ごとの要約（同じ分け方から、1 回だけ数える）。
+  const ruleGroups = groupFindingsByRule(findings);
   const pages: readonly PageView[] = pageIndexes.map(({ page, index }) => {
     const pageFindings = findings.filter(({ finding }) => finding.pageId === page.pageId);
+    const pageMainFindings = pageFindings.filter(isMainFinding);
+    const pageExcludedFindings = pageFindings.filter((view) => !isMainFinding(view));
     const earlier = earlierAttemptEvidenceIds(run, page);
     return {
       pageId: page.pageId,
@@ -756,6 +1062,10 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
       screenshots: index.screenshots.filter((screenshot) => !earlier.has(screenshot.evidenceId)),
       findings: pageFindings,
       findingCounts: countFindings(pageFindings),
+      mainFindingIds: pageMainFindings.map((view) => view.finding.findingId),
+      excludedFindingIds: pageExcludedFindings.map((view) => view.finding.findingId),
+      mainFindingCounts: countFindings(pageMainFindings),
+      excludedFindingCounts: countFindings(pageExcludedFindings),
       retryAttempts: retryRecordsOf(run, page).map((retry) => {
         const ids = new Set(retry.evidenceIds);
         return {
@@ -791,6 +1101,7 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
   }
 
   const crawl = run.effectiveConfig.crawl;
+  const executions = executionsView(run.executions);
   const model: ReportViewModel = {
     summary: {
       runId: run.runId,
@@ -809,6 +1120,14 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
         skipped: run.skippedPageCount,
       },
       findingCounts: countFindings(findings),
+      beaksightBlockRelation: {
+        byRelation: countByBlockRelation(findings),
+        linkedFindingCount: excludedFindings.filter(({ beaksightBlockRelation }) => beaksightBlockRelation !== null).length,
+        mainFindingCounts: countFindings(mainFindings),
+        excludedFindingCounts: countFindings(excludedFindings),
+      },
+      findingCountsByCategory: countFindingsByCategory(findings),
+      findingCountsByRule: countFindingsByRule(ruleGroups),
       safetyInvariantViolationCount: run.safety.invariantViolationCount,
       limits: {
         maxPages: crawl.maxPages,
@@ -817,8 +1136,9 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
         reached: { ...run.crawlLimits },
       },
       load: structuredClone(run.load),
-      executions: executionsView(run.executions),
-      siteUnavailableStop: siteUnavailableStopView(run),
+      executions,
+      siteUnavailableStop: siteUnavailableStopView(run, executions),
+      auditSend: auditSendView(run),
       incompleteReasons: run.incompleteReasons.map(reasonView),
       unverifiedInteractionCount: run.unverifiedInteractionCount,
       unverifiedInternalLinkCount: run.unverifiedInternalLinkCount,
@@ -827,6 +1147,11 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
     findings,
     criticalFindings: findings.filter(({ finding }) => CRITICAL_SEVERITIES.has(finding.severity)),
     categorySections,
+    ruleDigests: buildRuleDigests(ruleGroups, viewportOrder),
+    mainFindings,
+    excludedFindings,
+    mainRuleDigests: buildRuleDigests(groupFindingsByRule(mainFindings), viewportOrder),
+    excludedRuleDigests: buildRuleDigests(groupFindingsByRule(excludedFindings), viewportOrder),
     interactions: { items: interactionItems, byStatus, notVerifiableByKind },
     safety: { ...structuredClone(run.safety), events: safetyEvents },
     pages,

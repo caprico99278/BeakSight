@@ -5,7 +5,13 @@
  *   3 月 2 日に繰り越すなど）を使わない。読み戻せない値は、日時の書式の「未観測」（`formatNotObserved`）として示す。
  */
 import { formatNotObserved } from '../../../../src/presentation/format.js';
-import { parseCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
+import { formatCompactUtcTimestamp, parseCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
+
+/**
+ * 今の時刻（管理データの UTC の 14 桁。`label` は誤りの文に入れる時刻の名前）。FM2R の Minor 13: 画面のサーバの保存の口が、それぞれに書いていた
+ * `nowStamp` を、ここの 1 か所にまとめた。
+ */
+export const nowCompactTimestamp = (label: string): string => formatCompactUtcTimestamp(new Date(), label);
 
 /** ISO 8601 の秒までの部分の長さ（`YYYY-MM-DDTHH:mm:ss`）。`toISOString` のミリ秒を除く。 */
 const ISO_SECONDS_LENGTH = 'YYYY-MM-DDTHH:mm:ss'.length;

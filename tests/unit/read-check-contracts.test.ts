@@ -17,11 +17,16 @@ import {
   MAX_READ_CHECK_PARAMETERS,
   MAX_READ_CHECK_ROW_COUNT,
   MAX_READ_CHECKS_PER_JOB,
+  MAX_READ_CHECK_PAGE_PATH_LENGTH,
   READ_CHECK_EXPECTATION_KINDS,
   READ_CHECK_RESULTS,
+  READ_CHECK_TARGET_KINDS,
   isSendableField,
   isSendableReadCheckParameter,
+  readCheckPageUrlOf,
+  readCheckTargetKindOf,
   unsendableReadCheckParameterNames,
+  type ReadCheckDefinition,
 } from '../../src/discovery/read-check-contracts.js';
 import { sampleField } from './discovery-candidate-samples.js';
 
@@ -144,5 +149,60 @@ describe('CCX-10: the sendable fields of a READ check (the only judgement for th
     expect(unsendableReadCheckParameterNames(candidate, { q: 'x', status: 'open' })).toEqual([]);
     expect(unsendableReadCheckParameterNames(candidate, {})).toEqual([]);
     expect(unsendableReadCheckParameterNames(candidate, { invisible: 'x', q: 'x', missing: 'y', choice: 'a' })).toEqual(['invisible', 'missing', 'choice']);
+  });
+});
+
+// T37d（Task 37 の設計書 3.5）: READ の定義の対象は、READ の候補の識別の digest（`targetIdentityDigest`）か、画面の path（`targetPagePath`）のどちらか
+// 1 つ。画面の path の定義は、送る値を持たない（空だけ受ける）。画面の path は、`/` で始まり query と fragment を持たない、正規の形の path だけ。
+describe('T37d: the two targets of a READ check definition (a READ candidate or a page path)', () => {
+  const pageDefinition = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    targetPagePath: '/admin/members',
+    parameters: {},
+    expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }],
+    ...overrides,
+  });
+
+  it('has the closed list of the target kinds and the limit of the page path equal to the schema', () => {
+    expect(READ_CHECK_TARGET_KINDS).toEqual(['CANDIDATE', 'PAGE']);
+    expect(Object.isFrozen(READ_CHECK_TARGET_KINDS)).toBe(true);
+    expect(SCHEMA.properties.targetPagePath).toMatchObject({ maxLength: MAX_READ_CHECK_PAGE_PATH_LENGTH });
+  });
+
+  it('accepts a page path definition with no parameters, and tells the target kind of each definition', () => {
+    expect(validateControlDocument('read-check-definition', pageDefinition()).ok).toBe(true);
+    expect(validateControlDocument('read-check-definition', pageDefinition({ targetPagePath: '/' })).ok).toBe(true);
+    expect(readCheckTargetKindOf(pageDefinition() as unknown as ReadCheckDefinition)).toBe('PAGE');
+    expect(readCheckTargetKindOf(definition() as unknown as ReadCheckDefinition)).toBe('CANDIDATE');
+  });
+
+  it('rejects a definition with both targets, with no target, or a page path definition with parameters', () => {
+    for (const [name, value] of [
+      ['both targets', pageDefinition({ targetIdentityDigest: DIGEST })],
+      ['no target', { parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] }],
+      ['a page path with a parameter', pageDefinition({ parameters: { q: 'x' } })],
+      ['a page path that does not start with a slash', pageDefinition({ targetPagePath: 'admin' })],
+      ['an empty page path', pageDefinition({ targetPagePath: '' })],
+      ['a page path of another host', pageDefinition({ targetPagePath: '//example.invalid/admin' })],
+      ['a page path with a query', pageDefinition({ targetPagePath: '/admin?id=1' })],
+      ['a page path with a fragment', pageDefinition({ targetPagePath: '/admin#top' })],
+      ['a page path with a backslash', pageDefinition({ targetPagePath: '/\\example.invalid' })],
+      ['a page path with a space', pageDefinition({ targetPagePath: '/admin page' })],
+      ['a page path over the limit', pageDefinition({ targetPagePath: `/${'a'.repeat(MAX_READ_CHECK_PAGE_PATH_LENGTH)}` })],
+    ] as const) {
+      expect(validateControlDocument('read-check-definition', value).ok, name).toBe(false);
+    }
+  });
+
+  it('builds the page URL only from a canonical path on an http(s) origin (fail-closed)', () => {
+    const origin = 'http://127.0.0.1:4173';
+    expect(readCheckPageUrlOf(origin, '/admin/members')).toBe(`${origin}/admin/members`);
+    expect(readCheckPageUrlOf(origin, '/')).toBe(`${origin}/`);
+    expect(readCheckPageUrlOf(origin, '/a%20b')).toBe(`${origin}/a%20b`);
+    for (const path of ['admin', '//example.invalid/x', '/a/../b', '/a/./b', '/\\example.invalid', '/a\tb', '/会員', '/a b', '/a?b', '/a#b', '', `/${'a'.repeat(MAX_READ_CHECK_PAGE_PATH_LENGTH)}`]) {
+      expect(readCheckPageUrlOf(origin, path), JSON.stringify(path)).toBeNull();
+    }
+    expect(readCheckPageUrlOf('ftp://127.0.0.1', '/admin')).toBeNull();
+    expect(readCheckPageUrlOf('http://127.0.0.1:4173/base', '/admin')).toBeNull();
+    expect(readCheckPageUrlOf('not a url', '/admin')).toBeNull();
   });
 });

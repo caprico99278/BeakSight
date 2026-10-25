@@ -11,7 +11,7 @@
  *   `CREDENTIAL_PLATFORM_UNSUPPORTED` で拒む）。
  */
 import { join } from 'node:path';
-import { CREDENTIAL_PLATFORM } from '../../../../src/control/credentials/credential-platform.js';
+import { CREDENTIAL_PLATFORM, CREDENTIAL_PROTECTION_AVAILABLE } from '../../../../src/control/credentials/credential-platform.js';
 import { prepareCredentialStorage } from '../../../../src/control/credentials/credential-preparation.js';
 import {
   createCredentialStore,
@@ -23,9 +23,6 @@ import { localUiRepositoryRoot } from './control-store';
 /** 資格情報の暗号化を、この環境で使えるか（閉じた一覧。表示は `CREDENTIAL_ENVIRONMENT_CATALOG`）。 */
 export const CREDENTIAL_ENVIRONMENT_STATES = Object.freeze(['AVAILABLE', 'UNAVAILABLE', 'NOT_WINDOWS'] as const);
 export type CredentialEnvironmentState = (typeof CREDENTIAL_ENVIRONMENT_STATES)[number];
-
-/** 暗号化が使える状態。 */
-const PROTECTION_AVAILABLE = 'AVAILABLE' satisfies CredentialProtectionState;
 
 /** 起動のときの準備の結果（値を持たない）。 */
 export interface LocalUiCredentialPreparation {
@@ -57,7 +54,7 @@ export const credentialEnvironmentStateOf = (
   if (!platformSupported) {
     return 'NOT_WINDOWS';
   }
-  return protection === PROTECTION_AVAILABLE ? 'AVAILABLE' : 'UNAVAILABLE';
+  return protection === CREDENTIAL_PROTECTION_AVAILABLE ? 'AVAILABLE' : 'UNAVAILABLE';
 };
 
 const prepare = async (): Promise<LocalUiCredentialPreparation> => {
@@ -76,4 +73,4 @@ export const localUiCredentialEnvironment = async (): Promise<CredentialEnvironm
 
 /** 開始の前の確かめ（画面の表示の補助）に渡す、暗号化の状態。 */
 export const protectionStateOf = (state: CredentialEnvironmentState): CredentialProtectionState =>
-  state === 'AVAILABLE' ? PROTECTION_AVAILABLE : 'UNAVAILABLE';
+  state === 'AVAILABLE' ? CREDENTIAL_PROTECTION_AVAILABLE : 'UNAVAILABLE';

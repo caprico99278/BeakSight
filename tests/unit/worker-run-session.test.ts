@@ -22,7 +22,7 @@ import {
   isOwnRunLock,
   isProcessRunning,
   type RunLock,
-} from '../../src/orchestration/run-checkpoint.js';
+} from '../../src/core/process-lock.js';
 import { ArtifactWriter } from '../../src/report/artifact-writer.js';
 import { endWorkerRun, startWorkerRun } from '../../src/worker/worker-run-session.js';
 

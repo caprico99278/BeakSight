@@ -1,8 +1,9 @@
-// T25a（Task 25 の設計書 4.1、5 章）: 認証の設定（`beaksight-auth-setup/1`）の契約・スキーマ・検証の検査。
-// T26b（Task 26 の設計書 4.3）: 検証が受けるのは版 2（`beaksight-auth-setup/2`）だけになったので、検証の例の値は、版 1 の項目に
-// `automatedLogin: null` を足した版 2 の文書にする。版 1 のスキーマの検査は、版 1 の文書（`v1Setup`）で続ける。版 2 に固有の検査は
-// `control-auth-setup-v2.test.ts`。
-// - 契約（`src/control/auth/auth-setup-contracts.ts`）と JSON Schema（`schemas/control/auth-setup.schema.json`）の項目と上限の一致。
+// T25a（Task 25 の設計書 4.1、5 章）: 認証の設定の契約・スキーマ・検証の検査。
+// LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 認証の設定は版 3（`beaksight-auth-setup/3`）だけ。検証の例の値は、フォームの送信のログインの版 3 の
+// 文書（`tests/helpers/auth-setup-samples.ts` の項目を足す）。自動ログインの検査は `control-auth-setup-v2.test.ts`、スクリプトで送るログインの検査は
+// `control-auth-setup-v3.test.ts`。版 1・版 2 と知らない版の文書を形の誤りにする確かめは、ここの 1 か所（O1）。
+// - 契約（`src/control/auth/auth-setup-contracts.ts`）と JSON Schema（`schemas/control/auth-setup-v3.schema.json`）の項目と上限の一致（O2: 上限の
+//   一致の確かめは、ここの 1 か所）。
 // - 検証（`validateAuthSetup`）: 正しい設定が通る。各決まりの違反が、それぞれの誤りで拒まれる（fail-closed。当たった誤りをすべて返す）。
 // - 誤りの文に、設定の値（秘密に見える query の値など）を入れない。
 // 例の値は、匿名の値（`example.invalid`、`127.0.0.1`）だけを使う。
@@ -11,10 +12,8 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
-  AUTH_SETUP_SCHEMA_VERSION,
-  AUTH_SETUP_SCHEMA_VERSION_2,
+  AUTH_SETUP_SCHEMA_VERSION_3,
   AUTH_SETUP_VALIDATION_ERROR_CODES,
-  DEFAULT_EXCLUDED_URL_WORDS,
   MAX_ALLOWED_IDP_ORIGINS,
   MAX_AUTH_SETUP_PATH_LIST_ITEMS,
   MAX_AUTH_SETUP_URL_LENGTH,
@@ -22,12 +21,12 @@ import {
   MAX_LOGIN_POST_ENDPOINTS,
   MAX_SUCCESS_SELECTOR_LENGTH,
   MIN_LOGIN_ATTEMPTS,
-  SECRET_LIKE_QUERY_NAME_WORDS,
   type AuthSetup,
-  type AuthSetupV1,
   type AuthSetupValidationErrorCode,
   type AuthSetupValidationResult,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
+import { SECRET_LIKE_QUERY_NAME_WORDS } from '../../src/core/secret-query-names.js';
 import { sessionLostPathPrefixOf, validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
 import {
   MIN_PROFILE_REVISION,
@@ -39,6 +38,7 @@ import {
 import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
 import { MAX_URL_LENGTH } from '../../src/core/limits.js';
+import { FORM_NAVIGATION_SETUP_ITEMS, previousVersionSetupDocumentOf } from '../helpers/auth-setup-samples.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_ORIGIN = 'https://app.example.invalid';
@@ -47,8 +47,8 @@ const UNAPPROVED_ORIGIN = 'https://other.example.invalid';
 /** 誤りの文に出てはいけない目印（秘密に見える query の値）。 */
 const SECRET_MARKER = 'secret-marker-7f3c9a';
 
-const AUTH_SETUP_SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'auth-setup.schema.json');
-const AUTH_SETUP_SCHEMA_ID = 'urn:beaksight:schema:control:auth-setup:1';
+const AUTH_SETUP_SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'auth-setup-v3.schema.json');
+const AUTH_SETUP_SCHEMA_ID = 'urn:beaksight:schema:control:auth-setup:3';
 
 const targetConfig: AuditConfig = {
   ...createTestConfig(TEST_ORIGIN),
@@ -78,9 +78,9 @@ const validatedProfileOf = (input: SiteProfile, profileContext: ProfileValidatio
 
 const testAuthProfile = validatedProfileOf(testAuthProfileInput);
 
-/** 版 1 の文書（公開済みの版 1 のスキーマの検査に使う。T26b からは、検証は受けない）。 */
-const v1Setup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION,
+/** 検証の例の値（版 3 のフォームの送信のログイン。手動のログインなので `automatedLogin` は null）。 */
+const validSetup = {
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-test-env',
   profileRevision: 3,
   loginStartUrl: `${TEST_ORIGIN}/admin/login?next=%2Fadmin`,
@@ -91,17 +91,17 @@ const v1Setup = {
   auditPathPrefixes: ['/admin/'],
   maxLoginAttempts: 2,
   allowedIdpOrigins: [],
-} satisfies AuthSetupV1;
-
-/** 検証の例の値（版 2。手動のログインなので `automatedLogin` は null。T26b）。 */
-const validSetup = {
-  ...v1Setup,
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
   automatedLogin: null,
 } satisfies AuthSetup;
 
-/** 版 1 のスキーマの項目（版 2 の `automatedLogin` を除く）。 */
-const SETUP_KEYS = Object.freeze(Object.keys(v1Setup));
+/** 版 3 のスキーマの必須の項目（この順。設計書 4.1 の表、T26b の `automatedLogin`、T34a の版 3 の項目）。 */
+const REQUIRED_SETUP_KEYS = Object.freeze([
+  'schemaVersion', 'profileId', 'profileRevision', 'loginStartUrl', 'loginPostEndpoints', 'successCondition', 'sessionLostCondition', 'excludedPaths',
+  'auditPathPrefixes', 'maxLoginAttempts', 'allowedIdpOrigins', 'automatedLogin', 'loginTransport', 'scriptLogin', 'loginSideRequests', 'successStorageKey',
+]);
+
+/** 版 3 のスキーマの任意の項目（T35a）。 */
+const OPTIONAL_SETUP_KEYS = Object.freeze(['auditReadRequests', 'serviceRequestLimits']);
 
 /** 拒否のコード（重複を除き、並べた値）。 */
 const codesOf = (result: AuthSetupValidationResult): readonly AuthSetupValidationErrorCode[] =>
@@ -123,7 +123,7 @@ describe('T25a: the auth setup contract and its schema', () => {
   const properties = schema.properties as Record<string, Record<string, unknown>>;
 
   it('fixes the schema version, the error codes and the named limits', () => {
-    expect(AUTH_SETUP_SCHEMA_VERSION).toBe('beaksight-auth-setup/1');
+    expect(AUTH_SETUP_SCHEMA_VERSION_3).toBe('beaksight-auth-setup/3');
     expect(MIN_LOGIN_ATTEMPTS).toBe(1);
     expect(MAX_LOGIN_ATTEMPTS).toBe(3);
     expect(MAX_AUTH_SETUP_URL_LENGTH).toBe(MAX_URL_LENGTH);
@@ -142,18 +142,20 @@ describe('T25a: the auth setup contract and its schema', () => {
     expect(schema.$id).toBe(AUTH_SETUP_SCHEMA_ID);
     expect(schema.type).toBe('object');
     expect(schema.additionalProperties).toBe(false);
-    expect(schema.required).toEqual(SETUP_KEYS);
-    expect(Object.keys(properties)).toEqual(SETUP_KEYS);
+    expect(schema.required).toEqual(REQUIRED_SETUP_KEYS);
+    expect(Object.keys(properties)).toEqual([...REQUIRED_SETUP_KEYS, ...OPTIONAL_SETUP_KEYS]);
+    expect(Object.keys(validSetup).sort()).toEqual([...REQUIRED_SETUP_KEYS].sort());
   });
 
   it('uses the named constants as the limits of the schema', () => {
     const endpoints = properties.loginPostEndpoints ?? {};
     const endpointItem = (endpoints.items ?? {}) as { properties?: Record<string, Record<string, unknown>> };
     const success = (properties.successCondition ?? {}) as { properties?: Record<string, Record<string, unknown>> };
-    expect(properties.schemaVersion?.const).toBe(AUTH_SETUP_SCHEMA_VERSION);
+    expect(properties.schemaVersion?.const).toBe(AUTH_SETUP_SCHEMA_VERSION_3);
     expect(properties.loginStartUrl?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
     expect(endpoints.maxItems).toBe(MAX_LOGIN_POST_ENDPOINTS);
-    expect(endpoints.minItems).toBe(1);
+    // T34a: スクリプトで送るログインは空でよい（フォームの送信で 1 つ以上要るのは、検証の決まり `AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED`）。
+    expect(endpoints.minItems).toBe(0);
     expect(endpointItem.properties?.origin?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
     expect(endpointItem.properties?.path?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
     expect(success.properties?.selector?.maxLength).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
@@ -164,14 +166,14 @@ describe('T25a: the auth setup contract and its schema', () => {
     expect(properties.maxLoginAttempts?.maximum).toBe(MAX_LOGIN_ATTEMPTS);
     expect(properties.profileRevision?.minimum).toBe(MIN_PROFILE_REVISION);
     expect(properties.profileId?.$ref).toBe('urn:beaksight:schema:control:profile:1#/properties/profileId');
-    expect(PROFILE_ID_PATTERN.test(v1Setup.profileId)).toBe(true);
+    expect(PROFILE_ID_PATTERN.test(validSetup.profileId)).toBe(true);
   });
 
-  // T26b: 版 1 のスキーマは、管理データの版 1 の文書を読むために残す（公開済みの形のまま）。例の値は版 1 の文書。
+  // LG-3b: 版 1・版 2 のスキーマの名前は捨てた（版 3 だけ）。
   it('is one of the control schema names, and the schema accepts the valid setup', () => {
-    expect(CONTROL_SCHEMA_NAMES).toContain('auth-setup');
-    expect(validateControlDocument('auth-setup', v1Setup)).toEqual({ ok: true });
-    expect(validateControlDocument('auth-setup', { ...v1Setup, extra: true }).ok).toBe(false);
+    expect(CONTROL_SCHEMA_NAMES).toContain('auth-setup-v3');
+    expect(validateControlDocument('auth-setup-v3', validSetup)).toEqual({ ok: true });
+    expect(validateControlDocument('auth-setup-v3', { ...validSetup, extra: true }).ok).toBe(false);
   });
 });
 
@@ -235,13 +237,21 @@ describe('T25a: validateAuthSetup rejects each rule violation with its own code 
     expect(codesOf(validate(() => undefined))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
     expect(codesOf(validate(null))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
     expect(codesOf(validate(withSetup({ extra: 1 })))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-    // T26b: 検証が受けるのは版 2 だけ。版 1 の文書（版 1 の文字列）は、管理データから読むときだけ版 2 に直す（`auth-setup-store.ts`）。
-    // 版 2 を受けることは、上の「accepts the valid setup」で確かめる。
-    expect(codesOf(validate(v1Setup))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-    expect(codesOf(validate(withSetup({ schemaVersion: AUTH_SETUP_SCHEMA_VERSION })))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-    expect(codesOf(validate(withSetup({ schemaVersion: 'beaksight-auth-setup/3' })))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-    expect(codesOf(validate(withSetup({ loginPostEndpoints: [] })))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
     expect(codesOf(validate(withSetup({ maxLoginAttempts: 1.5 })))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
+  });
+
+  // LG-3b（O1。`control-auth-setup-v2.test.ts` と `control-auth-setup-v3.test.ts` の同じ確かめをまとめた）: 検証が受けるのは版 3 だけ。前の版
+  // （版 1・版 2）の文書、版の文字列だけを変えた文書、知らない版は、形の誤り。
+  it('rejects the documents of version 1 and version 2 and of an unknown version with AUTH_SETUP_SCHEMA_INVALID (LG-3)', () => {
+    for (const document of [
+      previousVersionSetupDocumentOf(validSetup, 1),
+      previousVersionSetupDocumentOf(validSetup, 2),
+      withSetup({ schemaVersion: 'beaksight-auth-setup/1' }),
+      withSetup({ schemaVersion: 'beaksight-auth-setup/2' }),
+      withSetup({ schemaVersion: 'beaksight-auth-setup/4' }),
+    ]) {
+      expect(codesOf(validate(document)), JSON.stringify(document.schemaVersion)).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
+    }
   });
 
   it('rejects a PUBLIC_PASSIVE profile with AUTH_SETUP_MODE_UNSUPPORTED', () => {

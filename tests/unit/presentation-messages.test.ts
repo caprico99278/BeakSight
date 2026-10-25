@@ -6,8 +6,10 @@ import {
   FORMAT_UNIT_TEXT,
   HTML_REPORT_TEXT,
   INCOMPLETE_REASON_DESCRIPTIONS,
+  INCOMPLETE_REASON_NEXT_STEPS,
   INTERACTION_REASON_DESCRIPTIONS,
   NOT_OBSERVED_TEXT,
+  PAGE_COVERAGE_ITEMS,
   RUN_SUMMARY_TEXT,
   activeRunInOutputDirectoryText,
   checkpointStoreFailedText,
@@ -21,6 +23,7 @@ import {
   finalizingRunText,
   finishedCheckpointCleanupFailedText,
   listText,
+  nextStepOfIncompleteReason,
   ordinalText,
   progressItemsText,
   resumingRunText,
@@ -54,6 +57,44 @@ describe('incomplete reason descriptions', () => {
 
   it('is frozen', () => {
     expect(Object.isFrozen(INCOMPLETE_REASON_DESCRIPTIONS)).toBe(true);
+  });
+
+  // T44c（Task 44 の設計書 P1-4）: 内側のスクロールの領域を走査しきれなかった理由と、次にできること。
+  it('explains INNER_SCROLL_CONTAINER_NOT_TRAVERSED with its next step (T44c)', () => {
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('読み込みの後に動く内側のスクロールの領域');
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('全部は確かめていません');
+    expect(nextStepOfIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('手で確かめてください');
+    expect(Object.isFrozen(INCOMPLETE_REASON_NEXT_STEPS)).toBe(true);
+  });
+
+  // T44h の判断 (1)（Task 44 の設計書の履歴の「T44h の測りとユーザーの判断」の行）: 未完了の理由のすべてのコード（ページの理由と、Run の閉じた一覧の外の理由を
+  // 含む）に、次にできることがある。CLI でも作る HTML レポートの文なので、画面の操作の名前（「監査の負荷」「前回の続きから再開する」など）は書かない。
+  it('gives a next step to every incomplete reason code, without the screen operations (T44h (1))', () => {
+    expect(Object.keys(INCOMPLETE_REASON_NEXT_STEPS).sort()).toEqual([...INCOMPLETE_REASON_CODES].sort());
+    for (const code of INCOMPLETE_REASON_CODES) {
+      const nextStep = nextStepOfIncompleteReason(code);
+      expect(nextStep, code).toMatch(JAPANESE_CHARACTER);
+      expect(nextStep, code).not.toContain(code);
+      expect(nextStep, code).not.toBe(describeIncompleteReason(code));
+      for (const screenOnly of ['監査の負荷', '前回の続きから再開する', '新しく始める', 'この画面']) {
+        expect(nextStep, code).not.toContain(screenOnly);
+      }
+    }
+    expect(nextStepOfIncompleteReason('UNHANDLED_FAILURE')).toContain('もう一度');
+    expect(nextStepOfIncompleteReason('MAX_PAGES_REACHED')).toContain('crawl.maxPages');
+  });
+
+  // T44R2 の I-7: DOM の準備の理由は、落ち着きの待ち（`resourceSettlingTimeoutMs` の期限）が PARTIAL のときに付くので、効く設定を案内する。
+  it('points DOM_READINESS_FAILED to crawl.resourceSettlingTimeoutMs, the setting that bounds the settling wait (T44R2 I-7)', () => {
+    expect(nextStepOfIncompleteReason('DOM_READINESS_FAILED')).toContain('crawl.resourceSettlingTimeoutMs');
+    expect(nextStepOfIncompleteReason('DOM_READINESS_FAILED')).not.toContain('crawl.navigationTimeoutMs');
+  });
+
+  // T44R2 の M-11: 不具合と見られる理由の、知らせる宛先は「BeakSight の開発者」（BeakSight はローカルの道具で、窓口の仕組みはない）。
+  it('names the developers of BeakSight as the recipient of the defect reports (T44R2 M-11)', () => {
+    for (const code of ['UNHANDLED_FAILURE', 'REQUIRED_ARTIFACT_INVALID', 'RULE_EVALUATION_FAILED', 'INVALID_BROWSER_DATA'] as const) {
+      expect(nextStepOfIncompleteReason(code), code).toContain('BeakSight の開発者に知らせてください');
+    }
   });
 
   // SU1（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で、その後の監査を始めなかった理由の説明。
@@ -120,6 +161,13 @@ describe('Run summary text', () => {
     });
     expect(Object.isFrozen(RUN_SUMMARY_TEXT)).toBe(true);
     expect(Object.isFrozen(RUN_SUMMARY_TEXT.coverage)).toBe(true);
+  });
+
+  // T44R2 の M-8: 網羅の項目の並び（HTML レポート・CLI・ChatGPT 用のバンドルの README）は、ここの 1 か所（`PAGE_COVERAGE_ITEMS`）。
+  it('holds the order of the coverage items in one place, covering every coverage label (T44R2 M-8)', () => {
+    expect(PAGE_COVERAGE_ITEMS).toEqual(['discovered', 'audited', 'partial', 'failed', 'skipped']);
+    expect([...PAGE_COVERAGE_ITEMS].sort()).toEqual(Object.keys(RUN_SUMMARY_TEXT.coverage).sort());
+    expect(Object.isFrozen(PAGE_COVERAGE_ITEMS)).toBe(true);
   });
 
   it('is the only name of those labels: the HTML report summary and the CLI text do not keep their own copies', () => {

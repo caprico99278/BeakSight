@@ -57,6 +57,7 @@ import {
   type RunProgressReport,
   type RunSummary,
 } from '../../src/core/contracts.js';
+import { wait } from '../../src/core/deadline.js';
 import type { RunCheckpoint } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
@@ -91,6 +92,7 @@ import {
   resumingRunText,
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
+  serviceRequestPacingWaitText,
   siteUnavailableStopText,
   unreadableCheckpointText,
 } from '../../src/presentation/messages.js';
@@ -657,7 +659,7 @@ describe('CLI: waiting for the output before exiting', () => {
     const pending = runCli(['validate-config', '--config', path], { stdout: slow, stderr: slow }).then((value) => {
       code = value;
     });
-    await new Promise((resolveLater) => setTimeout(resolveLater, 50));
+    await wait(50);
 
     expect(code).toBeUndefined();
     gate.resolve();
@@ -1265,7 +1267,6 @@ describe('CLI run: the bundle line of the result', () => {
     expect(bundleLinesOf(runSummaryLines(summary, 'out'))).toEqual([
       `${BUNDLE_PREFIX}${artifactFilePath('out', bundleFileName(execution.finishedAt))}`,
     ]);
-    expect(runSummaryLines(summary, 'out')).not.toContain(`${BUNDLE_PREFIX}${join('out', 'beaksight-audit-bundle.zip')}`);
   });
 
   // CCX-19（CC-048）: 最後の実行の終わりの時刻は、表示用モデルの `executions.lastFinishedAt` のまま使う（CLI の側で実行の記録から決め直さない）。
@@ -1538,6 +1539,13 @@ describe('CLI run: the notice lines of the site unavailability recheck and slowd
     expect(runNoticeLines(notice)).toEqual([siteUnavailableSlowdownText(formatDuration(10_000))]);
     expect(runNoticeLines(notice)).toEqual(['確かめ直しで応答が戻ったので、ページの読み込みの間隔を 10秒 に延ばして続けます。']);
     expect(runNoticeLines({ ...notice, minIntervalMs: 40_000 })).toEqual([siteUnavailableSlowdownText(formatDuration(40_000))]);
+  });
+
+  // DEF-141: 承認したサービスへの要求の 1 分あたりの上限で、次の読み込みの前に待つ知らせ（待つ時間と合計は書式にかけ、回数はそのまま）。
+  it('shows the notice of the wait by the per minute limit of the service requests, in one line', () => {
+    const notice: RunNotice = { kind: 'SERVICE_REQUEST_PACING_WAIT', waitMs: 45_000, waitCount: 2, totalWaitMs: 105_000 };
+    expect(runNoticeLines(notice)).toEqual([serviceRequestPacingWaitText(formatDuration(45_000), 2, formatDuration(105_000))]);
+    expect(runNoticeLines(notice)[0]).toContain('2 回目');
   });
 });
 

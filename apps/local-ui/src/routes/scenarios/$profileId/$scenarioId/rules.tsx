@@ -7,6 +7,7 @@ import { Notice } from '../../../../components/Notice';
 import { PageFrame } from '../../../../components/PageFrame';
 import { ScenarioProfilePanel } from '../../../../components/ScenarioProfilePanel';
 import { inputRuleStateDisplay, toneClass } from '../../../../display/labels';
+import { isSavedNoticeCurrent, savedRevisionOf } from '../../../../display/saved-notice';
 import { dataRulePageFn, saveDataRulesFn, type DataRuleExampleValueView, type DataRulePageView } from '../../../../server/data-rule-functions';
 
 /** 操作の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。 */
@@ -15,8 +16,11 @@ type DataRuleNotice = (typeof NOTICES)[number];
 const isDataRuleNotice = (value: unknown): value is DataRuleNotice => NOTICES.some((notice) => notice === value);
 
 export const Route = createFileRoute('/scenarios/$profileId/$scenarioId/rules')({
-  validateSearch: (search: Record<string, unknown>): { notice?: DataRuleNotice } =>
-    (isDataRuleNotice(search['notice']) ? { notice: search['notice'] } : {}),
+  // DEF-137: 保存した規則の集まりの版（`savedRevision`）も受ける（知らせは、画面の版がそれに届いたときだけ出す）。
+  validateSearch: (search: Record<string, unknown>): { notice?: DataRuleNotice; savedRevision?: number } => {
+    const savedRevision = savedRevisionOf(search['savedRevision']);
+    return isDataRuleNotice(search['notice']) ? { notice: search['notice'], ...(savedRevision === undefined ? {} : { savedRevision }) } : {};
+  },
   loader: async ({ params }) => {
     const page = await dataRulePageFn({ data: { scenarioId: params.scenarioId } });
     if (page === null || page.profile.profileId !== params.profileId) {
@@ -86,11 +90,14 @@ function Examples({ page }: Readonly<{ page: DataRulePageView }>) {
  */
 function DataRulePage() {
   const page = Route.useLoaderData();
-  const { notice } = Route.useSearch();
+  const search = Route.useSearch();
   const save = useServerFn(saveDataRulesFn);
   const navigate = useNavigate();
   const router = useRouter();
   const { profile, scenario, ruleSet } = page;
+  // DEF-137: 保存の知らせは、画面の規則の集まりの版が保存した版に届いたときだけ出す（改訂のない知らせは今のまま）。
+  const currentRuleSetRevision = ruleSet?.revision ?? 0;
+  const notice = search.notice !== undefined && isSavedNoticeCurrent(search.savedRevision, currentRuleSetRevision) ? search.notice : undefined;
   const params = { profileId: profile.profileId, scenarioId: scenario.scenarioId };
   const state = inputRuleStateDisplay(page.inputRuleState);
 
@@ -134,10 +141,16 @@ function DataRulePage() {
                   fieldRules: [...content.fieldRules],
                   relations: [...content.relations],
                   uniqueKeyFieldNames: [...content.uniqueKeyFieldNames],
+                  // FM2c: 一意にする欄の組の出どころの印と、テンプレートの既定を保存した印（あるときだけ）。
+                  ...(content.uniqueKeyOrigin === undefined ? {} : { uniqueKeyOrigin: content.uniqueKeyOrigin }),
+                  ...(content.templateDefaultsSaved === undefined ? {} : { templateDefaultsSaved: content.templateDefaultsSaved }),
                 },
               })}
-              onSaved={() => {
-                void router.invalidate().then(() => navigate({ to: '/scenarios/$profileId/$scenarioId/rules', params, search: { notice: 'saved' }, replace: true }));
+              onSaved={(result) => {
+                // DEF-137: 保存した規則の集まりの版も載せ、画面の版がそれに届くまで知らせを出さない。
+                const savedRevision = result.ruleSetRevision;
+                void router.invalidate().then(() =>
+                  navigate({ to: '/scenarios/$profileId/$scenarioId/rules', params, search: { notice: 'saved', savedRevision }, replace: true }));
               }}
               onReload={() => {
                 void router.invalidate();

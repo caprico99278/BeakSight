@@ -4,10 +4,10 @@
 // - 当たる要求（POST と送信先）は上限まで通し、超えたものを `403` で拒み、`onRejected` の `REQUEST_BUDGET` に知らせる（サーバに届かない）。
 // - 当たらない要求（GET、別の path）は数えない。`matches` の例外は当たったとして扱う（fail-closed）。
 // - 形の違う上限（関数でない、負の数、整数でない）は、中継を作らずに `TypeError`。
-import { createServer, request as httpRequest, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { request as httpRequest } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startEgressProxy, type EgressProxy, type EgressRejection, type EgressRequestBudget } from '../../src/safety/egress-proxy.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -18,7 +18,7 @@ afterEach(async () => {
 
 async function startServer(): Promise<{ readonly origin: string; readonly received: string[] }> {
   const received: string[] = [];
-  const server: Server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     request.resume();
     request.on('end', () => {
       received.push(`${request.method ?? ''} ${request.url ?? ''}`);
@@ -26,12 +26,8 @@ async function startServer(): Promise<{ readonly origin: string; readonly receiv
       response.end('ok');
     });
   });
-  await new Promise<void>((resolvePromise) => server.listen({ host: '127.0.0.1', port: 0 }, () => resolvePromise()));
-  cleanups.push(() => new Promise<void>((resolvePromise) => {
-    server.closeAllConnections();
-    server.close(() => resolvePromise());
-  }));
-  return { origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, received };
+  cleanups.push(() => server.close());
+  return { origin: server.origin, received };
 }
 
 async function startBudgetProxy(budget: EgressRequestBudget, rejections: EgressRejection[]): Promise<EgressProxy> {

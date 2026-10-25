@@ -2,9 +2,8 @@
 // `metadata` の Evidence にする。sitemap の `<loc>` は、切り詰める前の本文から取り出して正規化する。
 import { readFile } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
 import type { AuditConfig } from '../../src/config/types.js';
@@ -27,7 +26,7 @@ import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer, type FixtureServerOptions } from '../../fixtures/server.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, useHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import {
   FROZEN_POPUP_LATE_DELIVERY_SETTLE_MS,
   QUIET_PERIOD_MS,
@@ -35,6 +34,7 @@ import {
   UNLOAD_BEACON_PAGE,
   UNLOAD_BEACON_ROUNDS_TEST_TIMEOUT_MS,
 } from '../helpers/gate-harness.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -61,7 +61,7 @@ useHeadlessChromium((launched) => {
 
 afterEach(async () => {
   // 監査の後に Context が残っていたら、閉じたうえでテストを失敗にする。
-  const leftoverContexts = browser.contexts();
+  const leftoverContexts = testContextsOf(browser);
   for (const context of leftoverContexts) {
     await context.close();
   }
@@ -110,7 +110,7 @@ async function startCustomServer(
   let nonReadRequests = 0;
   const requestedPaths: string[] = [];
   const server = await startLoopbackHttpServer((request, response: ServerResponse) => {
-    if (request.method !== 'GET' && request.method !== 'HEAD') {
+    if (!READ_METHODS.has(request.method ?? '')) {
       nonReadRequests += 1;
     }
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
@@ -460,7 +460,7 @@ describe('collectSiteMetadata', () => {
         sitemap: sitemapOf(result).payload.outcome,
         invariantViolations: result.ledgerSnapshot?.invariantViolations,
         closeFailures: result.closeFailures.map(({ step, error }) => ({ step, error: String(error) })),
-        contexts: browser.contexts().length,
+        contexts: testContextsOf(browser).length,
       };
       if (
         summary.delivered !== 0
@@ -494,7 +494,7 @@ describe('collectSiteMetadata', () => {
   it('leaves no Context behind, and returns FAILED Evidence when the Passive Context cannot be constructed', async () => {
     const server = await startServer();
     await collect(server.origin);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
 
     server.resetRequestObservations();
     const failing = await collect(server.origin, { browser: browserOpeningPageAfterNewContext(browser) });
@@ -506,7 +506,7 @@ describe('collectSiteMetadata', () => {
     // Guard の取り付けの失敗は、Ledger の違反として残る。
     expect(failing.result.ledgerSnapshot?.invariantViolationCount).toBeGreaterThan(0);
     expect(server.getRequestObservations()).toEqual([]);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     await expectValidPageEvidence(failing);
   }, TEST_TIMEOUT_MS);
 
@@ -556,7 +556,7 @@ describe('collectSiteMetadata', () => {
     expect(result.failures).toEqual([]);
     expect(result.ledgerSnapshot?.invariantViolationCount).toBe(0);
     expect(server.getRequestObservations().map(({ pathname }) => pathname)).toContain('/sitemap.xml');
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
 
@@ -623,7 +623,7 @@ describe('collectSiteMetadata', () => {
     expect(result.ledgerSnapshot?.invariantViolationCount).toBe(0);
     expect(result.closeFailures).toEqual([]);
     expect(server.getRequestObservations()).toEqual([]);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     await expectValidPageEvidence(run);
   }, DEADLINE_TEST_TIMEOUT_MS);
 
@@ -643,7 +643,7 @@ describe('collectSiteMetadata', () => {
     const elapsedMs = performance.now() - startedAt;
     const { result } = run;
     // 閉じきれなかった Context は、テストが閉じる（後片付けの確認で、残った Context を失敗にするため）。
-    for (const context of browser.contexts()) {
+    for (const context of testContextsOf(browser)) {
       await context.close();
     }
 
@@ -685,7 +685,7 @@ describe('collectSiteMetadata', () => {
     await expect(
       collectSiteMetadata({ ...base, origin: server.origin, beforeNavigation: 'wait' as unknown as () => Promise<number> }),
     ).rejects.toThrow(TypeError);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   }, TEST_TIMEOUT_MS);
 });
 
@@ -721,7 +721,7 @@ describe('collectSiteMetadata navigation pacing (load control design 4.1, 4.4)',
     await expect(collectSiteMetadata(withoutPacing)).rejects.toThrow(TypeError);
     await expect(collectSiteMetadata({ ...withoutPacing, beforeNavigation: undefined as unknown as () => Promise<number> }))
       .rejects.toThrow(TypeError);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     expect(metadataRequestsAt(server)).toEqual({ robots: 0, sitemap: 0 });
   }, TEST_TIMEOUT_MS);
 
@@ -753,7 +753,7 @@ describe('collectSiteMetadata navigation pacing (load control design 4.1, 4.4)',
       navigationTimeoutMs: SHORT_NAVIGATION_TIMEOUT_MS,
       beforeNavigation: async () => {
         waits += 1;
-        await new Promise((resolve) => setTimeout(resolve, waitedMs));
+        await wait(waitedMs);
         return waitedMs;
       },
     });
@@ -887,7 +887,7 @@ describe('collectSiteMetadata observations of the main frame load (site unavaila
       afterNavigation: 'observe' as unknown as (observation: MainFrameLoadObservation) => void,
     })).rejects.toThrow(TypeError);
 
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     expect(server.requestedPaths()).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
@@ -961,7 +961,8 @@ describe('collectSiteMetadata with the Chromium of the CLI: failures after the r
   let cliBrowser: Browser;
 
   beforeAll(async () => {
-    cliBrowser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+    // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+    cliBrowser = await launchCliChromium();
   });
 
   afterAll(async () => {
@@ -997,7 +998,7 @@ describe('collectSiteMetadata with the Chromium of the CLI: failures after the r
     expect(run.result.failures).toEqual([]);
     expect(run.result.ledgerSnapshot?.invariantViolationCount).toBe(0);
     expect(server.requestedPaths()).toEqual(['/robots.txt', '/sitemap.xml']);
-    expect(cliBrowser.contexts()).toHaveLength(0);
+    expect(testContextsOf(cliBrowser)).toHaveLength(0);
     await expectValidPageEvidence(run);
   }, TEST_TIMEOUT_MS);
 });

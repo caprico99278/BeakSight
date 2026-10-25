@@ -1,5 +1,5 @@
 // 承認に縛る認証の設定の digest の唯一の owner（Task 28 の設計書 3 章の「承認を縛るもの」、10 章の 1。T28c）。純粋な関数。
-// - 入力: 保存した認証の設定（版 2 の文書。`StoredAuthSetup` の `setup`）と、資格情報の事実（自動ログインのプロファイルだけ。ほかは null）。
+// - 入力: 保存した認証の設定（版 3 の文書。`StoredAuthSetup` の `setup`）と、資格情報の事実（自動ログインのプロファイルだけ。ほかは null）。
 //   資格情報の事実は、資格情報のファイルの版（`credentialRevision`。ないときは null）と、管理データの `credential_events` の、そのプロファイルの
 //   資格情報の変更（登録・変更・削除）の最後の出来事の id（ないときは null）。T28R-fix-1（独立レビュー T28R の I-1）: 版は削除の後の登録で 1 に戻る
 //   ので、削除をまたいで必ず変わる出来事の id を入れる（削除して別の値で登録し直すと、digest が変わり再承認になる）。保存の時刻・鮮度・今の
@@ -8,12 +8,13 @@
 //   資格情報の版、最後の出来事の id を並べた JSON の `createSha256Fingerprint`（`sha256:<16進64桁>`。T28a の契約 `ApprovalBoundFacts.authSetupDigest`
 //   の形）。設定がなければ null。
 // - 資格情報の値は入れない: 認証の設定の文書は資格情報の値を持たない（設計書 4.7）。資格情報の事実は、版と出来事の id の 2 つの項目だけを写す（余分な
-//   項目は入れない）。文書の形（`auth-setup-v2` のスキーマ。項目の過不足を許さない）に合わない値は `RangeError`（黙って落とさない）。
+//   項目は入れない）。文書の形（版 3 のスキーマ `AUTH_SETUP_SCHEMA_NAME`。項目の過不足を許さない）に合わない値は `RangeError`（黙って落とさない）。
+//   LG-3b: 版 1・版 2 の文書の digest は求めない（形の誤り）。版 3 の文書の digest は、版 1・版 2 を捨てる前と同じ値（テストで固定する）。
 // - 管理データ・ファイル・資格情報のファイルを読まない（求めるのは `src/control/approval-external-facts.ts`）。
 import { createSha256Fingerprint } from '../../core/ids.js';
 import { sortedKeysJsonOf } from '../../core/sorted-keys-json.js';
 import { validateControlDocument } from '../control-schema-validator.js';
-import type { AuthSetup } from './auth-setup-contracts.js';
+import { AUTH_SETUP_SCHEMA_NAME, type AuthSetup } from './auth-setup-contracts.js';
 
 /** 認証の設定の digest の入力の形の印（版つき。T28R-fix-1 で、資格情報の最後の出来事の id を足して版 2 に上げた）。 */
 export const AUTH_SETUP_DIGEST_FORMAT = 'beaksight-auth-setup-digest/2';
@@ -23,9 +24,6 @@ const MIN_CREDENTIAL_REVISION = 1;
 
 /** 出来事の id の最小（SQLite の行の id は 1 から）。 */
 const MIN_CREDENTIAL_EVENT_ID = 1;
-
-/** 文書のスキーマの名前（版 2。保存の部品が版 1 を版 2 に直して返す）。 */
-const AUTH_SETUP_SCHEMA_NAME = 'auth-setup-v2';
 
 /** 承認に縛る資格情報の事実（値は持たない）。 */
 export interface AuthSetupCredentialFacts {
@@ -57,6 +55,7 @@ export const authSetupDigestOf = (
   if (stored === null) {
     return null;
   }
+  // 版 3 のスキーマで確かめる（LG-3b: 前の版の文書は形の誤り）。
   const shape = validateControlDocument(AUTH_SETUP_SCHEMA_NAME, stored.setup);
   if (!shape.ok) {
     throw new RangeError(`the auth setup does not match the contract: ${shape.errors.join('; ')}`);

@@ -22,7 +22,8 @@ import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { unzipSync } from 'fflate';
 import type { Download, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { ActionRunDocument } from '../../../src/control/actions/action-contracts.js';
+import { wait } from '../../../src/core/deadline.js';
+import { ACTION_RUN_SCHEMA_VERSION, type ActionRunDocument } from '../../../src/control/actions/action-contracts.js';
 import {
   ACTION_EVIDENCE_ARTIFACT_FILE_NAME,
   ACTION_REPORT_ARTIFACT_FILE_NAME,
@@ -52,6 +53,7 @@ import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { isWriteValueArtifactPlace, readWriteReportFiles } from '../../../tests/helpers/write-report-checks.js';
 import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, writeSiteEditPathOf, writeSiteRecordPathOf, type WriteSite } from '../../../tests/helpers/write-site-fixture.js';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
+import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
 import { SCENARIO_TIMEOUT_MS, UI_TIMEOUT_MS, createScenarioMarkerFlow, type JobDetail } from './helpers/scenario-marker-flow.ts';
 
 const PUBLIC_PROFILE = 't32h-public';
@@ -171,7 +173,8 @@ const createProfileOnScreen = async (
 ): Promise<void> => {
   const page = await flow.openPage('/profiles/new');
   await page.getByLabel(profileText.profileId, { exact: true }).fill(profileId);
-  await page.getByLabel(profileText.targetConfigPath, { exact: true }).selectOption(targetConfigPath);
+  // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
+  await chooseExistingTargetConfig(page, targetConfigPath, UI_TIMEOUT_MS);
   await page.getByText(profileText.configOk).waitFor({ timeout: UI_TIMEOUT_MS });
   if (test !== null) {
     await page.getByLabel(profileText.environment, { exact: true }).selectOption('TEST');
@@ -324,7 +327,8 @@ const saveNameRuleOnScreen = async (scenarioId: string, value: string): Promise<
   const dialog = page.getByRole('dialog');
   await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
   await dialog.getByRole('button', { name: ruleText.saveDialog.confirm, exact: true }).click();
-  await page.waitForURL(/\/rules\?notice=saved$/u, { timeout: UI_TIMEOUT_MS });
+  // DEF-137: 知らせの search は、保存した規則の集まりの版も持つ。
+  await page.waitForURL(/\/rules\?notice=saved&savedRevision=[1-9]\d*$/u, { timeout: UI_TIMEOUT_MS });
   await expect.poll(() => page.getByTestId('data-rule-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('DECIDED');
   await flow.snapshot(page);
 };
@@ -555,7 +559,10 @@ describe('T32h: the whole flow on the screen only, with the real worker', () => 
       ]);
       expectManifestMatches(entries, ACTION_BUNDLE_MANIFEST_FILE_NAME);
       const actionRun = await schemaCheckedEntryOf(entries, ACTION_RUN_ARTIFACT_FILE_NAME, 'action-run') as ActionRunDocument;
-      expect(actionRun).toMatchObject({ schemaVersion: 'action-run-schema/1.0', jobId, result: 'VERIFIED', recordId: state.createdId });
+      // T40c: 書き手は版 1.1（送り方 FORM、API の要約なし）を書く。
+      expect(actionRun).toMatchObject({
+        schemaVersion: ACTION_RUN_SCHEMA_VERSION, transport: 'FORM', api: null, jobId, result: 'VERIFIED', recordId: state.createdId,
+      });
       await schemaCheckedEntryOf(entries, ACTION_EVIDENCE_ARTIFACT_FILE_NAME, 'action-evidence');
       await schemaCheckedEntryOf(entries, APPROVAL_SUMMARY_ARTIFACT_FILE_NAME, 'approval-summary');
       // 落とした ZIP は、Run のディレクトリのバンドルと同じバイト列で、Run のディレクトリの報告の確かめ（スキーマ・`action-run.json` との一致・目印）も通る。
@@ -577,7 +584,7 @@ describe('T32h: the whole flow on the screen only, with the real worker', () => 
       `POST ${writeSiteRecordPathOf(state.createdId)}`,
     ];
     expect(nonReadRequestsOf(siteOf().requests)).toEqual(expected);
-    await new Promise((resolveWait) => setTimeout(resolveWait, LATE_REQUEST_WAIT_MS));
+    await wait(LATE_REQUEST_WAIT_MS);
     expect(nonReadRequestsOf(siteOf().requests)).toEqual(expected);
     expect(siteOf().members).toBe(2);
     expect(siteOf().successfulLogins).toBe(5);

@@ -29,11 +29,21 @@ import type { WorkerJobKind } from './worker-protocol.js';
  * T28e fix round 1: 書き込みのシナリオ（`SCENARIO`。作成・変更・承認。書き込みの実行ではない）を足した。
  * T30e: 書き込みのジョブ（`WRITE_CREATE`。承認された CREATE の実行）を足した。
  * T31e fix round 1: 更新の書き込みのジョブ（`WRITE_UPDATE`。承認された UPDATE の実行。始める口は T31f）を足した。
+ * T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブ（`ENTRY_CHECK`。開始の URL を読み取りだけで 1 回読み、ログインの画面の案を作る）を足した。
  */
 export const PROFILE_OPERATIONS = deepFreeze(
-  ['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE'] as const satisfies readonly (
-    WorkerJobKind | 'AUTH_SETUP' | 'CREDENTIAL' | 'SCENARIO'
-  )[],
+  [
+    'AUDIT',
+    'LOGIN_CHECK',
+    'DISCOVERY',
+    'READ_CHECK',
+    'AUTH_SETUP',
+    'CREDENTIAL',
+    'SCENARIO',
+    'WRITE_CREATE',
+    'WRITE_UPDATE',
+    'ENTRY_CHECK',
+  ] as const satisfies readonly (WorkerJobKind | 'AUTH_SETUP' | 'CREDENTIAL' | 'SCENARIO')[],
 );
 export type ProfileOperation = (typeof PROFILE_OPERATIONS)[number];
 
@@ -66,7 +76,20 @@ export const PROFILE_OPERATION_POLICY: Readonly<Record<ProfileOperation, Readonl
   WRITE_CREATE: { TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
   // T31e fix round 1: 更新の書き込みのジョブ（承認された UPDATE）も、書き込みのモードで、ログインを使う方式だけ（Task 31 の設計書 3 章。CREATE と同じ）。
   WRITE_UPDATE: { TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
+  // T43c: 入口の確かめは、公開のモードは認証なし、テストの 2 つのモードはログインを使う方式（ログインはしない。認証の設定がなくても始められる。
+  // `AUTH_SETUP_FREE_OPERATIONS`）。
+  ENTRY_CHECK: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
 });
+
+/**
+ * 認証の設定が要らない操作（T43c。閉じた一覧）。ログインをしないので、認証の設定が要るモードのプロファイルでも、認証の設定がない・古いまま始められる。
+ * ジョブの管理（開始の直前の確かめ）と画面の開始の確かめは、`operationRequiresAuthSetup` を通して、この一覧を使う。
+ */
+export const AUTH_SETUP_FREE_OPERATIONS = deepFreeze(['ENTRY_CHECK'] as const satisfies readonly ProfileOperation[]);
+
+/** 認証の設定が要らない操作か。 */
+const isAuthSetupFreeOperation = (operation: ProfileOperation): boolean =>
+  (AUTH_SETUP_FREE_OPERATIONS as readonly ProfileOperation[]).includes(operation);
 
 /** 操作の行（一覧にない値、文字列でない値は `undefined`。継承した名前（`constructor` など）を見ない）。 */
 const operationRowOf = (operation: unknown): Readonly<Partial<Record<AuditMode, readonly AuthStrategy[]>>> | undefined =>
@@ -113,7 +136,7 @@ export const EXECUTABLE_AUTH_STRATEGIES: Readonly<Partial<Record<AuditMode, read
 export const isExecutableAuthStrategy = (mode: unknown, auth: unknown): boolean => isProfileOperationAllowed('AUDIT', mode, auth);
 
 /**
- * 開始の前に、有効な認証の設定（`beaksight-auth-setup/2`）が要るモード（T25d。T28b で書き込みのモードを足した。`PROFILE_OPERATION_POLICY` の
+ * 開始の前に、有効な認証の設定（`beaksight-auth-setup/3`）が要るモード（T25d。T28b で書き込みのモードを足した。`PROFILE_OPERATION_POLICY` の
  * `AUTH_SETUP` の行）。
  */
 export const AUTH_SETUP_REQUIRED_AUDIT_MODES: readonly AuditMode[] = deepFreeze(Object.keys(PROFILE_OPERATION_POLICY.AUTH_SETUP) as AuditMode[]);
@@ -123,7 +146,7 @@ export const requiresAuthSetup = (mode: unknown): boolean => strategiesOf('AUTH_
 
 /**
  * その操作に、有効な認証の設定が要るか（T28b）。操作の行にあるモードで、認証の設定が要るモードのときだけ真（書き込みのモードの監査は、始められない
- * ので偽。開始の画面が、ログインの案内を出すかに使う）。
+ * ので偽。開始の画面が、ログインの案内を出すかに使う）。T43c: 認証の設定が要らない操作（`AUTH_SETUP_FREE_OPERATIONS`）は、どのモードでも偽。
  */
 export const operationRequiresAuthSetup = (operation: ProfileOperation, mode: unknown): boolean =>
-  strategiesOf(operation, mode) !== undefined && requiresAuthSetup(mode);
+  !isAuthSetupFreeOperation(operation) && strategiesOf(operation, mode) !== undefined && requiresAuthSetup(mode);

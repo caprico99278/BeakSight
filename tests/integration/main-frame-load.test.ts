@@ -9,6 +9,7 @@ import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   observeMainFrameLoad,
+  settleMainFrameLoad,
   trackMainFrameDocument,
   type MainFrameLoadObservation,
   type MainFrameLoadSettlement,
@@ -17,6 +18,7 @@ import { awaitBeforeDeadline } from '../../src/core/deadline.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 import { SITE_UNAVAILABLE_HTTP_STATUSES, siteUnavailabilityOf } from '../../src/orchestration/site-availability.js';
 import { useHeadlessChromium } from '../helpers/chromium.js';
+import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { closedLoopbackOrigin, startLoopbackHttpServer } from '../helpers/loopback-server.js';
 
 /** Playwright の読み込みの期限（ms）。実際に期限切れを起こすので、短くする。 */
@@ -63,7 +65,7 @@ const PATHS = Object.freeze({
   redirectToHang: '/redirect-to-hang',
 });
 
-type WaitUntil = NonNullable<NonNullable<Parameters<Page['goto']>[1]>['waitUntil']>;
+type WaitUntil = Parameters<typeof settleMainFrameLoad>[2]['waitUntil'];
 
 interface TestServer {
   readonly origin: string;
@@ -152,18 +154,17 @@ async function newPage(): Promise<Page> {
   return context.newPage();
 }
 
-/** `page.goto` の終わり方（読み込みが終わった、または例外）。Playwright の期限は `timeoutMs`（既定は `LOAD_TIMEOUT_MS`）。 */
+/**
+ * `page.goto` の終わり方（読み込みが終わった、または例外）。Playwright の期限は `timeoutMs`（既定は `LOAD_TIMEOUT_MS`）。
+ * CC-045: 終わり方で包む処理は `settleMainFrameLoad` の 1 か所（ここは既定の期限を足すだけ）。
+ */
 async function settleGoto(
   page: Page,
   url: string,
   waitUntil: WaitUntil,
   timeoutMs: number = LOAD_TIMEOUT_MS,
 ): Promise<MainFrameLoadSettlement> {
-  try {
-    return { status: 'FULFILLED', value: await page.goto(url, { waitUntil, timeout: timeoutMs }) };
-  } catch (error) {
-    return { status: 'REJECTED', reason: error };
-  }
+  return settleMainFrameLoad(page, url, { waitUntil, timeoutMs });
 }
 
 interface TimedObservation {
@@ -379,13 +380,13 @@ describe('trackMainFrameDocument (design 2.1)', () => {
     const mainFrame = Object.freeze({});
     const page = Object.assign(new EventEmitter(), { mainFrame: () => mainFrame });
     const tracker = trackMainFrameDocument(page as unknown as Page);
-    const document = { isNavigationRequest: () => true, frame: () => mainFrame };
-    const frameless = {
-      isNavigationRequest: () => true,
+    // CC-094: 偽の要求は共通の補助で作る（frame の口だけ、投げる口に替える）。
+    const document = fakePlaywrightRequest({ navigation: true, frame: mainFrame });
+    const frameless = fakePlaywrightRequest({ navigation: true }, {
       frame: () => {
         throw new Error('Service Worker requests do not have an associated frame.');
       },
-    };
+    });
     try {
       page.emit('request', document);
       page.emit('response', { request: () => document, status: () => SERVICE_UNAVAILABLE_STATUS });

@@ -133,8 +133,14 @@ export const INPUT_RULES: InputRuleReference = Object.freeze({
 export const AUTH_SETUP_DIGEST = 'sha256:2222222222222222222222222222222222222222222222222222222222222222';
 export const TARGET_CONFIG_DIGEST = '3333333333333333333333333333333333333333333333333333333333333333';
 
-/** シナリオの版 1 つ（CREATE の候補から）。 */
-export const sampleScenario = (overrides: Partial<ScenarioRevision> = {}): ScenarioRevision => ({
+/** T38b: FORM のシナリオの版（form の要求の形を必ず持つ。API のシナリオは要求の形が null）。 */
+export type FormScenarioRevision = ScenarioRevision & { readonly request: NonNullable<ScenarioRevision['request']> };
+
+/**
+ * シナリオの版 1 つ（CREATE の候補から。FORM のシナリオ）。T38b: 返す型は FORM のシナリオ（form の要求の形を持つ）。上書きで要求の形を null に
+ * しない（FORM の見本だけ。API のシナリオの見本は `scenario-api-draft.test.ts` が下書きの確かめから作る）。
+ */
+export const sampleScenario = (overrides: Partial<ScenarioRevision> = {}): FormScenarioRevision => formScenarioOf({
   schemaVersion: SCENARIO_SCHEMA_VERSION,
   scenarioId: 'scenario-1',
   profileId: PROFILE_ID,
@@ -161,6 +167,15 @@ export const sampleScenario = (overrides: Partial<ScenarioRevision> = {}): Scena
   updatedAt: '20261012010000',
   ...overrides,
 });
+
+/** FORM のシナリオの版か（要求の形を持つ）を確かめて、その型で返す（持たなければ、見本の使い方の誤り）。 */
+function formScenarioOf(scenario: ScenarioRevision): FormScenarioRevision {
+  const { request } = scenario;
+  if (request === null) {
+    throw new Error('sampleScenario makes a FORM scenario; do not override the request with null');
+  }
+  return { ...scenario, request };
+}
 
 /** UPDATE の候補（`UPDATE_CANDIDATE`）の、更新の画面と送信先の path の型（T31b）。 */
 export const UPDATE_FORM_PATH_TEMPLATE = '/members/{id}/edit';

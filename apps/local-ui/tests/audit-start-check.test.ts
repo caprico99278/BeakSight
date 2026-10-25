@@ -7,7 +7,8 @@
  * 例の値は、匿名の値（`example.invalid`）だけを使う。管理データもファイルも、子の process もブラウザも使わない。
  */
 import { describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../../src/control/auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../../../src/control/auth/auth-setup-policy.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile } from '../../../src/control/contracts.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../../src/control/profile-policy.js';
@@ -49,7 +50,7 @@ const authProfile = {
 } satisfies SiteProfile;
 
 const setup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: authProfile.profileId,
   profileRevision: REVISION,
   loginStartUrl: `${TEST_ORIGIN}/login`,

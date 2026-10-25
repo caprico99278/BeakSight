@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
+import { isChromiumLaunchRefused } from '../browser/chromium-launch.js';
 import {
   BrowserContextFactory,
   type BrowserContextFactoryOptions,
@@ -41,6 +42,12 @@ export const PREFLIGHT_CHECKS = Object.freeze([
   'START_URL',
   /** Chromium を起動できる。 */
   'BROWSER_LAUNCH',
+  /**
+   * EL-12（設計書 `2026-10-24-beaksight-external-launch-block-design.md` 3.2・3.5）: 外部のアプリの起動を止める Chromium の設定が効いている（起動の部品の
+   * 自己検査。`src/browser/chromium-launch.ts` の `checkExternalLaunchBlock`）。起動の部品が閉じた理由 `EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE` で断ったときの失敗の
+   * 項目（起動の部品が Browser を閉じてある）。
+   */
+  'EXTERNAL_LAUNCH_BLOCK',
   /** Guard の付いた Passive Context と page を作れて、Guard が有効である（作った Context と page は、すぐに閉じる）。 */
   'PASSIVE_GUARD',
 ] as const);
@@ -178,7 +185,8 @@ export async function runPreflight(options: PreflightOptions): Promise<Preflight
   try {
     browser = await launchBrowser({ headless: !config.browser.headed });
   } catch (error) {
-    return preflightFailure('BROWSER_LAUNCH', error, []);
+    // EL-12: 起動の部品の自己検査の不合格（外部のアプリの起動を止める設定が効かない）は、起動の失敗と分けた項目にする。
+    return preflightFailure(isChromiumLaunchRefused(error, 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE') ? 'EXTERNAL_LAUNCH_BLOCK' : 'BROWSER_LAUNCH', error, []);
   }
 
   const safetyLedgers: SafetyLedger[] = [];

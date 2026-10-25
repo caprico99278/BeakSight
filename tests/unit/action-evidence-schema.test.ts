@@ -87,8 +87,9 @@ const guardSummaryOf = (snapshot: WriteStageMonitorSnapshot): ActionGuardSummary
 describe('action-evidence.json schema (T32c)', () => {
   it('has the artifact id and the named version', () => {
     expect(schema.$id).toBe('urn:beaksight:schema:action-evidence:1.0');
-    expect(prop(schema, 'schemaVersion').const).toBe(ACTION_EVIDENCE_SCHEMA_VERSION);
-    expect(ACTION_EVIDENCE_SCHEMA_VERSION).toBe('action-evidence-schema/1.0');
+    // T40c: 書き手は 1.1 を書き、読み手は 1.0 と 1.1 を受ける（版の一覧とスキーマの enum の一致は `action-run-v11.test.ts`）。
+    expect(prop(schema, 'schemaVersion').enum).toContain(ACTION_EVIDENCE_SCHEMA_VERSION);
+    expect(ACTION_EVIDENCE_SCHEMA_VERSION).toBe('action-evidence-schema/1.1');
     expect(schema.additionalProperties).toBe(false);
   });
 

@@ -7,32 +7,31 @@
 // - `START` に、検証した設定の文書と `approvedTestOrigins` と、その SHA-256（`workerAuthenticationDigestOf`）を入れる。
 // - `AUTH_STATE` を受けたら、ジョブの行に最後の認証の状態を記録する（`SESSION_LOST` では止まったページの URL も）。公開の監査のジョブの
 //   `AUTH_STATE`、`RUN_STARTED` の前の `SESSION_LOST` は、契約の違反（`PROTOCOL_VIOLATION`）。
+// - T34R2-fix: 数と一覧つきの `AWAITING_LOGIN` は `START` を送ったジョブだけ（M-3）。スクリプトで送るログインの数は送り方が `SCRIPT_REQUEST` の
+//   ジョブだけ（M-4。一覧はどちらの送り方でも受ける）。
 // 管理データは一時のフォルダだけを使う。起動したワーカーは、すべて止まったことを確かめる。
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
+import { type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION, type SiteProfile } from '../../src/control/contracts.js';
-import {
-  createAuditJobManager,
-  type AuditJobManager,
-  type AuditWorkerForker,
-} from '../../src/control/job/audit-job-manager.js';
+import type { AuditJobManager, AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, updateProfile } from '../../src/control/store/profile-store.js';
-import { WORKER_PROTOCOL_VERSION, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
-import { writeFakeWorker, type FakeWorker, type FakeWorkerMode } from '../helpers/fake-audit-worker.js';
+import { WORKER_SCRIPT_LOGIN_BLOCK_REASONS, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
+import { writeFakeWorker, type FakeWorker, type FakeWorkerMode, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { blockingAfterStartFork, createCountingFork } from '../helpers/worker-fork.js';
 import {
-  CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
   expectWorkersExited,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
 } from '../helpers/job-test-support.js';
@@ -51,10 +50,24 @@ const TARGET_CONFIG_TEXT = JSON.stringify({ target: { id: 'example-test' } });
 const AUTH_PROFILE_ID = 'example-auth-job';
 const PUBLIC_PROFILE_ID = 'example-public-job';
 const SESSION_LOST_URL = `${TEST_ORIGIN}/admin/reports`;
+/** T34R2-fix: `READY` を遅らせる時間（ms。親が `START` の前に止める要求を受けるため。`CONTROL_JOB_TEST_TIMING` の `READY` の待ちより短い）。 */
+const READY_DELAY_MS = 500;
+/** T34R2-fix: スクリプトで送るログインの数（フォームの送信のジョブでは違反）。 */
+const SCRIPT_LOGIN_COUNTS = Object.freeze({
+  tokenRequestsAllowed: 0,
+  sideRequestsAllowed: [],
+  serviceOriginReads: 0,
+  blockedByReason: Object.fromEntries(WORKER_SCRIPT_LOGIN_BLOCK_REASONS.map((reason) => [reason, 0])),
+});
+/** T34R2-fix: フォームの送信のログインの段で止めた要求の一覧。 */
+const FORM_BLOCKED_REQUESTS = Object.freeze({
+  requests: [{ origin: TEST_ORIGIN, path: '/api/log_login', resourceType: 'xhr', reason: 'NON_READ_METHOD', count: 1 }],
+  unlisted: 0,
+});
 const TEST_TIMEOUT_MS = 60_000;
 
 const setupFor = (profileRevision: number, overrides: Partial<AuthSetup> = {}): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: AUTH_PROFILE_ID,
   profileRevision,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -78,32 +91,22 @@ let resolverCalls: string[] = [];
 
 const countingFork: AuditWorkerForker = forks.fork;
 
-const fakeWorker = (mode: FakeWorkerMode): FakeWorker => writeFakeWorker(workDirectory, mode, {
-  protocolVersion: WORKER_PROTOCOL_VERSION,
-  runId: FAKE_RUN_ID,
-  otherRunId: OTHER_RUN_ID,
-  heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-  exitCodes: {
-    complete: EXIT_CODES.COMPLETE,
-    partial: EXIT_CODES.PARTIAL,
-    interrupted: INTERRUPTED_EXIT_CODE,
-    configError: EXIT_CODES.CONFIG_ERROR,
-    failure: FAILURE_EXIT_CODE,
-  },
-  sessionLostUrl: SESSION_LOST_URL,
-});
+const fakeWorker = (mode: FakeWorkerMode, extra: Partial<FakeWorkerValues> = {}): FakeWorker => writeFakeWorker(
+  workDirectory,
+  mode,
+  fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, { sessionLostUrl: SESSION_LOST_URL, ...extra }),
+);
 
 const managerWith = (worker: FakeWorker, forkWorker: AuditWorkerForker = countingFork): AuditJobManager => {
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
+    workDirectory,
+    worker,
     resolveContext: (path) => {
       resolverCalls.push(path);
       return resolveTestContext(path);
     },
     forkWorker,
-    timing: CONTROL_JOB_TEST_TIMING,
   });
   return manager;
 };
@@ -253,6 +256,35 @@ describe('audit jobs (T25d): START and AUTH_STATE', () => {
     await expectWorkersExited(children);
   }, TEST_TIMEOUT_MS);
 
+  // DEF-138: `SESSION_LOST` の `AUTH_STATE` が持つセッションの切れの証拠を、ジョブの行に残す（画面の読む口が同じ値を返す）。
+  it('records the session loss evidence of SESSION_LOST with the lost page', async () => {
+    createAuthProfile();
+    saveSetup();
+    const sessionLoss = {
+      stage: 'desktop:passive',
+      requestedPath: '/admin/reports',
+      landedPath: '/login?next',
+      landedBy: 'BLOCKED_REDIRECT',
+      redirectPaths: [{ originKind: 'ALLOWED', path: '/admin/reports' }, { originKind: 'ALLOWED', path: '/login?next' }],
+      redirectPathsOmitted: 0,
+      blockedRequests: [{ method: 'GET', originKind: 'ALLOWED', path: '/login', reason: 'AUDIT_EXCLUDED_URL', count: 1 }],
+      blockedRequestsUnlisted: 0,
+      storageKeyChange: [{ storage: 'COOKIE', originKind: 'ALLOWED', change: 'REMOVED', count: 1, shapes: [] }],
+    };
+    const jobManager = managerWith(fakeWorker('auth-session-lost', { sessionLoss }));
+    const result = await jobManager.startAuditJob(authRequest());
+    if (!result.ok) throw new Error(result.reason);
+    expect(result.job.sessionLoss).toBeNull();
+    expect(await waitForJob(jobManager, result.job.jobId, isJobEnded)).toMatchObject({
+      state: 'FINISHED',
+      lastAuthState: 'SESSION_LOST',
+      sessionLostUrl: SESSION_LOST_URL,
+      sessionLoss,
+      failureReason: null,
+    });
+    await expectWorkersExited(children);
+  }, TEST_TIMEOUT_MS);
+
   // DEF-084: 子が最後のメッセージを送ってから終わると、混雑の下で、親の `exit` が最後の `message`（`AUTH_STATE`・`FINISHED`）より先に来ることが
   // ある。`START` の直後に親をふさいで、その形を決まって作る。
   it('records the lost session and FINISHED even when the exit of the worker arrives before its last messages (DEF-084)', async () => {
@@ -304,6 +336,69 @@ describe('audit jobs (T25d): START and AUTH_STATE', () => {
     const start = worker.received().find((message) => message['type'] === 'START');
     expect(start).toBeDefined();
     expect(start).not.toHaveProperty('authentication');
+    await expectWorkersExited(children);
+  }, TEST_TIMEOUT_MS);
+
+  // T34R-fix-a（T34R の I-1）: 数と一覧つきの `AWAITING_LOGIN` は、止める印で終わったログインの段だけが送る形。止める要求を送っていないジョブでは違反。
+  it('treats AWAITING_LOGIN with the login stage summary as a protocol violation when no stop was requested', async () => {
+    createAuthProfile();
+    saveSetup();
+    const jobManager = managerWith(fakeWorker('auth-awaiting-summary'));
+    const result = await jobManager.startAuditJob(authRequest());
+    if (!result.ok) throw new Error(result.reason);
+
+    expect(await waitForJob(jobManager, result.job.jobId, isJobEnded)).toMatchObject({
+      state: 'FAILED', failureReason: 'PROTOCOL_VIOLATION', loginStage: null,
+    });
+    await expectWorkersExited(children);
+  }, TEST_TIMEOUT_MS);
+
+  // T34R2-fix（T34R2 の M-3）: 数と一覧つきの `AWAITING_LOGIN` は、`START` を送ったジョブだけが受ける。`START` の前に止める要求を受けた（`START` の
+  // 代わりに `STOP` を送った）ジョブでは違反（ログインの段は始まっていない）。
+  it('treats AWAITING_LOGIN with the login stage summary as a protocol violation when the job was stopped before START', async () => {
+    createAuthProfile();
+    saveSetup();
+    const worker = fakeWorker('auth-stop-before-start-summary', { readyDelayMs: READY_DELAY_MS });
+    const jobManager = managerWith(worker);
+    const result = await jobManager.startAuditJob(authRequest());
+    if (!result.ok) throw new Error(result.reason);
+    expect(jobManager.stopAuditJob(result.job.jobId).ok).toBe(true);
+
+    expect(await waitForJob(jobManager, result.job.jobId, isJobEnded)).toMatchObject({
+      state: 'FAILED', failureReason: 'PROTOCOL_VIOLATION', loginStage: null,
+    });
+    expect(worker.received().map((message) => message['type'])).not.toContain('START');
+    await expectWorkersExited(children);
+  }, TEST_TIMEOUT_MS);
+
+  // T34R2-fix（T34R2 の M-4）: スクリプトで送るログインの数（`scriptLogin`）は、認証の設定の送り方が `SCRIPT_REQUEST` のジョブだけが受ける。フォームの
+  // 送信のジョブで受けたら違反。止めた要求の一覧（`blockedRequests`）は、どちらの送り方でも受ける。
+  it('treats the script login counts from a form navigation job as a protocol violation', async () => {
+    createAuthProfile();
+    saveSetup();
+    const jobManager = managerWith(fakeWorker('auth-timeout-login-stage', { loginStage: { scriptLogin: SCRIPT_LOGIN_COUNTS } }));
+    const result = await jobManager.startAuditJob(authRequest());
+    if (!result.ok) throw new Error(result.reason);
+
+    expect(await waitForJob(jobManager, result.job.jobId, isJobEnded)).toMatchObject({
+      state: 'FAILED', failureReason: 'PROTOCOL_VIOLATION', loginStage: null,
+    });
+    await expectWorkersExited(children);
+  }, TEST_TIMEOUT_MS);
+
+  it('records the blocked requests from a form navigation job', async () => {
+    createAuthProfile();
+    saveSetup();
+    const jobManager = managerWith(fakeWorker('auth-timeout-login-stage', { loginStage: { blockedRequests: FORM_BLOCKED_REQUESTS } }));
+    const result = await jobManager.startAuditJob(authRequest());
+    if (!result.ok) throw new Error(result.reason);
+
+    expect(await waitForJob(jobManager, result.job.jobId, isJobEnded)).toMatchObject({
+      state: 'FAILED',
+      failureReason: 'LOGIN_TIMEOUT',
+      lastAuthState: 'LOGIN_TIMEOUT',
+      loginStage: { scriptLogin: null, blockedRequests: FORM_BLOCKED_REQUESTS },
+    });
     await expectWorkersExited(children);
   }, TEST_TIMEOUT_MS);
 

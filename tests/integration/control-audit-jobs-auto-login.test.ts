@@ -20,18 +20,16 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION, type SiteProfile } from '../../src/control/contracts.js';
 import { createCredentialStoreWith, type CredentialStore } from '../../src/control/credentials/credential-store.js';
 import { CredentialProtectionError } from '../../src/control/credentials/dpapi-protector.js';
 import {
   WORKER_EXCLUDED_ENVIRONMENT_VARIABLES,
-  createAuditJobManager,
   workerEnvironmentOf,
   type AuditJobManager,
   type AuditJobTiming,
@@ -56,10 +54,10 @@ import {
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode } from '../helpers/fake-audit-worker.js';
 import {
-  CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
   expectWorkersExited,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
 } from '../helpers/job-test-support.js';
@@ -75,8 +73,8 @@ import {
   testAuthProfile,
 } from './control-profile-fixtures.js';
 
-/** テストの時間（ms。共通の設定より、準備と合図の見張りを長くする。自動ログインの段の時間のため）。 */
-const TEST_TIMING: AuditJobTiming = Object.freeze({ ...CONTROL_JOB_TEST_TIMING, readyTimeoutMs: 5_000, heartbeatTimeoutMs: 3_000 });
+/** テストの時間（ms。共通の設定に重ねて、準備と合図の見張りを長くする。自動ログインの段の時間のため）。 */
+const TEST_TIMING: Partial<AuditJobTiming> = Object.freeze({ readyTimeoutMs: 5_000, heartbeatTimeoutMs: 3_000 });
 /** 状態が変わるのを待つ上限（ms。共通の既定より長い。読み直す間隔は既定）。 */
 const WAIT_OPTIONS = Object.freeze({ limitMs: 20_000 });
 const TEST_TIMEOUT_MS = 120_000;
@@ -95,7 +93,7 @@ const MARKER_BYTES = 12;
 
 
 const AUTOMATED_SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -146,26 +144,17 @@ const stampAt = (timeMs: number): string => formatCompactUtcTimestamp(new Date(t
 
 const countingFork: AuditWorkerForker = forks.fork;
 
-const fakeWorker = (mode: FakeWorkerMode, autoLoginReport?: Record<string, unknown>): FakeWorker => writeFakeWorker(workDirectory, mode, {
-  protocolVersion: WORKER_PROTOCOL_VERSION,
-  runId: FAKE_RUN_ID,
-  otherRunId: OTHER_RUN_ID,
-  heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-  exitCodes: {
-    complete: EXIT_CODES.COMPLETE,
-    partial: EXIT_CODES.PARTIAL,
-    interrupted: INTERRUPTED_EXIT_CODE,
-    configError: EXIT_CODES.CONFIG_ERROR,
-    failure: FAILURE_EXIT_CODE,
-  },
-  ...(autoLoginReport === undefined ? {} : { autoLoginReport }),
-});
+const fakeWorker = (mode: FakeWorkerMode, autoLoginReport?: Record<string, unknown>): FakeWorker => writeFakeWorker(
+  workDirectory,
+  mode,
+  fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, autoLoginReport === undefined ? {} : { autoLoginReport }),
+);
 
 const managerWith = (worker: FakeWorker, store: CredentialStore = credentials.store): AuditJobManager => {
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
+    workDirectory,
+    worker,
     resolveContext: resolveTestContext,
     forkWorker: countingFork,
     timing: TEST_TIMING,

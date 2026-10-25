@@ -54,3 +54,10 @@ function describeError(error: unknown, fallback: string): string {
  * 管理データの準備、成果物のファイルの読み込みが共用する）。配列とプリミティブの値は、`code` を持たないとみなす（`isRecord`）。
  */
 export const errorCodeOf = (error: unknown): string | null => (isRecord(error) && typeof error.code === 'string' ? error.code : null);
+
+/**
+ * 誤りの値の文（PRE42-CC 組 5a。台帳の N1）。`Error` なら `message`、そうでなければ `String(error)`。長さは切り詰めない（上限が要るときは
+ * `safeErrorMessage` を使う）。管理データの `quick_check` の誤りの文、管理データを開く誤りの詳細、画面のサーバの背後の処理の誤りのコンソールの出力が
+ * 共用する。画面の起動の部品（`apps/local-ui/launcher/`）は実行時に core を読めないので、使わない。
+ */
+export const errorMessageOrString = (error: unknown): string => (error instanceof Error ? error.message : String(error));

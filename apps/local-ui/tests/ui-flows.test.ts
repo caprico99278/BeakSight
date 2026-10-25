@@ -88,26 +88,34 @@ afterAll(async () => {
 });
 
 describe('local UI: profiles', () => {
-  it('shows the empty list and the menu (T24f: with the run history)', async () => {
+  it('shows the empty list and the menu (T24f: with the run history. T43a: with "new profile")', async () => {
     const page = await openPage('/');
     expect(await page.locator('h1').textContent()).toBe(text.pages.profiles);
     await page.getByTestId('profile-list-empty').waitFor();
     expect(await page.getByTestId('profile-list-empty').textContent()).toBe(text.profileList.empty);
+    // T43a（Task 43 の設計書 4.1。ユーザーの確認）: 左のメニューに「新しいプロファイル」を足した（意図した期待の変更）。
     expect(await page.getByRole('navigation', { name: text.navigationLabel }).getByRole('link').allTextContents())
-      .toEqual([text.pages.profiles, LOCAL_UI_AUDIT_TEXT.pages.jobs, text.pages.environment]);
+      .toEqual([text.pages.profiles, text.pages.newProfile, LOCAL_UI_AUDIT_TEXT.pages.jobs, text.pages.environment]);
   });
 
   it('registers a profile with the keyboard only, after a client-side error, and lists it', async () => {
     const page = await openPage('/');
-    await tabTo(page, page.getByRole('link', { name: text.profileList.newProfile }));
+    // T43a: 左のメニューにも同じ名前のリンクがあるので、本文（一覧の上の帯）のリンクを選ぶ。
+    await tabTo(page, page.getByRole('main').getByRole('link', { name: text.profileList.newProfile }));
     await page.keyboard.press('Enter');
     await page.waitForURL(/\/profiles\/new$/u);
     await page.getByLabel(text.profileForm.profileId).waitFor();
 
     // 名前の形の誤り（画面の側の補助の確かめ）。
+    // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ（キーボードだけ: 選び方の radio で
+    // 下の矢印を押す）。「設定のファイル」は選び方のラベルにも部分一致するので、ラベルは完全一致で選ぶ。
+    await tabTo(page, page.getByLabel(text.profileForm.targetSourceNew, { exact: true }));
+    await page.keyboard.press('ArrowDown');
+    expect(await page.getByLabel(text.profileForm.targetSourceExisting, { exact: true }).isChecked()).toBe(true);
+    await page.getByLabel(text.profileForm.targetConfigPath, { exact: true }).waitFor({ timeout: UI_TIMEOUT_MS });
     await tabTo(page, page.getByLabel(text.profileForm.profileId));
     await page.keyboard.type('Not Valid');
-    await tabTo(page, page.getByLabel(text.profileForm.targetConfigPath));
+    await tabTo(page, page.getByLabel(text.profileForm.targetConfigPath, { exact: true }));
     await page.keyboard.press('ArrowDown');
     await page.getByText(text.profileForm.configOk).waitFor({ timeout: UI_TIMEOUT_MS });
     await tabTo(page, page.getByRole('button', { name: text.profileForm.save }));
@@ -118,7 +126,7 @@ describe('local UI: profiles', () => {
     await tabTo(page, page.getByLabel(text.profileForm.profileId));
     await page.keyboard.press('Control+A');
     await page.keyboard.type(PROFILE_ID);
-    expect(await page.getByLabel(text.profileForm.targetConfigPath).inputValue()).toBe(EXAMPLE_TARGET_CONFIG);
+    expect(await page.getByLabel(text.profileForm.targetConfigPath, { exact: true }).inputValue()).toBe(EXAMPLE_TARGET_CONFIG);
     await tabTo(page, page.getByRole('button', { name: text.profileForm.save }));
     await page.keyboard.press('Enter');
     await page.waitForURL(new RegExp(`/profiles/${PROFILE_ID}`, 'u'), { timeout: UI_TIMEOUT_MS });
@@ -147,6 +155,11 @@ describe('local UI: profiles', () => {
     await page.getByTestId('profile-auth-setup-notice').waitFor();
     expect(await page.getByTestId('profile-auth-setup-notice').textContent()).toBe(LOCAL_UI_AUTH_TEXT.profileFormNotice);
     expect(await page.getByText(text.profileForm.testModeNotice).count()).toBe(0);
+    // T43a fix round 1（Task 43 の設計書 4.1）: モードを選ぶと、環境は組み合わせの表の初めの値（テスト環境）に合う。利用者が公開の環境に戻して
+    // 保存すると、保存の検証（Task 22）が組み合わせの誤りで止める（意図した手順の変更。期待は変えない）。
+    // 「環境」は「テスト環境の Origin」などにも部分一致するので、ラベルは完全一致で選ぶ。
+    expect(await page.getByLabel(text.profileForm.environment, { exact: true }).inputValue()).toBe('TEST');
+    await page.getByLabel(text.profileForm.environment, { exact: true }).selectOption('PUBLIC');
     await page.getByRole('button', { name: text.profileForm.save }).click();
     await page.getByText(PROFILE_STORE_REJECTION_DESCRIPTIONS.PROFILE_INVALID.description).waitFor({ timeout: UI_TIMEOUT_MS });
     await page.getByText(PROFILE_VALIDATION_ERROR_DESCRIPTIONS.PROFILE_MODE_ENVIRONMENT_MISMATCH).waitFor();
@@ -166,6 +179,16 @@ describe('local UI: profiles', () => {
     expect(await second.getByTestId('profile-revision').textContent()).toBe(text.profileForm.revisionText(1));
     await second.getByRole('button', { name: text.reload }).click();
     await second.getByTestId('profile-revision').filter({ hasText: text.profileForm.revisionText(2) }).waitFor({ timeout: UI_TIMEOUT_MS });
+  });
+
+  // DEF-137（DEF-128 と同じ揺らぎ）: 保存の知らせは、画面の改訂が保存した改訂（search の `savedRevision`）に届いたときだけ出す（古い値のまま「更新しました」を
+  // 出さない）。改訂がまだ届いていない URL では知らせを出さず、届いた URL では出す。
+  it('shows the saved notice only when the revision on the screen reached the saved revision', async () => {
+    const ahead = await openPage(`/profiles/${PROFILE_ID}?saved=updated&savedRevision=1000`);
+    await ahead.getByTestId('profile-revision').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await ahead.getByText(text.profileForm.updated).count()).toBe(0);
+    const reached = await openPage(`/profiles/${PROFILE_ID}?saved=updated&savedRevision=1`);
+    await reached.getByText(text.profileForm.updated).waitFor({ timeout: UI_TIMEOUT_MS });
   });
 
   it('retires the profile with the keyboard only through the confirmation dialog (focus is trapped and returned)', async () => {

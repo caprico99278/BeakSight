@@ -32,19 +32,21 @@ import {
 import type { AuditRunResult, Finding, PageAuditResult, PageId, RunProgressReport, RunSummary } from '../../src/core/contracts.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
 import {
-  checkRunCheckpointConsistency,
-  checkRunCheckpointPageConsistency,
   currentProcessRunLockHost,
-  decideRunResumption,
   isProcessRunning,
   judgeRunLock,
   RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
+  type RunLock,
+  type RunLockHost,
+} from '../../src/core/process-lock.js';
+import {
+  checkRunCheckpointConsistency,
+  checkRunCheckpointPageConsistency,
+  decideRunResumption,
   type RunCheckpoint,
   type RunCheckpointPage,
   type RunCheckpointStore,
-  type RunLock,
-  type RunLockHost,
 } from '../../src/orchestration/run-checkpoint.js';
 import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import {
@@ -92,7 +94,7 @@ class SimulatedInterruption extends Error {
 type StoreCall =
   | { readonly kind: 'page'; readonly pageId: PageId }
   | { readonly kind: 'state'; readonly completedPageIds: readonly PageId[] }
-  | { readonly kind: 'acquire lock' | 'rewrite lock' | 'read lock' | 'release lock' }
+  | { readonly kind: 'acquire lock' | 'rewrite lock' | 'read lock' | 'take over lock' | 'release lock' }
   | { readonly kind: 'clean up'; readonly removedPaths: readonly string[] };
 
 interface StoreOptions {
@@ -133,6 +135,10 @@ function wrappedStore(target: ArtifactWriter, calls: StoreCall[], options: Store
     readRunLock: async (directory) => {
       calls.push({ kind: 'read lock' });
       return target.readRunLock(directory);
+    },
+    takeOverRunLock: async (directory, judged, lock) => {
+      calls.push({ kind: 'take over lock' });
+      return target.takeOverRunLock(directory, judged, lock);
     },
     releaseRunLock: async (directory) => {
       calls.push({ kind: 'release lock' });
@@ -230,6 +236,8 @@ function newSession(store: RunCheckpointStore, createLockHost?: (nowMs: number) 
     store,
     now: () => Date.now(),
     ...(createLockHost === undefined ? {} : { createLockHost }),
+    // DEF-172: 動いている process の ID の古く見えるロックは、取り直す前に猶予を置いて読み直す（ここでは待たずに進める。ロックは変わらない）。
+    wait: async () => undefined,
   });
   sessions.push(session);
   return session;
@@ -375,8 +383,10 @@ describe('R4a2b: a Run interrupted after the k-th page checkpoint and resumed is
   });
 
   it('remakes the stale lock of the previous execution (before an OS restart) and removes the directory of the unfinished page', async () => {
-    // 前の回のロックは、OS の起動の時刻が違うので古いとみなされ、作り直される（書き換えて読み直し、後始末をしてから保存する）。
-    expect(resumedCalls.slice(0, 4).map(({ kind }) => kind)).toEqual(['acquire lock', 'rewrite lock', 'read lock', 'clean up']);
+    // 前の回のロックは、OS の起動の時刻が違うので古いとみなされ、作り直される（原子的に取り直し、後始末をしてから保存する。LG-4: 書き換えて
+    // 読み直す前の方式は捨てた）。
+    // DEF-172: 動いている process の ID の古く見えるロックは、猶予の後に読み直してから取り直す（読み取りを除いた順は、今までどおり）。
+    expect(resumedCalls.map(({ kind }) => kind).filter((kind) => kind !== 'read lock').slice(0, 3)).toEqual(['acquire lock', 'take over lock', 'clean up']);
     const lock = await readJson(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock'))) as RunLock;
     expect(lock.bootedAtMs).not.toBe(previousLock.bootedAtMs);
     expect(lock.acquiredAtMs).toBeGreaterThanOrEqual(resumedAtMs);

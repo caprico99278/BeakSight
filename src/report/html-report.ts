@@ -26,8 +26,11 @@ import {
   type RunExecution,
   type RunLoad,
 } from '../core/contracts.js';
+import { BEAKSIGHT_BLOCK_RELATIONS } from '../core/beaksight-block-relation.js';
 import { INTERACTION_NOT_VERIFIABLE_KINDS } from '../core/evidence-types.js';
 import {
+  AUDIT_SEND_POLICY_CATALOG,
+  BEAKSIGHT_BLOCK_RELATION_CATALOG,
   EVIDENCE_TYPE_CATALOG,
   INTERACTION_NOT_VERIFIABLE_KIND_CATALOG,
   INTERACTION_STATUS_CATALOG,
@@ -56,9 +59,12 @@ import {
   formatTimes,
 } from '../presentation/format.js';
 import {
+  AUDIT_SEND_TEXT,
   HTML_REPORT_TEXT,
+  PAGE_COVERAGE_ITEMS,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
+  describeBlockedRequestReason,
   earlierAttemptRecordText,
   ordinalText,
   retryAttemptText,
@@ -199,7 +205,10 @@ const evidenceRef = (evidenceId: EvidenceId, location: EvidenceLocationView | nu
  */
 const reasonParts = (reason: ReasonView<string>): readonly [Fragment, Fragment, Fragment | null] => [
   renderCode(reason.code),
-  htmlText(reason.description),
+  // T44c（Task 44 の設計書 P1-4）: 次にできることのある理由は、説明の後に続ける。
+  reason.nextStep === null
+    ? htmlText(reason.description)
+    : joinWithSpace([htmlText(reason.description), htmlText(HTML_REPORT_TEXT.reasonNextStep(reason.nextStep))]),
   reason.detail === null ? null : renderCode(reason.detail),
 ];
 
@@ -223,10 +232,10 @@ const reasonList = (reasons: readonly ReasonView[]): Fragment => renderReference
 // ---------------------------------------------------------------------------------------------------------------
 
 /**
- * Finding の行。`anchored` が偽の行には `id` を付けない（同じ Finding を2回示すため。アンカーは category の節の行に付ける。
- * すべての Finding は、どれか1つの category の節に入る）。
+ * Finding の行（category の節だけが出す。アンカー `finding-<ID>` を付ける。すべての Finding は、どれか1つの category の節に入る）。T44f: 「重大な指摘」の
+ * 節は行を出し直さず、この行へのリンクの一覧にした（`findingLinkList`）。
  */
-const findingRow = (context: RenderContext, view: FindingView, anchored: boolean): SafeHtml<'row'> =>
+const findingRow = (context: RenderContext, view: FindingView): SafeHtml<'row'> =>
   renderFindingRow({
     finding: view.finding,
     allowedOrigins: context.allowedOrigins,
@@ -237,13 +246,35 @@ const findingRow = (context: RenderContext, view: FindingView, anchored: boolean
     })),
     screenshots: view.screenshots,
     pageAnchorId: view.finding.pageId === null ? null : (context.pageAnchors.get(view.finding.pageId) ?? null),
-    anchored,
+    anchored: true,
+    // BN-c・BN-d: BeakSight の遮断との関係の印（表示用モデルの判定のまま）と、BN-R0 の M-3: SAFETY の Finding の時点の印。
+    blockRelation: view.beaksightBlockRelation,
+    safetyBlockPhaseCounts: view.safetyBlockPhaseCounts,
   });
 
-const findingTableOrNone = (context: RenderContext, findings: readonly FindingView[], anchored: boolean): Fragment =>
+const findingTableOrNone = (context: RenderContext, findings: readonly FindingView[]): Fragment =>
   findings.length === 0
     ? renderParagraph(HTML_REPORT_TEXT.noFindings)
-    : renderFindingTable({ caption: null, rows: findings.map((view) => findingRow(context, view, anchored)) });
+    : renderFindingTable({ caption: null, rows: findings.map((view) => findingRow(context, view)) });
+
+/**
+ * T44f（Task 44 の設計書 P3-1 の D）: Finding へのリンクの一覧（severity の印、分類ごとの節の行へのリンク（Finding の ID）、文言）。「重大な指摘」の節と、
+ * ページの節の Finding の一覧が使う（行を出し直さない）。空なら「なし」。
+ */
+const findingLinkList = (findings: readonly FindingView[]): Fragment =>
+  renderReferenceList(
+    findings.map(({ finding }) =>
+      joinWithSpace([
+        renderSeverityBadge(finding.severity),
+        renderInternalLink(finding.findingId, toAnchorId('finding', finding.findingId)),
+        htmlText(finding.message),
+      ]),
+    ),
+  );
+
+/** T44f: 「重大な指摘」の節（分類ごとの節の行へのリンクの一覧。なければ、指摘のない節の文）。 */
+const findingLinksOrNone = (findings: readonly FindingView[]): Fragment =>
+  findings.length === 0 ? renderParagraph(HTML_REPORT_TEXT.noFindings) : findingLinkList(findings);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 節1: 要約
@@ -290,6 +321,33 @@ const executionRow = (execution: RunExecution, index: number): SafeHtml<'row'> =
   ]);
 };
 
+/**
+ * AS-b: 監査の段の送信の扱いのバッジと説明（ラベル・色・説明は表示カタログ）。値は表示用モデルの `summary.auditSend` のまま（数え直さない）。
+ */
+const auditSendPolicyValue = (auditSend: RunSummaryView['auditSend']): Fragment => {
+  const spec = AUDIT_SEND_POLICY_CATALOG[auditSend.policy];
+  return joinWithSpace([renderBadge(spec, auditSend.policy), spec.description === null ? null : htmlText(spec.description)]);
+};
+
+/**
+ * AS-b: 通したことの知らせ（目立つ形。表示用モデルの `prominent` が真のときだけ）。Run の小節の最初と、Safety の節に置く。件数は `formatCount`。
+ */
+const auditSendNotice = (auditSend: RunSummaryView['auditSend']): readonly Fragment[] =>
+  auditSend.prominent
+    ? [
+      renderParagraph(joinWithSpace([
+        renderBadge(AUDIT_SEND_POLICY_CATALOG[auditSend.policy], auditSend.policy),
+        htmlText(AUDIT_SEND_TEXT.passedNotice(formatCount(auditSend.passedRequests))),
+      ])),
+      // AS-c: 内訳（ほかの Origin への送信と、WebSocket の接続）。
+      renderParagraph(AUDIT_SEND_TEXT.passedDetail(formatCount(auditSend.passedOtherOriginRequests), formatCount(auditSend.passedWebSockets))),
+      // AS-c fix round 1: Guard の判定を通らずに開いた接続と、危険な語の接続（出すかは表示用モデルの `webSocketCaution`）。
+      ...(auditSend.webSocketCaution
+        ? [renderParagraph(AUDIT_SEND_TEXT.webSocketCaution(formatCount(auditSend.passedWebSocketsOutsideGuard), formatCount(auditSend.passedDangerousWebSockets)))]
+        : []),
+    ]
+    : [];
+
 function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): readonly Fragment[] {
   const text = HTML_REPORT_TEXT.summary;
   const counts = summary.findingCounts;
@@ -297,6 +355,7 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
   const viewports = sortByDisplayOrder(VIEWPORT_PROFILES, VIEWPORT_PROFILE_CATALOG);
   return [
     subsection(level, text.runHeading, SUMMARY_ANCHORS.run, [
+      ...auditSendNotice(summary.auditSend),
       renderKeyValueList([
         {
           label: RUN_SUMMARY_TEXT.runStatus,
@@ -309,16 +368,13 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         { label: text.startedAt, value: formatDateTime(summary.startedAt) },
         { label: text.finishedAt, value: formatDateTime(summary.finishedAt) },
         { label: RUN_SUMMARY_TEXT.toolVersion, value: renderCode(summary.toolVersion) },
+        // AS-b: 監査の段の送信の扱い（どの扱いで監査した結果か）。
+        { label: AUDIT_SEND_TEXT.label, value: auditSendPolicyValue(summary.auditSend) },
       ]),
     ]),
     subsection(level, RUN_SUMMARY_TEXT.coverageHeading, SUMMARY_ANCHORS.coverage, [
-      renderKeyValueList([
-        { label: RUN_SUMMARY_TEXT.coverage.discovered, value: formatCount(summary.coverage.discovered) },
-        { label: RUN_SUMMARY_TEXT.coverage.audited, value: formatCount(summary.coverage.audited) },
-        { label: RUN_SUMMARY_TEXT.coverage.partial, value: formatCount(summary.coverage.partial) },
-        { label: RUN_SUMMARY_TEXT.coverage.failed, value: formatCount(summary.coverage.failed) },
-        { label: RUN_SUMMARY_TEXT.coverage.skipped, value: formatCount(summary.coverage.skipped) },
-      ]),
+      // T44R2 の M-8: 項目の並びは `PAGE_COVERAGE_ITEMS`（1 か所）。
+      renderKeyValueList(PAGE_COVERAGE_ITEMS.map((item) => ({ label: RUN_SUMMARY_TEXT.coverage[item], value: formatCount(summary.coverage[item]) }))),
     ]),
     subsection(level, text.countsHeading, SUMMARY_ANCHORS.counts, [
       renderParagraph(text.countsNote),
@@ -340,6 +396,15 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
         })),
         { label: text.totalFindings, value: formatCount(counts.total) },
         { label: text.safetyInvariantViolations, value: formatCount(summary.safetyInvariantViolationCount) },
+      ]),
+      // BN-d: BeakSight の遮断と指摘の関係の区分の別の件数（区分の名前と順は表示カタログ）と、ChatGPT 用バンドルの本体の件数（表示用モデルの値のまま）。
+      renderParagraph(text.blockRelationNote),
+      renderKeyValueList([
+        ...sortByDisplayOrder(BEAKSIGHT_BLOCK_RELATIONS, BEAKSIGHT_BLOCK_RELATION_CATALOG).map((relation) => ({
+          label: text.blockRelationCount(BEAKSIGHT_BLOCK_RELATION_CATALOG[relation].label),
+          value: formatCount(summary.beaksightBlockRelation.byRelation[relation]),
+        })),
+        { label: text.bundleMainFindings, value: formatCount(summary.beaksightBlockRelation.mainFindingCounts.total) },
       ]),
     ]),
     subsection(level, text.limitsHeading, SUMMARY_ANCHORS.limits, [
@@ -405,7 +470,7 @@ function renderCategorySection(context: RenderContext, view: FindingSectionView,
   return subsection(level, spec.label, spec.anchor, [
     ...(spec.description === null ? [] : [renderParagraph(spec.description)]),
     renderKeyValueList([{ label: HTML_REPORT_TEXT.findingCount, value: formatCount(view.counts.total) }]),
-    findingTableOrNone(context, view.findings, true),
+    findingTableOrNone(context, view.findings),
   ]);
 }
 
@@ -484,16 +549,49 @@ function safetyEventRow(context: RenderContext, event: SafetyEventView): SafeHtm
     event.method === null ? none() : renderCode(event.method),
     event.url === null ? none() : renderUrlAsText(event.url),
     event.candidateId === null ? none() : renderCode(event.candidateId),
-    renderCode(event.reason),
+    safetyEventReasonCell(event),
     evidenceRef(event.evidenceId, event.location),
   ]);
+}
+
+/**
+ * T44R2 の M-7: Safety の事象の理由の欄（コード）。止めた要求の行は、止め方が理由ごとに違う（読み取りでない送信、上限、離れた後の上限は GET も止める）ので、
+ * 理由の説明（`describeBlockedRequestReason`）を添える。
+ */
+function safetyEventReasonCell(event: SafetyEventView): Fragment {
+  const description = event.kind === 'blockedRequests' ? describeBlockedRequestReason(event.reason) : null;
+  return description === null ? renderCode(event.reason) : joinWithSpace([renderCode(event.reason), htmlText(description)]);
 }
 
 function renderSafety(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): readonly Fragment[] {
   const text = HTML_REPORT_TEXT.safety;
   const { safety } = viewModel;
   const blocked = safety.blockedActions;
+  const { auditSend } = viewModel.summary;
   return [
+    // AS-b: 通したことの知らせ（目立つ形）と、扱い・通した数（method ごと）。値は表示用モデルの `summary.auditSend` のまま。
+    ...auditSendNotice(auditSend),
+    renderKeyValueList([
+      { label: AUDIT_SEND_TEXT.label, value: auditSendPolicyValue(auditSend) },
+      ...(auditSend.prominent
+        ? [
+          { label: AUDIT_SEND_TEXT.passedCount, value: formatCount(auditSend.passedRequests) },
+          // AS-c: ほかの Origin へ通した送信と、通した WebSocket の接続。
+          { label: AUDIT_SEND_TEXT.passedOtherOrigins, value: formatCount(auditSend.passedOtherOriginRequests) },
+          { label: AUDIT_SEND_TEXT.passedWebSockets, value: formatCount(auditSend.passedWebSockets) },
+          // AS-c fix round 1: そのうち Guard の判定を通らずに開いた接続と、危険な語の接続。
+          { label: AUDIT_SEND_TEXT.passedWebSocketsOutsideGuard, value: formatCount(auditSend.passedWebSocketsOutsideGuard) },
+          { label: AUDIT_SEND_TEXT.passedDangerousWebSockets, value: formatCount(auditSend.passedDangerousWebSockets) },
+        ]
+        : []),
+    ]),
+    ...(auditSend.prominent
+      ? [tableOrNone(
+        AUDIT_SEND_TEXT.methodsCaption,
+        AUDIT_SEND_TEXT.methodColumns,
+        Object.entries(auditSend.passedRequestsByMethod).map(([method, count]) => renderTableRow([renderCode(method), formatCount(count)])),
+      )]
+      : []),
     renderKeyValueList([
       { label: text.guard, value: safety.guardEnabled ? text.guardEnabled : text.guardDisabled },
       { label: text.excludedInteractionCandidates, value: formatCount(safety.excludedInteractionCandidateCount) },
@@ -585,17 +683,7 @@ function renderPage(context: RenderContext, view: PageView, level: SectionHeadin
     subsection(subLevel, text.screenshotsHeading, toAnchorId('page-screenshots', view.pageId), [
       renderReferenceList(view.screenshots.map((screenshot) => renderScreenshotRef(screenshot))),
     ]),
-    subsection(subLevel, text.findingsHeading, toAnchorId('page-findings', view.pageId), [
-      renderReferenceList(
-        view.findings.map(({ finding }) =>
-          joinWithSpace([
-            renderSeverityBadge(finding.severity),
-            renderInternalLink(finding.findingId, toAnchorId('finding', finding.findingId)),
-            htmlText(finding.message),
-          ]),
-        ),
-      ),
-    ]),
+    subsection(subLevel, text.findingsHeading, toAnchorId('page-findings', view.pageId), [findingLinkList(view.findings)]),
     ...(view.retryAttempts.length === 0
       ? []
       : [
@@ -619,7 +707,8 @@ const SUBSECTION_LEVEL: SectionHeadingLevel = 3;
 const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext, viewModel: ReportViewModel) => readonly Fragment[]>> =
   Object.freeze({
     SUMMARY: (_context, viewModel) => renderSummary(viewModel.summary, SUBSECTION_LEVEL),
-    CRITICAL_FINDINGS: (context, viewModel) => [findingTableOrNone(context, viewModel.criticalFindings, false)],
+    // T44f（Task 44 の設計書 P3-1 の D）: 行を出し直さず、分類ごとの節の行へのリンクの一覧にする。
+    CRITICAL_FINDINGS: (_context, viewModel) => [findingLinksOrNone(viewModel.criticalFindings)],
     CATEGORY_FINDINGS: (context, viewModel) =>
       viewModel.categorySections.map((section) => renderCategorySection(context, section, SUBSECTION_LEVEL)),
     INTERACTIONS: (context, viewModel) => renderInteractions(context, viewModel, SUBSECTION_LEVEL),

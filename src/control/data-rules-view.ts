@@ -17,6 +17,7 @@ export {
   MAX_RULE_RANGE_VALUE_LENGTH,
   NEEDS_RULE_INPUT_DETAILS,
   RULE_CONFLICT_DETAILS,
+  RULE_ORIGINS,
   RULE_PROBLEM_CODES,
   RULE_SET_ID_PATTERN,
   RULE_SET_SCHEMA_VERSION,
@@ -28,6 +29,7 @@ export {
   syntheticPhoneFormatOf,
 } from './data-rules/rule-contracts.js';
 export type {
+  BaseDateWindow,
   ExternalDeliveryBlockedDetail,
   FieldRelation,
   FieldRelationKind,
@@ -37,6 +39,7 @@ export type {
   GenerationMethod,
   NeedsRuleInputDetail,
   RuleConflictDetail,
+  RuleOrigin,
   RuleProblem,
   RuleProblemCode,
   RuleRange,
@@ -55,7 +58,17 @@ export { evaluateRuleSet } from './data-rules/field-evaluation.js';
 export type { FieldEvaluation, RuleSetEvaluation } from './data-rules/field-evaluation.js';
 
 export { generateScenarioData } from './data-rules/scenario-data.js';
+
+// T40R2-fix（M-1）: 照合の READ の期待が、実行のたびに変わる値と比べるか（開始の画面が、許可の発行と同じ判定で理由を出す）。
+export { readVerificationVaryingRejectionOf } from './data-rules/varying-values.js';
+// FM2b（手を減らす段 2 の設計書 3A.2）: 照合の READ の期待の欄を、実行のたびに値が変わる欄から推す（許可の発行と同じ値の作り方と判定）。
+export { planRuleSet } from './data-rules/field-evaluation.js';
+export { varyingFieldNamesOf } from './data-rules/varying-values.js';
 export type { ScenarioDataResult } from './data-rules/scenario-data.js';
+
+// FM2c（手動の操作を減らす設計書 3A.3）: 推した規則を保存できる規則の集まりの中身にする部品（下書きの自動の作成（FM2b）と画面が使う）。
+export { defaultRangeFieldNamesOf, inferRuleSetContent } from './data-rules/rule-set-inference.js';
+export type { InferredRuleSetContent } from './data-rules/rule-set-inference.js';
 
 export { computeRuleSetDigest } from './data-rules/rule-digest.js';
 export { assertStorableRuleSet } from './data-rules/rule-set-policy.js';

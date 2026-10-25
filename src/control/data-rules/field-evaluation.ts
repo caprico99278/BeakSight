@@ -3,7 +3,8 @@
 //   と、実行してよいか（送る欄すべてが `DECIDED` で、required なのに送る欄に選ばれていない欄がない）を返す。
 // - 欄ごとの判定の順（最初に当たったもの）:
 //   1. 候補の送れる欄でない（ない、hidden・readonly・disabled、password・file、`_method`）→ `RULE_CONFLICT` の `FIELD_NOT_SENDABLE`。
-//   2. 状態の欄（発見の分類の状態の欄の名前の語。`classify.ts` の `fieldNameHasStateWord`）→ `STATE_FIELD_NOT_USABLE`。
+//   2. 状態の欄（発見の分類の状態の欄の名前の語。`classify.ts` の `fieldNameHasStateWord`）→ `STATE_FIELD_NOT_USABLE`。DEF-147: API のシナリオの鍵は、
+//      論理削除にあたる鍵（`isApiSoftDeleteKeyName`）だけが `STATE_FIELD_NOT_USABLE`。公開の状態の鍵は規則で決めるが、論理削除の語の固定の値は拒む。
 //   3. 通知・配信を求める欄（外部到達の語の `NOTIFICATION`、またはメール・電話の語の選択の欄）→「送らない」側に固定する（`OPT_OUT`。規則に
 //      依らない）。checkbox は送らない（null）。select・radio は「送らない」側の値（`isNotificationOptOutValue`）。選べず required なら
 //      `NOTIFICATION_OPT_OUT_UNAVAILABLE`。required でなければ送らない（null）。名前に否定の語（`NOTIFICATION_NEGATION_WORDS`）がある欄は、
@@ -28,30 +29,69 @@
 //   「required なのに送る欄に選ばれていない欄」は、UPDATE では変える欄でも保つ欄でもない欄だけ（保つ欄は前の値のまま送る）。一意にする欄の組が、
 //   規則の集まりからもテンプレートの既定からも決まらないときは、UPDATE だけ、変える欄（`DECIDED` の欄）の組にする（使った値と重ならない値を作る
 //   ため。CREATE は今のまま空）。状態の欄・無効化の語・メールと電話の決まりは、CREATE と同じ判定がそのまま効く。
-// - 呼び出し側の誤り（規則の集まりが別のシナリオ、候補の識別の digest がシナリオと違う）は `RangeError`。
-import type { ScenarioRevision } from '../approval/scenario-contracts.js';
+// - T38e（Task 38 の設計書 3.6）: API のシナリオ（`scenarioTransportOf` が `API`）は、規則を本文の鍵（`fieldNames`）で引く。値を入れる先の欄は
+//   `api.keyFields[].field`（`NAME` か `SELECTOR`）で、欄の型は候補の probe の欄（`submissionProbeKeyFieldsOf`）の型。欄は鍵の名前で作る
+//   （推しと外部到達の語は鍵の名前で見る）。probe は欄の制約を残さないので、制約・選択肢・required はない。段 1 の 1 は「鍵と欄の対応が probe の
+//   欄と同じ」（違えば `FIELD_NOT_SENDABLE`）。欄の型と鍵の JSON の型の組（`SCENARIO_API_FIELD_JSON_TYPES`）が合わない、number の鍵の固定の値・
+//   人の範囲・汎用の値の空間が正規の数の形（`json-value.ts`）で表せなければ `JSON_VALUE_TYPE_MISMATCH`。ページが決める鍵（`api.pageKeys`）には
+//   値を作らず、規則があれば送る欄に選ばれていない行の `PAGE_KEY_RULE_NOT_ALLOWED`。「required なのに送る欄に選ばれていない欄」は数えない
+//   （欄に対応する鍵は、下書きの確かめですべて送る鍵）。FORM のシナリオは今のまま。
+// - FM2c（手動の操作を減らす設計書 3A.3）:
+//   - 保存した規則の基準日からの幅（`baseDateWindow`）は、範囲の手がかり（欄の min・max・step）のない date・datetime-local の欄にだけ当てる（欄に min・max が
+//     あれば `RANGE_OUTSIDE_FIELD_CONSTRAINT`、step があるかほかの型なら `CONSTRAINT_UNSUPPORTED`）。値は基準日（生成は実行の許可の発行日。判定だけの
+//     呼び出しは名前つきの参照の日 `EVALUATION_REFERENCE_BASE_DATE`。幅の値の数と関係の成り立ちは、どの基準日でも同じ）から求める。
+//   - 「番号・コード」（`DIGIT_CODE`）は、欄の pattern の桁数の数字を作る（pattern が数字だけの固定の桁数でなければ `PATTERN_UNSUPPORTED`、長さが合わな
+//     ければ `LENGTH_UNSATISFIABLE`）。FM2R fix round 1（I-3）: 番号・コードを推すのは、推した規則を作るとき（`inferredFieldRulesOf`）だけ。判定のたびの
+//     推し（保存した規則のない欄）は FM2c の前と同じで、番号・コードを推さない（既定の幅も、判定では入れない）。保存した番号・コードの規則は当てる。
+//   - API のシナリオの鍵の欄を、form の中の候補の欄（probe の欄の name で結ぶ。同じ型のとき）の制約と選択肢で補うのは、自動の作成の推し
+//     （`inferredFieldRulesOf`）のときだけ（fix round 1）。判定と生成は、今どおり制約なし（承認の後に、補いで値が黙って変わらないため）。補った範囲と桁は、
+//     自動の作成が保存する規則に固定する。保存した規則の桁の数（`digitCount`）は、番号・コードの桁に使う。
+//   - テンプレートの既定を保存した規則の集まり（`templateDefaultsSaved`。fix round 1）は、保存した関係と一意にする欄の組だけを使う（既定を足さない）。
+//   - 推した規則の写し（`inferredFieldRulesOf`）: 規則の集まりの自動の作成（`rule-set-inference.ts`）が使う。同じ段 1 の判定で推した規則（業務テンプレートと
+//     汎用の規則）だけを返す（推しは副作用の確認に依らない。確認が済むまでメール・電話の欄を止めるのは、保存した規則の判定でも同じ）。
+// - 呼び出し側の誤り（規則の集まりが別のシナリオ、候補の識別の digest がシナリオと違う、API のシナリオが API の指定を持たない）は `RangeError`。
+import {
+  API_SCENARIO_TRANSPORT,
+  isSameScenarioApiFieldIdentity,
+  isScenarioApiFieldJsonTypePair,
+  scenarioApiFieldIdentityOf,
+  scenarioTransportOf,
+  type ScenarioApiSpec,
+  type ScenarioRevision,
+} from '../approval/scenario-contracts.js';
+import type { ApiJsonValueType } from '../../core/api-request-shape.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { compareCodeUnits } from '../../core/text.js';
 import {
   CHOICE_FIELD_TYPES,
+  FIELD_CONSTRAINT_NAMES,
   isMethodOverrideFieldName,
   isUnsendableFieldType,
   writeFieldsOfName,
   type CandidateField,
+  type CandidateFieldConstraints,
   type CandidateFieldType,
   type DiscoveryCandidate,
 } from '../../discovery/candidate-contracts.js';
-import { fieldNameHasStateWord } from '../../discovery/classify.js';
+import {
+  fieldNameHasSoftDeleteWord,
+  fieldNameHasStateWord,
+  isApiSoftDeleteKeyName,
+  isPublicationStateKeyName,
+} from '../../discovery/classify.js';
 import { isSendableWriteFieldName } from '../../discovery/read-check-contracts.js';
+import { submissionProbeKeyFieldsOf } from '../../discovery/submission-probe-contracts.js';
 import {
   NAME_KANA_PAIRS,
   PERSON_NAME_KINDS,
   TEMPORAL_KINDS,
   defaultRelationsOf,
   defaultUniqueKeyFieldNamesOf,
+  fieldDigitCodeLengthOf,
   inferSemanticKind,
   isSemanticKindCompatible,
   templateDefaultRangeOf,
+  type InferenceOptions,
 } from './business-templates.js';
 import {
   AVOIDED_PERSON_NAME_PAIRS,
@@ -68,7 +108,9 @@ import {
   type ExternalDeliveryKind,
 } from './external-delivery-words.js';
 import {
+  BASE_DATE_WINDOW_FIELD_TYPES,
   alignUpToFieldStep,
+  baseDateWindowRangeOf,
   checkGenericRule,
   compareFieldValues,
   fieldStepFitOf,
@@ -85,7 +127,10 @@ import {
   SYNTHETIC_PHONE_FORMATS,
   isSyntheticEmailAddress,
   relationFieldNamesOf,
+  ruleBaseDateWindowOf,
+  ruleDigitCountOf,
   syntheticEmailAddressOf,
+  templateDefaultsSavedOf,
   syntheticPhoneFormatOf,
   syntheticPhoneNumberOf,
   type FieldRelation,
@@ -98,14 +143,38 @@ import {
   type SemanticKind,
   type SyntheticPhoneFormat,
 } from './rule-contracts.js';
+import { isJsonValueConvertible, jsonNumberRangeFits } from './json-value.js';
 import { textConstraintCheckOf, unsatisfiedDetailOf, type TextConstraintCheck } from './text-constraints.js';
 
-/** 判定が見るシナリオの項目。 */
-export type EvaluationScenario = Pick<ScenarioRevision, 'scenarioId' | 'kind' | 'candidate' | 'fieldNames' | 'sideEffectConfirmations' | 'update'>;
+/** 判定が見るシナリオの項目（T38e: 送り方と API の指定。FORM のシナリオは持たない）。 */
+export type EvaluationScenario = Pick<
+  ScenarioRevision,
+  'scenarioId' | 'kind' | 'candidate' | 'fieldNames' | 'sideEffectConfirmations' | 'update' | 'transport' | 'api'
+>;
+
+/** API のシナリオの API の指定（FORM のシナリオは null。API のシナリオが指定を持たなければ、呼び出し側の誤りの `RangeError`）。 */
+export const evaluationApiSpecOf = (scenario: Pick<EvaluationScenario, 'transport' | 'api'>): ScenarioApiSpec | null => {
+  if (scenarioTransportOf(scenario) !== API_SCENARIO_TRANSPORT) {
+    return null;
+  }
+  if (scenario.api === undefined) {
+    throw new RangeError('the API scenario has no API spec');
+  }
+  return scenario.api;
+};
 
 /** 保つ欄（T31d。UPDATE の指定の保つ欄。CREATE と、UPDATE の指定がない版は空）。値を作らず、規則も要らない。 */
 const keepFieldNamesOf = (scenario: EvaluationScenario): readonly string[] =>
   (scenario.kind === 'UPDATE' ? scenario.update?.keepFieldNames ?? [] : []);
+
+/** 判定が見る規則の集まりの項目（FM2c: 保存の前の中身も判定できるように、id・版・時刻は見ない）。 */
+export type EvaluationRuleSet = Pick<RuleSetRevision, 'scenarioId' | 'fieldRules' | 'relations' | 'uniqueKeyFieldNames' | 'templateDefaultsSaved'>;
+
+/**
+ * 判定だけの呼び出し（基準日を渡さない）で、基準日からの幅を値の範囲にするときの参照の日（FM2c）。幅は欄の min・max・step がないときだけ当てるので、
+ * 値の数と、欄どうしの関係が成り立つかは、どの基準日でも同じ（生成は実行の許可の発行日を渡す）。
+ */
+export const EVALUATION_REFERENCE_BASE_DATE = '2000-01-01';
 
 /** 欄 1 つの判定（補完の画面の 1 行）。 */
 export interface FieldEvaluation {
@@ -148,6 +217,8 @@ export type FieldPlan =
   | { readonly kind: 'DICTIONARY'; readonly values: readonly string[] }
   | { readonly kind: 'EMAIL'; readonly issueOf: TextConstraintCheck }
   | { readonly kind: 'PHONE'; readonly format: SyntheticPhoneFormat; readonly issueOf: TextConstraintCheck }
+  /** FM2c: 番号・コード（`digits` 桁の数字。欄の pattern の桁数）。 */
+  | { readonly kind: 'DIGIT_CODE'; readonly digits: number; readonly issueOf: TextConstraintCheck }
   | {
     readonly kind: 'DERIVED_TOTAL';
     readonly field: CandidateField;
@@ -312,23 +383,121 @@ const optOutDecision = (field: CandidateField, external: readonly ExternalDelive
     : { field, problem: null, rule: null, source: 'OPT_OUT', plan: { kind: 'OPT_OUT', value: null }, external };
 };
 
-const decideRule = (
-  name: string,
-  candidate: DiscoveryCandidate,
-  humanRule: FieldRule | undefined,
-  notificationConfirmed: boolean,
-): RuleDecision => {
+/** 送る欄 1 つの欄（FORM は候補の欄、API は鍵に対応する probe の欄から作る欄）と、送れるか、鍵の JSON の型（FORM は null。T38e）。 */
+interface SendTarget {
+  readonly field: CandidateField | null;
+  readonly sendable: boolean;
+  readonly jsonType: ApiJsonValueType | null;
+  /** FM2c fix round 1: 自動の作成の推しで、API の鍵の欄を補った同じ form の欄（ほかは null か、ない）。 */
+  readonly formField?: CandidateField | null;
+}
+
+/** FORM のシナリオの送る欄。 */
+const formTargetOf = (candidate: DiscoveryCandidate, name: string): SendTarget => {
   // T31b fix round 1: 値を送る欄（組の名前は組の checkbox だけ。`writeFieldsOfName`）で判定する（組でない同じ名前の欄は、今どおり送れない）。
   const fields = writeFieldsOfName(candidate.fields, name);
   const field = mergedFieldOf(fields);
-  if (field === null || !isSendableWriteFieldName(candidate, name) || isMethodOverrideFieldName(name)
-    || fields.some((candidateField) => isUnsendableFieldType(candidateField.type))) {
+  return {
+    field,
+    sendable: field !== null && isSendableWriteFieldName(candidate, name) && !isMethodOverrideFieldName(name)
+      && !fields.some((candidateField) => isUnsendableFieldType(candidateField.type)),
+    jsonType: null,
+  };
+};
+
+/** 制約のない欄の制約（probe は欄の制約を残さない。T38e）。 */
+const NO_FIELD_CONSTRAINTS: CandidateFieldConstraints = Object.freeze(
+  Object.fromEntries(FIELD_CONSTRAINT_NAMES.map((name) => [name, null])) as CandidateFieldConstraints,
+);
+
+/**
+ * API のシナリオの送る鍵の欄（T38e）。鍵と欄の対応（`api.keyFields`）が、候補の probe の鍵と欄の対応（`submissionProbeKeyFieldsOf`）と同じ欄の
+ * 識別のときだけ送れる。欄は鍵の名前と probe の欄の型で作る（制約・選択肢・required はない）。
+ */
+/** form の候補の種類（FM2c: この候補の欄だけが、probe の欄と同じ form の欄）。 */
+const FORM_CANDIDATE_KIND = 'FORM' satisfies DiscoveryCandidate['kind'];
+
+/**
+ * FM2c: probe の欄と同じ form の、同じ name・同じ型の候補の欄（制約と選択肢を補う）。form の外のボタンの候補、name のない probe の欄、型の違う欄は null。
+ */
+const sameFormFieldOf = (candidate: DiscoveryCandidate, probeField: { readonly name: string | null; readonly type: CandidateFieldType }): CandidateField | null => {
+  if (candidate.kind !== FORM_CANDIDATE_KIND || probeField.name === null || probeField.name.length === 0) {
+    return null;
+  }
+  const field = mergedFieldOf(writeFieldsOfName(candidate.fields, probeField.name));
+  return field !== null && field.type === probeField.type ? field : null;
+};
+
+/**
+ * API のシナリオの送る鍵の欄。FM2c fix round 1: 同じ form の欄の制約と選択肢で補うのは、自動の作成の推し（`supplement` が真）のときだけ。判定と生成は、
+ * 今どおり制約なし（承認の後に、補いで送る値が黙って変わらないため。補った範囲と桁は、自動の作成が保存する規則に固定する）。
+ */
+const apiTargetOf = (candidate: DiscoveryCandidate, api: ScenarioApiSpec, key: string, supplement: boolean): SendTarget => {
+  const keyField = api.keyFields.find((item) => item.key === key);
+  const probe = candidate.submissionProbe;
+  const probeField = probe === undefined ? null : submissionProbeKeyFieldsOf(probe).find((item) => item.key === key)?.field ?? null;
+  const identity = probeField === null ? null : scenarioApiFieldIdentityOf(probeField);
+  if (keyField === undefined || probeField === null || identity === null || !isSameScenarioApiFieldIdentity(identity, keyField.field)) {
+    return { field: null, sendable: false, jsonType: null };
+  }
+  const { type } = probeField;
+  const formField = supplement ? sameFormFieldOf(candidate, probeField) : null;
+  const field: CandidateField = {
+    name: key,
+    tag: type === 'textarea' ? 'textarea' : type.startsWith('select') ? 'select' : 'input',
+    type,
+    required: false,
+    readonly: false,
+    disabled: false,
+    hidden: false,
+    constraints: formField?.constraints ?? NO_FIELD_CONSTRAINTS,
+    options: formField?.options ?? null,
+    omittedOptionCount: formField?.omittedOptionCount ?? 0,
+    hasValue: false,
+  };
+  return { field, sendable: !isMethodOverrideFieldName(key) && !isUnsendableFieldType(type), jsonType: keyField.type, formField };
+};
+
+/**
+ * 人の規則の値（固定の一覧、number の鍵の人の範囲の端と刻み）が、鍵の JSON の型に変えられるか（T38e。`json-value.ts`）。推した規則は値を
+ * 持たない（作る値の空間は段 2 で確かめる）。
+ */
+const ruleValuesFitJsonType = (rule: FieldRule, source: RuleSource, jsonType: ApiJsonValueType): boolean => {
+  if (source !== 'HUMAN') {
+    return true;
+  }
+  if (!rule.fixedValues.every((value) => isJsonValueConvertible(value, jsonType))) {
+    return false;
+  }
+  const range = jsonType === 'number' ? rule.range : null;
+  return range === null || [range.min, range.max, range.step].every((value) => value === null || isJsonValueConvertible(value, jsonType));
+};
+
+const decideRule = (
+  name: string,
+  target: SendTarget,
+  humanRule: FieldRule | undefined,
+  notificationConfirmed: boolean,
+  inferenceOptions: InferenceOptions = {},
+): RuleDecision => {
+  const { field, jsonType } = target;
+  if (field === null || !target.sendable) {
     return { field, problem: conflict('FIELD_NOT_SENDABLE'), rule: null, source: null, plan: null, external: [] };
   }
   const external = externalDeliveryKindsOf(field);
   const fail = (problem: RuleProblem, rule: FieldRule | null = null, source: RuleSource | null = null): RuleDecision =>
     ({ field, problem, rule, source, plan: null, external });
-  if (fieldNameHasStateWord(field.name)) {
+  // T38e: 欄の型と鍵の JSON の型の組（T38b の下書きの確かめと同じ表）。
+  if (jsonType !== null && !isScenarioApiFieldJsonTypePair(field.type, jsonType)) {
+    return fail(conflict('JSON_VALUE_TYPE_MISMATCH'));
+  }
+  // DEF-147（設計書 `2026-10-21-beaksight-api-state-keys-design.md` 2 章）: API のシナリオの鍵（`jsonType` がある）は、論理削除にあたる鍵だけを使えない
+  // （`isApiSoftDeleteKeyName`。公開の状態の鍵は、ほかの欄と同じく入力の規則で利用者が決める）。ただし、その値に論理削除の語を固定することは拒む。
+  // FORM のシナリオの欄は、今どおり状態の欄の語（`fieldNameHasStateWord`）で使えない。
+  if (jsonType === null ? fieldNameHasStateWord(field.name) : isApiSoftDeleteKeyName(field.name)) {
+    return fail(conflict('STATE_FIELD_NOT_USABLE'));
+  }
+  if (jsonType !== null && isPublicationStateKeyName(field.name) && (humanRule?.fixedValues ?? []).some(fieldNameHasSoftDeleteWord)) {
     return fail(conflict('STATE_FIELD_NOT_USABLE'));
   }
   const contact = external.includes('EMAIL') || external.includes('PHONE');
@@ -356,7 +525,7 @@ const decideRule = (
     rule = humanRule;
     source = 'HUMAN';
   } else {
-    const kind = inferSemanticKind(field);
+    const kind = inferSemanticKind(field, inferenceOptions);
     if (kind === null) {
       return fail(needs('SEMANTIC_KIND_UNDECIDED'));
     }
@@ -370,6 +539,9 @@ const decideRule = (
   }
   if ((contact && !fixed && !CONTACT_KINDS.includes(rule.semanticKind)) || !isSemanticKindCompatible(rule.semanticKind, field.type)) {
     return fail(conflict('SEMANTIC_KIND_TYPE_MISMATCH'), rule, source);
+  }
+  if (jsonType !== null && !ruleValuesFitJsonType(rule, source, jsonType)) {
+    return fail(conflict('JSON_VALUE_TYPE_MISMATCH'), rule, source);
   }
   if (fixed) {
     const shape = contactShapeOf(field, external, rule.semanticKind);
@@ -402,13 +574,39 @@ const insideField = (type: CandidateFieldType, value: string, field: CandidateFi
   return low === null || high === null ? null : low >= 0 && high <= 0;
 };
 
+/**
+ * FM2c: 保存した規則の基準日からの幅の作り方（範囲の手がかりのない date・datetime-local の欄だけ。値の範囲は基準日に日の数を足して求める）。
+ */
+const baseDateWindowPlanOf = (field: CandidateField, window: NonNullable<ReturnType<typeof ruleBaseDateWindowOf>>, baseDate: string): PlanResult => {
+  const { min, max, step } = field.constraints;
+  if (!(BASE_DATE_WINDOW_FIELD_TYPES as readonly CandidateFieldType[]).includes(field.type) || step !== null) {
+    return unplanned(needs('CONSTRAINT_UNSUPPORTED'));
+  }
+  if (min !== null || max !== null) {
+    return unplanned(conflict('RANGE_OUTSIDE_FIELD_CONSTRAINT'));
+  }
+  const bounds = baseDateWindowRangeOf(field.type, baseDate, window);
+  if (bounds === null) {
+    return unplanned(needs('CONSTRAINT_UNSUPPORTED'));
+  }
+  const pseudo: CandidateField = { ...field, constraints: { ...field.constraints, min: bounds.min, max: bounds.max } };
+  const reason = checkGenericRule(pseudo);
+  return reason === null
+    ? planned({ kind: 'GENERIC', field: pseudo, issueOf: null })
+    : unplanned(reason === 'NOT_GENERIC_TYPE' ? conflict('SEMANTIC_KIND_TYPE_MISMATCH') : needs(reason));
+};
+
 /** 汎用の規則の値の空間を使う作り方（数・日時・色・選択。範囲は欄、人の規則、テンプレートの既定の順に補う）。 */
-const genericPlanOf = (field: CandidateField, rule: FieldRule, source: RuleSource): PlanResult => {
+const genericPlanOf = (field: CandidateField, rule: FieldRule, source: RuleSource, baseDate: string): PlanResult => {
   if (isChoiceType(field.type) || field.type === 'color') {
     const reason = checkGenericRule(field);
     return reason === null ? planned({ kind: 'GENERIC', field, issueOf: null }) : unplanned(reason === 'NOT_GENERIC_TYPE'
       ? conflict('SEMANTIC_KIND_TYPE_MISMATCH')
       : needs(reason));
+  }
+  const window = source === 'HUMAN' ? ruleBaseDateWindowOf(rule) : null;
+  if (window !== null) {
+    return baseDateWindowPlanOf(field, window, baseDate);
   }
   const textual = TEXT_INPUT_TYPES.includes(field.type);
   const type: CandidateFieldType = textual ? 'number' : field.type;
@@ -474,8 +672,20 @@ const genericPlanOf = (field: CandidateField, rule: FieldRule, source: RuleSourc
   return detail === null ? planned({ kind: 'GENERIC', field: pseudo, issueOf: check }) : unplanned(needs(detail));
 };
 
+/** HTML の number の既定の刻み（汎用の値の空間の刻みがないとき）。 */
+const DEFAULT_NUMBER_SPACE_STEP = '1';
+
+/**
+ * 汎用の値の空間（数の欄の最小・最大・刻み）の値が、number の鍵の値（正規の数の形）で表せる見込みか（T38e。`jsonNumberRangeFits`）。数でない欄
+ * （日時・色・選択）は、number の鍵の組に入らない（段 1 で拒む）ので、ここでは表せないとする。
+ */
+const genericSpaceFitsJsonNumber = (field: CandidateField): boolean => {
+  const { min, max, step } = field.constraints;
+  return field.type === 'number' && min !== null && max !== null && jsonNumberRangeFits(min, max, step ?? DEFAULT_NUMBER_SPACE_STEP);
+};
+
 /** 規則の意味の種類の作り方（段 2）。氏名は、組の絞り込みの後に確かめる。 */
-const planOf = (field: CandidateField, rule: FieldRule, source: RuleSource, derivedTotal: boolean): PlanResult => {
+const planOf = (field: CandidateField, rule: FieldRule, source: RuleSource, derivedTotal: boolean, baseDate: string): PlanResult => {
   const kind = rule.semanticKind;
   if (derivedTotal) {
     return isChoiceType(field.type)
@@ -508,8 +718,22 @@ const planOf = (field: CandidateField, rule: FieldRule, source: RuleSource, deri
     const format = SYNTHETIC_PHONE_FORMATS.find((candidate) => check(syntheticPhoneNumberOf(candidate, 0)) === null);
     return format === undefined ? unplanned(needs('PHONE_FORMAT_UNSUPPORTED')) : planned({ kind: 'PHONE', format, issueOf: check });
   }
-  return genericPlanOf(field, rule, source);
+  if (kind === 'DIGIT_CODE') {
+    // FM2c: 欄の pattern の桁数の数字（pattern が数字だけの固定の桁数でなければ作らない）。fix round 1: 保存した規則の桁の数があれば、それを使い
+    // （API の鍵の欄。欄の制約に合うかは下で確かめる）。
+    const digits = (source === 'HUMAN' ? ruleDigitCountOf(rule) : null) ?? fieldDigitCodeLengthOf(field.constraints);
+    if (digits === null) {
+      return unplanned(needs('PATTERN_UNSUPPORTED'));
+    }
+    const check = textConstraintCheckOf(field.constraints);
+    const detail = unsatisfiedDetailOf([DIGIT_CODE_SAMPLE_DIGIT.repeat(digits)], check);
+    return detail === null ? planned({ kind: 'DIGIT_CODE', digits, issueOf: check }) : unplanned(needs(detail));
+  }
+  return genericPlanOf(field, rule, source, baseDate);
 };
+
+/** 番号・コードの値の形を確かめる見本の数字（FM2c。桁の数だけ並べる）。 */
+const DIGIT_CODE_SAMPLE_DIGIT = '0';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 関係と、氏名の組
@@ -640,11 +864,14 @@ const totalPairsOf = (
 /** 従う欄（終了・合計・フリガナ）の名前。 */
 const dependentOf = (relation: FieldRelation): string => relationFieldNamesOf(relation).at(-1) ?? '';
 
-/** 人の関係に、テンプレートの既定の関係のうち、同じ種類で同じ従う欄でないものを足す。 */
-const effectiveRelationsOf = (human: readonly FieldRelation[], rules: readonly FieldRule[]): readonly FieldRelation[] => [
+/**
+ * 人の関係に、テンプレートの既定の関係のうち、同じ種類で同じ従う欄でないものを足す。FM2c fix round 1: テンプレートの既定を保存した規則の集まり
+ * （`templateDefaultsSaved`）は、保存した関係だけ（既定を足さない）。
+ */
+const effectiveRelationsOf = (human: readonly FieldRelation[], rules: readonly FieldRule[], defaultsSaved: boolean): readonly FieldRelation[] => [
   ...human,
-  ...defaultRelationsOf(rules).filter((relation) =>
-    !human.some((other) => other.kind === relation.kind && dependentOf(other) === dependentOf(relation))),
+  ...(defaultsSaved ? [] : defaultRelationsOf(rules).filter((relation) =>
+    !human.some((other) => other.kind === relation.kind && dependentOf(other) === dependentOf(relation)))),
 ];
 
 /** 生成で選ばない姓と名の組（辞書の owner の閉じた一覧。T29R-fix-1 の M-8）の、比べる鍵。 */
@@ -663,6 +890,8 @@ const ALL_PERSONS: readonly Person[] = Object.freeze(FAMILY_NAMES.flatMap((famil
 /** 判定の途中の欄 1 つ。 */
 interface Working {
   readonly fieldName: string;
+  /** 鍵の JSON の型（API のシナリオの送る鍵。FORM は null。T38e）。 */
+  readonly jsonType: ApiJsonValueType | null;
   field: CandidateField | null;
   problem: RuleProblem | null;
   rule: FieldRule | null;
@@ -671,37 +900,100 @@ interface Working {
   readonly external: readonly ExternalDeliveryKind[];
 }
 
-/** 判定と、値の作り方を求める（純粋。入力を変えない）。 */
-export const planRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenario, candidate: DiscoveryCandidate): RuleSetPlan => {
-  if (ruleSet.scenarioId !== scenario.scenarioId) {
-    throw new RangeError('the rule set belongs to another scenario');
-  }
+/** 送る欄の名前（重なりを除き、UTF-16 のコード単位の順）。 */
+const selectedFieldNamesOf = (scenario: EvaluationScenario): readonly string[] => [...new Set(scenario.fieldNames)].sort(compareCodeUnits);
+
+/** 送る欄 1 つの欄（FORM は候補の欄、API は鍵に対応する probe の欄から作る欄）。 */
+const sendTargetOf = (candidate: DiscoveryCandidate, api: ScenarioApiSpec | null, fieldName: string, supplement = false): SendTarget =>
+  (api === null ? formTargetOf(candidate, fieldName) : apiTargetOf(candidate, api, fieldName, supplement));
+
+/** 候補がシナリオの対象の候補か（違えば呼び出し側の誤りの `RangeError`）。 */
+const assertTargetCandidate = (scenario: EvaluationScenario, candidate: DiscoveryCandidate): void => {
   if (candidate.identityDigest !== scenario.candidate.identityDigest) {
     throw new RangeError('the candidate is not the target candidate of the scenario');
   }
+};
+
+/** 推した規則を作るときの推しの選び（FM2R fix round 1。I-3。判定のたびの推しは既定の選びのまま）。 */
+const SAVED_RULE_INFERENCE: InferenceOptions = Object.freeze({ digitCode: true });
+
+/** 推した規則 1 件と、その規則を当てる欄（FM2c。規則の集まりの自動の作成が使う）。 */
+export interface InferredFieldRule {
+  /** 推した規則（出どころの印は `INFERRED`。範囲・基準日からの幅は持たない）。 */
+  readonly rule: FieldRule;
+  /** 規則を当てる欄（FORM は候補の欄、API は鍵の欄。API の鍵の欄は、同じ form の欄の制約と選択肢で補った欄）。 */
+  readonly field: CandidateField;
+  /**
+   * API の鍵の欄を補った、同じ form の欄（FM2c fix round 1。FORM のシナリオと、補わなかった鍵は null）。判定と生成は補わないので、自動の作成は、
+   * この欄から求めた範囲と桁を、保存する規則に固定する。
+   */
+  readonly formField: CandidateField | null;
+}
+
+/**
+ * 送る欄ごとに、段 1 の判定（人の規則なし）で業務テンプレートか汎用の規則が推した規則（FM2c。純粋。欄の名前の順。凍結）。推しは副作用の確認に
+ * 依らない（メール・電話の欄も推す。確認が済むまで止めるのは、保存した規則の判定でも同じ）。推せない欄、「送らない」側に固定する欄、送れない欄は
+ * 入らない。候補がシナリオの対象でなければ `RangeError`。
+ */
+export const inferredFieldRulesOf = (scenario: EvaluationScenario, candidate: DiscoveryCandidate): readonly InferredFieldRule[] => {
+  assertTargetCandidate(scenario, candidate);
+  const api = evaluationApiSpecOf(scenario);
+  return deepFreeze(selectedFieldNamesOf(scenario).flatMap((fieldName): InferredFieldRule[] => {
+    const target = sendTargetOf(candidate, api, fieldName, true);
+    // FM2R fix round 1（I-3）: FM2c で足した推し（番号・コード）は、推した規則を作るときだけ。
+    const decision = decideRule(fieldName, target, undefined, true, SAVED_RULE_INFERENCE);
+    const inferred = decision.source === 'TEMPLATE' || decision.source === 'GENERIC';
+    return decision.problem === null && decision.rule !== null && decision.field !== null && inferred
+      ? [{ rule: { ...decision.rule, origin: 'INFERRED' }, field: decision.field, formField: target.formField ?? null }]
+      : [];
+  }));
+};
+
+/**
+ * 判定と、値の作り方を求める（純粋。入力を変えない）。FM2c: 基準日（実行の許可の発行日。Asia/Tokyo の `YYYY-MM-DD`）は、保存した規則の基準日からの
+ * 幅の値の範囲に使う（生成が渡す。渡さなければ参照の日 `EVALUATION_REFERENCE_BASE_DATE`）。
+ */
+export const planRuleSet = (
+  ruleSet: EvaluationRuleSet,
+  scenario: EvaluationScenario,
+  candidate: DiscoveryCandidate,
+  baseDate: string = EVALUATION_REFERENCE_BASE_DATE,
+): RuleSetPlan => {
+  if (ruleSet.scenarioId !== scenario.scenarioId) {
+    throw new RangeError('the rule set belongs to another scenario');
+  }
+  assertTargetCandidate(scenario, candidate);
+  const api = evaluationApiSpecOf(scenario);
   const confirmed = scenario.sideEffectConfirmations.NO_EXTERNAL_NOTIFICATION;
   const humanRules = new Map(ruleSet.fieldRules.map((rule) => [rule.fieldName, rule]));
-  const selected = [...new Set(scenario.fieldNames)].sort(compareCodeUnits);
+  const selected = selectedFieldNamesOf(scenario);
 
-  // 段 1: 規則
+  // 段 1: 規則（T38e: API のシナリオは、本文の鍵で規則を引き、鍵に対応する probe の欄で判定する）
   const working: Working[] = selected.map((fieldName) => {
-    const decision = decideRule(fieldName, candidate, humanRules.get(fieldName), confirmed);
-    return { fieldName, ...decision };
+    const target = sendTargetOf(candidate, api, fieldName);
+    const decision = decideRule(fieldName, target, humanRules.get(fieldName), confirmed);
+    return { fieldName, jsonType: target.jsonType, ...decision };
   });
   const decided = working.filter((item) => item.problem === null && item.rule !== null);
   const rules = new Map(decided.map((item) => [item.fieldName, item.rule as FieldRule]));
 
   // 関係（段 2 の前に決める。合計は単価 × 数量から求める）
-  const relations = effectiveRelationsOf(ruleSet.relations, [...rules.values()])
+  const defaultsSaved = templateDefaultsSavedOf(ruleSet);
+  const relations = effectiveRelationsOf(ruleSet.relations, [...rules.values()], defaultsSaved)
     .filter((relation) => selected.includes(dependentOf(relation)));
   const derivedTotals = new Set(relations.filter((relation) => relation.kind === 'TOTAL_EQUALS_UNIT_PRICE_TIMES_QUANTITY').map(dependentOf));
 
   // 段 2: 作り方
   for (const item of working) {
     if (item.problem === null && item.plan === null && item.rule !== null && item.field !== null && item.source !== null) {
-      const result = planOf(item.field, item.rule, item.source, derivedTotals.has(item.fieldName));
+      const result = planOf(item.field, item.rule, item.source, derivedTotals.has(item.fieldName), baseDate);
       item.plan = result.plan;
       item.problem = result.problem;
+      // T38e: number の鍵の汎用の値の空間（端と刻み）が、正規の数の形で表せること。
+      if (item.jsonType === 'number' && result.plan?.kind === 'GENERIC' && !genericSpaceFitsJsonNumber(result.plan.field)) {
+        item.plan = null;
+        item.problem = conflict('JSON_VALUE_TYPE_MISMATCH');
+      }
     }
   }
 
@@ -735,9 +1027,15 @@ export const planRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenar
       : relationProblemOf(relation, rules, plans);
     // T29R-fix-1（M-2）: 合計の欄の制約の中で成り立つ組を求め、生成はその組から選ぶ（判定で作れると言えば、生成も作れる）。
     if (problem === null && relation.kind === 'TOTAL_EQUALS_UNIT_PRICE_TIMES_QUANTITY' && dependent.plan?.kind === 'DERIVED_TOTAL') {
-      const pairs = totalPairsOf(relation, plans);
-      if (pairs.length === 0) {
+      const allPairs = totalPairsOf(relation, plans);
+      // T38e: number の鍵の合計は、正規の数の形で表せる組だけ（合計は単価 × 数量なので、桁が増える）。
+      const pairs = dependent.jsonType === 'number'
+        ? allPairs.filter(([unit, quantity]) => isJsonValueConvertible(multiplyDecimalIntegers(unit, quantity), 'number'))
+        : allPairs;
+      if (allPairs.length === 0) {
         problem = conflict('RELATION_UNSATISFIABLE');
+      } else if (pairs.length === 0) {
+        problem = conflict('JSON_VALUE_TYPE_MISMATCH');
       } else {
         dependent.plan = { ...dependent.plan, pairs };
         plans.set(dependent.fieldName, dependent.plan);
@@ -750,12 +1048,15 @@ export const planRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenar
     }
   }
 
-  // required なのに送る欄に選ばれていない欄（T31d: UPDATE の保つ欄は、前の値のまま送るので数えない）
+  // required なのに送る欄に選ばれていない欄（T31d: UPDATE の保つ欄は、前の値のまま送るので数えない。T38e: API のシナリオは数えない）
   const kept = keepFieldNamesOf(scenario);
-  const unselectedRequired = [...new Set(candidate.fields
+  const unselectedRequired = api !== null ? [] : [...new Set(candidate.fields
     .filter((field) => field.required && field.name.length > 0 && !selected.includes(field.name) && !kept.includes(field.name)
       && isSendableWriteFieldName(candidate, field.name))
     .map((field) => field.name))];
+  // T38e: ページが決める鍵の規則（値を作らない鍵。送る欄に選ばれていない行として拒む）
+  const pageKeyRules = api === null ? [] : ruleSet.fieldRules.filter((rule) =>
+    api.pageKeys.some(({ key }) => key === rule.fieldName) && !selected.includes(rule.fieldName));
 
   const fields: FieldEvaluation[] = [
     ...working.map((item) => ({
@@ -776,11 +1077,21 @@ export const planRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenar
       rule: null,
       externalDeliveryKinds: [],
     }) satisfies FieldEvaluation),
+    ...pageKeyRules.map((rule) => ({
+      fieldName: rule.fieldName,
+      selected: false,
+      status: 'RULE_CONFLICT',
+      problem: conflict('PAGE_KEY_RULE_NOT_ALLOWED'),
+      source: 'HUMAN',
+      rule,
+      externalDeliveryKinds: [],
+    }) satisfies FieldEvaluation),
   ].sort((left, right) => compareCodeUnits(left.fieldName, right.fieldName));
 
   const decidedRules = working.filter((item) => item.problem === null && item.rule !== null).map((item) => item.rule as FieldRule);
   const humanUnique = ruleSet.uniqueKeyFieldNames.filter((name) => selected.includes(name));
-  const ruleUnique = humanUnique.length > 0 ? [...humanUnique].sort(compareCodeUnits) : [...defaultUniqueKeyFieldNamesOf(decidedRules)];
+  // FM2c fix round 1: テンプレートの既定を保存した規則の集まりは、保存した組だけ（既定を足さない）。
+  const ruleUnique = humanUnique.length > 0 || defaultsSaved ? [...humanUnique].sort(compareCodeUnits) : [...defaultUniqueKeyFieldNamesOf(decidedRules)];
   // T31d: UPDATE で組が決まらなければ、変える欄（`DECIDED` の欄。`fields` は欄の名前の順）の組で、使った値と重ならない値を作る。
   const uniqueKeyFieldNames = ruleUnique.length === 0 && scenario.kind === 'UPDATE'
     ? fields.filter((field) => field.selected && field.status === 'DECIDED').map((field) => field.fieldName)
@@ -800,5 +1111,5 @@ export const planRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenar
 };
 
 /** 規則の集まりを、シナリオと対象の候補に照らして判定する（純粋。入力を変えない。凍結）。 */
-export const evaluateRuleSet = (ruleSet: RuleSetRevision, scenario: EvaluationScenario, candidate: DiscoveryCandidate): RuleSetEvaluation =>
+export const evaluateRuleSet = (ruleSet: EvaluationRuleSet, scenario: EvaluationScenario, candidate: DiscoveryCandidate): RuleSetEvaluation =>
   planRuleSet(ruleSet, scenario, candidate).evaluation;

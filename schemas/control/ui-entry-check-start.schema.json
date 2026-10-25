@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-entry-check-start:1",
+  "description": "Local UI Server Function input: start an entry check (ENTRY_CHECK) for one profile (Task 43 design 4.3; T43c). The job manager checks the profile, the revision and the mode again. No auth setup is needed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" }
+  }
+}

@@ -13,10 +13,9 @@
  *   テストだけの入口で写す）。本番の入口は変えない。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { createServer, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { ServerResponse } from 'node:http';
+import { startLoopbackHttpServer } from '../../../../tests/helpers/loopback-server.js';
 import { testLoginWorkerEntrySource } from '../../../../tests/helpers/test-login-worker-entry.js';
-import { LOOPBACK_HOST } from './local-server.ts';
 
 /** 画面のサーバが fork する、一時の root の中の監査のワーカーの入口（`localUiWorkerPath` の写しの場所）。 */
 const WORKER_ENTRY_PATH = 'dist/worker/audit-worker.js';
@@ -81,6 +80,8 @@ export const installTestAuthWorkerEntry = (
     loginTimeoutMs,
     prelude: recording,
     credentialsExpression: `fetch(${JSON.stringify(relayUrl)}).then((response) => response.json())`,
+    // TS-g: 画面のテストのジョブのブラウザは headless（`local-server.ts` の入口と同じテストだけの口。プロファイルの表示の設定の既定は表示）。
+    additionalHooks: '\n  hideJobBrowser: true,',
   });
   writeFileSync(`${root}/${WORKER_ENTRY_PATH}`, source, 'utf8');
 };
@@ -110,7 +111,7 @@ export const startCredentialRelay = async (): Promise<CredentialRelay> => {
     response.writeHead(STATUS_OK, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     response.end(JSON.stringify(credentials));
   };
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     if (request.method !== 'GET' || request.url !== RELAY_PATH) {
       response.writeHead(STATUS_NOT_FOUND);
       response.end();
@@ -124,10 +125,8 @@ export const startCredentialRelay = async (): Promise<CredentialRelay> => {
       answer(response, credentials);
     }
   });
-  await new Promise<void>((resolve) => server.listen({ host: LOOPBACK_HOST, port: 0 }, () => resolve()));
-  const { port } = server.address() as AddressInfo;
   return {
-    url: `http://${LOOPBACK_HOST}:${port}${RELAY_PATH}`,
+    url: `${server.origin}${RELAY_PATH}`,
     requested: () => requested,
     provide: (credentials) => {
       const response = waiting.shift();
@@ -137,13 +136,12 @@ export const startCredentialRelay = async (): Promise<CredentialRelay> => {
         answer(response, credentials);
       }
     },
-    close: () => new Promise<void>((resolve) => {
+    close: () => {
       for (const response of waiting.splice(0)) {
         response.destroy();
       }
-      server.closeAllConnections();
-      server.close(() => resolve());
-    }),
+      return server.close();
+    },
   };
 };
 
@@ -181,6 +179,7 @@ export const writeAuthTargetConfig = (
  * （`runAuditWorkerProcess`）を、自動ログインの段は本番のまま（資格情報のファイルの部品も、Browser の起動も本番の既定。headless）で呼ぶ。手動の
  * ログインの段の口が呼ばれたら、記録のフォルダの `manual-login-stage.log` に書いて止める（自動ログインが手動へ切り替えないことの確かめ）。記録の
  * フォルダには、ワーカーが親へ送ったメッセージと、標準出力と標準エラーも書き足す（`WORKER_RECORD_FILES`）。資格情報の値は、入口に書かない。
+ * TS-g: ジョブのブラウザは headless（テストだけの口 `hideJobBrowser`。Gate `ui-test-job-browser-hidden`）。
  */
 const AUTOMATED_ENTRY_SOURCE = String.raw`
 __RECORDING__
@@ -195,6 +194,7 @@ runAuditWorkerProcess(process, {
     },
     onLoginPageReady: async () => appendManualRecord(MANUAL_RECORD, 'onLoginPageReady\n'),
   },
+  hideJobBrowser: true,
 });
 `;
 

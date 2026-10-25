@@ -25,6 +25,12 @@ export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number];
 export const AUTH_STRATEGIES = Object.freeze(['NONE', 'MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const);
 export type AuthStrategy = (typeof AUTH_STRATEGIES)[number];
 
+/**
+ * 自動ログインの認証の方式（FM2R の Minor 4。1 回の操作で自動ログインに切り替える画面のサーバと画面が読む、値の唯一の定義。import を持たないこのファイルに
+ * 置くので、ブラウザのコードからも値として読める）。
+ */
+export const AUTOMATED_LOGIN_AUTH_STRATEGY = 'AUTOMATED_LOGIN' satisfies AuthStrategy;
+
 /** プロファイルの版。スキーマの `schemaVersion` の const と一致する。 */
 export const SITE_PROFILE_SCHEMA_VERSION = 'beaksight-profile/1';
 
@@ -36,6 +42,12 @@ export const MIN_PROFILE_REVISION = 1;
 
 /** 環境の隔離の確認の非秘密の参照（`environmentEvidenceRef`）の最大長（UTF-16 のコード単位）。スキーマの maxLength と一致する。 */
 export const MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH = 200;
+
+/**
+ * 承認したサービスの Origin（`approvedServiceOrigins`。認証のサービスと API の Origin。Task 34 の設計書 3.1）の最大の件数。スキーマの maxItems と
+ * 一致する。
+ */
+export const MAX_APPROVED_SERVICE_ORIGINS = 4;
 
 /** サイト・環境のプロファイル（ロードマップ第 5 章の形のまま。フィールドの追加・改名はしない）。 */
 export interface SiteProfile {
@@ -53,6 +65,13 @@ export interface SiteProfile {
   readonly approvedTestOrigins: readonly string[];
   /** 環境の隔離の確認の非秘密の参照。ないときは null。 */
   readonly environmentEvidenceRef: string | null;
+  /**
+   * 承認したサービスの Origin（T34a。Task 34 の設計書 3.1。任意の項目で、ないときは空と同じ）。認証のサービスと API の Origin（テスト環境の 2 つの
+   * モードだけ。HTTPS の Origin の正規の直列化（loopback の host だけ http も受ける）。上限 `MAX_APPROVED_SERVICE_ORIGINS`、重なりなし）。ターゲット
+   * 設定の `site.allowedOrigins` と重ならない（クロールの対象・読み込みの数え方・サイトの情報の取得の対象は広げない）。版を上げずに足した項目なので、
+   * 項目のないプロファイルの文書は今のまま。
+   */
+  readonly approvedServiceOrigins?: readonly string[];
 }
 
 /** プロファイルの検証で拒否するときのコード（閉じた一覧。設計書 4.4）。表示の文言は Task 23 の表示カタログに置く。 */
@@ -67,6 +86,10 @@ export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
   'PROFILE_TEST_ORIGIN_OUTSIDE_TARGET',
   'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
   'PROFILE_REVISION_NOT_ADVANCED',
+  // T34a（Task 34 の設計書 3.1）: 承認したサービスの Origin の形が違う、またはテスト環境の 2 つのモードでないのに持つ。
+  'PROFILE_SERVICE_ORIGIN_INVALID',
+  // T34a: 承認したサービスの Origin が、ターゲット設定の `site.allowedOrigins` に入っている（テスト環境の Origin と重ねない）。
+  'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
 ] as const);
 export type ProfileValidationErrorCode = (typeof PROFILE_VALIDATION_ERROR_CODES)[number];
 

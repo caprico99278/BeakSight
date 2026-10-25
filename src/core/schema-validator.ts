@@ -14,7 +14,8 @@ export type ArtifactSchemaName =
   | 'read-evidence'
   | 'action-run'
   | 'action-evidence'
-  | 'approval-summary';
+  | 'approval-summary'
+  | 'entry-check';
 
 /** スキーマの検証の結果（成果物と Control の契約で共通）。 */
 export type SchemaValidationResult =
@@ -70,6 +71,8 @@ const schemaIdByName: Readonly<Record<ArtifactSchemaName, string>> = {
   // 書き込みの報告の証拠 `action-evidence.json` と承認の要約 `approval-summary.json`（Task 32 の設計書 4.1。T32c）。
   'action-evidence': 'urn:beaksight:schema:action-evidence:1.0',
   'approval-summary': 'urn:beaksight:schema:approval-summary:1.0',
+  // 入口の確かめのジョブの成果物 `entry-check.json`（Task 43 の設計書 4.3。T43c）。
+  'entry-check': 'urn:beaksight:schema:entry-check:1.0',
 };
 
 /**

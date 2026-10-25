@@ -11,13 +11,20 @@
 //   `approval-summary.json` の `ApprovalSummaryDocument`、「人が決めたこと」と「自動で行うこと」の閉じた一覧）を、ファイルの末尾の節に足した。
 //   ワーカーが使える契約のファイル（`tests/architecture/worker-boundary-policy.ts` の `WORKER_ALLOWED_CONTROL_FILES`）なので、別のファイルに
 //   分けずにここに置く。値の一覧は既存の配列から導き、二重に定義しない。
+// - T40c（Task 40 の設計書 3.4、7 章の履歴の「T40a の報告（API の検証の指定）」「設計者の判断（順の入れ替え）」）: 記録と報告の版 1.1。書き手は 1.1 を
+//   書き、読み手は 1.1 だけを受ける（LG-4 で前の版 1.0 を捨てた。`ACTION_RUN_READABLE_SCHEMA_VERSIONS`・`ACTION_EVIDENCE_READABLE_SCHEMA_VERSIONS`。
+//   スキーマの `schemaVersion` の enum と同じ）。1.1 は送り方（`transport`）と API の要約（`ActionApiSummary`。FORM は null）を持ち、API の記録は成否の
+//   条件（`resultConditions`）を持たない（null）。組み立てと照らし合わせの純粋な部品は `action-api-summary.ts`。承認の要約（`approval-summary.json`）は、
+//   API のシナリオも今の形（種類は CREATE）で表せるので 1.0 のまま。
 import type {
   APPROVER_LOCAL_OPERATOR,
   ApprovalBoundFacts,
   InputRuleReference,
+  ScenarioApiMethod,
   ScenarioKind,
   ScenarioLimits,
   ScenarioResultCondition,
+  ScenarioTransport,
   SideEffectConfirmations,
   WriteReservationState,
 } from '../approval/scenario-contracts.js';
@@ -25,8 +32,15 @@ import type { SeedRecord } from '../data-rules/scenario-data.js';
 import type { ReadCheckResult } from '../../discovery/read-check-contracts.js';
 import type { ReadCheckEvidenceState, ReadCheckExecutedEvidence } from '../../discovery/read-check-evaluation.js';
 
-/** `action-run.json` の文書の形の印（スキーマの `schemaVersion` の const）。 */
-export const ACTION_RUN_SCHEMA_VERSION = 'action-run-schema/1.0';
+/** `action-run.json` の文書の形の印（書き手が書く版。T40c で 1.1）。 */
+export const ACTION_RUN_SCHEMA_VERSION = 'action-run-schema/1.1';
+
+/**
+ * `action-run.json` の読み手が受ける版（T40c。スキーマの `schemaVersion` の enum と同じ）。LG-4（テストの組の設計書 3.7.3）: 前の版 1.0 は捨て、今の版だけを
+ * 受ける（前の版の記録は、スキーマに合わないので、親の締めでも画面の読み出しでも使わない）。
+ */
+export const ACTION_RUN_READABLE_SCHEMA_VERSIONS = Object.freeze([ACTION_RUN_SCHEMA_VERSION] as const);
+export type ActionRunSchemaVersion = (typeof ACTION_RUN_READABLE_SCHEMA_VERSIONS)[number];
 
 /**
  * 書き込みの結果（ロードマップ 5 章の `ActionResult`。閉じた一覧）。
@@ -38,7 +52,9 @@ export const ACTION_RUN_SCHEMA_VERSION = 'action-run-schema/1.0';
  *   失敗と言い切らない（T30a fix round 1。設計者の判断。設計書 11 章）。
  * - `FAILED`: 送ったが、サイトが登録しなかったと判定できる（入力の誤り、429）。
  */
-export const ACTION_RESULTS = Object.freeze(['VERIFIED', 'PARTIAL', 'BLOCKED', 'UNKNOWN', 'FAILED'] as const);
+/** 照合まで済んだ結果（`ACTION_RESULTS` の値の名前つきの定数。PRE42-CC 組 1b の N4-8d: ほかのファイルは、ここから読む）。 */
+export const VERIFIED_ACTION_RESULT = 'VERIFIED';
+export const ACTION_RESULTS = Object.freeze([VERIFIED_ACTION_RESULT, 'PARTIAL', 'BLOCKED', 'UNKNOWN', 'FAILED'] as const);
 export type ActionResult = (typeof ACTION_RESULTS)[number];
 
 /**
@@ -47,7 +63,9 @@ export type ActionResult = (typeof ACTION_RESULTS)[number];
  * - `SENT`: Guard が承認の形の POST を通した。
  * - `UNKNOWN`: 送ったか分からない（ワーカーが落ちた、報告が届かないなど）。
  */
-export const SUBMISSION_STATES = Object.freeze(['NOT_SENT', 'SENT', 'UNKNOWN'] as const);
+/** 送らずに止めた送信の状態（`SUBMISSION_STATES` の値の名前つきの定数。PRE42-CC 組 1b の N4-8d: ほかのファイルは、ここから読む）。 */
+export const NOT_SENT_SUBMISSION_STATE = 'NOT_SENT';
+export const SUBMISSION_STATES = Object.freeze([NOT_SENT_SUBMISSION_STATE, 'SENT', 'UNKNOWN'] as const);
 export type SubmissionState = (typeof SUBMISSION_STATES)[number];
 
 /**
@@ -212,8 +230,37 @@ export interface ActionRunUpdate {
   readonly updateEvidence: WriteUpdateEvidence | null;
 }
 
+/** 結果の判定に使った条件（シナリオの検証の指定の写し。FORM の記録だけ）。 */
+export interface ActionRunResultConditions {
+  readonly successCondition: ScenarioResultCondition;
+  readonly inputErrorCondition: ScenarioResultCondition;
+}
+
+/**
+ * API の書き込みの要約（T40c。`action-run.json` と `action-evidence.json` の `api`。承認した API の指定の要約と、Guard の照合が返したページが決める鍵の
+ * 値）。組み立ては `action-api-summary.ts` の `actionApiSummaryOf` だけ。ヘッダの値・応答の本文・本文の生の値・欄に入れた値は持たない（I22）。
+ * - `method`・`origin`・`pathShape`・`shapeDigest`: 承認した要求の型（method、送り先の Origin の文字列、path の型）と型の digest。
+ * - `keyNames`: 欄に対応する鍵の名前（鍵の UTF-16 のコード単位の順。1 件以上）。`pageKeyNames`: ページが決める鍵の名前（同じ順）。
+ * - `httpFieldNames`: 許すヘッダの名前（ページが付ける名前だけ。小文字の順。値は持たない。成果物の項目の名前に秘密の語を使わないので、HTTP の
+ *   field の名前と呼ぶ）。`recordIdKey`: 登録の ID を取る応答の本文の鍵（なければ null）。
+ * - `pageKeyValues`: ページが決める鍵の値（Task 38 の判断 (1) で残す値。鍵ごとに、JSON の scalar を JSON の文字列にした形。例 `"tenant-1"`・`7`・
+ *   `true`・`null`）。長さが `MAX_SUBMITTED_VALUE_LENGTH` を超えた値は、値を残さずに null の印にする（JSON の null は文字列の `null`）。照合まで
+ *   進まなかった（送らなかった、読めていない）ときは、項目の全体が null。持つときの鍵は `pageKeyNames` とちょうど同じ。
+ */
+export interface ActionApiSummary {
+  readonly method: ScenarioApiMethod;
+  readonly origin: string;
+  readonly pathShape: string;
+  readonly shapeDigest: string;
+  readonly keyNames: readonly string[];
+  readonly pageKeyNames: readonly string[];
+  readonly httpFieldNames: readonly string[];
+  readonly recordIdKey: string | null;
+  readonly pageKeyValues: Readonly<Record<string, string | null>> | null;
+}
+
 export interface ActionRunDocument {
-  readonly schemaVersion: typeof ACTION_RUN_SCHEMA_VERSION;
+  readonly schemaVersion: ActionRunSchemaVersion;
   readonly jobId: string;
   readonly runId: string;
   readonly profileId: string;
@@ -223,13 +270,13 @@ export interface ActionRunDocument {
   readonly grantId: string;
   /** 生成の seed の記録（Task 29 の `SeedRecord`）。 */
   readonly seedRecord: SeedRecord;
-  /** 送った値（欄の名前 → 値。送らなかった欄は持たない。合成のテストデータなので平文）。 */
+  /**
+   * 送った値（欄の名前 → 値。送らなかった欄は持たない。合成のテストデータなので平文）。T40c: API の記録は、欄に対応する鍵ごとの生成した値（文字列。
+   * 鍵は `api.keyNames` の中）。
+   */
   readonly submittedValues: Readonly<Record<string, string>>;
-  /** 結果の判定に使った条件（シナリオの検証の指定の写し）。 */
-  readonly resultConditions: {
-    readonly successCondition: ScenarioResultCondition;
-    readonly inputErrorCondition: ScenarioResultCondition;
-  };
+  /** 結果の判定に使った条件（シナリオの検証の指定の写し）。T40c: API の記録は null（成否の条件を使わない。FORM は必須）。 */
+  readonly resultConditions: ActionRunResultConditions | null;
   readonly submission: SubmissionState;
   /** 送らずに止めた理由（送らずに止めたときだけ。ほかは null）。 */
   readonly blockReason: ActionBlockReason | null;
@@ -247,7 +294,47 @@ export interface ActionRunDocument {
   readonly finishedAt: string;
   /** T31f: UPDATE の書き込みの記録（UPDATE だけ。CREATE は持たない）。 */
   readonly update?: ActionRunUpdate;
+  /** T40c: 送り方。 */
+  readonly transport: ScenarioTransport;
+  /** T40c: API の要約（FORM は null）。 */
+  readonly api: ActionApiSummary | null;
+  /** T44e（Task 44 の設計書 P2-4）: 送らずに止めた具体的な理由（`PRECHECK_FAILED` のときだけの任意の項目。前に書いた記録は持たない）。 */
+  readonly precheckDetail?: PrecheckFailureDetail;
 }
+
+/**
+ * T44e（Task 44 の設計書 P2-4。設計の変更の履歴の T44e の行の (2)）: 送る前の確かめで送らずに止めた（`PRECHECK_FAILED`）ときの、具体的な理由の閉じた一覧。
+ * 送る・送らないの判定は変えない（理由を細かくするだけ）。書くのはワーカー（`write-create-run.ts`）で、`action-run.json` の任意の項目 `precheckDetail`。
+ * - `STOPPED`: 止める合図（撤回・シナリオの変更・止める操作）。
+ * - `SESSION_LOST`: 書き込みの画面でログインの状態が切れていた。
+ * - `PAGE_UNAVAILABLE`: 書き込みの画面を読めなかった（読み込みの失敗、4xx・5xx、欄を読めない）。
+ * - `CANDIDATE_CHANGED`: 画面の候補が、承認した候補と合わない（画面が変わった）。
+ * - `PRIOR_VALUES_EMPTY`: 更新の前の読み取りで、目印の欄がすべて空（値が入る前の画面）。
+ * - `KNOWN_KEPT_VALUE_MISMATCH`: 台帳が知る保つ鍵の値と、画面の値が違う（BeakSight の外で値が変わったレコード、結果が分からない更新の後のレコード、仮の値）。
+ * - `PRIOR_VALUE_UNUSABLE`: 前の値を記録・照合に使えない（長すぎる、承認した型に変えられない）。
+ * - `PRIOR_VALUE_CHANGED`: 書き込みの段で開き直した画面か、押す直前の読み直しの値が、前の読み取りと違う。
+ * - `FORM_NOT_READY`: 入力の前の確かめ、値の入力、押す操作のどれかに失敗した。
+ * - `UNEXPECTED_REQUEST`: 値を入れた後に、承認した送信のほかの要求が出た。
+ * - `RECHECK_REFUSED`: 送る直前の確かめ直しで、承認か実行の許可が外れていた。
+ * - `AUDIT_STAGE_STOPPED`: 監査の段の事実（ログインの状態の鍵の消失、サービスへの要求の上限）。
+ * - `PREFLIGHT_FAILED`: Run の前の確認（ブラウザの起動など）に失敗した。
+ */
+export const PRECHECK_FAILURE_DETAILS = Object.freeze([
+  'STOPPED',
+  'SESSION_LOST',
+  'PAGE_UNAVAILABLE',
+  'CANDIDATE_CHANGED',
+  'PRIOR_VALUES_EMPTY',
+  'KNOWN_KEPT_VALUE_MISMATCH',
+  'PRIOR_VALUE_UNUSABLE',
+  'PRIOR_VALUE_CHANGED',
+  'FORM_NOT_READY',
+  'UNEXPECTED_REQUEST',
+  'RECHECK_REFUSED',
+  'AUDIT_STAGE_STOPPED',
+  'PREFLIGHT_FAILED',
+] as const);
+export type PrecheckFailureDetail = (typeof PRECHECK_FAILURE_DETAILS)[number];
 
 // ---------------------------------------------------------------------------------------------------------------
 // 書き込みの報告（T32c。Task 32 の設計書 4.1、ユーザーの判断 3・6・7）
@@ -259,8 +346,12 @@ export interface ActionRunDocument {
 //   欄の前の値、照合の READ の取れた値）は入れ、`containsHumanEnteredValues` で示す（ユーザーの判断 6）。
 // ---------------------------------------------------------------------------------------------------------------
 
-/** `action-evidence.json` の文書の形の印（スキーマの `schemaVersion` の const）。 */
-export const ACTION_EVIDENCE_SCHEMA_VERSION = 'action-evidence-schema/1.0';
+/** `action-evidence.json` の文書の形の印（書き手が書く版。T40c で 1.1）。 */
+export const ACTION_EVIDENCE_SCHEMA_VERSION = 'action-evidence-schema/1.1';
+
+/** `action-evidence.json` の読み手が受ける版（T40c。スキーマの `schemaVersion` の enum と同じ。LG-4 で前の版 1.0 を捨てた）。 */
+export const ACTION_EVIDENCE_READABLE_SCHEMA_VERSIONS = Object.freeze([ACTION_EVIDENCE_SCHEMA_VERSION] as const);
+export type ActionEvidenceSchemaVersion = (typeof ACTION_EVIDENCE_READABLE_SCHEMA_VERSIONS)[number];
 
 /** `approval-summary.json` の文書の形の印（スキーマの `schemaVersion` の const）。 */
 export const APPROVAL_SUMMARY_SCHEMA_VERSION = 'approval-summary-schema/1.0';
@@ -343,7 +434,7 @@ export interface ActionGuardSummary {
  * - `response`: 送らなかった回は null。`guard`: 書き込みの段に入らなかった回は null。
  */
 export interface ActionEvidenceDocument {
-  readonly schemaVersion: typeof ACTION_EVIDENCE_SCHEMA_VERSION;
+  readonly schemaVersion: ActionEvidenceSchemaVersion;
   readonly jobId: string;
   readonly runId: string;
   readonly profileId: string;
@@ -362,6 +453,9 @@ export interface ActionEvidenceDocument {
   readonly reason: ActionOutcomeReason;
   readonly startedAt: string;
   readonly finishedAt: string;
+  /** T40c: 送り方と API の要約（`action-run.json` と同じ値）。API の `submission.actionPath` は API の path。 */
+  readonly transport: ScenarioTransport;
+  readonly api: ActionApiSummary | null;
 }
 
 /**

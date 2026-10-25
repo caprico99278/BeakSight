@@ -61,13 +61,17 @@ describe('execution grant policy (T28d)', () => {
       'GRANT_RESERVATION_SETTLED',
       'GRANT_CLOCK_BEFORE_APPROVAL',
       'GRANT_CLOCK_BEFORE_ISSUE',
-      // T31b: UPDATE の指定の前に保存した UPDATE の版には、許可を出さない。
-      'SCENARIO_UPDATE_SPEC_MISSING',
+      // LG-3: T31b の `SCENARIO_UPDATE_SPEC_MISSING`（UPDATE の指定の前に保存した UPDATE の版）は捨てた（その版は読まずに止まる）。
       // T31e: UPDATE の対象の選び直し（画面の予定の ID と違う・対象がない）。
       'TARGET_SELECTION_CHANGED',
       'TARGET_RECORD_UNAVAILABLE',
       // T31R-fix-1 の I-2: 台帳の登録の ID の取り方が、下書きの保存の後に変わり、path の型の `{id}` の位置に結び付かなくなった。
       'SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID',
+      // LG-3b: T38b の `API_WRITE_NOT_AVAILABLE`（T41a の契約のない API の更新）は捨てた（その版は読まずに止まる）。
+      // T40R2-fix（M-1）: 送る値のない照合の READ の期待が、実行のたびに変わる値と比べない。
+      'READ_VERIFICATION_NOT_VARYING',
+      // T41b: API の更新の台帳の ID の鍵が、下書きの保存の後に変わり、filter の名前に結び付かなくなった（`api-update-grant-start.test.ts`）。
+      'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
     ]);
     expect(WRITE_RESERVATION_REJECTION_REASONS).toEqual(['RESERVATION_NOT_FOUND', 'RESERVATION_TRANSITION_NOT_ALLOWED']);
     expect(Object.isFrozen(EXECUTION_GRANT_REJECTION_REASONS) && Object.isFrozen(WRITE_RESERVATION_REJECTION_REASONS)).toBe(true);
@@ -231,3 +235,6 @@ describe('execution grant policy (T31e): the update target', () => {
     expect(targetSelectionRejectionOf('rec-2', 'rec-2')).toBeNull();
   });
 });
+
+// LG-3b（2026-10-24 のテストの組の設計 3.7.2）: T40a の送り方の判定 `apiWriteRejectionOf` の表は捨てた（T41a の契約のない API の更新の版は、スキーマが
+// 拒むので読まれない。確かめは `scenario-api-update-contract.test.ts`）。

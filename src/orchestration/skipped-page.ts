@@ -8,7 +8,7 @@ import {
   type ViewportAuditStatus,
   type ViewportProfile,
 } from '../core/contracts.js';
-import type { NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
+import { PAGE_SCHEMA_VERSION, type NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
 import { derivePageAuditStatus } from '../core/status.js';
 
@@ -49,7 +49,7 @@ export function skippedPageResult(url: NormalizedHttpUrlEvidence, pageId: PageId
     ViewportAuditResult
   >;
   return deepFreeze({
-    schemaVersion: 'page-schema/1.0',
+    schemaVersion: PAGE_SCHEMA_VERSION,
     pageId,
     pageUrl: url,
     status: derivePageAuditStatus(VIEWPORT_PROFILES.map((profile) => viewports[profile].status)),

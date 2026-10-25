@@ -1,5 +1,6 @@
+import { AUDIT_SEND_POLICIES, isAuditSendPolicyName } from '../core/audit-send-policy.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
-import { INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../core/limits.js';
+import { INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE, MAX_CRAWL_MAX_PAGES, MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS } from '../core/limits.js';
 import {
   LOOPBACK_HOSTNAMES,
   canonicalizeAllowedOrigins,
@@ -31,7 +32,8 @@ const validateHttpUrl = (value: string): URL | undefined => {
 /**
  * 正の整数だけを受け付ける crawl の設定値。件数・深さと、時間（ms）。
  * 時間は、Page Auditor が期限の計算に使い、`auditInteraction` などが正の整数を要求するので、正の整数に限る
- * （Task 14〜17 の設計書 4.5.7）。`schemas/run.schema.json` の `effectiveConfig.crawl` も同じ規則にする。
+ * （Task 14〜17 の設計書 4.5.7）。`schemas/run.schema.json` の `effectiveConfig.crawl` も、正の整数の規則は同じにする。ただし、ページの上限の上限
+ * （`MAX_CRAWL_MAX_PAGES`。T44R の M-3）はスキーマに足さない（前の Run の文書の読み込みを変えないため。検証は、設定の読み込みのここで行う）。
  * 0 を許す `minNavigationIntervalMs` は、この一覧に入れず、`validateNavigationInterval` で確かめる。
  */
 const crawlIntegerKeys = [
@@ -163,9 +165,22 @@ const validateInteractionCandidateBudget = (crawl: UnknownRecord, audit: unknown
 };
 
 /**
- * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）を確かめる（サイトへの負荷の制御の設計書 3.2、4.2）。
- * 0 以上の整数でなければならない。許可 Origin にループバックでないものが1つでもあれば、`MIN_NAVIGATION_INTERVAL_MS` 以上でなければならない。
+ * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）の下限（ms）。許可 Origin（`site.allowedOrigins`）に、読めた Origin で
+ * ループバックでないものが1つでもあれば `MIN_NAVIGATION_INTERVAL_MS`、なければ 0（サイトへの負荷の制御の設計書 3.2、4.2）。
  * 許可 Origin そのものの誤り（文字列の配列でない、HTTP(S) の URL でない）は、`validateSite` が報告するので、ここでは、読めた Origin だけで判定する。
+ * T44d（Task 44 の設計書 P2-1）: 画面から間隔を変える部品も、この下限を使う（下限の決まりを写さない）。
+ */
+export const navigationIntervalFloorMsOf = (site: unknown): number => {
+  if (!isRecord(site) || !isStringArray(site.allowedOrigins)) {
+    return 0;
+  }
+  const allowedUrls = site.allowedOrigins.map(validateHttpUrl);
+  return allowedUrls.some((url) => url !== undefined && !isLoopbackUrl(url)) ? MIN_NAVIGATION_INTERVAL_MS : 0;
+};
+
+/**
+ * ページの読み込みの最小の間隔（`crawl.minNavigationIntervalMs`）を確かめる（サイトへの負荷の制御の設計書 3.2、4.2）。
+ * 0 以上の整数でなければならない。下限（`navigationIntervalFloorMsOf`）より短くてはならない。
  */
 const validateNavigationInterval = (crawl: UnknownRecord, site: unknown, errors: string[]): void => {
   const { minNavigationIntervalMs } = crawl;
@@ -173,11 +188,7 @@ const validateNavigationInterval = (crawl: UnknownRecord, site: unknown, errors:
     errors.push('crawl.minNavigationIntervalMs must be a non-negative integer');
     return;
   }
-  if (minNavigationIntervalMs >= MIN_NAVIGATION_INTERVAL_MS || !isRecord(site) || !isStringArray(site.allowedOrigins)) {
-    return;
-  }
-  const allowedUrls = site.allowedOrigins.map(validateHttpUrl);
-  if (allowedUrls.some((url) => url !== undefined && !isLoopbackUrl(url))) {
+  if (minNavigationIntervalMs < navigationIntervalFloorMsOf(site)) {
     errors.push(
       `crawl.minNavigationIntervalMs must be at least ${MIN_NAVIGATION_INTERVAL_MS} ms when site.allowedOrigins `
         + `includes an origin that is not a loopback address (${[...LOOPBACK_HOSTNAMES].join(', ')})`,
@@ -237,6 +248,10 @@ export const validateConfig = (input: unknown): ConfigValidationResult => {
         errors.push(`crawl.${key} must be a positive integer`);
       }
     }
+    // T44R（Task 44 のレビューの M-3）: ページの上限の上限（サービスの Origin への要求の 1 回の Run の上限の既定が、安全な整数を超えないように）。
+    if (isPositiveSafeInteger(crawl.maxPages) && crawl.maxPages > MAX_CRAWL_MAX_PAGES) {
+      errors.push(`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`);
+    }
     if (isPositiveSafeInteger(crawl.interactionTimeoutMs) && crawl.interactionTimeoutMs <= MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS) {
       errors.push(
         `crawl.interactionTimeoutMs must be greater than ${MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS} ms `
@@ -282,10 +297,17 @@ export const validateConfig = (input: unknown): ConfigValidationResult => {
     }
   }
 
-  if (!isRecord(audit) || !hasExactKeys(audit, ['performance', 'accessibility', 'interactions', 'screenshots'])) {
+  // AS-b: `sendPolicy`（監査の段の送信の扱い）は任意の項目（項目のない値は `READ_ONLY` と読む。設定を読んだ値は既定を合わせて必ず持つ）。値は一覧の値だけ。
+  const auditFlagKeys = ['performance', 'accessibility', 'interactions', 'screenshots'];
+  if (!isRecord(audit) || unknownKeys(audit, [...auditFlagKeys, 'sendPolicy']).length > 0 || !auditFlagKeys.every((key) => Object.hasOwn(audit, key))) {
     errors.push('audit must be an object with only supported settings');
-  } else if (Object.values(audit).some((value) => typeof value !== 'boolean')) {
-    errors.push('audit settings must be booleans');
+  } else {
+    if (auditFlagKeys.some((key) => typeof audit[key] !== 'boolean')) {
+      errors.push('audit settings must be booleans');
+    }
+    if (Object.hasOwn(audit, 'sendPolicy') && !isAuditSendPolicyName(audit.sendPolicy)) {
+      errors.push(`audit.sendPolicy must be one of ${AUDIT_SEND_POLICIES.join(', ')}`);
+    }
   }
 
   if (!isRecord(output) || !hasExactKeys(output, ['directory']) || typeof output.directory !== 'string' || output.directory.length === 0) {

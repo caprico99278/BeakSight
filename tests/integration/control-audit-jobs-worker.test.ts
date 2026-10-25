@@ -7,7 +7,7 @@
 //   `INTERRUPTED`（`SERVER_RESTARTED`）。
 // - どの場面でも、ワーカーと、その子孫（Chromium）が残らない（ID と起動の時刻で見分ける）。fixture のサーバに届いた要求は GET と HEAD だけ。
 // 作業のディレクトリ（リポジトリの root の代わり）、管理データ、出力先は、一時のフォルダだけ。
-import { fork, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -27,12 +27,14 @@ import { readJob, type AuditJobView } from '../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
+import { hideJobBrowser } from '../helpers/worker-fork-support.js';
 import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath } from '../../src/core/artifact-layout.js';
 import type { RunSummary } from '../../src/core/contracts.js';
 import { isJobEnded, waitForJob, type JobViewSource } from '../helpers/job-test-support.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../helpers/process-tree.js';
 import { cliTargetConfig, expectOnlyReadRequests, readJson } from '../helpers/run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from '../helpers/temporary-build.js';
+import { createCountingFork } from '../helpers/worker-fork.js';
 import { JOB_CHILD_PROTOCOL, startJobChild, type JobChild } from './control-audit-jobs-fixtures.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
@@ -54,14 +56,12 @@ let build: TemporaryBuild;
 let workDirectory: string;
 let database: ControlDatabase;
 let manager: AuditJobManager | undefined;
-const workers: ChildProcess[] = [];
+/** 本物の `fork` で起動し、起動した子を記録する（CC-097: `worker-fork.ts` の補助）。 */
+const forks = createCountingFork();
+const workers: readonly ChildProcess[] = forks.children;
 const jobChildren: JobChild[] = [];
 
-const recordingFork: AuditWorkerForker = (modulePath, args, options) => {
-  const child = fork(modulePath, [...args], options);
-  workers.push(child);
-  return child;
-};
+const recordingFork: AuditWorkerForker = forks.fork;
 
 /** 画面のサーバと同じ形の文脈の読み方（リポジトリの root の下のターゲット JSON を `loadConfig` で読む）。 */
 const loadConfigContext: AuditJobContextResolver = async (targetConfigPath) => ({
@@ -103,6 +103,8 @@ async function prepareProfile(name: string, minNavigationIntervalMs: number): Pr
     environmentEvidenceRef: null,
   }, { resolveContext: () => context });
   expect(created.ok).toBe(true);
+  // FM-2: テストのジョブのブラウザは今どおり headless。
+  hideJobBrowser(database, name);
   return outputDirectory;
 }
 

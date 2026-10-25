@@ -2,8 +2,8 @@
 // 受ける前に、BeakSight の外の操作（タブを閉じる、停止、再読み込み、別の URL への移動）やページのスクリプト（`location.replace` の連続）で
 // 取り消された場合は、Guard の違反（`HTTP_MAIN_FRAME_DELIVERY_FAILED`）にしない。違反にしないのは、Guard 自身の証拠（Guard の page の
 // CDP の session で受けたもの）で、Guard が許可して進めた読み取りの文書の要求が、応答を1つも受けずにブラウザに取り消されたと確かめた
-// 場合だけである。応答のヘッダの後の取り消し（204、ダウンロード）、凍結の段階、証拠がない場合、区別できない場合は、今のとおり違反にする
-// （fail-closed）。
+// 場合だけである。応答のヘッダの後の取り消し（ダウンロード）、凍結の段階、証拠がない場合、区別できない場合は、今のとおり違反にする
+// （fail-closed）。204 は、Chromium 156 では取り消しでなく終わった要求として報告され、違反にならない（DEF-163。対照の describe の説明を見る）。
 // 外からタブを閉じた場合は、読み込みの取り消しは違反にならないが、Guard の page の CDP の session が外れたことは、今のとおり
 // `CDP_SESSION_DETACHED` の違反になりうる（設計書 2.4）。
 //
@@ -16,9 +16,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import type { ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium, type Browser, type BrowserContext, type CDPSession, type Page, type Request } from 'playwright';
+import type { Browser, BrowserContext, CDPSession, Page, Request } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { INVALID_INTERCEPTION_ID_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
@@ -28,6 +27,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { PageAuditor } from '../../src/orchestration/page-auditor.js';
 import {
   activateInteractionFreeze,
+  announceOwnMainFrameNavigation,
   assertPassiveRequestGuardActive,
   awaitPassiveRequestGuardReady,
   CANCELED_DOCUMENT_EVIDENCE_RETENTION_MS,
@@ -36,11 +36,15 @@ import {
   installPassiveRequestGuard,
   isPassiveRequestGuardClosed,
   MAX_CANCELED_DOCUMENT_EVIDENCE,
+  pageLoadFactsOf,
   PENDING_MAIN_FRAME_DOCUMENT_RETENTION_MS,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
+import { launchCliChromium, testContextsOf, withoutBrowserFaviconRequestLines } from '../helpers/chromium.js';
 import { createDeferred } from '../helpers/deferred.js';
+import { fakeFrame, fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
 import { createGateFactory } from '../helpers/gate-harness.js';
+import { nonReadRequestsOf } from '../helpers/leak-places.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { createTestNavigationPacer } from '../helpers/navigation-pacer.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
@@ -68,7 +72,12 @@ const REPLACE_CHAIN_SECOND_DELAY_MS = 300;
 const REPLACE_CHAIN_IMMEDIATE_DELAY_MS = 0;
 
 /** 違反の記録（Ledger の snapshot の `invariantViolations` の要素）。 */
-const DELIVERY_FAILED = Object.freeze({ code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED', message: ABORTED });
+// DEF-145（設計書 `2026-10-21-beaksight-probe-navigation-and-dialog-design.md` 2.1）: この違反は、失敗した main frame の要求の method と path（と Origin）を持つ。
+const DELIVERY_FAILED = Object.freeze({
+  code: 'HTTP_MAIN_FRAME_DELIVERY_FAILED',
+  message: ABORTED,
+  request: expect.objectContaining({ method: expect.any(String), path: expect.any(String) }),
+});
 /** Guard の page の CDP の session が、page が開いたまま外れた違反（設計書 2.4。外からタブを閉じたときに記録されうる）。 */
 const SESSION_DETACHED = Object.freeze({
   code: 'CDP_SESSION_DETACHED',
@@ -131,7 +140,8 @@ let browser: Browser;
 
 beforeAll(async () => {
   // CLI と同じ起動の設定（headless）。
-  browser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+  // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+  browser = await launchCliChromium();
 });
 
 afterAll(async () => {
@@ -243,6 +253,18 @@ function observeRequestFailure(context: BrowserContext, url: string): Promise<st
   });
 }
 
+/** Context の `requestfinished` のうち、`url` の要求の最初のものを待つ（DEF-163: Chromium 156 の 204 の文書の読み込みの事象）。 */
+function observeRequestFinished(context: BrowserContext, url: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const onFinished = (request: Request): void => {
+      if (request.url() !== url) return;
+      context.off('requestfinished', onFinished);
+      resolve();
+    };
+    context.on('requestfinished', onFinished);
+  });
+}
+
 /** BeakSight の外から、page の CDP の session（Guard の session とは別のもの）で、命令を送る（調査と同じやり方）。 */
 async function sendFromOutside(context: BrowserContext, page: Page, method: 'Page.stopLoading' | 'Page.reload'): Promise<void>;
 async function sendFromOutside(context: BrowserContext, page: Page, method: 'Page.navigate', params: { readonly url: string }): Promise<void>;
@@ -320,6 +342,9 @@ async function expectNoViolationAfterSettle(context: BrowserContext, ledger: Saf
 /** 後続の許可した読み込みが通り、違反が0件のままであることを確かめる（Context が使えるまま）。 */
 async function expectNextLoadSucceeds(server: CancelServer, page: Page, context: BrowserContext, ledger: SafetyLedger): Promise<void> {
   expect(() => assertPassiveRequestGuardActive(context)).not.toThrow();
+  // DEF-129: factory の Passive の Context は、ページが始めた main frame の読み込みの数に上限を置く。この読み込みは BeakSight 自身の読み込みの代わり
+  // なので、本番の読み込みの部品（`settleMainFrameLoad`）と同じく、読み込む前に Guard に知らせる。
+  announceOwnMainFrameNavigation(page);
   const response = await page.goto(`${server.origin}${PATHS.start}`);
   expect(response?.status()).toBe(STATUS.ok);
   expect(ledger.snapshot().invariantViolations).toEqual([]);
@@ -339,7 +364,7 @@ async function expectDeliveryFailedViolation(context: BrowserContext, ledger: Sa
  * 届くことがあるため。DEF-028 と合わせて後で考える）。
  */
 function expectOnlySessionDetached(violations: readonly { readonly code: string; readonly message: string }[]): void {
-  expect(violations, `Safety Ledger violations: ${JSON.stringify(violations)}`).not.toContainEqual(DELIVERY_FAILED);
+  expect(violations, `Safety Ledger violations: ${JSON.stringify(violations)}`).not.toContainEqual(expect.objectContaining({ code: DELIVERY_FAILED.code }));
   expect([[], [SESSION_DETACHED]], `Safety Ledger violations: ${JSON.stringify(violations)}`).toContainEqual(violations);
 }
 
@@ -521,14 +546,35 @@ describe('DEF-027: Page Auditor, when the tab is closed from outside while a vie
     expectOnlySessionDetached(outcome.safety.invariantViolations);
     expect(outcome.safety.invariantViolationCount).toBe(outcome.safety.invariantViolations.length);
     expectOnlySessionDetached(ledgers.flatMap((ledger) => ledger.snapshot().invariantViolations));
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
   }, AUDIT_TEST_TIMEOUT_MS);
 });
 
 describe('DEF-027 controls: cancellations that stay violations (before and after the fix)', () => {
-  // 応答のヘッダを受けた後の取り消し（Chromium が、204 を描かない、ダウンロードに切り替える）。
+  // DEF-163（DF-1 の設計者の判断）: 204 の文書の読み込みは、ページを替えない応答で、サーバに届くのは読み取りの GET 1 件だけである。Chromium 156
+  // （Playwright 1.64.1）では、`page.goto` は `net::ERR_ABORTED` で失敗するが、その要求の事象は `requestfailed` でなく `requestfinished` になり（Guard の
+  // ない Context でも同じ。DF-1 の scratchpad の実験 `probe-204.test.ts`）、Guard は違反にしない。前の「違反のまま」は、ブラウザが `requestfailed` を
+  // 出していたことによる結果で、守りの決まりではない。ここでは、届いたのが GET 1 件だけ、読み取りでない要求が 0、違反がなく Context が閉じないこと
+  // （今の振る舞い）、Guard の記録（通した main frame の文書の要求の数）にこの GET が残ることを確かめる。
+  it('204 No Content: the load ends without a page change; only the read GET reaches the server, and it is not a violation', async () => {
+    const server = await startCancelServer();
+    await withGuardedPage(server, async (page, context, ledger) => {
+      const url = `${server.origin}${PATHS.noContent}`;
+      const finished = observeRequestFinished(context, url);
+
+      await expect(page.goto(url)).rejects.toThrow(ABORTED);
+
+      await finished;
+      await expectNoViolationAfterSettle(context, ledger);
+      expect(withoutBrowserFaviconRequestLines(server.requests.map(({ method, pathname }) => `${method} ${pathname}`)))
+        .toEqual([`GET ${PATHS.noContent}`]);
+      expect(nonReadRequestsOf(server.requests.map(({ method, pathname }) => ({ method, path: pathname })))).toEqual([]);
+      expect(pageLoadFactsOf(page)?.documentRequests).toBe(1);
+    });
+  });
+
+  // 応答のヘッダを受けた後の取り消し（Chromium が、ダウンロードに切り替える）。
   it.each([
-    { name: '204 No Content', path: PATHS.noContent },
     { name: 'Content-Disposition: attachment', path: PATHS.attachment },
     { name: 'application/octet-stream', path: PATHS.octetStream },
   ])('$name: the load is aborted after the response headers, so it stays a violation and invalidates the Context', async ({ path }) => {
@@ -728,14 +774,15 @@ const canceledEvidence = (document: FakeDocument, overrides: Record<string, unkn
 });
 
 /** Playwright の `requestfailed` が受ける、main frame のナビゲーションの要求。 */
-const failedNavigation = (page: Page, document: FakeDocument, errorText = ABORTED): Request => ({
-  isNavigationRequest: () => true,
-  frame: () => ({ parentFrame: () => null, page: () => page }),
-  method: () => document.method ?? 'GET',
-  url: () => document.url,
-  failure: () => ({ errorText }),
-  response: async () => null,
-}) as unknown as Request;
+// CC-094: 偽の要求は共通の補助で作る（DEF-120: main frame のナビゲーションの種類は `document`）。
+const failedNavigation = (page: Page, document: FakeDocument, errorText = ABORTED): Request => fakePlaywrightRequest({
+  method: document.method ?? 'GET',
+  url: document.url,
+  navigation: true,
+  frame: fakeFrame(page),
+  failureText: errorText,
+  response: null,
+});
 
 /** Guard の作業が終わり、記録された違反を返す（証拠を待つ時間より長く待つ）。 */
 async function violationsAfterSettle(guard: FakeGuard): Promise<readonly { readonly code: string; readonly message: string }[]> {

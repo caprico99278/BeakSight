@@ -16,21 +16,40 @@
 //   `tests/unit/schema-enum-consistency.test.ts`）。成果物は、表の全体を写さない（件数と、照らした項目だけ。設計書 4.8）。
 // - 純粋な定義と関数だけのファイル。Playwright、ブラウザ、`node:fs`、`src/control/`、監査エンジン、発見のブラウザの部品を import しない
 //   （`tests/architecture/discovery-boundary.test.ts` の (x)）。ワーカーとジョブの管理の両方から使う。
-import type { RunStatus } from '../core/contracts.js';
+// - T37a（Task 37 の設計書 3.1）: 監査の段の口のあるジョブの記録。終わり方 `SERVICE_REQUEST_LIMIT_REACHED`（残りの定義を読まない理由にもなる）、鍵の
+//   消失の詳しい理由（`endReasonDetail`。一覧は発見の成果物と同じ `JOB_END_REASON_DETAILS`）、監査の段の数（任意の `authentication`）。版を 1.1 に上げた。
+// - T37d（Task 37 の設計書 3.5）: 定義ごとの対象の種類と画面の path（`readCheckEvidenceTargetOf`）、監査の段の判定できない決まり
+//   （`readCheckAuditStageDetailOf`・`withReadCheckAuditStageDetail`。候補の READ と画面の READ の両方に当てる）。版を 1.2 に上げた（LG-4: 読み手は 1.2 だけ）。
+import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
+import type { JobSafetyViolation, RunAuthenticationSummary, RunStatus } from '../core/contracts.js';
+import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { MAX_URL_LENGTH } from '../core/limits.js';
 import { isSecretUrlQueryParameterName } from '../core/secret-query-names.js';
 import { deriveRunStatus } from '../core/status.js';
-import { normalizeWhitespace } from '../core/text.js';
-import type { CandidateLocation, DiscoveryCandidate } from './candidate-contracts.js';
+import { normalizeWhitespace, truncateWellFormed } from '../core/text.js';
+import { READ_CANDIDATE_CLASSIFICATION, type CandidateLocation, type DiscoveryCandidate } from './candidate-contracts.js';
 import { readParametersHaveDestructiveWord } from './classify.js';
-import { mergeDiscoveryCandidates } from './discovery-result.js';
-import type { ReadCheckExpectation, ReadCheckParameters, ReadCheckResult } from './read-check-contracts.js';
+import { authenticationSummaryPartOf, mergeDiscoveryCandidates, safetyViolationSummaryPartOf, type JobEndReasonDetail } from './discovery-result.js';
+import type {
+  ReadCheckDefinition,
+  ReadCheckExpectation,
+  ReadCheckParameters,
+  ReadCheckResult,
+  ReadCheckTargetKind,
+} from './read-check-contracts.js';
 
-/** 成果物の版（スキーマの `schemaVersion` の const）。 */
-export const READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION = 'read-evidence-schema/1.0';
+/**
+ * 成果物の版（書き手が書く版）。T37a: 1.1（終わり方・詳しい理由・監査の段の数を足した）。T37d: 1.2（定義ごとの対象の種類 `targetKind` と画面の path
+ * `targetPagePath`、監査の段の 2 つの詳しい理由を足した。画面の path の定義は識別の digest を持たない）。
+ */
+export const READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION = 'read-evidence-schema/1.2';
 
-/** READ の確かめで読む分類（今の分類がこれでなければ読まない）。 */
-const READ_CLASSIFICATION = 'READ' satisfies DiscoveryCandidate['classification'];
+/**
+ * 読み手が受ける版（スキーマの `schemaVersion` の enum。T37a fix round 1）。LG-4（テストの組の設計書 3.7.3）: 前の版（1.0・1.1）は捨て、今の版だけを
+ * 受ける（前の版の成果物は、スキーマに合わないので読めないものとして扱う）。版を上げるときは、前の版をここに残すかを決める（最後が書き手の版）。
+ */
+export const READ_EVIDENCE_ARTIFACT_READABLE_SCHEMA_VERSIONS = Object.freeze([READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION] as const);
+export type ReadEvidenceArtifactSchemaVersion = (typeof READ_EVIDENCE_ARTIFACT_READABLE_SCHEMA_VERSIONS)[number];
 
 // ---------------------------------------------------------------------------------------------------------------
 // 閉じた一覧
@@ -41,7 +60,11 @@ const READ_CLASSIFICATION = 'READ' satisfies DiscoveryCandidate['classification'
  * - `COMPLETED`: すべての定義を確かめた（結果の種類は問わない）。
  * - `MAX_RUNTIME_REACHED`: 実行の時間が `crawl.maxRuntimeMs` に達した（残りの定義は確かめない）。
  * - `STOPPED`: 止める要求を受けた（今の定義を終えてから止まった）。
- * - `AUTH_SESSION_LOST`: セッションの切れを見つけた（Task 25 の判定。止まる。再開しない）。
+ * - `AUTH_SESSION_LOST`: セッションの切れを見つけた（Task 25 の判定。止まる。再開しない）。T37a: ログインの状態の鍵がなくなった切れは、詳しい理由
+ *   `endReasonDetail` に `session-key` を持つ。
+ * - `SERVICE_REQUEST_LIMIT_REACHED`（T37a）: 承認したサービスの Origin への要求の上限に届いた（残りの定義は確かめない。Run Status は `PARTIAL`）。
+ * - `SITE_UNAVAILABLE`（DEF-136）: サイトの不調（読み取りの監査と同じ判定）が、1 回の確かめ直しの後も続いた（その定義と残りの定義は確かめない。
+ *   Run Status は `PARTIAL`。サイトが戻ってから始め直す）。
  * - `SAFETY_VIOLATION`: Safety Ledger に不変条件の違反が記録された（Run Status は `ABORTED_BY_SAFETY`）。
  * - `PREFLIGHT_FAILED`: Run の前の確認が失敗し、どの定義も確かめなかった。
  */
@@ -50,6 +73,8 @@ export const READ_CHECK_END_REASONS = Object.freeze([
   'MAX_RUNTIME_REACHED',
   'STOPPED',
   'AUTH_SESSION_LOST',
+  'SERVICE_REQUEST_LIMIT_REACHED',
+  'SITE_UNAVAILABLE',
   'SAFETY_VIOLATION',
   'PREFLIGHT_FAILED',
 ] as const);
@@ -83,7 +108,13 @@ export type ReadCheckEvidenceState = (typeof READ_CHECK_EVIDENCE_STATES)[number]
  * - `NAVIGATION_FAILED`: READ の URL の読み込みが失敗した（時間切れ、接続の失敗、外部への移動の遮断）→ `UNDETERMINED`。
  * - `HTTP_ERROR_STATUS`: READ の URL の応答が HTTP の 4xx・5xx → `UNDETERMINED`（期待と照らさない）。
  * - `RESULT_PAGE_UNREADABLE`: READ の URL は読み込めたが、構造を読めなかった（読み取りの失敗、時間切れ）→ `UNDETERMINED`。
- * - `SESSION_LOST`: READ の URL の読み込みで、セッションの切れを見つけた → `UNDETERMINED`（ジョブは止まる）。
+ * - `SESSION_LOST`: READ の URL の読み込みで、セッションの切れを見つけた → `UNDETERMINED`（ジョブは止まる）。T37d: ログインの状態の鍵の消失も
+ *   これ（ジョブの終わり方の詳しい理由が `session-key`）。
+ * - `SERVICE_READ_REFUSED`（T37d。Task 37 の設計書 3.5）: 読んで照らしたが、その読み込みの間に、上限で断った承認したサービスの Origin への要求か、
+ *   サービスの Origin の 401 があった（データが描けなかったかもしれない）→ 照らした結果に関係なく `UNDETERMINED`。
+ * - `AUDIT_STAGE_REQUEST_BLOCKED`（T37d）: 読んで照らしたが、その読み込みの間に、登録した読み取りの手続きの呼び出しを回数の上限か送り方で止めたか、
+ *   承認したサービスの Origin への読み取りでない要求（登録していない手続きの呼び出しなど）を止めた → 照らした結果に関係なく `UNDETERMINED`。
+ *   許可 Origin への計測の送信などは数えない。
  */
 export const READ_CHECK_DETAILS = Object.freeze([
   'EXPECTATIONS_EVALUATED',
@@ -100,8 +131,16 @@ export const READ_CHECK_DETAILS = Object.freeze([
   'HTTP_ERROR_STATUS',
   'RESULT_PAGE_UNREADABLE',
   'SESSION_LOST',
+  'SERVICE_READ_REFUSED',
+  'AUDIT_STAGE_REQUEST_BLOCKED',
 ] as const);
 export type ReadCheckDetail = (typeof READ_CHECK_DETAILS)[number];
+
+/**
+ * 監査の段の詳しい理由（T37d。読んで照らした定義を `UNDETERMINED` にする 2 つ。`READ_CHECK_DETAILS` の一部）。
+ */
+export const READ_CHECK_AUDIT_STAGE_DETAILS = Object.freeze(['SERVICE_READ_REFUSED', 'AUDIT_STAGE_REQUEST_BLOCKED'] as const satisfies readonly ReadCheckDetail[]);
+export type ReadCheckAuditStageDetail = (typeof READ_CHECK_AUDIT_STAGE_DETAILS)[number];
 
 /** 詳しい理由ごとの結果（`EXPECTATIONS_EVALUATED` は、期待と照らした結果。ここでは null）。 */
 export const READ_CHECK_DETAIL_RESULTS: Readonly<Record<ReadCheckDetail, ReadCheckResult | null>> = Object.freeze({
@@ -119,6 +158,8 @@ export const READ_CHECK_DETAIL_RESULTS: Readonly<Record<ReadCheckDetail, ReadChe
   HTTP_ERROR_STATUS: 'UNDETERMINED',
   RESULT_PAGE_UNREADABLE: 'UNDETERMINED',
   SESSION_LOST: 'UNDETERMINED',
+  SERVICE_READ_REFUSED: 'UNDETERMINED',
+  AUDIT_STAGE_REQUEST_BLOCKED: 'UNDETERMINED',
 });
 
 /** 期待 1 件と照らした結果（閉じた一覧。定義全体の結果の一覧 `READ_CHECK_RESULTS` の一部）。 */
@@ -237,11 +278,29 @@ export type ReadExpectationEvidence =
     readonly observedValue: string | null;
   };
 
+/**
+ * 定義の対象（T37d）。書き手は、対象の種類（`targetKind`）を必ず書き、候補なら識別の digest だけ、画面なら画面の path だけを書く（どちらか
+ * 1 つはスキーマが確かめる）。
+ */
+export interface ReadCheckEvidenceTarget {
+  /** 対象の種類。 */
+  readonly targetKind: ReadCheckTargetKind;
+  /** 候補の識別の digest（候補のときだけ）。 */
+  readonly targetIdentityDigest?: string;
+  /** 画面の path（画面のときだけ。T37d）。 */
+  readonly targetPagePath?: string;
+}
+
+/** 定義の対象を、成果物に書く形にする（T37d。純粋）。 */
+export const readCheckEvidenceTargetOf = (definition: ReadCheckDefinition): ReadCheckEvidenceTarget =>
+  (definition.targetPagePath !== undefined
+    ? Object.freeze({ targetKind: 'PAGE', targetPagePath: definition.targetPagePath })
+    : Object.freeze({ targetKind: 'CANDIDATE', targetIdentityDigest: definition.targetIdentityDigest }));
+
 /** 確かめた定義 1 件。 */
-export interface ReadCheckExecutedEvidence {
+export type ReadCheckExecutedEvidence = ReadCheckEvidenceTarget & {
   readonly readCheckId: string;
   readonly readCheckRevision: number;
-  readonly targetIdentityDigest: string;
   readonly state: Extract<ReadCheckEvidenceState, 'EXECUTED'>;
   readonly result: ReadCheckResult;
   readonly detail: ReadCheckDetail;
@@ -255,22 +314,34 @@ export interface ReadCheckExecutedEvidence {
   readonly structure: ReadStructureSummary | null;
   /** 期待ごとの結果（読んで照らしたときだけ。定義の順）。 */
   readonly expectations: readonly ReadExpectationEvidence[];
-}
+  /**
+   * DEF-129: READ の URL を読み込んだときの、Guard が通した main frame の文書の要求の数（BeakSight 自身の読み込み、リダイレクトの続き、ページが始めた
+   * 読み込みを含む）。読み込まなかった定義と、前の書き手の成果物にはない。ページが始めた読み込みを上限で止めた画面は、落ち着いていない画面として照らす。
+   */
+  readonly documentRequests?: number;
+  /** T37R2-fix: 同じ読み込みの、Guard が通した子の frame の文書の要求の数（別の数）。`documentRequests` と同じく、読み込まなかった定義と前の書き手の成果物にはない。 */
+  readonly childFrameDocumentRequests?: number;
+  /**
+   * DEF-130-fix: 同じ読み込みの、Guard が通した文書でない要求の数（別の数）。`documentRequests` と同じく、読み込まなかった定義と前の書き手の成果物には
+   * ない。文書でない要求を上限で止めた画面は、落ち着いていない画面として照らす。
+   */
+  readonly subresourceRequests?: number;
+};
 
 /** 確かめなかった定義 1 件（止まった後の残り）。 */
-export interface ReadCheckNotExecutedEvidence {
+export type ReadCheckNotExecutedEvidence = ReadCheckEvidenceTarget & {
   readonly readCheckId: string;
   readonly readCheckRevision: number;
-  readonly targetIdentityDigest: string;
   readonly state: Extract<ReadCheckEvidenceState, 'NOT_EXECUTED'>;
   readonly reason: ReadCheckNotExecutedReason;
-}
+};
 
 export type ReadCheckEvidence = ReadCheckExecutedEvidence | ReadCheckNotExecutedEvidence;
 
 /** 成果物 `read-evidence.json` の形。日時は UTC の 14 桁。 */
 export interface ReadEvidenceDocument {
-  readonly schemaVersion: typeof READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION;
+  /** 版（書き手は `READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION` を書く）。 */
+  readonly schemaVersion: ReadEvidenceArtifactSchemaVersion;
   readonly jobId: string;
   readonly runId: string;
   readonly startedAt: string;
@@ -279,6 +350,19 @@ export interface ReadEvidenceDocument {
   readonly endReason: ReadCheckEndReason;
   /** 定義（`START` の順）。 */
   readonly checks: readonly ReadCheckEvidence[];
+  /** 終わり方の詳しい理由（T37a。鍵の消失によるセッションの切れのときだけ。ほかは持たない）。 */
+  readonly endReasonDetail?: JobEndReasonDetail;
+  /** 監査の段の数（T37a。`run.json` の `authentication` と同じ形。認証の指定に監査の段の口があるジョブだけ）。 */
+  readonly authentication?: RunAuthenticationSummary;
+  /** DEF-138: セッションの切れの証拠（終わり方が `AUTH_SESSION_LOST` で、組み立てられたときだけ。`run.json` の `authentication.sessionLoss` と同じ形）。 */
+  readonly sessionLoss?: SessionLossEvidence;
+  /**
+   * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.3）: 実効の監査の段の送信の扱い（新しい成果物は必ず持つ。持たない古い成果物は `READ_ONLY` と
+   * 読む）。
+   */
+  readonly auditSendPolicy?: AuditSendPolicyName;
+  /** DEF-144: 違反で止まったときの違反の中身（終わり方が `SAFETY_VIOLATION` のときだけ。`discovery.json` と同じ形。押下はしないので `press` は `null`）。 */
+  readonly safetyViolation?: JobSafetyViolation;
 }
 
 /** 件数の要約（IPC の `FINISHED` で送る値。結果を載せない）。 */
@@ -287,6 +371,10 @@ export interface ReadEvidenceSummary {
   readonly checks: number;
   /** 確かめた定義の数。 */
   readonly executed: number;
+  /** 監査の段の数（T37a。成果物にあるときだけ。成果物と同じ値）。 */
+  readonly authentication?: RunAuthenticationSummary;
+  /** DEF-144: 違反の中身（成果物にあるときだけ。成果物と同じ値）。 */
+  readonly safetyViolation?: JobSafetyViolation;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -308,7 +396,7 @@ export const confirmReadTarget = (candidates: readonly DiscoveryCandidate[], ide
   if (candidate === undefined) {
     return Object.freeze({ kind: 'NOT_FOUND' });
   }
-  return Object.freeze(candidate.classification === READ_CLASSIFICATION ? { kind: 'CONFIRMED', candidate } : { kind: 'NOT_READ', candidate });
+  return Object.freeze(candidate.classification === READ_CANDIDATE_CLASSIFICATION ? { kind: 'CONFIRMED', candidate } : { kind: 'NOT_READ', candidate });
 };
 
 /** 候補の確かめの結果（画面を読み切れず、候補が見つからない `UNREADABLE` を含む）。 */
@@ -465,7 +553,7 @@ const evaluateSettledReadExpectation = (structure: ReadPageStructure, expectatio
         expectation,
         result: matchedOf(observed === readTextForComparison(expectation.value)),
         undeterminedReason: null,
-        observedValue: observed.slice(0, MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH).toWellFormed(),
+        observedValue: truncateWellFormed(observed, MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH),
       });
     }
   }
@@ -488,8 +576,51 @@ export const readCheckResultOf = (evidence: readonly ReadExpectationEvidence[]):
   return evidence.length > 0 && evidence.every(({ result }) => result === 'MATCHED') ? 'MATCHED' : 'UNDETERMINED';
 };
 
+/**
+ * 1 つの定義の読み込みの間の、監査の段の事実（T37d。設計者の判断「止めた読み取りの数の扱い」。ワーカーが、その読み込みの前と後の数の差で作る）。
+ * - `serviceReadRefused`: 上限で断った承認したサービスの Origin への要求か、サービスの Origin の 401 があった（`serviceReadRefusalCountOf` の差）。
+ * - `registeredReadRequestsBlocked`: 登録した読み取りの手続きの呼び出しを、回数の上限か送り方で止めた数（`READ_REQUEST_OVER_LIMIT`・
+ *   `READ_REQUEST_NOT_SCRIPT`）。
+ * - `serviceOriginNonReadBlocked`: 承認したサービスの Origin への読み取りでない要求（登録していない手続きの呼び出しなど）を止めた数。許可 Origin への
+ *   計測の送信と、token の更新を止めたことは数えない（token の更新を止めた後に 401 が出れば、`serviceReadRefused` で当たる）。
+ * - `allowedOriginDataRequestsBlocked`（T37R-fix-B。T37R の M-5）: 許可 Origin への読み取りでない要求のうち、要求の種類が `fetch`・`xhr` のものを止めた
+ *   数（`ping`・`beacon` などの計測の送信は数えない）。T37R-fix-B2（設計書 8 章の最後の行）: 記録して成果物に残すだけで、判定には使わない（`fetch` で
+ *   送る計測の送信と見分けられないため。同じ Origin の POST でデータを取る画面は `NOT_MATCHED` になりうる限界）。
+ * T37R-fix-B（T37R の M-2）: ワーカーは、この形を `src/orchestration/audit-stage-run.ts` の 1 か所（`auditStageReadObservationBetween`）で作り、発見と
+ * READ の確かめの両方が、この関数の結果で「描けなかった画面」を決める（`isAuditStageReadObstructed`）。
+ */
+export interface ReadCheckAuditStageObservation {
+  readonly serviceReadRefused: boolean;
+  readonly registeredReadRequestsBlocked: number;
+  readonly serviceOriginNonReadBlocked: number;
+  readonly allowedOriginDataRequestsBlocked: number;
+}
+
+/**
+ * 監査の段の詳しい理由（T37d。純粋）: 断った要求か 401 があれば `SERVICE_READ_REFUSED`、そうでなく止めた手続きの呼び出しかサービスの Origin への読み
+ * 取りでない要求があれば `AUDIT_STAGE_REQUEST_BLOCKED`、どれもなければ null。鍵の消失は、読み込みの部品がセッションの切れにする（`SESSION_LOST`）。
+ */
+export const readCheckAuditStageDetailOf = (observation: ReadCheckAuditStageObservation): ReadCheckAuditStageDetail | null => {
+  if (observation.serviceReadRefused) {
+    return 'SERVICE_READ_REFUSED';
+  }
+  // T37R-fix-B2（M-5 の既定の取り下げ）: 許可 Origin への `fetch`・`xhr` を止めた数（`allowedOriginDataRequestsBlocked`）は、判定に使わない。
+  return observation.registeredReadRequestsBlocked > 0 || observation.serviceOriginNonReadBlocked > 0 ? 'AUDIT_STAGE_REQUEST_BLOCKED' : null;
+};
+
+/**
+ * 読んで照らした定義（`EXPECTATIONS_EVALUATED`）に、監査の段の詳しい理由があれば、照らした結果に関係なく `UNDETERMINED` にする（T37d。純粋）。構造と
+ * 期待ごとの結果は残す（なぜ判定しなかったかを見るため）。読まずに決まった定義と、照らす前に判定できなかった定義（詳しい理由が別）は、そのまま返す。
+ */
+export const withReadCheckAuditStageDetail = (
+  evidence: ReadCheckExecutedEvidence,
+  detail: ReadCheckAuditStageDetail | null,
+): ReadCheckExecutedEvidence => (detail === null || evidence.detail !== 'EXPECTATIONS_EVALUATED'
+  ? evidence
+  : Object.freeze({ ...evidence, result: 'UNDETERMINED', detail }));
+
 /** 構造の要約（件数だけ）。 */
-export const readStructureSummaryOf = (structure: ReadPageStructure): ReadStructureSummary => Object.freeze({
+export const readStructureSummaryOf =(structure: ReadPageStructure): ReadStructureSummary => Object.freeze({
   region: structure.region,
   tables: structure.tableRowCounts.length,
   tableRowCounts: Object.freeze(structure.tableRowCounts.slice(0, MAX_READ_EVIDENCE_STRUCTURE_COUNTS)),
@@ -506,9 +637,13 @@ export const readStructureSummaryOf = (structure: ReadPageStructure): ReadStruct
 // ---------------------------------------------------------------------------------------------------------------
 
 /** 件数の要約（定義の数と、確かめた数）。 */
-export const readEvidenceSummaryOf = (document: Pick<ReadEvidenceDocument, 'checks'>): ReadEvidenceSummary => Object.freeze({
+export const readEvidenceSummaryOf = (
+  document: Pick<ReadEvidenceDocument, 'checks' | 'authentication' | 'safetyViolation'>,
+): ReadEvidenceSummary => Object.freeze({
   checks: document.checks.length,
   executed: document.checks.filter(({ state }) => state === 'EXECUTED').length,
+  ...authenticationSummaryPartOf(document),
+  ...safetyViolationSummaryPartOf(document),
 });
 
 /**

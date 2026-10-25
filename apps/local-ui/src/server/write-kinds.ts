@@ -5,14 +5,16 @@
  */
 import type { ScenarioKind } from '../../../../src/control/approval-view.js';
 import type { AuditJobKind } from '../../../../src/control/job/job-records.js';
+// PRE42-CC 組 3（CC-105 の B）: ジョブの種類の値は、IPC の契約の名前つきの定数から読む（画面のサーバに同じ値を書かない）。
+import { WORKER_WRITE_CREATE_JOB_KIND, WORKER_WRITE_UPDATE_JOB_KIND } from '../../../../src/control/worker-protocol.js';
 
 /** 書き込みのジョブの種類。 */
 export type WriteJobKind = Extract<AuditJobKind, 'WRITE_CREATE' | 'WRITE_UPDATE'>;
 
 /** シナリオの種類ごとの、書き込みのジョブの種類。 */
 const WRITE_JOB_KIND_OF_SCENARIO_KIND = Object.freeze({
-  CREATE: 'WRITE_CREATE',
-  UPDATE: 'WRITE_UPDATE',
+  CREATE: WORKER_WRITE_CREATE_JOB_KIND,
+  UPDATE: WORKER_WRITE_UPDATE_JOB_KIND,
 } as const satisfies Record<ScenarioKind, WriteJobKind>);
 
 /** シナリオの種類の、書き込みのジョブの種類。 */

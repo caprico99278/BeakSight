@@ -28,6 +28,7 @@ import { isBundleFileName } from '../../../src/core/artifact-layout.js';
 import { validateArtifact } from '../../../src/core/schema-validator.js';
 import { BROWSER_DEFAULT_FAVICON_PATH } from '../../../tests/helpers/chromium.js';
 import { expectFinishedInTime, onlyRunDirectory, runCliProcess, type CliProcessResult } from '../../../tests/helpers/cli-process.js';
+import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   outputDirectoryOf,
@@ -48,6 +49,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 
 /** テストの値（匿名）。 */
 const PROFILE_ID = 't24g-parity';
@@ -222,21 +224,13 @@ beforeAll(async () => {
   expect((await call('createProfileFn', 'POST', { profile: publicProfileDocument(PROFILE_ID, targetConfigPath) })).value).toMatchObject({ ok: true });
   const uiStartedAt = Date.now();
   const start = (await call('startAuditJobFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 1, startNew: true })).value as { jobId: string };
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  let job: UiJob | null = null;
-  for (;;) {
-    job = (await call('getAuditJobFn', 'GET', { jobId: start.jobId })).value as UiJob | null;
-    if (job?.active === true) {
-      descendants.push(...descendantsOf(started.child.pid ?? 0, await listProcesses()));
-    }
-    if (job !== null && !job.active) {
-      break;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`画面のジョブが終わらなかった: ${JSON.stringify(job)}`);
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
+  // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助（上限と間隔は前と同じ）。読むたびに、動いている間は画面のサーバの子孫を記録する。
+  const job = await waitForJobViaServerFunctions(
+    (jobId) => readUiJobRecording(call, started, jobId),
+    start.jobId,
+    (current) => !current.active,
+    { limitMs: WAIT_LIMIT_MS, stepMs: WAIT_POLL_MS },
+  );
   const uiFinishedAt = Date.now();
   expect(job.state).toBe('FINISHED');
   ui = outcomeOf(job.exitCode, `${root.root}/${outputDirectoryOf(PROFILE_ID)}/${job.runId ?? ''}`, requestsBetween(uiStartedAt, uiFinishedAt));
@@ -299,7 +293,7 @@ describe('CLI and the UI job give the same audit (Task 24 design 7, G24)', () =>
     const { cli: cliOutcome, ui: uiOutcome } = outcomes();
     for (const outcome of [cliOutcome, uiOutcome]) {
       expect(outcome.requests.length).toBeGreaterThan(0);
-      expect(outcome.requests.filter((request) => request.method !== 'GET' && request.method !== 'HEAD')).toEqual([]);
+      expect(outcome.requests.filter((request) => !READ_METHODS.has(request.method))).toEqual([]);
     }
     expect(stableRequestsOf(uiOutcome.requests)).toEqual(stableRequestsOf(cliOutcome.requests));
   });
@@ -313,26 +307,23 @@ describe('CLI and the UI job give the same audit (Task 24 design 7, G24)', () =>
   });
 });
 
+/** 画面のジョブを 1 回読み、動いている間は画面のサーバの子孫を記録する（PRE42-CC 組 UI-K2。待つのは補助 `waitForJobViaServerFunctions`）。 */
+async function readUiJobRecording(call: CallServerFunction, uiServer: StartedServer, jobId: string): Promise<UiJob | null> {
+  const job = (await call('getAuditJobFn', 'GET', { jobId })).value as UiJob | null;
+  if (job?.active === true) {
+    descendants.push(...descendantsOf(uiServer.child.pid ?? 0, await listProcesses()));
+  }
+  return job;
+}
+
 /** 画面のジョブが `predicate` を満たすまで読み直す（動いている間は、画面のサーバの子孫を記録する）。 */
 async function waitForUiJob(jobId: string, predicate: (job: UiJob) => boolean): Promise<UiJob> {
   const call = callFunction;
-  if (call === undefined || server === undefined) {
+  const uiServer = server;
+  if (call === undefined || uiServer === undefined) {
     throw new Error('画面のサーバがない');
   }
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const job = (await call('getAuditJobFn', 'GET', { jobId })).value as UiJob | null;
-    if (job?.active === true) {
-      descendants.push(...descendantsOf(server.child.pid ?? 0, await listProcesses()));
-    }
-    if (job !== null && predicate(job)) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`画面のジョブが期待の状態にならなかった: ${JSON.stringify(job)}`);
-    }
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS / 5));
-  }
+  return waitForJobViaServerFunctions((id) => readUiJobRecording(call, uiServer, id), jobId, predicate, { limitMs: WAIT_LIMIT_MS, stepMs: WAIT_POLL_MS / 5 });
 }
 
 const partialOutcomes = (): { readonly cli: AuditOutcome; readonly ui: AuditOutcome } => {
@@ -445,7 +436,7 @@ describe.skipIf(process.platform !== 'win32')('CLI and the UI job give the same 
     for (const outcome of [cliOutcome, uiOutcome]) {
       expect(outcome.run['safety']).toMatchObject({ guardEnabled: true, invariantViolationCount: 0, invariantViolations: [] });
       expect(outcome.requests.length).toBeGreaterThan(0);
-      expect(outcome.requests.filter((request) => request.method !== 'GET' && request.method !== 'HEAD')).toEqual([]);
+      expect(outcome.requests.filter((request) => !READ_METHODS.has(request.method))).toEqual([]);
     }
     expect(uiOutcome.run['safety']).toEqual(cliOutcome.run['safety']);
     expect(stableRequestsOf(uiOutcome.requests)).toEqual(stableRequestsOf(cliOutcome.requests));

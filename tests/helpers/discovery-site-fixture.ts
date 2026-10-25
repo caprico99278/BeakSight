@@ -27,10 +27,13 @@
 // - T27R2 の C1: `pollingPages` を真にすると、ポーリングの画面（`DISCOVERY_SITE_POLLING_PAGES`。互いにリンクし、`/admin` からはリンクしない）を
 //   足す。どの画面も、`DISCOVERY_SITE_POLLING_INTERVAL_MS` ごとに同じ Origin の `DISCOVERY_SITE_EXTRA_PATHS.pollApi` へ GET を送り、サーバは
 //   `DISCOVERY_SITE_POLLING_RESPONSE_DELAY_MS` 待って応答する（閉じるときに進行中の要求がありうる形）。
+// - DEF-136: `setPageFault(path, fault)` で、管理画面の 1 つの画面（セッションの確かめの後）を不調にする: 指定の状態（503・500・404 など）を返す
+//   （本文に、ほかの画面へのリンクと GET の form を持つ。`times` の回数だけ。省略は毎回）、接続を切る（`REFUSE`。応答なしで socket を壊す）、応答しない
+//   （`HANG`。閉じるまで応答しない）。届いた要求は管理画面の HTML の要求として記録する。
 import { randomBytes } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 const STATUS_OK = 200;
 const STATUS_NO_CONTENT = 204;
@@ -193,6 +196,18 @@ export interface DiscoverySiteRequest {
   readonly authenticated: boolean;
 }
 
+/** DEF-136: 不調の画面（`STATUS`）の本文にだけあるリンク（ほかの画面からはリンクしない。発見がエラーの画面からリンクを拾わないことを確かめる）。 */
+export const DISCOVERY_SITE_FAULT_LINK = '/admin/fault-only';
+
+/**
+ * DEF-136: 画面の不調（`setPageFault`）。`STATUS` は `status` の応答（`times` の回数だけ。省略は毎回。回数を使い切ったら、ふつうの画面に戻る）、
+ * `REFUSE` は応答なしで接続を切る、`HANG` は閉じるまで応答しない。
+ */
+export type DiscoverySitePageFault =
+  | { readonly kind: 'STATUS'; readonly status: number; readonly times?: number }
+  | { readonly kind: 'REFUSE' }
+  | { readonly kind: 'HANG' };
+
 export interface DiscoverySiteOptions {
   /** 管理画面の HTML を、この数まで読んだら、セッションを期限切れにする（セッションの切れ）。 */
   readonly expireAfterAdminPages?: number;
@@ -215,12 +230,19 @@ export interface DiscoverySite {
   setShape(shape: DiscoverySiteShape): void;
   /** T27e: 管理画面のセッションを、今すぐすべて期限切れにする（セッションの切れ）。 */
   expireSessions(): void;
+  /** DEF-136: 管理画面の `path` の画面を不調にする（null で戻す）。 */
+  setPageFault(path: string, fault: DiscoverySitePageFault | null): void;
   /** ページの欄に、正しい資格情報を入れる（値はテストに返さない）。 */
   fillCredentials(fill: (selector: string, value: string) => Promise<void>): Promise<void>;
   /** 正しい資格情報でログインした回数。 */
   readonly successfulLogins: number;
   /** 秘密の目印のすべて（目印の検査にだけ使う。値を出力しない）。 */
   secretValues(): readonly string[];
+  /**
+   * FM2d: 秘密の目印のうち、ログインの状態と資格情報のもの（セッションの値、資格情報、localStorage の値）だけ。監査の成果物（見えている文と form の値を残す）の
+   * 検索に使う（値を出力しない）。
+   */
+  loginStateValues(): readonly string[];
   close(): Promise<void>;
 }
 
@@ -246,7 +268,6 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
   const issued: string[] = [];
   const tokens: string[] = [];
   const requests: DiscoverySiteRequest[] = [];
-  const sockets = new Set<Duplex>();
   const credentials = { user: `u${randomValue()}`, pass: `p${randomValue()}` };
   const markers = {
     value: `val${randomValue()}`,
@@ -257,6 +278,9 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
     row: `row${randomValue()}`,
   };
   let csrf = randomValue();
+  /** DEF-136: 不調にした画面（path → 不調）と、応答していない応答。 */
+  const faults = new Map<string, DiscoverySitePageFault>();
+  const hanging = new Set<ServerResponse>();
   let variant: DiscoverySiteVariant = 'base';
   let shape: DiscoverySiteShape = 'base';
   let successfulLogins = 0;
@@ -501,6 +525,31 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
       response.end();
       return { adminDocument: false, authenticated: true };
     }
+    // DEF-136: 不調にした画面。
+    const fault = faults.get(pathname);
+    if (fault !== undefined) {
+      if (fault.kind === 'REFUSE') {
+        response.socket?.destroy();
+        return { adminDocument: true, authenticated: true };
+      }
+      if (fault.kind === 'HANG') {
+        hanging.add(response);
+        response.once('close', () => hanging.delete(response));
+        return { adminDocument: true, authenticated: true };
+      }
+      if (fault.times !== undefined) {
+        if (fault.times <= 1) {
+          faults.delete(pathname);
+        } else {
+          faults.set(pathname, { ...fault, times: fault.times - 1 });
+        }
+      }
+      response.writeHead(fault.status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(`<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>誤り</title></head><body><main><h1>誤り ${fault.status}</h1>`
+        + `<p><a href="${DISCOVERY_SITE_FAULT_LINK}">誤りの画面のリンク</a></p>`
+        + `<form method="get" action="${p.list}"><input type="search" name="fault"><button type="submit">検索</button></form></main></body></html>`);
+      return { adminDocument: true, authenticated: true };
+    }
     if (pathname === p.api) {
       setTimeout(() => {
         response.writeHead(STATUS_OK, { 'content-type': 'application/json', 'cache-control': 'no-store' });
@@ -540,7 +589,7 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
     return { adminDocument: true, authenticated: true };
   };
 
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const at = Date.now();
     const url = new URL(request.url ?? '/', origin());
     const isRead = request.method === 'GET' || request.method === 'HEAD';
@@ -555,16 +604,11 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
     }
     requests.push({ method: request.method ?? '', path: `${url.pathname}${url.search}`, at, ...result });
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
+  server.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
     requests.push({ method: 'UPGRADE', path: request.url ?? '/', at: Date.now(), adminDocument: false, authenticated: false });
     socket.destroy();
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, () => resolve()));
-  port = (server.address() as AddressInfo).port;
+  port = server.port;
 
   return {
     origin: origin(),
@@ -579,6 +623,13 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
     expireSessions: () => {
       sessions.clear();
     },
+    setPageFault: (path, fault) => {
+      if (fault === null) {
+        faults.delete(path);
+      } else {
+        faults.set(path, fault);
+      }
+    },
     async fillCredentials(fill) {
       await fill(DISCOVERY_SITE_LOGIN_FIELDS.user, credentials.user);
       await fill(DISCOVERY_SITE_LOGIN_FIELDS.pass, credentials.pass);
@@ -590,9 +641,7 @@ export async function startDiscoverySite(options: DiscoverySiteOptions = {}): Pr
       ...issued, ...tokens, credentials.user, credentials.pass, markers.value, markers.hidden, markers.label, markers.storage,
       ...(options.readCheckPages === true || options.markerShapes === true ? [markers.row] : []),
     ],
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    loginStateValues: () => [...issued, credentials.user, credentials.pass, markers.storage],
+    close: () => server.close(),
   };
 }

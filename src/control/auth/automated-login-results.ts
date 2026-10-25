@@ -5,6 +5,7 @@
 // - ログインの Origin は、認証の設定の `loginStartUrl` の Origin（設計書 4.5 と変更履歴の「Blocker: T26c」の行の (4)）。資格情報の
 //   ファイル（T26a）が保存する `loginOrigin` と同じく、既存の Origin の正規化（`canonicalHttpOriginOf`）で確かめる。
 // 値の一覧は `as const` の凍結した配列として 1 回だけ定義し、型はその配列から導く。SQL と秘密を持たない。
+import { SERVER_ERROR_HTTP_STATUS_RANGE, TOO_MANY_REQUESTS_HTTP_STATUS, isHttpStatusInRange } from '../../core/http-status.js';
 import { canonicalHttpOriginOf } from '../../crawl/normalize-url.js';
 
 /** 自動ログインの成功の結果。 */
@@ -46,6 +47,61 @@ export const AUTOMATED_LOGIN_RATE_LIMITED_RESULT = 'RATE_LIMITED' satisfies Auto
 
 /** 結果が分からないときの結果（ワーカーが結果なしで終わったときにも使う）。 */
 export const AUTOMATED_LOGIN_UNKNOWN_RESULT = 'AUTH_RESULT_UNKNOWN' satisfies AutomatedLoginFailureResult;
+
+/**
+ * 状態のコードを当てる応答の種類（T36R-fix。T36R の M-5。閉じた一覧）。
+ * - `DOCUMENT_RESPONSE`: ログインの画面を開いたときと、form の送信の後の main frame の文書の応答（ワーカーの `statusOutcome`）。
+ * - `TOKEN_RESPONSE`: スクリプトで送るログインの、token の送信の応答（ワーカーの `tokenResponseOutcome`。2xx は成功の確かめに進むので、ここに来ない）。
+ */
+export const LOGIN_HTTP_RESPONSE_KINDS = Object.freeze(['DOCUMENT_RESPONSE', 'TOKEN_RESPONSE'] as const);
+export type LoginHttpResponseKind = (typeof LOGIN_HTTP_RESPONSE_KINDS)[number];
+
+/** 応答の状態のコードから決まりうる結果。 */
+export type LoginHttpStatusFailureResult = Extract<
+  AutomatedLoginFailureResult,
+  'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED' | typeof AUTOMATED_LOGIN_RATE_LIMITED_RESULT | typeof AUTOMATED_LOGIN_UNKNOWN_RESULT
+>;
+
+/** 状態のコードの表の 1 行。 */
+export interface LoginHttpStatusResult {
+  readonly status: number;
+  readonly result: LoginHttpStatusFailureResult;
+  /** この行を当てる応答（form の文書の応答では、400・401・423 は当てず、認証の設定の失敗の条件で決める）。 */
+  readonly responseKinds: readonly LoginHttpResponseKind[];
+}
+
+/** 400（資格情報の誤り）。 */
+const BAD_REQUEST_HTTP_STATUS = 400;
+/** 401（資格情報の誤り）。 */
+const UNAUTHORIZED_HTTP_STATUS = 401;
+/** 423（アカウントのロック）。 */
+const LOCKED_HTTP_STATUS = 423;
+
+const TOKEN_RESPONSE_ONLY: readonly LoginHttpResponseKind[] = Object.freeze(['TOKEN_RESPONSE'] as const);
+
+/**
+ * ログインの応答の状態のコードから結果への表（T36R-fix。T36R の M-5。400・401・423・429 の対応の唯一の置き場。Task 36 の設計書 3.4 の表と、
+ * Task 26 の設計書 4.5 の 429）。5xx は、どの応答でも結果が分からない（`AUTH_RESULT_UNKNOWN`）。token の送信の応答で、表にも 5xx にもない状態も、
+ * 結果が分からない。form の文書の応答で、表にも 5xx にもない状態は決めない（`null`。成功の条件と失敗の条件を待つ）。
+ */
+export const LOGIN_HTTP_STATUS_RESULTS: readonly LoginHttpStatusResult[] = Object.freeze([
+  Object.freeze({ status: BAD_REQUEST_HTTP_STATUS, result: 'INVALID_CREDENTIALS', responseKinds: TOKEN_RESPONSE_ONLY }),
+  Object.freeze({ status: UNAUTHORIZED_HTTP_STATUS, result: 'INVALID_CREDENTIALS', responseKinds: TOKEN_RESPONSE_ONLY }),
+  Object.freeze({ status: LOCKED_HTTP_STATUS, result: 'ACCOUNT_LOCKED', responseKinds: TOKEN_RESPONSE_ONLY }),
+  Object.freeze({ status: TOO_MANY_REQUESTS_HTTP_STATUS, result: AUTOMATED_LOGIN_RATE_LIMITED_RESULT, responseKinds: LOGIN_HTTP_RESPONSE_KINDS }),
+]);
+
+/** 応答の状態のコードから決まる結果（決まらなければ `null`。上の表）。`RATE_LIMITED` のときは、呼ぶ側が `Retry-After` を読む。 */
+export const loginHttpStatusResultOf = (status: number, responseKind: LoginHttpResponseKind): LoginHttpStatusFailureResult | null => {
+  const row = LOGIN_HTTP_STATUS_RESULTS.find((entry) => entry.status === status && entry.responseKinds.includes(responseKind));
+  if (row !== undefined) {
+    return row.result;
+  }
+  if (isHttpStatusInRange(status, SERVER_ERROR_HTTP_STATUS_RANGE)) {
+    return AUTOMATED_LOGIN_UNKNOWN_RESULT;
+  }
+  return responseKind === 'TOKEN_RESPONSE' ? AUTOMATED_LOGIN_UNKNOWN_RESULT : null;
+};
 
 /**
  * ログインの POST を送ったか（閉じた一覧）。`YES` は送った、`NO` は送る前に終わった（ロックの心配がない）、`UNKNOWN` は分からない

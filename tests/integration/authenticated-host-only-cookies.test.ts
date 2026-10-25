@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';

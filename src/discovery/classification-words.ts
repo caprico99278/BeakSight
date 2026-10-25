@@ -1,6 +1,6 @@
 // 発見の候補の分類のための語の閉じた一覧（Task 27 の設計書 4.3、10 章の 3。T27a）。比べ方は `classify.ts`。
 // - どの一覧も、比べる形（Unicode の正規化 NFKC と大文字小文字の畳み込みの後）で書く（`tests/unit/discovery-classify.test.ts` で確かめる）。
-// - 危険な語は、Task 25 の既定の危険な語（`src/control/auth/auth-setup-contracts.ts` の `DEFAULT_EXCLUDED_URL_WORDS`。変えない。認証つきの
+// - 危険な語は、Task 25 の既定の危険な語（`src/core/default-excluded-url-words.ts` の `DEFAULT_EXCLUDED_URL_WORDS`。変えない。認証つきの
 //   Run の設定の digest を変えないため）の英語をすべて含み、日本語と英語の語を足した、発見の分類のための別の一覧。含むことはテストで
 //   固定する（発見の部品は `src/control/` を import しない。`tests/architecture/discovery-boundary.test.ts`）。
 // - 語の一覧は照らすためのデータで、利用者に見せる文言ではない（表示の文言は表示のカタログ。GATE-UI06 の除外の理由）。
@@ -111,6 +111,17 @@ export const DISCOVERY_SUBMITTER_WORDS = Object.freeze([
   ...DISCOVERY_SEARCH_WORDS,
   ...DISCOVERY_UPDATE_WORDS,
   ...DISCOVERY_CREATE_WORDS,
+] as const);
+
+/**
+ * T44c（Task 44 の設計書 P1-3。設計者の判断）: 送らずに観察する probe の押す順だけに使う、送信の語（登録・更新の語の次の段）。送信ボタンの語の閉じた一覧
+ * （`DISCOVERY_SUBMITTER_WORDS`）には入れない（候補の `submitterWords`・識別の digest・規則・成果物のスキーマに響かない）。比べ方は更新・登録の語と同じ
+ * （`classify.ts` の `submitterTextHasSubmitWord`）。
+ */
+export const DISCOVERY_SUBMIT_PRESS_WORDS = Object.freeze([
+  'submit',
+  '送信',
+  '確定',
 ] as const);
 
 /**
@@ -232,6 +243,51 @@ export const DISCOVERY_STATE_FIELD_WORDS = Object.freeze([
 ] as const);
 
 /**
+ * DEF-147（設計書 `2026-10-21-beaksight-api-state-keys-design.md` 2 章）: 論理削除の語（API の要求の本文の鍵の名前に当たれば、その型は論理削除にあたる鍵を
+ * 持つとして実行しない。`api-shape-classification.ts` の `isApiSoftDeleteKeyName`）。状態の欄の語（`DISCOVERY_STATE_FIELD_WORDS`）のうち「消す・捨てる」の
+ * 意味の語と、欄の名前のための削除の語（`DISCOVERY_REMOVAL_FIELD_WORDS`）のうち同じ意味の語。比べ方は `classify.ts` の `fieldNameHasListedWord`（英語の語は
+ * 語の単位、日本語の語は部分一致）。フォームの送信の分類（状態の欄の印）には使わない。
+ */
+export const DISCOVERY_SOFT_DELETE_FIELD_WORDS = Object.freeze([
+  'deleted',
+  'delete',
+  'del',
+  'delflg',
+  'delflag',
+  'deleteflg',
+  'deleteflag',
+  'archived',
+  'archive',
+  'removed',
+  'trash',
+  'trashed',
+  'purged',
+  'discarded',
+  'destroyed',
+  'erased',
+  '削除',
+  '退会',
+] as const);
+
+/**
+ * DEF-147: 公開の状態の語（API の要求の本文の鍵の名前が、状態の欄の語にはこの語でだけ当たるなら、公開の状態の鍵として論理削除にしない。値は入力の規則で
+ * 利用者が決める）。比べ方は `fieldNameHasListedWord`。承認の画面の注意の印と、API の更新の保つ欄の既定の知らせにも使う（`isPublicationStateKeyName`）。
+ */
+export const DISCOVERY_PUBLICATION_STATE_FIELD_WORDS = Object.freeze([
+  'status',
+  'state',
+  'published',
+  'unpublished',
+  'publish',
+  'visible',
+  'visibility',
+  '公開',
+  '非公開',
+  '状態',
+  'ステータス',
+] as const);
+
+/**
  * 状態の欄の語のうち、名前・順・ラベルの語（`DISCOVERY_STATE_FIELD_LABEL_WORDS`）がすぐ後に続く形では当てない語（T31a。閉じた例外の一覧）。
  * `display_name`・`displayName`・`show_order`・`表示名`・`表示順` は、表示に使う名前や並びの欄で、状態の欄ではない（T31a fix round 1 で `show` を
  * 足した）。
@@ -271,4 +327,44 @@ export const DISCOVERY_DISABLING_WORDS = Object.freeze([
   '解約',
   '退会',
   '非公開',
+] as const);
+
+/**
+ * T43d（Task 43 の設計書 4.4）: ログアウトの語（閉じた一覧）。成功の画面のセレクタの案で、ログインの後の画面の見えるリンクやボタンの文字・`aria-label`・
+ * `title`・`href` に含まれていれば、ログアウトの要素の候補にする（押さない。要素の文字は記録せず、当たった語だけを記録する）。英語の語は、既定で読まない
+ * 危険な語（`DEFAULT_EXCLUDED_URL_WORDS`）のログアウトの語と同じで、どの語も危険な語（`DISCOVERY_DESTRUCTIVE_WORDS`）に含まれる（テストで固定する）。
+ * 日本語の語を照らすデータなので、日本語の語の一覧を持てるこのファイルに置く（GATE-UI06 の除外の理由と同じ）。
+ */
+export const DISCOVERY_LOGOUT_WORDS = Object.freeze(['logout', 'signout', 'sign-out', 'log-out', 'ログアウト'] as const);
+
+/**
+ * ML-a-fix-3（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 6 章の ML-R2 の行の M-2）: 手続きの呼び出しの名前の、書き込みの語のうち、
+ * 危険な語・更新の語・登録の語（`DISCOVERY_DESTRUCTIVE_WORDS`・`DISCOVERY_UPDATE_WORDS`・`DISCOVERY_CREATE_WORDS`）にない語（閉じた一覧。重ねない）。
+ * 判定は `classify.ts` の `procedureNameHasWriteWord`（4 つの一覧を、語の単位で比べる）。
+ */
+export const DISCOVERY_PROCEDURE_WRITE_WORDS = Object.freeze(['upsert', 'set', 'write', 'put', 'patch'] as const);
+
+/**
+ * T43R-fix の C-1 (b)（Task 43 の設計書 7 章の T43R の行）: 成功の画面のセレクタの案に使う属性の値（id・name・href）で、ログアウトの語のほかに含んでよい
+ * 一般の語（閉じた一覧。小文字）。属性の値からログアウトの語を除いた残りが、この語と区切り（`.`・`:`・`_`・`/`・`-`・空白）だけのときだけ案にする（利用者の
+ * 名前や ID が入りうる値を案にしない）。
+ */
+export const DISCOVERY_LOGOUT_GENERAL_WORDS = Object.freeze([
+  'button',
+  'btn',
+  'link',
+  'menu',
+  'nav',
+  'navbar',
+  'header',
+  'action',
+  'icon',
+  'item',
+  'global',
+  'main',
+  'top',
+  'side',
+  'dropdown',
+  'admin',
+  'app',
 ] as const);

@@ -7,7 +7,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   WORKER_PROTOCOL_VERSION,
   targetConfigDigestOf,
@@ -19,7 +20,7 @@ import {
 const ORIGIN = 'http://127.0.0.1:4173';
 const SHA256 = targetConfigDigestOf(new TextEncoder().encode('{}'));
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-discovery',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,

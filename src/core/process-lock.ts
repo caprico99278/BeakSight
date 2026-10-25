@@ -6,6 +6,7 @@
  * - `src/orchestration/run-checkpoint.ts` が、今の名前で export し直す（利用者を変えないため）。
  */
 import { uptime } from 'node:os';
+import { isDeepStrictEqual } from 'node:util';
 import { errorCodeOf } from './errors.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from './guards.js';
 import { MILLISECONDS_PER_SECOND } from './time-units.js';
@@ -121,6 +122,8 @@ export function renewRunLock(lock: RunLock, nowMs: number): RunLock {
  */
 export const RUN_LOCK_STATES = Object.freeze(['ACTIVE', 'STALE'] as const);
 export type RunLockState = (typeof RUN_LOCK_STATES)[number];
+/** 動いている Run のロックの判定の結果（`RUN_LOCK_STATES` の `ACTIVE`）。使う側は文字列を書き写さず、これを読む（PRE42-CC 組 R。CC-110）。 */
+export const ACTIVE_RUN_LOCK_STATE = 'ACTIVE' satisfies RunLockState;
 
 /** ロックの判定の入力（今の時刻、今の OS の起動の時刻、プロセスが動いているかを調べる関数）。 */
 export interface RunLockJudgementInput extends Pick<RunLockHost, 'nowMs' | 'bootedAtMs'> {
@@ -157,8 +160,8 @@ export function judgeRunLock(lock: unknown, current: RunLockJudgementInput): Run
 
 /**
  * 読み直したロックの中身（ファイルから読んだ値）が、`lock`（自分が書いたロック）と同じ持ち主のものか（プロセスの ID とロックを取った時刻が
- * 同じ。設計書 4.4）。出力先の開始のロック（DEF-057。Task 24 の設計書 4.6）の、離す前の確かめと、保存のセッション（`run-checkpoint-session.ts`）
- * の、前の方式の取り直しの後の読み直しに使う（CC-057。T24h-2 で 1 つにした）。
+ * 同じ。設計書 4.4）。出力先の開始のロック（DEF-057。Task 24 の設計書 4.6）の、離す前の確かめなどに使う（CC-057。T24h-2 で 1 つにした。
+ * LG-4: 保存のセッションの前の方式の取り直しは捨てた）。
  */
 export function isOwnRunLock(value: unknown, lock: RunLock): boolean {
   return isRecord(value) && value.processId === lock.processId && value.acquiredAtMs === lock.acquiredAtMs;
@@ -242,10 +245,14 @@ export async function takeOverStaleLock(
   existing: unknown,
   lock: RunLock,
   judgement: RunLockJudgementInput,
+  grace?: RunLockGrace,
 ): Promise<LockTakeoverResult> {
   let current = existing;
   for (let attempt = 1; attempt <= LOCK_TAKEOVER_MAX_ATTEMPTS; attempt += 1) {
-    if (judgeRunLock(current, judgement) === 'ACTIVE') {
+    // DEF-172: 猶予（`judgeRunLockWithGrace`）は、最初の判定だけ（判定し直しのたびに待たない）。
+    const judged = await judgeRunLockWithGrace(current, judgement, attempt === 1 ? grace : undefined);
+    current = judged.existing;
+    if (judged.state === ACTIVE_RUN_LOCK_STATE) {
       return Object.freeze<LockTakeoverResult>({ kind: 'HELD', existing: current });
     }
     const takeover = await port.takeOver(current, lock);
@@ -269,7 +276,100 @@ export async function acquireLockTakingOverStale(
   port: LockFilePort,
   lock: RunLock,
   judgement: RunLockJudgementInput,
+  grace?: RunLockGrace,
 ): Promise<LockTakeoverResult> {
   const acquisition = await port.acquire(lock);
-  return acquisition.acquired ? LOCK_TAKEOVER_ACQUIRED : await takeOverStaleLock(port, acquisition.existing, lock, judgement);
+  return acquisition.acquired ? LOCK_TAKEOVER_ACQUIRED : await takeOverStaleLock(port, acquisition.existing, lock, judgement, grace);
+}
+
+/** DEF-172: 動いている持ち主のロックが古く見えるときに、取り直す前に待つ時間の、ハートビートの間隔に足す分（ms）。 */
+export const RUN_LOCK_TAKEOVER_GRACE_MARGIN_MS = 15_000;
+
+/**
+ * DEF-172: 動いている持ち主（process が動いている）のロックが古く見える（ハートビートが古い、起動の時刻がずれる）ときに、取り直す前に待つ時間
+ * （ms。ハートビートの間隔より長い）。待った後に読み直し、ハートビートが進んでいれば（中身が変わっていれば）動いている Run のものとし、進んで
+ * いなければ取り直す。持ち主が止まっていた（スリープ、時計の跳び、出力の止まった端末）間に、動いている Run を取り直さないため。
+ */
+export const RUN_LOCK_TAKEOVER_GRACE_MS = RUN_LOCK_HEARTBEAT_INTERVAL_MS + RUN_LOCK_TAKEOVER_GRACE_MARGIN_MS;
+
+/** DEF-172: 取り直す前の猶予の口（読み直し、待ち、待つことの知らせ）。 */
+export interface RunLockGrace {
+  /** ロックを読み直す（ない、読めないなら `null`）。 */
+  readonly reread: () => Promise<unknown>;
+  /** `ms` だけ待つ（本番は `src/core/deadline.ts` の `wait`。テストは注入した待ち）。 */
+  readonly wait: (ms: number) => Promise<void>;
+  /** 待つ前に 1 回だけ知らせる（待つ時間 ms）。省略は知らせない。 */
+  readonly onWait?: ((waitMs: number) => void) | undefined;
+}
+
+/** `judgeRunLockWithGrace` の結果（`existing` は、判定した中身。猶予の後に変わっていれば、読み直した中身）。 */
+export interface RunLockGraceJudgement {
+  readonly state: RunLockState;
+  readonly existing: unknown;
+}
+
+/**
+ * DEF-172: ロックを判定する（判定の部品はここだけ。保存のセッションの再開、出力先の開始のロック、出力先の動いている Run の確かめが使う）。
+ * 1. `judgeRunLock` が `ACTIVE` なら `ACTIVE`。
+ * 2. `STALE` で、形が正しくない、またはロックの process が動いていなければ、すぐに `STALE`（今までと同じ）。
+ * 3. process が動いているのに古く見えるときは、`grace` があれば `RUN_LOCK_TAKEOVER_GRACE_MS` だけ待って読み直す（`grace` がなければ `STALE`）。
+ *    中身が同じか、なくなっていれば `STALE`（判定した中身は前のもの）。変わっていれば（ハートビートが進んだ、ほかの起動が作った）`ACTIVE`
+ *    （判定した中身は読み直したもの）。
+ */
+export async function judgeRunLockWithGrace(
+  existing: unknown,
+  judgement: RunLockJudgementInput,
+  grace: RunLockGrace | undefined,
+): Promise<RunLockGraceJudgement> {
+  const [judged] = await judgeRunLocksWithGrace(
+    [{ existing, reread: grace?.reread ?? (async () => existing) }],
+    judgement,
+    grace,
+  );
+  return judged ?? Object.freeze({ state: judgeRunLock(existing, judgement), existing });
+}
+
+/** `judgeRunLocksWithGrace` の 1 つのロック（判定した中身と、その読み直し）。 */
+export interface RunLockGraceCandidate {
+  readonly existing: unknown;
+  readonly reread: () => Promise<unknown>;
+}
+
+/**
+ * DEF-172・SR-1-F5（SR-1R3 の I1）: いくつものロックを、`judgeRunLockWithGrace` と同じ規則でまとめて判定する（判定の部品は、ここの 1 つ）。
+ * 猶予の要るロック（process が動いているのに古く見える）がいくつあっても、待つのは全部まとめて 1 回だけ（1 回の判定で最大
+ * `RUN_LOCK_TAKEOVER_GRACE_MS`）。待った後に、猶予の要るロックだけを読み直す。結果は、`candidates` と同じ順。`grace` の `reread` は使わない
+ * （それぞれの `reread` を使う。待ちと知らせだけを使う）。
+ */
+export async function judgeRunLocksWithGrace(
+  candidates: readonly RunLockGraceCandidate[],
+  judgement: RunLockJudgementInput,
+  grace: Pick<RunLockGrace, 'wait' | 'onWait'> | undefined,
+): Promise<readonly RunLockGraceJudgement[]> {
+  const first = candidates.map(({ existing }) => Object.freeze({ state: judgeRunLock(existing, judgement), existing }));
+  const needsGrace = (index: number): boolean => {
+    const existing = candidates[index]?.existing;
+    return grace !== undefined
+      && first[index]?.state !== ACTIVE_RUN_LOCK_STATE
+      && isRunLock(existing)
+      && judgement.isProcessRunning(existing.processId);
+  };
+  const graced = first.map((_judged, index) => index).filter(needsGrace);
+  if (grace === undefined || graced.length === 0) {
+    return Object.freeze(first);
+  }
+  grace.onWait?.(RUN_LOCK_TAKEOVER_GRACE_MS);
+  await grace.wait(RUN_LOCK_TAKEOVER_GRACE_MS);
+  const results: RunLockGraceJudgement[] = [...first];
+  for (const index of graced) {
+    const candidate = candidates[index];
+    if (candidate === undefined) {
+      continue;
+    }
+    const again = await candidate.reread();
+    results[index] = again === null || isDeepStrictEqual(again, candidate.existing)
+      ? Object.freeze({ state: 'STALE' as const, existing: candidate.existing })
+      : Object.freeze({ state: ACTIVE_RUN_LOCK_STATE, existing: again });
+  }
+  return Object.freeze(results);
 }

@@ -8,7 +8,8 @@
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { EXIT_CODES, FAILURE_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   WORKER_JOB_KIND_NOT_SUPPORTED_REASON,
   WORKER_PROTOCOL_VERSION,
@@ -18,6 +19,7 @@ import {
   type WorkerToParentMessage,
 } from '../../src/control/worker-protocol.js';
 import type { RunId } from '../../src/core/contracts.js';
+import { REDACTED } from '../../src/core/redaction.js';
 import { ArtifactWriteError } from '../../src/report/artifact-writer.js';
 import { startAuditWorker, type AuditWorker, type WorkerChannel } from '../../src/worker/audit-worker-session.js';
 import type { LoginStageResult } from '../../src/worker/authenticated-login.js';
@@ -34,7 +36,7 @@ const HEARTBEAT_INTERVAL_MS = 1_000;
 const SESSION_VALUE = 'session-value-example';
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-discovery',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -78,6 +80,7 @@ const ranOutcome: DiscoveryRunOutcome = {
   runStatus: 'PARTIAL',
   exitCode: EXIT_CODES.PARTIAL,
   summary: { pagesRead: 3, pagesNotRead: 2, candidates: 5 },
+  endReason: 'MAX_PAGES_REACHED',
 };
 
 interface Run {
@@ -156,7 +159,7 @@ describe('audit worker session (T27d): the discovery job', () => {
     const run = await runWorker({
       executeDiscovery: async (_request, observer) => {
         observer.onRunStarted({ runId: RUN_ID, runDirectory: resolve(OUTPUT_DIRECTORY, RUN_ID) });
-        observer.onSessionLost(`${ORIGIN}/login?expired=1`);
+        observer.onSessionLost(`${ORIGIN}/login?expired=1`, null);
         return ranOutcome;
       },
     });
@@ -178,7 +181,8 @@ describe('audit worker session (T27d): the discovery job', () => {
         runDirectory: RUN_ID,
         resumeDecision: { kind: 'NEW_RUN', completedPages: null },
       },
-      { protocol: WORKER_PROTOCOL_VERSION, type: 'AUTH_STATE', state: 'SESSION_LOST', sessionLostUrl: `${ORIGIN}/login?expired=1` },
+      // T44g（P4-1）: セッションの切れの URL は、query のすべての値を伏せる（`redactRecordedRequestUrl`）。
+      { protocol: WORKER_PROTOCOL_VERSION, type: 'AUTH_STATE', state: 'SESSION_LOST', sessionLostUrl: `${ORIGIN}/login?expired=${REDACTED}` },
       {
         protocol: WORKER_PROTOCOL_VERSION,
         type: 'FINISHED',
@@ -189,6 +193,19 @@ describe('audit worker session (T27d): the discovery job', () => {
     expect(run.exitCode).toBe(EXIT_CODES.PARTIAL);
     expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
     expect(JSON.stringify(run.sent)).not.toContain(SESSION_VALUE);
+  });
+
+  // DEF-143: 発見の流れが成果物を組み立てて書く段に入ったら、監査と同じ口（`RUN_FINALIZING`）で親へ知らせる。
+  it('relays the start of the finalizing stage of the discovery flow as RUN_FINALIZING, before FINISHED', async () => {
+    const run = await runWorker({
+      executeDiscovery: async (_request, observer) => {
+        observer.onRunStarted({ runId: RUN_ID, runDirectory: resolve(OUTPUT_DIRECTORY, RUN_ID) });
+        observer.onFinalizing?.();
+        return ranOutcome;
+      },
+    });
+    expect(meaningful(run).map(({ type }) => type)).toEqual(['AUTH_STATE', 'RUN_STARTED', 'RUN_FINALIZING', 'FINISHED']);
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
   });
 
   it('sends FINISHED without the counts when the discovery did not start a Run (RUN_ACTIVE)', async () => {

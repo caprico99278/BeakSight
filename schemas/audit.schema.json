@@ -7,6 +7,10 @@
     "schemaVersion": { "const": "audit-schema/1.0" },
     "run": { "$ref": "urn:beaksight:schema:run:1.0" },
     "pages": { "type": "array", "items": { "$ref": "urn:beaksight:schema:page:1.0" } },
-    "findings": { "type": "array", "items": { "$ref": "urn:beaksight:schema:finding:1.0" } }
+    "findings": {
+      "description": "T44f (Task 44 design P3-1 B): the Findings not in the findings of any page (the Findings of the Run rules, such as the cross-page rules; some have a page ID). The Findings of a page are in pages[].findings only. All the Findings of the Run are the page Findings (in the page order) followed by these. The version stays 1.0; documents of the earlier writers have all the Findings here.",
+      "type": "array",
+      "items": { "$ref": "urn:beaksight:schema:finding:1.0" }
+    }
   }
 }

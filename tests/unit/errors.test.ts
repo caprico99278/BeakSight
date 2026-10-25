@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ERROR_MESSAGE_FALLBACK, safeErrorMessage } from '../../src/core/errors.js';
+import { ERROR_MESSAGE_FALLBACK, errorMessageOrString, safeErrorMessage } from '../../src/core/errors.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../../src/core/limits.js';
 
 describe('safeErrorMessage', () => {
@@ -132,5 +132,38 @@ describe('safeErrorMessage', () => {
   it('defines a non-empty fallback message', () => {
     expect(ERROR_MESSAGE_FALLBACK.length).toBeGreaterThan(0);
     expect(ERROR_MESSAGE_FALLBACK.length).toBeLessThanOrEqual(MAX_ERROR_MESSAGE_LENGTH);
+  });
+});
+
+describe('errorMessageOrString (PRE42-CC group 5a, N1)', () => {
+  // 置き換える前のインラインの式（`error instanceof Error ? error.message : String(error)`）と、どの値でも同じ結果になる。
+  const inline = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+  it('returns the message of an Error and String(value) otherwise, the same as the inline expression', () => {
+    const values: readonly unknown[] = [
+      new Error('broken'),
+      new TypeError(''),
+      Object.assign(new Error('with code'), { code: 'ENOENT' }),
+      'plain failure',
+      '',
+      undefined,
+      null,
+      42,
+      10n,
+      Symbol('name'),
+      { message: 'not an Error' },
+      { toString: () => 'custom' },
+      [1, 2],
+    ];
+    for (const value of values) {
+      expect(errorMessageOrString(value)).toBe(inline(value));
+    }
+    expect(errorMessageOrString(new Error('broken'))).toBe('broken');
+    expect(errorMessageOrString({ message: 'not an Error' })).toBe('[object Object]');
+  });
+
+  it('does not limit the length (callers that need a limit use safeErrorMessage)', () => {
+    const long = 'x'.repeat(MAX_ERROR_MESSAGE_LENGTH * 2);
+    expect(errorMessageOrString(new Error(long))).toBe(long);
   });
 });

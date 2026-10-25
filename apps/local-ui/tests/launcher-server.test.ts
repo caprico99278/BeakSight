@@ -22,6 +22,8 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
+import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
+import { cspViolationsOf, recordCspViolations } from './helpers/ui-page.ts';
 
 /** すべての応答に付く header（値まで確かめるもの）。 */
 const FIXED_SECURITY_HEADERS = Object.freeze({
@@ -198,11 +200,7 @@ describe('launcher: browser and Server Function', () => {
       const requests: string[] = [];
       context.on('request', (request) => requests.push(request.url()));
       const page = await context.newPage();
-      await page.addInitScript(() => {
-        const violations: string[] = [];
-        Object.defineProperty(window, '__cspViolations', { value: violations });
-        document.addEventListener('securitypolicyviolation', (event) => violations.push(`${event.violatedDirective} ${event.blockedURI}`));
-      });
+      await page.addInitScript(recordCspViolations);
       const consoleErrors: string[] = [];
       page.on('console', (message) => {
         if (message.type() === 'error') {
@@ -219,9 +217,11 @@ describe('launcher: browser and Server Function', () => {
       expect(cookies[0]).toMatchObject({ httpOnly: true, sameSite: 'Strict', path: '/' });
 
       // 画面からプロファイルを登録し、そのときの Server Function（POST）の要求を記録する。
-      await page.getByRole('link', { name: LOCAL_UI_TEXT.profileList.newProfile }).click();
+      // T43a: 左のメニューにも同じ名前のリンクがあるので、本文（一覧の上の帯）のリンクを選ぶ。
+      await page.getByRole('main').getByRole('link', { name: LOCAL_UI_TEXT.profileList.newProfile }).click();
       await page.getByLabel(LOCAL_UI_TEXT.profileForm.profileId).fill('t23e-csrf');
-      await page.getByLabel(LOCAL_UI_TEXT.profileForm.targetConfigPath).selectOption('config/targets/example.json');
+      // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
+      await chooseExistingTargetConfig(page, 'config/targets/example.json', SERVER_FN_TIMEOUT_MS);
       const serverFnPost = page.waitForRequest(
         (request: PlaywrightRequest) => request.url().includes('/_serverFn/') && request.method() === 'POST',
         { timeout: SERVER_FN_TIMEOUT_MS },
@@ -236,8 +236,8 @@ describe('launcher: browser and Server Function', () => {
         body: sent.postData() ?? '',
       };
 
-      const violations = await page.evaluate(() => (window as unknown as { __cspViolations: string[] }).__cspViolations);
-      expect(violations).toEqual([]);
+      // 記録がなければ（init script が動かなかった文書）誤りにする。
+      expect(await cspViolationsOf(page, true)).toEqual([]);
       expect(consoleErrors.filter((text) => /Content Security Policy/iu.test(text))).toEqual([]);
       expect(requests.filter((url) => !url.startsWith(`${origin}/`))).toEqual([]);
     } finally {

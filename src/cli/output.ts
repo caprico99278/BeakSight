@@ -9,11 +9,13 @@
 import type { ConfigError, ConfigErrorKind } from '../config/config-error.js';
 import type { AuditConfig } from '../config/types.js';
 import { RUN_ARTIFACT_FILE_NAMES, artifactFilePath, bundleFileName } from '../core/artifact-layout.js';
+import { BEAKSIGHT_BLOCK_RELATIONS } from '../core/beaksight-block-relation.js';
 import { RUN_STATUSES, type RunProgressReport, type RunStatus } from '../core/contracts.js';
 import { safeErrorMessage } from '../core/errors.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { normalizeWhitespace, replaceControlCharacters } from '../core/text.js';
 import {
+  BEAKSIGHT_BLOCK_RELATION_CATALOG,
   RUN_EXECUTION_END_REASON_CATALOG,
   RUN_STATUS_CATALOG,
   SEVERITY_CATALOG,
@@ -26,9 +28,12 @@ import { formatCount, formatDuration, formatElapsedTime, formatRequestsWithPeak,
 import type { RunVersionDifference, RunVersionField } from '../orchestration/run-checkpoint.js';
 import type { RunNotice, RunResumeUnavailableReason } from '../orchestration/run-coordinator.js';
 import {
+  AUDIT_SEND_TEXT,
+  BEAKSIGHT_BLOCK_RELATION_SUMMARY_TEXT,
   CLI_COMMAND_DESCRIPTIONS,
   CLI_OPTION_DESCRIPTIONS,
   CLI_TEXT,
+  PAGE_COVERAGE_ITEMS,
   RUN_SUMMARY_TEXT,
   activeRunInOutputDirectoryText,
   authSessionLostNoticeText,
@@ -48,6 +53,7 @@ import {
   resumingRunText,
   runLockHeldText,
   runLockTakenOverText,
+  serviceRequestPacingWaitText,
   siteUnavailableRecheckText,
   siteUnavailableSlowdownText,
   siteUnavailableStopText,
@@ -197,9 +203,13 @@ export function runStartedLines(config: AuditConfig): readonly string[] {
  * - `SITE_UNAVAILABLE_RECHECK`: サイトの不調でページを捨てた後、待ってから同じページを確かめ直す（待つ時間は `formatDuration`。何回目かと
  *   最大の回数は、そのまま）。
  * - `SITE_UNAVAILABLE_SLOWDOWN`: 確かめ直しで応答が戻ったので、ページの読み込みの間隔を延ばして続ける（新しい間隔は `formatDuration`）。
+ * - `SERVICE_REQUEST_PACING_WAIT`（DEF-141）: 承認したサービスへの要求の 1 分あたりの上限で、次の読み込みの前に待つ（待つ時間と合計は `formatDuration`。
+ *   回数は、そのまま）。
  */
 export function runNoticeLines(notice: RunNotice): readonly string[] {
   switch (notice.kind) {
+    case 'SERVICE_REQUEST_PACING_WAIT':
+      return [serviceRequestPacingWaitText(formatDuration(notice.waitMs), notice.waitCount, formatDuration(notice.totalWaitMs))];
     case 'SITE_UNAVAILABLE_RECHECK':
       return [siteUnavailableRecheckText(notice.url, formatDuration(notice.delayMs), notice.attempt, notice.maxAttempts)];
     case 'SITE_UNAVAILABLE_SLOWDOWN':
@@ -259,7 +269,7 @@ export function runProgressLines(report: RunProgressReport): readonly string[] {
 export function runSummaryLines(summary: RunSummaryView, runDirectory: string): readonly string[] {
   const coverage = RUN_SUMMARY_TEXT.coverage;
   const counts = summary.findingCounts;
-  const { load, executions } = summary;
+  const { load, executions, beaksightBlockRelation: blockRelation } = summary;
   const groupLines = sortByDisplayOrder(SEVERITY_GROUPS, SEVERITY_GROUP_CATALOG).map((group) =>
     cliFieldText(
       findingGroupCountsLabelText(SEVERITY_GROUP_CATALOG[group].label),
@@ -276,15 +286,21 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
     cliFieldText(CLI_TEXT.run.bundle, artifactFilePath(runDirectory, bundleFileName(executions.lastFinishedAt))),
     cliFieldText(
       RUN_SUMMARY_TEXT.coverageHeading,
-      listText([
-        cliCountText(coverage.discovered, formatCount(summary.coverage.discovered)),
-        cliCountText(coverage.audited, formatCount(summary.coverage.audited)),
-        cliCountText(coverage.partial, formatCount(summary.coverage.partial)),
-        cliCountText(coverage.failed, formatCount(summary.coverage.failed)),
-        cliCountText(coverage.skipped, formatCount(summary.coverage.skipped)),
-      ]),
+      // T44R2 の M-8: 項目の並びは `PAGE_COVERAGE_ITEMS`（1 か所）。
+      listText(PAGE_COVERAGE_ITEMS.map((item) => cliCountText(coverage[item], formatCount(summary.coverage[item])))),
     ),
     ...groupLines,
+    // BN-d: BeakSight の遮断と結び付く指摘（バンドルの本体から外したサイト品質の指摘）の件数。出すかと件数は、表示用モデルの値のまま。
+    ...(blockRelation.linkedFindingCount > 0
+      ? [cliFieldText(
+        BEAKSIGHT_BLOCK_RELATION_SUMMARY_TEXT.label,
+        BEAKSIGHT_BLOCK_RELATION_SUMMARY_TEXT.value(listText(
+          sortByDisplayOrder(BEAKSIGHT_BLOCK_RELATIONS, BEAKSIGHT_BLOCK_RELATION_CATALOG)
+            .filter((relation) => relation !== 'NONE')
+            .map((relation) => cliCountText(BEAKSIGHT_BLOCK_RELATION_CATALOG[relation].label, formatCount(blockRelation.byRelation[relation]))),
+        )),
+      )]
+      : []),
     cliFieldText(
       RUN_SUMMARY_TEXT.loadHeading,
       listText([
@@ -301,6 +317,18 @@ export function runSummaryLines(summary: RunSummaryView, runDirectory: string): 
       labelWithCodeText(RUN_EXECUTION_END_REASON_CATALOG[executions.lastEndReason].label, executions.lastEndReason),
     ),
     ...(summary.siteUnavailableStop === null ? [] : [siteUnavailableStopText(summary.siteUnavailableStop.detail)]),
+    // AS-b: 通したことの知らせ（出すかどうかは表示用モデルの `auditSend.prominent` のまま。件数は数え直さない）。
+    ...(summary.auditSend.prominent
+      ? [
+        AUDIT_SEND_TEXT.passedNotice(formatCount(summary.auditSend.passedRequests)),
+        // AS-c: 内訳（ほかの Origin への送信と、WebSocket の接続）。
+        AUDIT_SEND_TEXT.passedDetail(formatCount(summary.auditSend.passedOtherOriginRequests), formatCount(summary.auditSend.passedWebSockets)),
+        // AS-c fix round 1: Guard の判定を通らずに開いた接続と、危険な語の接続（出すかは表示用モデルの `webSocketCaution`）。
+        ...(summary.auditSend.webSocketCaution
+          ? [AUDIT_SEND_TEXT.webSocketCaution(formatCount(summary.auditSend.passedWebSocketsOutsideGuard), formatCount(summary.auditSend.passedDangerousWebSockets))]
+          : []),
+      ]
+      : []),
     ...(summary.incompleteReasons.length > 0
       ? [cliFieldText(RUN_SUMMARY_TEXT.reasonsHeading, formatCount(summary.incompleteReasons.length))]
       : []),

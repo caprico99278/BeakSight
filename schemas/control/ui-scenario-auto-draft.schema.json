@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-auto-draft:1",
+  "description": "Local UI Server Function input: make the scenario drafts of the latest discovery by one press (FM2b; the fewer manual steps design 3A.2). The profile revision and the discovery job are the ones the confirmation dialog showed; the server checks them again and makes nothing when they changed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedRevision", "discoveryJobId"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/revision" },
+    "discoveryJobId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "$id": "urn:beaksight:schema:control:scenario:1",
-  "description": "One revision of a write scenario (Task 28 design 4.1): one CREATE or UPDATE candidate of the latest discovery, the request shape, the fields to send, the READ checks to compare with, the side effect confirmations, the limits and the approval TTL (at most the defaults) and the reference to the input rules. The value lists and limits are owned by src/control/approval/scenario-contracts.ts; the draft rules against the candidate are checked by src/control/approval/scenario-policy.ts. The verification spec (Task 30 design 3, T30a: the success and input error conditions, the way to take the record id and the READ verification bound to the generated values) is required and each item is null while not specified; a scenario with an unspecified item can be approved but gets no execution grant. The UPDATE spec (Task 31 design 3, T31b: the CREATE scenario of the ledger, the path templates of the update form and of the action with {id} once as a whole segment, the fields to keep and the templated identity digest of the candidate) is required; it is null for a CREATE scenario, and null for an UPDATE revision stored before the UPDATE spec (readable, but neither approved nor granted); the draft validation requires it for an UPDATE draft. No property holds an input value, a token, an option label or a credential. The state (DRAFT, APPROVED, REVOKED) is kept by the store, not in a revision.",
+  "description": "One revision of a write scenario (Task 28 design 4.1): one CREATE or UPDATE candidate of the latest discovery, the request shape, the fields to send, the READ checks to compare with, the side effect confirmations, the limits and the approval TTL (at most the defaults) and the reference to the input rules. The value lists and limits are owned by src/control/approval/scenario-contracts.ts; the draft rules against the candidate are checked by src/control/approval/scenario-policy.ts. The verification spec (Task 30 design 3, T30a: the success and input error conditions, the way to take the record id and the READ verification bound to the generated values) is required and each item is null while not specified; a scenario with an unspecified item can be approved but gets no execution grant. The UPDATE spec (Task 31 design 3, T31b: the CREATE scenario of the ledger, the path templates of the update form and of the action with {id} once as a whole segment, the fields to keep and the templated identity digest of the candidate) is required; it is null for a CREATE scenario and for an API scenario, and a spec for a FORM UPDATE scenario (LG-3: the revisions stored before the UPDATE spec, before the verification spec and the API UPDATE revisions stored before the contract of T41a are not read); the draft validation requires it for an UPDATE draft. No property holds an input value, a token, an option label or a credential. The state (DRAFT, APPROVED, REVOKED) is kept by the store, not in a revision. T38b (Task 38 design 3.2): the transport (absent or FORM for a form scenario as before; API for a scenario of the request of the page script) and the API spec of an API scenario (request is null; the field names are the keys of the body to send).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -37,7 +37,12 @@
         "ruleDigest": { "$ref": "#/$defs/fingerprint" }
       }
     },
-    "request": { "$ref": "#/$defs/request" },
+    "transport": {
+      "description": "T38b (Task 38 design 3.2): the way the scenario sends. Absent in a FORM scenario stored before (and written by the FORM drafts); FORM is also accepted. API: the request of the page script to an approved service origin; the request shape is in api and request is null.",
+      "enum": ["FORM", "API"]
+    },
+    "request": { "anyOf": [{ "$ref": "#/$defs/request" }, { "type": "null" }] },
+    "api": { "$ref": "#/$defs/api" },
     "fieldNames": {
       "type": "array",
       "uniqueItems": true,
@@ -74,7 +79,184 @@
   },
   "if": { "properties": { "kind": { "const": "CREATE" } }, "required": ["kind"] },
   "then": { "properties": { "update": { "type": "null" } } },
+  "allOf": [
+    {
+      "description": "T38b: an API scenario has the API spec, no request of a form and no UPDATE spec of a form.",
+      "if": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] },
+      "then": { "required": ["api"], "properties": { "api": { "$ref": "#/$defs/api" }, "request": { "type": "null" }, "update": { "type": "null" } } }
+    },
+    {
+      "description": "T38b: a FORM scenario (transport absent or FORM) has the request of a form and no API spec.",
+      "if": { "not": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] } },
+      "then": { "properties": { "request": { "$ref": "#/$defs/request" }, "api": false } }
+    },
+    {
+      "description": "T38c: the READ verification of a FORM scenario binds at least one value (only an API scenario may have no binding, for a page path template READ; the rule against the READ check definition is checked by src/control/approval/scenario-policy.ts).",
+      "if": { "not": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] } },
+      "then": {
+        "properties": {
+          "verification": {
+            "type": "object",
+            "properties": {
+              "readVerification": {
+                "anyOf": [{ "type": "null" }, { "type": "object", "properties": { "bindings": { "type": "array", "minItems": 1 } } }]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "description": "LG-3 (the test suite tiers design 3.7.2): a FORM UPDATE scenario has the UPDATE spec (not null).",
+      "if": {
+        "properties": { "kind": { "const": "UPDATE" } },
+        "required": ["kind"],
+        "not": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] }
+      },
+      "then": { "properties": { "update": { "$ref": "#/$defs/update" } } }
+    },
+    {
+      "description": "LG-3 (the test suite tiers design 3.7.2): an API UPDATE scenario has the contract of T41a (the kept keys, the templated identity digest and the ledger).",
+      "if": { "properties": { "kind": { "const": "UPDATE" }, "transport": { "const": "API" } }, "required": ["kind", "transport"] },
+      "then": {
+        "properties": {
+          "api": {
+            "type": "object",
+            "required": ["keptKeys", "templatedIdentityDigest"],
+            "properties": { "keptKeys": true, "templatedIdentityDigest": true, "ledger": { "type": "object" } }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
+    "apiKey": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "apiJsonType": { "enum": ["string", "number", "boolean", "null", "object", "array"] },
+    "apiFieldSelector": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "apiFieldType": {
+      "description": "T38R2-fix (Task 38 design 7, the last row; M-2): the input type of the field behind a key to send (SCENARIO_API_FIELD_TYPES of src/control/approval/scenario-contracts.ts).",
+      "enum": ["text", "search", "email", "url", "tel", "date", "textarea", "number"]
+    },
+    "apiRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "origin", "pathShape", "queryNames", "contentType", "prefer"],
+      "properties": {
+        "method": { "enum": ["POST", "PATCH"] },
+        "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "pathShape": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 1024 },
+        "queryNames": { "type": "array", "uniqueItems": true, "items": { "enum": ["select"] } },
+        "contentType": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 100 }, { "type": "null" }] },
+        "prefer": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "return=representation",
+              "return=minimal",
+              "return=headers-only",
+              "resolution=merge-duplicates",
+              "resolution=ignore-duplicates",
+              "return=other",
+              "resolution=other",
+              "other"
+            ]
+          }
+        }
+      }
+    },
+    "apiFieldIdentity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name"],
+          "properties": { "kind": { "const": "NAME" }, "name": { "type": "string", "minLength": 1, "maxLength": 256 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "selector"],
+          "properties": { "kind": { "const": "SELECTOR" }, "selector": { "$ref": "#/$defs/apiFieldSelector" } }
+        }
+      ]
+    },
+    "apiKeyField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "type", "field", "fieldType"],
+      "properties": {
+        "key": { "$ref": "#/$defs/apiKey" },
+        "type": { "$ref": "#/$defs/apiJsonType" },
+        "field": { "$ref": "#/$defs/apiFieldIdentity" },
+        "fieldType": { "$ref": "#/$defs/apiFieldType" }
+      }
+    },
+    "api": {
+      "description": "T38b (Task 38 design 3.2, 7 history): the API spec of an API scenario, made from the shape of the submission probe (no value): the shape digest, the request shape, the keys to send with their input fields, the keys decided by the page (named at the approval; their values are not compared), the header names supplied by the page (the names supplied by the browser are left out), the filter name of an UPDATE, the way to take the record id (a key of the response body; null for the way of the verification spec) and the ledger of an UPDATE. The lists and limits are owned by src/control/approval/scenario-contracts.ts.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shapeDigest", "request", "keyFields", "pageKeys", "headerNames", "filterName", "recordId", "ledger"],
+      "properties": {
+        "shapeDigest": { "$ref": "#/$defs/fingerprint" },
+        "request": { "$ref": "#/$defs/apiRequest" },
+        "keyFields": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/apiKeyField" } },
+        "keptKeys": {
+          "description": "T41a (Task 41 design 3.1): the kept keys of an API UPDATE (the marked keys that are not changed; no generated value). Only an UPDATE has them.",
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/apiKeyField" }
+        },
+        "pageKeys": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "type"],
+            "properties": {
+              "key": { "$ref": "#/$defs/apiKey" },
+              "type": { "$ref": "#/$defs/apiJsonType" },
+              "field": {
+                "description": "T41a (Task 41 design 3.3, the user decision 2): the field of the update page for a key decided by the page of an API UPDATE.",
+                "$ref": "#/$defs/apiFieldIdentity"
+              }
+            }
+          }
+        },
+        "templatedIdentityDigest": {
+          "description": "T41a (Task 41 design 3.1): the identity digest of the candidate with the last record id of the page path as {id} (an API UPDATE only).",
+          "$ref": "#/$defs/fingerprint"
+        },
+        "headerNames": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/apiKey" } },
+        "filterName": { "anyOf": [{ "$ref": "#/$defs/apiKey" }, { "type": "null" }] },
+        "recordId": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source", "key"],
+              "properties": { "source": { "enum": ["RESPONSE_BODY_KEY"] }, "key": { "$ref": "#/$defs/apiKey" } }
+            },
+            { "type": "null" }
+          ]
+        },
+        "ledger": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["targetCreateScenarioId", "formPathTemplate"],
+              "properties": {
+                "targetCreateScenarioId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+                "formPathTemplate": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+              }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
     "fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
     "timestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
     "request": {
@@ -174,7 +356,7 @@
       "properties": {
         "readCheckId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
         "revision": { "type": "integer", "minimum": 1 },
-        "bindings": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "$ref": "#/$defs/binding" } },
+        "bindings": { "type": "array", "minItems": 0, "maxItems": 50, "items": { "$ref": "#/$defs/binding" } },
         "expectations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/verificationExpectation" } }
       }
     },

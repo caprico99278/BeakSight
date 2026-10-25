@@ -6,11 +6,8 @@
 // 共通化の前に書いて PASS させ、共通化の後も同じ表で PASS させる（振る舞いを変えないことの確かめ）。
 import { describe, expect, it } from 'vitest';
 import type { AuditConfig } from '../../src/config/types.js';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  SECRET_LIKE_QUERY_NAME_WORDS as AUTH_SETUP_SECRET_LIKE_QUERY_NAME_WORDS,
-  type AuthSetup,
-} from '../../src/control/auth/auth-setup-contracts.js';
+import type { AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile } from '../../src/control/contracts.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
@@ -54,7 +51,7 @@ if (!profileResult.ok) {
 const profile = profileResult.profile;
 
 const setupWithLoginQueryName = (name: string): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-test-env',
   profileRevision: 1,
   loginStartUrl: `${TEST_ORIGIN}/login?${name}=value`,
@@ -139,10 +136,10 @@ describe('CCX-4: the current judgments of the three secret-like name policies', 
   });
 });
 
-// 共通化の後（CCX-4）: 3 つの方針の語の一覧と比べ方は `src/core/secret-query-names.ts` に名前を付けて並び、元の場所は同じ値を公開し直す。
+// 共通化の後（CCX-4）: 3 つの方針の語の一覧と比べ方は `src/core/secret-query-names.ts` に名前を付けて並ぶ。PRE42-CC 組 Z: 認証の設定の契約
+// （`auth-setup-contracts.ts`）は一覧を公開し直さない（呼び出し側は core から読む。Gate `secret-name-policies` の (d)）。
 describe('CCX-4: the three policies are named in src/core/secret-query-names.ts', () => {
-  it('re-exports the same frozen list of the auth setup policy from auth-setup-contracts.ts', () => {
-    expect(AUTH_SETUP_SECRET_LIKE_QUERY_NAME_WORDS).toBe(SECRET_LIKE_QUERY_NAME_WORDS);
+  it('keeps the lists frozen in the owner', () => {
     for (const list of [SECRET_URL_QUERY_PARAMETER_NAMES, SECRET_LIKE_QUERY_NAME_WORDS, SECRET_LIKE_HEADER_EXACT_NAMES, SECRET_LIKE_HEADER_NAME_WORDS]) {
       expect(Object.isFrozen(list)).toBe(true);
     }

@@ -35,7 +35,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { strToU8, zipSync } from 'fflate';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS } from '../../../src/control/auth/auth-setup-contracts.js';
 import {
   CREDENTIAL_FILE_SUFFIX,
   MAX_CREDENTIAL_VALUE_LENGTH,
@@ -63,6 +64,7 @@ import {
 } from '../../../tests/helpers/automated-login-fixture.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { openWalControlDatabase, shiftAutoLoginAttemptsBack } from '../../../tests/helpers/control-data-test-writes.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   MANUAL_LOGIN_STAGE_RECORD,
@@ -92,6 +94,7 @@ import {
   type SearchedPlace,
 } from './helpers/secret-markers.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
 const IS_WINDOWS = process.platform === 'win32';
@@ -374,15 +377,13 @@ interface JobDetail {
 /** ジョブが終わるまで待つ。 */
 const waitForJobEnd = async (jobId: string): Promise<JobDetail> => {
   await recordDescendants();
-  let job: JobDetail | null = null;
-  await expect.poll(async () => {
-    job = await valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId });
-    return job?.active;
-  }, { timeout: JOB_TIMEOUT_MS, interval: POLL_MS }).toBe(false);
-  if (job === null) {
-    throw new Error('ジョブがない');
-  }
-  return job;
+  // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助 `waitForJobViaServerFunctions`（上限と間隔は前と同じ）。
+  return waitForJobViaServerFunctions(
+    (id) => valueOf<JobDetail | null>('getAuditJobFn', 'GET', { jobId: id }),
+    jobId,
+    (job) => !job.active,
+    { limitMs: JOB_TIMEOUT_MS, stepMs: POLL_MS },
+  );
 };
 
 /** 開いたページの移動の先のジョブの ID を覚えて返す。 */
@@ -440,7 +441,7 @@ const isHeld = async (profileId: string): Promise<boolean> => {
 
 /** fixture の自動ログインの認証の設定。 */
 const fixtureSetupOf = (profileId: string, variant: AutomatedLoginFormVariant, outcome: AutomatedLoginOutcome): Record<string, unknown> => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: fixtureOf().formUrl(variant, outcome),
@@ -466,7 +467,7 @@ const fixtureSetupOf = (profileId: string, variant: AutomatedLoginFormVariant, o
 
 /** 認証つきの fixture のサイトの、自動ログインの認証の設定（T26d-2 の端から端と同じ）。 */
 const siteSetupOf = (profileId: string, site: AuthenticatedSite): Record<string, unknown> => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${site.originA}${AUTH_SITE_PATHS.login}`,
@@ -606,10 +607,6 @@ const expectNoMarkerAnywhere = async (scenario: string): Promise<MarkerSearch> =
   return search;
 };
 
-/** 自動ログインの fixture に届いた、GET と HEAD 以外の要求（`<method> <path>`。`since` 番目から）。 */
-const nonReadRequests = (requests: readonly { readonly method: string; readonly path: string }[], since = 0): readonly string[] =>
-  requests.slice(since).filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
-
 describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automated login flows${IS_WINDOWS ? '' : ` [skipped: ${SKIP_REASON}]`}`, () => {
   beforeAll(async () => {
     root = createTemporaryUiRoot('built');
@@ -688,7 +685,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
     expect(await loginCheckOnPage(CHANGE_PROFILE)).toMatchObject({ autoLogin: { result: 'SUCCEEDED', submitted: 'YES' } });
     // 3 回とも、ログインの POST の 1 回だけを送った。
     const loginPost = `POST ${fixture.authPath('success')}`;
-    expect(nonReadRequests(fixture.requests, since)).toEqual([loginPost, loginPost, loginPost]);
+    expect(nonReadRequestsOf(fixture.requests, since)).toEqual([loginPost, loginPost, loginPost]);
     await expectNoMarkerAnywhere('password changed and checked');
 
     // 削除 → 資格情報のファイルが消え、一時のファイルも残らない。
@@ -723,7 +720,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
       autoLogin: { result: 'SUCCEEDED', submitted: 'YES' },
     });
     expect(site.successfulLogins).toBe(1);
-    expect(nonReadRequests(site.requests)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
+    expect(nonReadRequestsOf(site.requests)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
     const search = await expectNoMarkerAnywhere('audit completed');
     expect(search.places.some(({ place }) => place.startsWith(`root:t25e-output-${AUDIT_PROFILE}/`) && place.includes('.zip!'))).toBe(true);
     expect(search.places.some(({ place }) => place.startsWith('html:/artifacts/'))).toBe(true);
@@ -741,7 +738,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
       runId: null,
       autoLogin: { result: 'INVALID_CREDENTIALS', submitted: 'YES' },
     });
-    expect(nonReadRequests(fixture.requests, since)).toEqual([`POST ${fixture.authPath('success')}`]);
+    expect(nonReadRequestsOf(fixture.requests, since)).toEqual([`POST ${fixture.authPath('success')}`]);
     expect(await isHeld(INVALID_PROFILE)).toBe(true);
     await expectNoMarkerAnywhere('invalid credentials');
   }, SCENARIO_TIMEOUT_MS);
@@ -757,7 +754,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
       autoLogin: { result: 'LOGIN_FORM_INVALID', submitted: 'NO', formInvalidReason: 'METHOD_NOT_POST' },
     });
     // 読み取りでない要求も、目印を載せた要求も、サーバに届かない。止めない（送っていないため）。
-    expect(nonReadRequests(fixture.requests, since)).toEqual([]);
+    expect(nonReadRequestsOf(fixture.requests, since)).toEqual([]);
     expect(fixture.requests.slice(since).filter(({ path, body }) => [USER_FORM, PASS_FORM].some((marker) => path.includes(marker) || body.includes(marker))))
       .toEqual([]);
     expect(await isHeld(FORM_PROFILE)).toBe(false);
@@ -783,7 +780,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
       autoLogin: { result: 'SUCCEEDED', submitted: 'YES' },
     });
     expect(site.successfulLogins).toBe(2);
-    expect(nonReadRequests(site.requests)).toEqual([`POST ${AUTH_SITE_PATHS.login}`, `POST ${AUTH_SITE_PATHS.login}`]);
+    expect(nonReadRequestsOf(site.requests)).toEqual([`POST ${AUTH_SITE_PATHS.login}`, `POST ${AUTH_SITE_PATHS.login}`]);
     await expectNoMarkerAnywhere('resumed');
   }, SCENARIO_TIMEOUT_MS);
 

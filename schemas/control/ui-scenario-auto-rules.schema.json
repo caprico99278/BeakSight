@@ -1,0 +1,11 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-scenario-auto-rules:1",
+  "description": "Local UI Server Function input: attach the inferred input rules to one API scenario draft saved through the guide of the automatic drafts (FM2b; the fewer manual steps design 3A.2, 3A.3). Only before the approval; refused when the scenario already has rules.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/revision" }
+  }
+}

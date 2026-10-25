@@ -5,9 +5,17 @@
  * - 期待は、閉じた一覧（サーバが返した `expectationKinds`。表示の順はカタログ）から選ぶ。件数と長さの上限は、サーバが返した契約の値。
  * - 保存は、サーバの検証（`validateReadCheckDefinition`）と保存の部品が決める。拒まれたら、理由を項目ごとに日本語で出す（送る値の誤りはその欄に、
  *   ほかは上のお知らせに）。画面の確かめ（必須、数の範囲、長さ）は補助だけ。
+ * - T37d（Task 37 の設計書 3.5）: 対象は「候補を読む」（送る値の欄）か「画面を読む」（画面の path の欄と、直近の発見の結果の画面から選ぶ一覧。一覧が
+ *   なければ入力だけ。送る値はない）。path の誤りは、その欄にも出す。
  */
 import { useState } from 'react';
 import type { ReadCheckExpectation, ReadCheckExpectationKind } from '../../../../src/control/discovery-view.js';
+// PRE42-CC 組 UI-K2（CC-113）: 期待の種類の値は、発見の部品に触れない純粋な core の owner から読む（書き写さない）。
+import {
+  ROW_COUNT_AT_LEAST_EXPECTATION_KIND,
+  ROW_COUNT_EXPECTATION_KINDS,
+  TEXT_CONTAINS_EXPECTATION_KIND,
+} from '../../../../src/core/read-check-expectation-kinds.js';
 import { READ_CHECK_EXPECTATION_KIND_CATALOG, sortByDisplayOrder } from '../../../../src/presentation/catalog.js';
 import { formatCount, formatInteger } from '../../../../src/presentation/format.js';
 import {
@@ -39,20 +47,42 @@ export interface ReadCheckFormInitial {
   readonly expectations: readonly ReadCheckExpectation[];
 }
 
-/** 送る定義（サーバが確かめる）。 */
-export interface ReadCheckDefinitionInput {
-  readonly targetIdentityDigest: string;
-  readonly parameters: Readonly<Record<string, string>>;
-  readonly expectations: readonly Readonly<Record<string, unknown>>[];
-}
+/** 送る定義（サーバが確かめる）。T37d: 対象は、候補の識別の digest か画面の path のどちらか。 */
+export type ReadCheckDefinitionInput =
+  | {
+    readonly targetIdentityDigest: string;
+    readonly parameters: Readonly<Record<string, string>>;
+    readonly expectations: readonly Readonly<Record<string, unknown>>[];
+  }
+  | {
+    readonly targetPagePath: string;
+    readonly parameters: Readonly<Record<string, never>>;
+    readonly expectations: readonly Readonly<Record<string, unknown>>[];
+  };
+
+/**
+ * フォームの対象（T37d。Task 37 の設計書 3.5）: 候補を読む（送る値の欄は候補の送れる欄）か、画面を読む（画面の path の欄と、直近の発見の結果の画面から
+ * 選ぶ一覧。送る値はない）。
+ */
+export type ReadCheckFormTarget =
+  | { readonly kind: 'CANDIDATE'; readonly candidate: ReadCheckCandidateView }
+  | { readonly kind: 'PAGE'; readonly pagePaths: readonly string[]; readonly initialPath: string };
+
+/** 画面の path の欄に出す、保存を拒む理由（T37d。それ以外の理由は上のお知らせだけに出す）。 */
+const PAGE_PATH_REJECTIONS: ReadonlySet<ReadCheckSaveRejectionCode> = new Set<ReadCheckSaveRejectionCode>([
+  'READ_PAGE_PATH_INVALID',
+  'READ_PAGE_PATH_EXCLUDED',
+  'READ_PAGE_PATH_DANGEROUS_WORD',
+]);
+type ReadCheckSaveRejectionCode = Extract<ReadCheckSaveView, { ok: false }>['reason'];
 
 /** 数の欄の値（0 以上の整数の文字だけを数にする。ほかは文字のまま送り、サーバの形の確かめが拒む）。 */
 const NON_NEGATIVE_INTEGER = /^[0-9]+$/u;
 const countValueOf = (value: string): number | string => (NON_NEGATIVE_INTEGER.test(value) ? Number(value) : value);
 
-/** 期待の種類のうち、行の数を照らすもの。 */
-const ROW_COUNT_KINDS: ReadonlySet<ReadCheckExpectationKind> = new Set<ReadCheckExpectationKind>(['ROW_COUNT_EQUALS', 'ROW_COUNT_AT_LEAST']);
-const TEXT_CONTAINS_KIND: ReadCheckExpectationKind = 'TEXT_CONTAINS';
+/** 期待の種類のうち、行の数を照らすもの（PRE42-CC 組 UI-K2: 一覧は core の `ROW_COUNT_EXPECTATION_KINDS` を読む）。 */
+const ROW_COUNT_KINDS: ReadonlySet<ReadCheckExpectationKind> = new Set<ReadCheckExpectationKind>(ROW_COUNT_EXPECTATION_KINDS);
+const TEXT_CONTAINS_KIND = TEXT_CONTAINS_EXPECTATION_KIND;
 
 /** 期待の入力の値を、送る形にする（種類ごとの項目だけ）。 */
 const expectationOf = (input: ExpectationInput): Readonly<Record<string, unknown>> => {
@@ -75,8 +105,8 @@ const inputOf = (expectation: ReadCheckExpectation, key: number): ExpectationInp
   value: 'value' in expectation ? expectation.value : '',
 });
 
-export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onReload }: Readonly<{
-  candidate: ReadCheckCandidateView;
+export function ReadCheckForm({ target, form, initial, onSave, onSaved, onReload }: Readonly<{
+  target: ReadCheckFormTarget;
   form: ReadCheckFormView;
   initial: ReadCheckFormInitial | null;
   onSave: (definition: ReadCheckDefinitionInput) => Promise<ReadCheckSaveView>;
@@ -85,7 +115,7 @@ export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onRel
 }>) {
   const kinds = sortByDisplayOrder(form.expectationKinds, READ_CHECK_EXPECTATION_KIND_CATALOG);
   const [firstKind] = kinds;
-  const blankExpectation = (key: number): ExpectationInput => ({ key, kind: firstKind ?? 'ROW_COUNT_AT_LEAST', count: '', text: '', field: '', value: '' });
+  const blankExpectation = (key: number): ExpectationInput => ({ key, kind: firstKind ?? ROW_COUNT_AT_LEAST_EXPECTATION_KIND, count: '', text: '', field: '', value: '' });
   const [parameters, setParameters] = useState<Readonly<Record<string, string>>>(initial?.parameters ?? {});
   const [expectations, setExpectations] = useState<readonly ExpectationInput[]>(
     initial === null || initial.expectations.length === 0 ? [blankExpectation(0)] : initial.expectations.map(inputOf),
@@ -93,6 +123,11 @@ export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onRel
   const [nextKey, setNextKey] = useState(expectations.length);
   const [saving, setSaving] = useState(false);
   const [rejection, setRejection] = useState<Extract<ReadCheckSaveView, { ok: false }> | null>(null);
+  const [pagePath, setPagePath] = useState(target.kind === 'PAGE' ? target.initialPath : '');
+  const candidate = target.kind === 'CANDIDATE' ? target.candidate : null;
+  const pagePathErrors = rejection === null
+    ? []
+    : rejection.errors.filter((error) => PAGE_PATH_REJECTIONS.has(error.code)).map((error) => READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS[error.code].description);
 
   const parameterErrors = (name: string): readonly string[] =>
     rejection === null
@@ -111,12 +146,15 @@ export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onRel
         event.preventDefault();
         setSaving(true);
         const sent = Object.fromEntries(
-          candidate.fields.flatMap((field) => {
+          (candidate?.fields ?? []).flatMap((field) => {
             const value = parameters[field.name] ?? '';
             return value === '' ? [] : [[field.name, value] as const];
           }),
         );
-        void onSave({ targetIdentityDigest: candidate.identityDigest, parameters: sent, expectations: expectations.map(expectationOf) })
+        const definition: ReadCheckDefinitionInput = candidate === null
+          ? { targetPagePath: pagePath, parameters: {}, expectations: expectations.map(expectationOf) }
+          : { targetIdentityDigest: candidate.identityDigest, parameters: sent, expectations: expectations.map(expectationOf) };
+        void onSave(definition)
           .then((result) => {
             if (result.ok) {
               setRejection(null);
@@ -144,6 +182,56 @@ export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onRel
         </Notice>
       )}
 
+      {target.kind === 'PAGE' ? (
+        <fieldset className="field-group" data-testid="read-check-page">
+          <legend className="field-group-heading">{text.page.pagePath}</legend>
+          <p className="field-hint">{text.page.note}</p>
+          {target.pagePaths.length === 0 ? <p className="field-hint" data-testid="read-check-no-page-paths">{text.page.noPagePaths}</p> : (
+            <FieldFrame label={text.page.choosePath} errors={[]}>
+              {({ id, describedBy }) => (
+                <select
+                  id={id}
+                  name="page-path-choice"
+                  className="input"
+                  data-testid="read-check-page-path-choice"
+                  value={target.pagePaths.includes(pagePath) ? pagePath : ''}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    if (event.target.value !== '') {
+                      setPagePath(event.target.value);
+                    }
+                  }}
+                >
+                  <option value="">{text.page.chooseNone}</option>
+                  {target.pagePaths.map((path) => <option key={path} value={path}>{path}</option>)}
+                </select>
+              )}
+            </FieldFrame>
+          )}
+          <FieldFrame label={text.page.pagePath} hint={text.page.pagePathHint} errors={pagePathErrors}>
+            {({ id, describedBy, invalid }) => (
+              <input
+                id={id}
+                name="page-path"
+                className="input"
+                type="text"
+                required
+                autoComplete="off"
+                maxLength={form.maxPagePathLength}
+                value={pagePath}
+                aria-describedby={describedBy}
+                aria-invalid={invalid}
+                data-testid="read-check-page-path"
+                onChange={(event) => setPagePath(event.target.value)}
+              />
+            )}
+          </FieldFrame>
+          {/* T38f: `{id}` つきの型の案内（API で送るシナリオの照合の READ に使える。印はサーバが返す契約の値）。 */}
+          <p className="field-hint" data-testid="read-check-page-template-hint">{text.page.pageTemplateHint(form.pageTemplatePlaceholder)}</p>
+        </fieldset>
+      ) : null}
+
+      {candidate === null ? null : (
       <fieldset className="field-group" data-testid="read-check-parameters">
         <legend className="field-group-heading">{text.parametersHeading}</legend>
         <p className="field-hint">{text.parametersNote}</p>
@@ -174,6 +262,7 @@ export function ReadCheckForm({ candidate, form, initial, onSave, onSaved, onRel
           );
         })}
       </fieldset>
+      )}
 
       <fieldset className="field-group" data-testid="read-check-expectations">
         <legend className="field-group-heading">{text.expectationsHeading}</legend>

@@ -24,7 +24,7 @@ import {
   isProcessRunning,
   type RunLock,
   type RunLockHost,
-} from '../../src/orchestration/run-checkpoint.js';
+} from '../../src/core/process-lock.js';
 import { RunCheckpointSession, type RunCheckpointSessionStart } from '../../src/orchestration/run-checkpoint-session.js';
 import { ArtifactWriter, type CheckpointFileOperations } from '../../src/report/artifact-writer.js';
 import { createDeferred, type Deferred } from '../helpers/deferred.js';
@@ -101,7 +101,8 @@ async function overlapTwoTakeovers<T>(
   const afters: readonly AfterTakeoverGate[] = [0, 1].map(() => ({ reached: createDeferred<void>(), proceed: createDeferred<void>() }));
   const runs = gates.map(async (gate, index) =>
     await start(index, new ArtifactWriter({ fileOperations: gatedFileOperations(gate) }), afters[index]!));
-  await Promise.all(gates.map(async (gate) => await gate.reached.promise));
+  // DEF-170: 取り直しの札を持てなかった起動は、`rename` に来ずに終わる（ほかが取り直している）。
+  await Promise.all(gates.map(async (gate, index) => await Promise.race([gate.reached.promise, runs[index]])));
   gates[0].proceed.resolve();
   await Promise.race([afters[0]!.reached.promise, runs[0]]);
   gates[1].proceed.resolve();
@@ -151,10 +152,12 @@ describe('DEF-060: two resumes take over the same stale run lock at the same tim
       return started;
     });
 
-    expect(starts.map(({ ok }) => ok)).toEqual([true, false]);
-    expect(starts[1]).toMatchObject({ ok: false, reason: 'LOCK_HELD_BY_ACTIVE_RUN' });
+    // DEF-170: 2 つ目は、1 つ目が取り直しの札を持つ間に来れば `LOCK_TAKEN_OVER_CONCURRENTLY`、取り直しの後に来れば `LOCK_HELD_BY_ACTIVE_RUN`。
+    const held = starts.findIndex(({ ok }) => ok);
+    expect(starts.filter(({ ok }) => ok)).toHaveLength(1);
+    expect(starts[1 - held]).toMatchObject({ ok: false, reason: expect.stringMatching(/^LOCK_(?:HELD_BY_ACTIVE_RUN|TAKEN_OVER_CONCURRENTLY)$/u) });
     const lock = await new ArtifactWriter().readRunLock(runDirectory);
-    expect(lock).toMatchObject({ processId: OWNER_PROCESS_IDS[0] });
+    expect(lock).toMatchObject({ processId: OWNER_PROCESS_IDS[held as 0 | 1] });
   });
 });
 
@@ -164,7 +167,7 @@ describe('DEF-060: two starts take over the same stale output start lock at the 
     const stale = createRunLock({ ...currentProcessRunLockHost(Date.now()), processId: deadProcessId() });
     await new ArtifactWriter().acquireOutputStartLock(outputDirectory, stale);
     const deadOwner = stale.processId;
-    const { acquireLockTakingOverStale } = await import('../../src/orchestration/run-checkpoint.js');
+    const { acquireLockTakingOverStale } = await import('../../src/core/process-lock.js');
 
     const results = await overlapTwoTakeovers(async (index, writer) => {
       const lock: RunLock = createRunLock({ ...currentProcessRunLockHost(Date.now()), processId: OWNER_PROCESS_IDS[index]! });
@@ -179,8 +182,11 @@ describe('DEF-060: two starts take over the same stale output start lock at the 
       );
     });
 
-    expect(results.map(({ kind }) => kind)).toEqual(['ACQUIRED', 'HELD']);
-    await expect(new ArtifactWriter().readOutputStartLock(outputDirectory)).resolves.toMatchObject({ processId: OWNER_PROCESS_IDS[0] });
+    // DEF-170: 2 つ目は、取り直しの札を持てなければ `CONTENDED`、取り直しの後に来れば `HELD`。
+    const held = results.findIndex(({ kind }) => kind === 'ACQUIRED');
+    expect(results.filter(({ kind }) => kind === 'ACQUIRED')).toHaveLength(1);
+    expect(['HELD', 'CONTENDED']).toContain(results[1 - held]?.kind);
+    await expect(new ArtifactWriter().readOutputStartLock(outputDirectory)).resolves.toMatchObject({ processId: OWNER_PROCESS_IDS[held as 0 | 1] });
     // 動かした古いファイルは残らず、出力先の Run のディレクトリの一覧にも混ざらない。
     expect((await readdir(outputDirectory)).sort()).toEqual([outputStartLockPath(outputDirectory).slice(outputDirectory.length + 1)]);
     expect(await listRunDirectories(outputDirectory)).toEqual([]);
@@ -201,7 +207,8 @@ describe('ArtifactWriter: the atomic takeover of a stale lock', () => {
     expect(await readdir(outputDirectory)).toHaveLength(1);
   });
 
-  it('reports CHANGED and leaves the lock as it is when the lock is not the judged one (another start moved or renewed it)', async () => {
+  // DEF-170: 動かしたものが判定したものでなければ、戻して `LOST`（取り直しに進まない。fail-closed。前は `CHANGED`）。
+  it('reports LOST and leaves the lock as it is when the lock is not the judged one (another start moved or renewed it)', async () => {
     const runDirectory = runArtifactDirectory(newDirectory(), createRunId(20261009000000));
     const writer = new ArtifactWriter();
     const judged = createRunLock({ ...currentProcessRunLockHost(Date.now()), processId: deadProcessId() });
@@ -209,7 +216,7 @@ describe('ArtifactWriter: the atomic takeover of a stale lock', () => {
     await writer.acquireRunLock(runDirectory, current);
 
     await expect(writer.takeOverRunLock(runDirectory, judged, createRunLock(currentProcessRunLockHost(Date.now()))))
-      .resolves.toEqual({ outcome: 'CHANGED' });
+      .resolves.toEqual({ outcome: 'LOST' });
 
     await expect(writer.readRunLock(runDirectory)).resolves.toEqual(current);
     expect(await readdir(join(runDirectory, 'checkpoint'))).toEqual(['run.lock']);
@@ -288,11 +295,15 @@ describe('ArtifactWriter: the atomic takeover of a stale lock', () => {
     });
     await expect(writer.takeOverRunLock(runDirectory, stale, createRunLock(currentProcessRunLockHost(Date.now()))))
       .resolves.toEqual({ outcome: 'ACQUIRED' });
-    expect(await readdir(join(runDirectory, 'checkpoint'))).toHaveLength(2);
+    // DEF-170: 消せなかったのは、動かした古いロックと、取り直しの札（持ち主はこの process）。
+    const left = (await readdir(join(runDirectory, 'checkpoint'))).sort();
+    expect(left).toHaveLength(3);
+    expect(left.filter((name) => name.endsWith('.takeover'))).toEqual(['.run.lock.takeover']);
 
-    // 再開のときの後始末が、書き出しの途中の一時ファイルと同じく消す。
-    await expect(new ArtifactWriter().cleanUpForResume(runDirectory, [])).resolves.toHaveLength(1);
-    expect(await readdir(join(runDirectory, 'checkpoint'))).toEqual(['run.lock']);
+    // DEF-170: 持ち主の process（この process）が動いている間は、再開のときの後始末も消さない（ほかの起動の取り直しの途中のものを消さない）。
+    // 死んだ process のものは消す（`lock-takeover-overlap.test.ts`）。
+    await expect(new ArtifactWriter().cleanUpForResume(runDirectory, [])).resolves.toHaveLength(0);
+    expect((await readdir(join(runDirectory, 'checkpoint'))).sort()).toEqual(left);
     expect(existsSync(artifactFilePath(runDirectory, checkpointArtifactRelativePath('lock')))).toBe(true);
   });
 });

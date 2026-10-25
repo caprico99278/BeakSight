@@ -1,6 +1,6 @@
 /**
  * シナリオの入力の規則の今の事実（Task 29 の設計書 4.4。T29e）。サーバだけで使う（ブラウザ側のコードは import しない。`data-rule-functions.ts` と
- * `scenario-functions.ts` だけが使う。Gate `local-ui-boundary` の (i)）。
+ * `scenario-functions.ts`、FM2b から `scenario-autodraft-functions.ts`（規則の集まりの id）だけが使う。Gate `local-ui-boundary` の (i)）。
  * - 規則の集まりの最新の版（なければ、人の規則のない空の版）を、シナリオの今の版と発見の根拠の写しに照らして `evaluateRuleSet` にかける（判定の owner は
  *   `src/control/data-rules/field-evaluation.ts`。ここではやり直さない）。状態は `display/data-rules.ts` の `inputRuleStateOf` が選ぶ。
  */

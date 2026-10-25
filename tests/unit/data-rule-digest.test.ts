@@ -90,4 +90,20 @@ describe('rule set digest (T29a)', () => {
     expect(reference).toEqual({ ruleSetId: 'rules-1', revision: 3, digest: BASE });
     expect(Object.isFrozen(reference)).toBe(true);
   });
+
+  /**
+   * LG-3（2026-10-24 の設計 3.7.2）: 版 1 の文書と digest の形の版 1 を捨てる前のコードで求めた、今の版（版 2 の文書・形の版 2）の値。捨てた後も
+   * 変わらない（保存した行の digest と、承認に結んだ参照が変わらない）。
+   */
+  it('keeps the values of the version 2 digest of the samples (LG-3)', () => {
+    expect(BASE).toBe('sha256:02d9186b87efcabba3df89b4a34caf7e362dc78b3a8dfef694c15459590f0b6b');
+    expect(computeRuleSetDigest(sampleRuleSet({
+      fieldRules: sampleRuleSet().fieldRules.map((rule, index) => (index === 0
+        ? { ...rule, origin: 'INFERRED', baseDateWindow: null, digitCount: null }
+        : rule)),
+      relations: sampleRuleSet().relations.map((relation) => ({ ...relation, origin: 'INFERRED' })),
+      uniqueKeyOrigin: 'INFERRED',
+      templateDefaultsSaved: true,
+    }))).toBe('sha256:0167c22cb53d3fe7073a3a3de783979cdd957cb4d6b419d24e0b0d662abcfa0a');
+  });
 });

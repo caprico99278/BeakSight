@@ -6,9 +6,9 @@
 // - 資格情報と CSRF の値は、起動のたびに作る仮の値（ランダム）。テストは、ページの入力の欄に入れるためだけに読み、出力しない。
 // - サーバに届いた要求（Origin の別、method、path と query）を、順に記録する。WebSocket の upgrade も記録して、すぐに切る。
 import { randomBytes } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 /** 仮の値の長さ（バイト）。 */
 const RANDOM_VALUE_BYTES = 12;
@@ -129,7 +129,6 @@ export async function startLoginFixtureServer(): Promise<LoginFixtureServer> {
   const csrf = randomValue();
   const sessions = new Set<string>();
   const requests: LoginFixtureRequest[] = [];
-  const sockets = new Set<Duplex>();
   let successfulLogins = 0;
   let port = 0;
   const originA = (): string => `http://127.0.0.1:${port}`;
@@ -251,7 +250,7 @@ export async function startLoginFixtureServer(): Promise<LoginFixtureServer> {
     response.end(request.method === 'POST' ? 'B-POST-RECEIVED' : '');
   };
 
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const site = siteOf(request);
     const url = new URL(request.url ?? '/', site === 'A' ? originA() : originB());
     requests.push({ site, method: request.method ?? '', path: `${url.pathname}${url.search}` });
@@ -261,18 +260,13 @@ export async function startLoginFixtureServer(): Promise<LoginFixtureServer> {
       response.end();
     });
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
+  server.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
     const site = siteOf(request);
     const url = new URL(request.url ?? '/', site === 'A' ? originA() : originB());
     requests.push({ site, method: 'UPGRADE', path: `${url.pathname}${url.search}` });
     socket.destroy();
   });
-  await new Promise<void>((resolve) => server.listen({ host: '127.0.0.1', port: 0 }, () => resolve()));
-  port = (server.address() as AddressInfo).port;
+  port = server.port;
 
   return {
     originA: originA(),
@@ -285,9 +279,6 @@ export async function startLoginFixtureServer(): Promise<LoginFixtureServer> {
       await fill('#user', credentials.user);
       await fill('#pass', credentials.pass);
     },
-    async close() {
-      for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: () => server.close(),
   };
 }

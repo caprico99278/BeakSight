@@ -24,7 +24,13 @@
 //   送るとサーバが method の上書きとして扱いうるので、実行できないもの（`DESTRUCTIVE`）にする。
 // 純粋な関数だけのファイル。Playwright、ブラウザ、`node:fs`、`src/control/`、監査エンジンを import しない
 // （`tests/architecture/discovery-boundary.test.ts`）。
-import { compareCodeUnits, foldNfkcCase } from '../core/text.js';
+import {
+  API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES,
+  API_WRITE_SECRET_LIKE_KEY_SEGMENTS,
+  API_WRITE_SECRET_LIKE_KEY_WORDS,
+  isSecretUrlQueryParameterName,
+} from '../core/secret-query-names.js';
+import { compareCodeUnits, foldNfkcCase, stripCombiningMarks } from '../core/text.js';
 import { classifyUrl } from '../crawl/admission-policy.js';
 import {
   CANDIDATE_REASON_CLASSIFICATIONS,
@@ -42,11 +48,15 @@ import {
   DISCOVERY_CREATE_WORDS,
   DISCOVERY_DESTRUCTIVE_WORDS,
   DISCOVERY_GRAPHQL_PATH_WORDS,
+  DISCOVERY_PROCEDURE_WRITE_WORDS,
+  DISCOVERY_PUBLICATION_STATE_FIELD_WORDS,
   DISCOVERY_REMOVAL_FIELD_WORDS,
   DISCOVERY_SEARCH_WORDS,
+  DISCOVERY_SOFT_DELETE_FIELD_WORDS,
   DISCOVERY_STATE_FIELD_LABEL_WORDS,
   DISCOVERY_STATE_FIELD_LABELED_WORDS,
   DISCOVERY_STATE_FIELD_WORDS,
+  DISCOVERY_SUBMIT_PRESS_WORDS,
   DISCOVERY_UPDATE_WORDS,
 } from './classification-words.js';
 
@@ -94,8 +104,12 @@ const separatedWordsOf = (text: string): readonly string[] =>
 /** 語の境界で分けた語の一覧（畳み込んだ形）。camelCase の境で分けた語と、分けない語の両方（`addItem` の `add`、`GraphQL` の `graphql`）。 */
 const wordsOf = (text: string): readonly string[] => [...separatedWordsOf(splitCamelCase(text)), ...separatedWordsOf(text)];
 
-/** ASCII だけの語か（英語の語。語の境界で比べる）。 */
-const isAsciiWord = (word: string): boolean => /^[\x20-\x7e]+$/u.test(word);
+/**
+ * ASCII だけの語か（英語の語。語の境界で比べる。そうでない語は部分一致で比べる）。PRE42-CC 組 4（CC-082 1′）: 語の一覧の比べ方の振り分けの唯一の
+ * owner。入力の規則の「送らない」側の選択肢の値の比べ（`src/control/data-rules/external-delivery-words.ts`）も使う
+ * （`tests/architecture/data-rules-boundary.test.ts` の (g)）。
+ */
+export const isAsciiWord = (word: string): boolean => /^[\x20-\x7e]+$/u.test(word);
 
 /** 大文字の続きの後の、大文字で始まる語の境（`XMLDelete` の `XML` と `Delete`）。 */
 const UPPERCASE_RUN_BOUNDARY = /(\p{Lu})(\p{Lu}\p{Ll})/gu;
@@ -176,6 +190,12 @@ export const submitterWordsOf = (text: string): readonly string[] => {
 };
 
 /**
+ * T44c（設計者の判断）: 送信ボタンの文言（probe が読んだ文字）が、送信の語（`DISCOVERY_SUBMIT_PRESS_WORDS`）に当たるか（更新・登録の語と同じ語の境界の
+ * 比べ方）。送らずに観察する probe の押す順だけが使う（候補の語・識別の digest には入れない）。
+ */
+export const submitterTextHasSubmitWord = (text: string): boolean => containsWord(DISCOVERY_SUBMIT_PRESS_WORDS, [text]);
+
+/**
  * READ の確かめで送る値（名前 → 値）の名前か値が、発見の分類の危険な語に当たるか（T27R-fix-1。DEF-088 の (b)）。比べ方は分類の危険な語と同じ
  * （部分一致、畳み込み、区切りを除いた形。日本語を含む）。サーバが percent-encode を外しうるので、外した形でも比べる（fail-closed）。定義の保存の
  * 確かめ（`src/control/read-check-policy.ts`）と、ワーカーの実行の前の確かめ（`read-check-evaluation.ts` の `buildReadCheckUrl`）が使う。
@@ -203,6 +223,43 @@ export const fieldNameHasListedWord = (name: string, words: readonly string[]): 
 };
 
 /**
+ * API の本文の鍵の名前が、秘密に見える名前か（秘密に見える名前の方針 6。T38R-fix の I-2、T38R2-fix の M-1。語の一覧は `src/core/secret-query-names.ts`）。
+ * ページが決める鍵と、登録の ID を読む応答の鍵（値を照らさない鍵）を拒む下書きの確かめ（`src/control/approval/scenario-policy.ts`）が使う。次のどれかに
+ * 当たれば当たる（fail-closed）:
+ * - 方針 1 の完全一致（`isSecretUrlQueryParameterName`）。名前そのものと、NFKC と大文字小文字を畳んだ（`foldNfkcCase`）名前の両方で比べる。
+ * - `API_WRITE_SECRET_LIKE_KEY_WORDS` の部分一致（畳んだ名前から文字と数字以外を除いた形。全角の英字・`ſ`・ケルビン記号・半角カナは NFKC で畳める）。
+ * - `API_WRITE_SECRET_LIKE_KEY_SEGMENTS` の語の単位の一致（`fieldNameHasListedWord`。欄の名前の語に分ける。語の後の数字と頭字語の境でも分ける）。
+ * - T41a: 結合文字を除いた形（NFD の後。`src/core/text.ts` の `stripCombiningMarks`）でも、上の 3 つを比べる（部分一致の語も同じ形にする）。
+ * 限界: NFKC で畳めない形の似た文字（キリル文字の `о`・`ѕ` など）と、数字で書き換えた語（`p4ssword`）には当たらない。
+ */
+export const isApiWriteKeyNameSecretLike = (name: string): boolean =>
+  // T44g（P4-2）: 比べる形が誤検知の除く一覧（`API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES`）にちょうど当たる鍵は除く。
+  !isExcludedApiWriteKeyName(name)
+  // T41a: 結合文字を除いた形（`stripCombiningMarks`。語の側も同じ形にする）でも比べる。
+  && [name, stripCombiningMarks(name)].some((form) => isApiWriteKeyFormSecretLike(form));
+
+/**
+ * T44g（Task 44 の設計書 P4-2）: 鍵の名前の比べる形（NFKC と大文字小文字を畳み、文字と数字以外を除いた形。結合文字を除いた形も）が、どれも
+ * `API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES` の語にちょうど当たるか（部分一致の誤検知として除く鍵）。
+ */
+const isExcludedApiWriteKeyName = (name: string): boolean => {
+  const forms = [compactText(foldNfkcCase(name)), compactText(stripCombiningMarks(foldNfkcCase(name)))];
+  return forms.every((form) => (API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES as readonly string[]).includes(form));
+};
+
+/** 方針 6 の比べの 1 つの形（`isApiWriteKeyNameSecretLike` の説明の 3 つ）。 */
+const isApiWriteKeyFormSecretLike = (name: string): boolean => {
+  const folded = foldNfkcCase(name);
+  if (isSecretUrlQueryParameterName(name) || isSecretUrlQueryParameterName(folded)) {
+    return true;
+  }
+  const compact = compactText(folded);
+  const strippedCompact = compactText(stripCombiningMarks(folded));
+  return API_WRITE_SECRET_LIKE_KEY_WORDS.some((word) => compact.includes(word) || strippedCompact.includes(compactText(stripCombiningMarks(word))))
+    || fieldNameHasListedWord(name, API_WRITE_SECRET_LIKE_KEY_SEGMENTS);
+};
+
+/**
  * GET の form の欄の名前が、危険な語に当たるか（T27R-fix-1 の DEF-088 の (a)、T27R-fix-2）。比べ方は `fieldNameHasListedWord`（英語の語は語の
  * 単位の並び、日本語の語は部分一致。T29c で、その関数を使う形にした。判定の結果は変えない）。
  */
@@ -216,6 +273,22 @@ export const fieldNameHasDestructiveWord = (name: string): boolean => fieldNameH
  */
 export const fieldNameHasRemovalWord = (name: string): boolean =>
   fieldNameHasDestructiveWord(name) || fieldNameHasListedWord(name, DISCOVERY_REMOVAL_FIELD_WORDS);
+
+/** ML-a-fix-3: 手続きの呼び出しの書き込みの語（危険な語・更新の語・登録の語と、手続きの名前のための語）。 */
+const PROCEDURE_WRITE_WORDS: readonly string[] = Object.freeze([
+  ...DISCOVERY_DESTRUCTIVE_WORDS,
+  ...DISCOVERY_UPDATE_WORDS,
+  ...DISCOVERY_CREATE_WORDS,
+  ...DISCOVERY_PROCEDURE_WRITE_WORDS,
+]);
+
+/**
+ * ML-a-fix-3（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 6 章の ML-R2 の行の M-2）: 手続きの呼び出しの名前（path）が、書き込みの語
+ * （`upsert`・`insert`・`update`・`create`・`delete`・`remove`・`save`・`set`・`write`・`add` など）を含むか。比べ方は欄の名前の語の単位の比べ
+ * （`fieldNameHasListedWord`。`settings`・`address` は `set`・`add` に当たらない）。手動のログインの成功からの自動の登録
+ * （`src/control/manual-login-registration.ts`）が、書き込みの手続きを登録しないために使う。
+ */
+export const procedureNameHasWriteWord = (name: string): boolean => fieldNameHasListedWord(name, PROCEDURE_WRITE_WORDS);
 
 /** 送信ボタンの語に、ある一覧の語があるか（4 つの一覧は重ならないので、語がどの一覧の語かで決まる）。 */
 const hasListedWord = (submitterWords: ReadonlySet<string>, words: readonly string[]): boolean => words.some((word) => submitterWords.has(word));
@@ -240,8 +313,11 @@ export interface CandidateFacts {
   readonly createWord: boolean;
 }
 
-/** 送信先の Origin が、許可 Origin の中か（解析できない Origin は外。fail-closed）。 */
-const isInsideAllowedOrigins = (origin: string, policy: CandidateClassificationPolicy): boolean =>
+/**
+ * 送信先の Origin が、許可 Origin の中か（解析できない Origin は外。fail-closed）。T37c: 送らずに観察する probe の対象の選び方
+ * （`submission-probe-contracts.ts` の `isSubmissionProbeTarget`。画面と送信先の Origin）も使う（書き写さない）。
+ */
+export const isInsideAllowedOrigins = (origin: string, policy: CandidateClassificationPolicy): boolean =>
   URL.canParse(origin) && classifyUrl(new URL(origin), { allowedOrigins: policy.allowedOrigins }).kind === 'INTERNAL_NAVIGABLE';
 
 const factsOf = (candidate: DiscoveredCandidate, policy: CandidateClassificationPolicy): CandidateFacts => {
@@ -372,6 +448,21 @@ export const fieldNameHasStateWord = (name: string): boolean => {
   return DISCOVERY_STATE_FIELD_WORDS.some((word) =>
     (isAsciiWord(word) ? nameHasAsciiStateWord(word, sequences) : nameHasJapaneseStateWord(word, folded)));
 };
+
+/** DEF-147: 欄（鍵）の名前が、論理削除の語（`DISCOVERY_SOFT_DELETE_FIELD_WORDS`）に当たるか。 */
+export const fieldNameHasSoftDeleteWord = (name: string): boolean => fieldNameHasListedWord(name, DISCOVERY_SOFT_DELETE_FIELD_WORDS);
+
+/** DEF-147: 欄（鍵）の名前が、公開の状態の語（`DISCOVERY_PUBLICATION_STATE_FIELD_WORDS`）に当たるか。 */
+export const isPublicationStateKeyName = (name: string): boolean => fieldNameHasListedWord(name, DISCOVERY_PUBLICATION_STATE_FIELD_WORDS);
+
+/**
+ * DEF-147（設計書 `2026-10-21-beaksight-api-state-keys-design.md` 2 章）: API の要求の本文の鍵の名前が、論理削除にあたる鍵か（API の型の分類と、API の
+ * シナリオと入力の規則の判定が使う唯一の判定）。論理削除の語に当たるか、状態の欄の語（`fieldNameHasStateWord`）に当たるのに公開の状態の語に当たらない
+ * （公開の状態でも論理削除でもない状態の語。止める側）なら真。公開の状態の語にだけ当たる鍵（status・is_published・published_at など）は偽。フォームの
+ * 送信の分類（状態の欄の印）は、今どおり `fieldNameHasStateWord`。
+ */
+export const isApiSoftDeleteKeyName = (name: string): boolean =>
+  fieldNameHasSoftDeleteWord(name) || (fieldNameHasStateWord(name) && !isPublicationStateKeyName(name));
 
 /** 状態の欄の名前（語の境界で比べる）を持つか。 */
 const hasStateField = (candidate: DiscoveredCandidate): boolean => candidate.fields.some((field) => fieldNameHasStateWord(field.name));

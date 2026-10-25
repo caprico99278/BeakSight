@@ -144,7 +144,10 @@ describe('createStartingJob with the job kind and the attempt (T26c, Blocker A)'
   it('requires the job kind in the type (no silent AUDIT)', () => {
     // T27c: ジョブの種類に `DISCOVERY` と `READ_CHECK` を足した（行を作る部品は、表が受ける種類をすべて受ける。始める口は T27d・T27e）。
     // T30d: 書き込みのジョブ `WRITE_CREATE` を足した（始める口は T30e）。T31e: 更新の書き込みのジョブ `WRITE_UPDATE` を足した（始める口は T31f）。
-    expectTypeOf<NewAuditJob['jobKind']>().toEqualTypeOf<'AUDIT' | 'LOGIN_CHECK' | 'DISCOVERY' | 'READ_CHECK' | 'WRITE_CREATE' | 'WRITE_UPDATE'>();
+    // T43c: 入口の確かめのジョブ `ENTRY_CHECK` を足した。
+    expectTypeOf<NewAuditJob['jobKind']>().toEqualTypeOf<
+      'AUDIT' | 'LOGIN_CHECK' | 'DISCOVERY' | 'READ_CHECK' | 'WRITE_CREATE' | 'WRITE_UPDATE' | 'ENTRY_CHECK'
+    >();
     expectTypeOf<undefined extends NewAuditJob['jobKind'] ? true : false>().toEqualTypeOf<false>();
   });
 });

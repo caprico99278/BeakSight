@@ -32,11 +32,12 @@ import { readPlaywrightVersion, readToolVersion } from '../../src/orchestration/
 import {
   RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
   RUN_LOCK_STALE_AFTER_MS,
+  RUN_LOCK_TAKEOVER_GRACE_MS,
   createRunLock,
   currentProcessRunLockHost,
   isProcessRunning,
   type RunLock,
-} from '../../src/orchestration/run-checkpoint.js';
+} from '../../src/core/process-lock.js';
 import type { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import { RunDirectoryUnavailableError, type RunCoordinatorDependencies } from '../../src/orchestration/run-coordinator.js';
 import { activeRunInOutputDirectoryText, startingRunInOutputDirectoryText } from '../../src/presentation/messages.js';
@@ -290,10 +291,16 @@ describe('executeAuditRun: a stale output start lock is taken over', () => {
     await placeStartLock(outputDirectory, lock());
     const record: { before?: unknown; afterExists?: boolean } = {};
     const { dependencies, created } = fakeDependencies(recordingStartingRun(outputDirectory, record));
+    // DEF-172: 持ち主の process が動いているのに古く見えるロックは、猶予を置いて読み直してから取り直す（待ちは注入した待ち。ロックは変わらない）。
+    const waits: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      waits.push(ms);
+    };
 
-    const outcome = await executeAuditRun(config, dependencies, { startNew: false });
+    const outcome = await executeAuditRun(config, { ...dependencies, sleep }, { startNew: false });
 
     expect(outcome.kind).toBe('RAN');
+    expect(waits.filter((ms) => ms === RUN_LOCK_TAKEOVER_GRACE_MS).length).toBeLessThanOrEqual(1);
     expect(created).toHaveLength(1);
     expect(record.before).toMatchObject({ processId: process.pid });
     expect(record.afterExists).toBe(false);

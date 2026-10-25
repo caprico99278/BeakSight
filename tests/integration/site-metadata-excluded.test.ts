@@ -13,7 +13,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium, testContextsOf } from '../helpers/chromium.js';
 import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -104,7 +104,7 @@ describe.each(LAUNCHERS)('T25c round 3: collectSiteMetadata does not fetch exclu
     expect(waits).toBe(0);
     expect(observations).toBe(0);
     expect(serverPaths()).toEqual([]);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     await expectValidPageEvidence(result, options);
   });
 
@@ -128,7 +128,7 @@ describe.each(LAUNCHERS)('T25c round 3: collectSiteMetadata does not fetch exclu
 
   it('rejects a judgement that is not a function with a TypeError, before creating a Context', async () => {
     await expect(collect('yes' as unknown as SiteMetadataOptions['isExcludedUrl'])).rejects.toThrow(TypeError);
-    expect(browser.contexts()).toHaveLength(0);
+    expect(testContextsOf(browser)).toHaveLength(0);
     expect(serverPaths()).toEqual([]);
   });
 });

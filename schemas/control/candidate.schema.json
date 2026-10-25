@@ -122,7 +122,10 @@
           "INCOMPLETE_FRAME_OR_CLOSED_SHADOW",
           "INCOMPLETE_FREEZE_UNAVAILABLE",
           "INCOMPLETE_READ_FAILED",
-          "INCOMPLETE_LIMIT_REACHED"
+          "INCOMPLETE_LIMIT_REACHED",
+          "INCOMPLETE_PAGE_NAVIGATION_LIMIT",
+          "INCOMPLETE_PAGE_SUBRESOURCE_LIMIT",
+          "SERVICE_READ_REFUSED"
         ]
       }
     },
@@ -161,7 +164,11 @@
     },
     "hasStateField": { "type": "boolean" },
     "identityDigest": { "$ref": "#/$defs/digest" },
-    "ruleDigest": { "$ref": "#/$defs/digest" }
+    "ruleDigest": { "$ref": "#/$defs/digest" },
+    "submissionProbe": {
+      "description": "Optional (T37c; Task 37 design 3.4): the result of the submission probe (pressed in the frozen Context; nothing is sent). Only the candidates that were probe targets have it. Not part of the identity or the rule digest. The contract is src/discovery/submission-probe-contracts.ts.",
+      "$ref": "#/$defs/submissionProbe"
+    }
   },
   "allOf": [
     {
@@ -320,6 +327,247 @@
         "inlineHandler": { "type": "boolean" }
       }
     },
-    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "submissionProbe": {
+      "description": "T37c: the result of the submission probe. No value: never a marker, a body value, a query value or a header value. The result, the reason and the shape follow the T37b classification (src/discovery/api-shape-classification.ts); NOT_OBSERVED has its own reasons.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result",
+        "reason",
+        "shape",
+        "shapeDigest",
+        "nonReadRequestCount",
+        "readRequestCount",
+        "unrecordedShapeCount",
+        "filledFieldCount",
+        "skippedFieldCount"
+      ],
+      "properties": {
+        "result": { "enum": ["API_CREATE", "API_UPDATE", "NOT_EXECUTABLE", "NO_REQUEST", "NOT_OBSERVED"] },
+        "reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "DELETE_METHOD",
+                "PUT_METHOD",
+                "METHOD_OVERRIDE",
+                "UNAPPROVED_ORIGIN",
+                "PROCEDURE_CALL_PATH",
+                "UPSERT",
+                "ARRAY_BODY",
+                "NON_JSON_BODY",
+                "MULTIPLE_REQUESTS",
+                "SOFT_DELETE_KEY",
+                "SHAPE_TRUNCATED",
+                "FILTER_MISSING",
+                "FILTER_MULTIPLE",
+                "FILTER_NOT_PAGE_VALUE",
+                "UNRECOGNIZED",
+                "EXTERNAL_SCHEME",
+                "PAGE_CHANGED",
+                "PRESS_LIMIT_REACHED",
+                "TARGET_NOT_FOUND",
+                "PRESS_FAILED",
+                "CONTEXT_CLOSED_BY_GUARD"
+              ]
+            },
+            { "type": "null" }
+          ]
+        },
+        "shape": { "anyOf": [{ "$ref": "#/$defs/apiRequestShape" }, { "type": "null" }] },
+        "shapeDigest": { "anyOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+        "nonReadRequestCount": { "$ref": "#/$defs/count" },
+        "readRequestCount": { "$ref": "#/$defs/count" },
+        "unrecordedShapeCount": { "$ref": "#/$defs/count" },
+        "filledFieldCount": { "$ref": "#/$defs/count" },
+        "skippedFieldCount": { "$ref": "#/$defs/count" },
+        "inputFields": {
+          "description": "Optional (T38a; Task 38 design 3.1): the fields the probe filled or selected before the press (for a BUTTON candidate, the fields outside the forms). The name attribute, the unique CSS on the screen (T43c builder, a Playwright-parsable shape) and the field type; the marker is the number of the marker of the press (0-based for each press; null for a selected field). Never a value. Absent in the probes written before T38a.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "selector", "type", "marker"],
+            "properties": {
+              "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+              "selector": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 512 }, { "type": "null" }] },
+              "type": { "$ref": "#/$defs/field/properties/type" },
+              "marker": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 31 }, { "type": "null" }] }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "type": "object", "properties": { "result": { "const": "NOT_EXECUTABLE" } }, "required": ["result"] },
+          "then": {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "enum": [
+                  "DELETE_METHOD",
+                  "PUT_METHOD",
+                  "METHOD_OVERRIDE",
+                  "UNAPPROVED_ORIGIN",
+                  "PROCEDURE_CALL_PATH",
+                  "UPSERT",
+                  "ARRAY_BODY",
+                  "NON_JSON_BODY",
+                  "MULTIPLE_REQUESTS",
+                  "SOFT_DELETE_KEY",
+                  "SHAPE_TRUNCATED",
+                  "FILTER_MISSING",
+                  "FILTER_MULTIPLE",
+                  "FILTER_NOT_PAGE_VALUE",
+                  "UNRECOGNIZED",
+                  "EXTERNAL_SCHEME"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "type": "object", "properties": { "result": { "const": "NOT_OBSERVED" } }, "required": ["result"] },
+          "then": {
+            "type": "object",
+            "properties": {
+              "reason": { "enum": ["PAGE_CHANGED", "PRESS_LIMIT_REACHED", "TARGET_NOT_FOUND", "PRESS_FAILED", "CONTEXT_CLOSED_BY_GUARD"] },
+              "shape": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "type": "object", "properties": { "result": { "const": "API_CREATE" } }, "required": ["result"] },
+          "then": { "type": "object", "properties": { "reason": { "type": "null" }, "shape": { "type": "object" } } }
+        },
+        {
+          "if": { "type": "object", "properties": { "result": { "const": "API_UPDATE" } }, "required": ["result"] },
+          "then": { "type": "object", "properties": { "reason": { "type": "null" }, "shape": { "type": "object" } } }
+        },
+        {
+          "if": { "type": "object", "properties": { "result": { "const": "NO_REQUEST" } }, "required": ["result"] },
+          "then": { "type": "object", "properties": { "reason": { "type": "null" }, "shape": { "type": "null" } } }
+        },
+        {
+          "if": { "type": "object", "properties": { "shape": { "type": "null" } }, "required": ["shape"] },
+          "then": { "type": "object", "properties": { "shapeDigest": { "type": "null" } } },
+          "else": { "type": "object", "properties": { "shapeDigest": { "type": "string" } } }
+        }
+      ]
+    },
+    "apiRequestShape": {
+      "description": "T37c: the shape of the blocked request of the probe (src/core/api-request-shape.ts; T37b). Names only; a value-like, too long or marker-carrying name is [REDACTED].",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "resourceType",
+        "origin",
+        "pathShape",
+        "queryNames",
+        "omittedQueryNameCount",
+        "filters",
+        "headerNames",
+        "omittedHeaderNameCount",
+        "contentType",
+        "prefer",
+        "body"
+      ],
+      "properties": {
+        "method": { "type": "string", "pattern": "^(?:[A-Z]+|\\[REDACTED\\])$", "maxLength": 32 },
+        "resourceType": { "type": "string", "pattern": "^[a-z]+$", "maxLength": 64 },
+        "origin": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "index"],
+              "properties": { "kind": { "const": "APPROVED_API" }, "index": { "$ref": "#/$defs/count" } }
+            },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "ALLOWED" } } },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "const": "OTHER" } } }
+          ]
+        },
+        "pathShape": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "queryNames": { "type": "array", "maxItems": 32, "items": { "type": "string", "maxLength": 64 } },
+        "omittedQueryNameCount": { "$ref": "#/$defs/count" },
+        "filters": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "operator", "valueMatchesPagePath"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 64 },
+              "operator": { "enum": ["eq", "OTHER"] },
+              "valueMatchesPagePath": { "type": "boolean" }
+            }
+          }
+        },
+        "headerNames": { "type": "array", "maxItems": 64, "items": { "type": "string", "maxLength": 64 } },
+        "omittedHeaderNameCount": { "$ref": "#/$defs/count" },
+        "contentType": { "anyOf": [{ "type": "string", "maxLength": 100 }, { "type": "null" }] },
+        "prefer": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "return=representation",
+              "return=minimal",
+              "return=headers-only",
+              "resolution=merge-duplicates",
+              "resolution=ignore-duplicates",
+              "return=other",
+              "resolution=other",
+              "other"
+            ]
+          }
+        },
+        "body": { "$ref": "#/$defs/apiRequestBody" }
+      }
+    },
+    "apiRequestBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "keys", "omittedKeyCount", "markerKeys", "stateKeyPresent"],
+      "properties": {
+        "kind": { "enum": ["NONE", "UNREADABLE", "NOT_JSON", "OBJECT", "ARRAY", "SCALAR"] },
+        "keys": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 64 },
+              "type": { "enum": ["string", "number", "boolean", "null", "object", "array"] }
+            }
+          }
+        },
+        "omittedKeyCount": { "$ref": "#/$defs/count" },
+        "markerKeys": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "markers"],
+            "properties": {
+              "key": { "type": "string", "maxLength": 64 },
+              "markers": { "type": "array", "maxItems": 32, "items": { "type": "integer", "minimum": 0, "maximum": 31 } }
+            }
+          }
+        },
+        "stateKeyPresent": {
+          "description": "T37R-fix-A (I-3): whether any top-level key is a soft-delete state key, judged on the names before hiding and truncation. Only the truth value; never the name.",
+          "type": "boolean"
+        }
+      }
+    }
   }
 }

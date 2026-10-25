@@ -2,9 +2,12 @@ import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import type { SideEffectConfirmation } from '../../../../../../../src/control/approval-view.js';
+// PRE42-CC 組 UI-K（組 2 の引き継ぎ。CC-106）: シナリオの種類の値は、管理データに触れない純粋な owner から読む（文字列で比べない）。
+import { UPDATE_SCENARIO_KIND } from '../../../../../../../src/core/scenario-kind.js';
 import { SIDE_EFFECT_CONFIRMATION_CATALOG, sortByDisplayOrder } from '../../../../../../../src/presentation/catalog.js';
 import { formatCount, formatDateTime, formatInteger } from '../../../../../../../src/presentation/format.js';
 import {
+  LOCAL_UI_AUTO_DRAFT_TEXT,
   LOCAL_UI_DISCOVERY_TEXT,
   LOCAL_UI_SCENARIO_TEXT,
   LOCAL_UI_WRITE_TEXT,
@@ -12,8 +15,10 @@ import {
   listText,
 } from '../../../../../../../src/presentation/messages.js';
 import { ConfirmDialog } from '../../../../components/ConfirmDialog';
+import { DraftValueMark } from '../../../../components/DraftValueMark';
 import { Notice } from '../../../../components/Notice';
 import { PageFrame } from '../../../../components/PageFrame';
+import { ScenarioApiShape } from '../../../../components/ScenarioApiShape';
 import { ScenarioProfilePanel } from '../../../../components/ScenarioProfilePanel';
 import { ScenarioStatus } from '../../../../components/ScenarioStatus';
 import { WriteResultHistory } from '../../../../components/WriteResultDetails';
@@ -40,7 +45,8 @@ import {
 } from '../../../../server/scenario-functions';
 
 /** 操作の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。 */
-const NOTICES = Object.freeze(['saved', 'approved', 'revoked'] as const);
+// FM2b: `autoRules`・`autoRulesFailed` は、自動の下書きの案内から作った更新の保存の後（推した入力の規則を付けた・付けられなかった）。
+const NOTICES = Object.freeze(['saved', 'approved', 'revoked', 'autoRules', 'autoRulesFailed'] as const);
 type ScenarioNotice = (typeof NOTICES)[number];
 const isScenarioNotice = (value: unknown): value is ScenarioNotice => NOTICES.some((notice) => notice === value);
 
@@ -63,7 +69,27 @@ const discoveryText = LOCAL_UI_DISCOVERY_TEXT;
 /** 承認したシナリオの保存の状態（撤回の操作を出すか）。 */
 const APPROVED_STATE = 'APPROVED';
 
-const NOTICE_TEXT: Readonly<Record<ScenarioNotice, string>> = Object.freeze({ saved: text.saved, approved: text.approved, revoked: text.revoked });
+const NOTICE_TEXT: Readonly<Record<ScenarioNotice, string>> = Object.freeze({
+  saved: text.saved,
+  approved: text.approved,
+  revoked: text.revoked,
+  autoRules: LOCAL_UI_AUTO_DRAFT_TEXT.savedWithRules,
+  autoRulesFailed: LOCAL_UI_AUTO_DRAFT_TEXT.savedRulesFailed,
+});
+
+/** FM2b: 自動の下書きが推した値のまま残る項目（項目、値、出どころの印と根拠）。 */
+function InferredItems({ page, testId }: Readonly<{ page: ScenarioDetailPageView; testId: string }>) {
+  return (
+    <ul data-testid={testId}>
+      {page.inferredItems.map((item) => (
+        <li key={`${item.item}:${item.value}`} data-item={item.item} data-value={item.value}>
+          {LOCAL_UI_AUTO_DRAFT_TEXT.inferredItems[item.item]}: <code>{item.value}</code>{' '}
+          <DraftValueMark origin={item.origin} ground={item.ground} />
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 /** 上限の表示。 */
 const limitsTextOf = (page: ScenarioDetailPageView): string =>
@@ -71,9 +97,10 @@ const limitsTextOf = (page: ScenarioDetailPageView): string =>
 
 const writeText = LOCAL_UI_WRITE_TEXT;
 
-/** 検証の指定の項目ごとの値（T30g。未指定は「未指定」）。 */
+/** 検証の指定の項目ごとの値（T30g。未指定は「未指定」。T40a-fix: 出す項目は `page.verificationItems`）。 */
 function Verification({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
   const { successCondition, inputErrorCondition, recordId, readVerification } = page.scenario.verification;
+  const apiRecordIdKey = page.scenario.api?.recordId?.key ?? null;
   const valueOf = (item: 'successCondition' | 'inputErrorCondition' | 'recordId' | 'readVerification'): string => {
     switch (item) {
       case 'successCondition':
@@ -83,9 +110,11 @@ function Verification({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
           ? writeText.verificationItemUnset
           : writeText.conditionValue(inputErrorCondition.pathPrefix, inputErrorCondition.selector);
       case 'recordId':
-        return recordId === null
-          ? writeText.verificationItemUnset
-          : listText([recordIdSourceDisplay(recordId.source).label, recordId.source === 'URL_PATH_PATTERN' ? recordId.pathPattern : recordId.selector]);
+        // T40a-fix: API のシナリオは、応答の本文の鍵（`api.recordId`）でも ID を取れる（検証の指定の取り方がなければ、そちらを出す）。
+        if (recordId === null) {
+          return apiRecordIdKey === null ? writeText.verificationItemUnset : writeText.apiRecordIdValue(apiRecordIdKey);
+        }
+        return listText([recordIdSourceDisplay(recordId.source).label, recordId.source === 'URL_PATH_PATTERN' ? recordId.pathPattern : recordId.selector]);
       case 'readVerification':
         return readVerification === null
           ? writeText.verificationItemUnset
@@ -94,9 +123,10 @@ function Verification({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
   };
   return (
     <dl className="facts" data-testid="scenario-verification-values">
-      {(['successCondition', 'inputErrorCondition', 'recordId', 'readVerification'] as const).map((item) => [
+      {/* T40a-fix: 求める項目だけを出す（API のシナリオは ID の取り方と照合の READ。成否の条件と入力の誤りの条件は使わないので出さない）。 */}
+      {page.verificationItems.map((item) => [
         <dt key={`${item}:label`}>{scenarioVerificationItemDisplay(item).label}</dt>,
-        <dd key={`${item}:value`} data-item={item} data-set={String(page.scenario.verification[item] !== null)}><code>{valueOf(item)}</code></dd>,
+        <dd key={`${item}:value`} data-item={item} data-set={String(!page.missingVerification.includes(item))}><code>{valueOf(item)}</code></dd>,
       ])}
     </dl>
   );
@@ -104,19 +134,23 @@ function Verification({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
 
 /** T31h-1: UPDATE の指定（台帳、path の型、変える欄・保つ欄）と、更新の予定のレコード。 */
 function UpdateSpec({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
-  const { update, fieldNames } = page.scenario;
+  const { update, fieldNames, api } = page.scenario;
   const updateText = text.update;
-  if (update === null) {
+  // T38f: API の UPDATE は、form の UPDATE の指定を持たず、台帳の参照（`api.ledger`）を持つ（送信先の path の型と保つ欄はない）。
+  const apiLedger = api?.ledger ?? null;
+  if (update === null && apiLedger === null) {
     return <p data-testid="scenario-update-spec-missing">{updateText.specMissing}</p>;
   }
   const ledger = page.updateLedger;
+  const targetCreateScenarioId = update?.targetCreateScenarioId ?? apiLedger?.targetCreateScenarioId ?? '';
+  const formPathTemplate = update?.formPathTemplate ?? apiLedger?.formPathTemplate ?? '';
   return (
     <>
       <dl className="facts" data-testid="scenario-update-values">
         <dt>{updateText.ledger}</dt>
-        <dd data-testid="scenario-update-ledger-value" data-scenario-id={update.targetCreateScenarioId}>
+        <dd data-testid="scenario-update-ledger-value" data-scenario-id={targetCreateScenarioId}>
           {ledger === null || ledger.pagePath === null
-            ? <code>{update.targetCreateScenarioId}</code>
+            ? <code>{targetCreateScenarioId}</code>
             : (
               <Link to="/scenarios/$profileId/$scenarioId" params={{ profileId: page.profile.profileId, scenarioId: ledger.scenarioId }}>
                 {updateText.ledgerOption(ledger.scenarioId, ledger.pagePath)}
@@ -124,13 +158,21 @@ function UpdateSpec({ page }: Readonly<{ page: ScenarioDetailPageView }>) {
             )}
         </dd>
         <dt>{updateText.formPathTemplate}</dt>
-        <dd data-testid="scenario-update-form-template"><code>{update.formPathTemplate}</code></dd>
-        <dt>{updateText.actionPathTemplate}</dt>
-        <dd data-testid="scenario-update-action-template"><code>{update.actionPathTemplate}</code></dd>
+        <dd data-testid="scenario-update-form-template"><code>{formPathTemplate}</code></dd>
+        {update === null ? null : (
+          <>
+            <dt>{updateText.actionPathTemplate}</dt>
+            <dd data-testid="scenario-update-action-template"><code>{update.actionPathTemplate}</code></dd>
+          </>
+        )}
         <dt>{updateText.changedFields}</dt>
         <dd data-testid="scenario-update-changed">{fieldNames.length === 0 ? updateText.none : listText(fieldNames)}</dd>
-        <dt>{updateText.keptFields}</dt>
-        <dd data-testid="scenario-update-kept">{update.keepFieldNames.length === 0 ? updateText.none : listText(update.keepFieldNames)}</dd>
+        {update === null ? null : (
+          <>
+            <dt>{updateText.keptFields}</dt>
+            <dd data-testid="scenario-update-kept">{update.keepFieldNames.length === 0 ? updateText.none : listText(update.keepFieldNames)}</dd>
+          </>
+        )}
       </dl>
       <h3>{updateText.plannedTarget}</h3>
       <p className="field-hint">{updateText.plannedTargetNote}</p>
@@ -266,6 +308,12 @@ function ScenarioDetailPage() {
             <p data-testid="scenario-unconfirmed">{text.unconfirmedSideEffects}</p>
           </Notice>
         )}
+        {/* T40R2-fix（使える度合い）: 画面から ID を取る型が書き込みの画面にも当たるときの注意（保存の画面と同じ文言。実行は止めない）。 */}
+        {page.recordIdPatternCaution ? (
+          <Notice kind="caution">
+            <p data-testid="scenario-record-id-caution">{writeText.recordIdPatternCaution}</p>
+          </Notice>
+        ) : null}
         {/* T30g: 検証の指定に未指定の項目があれば、実行できない理由として出す（`VERIFICATION_SPEC_MISSING`）。 */}
         {page.missingVerification.length === 0 ? null : (
           <Notice kind="caution" heading={writeText.verificationMissingHeading}>
@@ -275,6 +323,13 @@ function ScenarioDetailPage() {
                 {page.missingVerification.map((item) => <li key={item} data-item={item}>{scenarioVerificationItemDisplay(item).label}</li>)}
               </ul>
             </div>
+          </Notice>
+        )}
+        {/* FM2b: 自動の下書きが推した値のまま残る項目と根拠（表示のときに求め直す。承認に結ばない）。 */}
+        {page.inferredItems.length === 0 ? null : (
+          <Notice kind="caution" heading={LOCAL_UI_AUTO_DRAFT_TEXT.inferredHeading}>
+            <p>{LOCAL_UI_AUTO_DRAFT_TEXT.inferredNote}</p>
+            <InferredItems page={page} testId="scenario-inferred" />
           </Notice>
         )}
         {rejection === null ? null : (
@@ -341,6 +396,18 @@ function ScenarioDetailPage() {
               <dt>{text.approveDialog.ttl}</dt>
               <dd>{text.daysValue(formatInteger(scenario.approvalTtlDays))}</dd>
             </dl>
+            {/* T38c: API のシナリオは、承認が縛る要求の型の要約を、承認の前に出す。 */}
+            {scenario.api === null ? null : (
+              <ScenarioApiShape api={scenario.api} transport={scenario.transport} testId="scenario-approve-api-shape"
+                publicationStateKeys={scenario.apiPublicationStateKeys} />
+            )}
+            {/* FM2b: 推測の項目が 1 つでも残る下書きは、承認の前に一覧を出す。 */}
+            {page.inferredItems.length === 0 ? null : (
+              <>
+                <h3>{LOCAL_UI_AUTO_DRAFT_TEXT.approveInferredHeading}</h3>
+                <InferredItems page={page} testId="scenario-approve-inferred" />
+              </>
+            )}
             <h3>{text.approveDialog.sideEffects}</h3>
             <SideEffects page={page} />
             <h3>{text.approveDialog.diff}</h3>
@@ -362,16 +429,21 @@ function ScenarioDetailPage() {
       <section className="panel" data-testid="scenario-request">
         <h2 className="panel-heading">{text.requestHeading}</h2>
         <dl className="facts">
-          <dt>{text.formMethod}</dt>
-          <dd>{scenario.request.methodOverride === null
-            ? scenario.request.formMethod
-            : discoveryText.methodOverride(scenario.request.formMethod, scenario.request.methodOverride)}</dd>
-          <dt>{text.origin}</dt>
-          <dd><code>{scenario.request.origin}</code></dd>
-          <dt>{text.path}</dt>
-          <dd><code>{scenario.request.path}</code></dd>
-          <dt>{text.enctype}</dt>
-          <dd>{scenario.request.enctype}</dd>
+          {/* T38b: form の要求の形は FORM のシナリオだけ（API のシナリオの要求の型は、下の要約。T38c）。 */}
+          {scenario.request === null ? null : (
+            <>
+              <dt>{text.formMethod}</dt>
+              <dd>{scenario.request.methodOverride === null
+                ? scenario.request.formMethod
+                : discoveryText.methodOverride(scenario.request.formMethod, scenario.request.methodOverride)}</dd>
+              <dt>{text.origin}</dt>
+              <dd><code>{scenario.request.origin}</code></dd>
+              <dt>{text.path}</dt>
+              <dd><code>{scenario.request.path}</code></dd>
+              <dt>{text.enctype}</dt>
+              <dd>{scenario.request.enctype}</dd>
+            </>
+          )}
           <dt>{text.fieldsHeading}</dt>
           <dd data-testid="scenario-field-names">{scenario.fieldNames.length === 0 ? discoveryText.noFlags : listText(scenario.fieldNames)}</dd>
           <dt>{text.readChecksHeading}</dt>
@@ -392,11 +464,14 @@ function ScenarioDetailPage() {
               )}
           </dd>
         </dl>
+        {scenario.api === null ? null : (
+          <ScenarioApiShape api={scenario.api} transport={scenario.transport} testId="scenario-api-shape" publicationStateKeys={scenario.apiPublicationStateKeys} />
+        )}
         <h3>{text.sideEffectsHeading}</h3>
         <SideEffects page={page} />
       </section>
 
-      {scenario.kind !== 'UPDATE' ? null : (
+      {scenario.kind !== UPDATE_SCENARIO_KIND ? null : (
         <section className="panel" data-testid="scenario-update-section">
           <h2 className="panel-heading">{text.update.heading}</h2>
           <UpdateSpec page={page} />

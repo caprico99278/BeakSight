@@ -13,7 +13,7 @@
  *   コンパイラ API・外部ツール・子プロセス・`dist/` を使わない）。コメントと文字列リテラルの中身は見ない（近似の検査である）。
  */
 import { describe, expect, it } from 'vitest';
-import { countIdentifier, findCallSites, loadSourceFiles, scanSource, type SourceFile } from './source-scan.js';
+import { countIdentifier, findCallSites, loadSourceFiles, scanSource, sourceFileAt, type SourceFile } from './source-scan.js';
 
 const SOURCE_FILES = loadSourceFiles();
 
@@ -59,11 +59,7 @@ const findOwnerCheckDefinitions = (bare: string): readonly string[] =>
 
 const bareOf = (source: string): string => scanSource(source).bare;
 
-const sourceFile = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  expect(file, path).toBeDefined();
-  return file ?? { path, content: '', ...scanSource('') };
-};
+const sourceFile = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 describe('incomplete reason ownership detectors (CCX-1)', () => {
   it('detects membership checks against INCOMPLETE_REASON_CODES, as written before CC-034', () => {

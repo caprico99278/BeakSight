@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-login-stage-row-key:1",
+  "description": "Local UI Server Function input (FM-1; fewer manual steps design 2.1): one row of the login stage table of a job, to show what the row adds to the auth setup. passed selects the list (true: the requests passed during the manual login, false: the blocked requests); index is the row in that list (the list has at most MAX_WORKER_LOGIN_STAGE_BLOCKED_REQUESTS rows).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jobId", "passed", "index"],
+  "properties": {
+    "jobId": { "$ref": "urn:beaksight:schema:control:worker-message:1#/$defs/start/properties/jobId" },
+    "passed": { "type": "boolean" },
+    "index": { "type": "integer", "minimum": 0, "maximum": 7 }
+  }
+}

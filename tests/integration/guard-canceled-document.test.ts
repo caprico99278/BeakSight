@@ -8,10 +8,9 @@
 // - 競合は数 ms なので、DEF-026 の調査で毎回起きた条件（iframe を数十個作り、0〜9ms 後に消す）を使う。
 // - 許可 Origin の外は、127.0.0.1 の別のポートの fixture のサーバで確かめる。別のサイト（OOPIF）は、同じ fixture のサーバを
 //   別のホスト名（`localhost`）で読む。インターネット上のサイトは使わない。
-import { chromium, type Browser, type BrowserContext, type CDPSession } from 'playwright';
+import type { Browser, BrowserContext, CDPSession } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { INVALID_INTERCEPTION_ID_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
 import { ResourceCache, type ResourceDeliveryRole } from '../../src/browser/resource-delivery.js';
@@ -21,7 +20,7 @@ import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import { isPassiveRequestGuardClosed } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { canceledEvidenceViolation } from '../helpers/canceled-evidence-diagnostic.js';
-import { oopifTargetUrls } from '../helpers/chromium.js';
+import { launchCliChromium, oopifTargetUrls } from '../helpers/chromium.js';
 import { crossSiteFramePath, crossSiteOriginOf } from '../helpers/external-scheme-fixture.js';
 import { NO_NON_READ_REQUESTS, openServerWindow, type ServerWindow } from '../helpers/gate-harness.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
@@ -56,7 +55,8 @@ beforeAll(async () => {
   allowedServer = await startFixtureServer();
   outsideServer = await startFixtureServer();
   // CLI と同じ起動の設定（headless）。
-  browser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+  // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+  browser = await launchCliChromium();
   const config = createTestConfig(allowedServer.origin);
   // 読み込み直しの Context（`REVISIT`）の届け方の部品が働くよう、Run と同じく、Run 全体のキャッシュと負荷の記録を渡す。
   factory = new BrowserContextFactory(browser, config, () => new SafetyLedger(), {

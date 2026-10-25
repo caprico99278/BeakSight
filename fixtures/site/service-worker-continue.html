@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Fixture Service Worker Continue</title></head>
+  <body>
+    <h1>Fixture Service Worker Continue</h1>
+    <p>This page registers a Service Worker on load, as an ordinary site does, and continues its script afterwards (UPG-SW).</p>
+    <script>
+      // UPG-SW: ふつうのサイトと同じく、読み込みのときに Service Worker を登録し（失敗は Promise の拒否で受ける）、その後の処理を続ける。
+      // 結果は html 要素に残す。
+      // - data-service-worker-registration: `registered`、`rejected:<name>:<message>`。
+      // - data-after-registration: 登録の呼び出しの後の処理が動いたら `ran`。
+      // ページのスクリプト自身は、GET・HEAD 以外の要求を送らない。
+      const report = (name, state) => {
+        document.documentElement.dataset[name] = state;
+      };
+      navigator.serviceWorker.register('/fixture-service-worker.js').then(
+        () => report('serviceWorkerRegistration', 'registered'),
+        (error) => report('serviceWorkerRegistration', `rejected:${error?.name}:${error?.message}`),
+      );
+      report('afterRegistration', 'ran');
+    </script>
+  </body>
+</html>

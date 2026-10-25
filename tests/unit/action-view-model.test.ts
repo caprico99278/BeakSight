@@ -14,14 +14,23 @@ import {
   AUTOMATED_ACTION_CATALOG,
   HUMAN_DECISION_CATALOG,
   SCENARIO_KIND_CATALOG,
+  SCENARIO_TRANSPORT_CATALOG,
+  SCENARIO_VERIFICATION_ITEM_CATALOG,
 } from '../../src/presentation/catalog.js';
 import { formatDateTime, formatInteger } from '../../src/presentation/format.js';
-import { ACTION_REPORT_TEXT } from '../../src/presentation/messages.js';
+import { ACTION_REPORT_TEXT, listText } from '../../src/presentation/messages.js';
 import { buildActionViewModel, type ActionReportInput } from '../../src/report/action-view-model.js';
 import {
+  SAMPLE_API_ORIGIN,
+  SAMPLE_API_PATH,
+  SAMPLE_API_SHAPE_DIGEST,
+  blockedApiDocuments,
   blockedDocuments,
   partialDocuments,
+  sampleApiSummary,
   unknownDocuments,
+  verifiedApiCreateDocuments,
+  verifiedApiUpdateDocuments,
   verifiedCreateDocuments,
   verifiedUpdateDocuments,
   type ActionReportDocuments,
@@ -125,5 +134,109 @@ describe('action report view model (T32f)', () => {
   it('shows a response without a status as not observed, without making it 0', () => {
     const model = modelOf(unknownDocuments());
     expect(model.response).toEqual({ httpStatusText: formatInteger(null), judgement: null, judgedAtText: ACTION_REPORT_TEXT.none });
+  });
+});
+
+// T40d（Task 40 の設計書 3.4、3.5、7 章の履歴の「T40a の報告（API の検証の指定）」「T40c の報告」）: 版 1.1 の API の要約の節。
+// - 送り方（カタログのラベル）、method、送り先の Origin と path の型、型の digest、送る鍵、許すヘッダの名前、登録の ID の鍵、ページが決める鍵とその値。
+// - ページが決める鍵の値の null の印は「上限を超えたので残していない」、送らなかった回（値の全体が null）は「値がない」。
+// - 成否の条件と入力の誤りの条件は出さず、「API では応答の状態と ID で判定する」旨の説明を出す。
+// - FORM の文書（1.0 と 1.1）は API の節を持たず、2 つの版の表示用モデルは同じ。
+/** T41e: 保つ欄の値の目印（記録の形に入れても、表示用モデルに入らないことを確かめる）。 */
+const KEPT_VALUE_MARKER = 'kept-value-t41e';
+
+/** T41e: 保つ欄に値の目印を入れた API の UPDATE（契約の形では保つ欄は値を持たない。表示が値を拾わないことの確かめ）。 */
+const verifiedApiUpdateWithKeptMarker = (): ActionReportDocuments => {
+  const documents = verifiedApiUpdateDocuments();
+  const update = documents.evidence.update;
+  if (update === null || update.updateEvidence === null) {
+    throw new Error('the API update sample has no update evidence');
+  }
+  const fields = update.updateEvidence.fields.map((field) => (field.role === 'KEPT' ? { ...field, previousValue: KEPT_VALUE_MARKER, newValue: KEPT_VALUE_MARKER } : field));
+  return { ...documents, evidence: { ...documents.evidence, update: { ...update, updateEvidence: { fields } } } };
+};
+
+describe('action report view model of an API write (T40d)', () => {
+  const apiText = ACTION_REPORT_TEXT.api;
+
+  it('builds the API section from the summary of the evidence of 1.1', () => {
+    const model = modelOf(verifiedApiCreateDocuments());
+    expect(model.api).toEqual({
+      transport: { code: 'API', spec: SCENARIO_TRANSPORT_CATALOG.API },
+      judgementNote: apiText.judgementNote,
+      method: 'POST',
+      origin: SAMPLE_API_ORIGIN,
+      pathShape: SAMPLE_API_PATH,
+      shapeDigest: SAMPLE_API_SHAPE_DIGEST,
+      keyNamesText: listText(['email', 'name']),
+      httpFieldNamesText: listText(['x-client-info']),
+      recordIdKeyText: 'id',
+      pageKeys: [{ key: 'tenant_id', valueText: '"tenant-1"', kept: true }],
+    });
+    // 送信の結果（応答の状態と判定）、登録の ID、照合の READ の結果は、今の節の値のまま描ける。
+    expect(model.response).toMatchObject({ httpStatusText: formatInteger(201), judgement: { code: 'SUCCESS' } });
+    expect(model.summary.recordId).toBe('1001');
+    expect(model.readVerification.executed?.result.code).toBe('MATCHED');
+  });
+
+  it('shows a cut page key value as not kept over the limit, and no values for a run that was not sent', () => {
+    const base = verifiedApiCreateDocuments();
+    const api = sampleApiSummary({ pageKeyNames: ['source', 'tenant_id'], pageKeyValues: { source: '7', tenant_id: null } });
+    const cut = modelOf({ ...base, actionRun: { ...base.actionRun, api }, evidence: { ...base.evidence, api } });
+    expect(cut.api?.pageKeys).toEqual([
+      { key: 'source', valueText: '7', kept: true },
+      { key: 'tenant_id', valueText: apiText.pageKeyValueCut, kept: false },
+    ]);
+    const blocked = modelOf(blockedApiDocuments());
+    expect(blocked.api?.pageKeys).toEqual([{ key: 'tenant_id', valueText: apiText.pageKeyValuesNotRecorded, kept: false }]);
+    expect(blocked.response).toBeNull();
+  });
+
+  it('shows no page key and the unset record ID key with the texts of the catalog', () => {
+    const base = verifiedApiCreateDocuments();
+    const api = sampleApiSummary({ pageKeyNames: [], pageKeyValues: {}, httpFieldNames: [], recordIdKey: null });
+    const model = modelOf({ ...base, actionRun: { ...base.actionRun, api }, evidence: { ...base.evidence, api } });
+    expect(model.api).toMatchObject({ pageKeys: [], httpFieldNamesText: apiText.none, recordIdKeyText: apiText.recordIdKeyUnset });
+  });
+
+  it('does not show the success and input error conditions of an API write, and tells how an API write is judged', () => {
+    // 条件の値（FORM の見本の path とセレクタ）を記録に残したままの文書でも、表示用モデルに条件は入らない。条件の項目の説明も入らない。
+    const base = verifiedApiCreateDocuments();
+    const conditions = verifiedCreateDocuments().actionRun.resultConditions;
+    const text = JSON.stringify(modelOf({ ...base, actionRun: { ...base.actionRun, resultConditions: conditions } }));
+    expect(text).toContain(JSON.stringify(apiText.judgementNote));
+    for (const value of ['/members/new', '.registered']) {
+      expect(text, value).not.toContain(value);
+    }
+    for (const item of [SCENARIO_VERIFICATION_ITEM_CATALOG.successCondition, SCENARIO_VERIFICATION_ITEM_CATALOG.inputErrorCondition]) {
+      expect(text).not.toContain(item.description);
+    }
+  });
+
+  // T41e（Task 41 の設計書 3.5）: API の UPDATE は、API の要約と更新の前後の差分の両方を持つ。保つ欄の値は出さない。ページが決める鍵の値は、更新では
+  // 残さない（送る前の値と照らす）ので、値の全体がない回とも上限の印とも違う文言で示す。
+  it('builds both the API section and the update diff of an API update, without the values of the kept fields', () => {
+    const model = modelOf(verifiedApiUpdateWithKeptMarker());
+    expect(model.api).toMatchObject({ transport: { code: 'API' }, keyNamesText: listText(['name']) });
+    expect(model.api?.pageKeys).toEqual([{ key: 'tenant_id', valueText: apiText.pageKeyValueNotKeptForUpdate, kept: false }]);
+    expect(model.update).toEqual({
+      targetRecordId: '1001',
+      evidenceRecorded: true,
+      changed: [{ fieldName: 'name', previousValue: '前の 名前', newValue: '新しい 名前', matchedText: ACTION_REPORT_TEXT.matchedValue }],
+      kept: [{ fieldName: 'email', matchedText: ACTION_REPORT_TEXT.matchedValue }],
+    });
+    expect(model.summary.kind.code).toBe('UPDATE');
+    // 保つ欄の値は、記録の形に入っていても表示用モデルに入らない。
+    expect(JSON.stringify(model)).not.toContain(KEPT_VALUE_MARKER);
+  });
+
+  it.each<readonly [string, () => ActionReportDocuments]>([
+    ['a verified create', verifiedCreateDocuments],
+    ['a verified update', verifiedUpdateDocuments],
+    ['a blocked run', blockedDocuments],
+    ['an unknown run', unknownDocuments],
+    ['a partial run', partialDocuments],
+  ])('keeps the FORM view of %s: no API section', (_label, documents) => {
+    expect(modelOf(documents()).api).toBeNull();
   });
 });

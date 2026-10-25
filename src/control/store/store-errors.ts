@@ -2,6 +2,7 @@
 // - 理由の値だけを持つ。利用者への日本語の説明と取るべき手順は、表示の部品（`src/presentation/messages.ts`。T23d）が持つ。
 // - `detail` は英語の技術的な詳細（ログと診断用）。
 // - SQLite の誤り（`node:sqlite` の `ERR_SQLITE_ERROR`）は、主の結果コード（拡張コードの下位 8 bit）で分類する。
+import { errorMessageOrString } from '../../core/errors.js';
 import { CONTROL_ENVIRONMENT_FAILURE_REASONS } from '../environment/control-environment.js';
 
 /** 止める理由（閉じた一覧。先頭は環境の確かめの理由）。 */
@@ -17,6 +18,8 @@ export const CONTROL_STORE_FAILURE_REASONS = Object.freeze([
   'NOT_A_BEAKSIGHT_DATABASE',
   /** この BeakSight が知るより新しい版で作られた。書き込まない。 */
   'DATABASE_FROM_NEWER_VERSION',
+  /** 基準の版（版 17）より前の版の管理データ（LG-2。前の版からの移し替えは持たない）。書き込まない。 */
+  'DATABASE_FROM_OLDER_VERSION',
   /** 別のプログラムが開いている・書き込んでいる（busy の待ちを過ぎた）。 */
   'DATABASE_LOCKED',
   /** ファイルが読み取り専用で、書き込めない。 */
@@ -52,12 +55,12 @@ export interface ControlStoreFailure {
 /**
  * 管理データを開く・準備するときの誤りを、止める理由と詳細にする（CCX-5、台帳の N2。`npm run setup:local` と画面のサーバの準備が使う）。
  * `ControlStoreError` はその理由と誤りの文のまま。それ以外は `DATABASE_OPEN_FAILED` にし、詳細は `Error` なら `message`、そうでなければ
- * `String(error)`。
+ * `String(error)`（`errorMessageOrString`。台帳の N1）。
  */
 export const controlStoreFailureOf = (error: unknown): ControlStoreFailure =>
   error instanceof ControlStoreError
     ? { reason: error.reason, detail: error.message }
-    : { reason: 'DATABASE_OPEN_FAILED', detail: error instanceof Error ? error.message : String(error) };
+    : { reason: 'DATABASE_OPEN_FAILED', detail: errorMessageOrString(error) };
 
 /** `node:sqlite` が投げる誤りのコード。 */
 const NODE_SQLITE_ERROR_CODE = 'ERR_SQLITE_ERROR';

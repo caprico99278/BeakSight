@@ -3,6 +3,7 @@
 // どのテストも、実際の期限（`SESSION_OPEN_TIMEOUT_MS`、`CONTEXT_CLOSE_TIMEOUT_MS`）を待たず、短い期限を注入する。
 import type { BrowserContext, Page } from 'playwright';
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { ContextConstructionError, type BrowserContextFactory } from '../../src/browser/context-factory.js';
 import type { Viewport } from '../../src/config/types.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS, SESSION_OPEN_TIMEOUT_MS } from '../../src/core/limits.js';
@@ -128,7 +129,7 @@ async function collectUnhandledRejections(run: () => Promise<void>): Promise<unk
   process.on('unhandledRejection', onUnhandled);
   try {
     await run();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await wait(20);
   } finally {
     process.off('unhandledRejection', onUnhandled);
   }
@@ -537,7 +538,7 @@ describe('releaseLatePassiveContextFailure (DEF-008, P18c)', () => {
           },
         },
       );
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await wait(20);
     });
 
     expect(unhandled).toEqual([]);

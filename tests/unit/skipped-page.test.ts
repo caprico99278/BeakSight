@@ -34,7 +34,8 @@ describe('skippedPageResult', () => {
       navigationOutcome: null,
     };
     expect(result).toEqual({
-      schemaVersion: 'page-schema/1.0',
+      // BN-a: 書くのはいつも最新の版（印の要る Evidence は持たない）。
+      schemaVersion: 'page-schema/1.1',
       pageId: PAGE_ID,
       pageUrl: URL_,
       status: 'SKIPPED',

@@ -1,0 +1,21 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-target-crawl-limits:1",
+  "description": "Local UI Server Function input (T44d; Task 44 design P2-1): check (GET) or save (POST) the three crawl limits of the target configuration a profile points to (crawl.maxPages, crawl.maxRuntimeMs, crawl.minNavigationIntervalMs). expectedTargetConfigDigest is the targetConfigDigestOf value of the file the screen read. The ranges are not bound here: the server checks them with the same rules as validateConfig and returns the problems by field.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "expectedTargetConfigDigest", "limits"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "expectedTargetConfigDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxPages", "maxRuntimeMs", "minNavigationIntervalMs"],
+      "properties": {
+        "maxPages": { "type": "number" },
+        "maxRuntimeMs": { "type": "number" },
+        "minNavigationIntervalMs": { "type": "number" }
+      }
+    }
+  }
+}

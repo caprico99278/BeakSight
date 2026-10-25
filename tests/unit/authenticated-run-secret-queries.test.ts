@@ -4,7 +4,7 @@
 //     `FAILED`（`CONFIG_ERROR`）で終え、画面は `CONFIG_ERROR` の手順で案内する）。公開監査では今のまま始まる。
 // (2) 認証つきの Run では、ワーカーが送る `FAILED` の `detail` の URL の秘密を伏せる（公開監査の `detail` は今のまま）。
 // ブラウザは起動しない（監査の Browser の起動の関数は、呼ばれたかだけを数える）。
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -13,7 +13,9 @@ import { CONFIG_ERROR_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import { classifyCliFailure } from '../../src/cli/failure.js';
 import { ConfigError } from '../../src/config/config-error.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, DEFAULT_EXCLUDED_URL_WORDS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import type { AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import {
   WORKER_PROTOCOL_VERSION,
@@ -35,6 +37,8 @@ import {
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { runLoginStage } from '../../src/worker/authenticated-login.js';
 import { startAuditWorker, type AuditWorker, type WorkerChannel } from '../../src/worker/audit-worker-session.js';
+import { runCli } from '../../src/cli/main.js';
+import { captureCliOutput } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const ORIGIN = 'http://127.0.0.1:4173';
@@ -92,7 +96,9 @@ describe('T25f round 1 (1): an authenticated Run does not keep a secret query pa
     expect(() => assertRunAuthentication(authentication, configWith(['page', 'q']))).not.toThrow();
   });
 
-  it('makes the RunCoordinator constructor reject it with the authentication, and keeps the public audit as it is', () => {
+  // T44g（Task 44 の P4-1 の発見事項 4）: 公開監査も、同じ部品と理由（`secretAllowedQueryParameters`・`CONFIG_INVALID`）で拒む（書き手が、公開監査でも
+  // 保存と成果物の URL の秘密に見える名前の値を伏せるので、その名前をページの URL に残すと再開できない）。
+  it('makes the RunCoordinator constructor reject it with and without the authentication', () => {
     let launched = 0;
     const base = {
       launchBrowser: async () => {
@@ -105,13 +111,42 @@ describe('T25f round 1 (1): an authenticated Run does not keep a secret query pa
       outputDirectory: 'unused-output',
     };
     expect(() => new RunCoordinator({ ...base, config: configWith(['token']), authentication })).toThrow(ConfigError);
-    expect(() => new RunCoordinator({ ...base, config: configWith(['token']) })).not.toThrow();
+    expect(() => new RunCoordinator({ ...base, config: configWith(['token']) })).toThrow(ConfigError);
+    expect(() => new RunCoordinator({ ...base, config: configWith(['page', 'q']) })).not.toThrow();
     expect(launched).toBe(0);
+  });
+
+  it('shows the reason with the parameter name on the CLI for the public audit, and launches no Browser', async () => {
+    const directory = await workDirectory();
+    const configPath = join(directory, 'public-secret.json');
+    await writeFile(configPath, JSON.stringify({
+      target: { id: 'public-secret' },
+      site: { startUrl: `${ORIGIN}/`, allowedOrigins: [ORIGIN] },
+      crawl: { minNavigationIntervalMs: 0, allowedQueryParameters: ['page', 'token'] },
+    }), 'utf8');
+    let launched = 0;
+    const stdout = captureCliOutput();
+    const stderr = captureCliOutput();
+    const code = await runCli(['run', '--config', configPath, '--output', join(directory, 'output'), '--headless'], { stdout: stdout.output, stderr: stderr.output }, {
+      run: {
+        launchBrowser: async () => {
+          launched += 1;
+          throw new Error('not launched');
+        },
+        clock: () => new Date(),
+        now: () => Date.now(),
+      },
+    });
+    expect(code).toBe(CONFIG_ERROR_EXIT_CODE);
+    expect(launched).toBe(0);
+    expect(`${stdout.text()}${stderr.text()}`).toContain('crawl.allowedQueryParameters must not contain "token"');
   });
 
   it('guides the screen with the CONFIG_ERROR action', () => {
     expect(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.CONFIG_ERROR.action).toContain(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION);
     expect(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION).toContain('crawl.allowedQueryParameters');
+    // T44g: 公開の監査も同じ理由で始めないので、画面の案内は公開の監査にも当てはまる文にする。
+    expect(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION).toContain('公開の監査');
   });
 });
 
@@ -120,7 +155,7 @@ describe('T25f round 1 (1): an authenticated Run does not keep a secret query pa
 // ---------------------------------------------------------------------------------------------------------------
 
 const setup: AuthSetup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-auth',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -240,9 +275,12 @@ describe('T25f round 1 (1): the worker does not start an authenticated Run with 
     expect(authenticated.launched).toBe(0);
     expect(authenticated.messages.some((message) => message.type === 'RUN_STARTED')).toBe(false);
 
+    // T44g（Task 44 の P4-1 の発見事項 4）: 公開監査も、同じ理由（`CONFIG_ERROR`）で始めない（監査の Browser を起動しない）。
     const publicRun = await runWorker({ authenticated: false, config: configWith(['token'], join(await workDirectory(), 'output')), executeAuditRun });
-    expect(failedOf(publicRun.messages).map(({ reason }) => reason)).not.toContain('CONFIG_ERROR');
-    expect(publicRun.launched).toBeGreaterThan(0);
+    expect(failedOf(publicRun.messages).map(({ reason }) => reason)).toEqual(['CONFIG_ERROR']);
+    expect(publicRun.exitCode).toBe(CONFIG_ERROR_EXIT_CODE);
+    expect(publicRun.launched).toBe(0);
+    expect(publicRun.messages.some((message) => message.type === 'RUN_STARTED')).toBe(false);
   });
 });
 

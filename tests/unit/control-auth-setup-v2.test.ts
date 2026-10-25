@@ -1,6 +1,8 @@
-// T26b（Task 26 の設計書 4.3、4.4 の結果の区別、4.5 の上限の「回数 1」）: 認証の設定の版 2（`beaksight-auth-setup/2`）の契約・スキーマ・検証の検査。
-// - 契約（`src/control/auth/auth-setup-contracts.ts`）と版 2 の JSON Schema（`schemas/control/auth-setup-v2.schema.json`）の項目と上限の一致。
-// - 版 1 のスキーマ（`schemas/control/auth-setup.schema.json`）は公開済みの形のまま（項目に `automatedLogin` がない）。
+// T26b（Task 26 の設計書 4.3、4.4 の結果の区別、4.5 の上限の「回数 1」）: 認証の設定の自動ログインの設定（`automatedLogin`。版 2 で足した項目）の
+// 契約・スキーマ・検証の検査。
+// - LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 認証の設定は版 3 だけになったので、例の値はフォームの送信のログインの版 3 の文書。スキーマは
+//   `schemas/control/auth-setup-v3.schema.json`。版 1・版 2 のスキーマの確かめと、上限の一致の重なり（O2）は捨てた（上限の一致は
+//   `control-auth-setup.test.ts` の 1 か所）。
 // - 検証（`validateAuthSetup`）: プロファイルの方式で `automatedLogin` の要否を決める。自動ログインでは回数は 1 だけ。3 つのセレクタの形と
 //   重なり。失敗の条件どうしと、失敗の条件と成功の条件の重なり。方式の判定（`TEST_AUTH_PASSIVE` で、手動か自動のログイン）。
 // - 誤りの文に、設定の値（セレクタ、path）を入れない。
@@ -10,16 +12,11 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { AuditConfig } from '../../src/config/types.js';
 import {
-  AUTH_SETUP_SCHEMA_VERSION,
-  AUTH_SETUP_SCHEMA_VERSION_2,
   AUTH_SETUP_VALIDATION_ERROR_CODES,
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
-  MAX_ALLOWED_IDP_ORIGINS,
-  MAX_AUTH_SETUP_PATH_LIST_ITEMS,
   MAX_AUTH_SETUP_URL_LENGTH,
   MAX_LOGIN_ATTEMPTS,
-  MAX_LOGIN_POST_ENDPOINTS,
   MAX_SUCCESS_SELECTOR_LENGTH,
   MIN_LOGIN_ATTEMPTS,
   type AuthSetup,
@@ -30,21 +27,19 @@ import {
 } from '../../src/control/auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../../src/control/auth/auth-setup-policy.js';
 import {
-  MIN_PROFILE_REVISION,
   SITE_PROFILE_SCHEMA_VERSION,
   type SiteProfile,
   type ValidatedSiteProfile,
 } from '../../src/control/contracts.js';
-import { CONTROL_SCHEMA_NAMES, validateControlDocument } from '../../src/control/control-schema-validator.js';
+import { validateControlDocument } from '../../src/control/control-schema-validator.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../src/control/profile-policy.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const TEST_ORIGIN = 'https://app.example.invalid';
 const LOOPBACK_ORIGIN = 'http://127.0.0.1:4173';
 
-const AUTH_SETUP_V1_SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'auth-setup.schema.json');
-const AUTH_SETUP_V2_SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'auth-setup-v2.schema.json');
-const AUTH_SETUP_V2_SCHEMA_ID = 'urn:beaksight:schema:control:auth-setup:2';
+const AUTH_SETUP_SCHEMA_PATH = resolve(process.cwd(), 'schemas', 'control', 'auth-setup-v3.schema.json');
 
 const targetConfig: AuditConfig = {
   ...createTestConfig(TEST_ORIGIN),
@@ -76,7 +71,7 @@ const manualProfile = validatedProfileOf(manualProfileInput);
 const automatedProfile = validatedProfileOf({ ...manualProfileInput, auth: 'AUTOMATED_LOGIN' });
 
 const manualSetup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-test-env',
   profileRevision: 3,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -115,21 +110,20 @@ const codesOf = (result: AuthSetupValidationResult): readonly AuthSetupValidatio
 const validate = (input: unknown, profile: ValidatedSiteProfile = automatedProfile): AuthSetupValidationResult =>
   validateAuthSetup(input, profile, context);
 
-/** 自動ログインの設定の一部を変えた、版 2 の設定。 */
+/** 自動ログインの設定の一部を変えた設定。 */
 const withAutomatedLogin = (overrides: Record<string, unknown>): Record<string, unknown> => ({
   ...automatedSetup,
   automatedLogin: { ...automatedLogin, ...overrides },
 });
 
-/** 失敗の条件の一部を変えた、版 2 の設定。 */
+/** 失敗の条件の一部を変えた設定。 */
 const withFailureConditions = (overrides: Record<string, LoginResultCondition | null>): Record<string, unknown> =>
   withAutomatedLogin({ failureConditions: { ...automatedLogin.failureConditions, ...overrides } });
 
 const NO_FAILURE_CONDITIONS = Object.freeze({ invalidCredentials: null, accountLocked: null, mfaRequired: null, credentialExpired: null });
 
-describe('T26b: the auth setup contract version 2 and its schema', () => {
-  const v1Schema = JSON.parse(readFileSync(AUTH_SETUP_V1_SCHEMA_PATH, 'utf8')) as Record<string, unknown>;
-  const schema = JSON.parse(readFileSync(AUTH_SETUP_V2_SCHEMA_PATH, 'utf8')) as Record<string, unknown>;
+describe('T26b: the automated login in the auth setup contract and its schema', () => {
+  const schema = JSON.parse(readFileSync(AUTH_SETUP_SCHEMA_PATH, 'utf8')) as Record<string, unknown>;
   const properties = schema.properties as Record<string, Record<string, unknown>>;
   const definitions = (schema.$defs ?? {}) as Record<string, Record<string, unknown>>;
 
@@ -144,9 +138,7 @@ describe('T26b: the auth setup contract version 2 and its schema', () => {
   const propertiesOf = (node: Record<string, unknown> | undefined): Record<string, Record<string, unknown>> =>
     (resolved(node).properties ?? {}) as Record<string, Record<string, unknown>>;
 
-  it('fixes the schema versions, the automated login limit and the closed list of the failure conditions', () => {
-    expect(AUTH_SETUP_SCHEMA_VERSION).toBe('beaksight-auth-setup/1');
-    expect(AUTH_SETUP_SCHEMA_VERSION_2).toBe('beaksight-auth-setup/2');
+  it('fixes the automated login limit and the closed list of the failure conditions', () => {
     expect(AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS).toBe(1);
     expect(AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS).toBeGreaterThanOrEqual(MIN_LOGIN_ATTEMPTS);
     expect(AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS).toEqual(['invalidCredentials', 'accountLocked', 'mfaRequired', 'credentialExpired']);
@@ -161,41 +153,11 @@ describe('T26b: the auth setup contract version 2 and its schema', () => {
     }
   });
 
-  it('keeps the published version 1 schema as it was (no automatedLogin)', () => {
-    expect(v1Schema.$id).toBe('urn:beaksight:schema:control:auth-setup:1');
-    expect((v1Schema.properties as Record<string, Record<string, unknown>>).schemaVersion?.const).toBe(AUTH_SETUP_SCHEMA_VERSION);
-    expect(Object.keys(v1Schema.properties as object)).not.toContain('automatedLogin');
-  });
-
-  it('has the $id of version 2, no additional properties, and the fields of version 1 plus automatedLogin', () => {
-    const v1Keys = Object.keys(v1Schema.properties as object);
-    expect(schema.$id).toBe(AUTH_SETUP_V2_SCHEMA_ID);
-    expect(schema.type).toBe('object');
-    expect(schema.additionalProperties).toBe(false);
-    expect(schema.required).toEqual([...v1Keys, 'automatedLogin']);
-    expect(Object.keys(properties)).toEqual([...v1Keys, 'automatedLogin']);
-    expect(Object.keys(manualSetup)).toEqual([...v1Keys, 'automatedLogin']);
-  });
-
-  it('uses the named constants as the limits of the schema (the same limits as version 1)', () => {
-    const endpoints = properties.loginPostEndpoints ?? {};
-    const endpointItem = propertiesOf(endpoints.items as Record<string, unknown>);
-    expect(properties.schemaVersion?.const).toBe(AUTH_SETUP_SCHEMA_VERSION_2);
-    expect(properties.loginStartUrl?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(endpoints.maxItems).toBe(MAX_LOGIN_POST_ENDPOINTS);
-    expect(endpoints.minItems).toBe(1);
-    expect(endpointItem.origin?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(endpointItem.path?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
+  // LG-3b（O2）: 版 1・版 2 のスキーマの確かめは捨てた。上限の一致は `control-auth-setup.test.ts` の 1 か所（重なりを捨てた）。
+  // `sessionLostCondition.pathPrefix` と `successCondition.pathPrefix` の上限は、そこで確かめていなかったので、ここに残す。
+  it('uses the named constants as the limits of the condition paths in the schema', () => {
     expect(propertiesOf(properties.successCondition).pathPrefix?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(propertiesOf(properties.successCondition).selector?.maxLength).toBe(MAX_SUCCESS_SELECTOR_LENGTH);
     expect(propertiesOf(properties.sessionLostCondition).pathPrefix?.maxLength).toBe(MAX_AUTH_SETUP_URL_LENGTH);
-    expect(properties.excludedPaths?.maxItems).toBe(MAX_AUTH_SETUP_PATH_LIST_ITEMS);
-    expect(properties.auditPathPrefixes?.maxItems).toBe(MAX_AUTH_SETUP_PATH_LIST_ITEMS);
-    expect(properties.allowedIdpOrigins?.maxItems).toBe(MAX_ALLOWED_IDP_ORIGINS);
-    expect(properties.maxLoginAttempts?.minimum).toBe(MIN_LOGIN_ATTEMPTS);
-    expect(properties.maxLoginAttempts?.maximum).toBe(MAX_LOGIN_ATTEMPTS);
-    expect(properties.profileRevision?.minimum).toBe(MIN_PROFILE_REVISION);
-    expect(properties.profileId?.$ref).toBe('urn:beaksight:schema:control:profile:1#/properties/profileId');
   });
 
   it('defines automatedLogin as null or the three selectors and the closed list of the failure conditions', () => {
@@ -223,20 +185,15 @@ describe('T26b: the auth setup contract version 2 and its schema', () => {
     }
   });
 
-  it('is one of the control schema names, and the schemas tell version 1 and version 2 apart', () => {
-    expect(CONTROL_SCHEMA_NAMES).toContain('auth-setup-v2');
-    expect(validateControlDocument('auth-setup-v2', manualSetup)).toEqual({ ok: true });
-    expect(validateControlDocument('auth-setup-v2', automatedSetup)).toEqual({ ok: true });
-    expect(validateControlDocument('auth-setup', manualSetup).ok).toBe(false);
+  it('accepts the manual and the automated setups in the schema, and requires automatedLogin', () => {
+    expect(validateControlDocument('auth-setup-v3', manualSetup)).toEqual({ ok: true });
+    expect(validateControlDocument('auth-setup-v3', automatedSetup)).toEqual({ ok: true });
     const { automatedLogin: _omitted, ...withoutAutomatedLogin } = manualSetup;
-    const v1Document = { ...withoutAutomatedLogin, schemaVersion: AUTH_SETUP_SCHEMA_VERSION };
-    expect(validateControlDocument('auth-setup', v1Document)).toEqual({ ok: true });
-    expect(validateControlDocument('auth-setup-v2', v1Document).ok).toBe(false);
-    expect(validateControlDocument('auth-setup-v2', withoutAutomatedLogin).ok).toBe(false);
+    expect(validateControlDocument('auth-setup-v3', withoutAutomatedLogin).ok).toBe(false);
   });
 });
 
-describe('T26b: validateAuthSetup accepts version 2', () => {
+describe('T26b: validateAuthSetup accepts the automated login', () => {
   it('accepts an automated login setup for an AUTOMATED_LOGIN profile, as a deeply frozen copy', () => {
     const input = structuredClone(automatedSetup);
     const result = validate(input);
@@ -285,14 +242,8 @@ describe('T26b: validateAuthSetup accepts version 2', () => {
   });
 });
 
-describe('T26b: validateAuthSetup rejects version 2 rule violations with their own codes', () => {
-  it('rejects a version 1 document (it is turned into version 2 only when the store reads it)', () => {
-    const { automatedLogin: _omitted, ...withoutAutomatedLogin } = manualSetup;
-    expect(codesOf(validate({ ...withoutAutomatedLogin, schemaVersion: AUTH_SETUP_SCHEMA_VERSION }, manualProfile)))
-      .toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-    expect(codesOf(validate(withoutAutomatedLogin, manualProfile))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
-  });
-
+// LG-3b（O1）: 版 1 の文書を形の誤りにする確かめは、`control-auth-setup.test.ts` の 1 か所にまとめた。
+describe('T26b: validateAuthSetup rejects the automated login rule violations with their own codes', () => {
   it('rejects an automated login setup for a MANUAL_SESSION profile with AUTH_SETUP_AUTOMATED_LOGIN_NOT_ALLOWED', () => {
     expect(codesOf(validate({ ...manualSetup, automatedLogin }, manualProfile))).toEqual(['AUTH_SETUP_AUTOMATED_LOGIN_NOT_ALLOWED']);
   });
