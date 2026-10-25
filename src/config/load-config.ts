@@ -40,6 +40,17 @@ const deepMerge = (base: unknown, addition: unknown): unknown => {
   return merged;
 };
 
+/**
+ * 対象の設定のファイルの中身（JSON を読んだ値）に、既定値（`DEFAULT_CONFIG`）を深く合わせた値（`validateConfig` に渡す前の形。上書きは含まない）。
+ * T44d（Task 44 の設計書 P2-1）: 画面から負荷の値を変える部品も、`loadConfig` と同じ合わせ方で確かめるために使う（合わせ方を写さない）。
+ */
+export const targetConfigWithDefaultsOf = (targetConfig: unknown): unknown => deepMerge(DEFAULT_CONFIG, targetConfig);
+
+/**
+ * 設定のファイルの中身の先頭の UTF-8 の BOM を 1 つだけ取り除く（`loadConfig` と同じ読み方。T44d で、画面から負荷の値を変える部品と共用する）。
+ */
+export const targetConfigTextWithoutByteOrderMark = (contents: string): string => withoutByteOrderMark(contents);
+
 /** 例外の文（技術的な詳細）。 */
 const errorDetail = (error: unknown): string => safeErrorMessage(error, MAX_ERROR_MESSAGE_LENGTH);
 
@@ -153,7 +164,7 @@ export const loadConfig = async (path?: string, overrides?: AuditConfigOverrides
   }
   const targetPath = resolvedPath ?? await selectCanonicalTargetConfigPath(canonicalTargetDirectory);
   const targetConfig = await readTargetConfig(targetPath);
-  const merged = deepMerge(deepMerge(DEFAULT_CONFIG, targetConfig), overrides);
+  const merged = deepMerge(targetConfigWithDefaultsOf(targetConfig), overrides);
   const validation = validateConfig(merged);
   if (!validation.ok) {
     throw new ConfigError('CONFIG_INVALID', `invalid configuration: ${validation.errors.join('; ')}`, validation.errors);

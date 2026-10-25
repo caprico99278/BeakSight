@@ -8,26 +8,32 @@
 // - 読み（`getAuthSetup`）は、読むだけの入口（`withReadTransaction`）の中で、設定の行とプロファイルの行を読む。保存してあった文書は、形
 //   （スキーマ）と行との一致だけを確かめ、今の文脈では検証し直さない（壊れていれば `ControlStoreError` の `DATABASE_INTEGRITY_FAILED`）。
 //   プロファイルの改訂が変わった（取り消しを含む）設定は、`freshness: 'STALE'` で返す（古い改訂の設定では監査を始めない。設計書 4.1）。
-// - 版 2（Task 26 の設計書 4.3。T26b）: 保存は版 2 で書く（`validateAuthSetup` が版 2 だけを受ける）。読むときは、版 2 の文書は版 2 の
-//   スキーマで、版 1 の文書は版 1 のスキーマで確かめ、版 1 は `automatedLogin: null` の版 2 に直して返す（保存し直すまで行は書き換えない）。
-//   どちらでもない文書は、壊れた行。版 1 を版 2 に直すのは、この部品の読み出しだけ。
+// - LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 保存も読み出しも版 3 だけ（`validateAuthSetup` が版 3 だけを受け、読むときは版 3 のスキーマで
+//   確かめる）。版 1・版 2 の文書の行は、読み替えずに壊れた行（`DATABASE_INTEGRITY_FAILED`）にする（T26b・T34a の読み替えは捨てた）。
 // - 秘密（Cookie、localStorage、パスワード）は扱わない（認証の設定は秘密を含まない文書。設計書 3 章）。
 // - 生の接続（`ControlDatabase.connection`）を外へ出さない。返す値は凍結した写し。
+import {
+  AUTH_SETUP_FRESHNESS_VALUES,
+  CURRENT_AUTH_SETUP_FRESHNESS,
+  STALE_AUTH_SETUP_FRESHNESS,
+  type AuthSetupFreshness,
+} from '../../core/auth-setup-freshness.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { isRecord } from '../../core/guards.js';
 import { formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
+  AUTH_SETUP_SCHEMA_NAME,
   type AuthSetup,
-  type AuthSetupV1,
   type AuthSetupValidationError,
 } from '../auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../auth/auth-setup-policy.js';
 import { validateControlDocument } from '../control-schema-validator.js';
-import { isAcceptedTargetConfigPath, validateSiteProfile } from '../profile-policy.js';
+import type { ValidatedSiteProfile } from '../contracts.js';
+import { isAcceptedTargetConfigPath, validateSiteProfile, type ProfileValidationContext } from '../profile-policy.js';
 import type { ControlDatabase } from './control-database.js';
-import type { ProfileStatus } from './profile-records.js';
+import { ACTIVE_PROFILE_STATUS, RETIRED_PROFILE_STATUS } from './profile-records.js';
 import { getProfile, type ProfileContextResolver, type StoredProfile } from './profile-store.js';
+import type { SqliteConnection } from './sqlite-module.js';
 import { ControlStoreError } from './store-errors.js';
 import { withReadTransaction, withWriteTransaction } from './transaction.js';
 
@@ -48,9 +54,11 @@ export const AUTH_SETUP_STORE_REJECTION_REASONS = Object.freeze([
 ] as const);
 export type AuthSetupStoreRejectionReason = (typeof AUTH_SETUP_STORE_REJECTION_REASONS)[number];
 
-/** 保存してある設定が、今のプロファイルの改訂に結びつくか（`CURRENT`）、古いか（`STALE`。改訂が変わった、取り消した）。 */
-export const AUTH_SETUP_FRESHNESS_VALUES = Object.freeze(['CURRENT', 'STALE'] as const);
-export type AuthSetupFreshness = (typeof AUTH_SETUP_FRESHNESS_VALUES)[number];
+/**
+ * 保存してある設定が、今のプロファイルの改訂に結びつくか（`CURRENT`）、古いか（`STALE`。改訂が変わった、取り消した）。PRE42-CC 組 UI-K2（CC-113）:
+ * 定義は、画面のブラウザ側からも読める純粋なファイル `src/core/auth-setup-freshness.ts` に移し、ここは同じ名前で公開し直す。
+ */
+export { AUTH_SETUP_FRESHNESS_VALUES, CURRENT_AUTH_SETUP_FRESHNESS, STALE_AUTH_SETUP_FRESHNESS, type AuthSetupFreshness };
 
 /** 保存してある認証の設定（凍結）。 */
 export interface StoredAuthSetup {
@@ -94,9 +102,6 @@ const UPSERT_AUTH_SETUP_SQL = 'INSERT INTO auth_setups (profile_id, profile_revi
   + 'ON CONFLICT (profile_id) DO UPDATE SET profile_revision = excluded.profile_revision, document = excluded.document, '
   + 'updated_at = excluded.updated_at';
 
-const ACTIVE: ProfileStatus = 'ACTIVE';
-const RETIRED: ProfileStatus = 'RETIRED';
-
 const NO_ERRORS: readonly AuthSetupValidationError[] = Object.freeze([]);
 
 const rejected = (
@@ -114,18 +119,11 @@ const timestampOf = (now: (() => Date) | undefined): string =>
 
 /** 設定が、今のプロファイルの改訂に結びつくか。 */
 const freshnessOf = (setup: AuthSetup, profile: StoredProfile): AuthSetupFreshness =>
-  profile.status === ACTIVE && profile.profile.revision === setup.profileRevision ? 'CURRENT' : 'STALE';
+  profile.status === ACTIVE_PROFILE_STATUS && profile.profile.revision === setup.profileRevision ? CURRENT_AUTH_SETUP_FRESHNESS : STALE_AUTH_SETUP_FRESHNESS;
 
-/** 版 1 の文書を、`automatedLogin: null` の版 2 にする（T26b。版 1 は手動のログインだけの版なので、自動ログインの設定はない）。 */
-const authSetupV2Of = (setup: AuthSetupV1): AuthSetup => ({ ...setup, schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2, automatedLogin: null });
-
-/** 保存してあった文書を、版 2 の設定として読む（版 2 はそのまま、版 1 は版 2 に直す）。どちらの形でもなければ `undefined`。 */
-const storedSetupOf = (parsed: unknown): AuthSetup | undefined => {
-  if (validateControlDocument('auth-setup-v2', parsed).ok) {
-    return parsed as AuthSetup;
-  }
-  return validateControlDocument('auth-setup', parsed).ok ? authSetupV2Of(parsed as AuthSetupV1) : undefined;
-};
+/** 保存してあった文書を、設定として読む（版 3 のスキーマに合う文書だけ。LG-3b: 前の版は読み替えない）。合わなければ `undefined`。 */
+const storedSetupOf = (parsed: unknown): AuthSetup | undefined =>
+  (validateControlDocument(AUTH_SETUP_SCHEMA_NAME, parsed).ok ? parsed as AuthSetup : undefined);
 
 /** 読み出し: 壊れた行は、データベースの誤りとして止める。 */
 const storedOf = (row: AuthSetupRow, profile: StoredProfile | null): StoredAuthSetup => {
@@ -140,7 +138,7 @@ const storedOf = (row: AuthSetupRow, profile: StoredProfile | null): StoredAuthS
   }
   const setup = storedSetupOf(parsed);
   if (setup === undefined) {
-    return fail('the stored document is not an auth setup of version 1 or 2');
+    return fail('the stored document is not an auth setup of version 3');
   }
   if (setup.profileId !== row.profile_id || setup.profileRevision !== row.profile_revision) {
     return fail('the stored document does not match its row (profileId or profileRevision)');
@@ -182,7 +180,7 @@ export const saveAuthSetup = (database: ControlDatabase, input: unknown, options
   if (current === null) {
     return rejected('PROFILE_NOT_FOUND', 'no profile has this profileId');
   }
-  if (current.status === RETIRED) {
+  if (current.status === RETIRED_PROFILE_STATUS) {
     return rejected('PROFILE_RETIRED', 'an auth setup cannot be saved for a retired profile');
   }
   if (!isAcceptedTargetConfigPath(current.profile.targetConfigPath)) {
@@ -196,21 +194,48 @@ export const saveAuthSetup = (database: ControlDatabase, input: unknown, options
   if (!profile.ok) {
     return rejected('PROFILE_INVALID', 'the stored profile does not pass validateSiteProfile with the current target configuration');
   }
-  const validation = validateAuthSetup(copy, profile.profile, context);
+  const validation = validateAuthSetupForProfile(copy, profile.profile, context);
   if (!validation.ok) {
-    return rejected('AUTH_SETUP_INVALID', 'the auth setup did not pass validateAuthSetup', validation.errors);
+    return validation;
   }
   const { setup } = validation;
   return withWriteTransaction(database, (connection) => {
     const latest = getProfile(database, profileId);
-    if (latest === null || latest.status !== ACTIVE || latest.profile.revision !== profile.profile.revision) {
+    if (latest === null || latest.status !== ACTIVE_PROFILE_STATUS || latest.profile.revision !== profile.profile.revision) {
       return rejected('PROFILE_REVISION_CONFLICT', 'the profile changed after the auth setup was validated');
     }
-    const updatedAt = timestampOf(options.now);
-    connection.prepare(UPSERT_AUTH_SETUP_SQL).run(setup.profileId, setup.profileRevision, JSON.stringify(setup), updatedAt);
-    return deepFreeze({
-      ok: true,
-      stored: { setup, updatedAt, freshness: 'CURRENT', profileRevision: latest.profile.revision },
-    } satisfies AuthSetupStoreResult);
+    return writeAuthSetupRow(connection, setup, options.now);
   });
+};
+
+/**
+ * 設定を、結びつくプロファイル（検証した改訂）と文脈で検証する（T43d。`saveAuthSetup` と、プロファイルと認証の設定のまとめて保存
+ * （`profile-auth-setup-store.ts`）が使う）。入力の写しを取ってから検証する。
+ */
+export const validateAuthSetupForProfile = (
+  input: unknown,
+  profile: ValidatedSiteProfile,
+  context: ProfileValidationContext,
+): { readonly ok: true; readonly setup: AuthSetup } | Rejection => {
+  let copy: unknown;
+  try {
+    copy = structuredClone(input);
+  } catch {
+    return rejected('AUTH_SETUP_INVALID', 'the auth setup must be a plain JSON value', [schemaError('the auth setup must be a plain JSON value', null)]);
+  }
+  const validation = validateAuthSetup(copy, profile, context);
+  return validation.ok ? validation : rejected('AUTH_SETUP_INVALID', 'the auth setup did not pass validateAuthSetup', validation.errors);
+};
+
+/**
+ * 検証した設定を、書き込みのトランザクションの中で書く（T43d。プロファイルごとに 1 行。あれば置き換える）。呼ぶ側が `withWriteTransaction` の中で、
+ * 結びつくプロファイルの改訂を確かめてから呼ぶ。返す値の改訂は、設定が結びつく改訂（書いた時点の今の改訂）。
+ */
+export const writeAuthSetupRow = (connection: SqliteConnection, setup: AuthSetup, now: (() => Date) | undefined): AuthSetupStoreResult => {
+  const updatedAt = timestampOf(now);
+  connection.prepare(UPSERT_AUTH_SETUP_SQL).run(setup.profileId, setup.profileRevision, JSON.stringify(setup), updatedAt);
+  return deepFreeze({
+    ok: true,
+    stored: { setup, updatedAt, freshness: CURRENT_AUTH_SETUP_FRESHNESS, profileRevision: setup.profileRevision },
+  } satisfies AuthSetupStoreResult);
 };

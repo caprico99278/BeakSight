@@ -1,12 +1,13 @@
 // プロファイルの保存のテストの共通の値（Task 23 の T23c）。親のテストと、子 process（`control-profile-child.ts`）の両方が使う。
 // - 例の値は匿名の値だけ（`example.invalid`、`config/targets/example.json` など）。
 // - 子 process は TypeScript のソースを直接読む（Node の型の除去）。`.js` の指定子は、同じ名前の `.ts` に読み替える
-//   （`module.registerHooks` の resolve。子 process の中だけで使う）。
+//   （`module.registerHooks` の resolve。子 process の中だけで使う。本文は `tests/helpers/typescript-source-hook.ts`）。
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile } from '../../src/control/contracts.js';
 import type { ProfileValidationContext } from '../../src/control/profile-policy.js';
 import type { ProfileContextResolver } from '../../src/control/store/profile-store.js';
 import { createTestConfig } from '../helpers/test-config.js';
+import { TYPESCRIPT_SOURCE_RESOLVE_HOOK } from '../helpers/typescript-source-hook.js';
 
 export const TEST_ORIGIN = 'https://app.example.invalid';
 /** ターゲット設定が変わった後に許される、別の Origin。 */
@@ -69,19 +70,7 @@ export const testWriteProfile = (profileId: string, revision: number, origin = T
 
 /** 子 process の始めに動かす本文（`.js` を `.ts` に読み替えてから、引数の 1 つ目のモジュールを読み込む）。 */
 const TYPESCRIPT_CHILD_LOADER = `
-import { registerHooks } from 'node:module';
-registerHooks({
-  resolve(specifier, context, next) {
-    try {
-      return next(specifier, context);
-    } catch (error) {
-      if (/^\\.{1,2}\\//u.test(specifier) && specifier.endsWith('.js')) {
-        return next(specifier.slice(0, -'.js'.length) + '.ts', context);
-      }
-      throw error;
-    }
-  },
-});
+${TYPESCRIPT_SOURCE_RESOLVE_HOOK}
 await import(process.argv[1]);
 `;
 

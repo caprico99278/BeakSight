@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
+import { ACTIVE_PROFILE_STATUS } from '../../../../../src/control/store/profile-records.js';
 import { compareCodeUnits } from '../../../../../src/core/text.js';
 import { CANDIDATE_CLASSIFICATION_CATALOG } from '../../../../../src/presentation/catalog.js';
 import { formatCount, formatDateTime } from '../../../../../src/presentation/format.js';
@@ -11,6 +12,7 @@ import {
   LOCAL_UI_DISCOVERY_TEXT,
   LOCAL_UI_SCENARIO_TEXT,
   LOCAL_UI_TEXT,
+  SCENARIO_DRAFT_REJECTION_DESCRIPTIONS,
   cliFieldText,
   labelWithCodeText,
   listText,
@@ -26,28 +28,33 @@ import {
   discoveryDriftDisplay,
   discoveryEndReasonDisplay,
   runStatusDisplay,
+  submissionProbeReasonDisplay,
+  submissionProbeResultDisplay,
   toneClass,
   usesScenarios,
 } from '../../display/labels';
 import type { AuditJobStartView } from '../../server/audit-job-functions';
-import type { CandidateFieldView, DiscoveryCandidateDetailView } from '../../server/discovery-documents';
+import type { CandidateFieldView, DiscoveryCandidateDetailView, SubmissionProbeView } from '../../server/discovery-documents';
 import { discoveryPageFn, startDiscoveryFn, type DiscoveryCandidateView, type DiscoveryPageView } from '../../server/discovery-functions';
+import { scenarioAutoDraftPreviewFn } from '../../server/scenario-autodraft-functions';
+import { ScenarioAutoDraftPanel } from '../../components/ScenarioAutoDraftPanel';
 
 export const Route = createFileRoute('/discovery/$profileId')({
   loader: async ({ params }) => {
-    const page = await discoveryPageFn({ data: { profileId: params.profileId } });
+    // FM2b: シナリオの下書きをボタン 1 回で作るまとまりの値（押せない理由と、確認のダイアログの一覧。保存しない）も読む。
+    const [page, autoDraft] = await Promise.all([
+      discoveryPageFn({ data: { profileId: params.profileId } }),
+      scenarioAutoDraftPreviewFn({ data: { profileId: params.profileId } }),
+    ]);
     if (page === null) {
       throw notFound();
     }
-    return page;
+    return { ...page, autoDraft };
   },
   component: DiscoveryPage,
 });
 
 const text = LOCAL_UI_DISCOVERY_TEXT;
-
-/** 取り消していないプロファイルの状態。 */
-const ACTIVE_PROFILE_STATUS = 'ACTIVE';
 
 /** 候補の画面のまとまり（画面の Origin と path）。 */
 interface CandidateGroup {
@@ -115,6 +122,40 @@ const fieldOptionsOf = (field: CandidateFieldView): string => {
   return field.omittedOptionCount > 0 ? listText([...values, text.optionsOmitted(formatCount(field.omittedOptionCount))]) : listText(values);
 };
 
+/** T37c（Task 37 の設計書 3.6）: 送らずに観察する probe の結果（結果、理由、型の要点。最小の表示。詳しい画面は T37e）。 */
+function SubmissionProbes({ probes }: Readonly<{ probes: readonly SubmissionProbeView[] }>) {
+  const probeText = text.submissionProbe;
+  return (
+    <section data-testid="candidate-submission-probes">
+      <h4>{probeText.heading}</h4>
+      <p>{probeText.body}</p>
+      {probes.map((probe, index) => {
+        const result = submissionProbeResultDisplay(probe.result);
+        return (
+          <dl className="facts" key={`${probe.result}:${String(index)}`} data-probe-result={probe.result}>
+            <dt>{probeText.result}</dt>
+            <dd><span className={toneClass(result.tone)}>{result.label}</span>{result.description === null ? null : <> {result.description}</>}</dd>
+            <dt>{probeText.reason}</dt>
+            <dd>{probe.reason === null ? probeText.noReason : labelWithCodeText(submissionProbeReasonDisplay(probe.reason).label, probe.reason)}</dd>
+            {probe.shape === null ? (
+              <><dt>{probeText.method}</dt><dd>{probeText.noShape}</dd></>
+            ) : (
+              <>
+                <dt>{probeText.method}</dt>
+                <dd><code>{probe.shape.method}</code></dd>
+                <dt>{probeText.pathShape}</dt>
+                <dd><code>{probe.shape.pathShape}</code></dd>
+                <dt>{probeText.bodyKeys}</dt>
+                <dd>{probe.shape.bodyKeyNames.length === 0 ? probeText.noBodyKeys : listText(probe.shape.bodyKeyNames)}</dd>
+              </>
+            )}
+          </dl>
+        );
+      })}
+    </section>
+  );
+}
+
 /** 候補の詳しい内容（候補を最後に見た発見のジョブの `discovery.json` から）。 */
 function CandidateDetail({ candidate, detail }: Readonly<{ candidate: DiscoveryCandidateView; detail: DiscoveryCandidateDetailView }>) {
   const classification = candidateClassificationDisplay(candidate.classification);
@@ -146,6 +187,7 @@ function CandidateDetail({ candidate, detail }: Readonly<{ candidate: DiscoveryC
           {detail.incompleteReasons.map((reason) => <li key={reason}>{DISCOVERY_INCOMPLETE_REASON_DESCRIPTIONS[reason]}</li>)}
         </ul>
       )}
+      {detail.submissionProbes.length === 0 ? null : <SubmissionProbes probes={detail.submissionProbes} />}
       <h4>{text.fieldsHeading}</h4>
       {detail.fields.length === 0 ? <p>{text.noFields}</p> : (
         <div className="table-wrap">
@@ -239,6 +281,27 @@ function CandidateRows({ candidate, page, editable }: Readonly<{ candidate: Disc
                   </Link>
                 </p>
               ) : null}
+              {/* T38f（Task 38 の設計書 3.7）: API の候補は、probe の行（型）ごとに「API のシナリオを作る」を出す（型の digest で行を選ぶ）。 */}
+              {editable ? candidate.apiScenarioRows.map((row) => (row.rejection !== null ? (
+                // T41e-2（Task 41 の設計書 3.3）: 型から API のシナリオを作れない行は、作成の画面へのリンクの代わりに理由を出す（判定はサーバの下書きの確かめと同じ部品）。
+                <p className="cell-action" key={row.shapeDigest} data-testid="candidate-api-scenario-rejected" data-shape-digest={row.shapeDigest}
+                  data-reason={row.rejection}>
+                  <span>{LOCAL_UI_SCENARIO_TEXT.apiCandidateRejected(row.method, row.pathShape)}</span>
+                  <span className="field-hint">{SCENARIO_DRAFT_REJECTION_DESCRIPTIONS[row.rejection].description}</span>
+                </p>
+              ) : (
+                <p className="cell-action" key={row.shapeDigest}>
+                  <Link
+                    to="/scenarios/$profileId/new"
+                    params={{ profileId: page.profile.profileId }}
+                    search={{ candidate: candidate.identityDigest, shape: row.shapeDigest }}
+                    data-testid="candidate-create-api-scenario"
+                    data-shape-digest={row.shapeDigest}
+                  >
+                    {LOCAL_UI_SCENARIO_TEXT.createApiFromCandidate(row.method, row.pathShape)}
+                  </Link>
+                </p>
+              ))) : null}
             </>
           )}
         </td>
@@ -407,6 +470,9 @@ function DiscoveryPage() {
           </>
         )}
       </section>
+
+      {/* FM2b: シナリオを使うプロファイルだけ、下書きをボタン 1 回で作るまとまりを出す（押せない理由は、まとまりの中に出す）。 */}
+      {usesScenarios(profile.mode, profile.auth) ? <ScenarioAutoDraftPanel profileId={profile.profileId} preview={page.autoDraft} /> : null}
 
       <section className="panel" data-testid="discovery-candidates">
         <h2 className="panel-heading">{text.candidatesHeading}</h2>

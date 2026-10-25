@@ -18,6 +18,10 @@
  *   T30c（Task 30 の設計書 5 章）: 入力の部品を、ログインの入力の部品と書き込みの入力の部品（`src/browser/write-form-submitter.ts`）の 2 つに
  *   広げた。数える操作に、`uncheck`、`setChecked`、`dispatchEvent`、`dblclick`、`tap`、`dragTo` を足した（`click` の例外のファイルでも、これらは
  *   許さない）。
+ *   T37c（Task 37 の設計書 3.2 の「押下」）: 入力の部品に、送らずに観察する probe の押す部品（`src/interaction/submission-probe.ts`。凍結した Context で
+ *   合成の目印を入れ、`select` を選び、押す）を足した（ちょうど 3 つ）。この部品は `fill`・`selectOption`・`click` だけを使う。
+ *   T39d（Task 39 の設計書 3.5）: API のシナリオの書き込みの入力と押下の部品（`src/browser/api-write-submitter.ts`）を足した（ちょうど 4 つ）。この部品も
+ *   `fill`・`selectOption`・`click` だけを使う。
  * - (x) 入力の部品（`login-form-submitter`）を参照する（import、動的 import、`require`、文字列）のは、自動ログインの段
  *   （`src/worker/automated-login.ts`）だけ。手動のログインの段（`authenticated-login.ts`）は参照しない。書き込みの入力の部品を参照してよい
  *   ファイルは、`write-stage-boundary.test.ts` の (d) が決める。
@@ -38,7 +42,8 @@ const HOOK_OWNER_PATHS: ReadonlySet<string> = new Set([
   // T26d-2: 自動ログインの段（`launchAutomatedLoginBrowser` を依存として受ける）。
   'src/worker/automated-login.ts',
 ]);
-const TEST_ONLY_HOOK_NAMES: readonly string[] = ['onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore'];
+// FM-2: ジョブのブラウザを表示しないテストだけの口（`hideJobBrowser`。process の組み立てだけが持つ）を足した。
+const TEST_ONLY_HOOK_NAMES: readonly string[] = ['onLoginPageReady', 'launchLoginBrowser', 'launchAutomatedLoginBrowser', 'openCredentialStore', 'hideJobBrowser'];
 const ENTRY_CALL = /\brunAuditWorkerProcess\s*\(([^)]*)\)/gu;
 const ENVIRONMENT_READS = /\bprocess\s*\.\s*(?:env|argv)\b/gu;
 /**
@@ -50,8 +55,20 @@ const INPUT_OPERATIONS = /\.\s*(?:fill|press|pressSequentially|setInputFiles|che
 const FORM_SUBMITTER_PATH = 'src/browser/login-form-submitter.ts';
 /** (q) の例外（T30c: 書き込みの入力の部品）。 */
 const WRITE_FORM_SUBMITTER_PATH = 'src/browser/write-form-submitter.ts';
-/** (q) 入力の操作を許すファイル（閉じた一覧。ちょうど 2 つ）。 */
-const INPUT_OPERATION_OWNERS: ReadonlySet<string> = new Set([FORM_SUBMITTER_PATH, WRITE_FORM_SUBMITTER_PATH]);
+/**
+ * (q) の例外（T37c: 送らずに観察する probe の押す部品。凍結した Context で、候補の範囲の欄に合成の目印を入れ、`select` を選び、押す。Guard が凍結の段で
+ * すべての要求を止める）。
+ */
+const SUBMISSION_PROBE_PATH = 'src/interaction/submission-probe.ts';
+/**
+ * (q) の例外（T39d: API のシナリオの書き込みの入力と押下の部品。書き込みの段の Context で、確かめた欄に値を入れ、`select` を選び、送信の要素を押す。
+ * Guard の書き込みの段が送る中身を照らす）。
+ */
+const API_WRITE_SUBMITTER_PATH = 'src/browser/api-write-submitter.ts';
+/** (q) 入力の操作を許すファイル（閉じた一覧。ちょうど 4 つ）。 */
+const INPUT_OPERATION_OWNERS: ReadonlySet<string> = new Set([
+  FORM_SUBMITTER_PATH, WRITE_FORM_SUBMITTER_PATH, SUBMISSION_PROBE_PATH, API_WRITE_SUBMITTER_PATH,
+]);
 /**
  * (q) `click` だけの例外（T26g-1）: 既存の Interaction の部品。隔離した Context で、読み取りだけの操作の候補を押す（値を入れない。要求は
  * Interaction の Guard が止める）。ここでも `click` のほかの入力の操作は許さない。
@@ -124,8 +141,11 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     expect(leaks).toEqual([]);
   });
 
-  it('(q) src/ never types into the page, except the two form input owners (login and write)', () => {
-    expect([...INPUT_OPERATION_OWNERS]).toEqual(['src/browser/login-form-submitter.ts', 'src/browser/write-form-submitter.ts']);
+  it('(q) src/ never types into the page, except the four input owners (login, write, the submission probe and the API write)', () => {
+    expect([...INPUT_OPERATION_OWNERS]).toEqual([
+      'src/browser/login-form-submitter.ts', 'src/browser/write-form-submitter.ts', 'src/interaction/submission-probe.ts',
+      'src/browser/api-write-submitter.ts',
+    ]);
     const operations = SOURCE_FILES
       .filter(({ path }) => !INPUT_OPERATION_OWNERS.has(path))
       .flatMap((file) => findInputOperations(file)
@@ -144,6 +164,12 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     for (const operation of ['.fill(', '.selectOption(', '.check(', '.uncheck(', '.click(']) {
       expect(findInputOperations(writeOwner ?? scanSource('')), operation).toContain(operation);
     }
+    // T37c: 送らずに観察する probe の押す部品も、実際に目印を入れ、選び、押す（例外の一覧が古くなっていない）。ほかの入力の操作（check など）は使わない。
+    const probeOwner = SOURCE_FILES.find(({ path }) => path === SUBMISSION_PROBE_PATH);
+    expect([...new Set(findInputOperations(probeOwner ?? scanSource('')))].sort()).toEqual(['.click(', '.fill(', '.selectOption(']);
+    // T39d: API の書き込みの入力と押下の部品も、`fill`・`selectOption`・`click` だけを使う（ほかの入力の操作は使わない）。
+    const apiWriteOwner = SOURCE_FILES.find(({ path }) => path === API_WRITE_SUBMITTER_PATH);
+    expect([...new Set(findInputOperations(apiWriteOwner ?? scanSource('')))].sort()).toEqual(['.click(', '.fill(', '.selectOption(']);
   });
 
   it('(x) only the automated login stage refers to the form input owner (the manual login stage does not)', () => {

@@ -38,6 +38,7 @@ import { SafetyLedger, type SafetyLedgerSnapshot } from '../../src/safety/safety
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { NO_NON_READ_REQUESTS, openServerWindow, QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
+import { roundsOf } from '../helpers/test-rounds.js';
 
 /** fixture のページ。 */
 const RACE_PAGE = '/popup-close-race.html';
@@ -46,10 +47,10 @@ const FORBIDDEN_PATH = '/def085-forbidden';
 /** 同じ Origin の、除外のパスの前方一致と、その下の届いてはいけないパス。 */
 const EXCLUDED_PATH_PREFIX = '/def085-excluded/';
 const EXCLUDED_PATH = `${EXCLUDED_PATH_PREFIX}logout`;
-/** burst の場面の回数。 */
-const BURST_ROUNDS = 20;
-/** storm の場面の回数。 */
-const STORM_ROUNDS = 40;
+/** burst の場面の回数（値は `test-rounds.ts`。TS-b のふだんの組と全部の組）。 */
+const BURST_ROUNDS = roundsOf('popupCloseRaceBurst');
+/** storm の場面の回数（値は `test-rounds.ts`）。 */
+const STORM_ROUNDS = roundsOf('popupCloseRaceStorm');
 /** storm を続けさせる時間（ms）。この後、Guard が閉じていなければ持ち主が閉じる。 */
 const STORM_RUN_MS = 300;
 /** 全部の回の後に、閉じた後に遅れて届く要求を見逃さないために待つ時間（ms）。期限ではなく、確かめる前の余裕である。 */

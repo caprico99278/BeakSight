@@ -23,7 +23,7 @@ import {
   findingCategoriesInSection,
   sortByDisplayOrder,
 } from '../../src/presentation/catalog.js';
-import { describeIncompleteReason, describeInteractionReason } from '../../src/presentation/messages.js';
+import { describeIncompleteReason, describeInteractionReason, nextStepOfIncompleteReason } from '../../src/presentation/messages.js';
 import { buildReportViewModel, type ReportViewModel } from '../../src/report/view-model.js';
 import {
   FIXTURE_ORIGIN,
@@ -202,7 +202,8 @@ describe('buildReportViewModel: the run summary (design 6.1.3, 6.1.4)', () => {
       reached: { maxPagesReached: true, maxDepthReached: false, maxRuntimeReached: false },
     });
     expect(model.summary.incompleteReasons).toEqual([
-      { code: 'MAX_PAGES_REACHED', detail: null, description: describeIncompleteReason('MAX_PAGES_REACHED') },
+      // T44h の判断 (1): 未完了の理由は、どれも次にできること（`nextStepOfIncompleteReason`）を持つ。
+      { code: 'MAX_PAGES_REACHED', detail: null, description: describeIncompleteReason('MAX_PAGES_REACHED'), nextStep: nextStepOfIncompleteReason('MAX_PAGES_REACHED') },
     ]);
     expect(model.summary.unverifiedInteractionCount).toBe(2);
     expect(model.summary.unverifiedInternalLinkCount).toBe(1);
@@ -604,7 +605,7 @@ describe('buildReportViewModel: pages and the records before a retry (design 6.1
       ['mobile', 'SKIPPED', null],
     ]);
     expect(skipped.incompleteReasons).toEqual([
-      { code: 'MAX_PAGES_REACHED', detail: null, description: describeIncompleteReason('MAX_PAGES_REACHED') },
+      { code: 'MAX_PAGES_REACHED', detail: null, description: describeIncompleteReason('MAX_PAGES_REACHED'), nextStep: nextStepOfIncompleteReason('MAX_PAGES_REACHED') },
     ]);
     expect(skipped.viewports[0]?.incompleteReasons).toEqual(skipped.incompleteReasons);
     expect(pageView(model, PAGE_1).pageJsonPath).toBe('pages/PAGE-000001/page.json');
@@ -673,6 +674,8 @@ describe('buildReportViewModel: Interactions and Safety (design 6.1.4)', () => {
           code: 'SESSION_OPEN_DEADLINE',
           detail: 'reason 8',
           description: describeInteractionReason('SESSION_OPEN_DEADLINE'),
+          // T44c: Interaction の理由は、次にできることを持たない。
+          nextStep: null,
         },
         location: {
           evidenceId: idOf(E_INTERACTION_1),
@@ -720,6 +723,7 @@ describe('buildReportViewModel: Interactions and Safety (design 6.1.4)', () => {
         code: payload!.reason,
         detail: payload!.reasonDetail,
         description: describeInteractionReason(payload!.reason),
+        nextStep: null,
       });
       expect(item, item.evidenceId).not.toHaveProperty('reasonDetail');
     }
@@ -727,6 +731,7 @@ describe('buildReportViewModel: Interactions and Safety (design 6.1.4)', () => {
       code: 'CLICK_FAILED',
       detail: null,
       description: describeInteractionReason('CLICK_FAILED'),
+      nextStep: null,
     });
   });
 
@@ -763,8 +768,8 @@ describe('buildReportViewModel: the Safety events (design 6.1.10)', () => {
   const S_EMPTY = safety(43, PAGE_1, 'mobile');
   const S_SECOND = safety(44, PAGE_2, 'mobile', {
     blockedRequests: [
-      { method: 'DELETE', url: url('/api/second-1'), reason: 'NON_READ_METHOD' },
-      { method: 'PATCH', url: url('/api/second-2'), reason: 'NON_READ_METHOD' },
+      { method: 'DELETE', url: url('/api/second-1'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
+      { method: 'PATCH', url: url('/api/second-2'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
     ],
   });
   const S_NO_VIEWPORT = safety(45, PAGE_2, null, {

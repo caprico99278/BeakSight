@@ -138,6 +138,8 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     await page.fill('#customer_name', NAME_VALUE);
     await page.fill('#memo', MEMO_VALUE);
     await options.beforeClick?.();
+    // T40R-fix-A: 値を入れる間は窓の観察の段。押す直前に送信の段を開く（書き込みの入力の部品と同じ順。窓を開かない回は開けない）。
+    monitor.openSubmissionPhase();
     await Promise.all([
       page.waitForEvent('framenavigated', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined),
       page.click('#go'),
@@ -225,6 +227,8 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     await monitor.openSubmissionWindow(page);
     await page.fill('#customer_name', NAME_VALUE);
     await page.fill('#memo', MEMO_VALUE);
+    // T40R-fix-A: 押す直前に送信の段を開く。
+    monitor.openSubmissionPhase();
     await page.click('#go', { noWaitAfter: true });
     await wait(QUIET_PERIOD_MS * 2);
     expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.createHang}`);
@@ -270,6 +274,8 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     await monitor.openSubmissionWindow(page);
     await page.fill('#customer_name', NAME_VALUE);
     await page.fill('#memo', MEMO_VALUE);
+    // T40R-fix-A: 押す直前に送信の段を開く。
+    monitor.openSubmissionPhase();
     await page.click('#go', { noWaitAfter: true });
     await wait(QUIET_PERIOD_MS * 2);
     expectedNonRead.push(`A POST ${WRITE_FIXTURE_PATHS.createHang}`);
@@ -315,7 +321,15 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     { round: 'a POST whose action the page rewrites before the submission', variant: 'js-action', evidence: (ledger) => blockedPosts(ledger, WRITE_FIXTURE_PATHS.otherPath) === 1 },
     { round: 'a text/plain POST', variant: 'text-plain', evidence: (_ledger, monitor) => payloadReason(monitor, 'ENCTYPE_NOT_ALLOWED') },
     { round: 'a POST from a document that is not UTF-8', variant: 'sjis', evidence: (_ledger, monitor) => payloadReason(monitor, 'DOCUMENT_CHARSET_NOT_UTF8') },
-    { round: 'a POST without the submission window', variant: 'plain', openWindow: false, evidence: (_ledger, monitor) => payloadReason(monitor, 'DOCUMENT_CHARSET_UNKNOWN') },
+    // T40R-fix-A: 窓を開かなければ送信の段も開けない。承認の形の POST は、照合（前は `DOCUMENT_CHARSET_UNKNOWN` で止めた）の前に、要求の判定で止まる
+    // （Safety Ledger に止めた POST が残り、照合にはかけない）。
+    {
+      round: 'a POST without the submission window',
+      variant: 'plain',
+      openWindow: false,
+      evidence: (ledger, monitor) => blockedPosts(ledger, WRITE_FIXTURE_PATHS.create) === 1
+        && Object.values(monitor.snapshot().blockedByPayloadReason).every((count) => count === 0),
+    },
     {
       round: 'a multipart POST with the content of a file',
       variant: 'file',
@@ -364,6 +378,8 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
       + '<button id="go" type="submit">register</button></form>');
     await page.fill('#customer_name', NAME_VALUE);
     await page.fill('#memo', MEMO_VALUE);
+    // T40R-fix-A: 押す直前に送信の段を開く（送信の段でも、測った文書と違う文書の POST は通さない）。
+    monitor.openSubmissionPhase();
     await page.click('#go');
     await wait(QUIET_PERIOD_MS * 2);
     expect(monitor.submissionReport().submission).toBe('NOT_SENT');
@@ -378,6 +394,8 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
     await monitor.openSubmissionWindow(page);
     await frame.locator('#customer_name').fill(NAME_VALUE);
     await frame.locator('#memo').fill(MEMO_VALUE);
+    // T40R-fix-A: 押す直前に送信の段を開く（送信の段でも、iframe の form の POST は通さない）。
+    monitor.openSubmissionPhase();
     await frame.locator('#go').click();
     await wait(QUIET_PERIOD_MS * 2);
     expect(monitor.submissionReport().submission).toBe('NOT_SENT');
@@ -387,14 +405,25 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
   it('does not deliver the POST of a popup (a form with target _blank)', async () => {
     const { page, ledger, monitor } = await openGuarded();
     const popup = page.waitForEvent('popup', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => null);
-    await submitForm(page, monitor, 'popup');
+    // DEF-154: 混雑の下では、Guard が popup の最初のナビゲーション（承認の形の POST）を fail-closed で止めて Context を閉じるのが、`page.click` の
+    // 戻りより先になる回がある（「Target page, context or browser has been closed」）。その回は、ページが閉じていて、その POST に結びつく
+    // fail-closed の記録（`PASSIVE_GUARD_PAGE_NOT_READY`）が Ledger にあるときだけ続け、止めた証拠のある回に数える。ほかの誤りは投げ直す。
+    const isFailClosedPopupPost = (entry: { readonly code: string; readonly request?: { readonly method: string; readonly path: string } }): boolean =>
+      entry.code === 'PASSIVE_GUARD_PAGE_NOT_READY' && entry.request?.method === 'POST' && entry.request.path === WRITE_FIXTURE_PATHS.create;
+    let closedByFailClosed = false;
+    try {
+      await submitForm(page, monitor, 'popup');
+    } catch (error) {
+      if (!page.isClosed() || !ledger.snapshot().invariantViolations.some(isFailClosedPopupPost)) throw error;
+      closedByFailClosed = true;
+    }
     const opened = await popup;
     await opened?.waitForLoadState('load', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined);
     await wait(QUIET_PERIOD_MS * 2);
     const snapshot = ledger.snapshot();
     console.info(`T30b (${name}) popup: violations ${JSON.stringify(snapshot.invariantViolations.map((entry) => entry.code))}; `
       + `blocked ${JSON.stringify(snapshot.blockedRequests.map((entry) => `${entry.method} ${new URL(entry.url).pathname}`))}; `
-      + `monitor ${JSON.stringify(monitor.snapshot())}`);
+      + `monitor ${JSON.stringify(monitor.snapshot())}; closed by fail-closed during the click ${closedByFailClosed}`);
     expect(monitor.submissionReport().submission).toBe('NOT_SENT');
     // 今の Guard のとおり、popup の最初のナビゲーションは、Guard が CDP の session を付けた印のない page の要求として route の層で止め、明示の
     // 理由の違反にして Context を閉じる（`PASSIVE_GUARD_PAGE_NOT_READY`。DEF-113 の直しの前は、frame の判定の失敗 `FRAME_CLASSIFICATION_FAILED`
@@ -405,9 +434,11 @@ describe.each(CHROMIUM_LAUNCHES)('T30b: the write stage of the Guard, with $name
       'the POST of a popup',
       ledger,
       monitor,
-      snapshot.invariantViolations.some((entry) => popupViolations.includes(entry.code))
-        || blockedPosts(ledger, WRITE_FIXTURE_PATHS.create) >= 1
-        || monitor.snapshot().blockedByPayloadReason.DOCUMENT_CHARSET_UNKNOWN === 1,
+      closedByFailClosed
+        ? snapshot.invariantViolations.some(isFailClosedPopupPost)
+        : snapshot.invariantViolations.some((entry) => popupViolations.includes(entry.code))
+          || blockedPosts(ledger, WRITE_FIXTURE_PATHS.create) >= 1
+          || monitor.snapshot().blockedByPayloadReason.DOCUMENT_CHARSET_UNKNOWN === 1,
       popupViolations,
     );
   }, ROUND_TIMEOUT_MS);

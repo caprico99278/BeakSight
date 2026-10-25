@@ -6,9 +6,10 @@
 // テストは、短い時間の指定（`TEST_POLICY`）で動かす。本番の名前つきの定数の値も確かめる。
 import { EventEmitter } from 'node:events';
 import type { Page, Request } from 'playwright';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   DISCOVERY_NETWORK_QUIET_MS,
+  DISCOVERY_RESPONSE_BODY_GRACE_MS,
   DISCOVERY_SETTLE_POLICY,
   DISCOVERY_SETTLE_TIMEOUT_MS,
   InFlightRequestCounter,
@@ -44,6 +45,44 @@ describe('T27b: the in-flight request counter', () => {
     emitter.emit('requestfailed', second);
     expect(counter.inFlight).toBe(0);
     expect(counter.quietSinceMs()).not.toBeNull();
+  });
+
+  // DEF-127（T37a fix round 1）: ページが応答の本文を読まない要求は、`requestfinished` が来ないことがある（実機で確かめた）。T37R-fix-B（T37R の I-2）:
+  // 応答を受けた要求は、応答から猶予（既定 2 秒）までは進行中に数え（本文が遅い応答を待つ）、猶予を過ぎたら外す。静かになった時刻は、猶予の終わり。
+  it('keeps a request in flight for the grace after its response, then takes it out at the end of the grace (DEF-127, T37R I-2)', () => {
+    vi.useFakeTimers({ now: 10_000 });
+    try {
+      expect(DISCOVERY_RESPONSE_BODY_GRACE_MS).toBe(2_000);
+      const { page, emitter } = fakePage();
+      const counter = new InFlightRequestCounter(page);
+      const [unread, finished, waiting] = [fakeRequest(), fakeRequest(), fakeRequest()];
+      emitter.emit('request', unread);
+      emitter.emit('request', finished);
+      emitter.emit('request', waiting);
+      emitter.emit('response', { request: () => unread });
+      emitter.emit('response', { request: () => finished });
+      expect(counter.inFlight).toBe(3);
+      vi.advanceTimersByTime(500);
+      // 本文の終わりが来た要求は、すぐに外れる（2 回目の数え下げにならない）。
+      emitter.emit('requestfinished', finished);
+      emitter.emit('requestfinished', finished);
+      expect(counter.inFlight).toBe(2);
+      emitter.emit('requestfailed', waiting);
+      expect(counter.inFlight).toBe(1);
+      expect(counter.quietSinceMs()).toBeNull();
+      vi.advanceTimersByTime(DISCOVERY_RESPONSE_BODY_GRACE_MS - 500 - 1);
+      expect(counter.quietSinceMs()).toBeNull();
+      vi.advanceTimersByTime(1);
+      expect(counter.inFlight).toBe(0);
+      expect(counter.quietSinceMs()).toBe(10_000 + DISCOVERY_RESPONSE_BODY_GRACE_MS);
+      // 静かになった時刻は、読み直しても変わらない（落ち着きの待ちの「読み取りの間も静か」の比べ）。
+      vi.advanceTimersByTime(300);
+      expect(counter.quietSinceMs()).toBe(10_000 + DISCOVERY_RESPONSE_BODY_GRACE_MS);
+      counter.dispose();
+      expect(emitter.listenerCount('response')).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('ignores the end of a request that started before it began counting, and stops counting after dispose', () => {

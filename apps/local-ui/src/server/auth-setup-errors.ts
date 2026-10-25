@@ -7,10 +7,15 @@
  * - 同じコード・項目・行の誤りは 1 つにまとめる。
  * - T26e（Task 26 の設計書 4.3）: 自動ログインの項目（3 つのセレクタと、4 つの失敗の条件のパスとセレクタ）を足した。失敗の条件の全体を指す誤り
  *   （条件の重なり）は、その条件のパスの欄に出す。
+ * - T34d（Task 34 の設計書 3.2、3.6）: 版 3 の項目（ログインの送り方、token の送信先の Origin・path・必須の query、ログインに伴う送信、成功の
+ *   ローカル ストレージの鍵の Origin・接頭辞・接尾辞）を足した。項目の全体を指す誤りは、その項目の最初の欄に出す。必須の query とログインに伴う
+ *   送信は、行（1 から）も出す。
+ * - T35d（Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出しの一覧（行を出す）と、サービスの Origin への要求の上限（1 分あたり・1 回の Run
+ *   あたり）の欄を足した。上限の全体を指す誤りは、1 分あたりの欄に出す。
  */
 import {
   AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS,
-  type AuthSetup,
+  type AuthSetupV3,
   type AuthSetupValidationError,
   type AuthSetupValidationErrorCode,
   type AutomatedLoginSetup,
@@ -29,7 +34,7 @@ export const failureConditionPathFieldOf = (kind: AutomatedLoginFailureCondition
 export const failureConditionSelectorFieldOf = (kind: AutomatedLoginFailureConditionKind): FailureConditionSelectorField => `${kind}Selector`;
 
 /** 自動ログインの設定の、文書の項目の名前（位置の区切り）。 */
-const AUTOMATED_LOGIN_DOCUMENT_NAME = 'automatedLogin' satisfies keyof AuthSetup;
+const AUTOMATED_LOGIN_DOCUMENT_NAME = 'automatedLogin' satisfies keyof AuthSetupV3;
 const FAILURE_CONDITIONS_DOCUMENT_NAME = 'failureConditions' satisfies keyof AutomatedLoginSetup;
 
 /** 認証の設定のフォームの項目（画面の入力の欄）のうち、自動ログインの失敗の条件でないもの。 */
@@ -46,6 +51,20 @@ const BASE_AUTH_SETUP_FORM_FIELDS = Object.freeze([
   'usernameSelector',
   'passwordSelector',
   'submitSelector',
+  // T34d（Task 34 の設計書 3.2、3.6）: 版 3 のスクリプトで送るログインの欄（ログインの送り方、token の送信先、必須の query、ログインに伴う送信、
+  // 成功のローカル ストレージの鍵）。
+  'loginTransport',
+  'scriptOrigin',
+  'scriptPath',
+  'requiredQuery',
+  'loginSideRequests',
+  'storageOrigin',
+  'storagePrefix',
+  'storageSuffix',
+  // T35d（Task 35 の設計書 3.1）: 監査の段の読み取りの手続きの呼び出しの一覧と、サービスの Origin への要求の上限（1 分あたり、1 回の Run あたり）。
+  'auditReadRequests',
+  'servicePerMinute',
+  'servicePerRun',
 ] as const);
 
 /** 認証の設定のフォームの項目（T26e: 自動ログインの失敗の条件のパスとセレクタの欄を含む）。 */
@@ -67,7 +86,7 @@ export interface AuthSetupErrorView {
 }
 
 /** 位置の区切りの並び（文書の項目の名前）と、フォームの項目。 */
-type FieldLocation = readonly [keyof AuthSetup, ...string[]];
+type FieldLocation = readonly [keyof AuthSetupV3, ...string[]];
 
 /** 文書の項目の位置と、フォームの項目。 */
 const DOCUMENT_FIELD_LOCATIONS: readonly (readonly [FieldLocation, AuthSetupFormField])[] = Object.freeze([
@@ -79,6 +98,22 @@ const DOCUMENT_FIELD_LOCATIONS: readonly (readonly [FieldLocation, AuthSetupForm
   [['excludedPaths'], 'excludedPaths'],
   [['auditPathPrefixes'], 'auditPathPrefixes'],
   [['maxLoginAttempts'], 'maxLoginAttempts'],
+  // T34d: 版 3 の項目。項目の全体を指す誤り（要る・持てない・鍵の形）は、その項目の最初の欄に出す。
+  [['loginTransport'], 'loginTransport'],
+  [['scriptLogin'], 'scriptOrigin'],
+  [['scriptLogin', 'origin'], 'scriptOrigin'],
+  [['scriptLogin', 'path'], 'scriptPath'],
+  [['scriptLogin', 'requiredQuery'], 'requiredQuery'],
+  [['loginSideRequests'], 'loginSideRequests'],
+  [['successStorageKey'], 'storageOrigin'],
+  [['successStorageKey', 'origin'], 'storageOrigin'],
+  [['successStorageKey', 'prefix'], 'storagePrefix'],
+  [['successStorageKey', 'suffix'], 'storageSuffix'],
+  // T35d: 監査の段の項目。要求の上限の全体を指す誤りは、1 分あたりの欄に出す。
+  [['auditReadRequests'], 'auditReadRequests'],
+  [['serviceRequestLimits'], 'servicePerMinute'],
+  [['serviceRequestLimits', 'perMinute'], 'servicePerMinute'],
+  [['serviceRequestLimits', 'perRun'], 'servicePerRun'],
   [[AUTOMATED_LOGIN_DOCUMENT_NAME, 'usernameSelector'], 'usernameSelector'],
   [[AUTOMATED_LOGIN_DOCUMENT_NAME, 'passwordSelector'], 'passwordSelector'],
   [[AUTOMATED_LOGIN_DOCUMENT_NAME, 'submitSelector'], 'submitSelector'],
@@ -91,7 +126,13 @@ const DOCUMENT_FIELD_LOCATIONS: readonly (readonly [FieldLocation, AuthSetupForm
 ]);
 
 /** 1 行に 1 つの項目（行を出す）。 */
-const LIST_FIELDS: ReadonlySet<AuthSetupFormField> = new Set(['loginPostEndpoints', 'excludedPaths', 'auditPathPrefixes']);
+const LIST_FIELDS: ReadonlySet<AuthSetupFormField> = new Set([
+  'loginPostEndpoints', 'excludedPaths', 'auditPathPrefixes',
+  // T34d: 版 3 の、行を足して入れる一覧（必須の query、ログインに伴う送信）。
+  'requiredQuery', 'loginSideRequests',
+  // T35d: 監査の段の読み取りの手続きの呼び出し。
+  'auditReadRequests',
+]);
 /** 配列の位置の区切り（0 から）。 */
 const ARRAY_INDEX = /^\d+$/u;
 

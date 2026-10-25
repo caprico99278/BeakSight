@@ -48,8 +48,8 @@ const readChange = (change: Partial<NonNullable<ScenarioRevision['verification']
   verificationChange({ readVerification: { ...READ, ...change } });
 
 describe('approval digest (T28a)', () => {
-  it('has a versioned format mark (version 3 since the UPDATE spec, T31b) and returns a sha256 fingerprint', () => {
-    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/3');
+  it('has a versioned format mark (version 4 since the API items, T38c; version 3 was the UPDATE spec, T31b) and returns a sha256 fingerprint', () => {
+    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/4');
     expect(isSha256Fingerprint(BASE_DIGEST)).toBe(true);
   });
 

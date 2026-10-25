@@ -18,7 +18,7 @@ import {
   type AuditRunStart,
 } from '../../src/cli/audit-run.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import type { RunNotice } from '../../src/orchestration/run-coordinator.js';
@@ -29,6 +29,7 @@ import {
   type AuthenticatedSite,
 } from '../helpers/authenticated-site-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 const LAUNCHERS = [
@@ -116,7 +117,7 @@ describe.each(LAUNCHERS)('T25d: executeAuditRun with the authentication (%s)', (
     expect(lostUrl.startsWith(`${started.originA}${AUTH_SITE_PATHS.admin}/`)).toBe(true);
     // 1 ページ目は監査済み。止まったのは、その後のページ。
     expect(lostUrl).not.toBe(`${started.originA}${AUTH_SITE_PATHS.admin}`);
-    expect(started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect(started.requests.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
 
     // 認証の指定なしでは、設定が違う（`audit.interactions`）ので、止まった Run を再開しない。
     const starts: AuditRunStart[] = [];
@@ -142,6 +143,6 @@ describe.each(LAUNCHERS)('T25d: executeAuditRun with the authentication (%s)', (
     expect(starts[0]?.notices).toEqual([]);
     expect(resumed.runId).toBe(first.runId);
     expect(resumed.summary.executions.count).toBe(2);
-    expect(started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect(started.requests.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
   }, TEST_TIMEOUT_MS);
 });

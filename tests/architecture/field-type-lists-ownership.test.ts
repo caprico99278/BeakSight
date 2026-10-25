@@ -19,7 +19,7 @@ import {
   SELECT_FIELD_TYPES,
   VALUE_INPUT_FIELD_TYPES,
 } from '../../src/discovery/candidate-contracts.js';
-import { findNamedImports, loadLocalUiSourceFiles, loadSourceFiles, scanSource, type SourceFile } from './source-scan.js';
+import { findNamedImports, loadLocalUiSourceFiles, loadSourceFiles, scanSource, violationsOf, type SourceFile } from './source-scan.js';
 
 const SOURCE_FILES: readonly SourceFile[] = [...loadSourceFiles(), ...loadLocalUiSourceFiles()];
 
@@ -63,8 +63,8 @@ const copiedListsOf = (code: string): readonly string[] =>
     return GUARDED_LISTS.filter(([, list]) => sameSet(values, list)).map(([name]) => `${name}: ${array.replace(/\s+/gu, ' ')}`);
   });
 
-const violationsOf = (files: readonly SourceFile[]): readonly string[] =>
-  files.flatMap((file) => copiedListsOf(file.code).map((violation) => `${file.path}: ${violation}`));
+/** 一覧の書き写し（`<パス>: <見つけたもの>`。`source-scan.ts` の `violationsOf`。PRE42-CC 組 G）。 */
+const copiedListViolationsOf = (files: readonly SourceFile[]): readonly string[] => violationsOf(files, (file) => copiedListsOf(file.code));
 
 describe('field type lists (T30f fix round 2)', () => {
   it('lists the value input field types as the candidate field types without password, file and hidden (CCX-20)', () => {
@@ -88,7 +88,7 @@ describe('field type lists (T30f fix round 2)', () => {
 
   it('(a) keeps the lists in the owner only', () => {
     expect(SOURCE_FILES.some((file) => file.path === OWNER)).toBe(true);
-    expect(violationsOf(SOURCE_FILES.filter((file) => file.path !== OWNER))).toEqual([]);
+    expect(copiedListViolationsOf(SOURCE_FILES.filter((file) => file.path !== OWNER))).toEqual([]);
   });
 
   it('(b) the owner has the lists, and the users import them from the owner', () => {

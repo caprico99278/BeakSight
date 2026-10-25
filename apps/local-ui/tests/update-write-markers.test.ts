@@ -23,7 +23,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import type { Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { readWriteResult } from '../../../src/control/actions/write-result-facts.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2 } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import {
   createScenario,
   readApprovalReceipts,
@@ -223,7 +223,7 @@ describe('T31i: an UPDATE started on the screen with the real worker, up to the 
     })).toMatchObject({ ok: true });
     expect(await flow.valueOf('saveAuthSetupFn', 'POST', {
       setup: {
-        schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2, profileId: PROFILE_ID, profileRevision: FIRST_REVISION,
+        ...FORM_NAVIGATION_SETUP_ITEMS, profileId: PROFILE_ID, profileRevision: FIRST_REVISION,
         loginStartUrl: `${siteOf().origin}${WRITE_SITE_PATHS.login}`, loginPostEndpoints: [{ origin: siteOf().origin, path: WRITE_SITE_PATHS.login }],
         successCondition: { pathPrefix: WRITE_SITE_PATHS.list, selector: '#search' }, sessionLostCondition: { pathPrefix: WRITE_SITE_PATHS.login },
         excludedPaths: ['/logout'], auditPathPrefixes: [WRITE_SITE_PATHS.list], maxLoginAttempts: 2, allowedIdpOrigins: [], automatedLogin: null,

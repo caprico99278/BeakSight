@@ -99,6 +99,11 @@ export const WRITE_SITE_MODES = Object.freeze([
   'js-hidden-checkbox',
   'js-hidden-select',
   'js-enable-disabled',
+  // T40R-fix-A（Task 40 の設計書 7 章の T40R の I-1）: 名前とメールの欄がそろった入力の事象で、押されなくてもページの JS が form を送る（承認どおりの POST）。
+  'js-submit-on-input',
+  // T40R-fix-A2（設計書 7 章の「T40R-fix-A・B の報告」）: 登録の後に書き込みの画面（`/members/new`）へ戻し、その画面に登録の印（`.registered`）を出す
+  // （成功の条件に当たる画面が書き込みの画面のままで、その path が ID の型 `/members/{id}` に当たる形）。
+  'stay-on-form',
 ] as const);
 
 /** T30R2-fix-1（M-b）: `js-navigate-slow` の応答の遅れ（ms。結果を待つ上限より短く、ページの JS の移動より十分長い）。 */
@@ -194,8 +199,23 @@ export interface WriteSite {
   readonly keptMarker: string;
   /** T31R2-fix-1（C-1）: 秘密に見える名前の一覧に当たる一般の名前の hidden（`code`・`key`）を、登録と更新の画面に出す（`true`）・出さない（`false`）。 */
   setSecretHiddenFields(enabled: boolean): void;
+  /**
+   * T37a fix round 1: 登録の画面（`/members/new`）を開くたびに、ページの JS が `origin`（承認したサービスの Origin の代わりの別のサーバ）へ GET を
+   * `count` 回送る（`null` なら送らない。既定）。書き込みのジョブで、承認したサービスの Origin への要求の上限に届かせるため。
+   */
+  setServiceReads(origin: string | null, count: number): void;
+  /**
+   * T37R-fix-B（T37R の M-3）: 一覧の画面（`/members`。照合の READ の対象）を開くたびに、ページの JS が同じ Origin の fetch の POST
+   * （`WRITE_SITE_LIST_DATA_PATH`）でデータを取る（`true`）。監査の段の口のある書き込みのジョブでは Guard が止める。既定は送らない。
+   * T37R-fix-B2: `origin` を渡すと、同じ Origin ではなく `origin`（承認したサービスの Origin の代わりの別のサーバ）へ送る。止めたサービスの Origin への
+   * 読み取りでない要求は判定に使い、照合の READ は判定できない。同じ Origin への要求は数えて残すだけで、判定には使わない（設計書 8 章の最後の行）。
+   */
+  setListDataRequest(enabled: boolean, origin?: string): void;
   close(): Promise<void>;
 }
+
+/** T37R-fix-B: 一覧の画面のページの JS がデータを取る POST の path（Guard が止める。サーバは受けない想定）。 */
+export const WRITE_SITE_LIST_DATA_PATH = '/members/data';
 
 const randomValue = (): string => randomBytes(RANDOM_VALUE_BYTES).toString('hex');
 const escapeHtml = (value: string): string => value.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split('"').join('&quot;');
@@ -234,6 +254,12 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
   const keptMarker = `kept${randomValue()}`;
   let updatePages = false;
   let secretHiddenFields = false;
+  /** T37a fix round 1: 登録の画面のページの JS が送るサービスの読み取り（`setServiceReads`）。 */
+  let serviceReads: { origin: string | null; count: number } = { origin: null, count: 0 };
+  /** T37R-fix-B: 一覧の画面のページの JS が、同じ Origin の fetch の POST でデータを取る（`setListDataRequest`）。 */
+  let listDataRequest = false;
+  /** T37R-fix-B2: 一覧の画面のページの JS がデータを取る POST の宛先の Origin（空なら同じ Origin）。 */
+  let listDataOrigin = '';
   /** T31R2-fix-1（C-1）: 秘密に見える名前の一覧に当たる一般の名前の hidden（`setSecretHiddenFields`）。 */
   const secretHiddenHtml = (): string => (secretHiddenFields ? '<input type="hidden" name="code" value="c-1"><input type="hidden" name="key" value="k-1">' : '');
   let updateMode: WriteSiteUpdateMode = 'success';
@@ -242,6 +268,8 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
   const held: ServerResponse[] = [];
   let mode: WriteSiteMode = 'success';
   let nextId = FIRST_MEMBER_ID;
+  /** T40R-fix-A2: `stay-on-form` で、次の書き込みの画面に登録の印を出すか。 */
+  let registeredNoticePending = false;
   const p = WRITE_SITE_PATHS;
 
   const hasSession = (request: IncomingMessage): boolean => {
@@ -269,6 +297,9 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       'js-enable-disabled': "document.getElementById('f').addEventListener('submit', () => { const x = document.getElementById('c-parent'); x.disabled = false; x.value = 'p-9'; });",
       'js-navigate-slow': "document.getElementById('f').addEventListener('submit', () => { setTimeout(() => { "
         + `location.href = '${p.create}/${nextId}'; }, ${JS_NAVIGATE_DELAY_MS}); });`,
+      'js-submit-on-input': "let autoSent = false; for (const id of ['name', 'email']) { document.getElementById(id).addEventListener('input', () => {"
+        + " if (!autoSent && document.getElementById('name').value !== '' && document.getElementById('email').value !== '') { autoSent = true;"
+        + " document.getElementById('f').submit(); } }); }",
     } as Partial<Record<WriteSiteMode, string>>)[mode] ?? '';
     if (optional) {
       return `<h1>会員の登録</h1><form id="f" method="post" action="${p.create}">`
@@ -296,7 +327,9 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       + '<input type="hidden" name="parent_id" id="c-parent" value="" disabled>'
       + secretHiddenHtml()
       + '<button id="register" type="submit">登録</button></form>'
-      + (script === '' ? '' : `<script>${script}</script>`);
+      + (script === '' ? '' : `<script>${script}</script>`)
+      + (serviceReads.origin === null ? ''
+        : `<script>for (let i = 0; i < ${serviceReads.count}; i += 1) fetch('${serviceReads.origin}/rest/v1/m' + i).catch(() => 0);</script>`);
   };
 
   const newMember = (id: number, name: string, email: string | null = null): (typeof members)[number] => ({
@@ -379,7 +412,8 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       + '<table><thead><tr><th>番号</th><th>名前</th></tr></thead><tbody>'
       + rows.map((member) => `<tr><td>${member.id}</td><td>${escapeHtml(member.name)}</td></tr>`).join('')
       + `</tbody></table><p>該当 ${rows.length} 件</p><p><a href="${p.form}">会員の登録へ</a></p>`
-      + (updatePages ? `<p>${members.map((member) => `<a href="${writeSiteRecordPathOf(member.id)}">会員 ${member.id}</a>`).join(' ')}</p>` : '');
+      + (updatePages ? `<p>${members.map((member) => `<a href="${writeSiteRecordPathOf(member.id)}">会員 ${member.id}</a>`).join(' ')}</p>` : '')
+      + (listDataRequest ? `<script>fetch('${listDataOrigin}${WRITE_SITE_LIST_DATA_PATH}', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => 0);</script>` : '');
   };
 
   /** 登録の送信先の応答（ファイルの先頭の説明）。 */
@@ -406,6 +440,13 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       case 'no-condition':
         register();
         response.writeHead(STATUS_SEE_OTHER, { location: p.done });
+        response.end();
+        return;
+      case 'stay-on-form':
+        register();
+        // T40R-fix-A2: 次に読み込む書き込みの画面に、登録の印を 1 回だけ出す。
+        registeredNoticePending = true;
+        response.writeHead(STATUS_SEE_OTHER, { location: p.form });
         response.end();
         return;
       case 'both-conditions': {
@@ -493,7 +534,10 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       return;
     }
     if (request.method === 'GET' && (url.pathname === p.form || url.pathname === p.optionalForm)) {
-      sendHtml(response, formHtml(url.pathname === p.optionalForm));
+      // T40R-fix-A2: `stay-on-form` の登録の直後の 1 回だけ、登録の印を足す。
+      const notice = registeredNoticePending && url.pathname === p.form ? '<p class="registered">登録しました</p>' : '';
+      registeredNoticePending = false;
+      sendHtml(response, formHtml(url.pathname === p.optionalForm) + notice);
       return;
     }
     if (request.method === 'POST' && url.pathname === p.create) {
@@ -581,6 +625,13 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
     keptMarker,
     setSecretHiddenFields: (enabled) => {
       secretHiddenFields = enabled;
+    },
+    setServiceReads: (origin, count) => {
+      serviceReads = { origin, count };
+    },
+    setListDataRequest: (enabled, origin) => {
+      listDataRequest = enabled;
+      listDataOrigin = origin ?? '';
     },
     enableUpdatePages: () => {
       updatePages = true;

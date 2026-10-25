@@ -33,7 +33,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { isRecord } from '../../src/core/guards.js';
-import { isProcessRunning } from '../../src/orchestration/run-checkpoint.js';
+import { isProcessRunning } from '../../src/core/process-lock.js';
 import { CLI_PROCESS_LIMIT_MS, type CliProcessResult } from './cli-process.js';
 import type { TemporaryBuild } from './temporary-build.js';
 

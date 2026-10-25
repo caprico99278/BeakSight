@@ -12,12 +12,14 @@
 //   読み直してやり直す）。規則の新しい版を保存しただけでも、承認の判定の今の事実が変わるので、参照を付け直す前から再承認が要る（`INPUT_RULES_CHANGED`）。
 // - 呼び出し側の誤り（形の違う ID・時刻・版、別の規則の集まりの id、契約の形に合わない中身、前の時刻）は、書く前に `RangeError`。
 import { deepFreeze } from '../../core/immutable.js';
+import { jsonCopyOf } from '../../core/json-copy.js';
 import { dateOfCompactUtcTimestamp } from '../../core/utc-timestamp.js';
 import { attachInputRuleReference, type ScenarioStoreResult } from '../approval/scenario-store.js';
 import { scenarioRowOf, scenarioViewOf } from '../approval/scenario-facts.js';
 import type { InputRuleReference } from '../approval/scenario-contracts.js';
 import { isProfileOperationAllowed } from '../execution-policy.js';
 import type { ControlDatabase } from '../store/control-database.js';
+import { RETIRED_PROFILE_STATUS } from '../store/profile-records.js';
 import { getProfile } from '../store/profile-store.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
 import { withReadTransaction, withWriteTransaction } from '../store/transaction.js';
@@ -85,7 +87,6 @@ export interface RuleSetSaveAndAttachResult {
   readonly attachment: ScenarioStoreResult | null;
 }
 
-const RETIRED_PROFILE_STATUS = 'RETIRED';
 const ONE_ROW = 1;
 
 const INSERT_RULE_SET_SQL = `INSERT INTO rule_sets (${RULE_SET_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)`;
@@ -115,7 +116,7 @@ const checkedSaveOf = (input: RuleSetSave): RuleSetSave => {
     ruleSetId: requireId(input.ruleSetId, 'rule set id'),
     scenarioId: requireId(input.scenarioId, 'scenario id'),
     expectedRevision: requireExpectedRevision(input.expectedRevision),
-    content: JSON.parse(JSON.stringify(input.content)) as RuleSetContent,
+    content: jsonCopyOf(input.content) as RuleSetContent,
     at: input.at,
   });
 };

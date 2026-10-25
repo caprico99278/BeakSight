@@ -15,13 +15,16 @@
  * - URL のパスは、要求の URL（URL の構文で正規化したもの）から、区切りごとに decode して読む（Router の解釈に頼らない）。decode できない区切り、
  *   decode して `/`・`\`・NUL を含む区切りは 404。
  * - `report.html` は、`<head>` の `<style>` の中身の SHA-256 を、内部の header で守りの部品に渡す（守りの部品が、script を動かさない CSP に
- *   入れる）。JSON と ZIP は `Content-Disposition: attachment`（ファイル名は ASCII の決まった形）。応答の守りの header（CSP、`nosniff` など）は、
+ *   入れる）。JSON と ZIP は `Content-Disposition: attachment`（ファイル名は ASCII の決まった形。PRE42-BN: プロファイルの名前の入ったバンドルの
+ *   名前が ASCII の外の文字を含むときは、ASCII の代わりの名前と、UTF-8 の `filename*` の両方）。応答の守りの header（CSP、`nosniff` など）は、
  *   守りの部品（`launcher/request-guard.ts`）が付ける。
  * - T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: 書き込みのジョブの報告の 4 つ（`action-report.html`、`action-evidence.json`、
  *   `approval-summary.json`、書き込みのバンドルの ZIP）を、親の確かめ（ジョブの行の `writeReportCheck`）が `VALID` のジョブだけ配る（それ以外の
  *   ジョブは、ファイルがあっても 404）。バンドルは、`action-run.json` の `finishedAt` から決まる名前（`actionBundleFileName`）の 1 つだけ。2 つの JSON
  *   は、配る前に成果物のスキーマと、文書のジョブの ID がこのジョブであることを確かめ直す（`JOB_RESULT_DOCUMENTS`）。style の hash の header を付ける
  *   HTML は、名前の閉じた一覧（`report.html`、`action-report.html`）だけ。`action-run.json` は配らない（画面は書き込みの結果の欄で示す）。
+ * - T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブの `entry-check.json` も、決まった名前の成果物として配り（ダウンロード）、画面のサーバが読んで
+ *   ジョブの詳細と認証の設定の案に使う（`readJobResultDocument`。スキーマとジョブの ID を確かめる）。
  */
 import { createServerOnlyFn } from '@tanstack/react-start';
 import { createHash } from 'node:crypto';
@@ -37,12 +40,14 @@ import {
   ACTION_RUN_ARTIFACT_FILE_NAME,
   APPROVAL_SUMMARY_ARTIFACT_FILE_NAME,
   DISCOVERY_ARTIFACT_FILE_NAME,
+  ENTRY_CHECK_ARTIFACT_FILE_NAME,
   PAGES_ARTIFACT_DIRECTORY,
   READ_EVIDENCE_ARTIFACT_FILE_NAME,
   RUN_ARTIFACT_FILE_NAMES,
   SCREENSHOT_FILE_NAMES,
   actionBundleFileName,
   artifactFilePath,
+  bundleFileNameTimestampOf,
   isActionBundleFileName,
   isBundleFileName,
   isPortableRelativeArtifactPath,
@@ -55,6 +60,7 @@ import {
 } from '../../../../src/core/contained-artifact-file.js';
 import { isRecord } from '../../../../src/core/guards.js';
 import { isPageId } from '../../../../src/core/ids.js';
+import { compareCodeUnits } from '../../../../src/core/text.js';
 import { validateArtifact, type ArtifactSchemaName } from '../../../../src/core/schema-validator.js';
 import { LOCAL_UI_AUDIT_TEXT } from '../../../../src/presentation/messages.js';
 import { ARTIFACT_ROUTE_PREFIX, ARTIFACT_STYLE_HASH_RESPONSE_HEADER, artifactRoutePath } from '../security/artifact-route';
@@ -87,6 +93,30 @@ const ATTACHMENT_EXTENSIONS: ReadonlySet<string> = new Set(['.json', '.zip']);
 const FILE_NAME_REPLACEMENT = '_';
 const FILE_NAME_UNSAFE_CHARACTER = /[^A-Za-z0-9._-]/gu;
 
+/**
+ * PRE42-BN: `filename*` の値（RFC 5987 の UTF-8 の percent-encode）で、`encodeURIComponent` が符号化せずに残すが、attr-char の外の文字。
+ * `!` は attr-char なので残す。
+ */
+const NON_ATTR_CHARACTERS = /['()*]/gu;
+
+/** 1 文字（ASCII）を `%XX`（大文字の 16 進）にする。 */
+const percentEncodedOf = (character: string): string => `%${character.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`;
+
+/**
+ * ダウンロードの `Content-Disposition` の値（PRE42-BN）。名前が ASCII の決まった文字（英数字、`.`、`_`、`-`）だけなら、今の
+ * `attachment; filename="<名前>"` のまま。ほかの文字（日本語、空白、括弧など）を含む名前は、`filename` に ASCII の代わりの名前（ほかの文字を `_` に
+ * したもの）を置き、`filename*` に UTF-8 の percent-encode の名前（RFC 6266、RFC 5987）を置く（`filename*` を読むブラウザは、元の名前で保存する）。
+ * header の値は ASCII だけになる。
+ */
+const attachmentContentDispositionOf = (fileName: string): string => {
+  const fallback = fileName.replace(FILE_NAME_UNSAFE_CHARACTER, FILE_NAME_REPLACEMENT);
+  if (fallback === fileName) {
+    return `attachment; filename="${fileName}"`;
+  }
+  const encoded = encodeURIComponent(fileName).replace(NON_ATTR_CHARACTERS, percentEncodedOf);
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+};
+
 /** スクリーンショットのファイルの名前（撮り方ごと）。 */
 const SCREENSHOT_NAMES: ReadonlySet<string> = new Set(Object.values(SCREENSHOT_FILE_NAMES));
 
@@ -106,6 +136,8 @@ export const JOB_ARTIFACT_KINDS = Object.freeze([
   'ACTION_EVIDENCE_JSON',
   'APPROVAL_SUMMARY_JSON',
   'ACTION_BUNDLE',
+  // T43c: 入口の確かめのジョブの成果物（読んだ事実と案だけ。欄の値は持たない。URL は書くときに伏せ字を通してある）。
+  'ENTRY_CHECK_JSON',
 ] as const);
 export type JobArtifactKind = (typeof JOB_ARTIFACT_KINDS)[number];
 
@@ -131,6 +163,7 @@ const FIXED_ARTIFACTS: readonly {
   { kind: 'AUDIT_JSON', relativePath: RUN_ARTIFACT_FILE_NAMES.audit },
   { kind: 'DISCOVERY_JSON', relativePath: DISCOVERY_ARTIFACT_FILE_NAME },
   { kind: 'READ_EVIDENCE_JSON', relativePath: READ_EVIDENCE_ARTIFACT_FILE_NAME },
+  { kind: 'ENTRY_CHECK_JSON', relativePath: ENTRY_CHECK_ARTIFACT_FILE_NAME },
 ]);
 const FIXED_ARTIFACT_PATHS: ReadonlySet<string> = new Set(FIXED_ARTIFACTS.map((artifact) => artifact.relativePath));
 
@@ -183,15 +216,21 @@ const isRealFile = async (runDirectory: string, relativePath: string): Promise<b
   }
 };
 
-/** Run のディレクトリの直下の ChatGPT 用バンドルの名前（新しい名前の順の最初。なければ `null`）。リンクは数えない。 */
+/**
+ * バンドルの名前の、新しい順（名前の日時 `bundleFileNameTimestampOf` の新しい順。日時が同じなら、名前のコード単位の逆の順）。
+ * PRE42-BN: 名前にプロファイルの名前が入るので、名前の順では新しい順にならない。
+ */
+const compareBundleNamesNewestFirst = (left: string, right: string): number =>
+  compareCodeUnits(bundleFileNameTimestampOf(right) ?? '', bundleFileNameTimestampOf(left) ?? '') || compareCodeUnits(right, left);
+
+/** Run のディレクトリの直下の ChatGPT 用バンドルの名前（日時の新しい順の最初。なければ `null`）。リンクは数えない。 */
 const bundleNameOf = async (runDirectory: string): Promise<string | null> => {
   let names: readonly string[];
   try {
     names = (await readdir(runDirectory, { withFileTypes: true }))
       .filter((entry) => entry.isFile() && isBundleFileName(entry.name))
       .map((entry) => entry.name)
-      .sort()
-      .reverse();
+      .sort(compareBundleNamesNewestFirst);
   } catch {
     return null;
   }
@@ -213,8 +252,17 @@ const JOB_RESULT_DOCUMENTS = Object.freeze({
   'action-run': { fileName: ACTION_RUN_ARTIFACT_FILE_NAME, schema: 'action-run' },
   'action-evidence': { fileName: ACTION_EVIDENCE_ARTIFACT_FILE_NAME, schema: 'action-evidence' },
   'approval-summary': { fileName: APPROVAL_SUMMARY_ARTIFACT_FILE_NAME, schema: 'approval-summary' },
+  // T43c: 入口の確かめの成果物（ジョブの詳細と、認証の設定の画面の案が読む）。
+  'entry-check': { fileName: ENTRY_CHECK_ARTIFACT_FILE_NAME, schema: 'entry-check' },
+  // AS-b: 監査の Run の `run.json`（ジョブの詳細が、監査の段の送信の扱いと通した数を読む）。ジョブの ID を持たないので、Run の ID がこのジョブの Run の ID で
+  // あることを確かめる（`isDocumentOfJob`）。
+  run: { fileName: RUN_ARTIFACT_FILE_NAMES.run, schema: 'run' },
 } as const satisfies Record<string, { readonly fileName: string; readonly schema: ArtifactSchemaName }>);
 export type JobResultDocumentKind = keyof typeof JOB_RESULT_DOCUMENTS;
+
+/** 文書がこのジョブのものか（`run.json` は Run の ID、ほかはジョブの ID で確かめる）。 */
+const isDocumentOfJob = (job: AuditJobView, kind: JobResultDocumentKind, value: Readonly<Record<string, unknown>>): boolean =>
+  kind === 'run' ? job.runId !== null && value['runId'] === job.runId : value['jobId'] === job.jobId;
 
 /** T32g: 配る前にスキーマとジョブの ID を確かめ直す、書き込みの報告の JSON（Run のディレクトリからの相対パス → 文書の種類）。 */
 const CHECKED_WRITE_REPORT_DOCUMENTS: ReadonlyMap<string, JobResultDocumentKind> = new Map([
@@ -230,7 +278,7 @@ const checkedJobDocumentOf = async (job: AuditJobView, bytes: Buffer, kind: JobR
   try {
     const value: unknown = JSON.parse(bytes.toString('utf8'));
     const valid = (await validateArtifact(JOB_RESULT_DOCUMENTS[kind].schema, value)).ok;
-    return valid && isRecord(value) && value['jobId'] === job.jobId ? value : null;
+    return valid && isRecord(value) && isDocumentOfJob(job, kind, value) ? value : null;
   } catch {
     return null;
   }
@@ -414,14 +462,14 @@ const headStyleHashOf = (html: string): string | null => {
 };
 
 /**
- * ダウンロードのファイル名（ASCII の決まった形: `<Run のディレクトリ>-<相対パスの区切りを - にしたもの>`。バンドルは、その名前のまま。T32g: 書き込みの
- * バンドルも、その名前のまま）。
+ * ダウンロードのファイル名（決まった形: `<Run のディレクトリ>-<相対パスの区切りを - にしたもの>`。バンドルは、その名前のまま。T32g: 書き込みの
+ * バンドルも、その名前のまま）。PRE42-BN: ASCII の決まった文字の外の文字は、ここでは置き換えない（`attachmentContentDispositionOf` が、ASCII の代わりの
+ * 名前と `filename*` を作る。プロファイルの名前の入ったバンドルの名前を、日本語のまま渡すため）。
  */
 const attachmentFileNameOf = (runDirectory: string, relativePath: string): string =>
   (isBundleFileName(relativePath) || isActionBundleFileName(relativePath)
     ? relativePath
-    : `${runDirectory.replaceAll('/', '-')}-${relativePath.replaceAll('/', '-')}`)
-    .replace(FILE_NAME_UNSAFE_CHARACTER, FILE_NAME_REPLACEMENT);
+    : `${runDirectory.replaceAll('/', '-')}-${relativePath.replaceAll('/', '-')}`);
 
 /**
  * 成果物の Server Routes の GET の応答を作る。許可の一覧の外、読めないもの（ない、リンク、Run のディレクトリの外、大きすぎる、入れ替わった）、
@@ -457,7 +505,7 @@ export const serveJobArtifact = async (request: Request): Promise<Response> => {
   };
   const extension = extname(parsed.relativePath).toLowerCase();
   if (ATTACHMENT_EXTENSIONS.has(extension)) {
-    headers['Content-Disposition'] = `attachment; filename="${attachmentFileNameOf(job.runDirectory, parsed.relativePath)}"`;
+    headers['Content-Disposition'] = attachmentContentDispositionOf(attachmentFileNameOf(job.runDirectory, parsed.relativePath));
   }
   if (STYLE_HASHED_HTML_FILE_NAMES.has(parsed.relativePath)) {
     const styleHash = headStyleHashOf(reading.bytes.toString('utf8'));

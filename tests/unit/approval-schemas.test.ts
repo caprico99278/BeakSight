@@ -128,7 +128,9 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     const read = scenarioDefs.readVerification;
     expect(prop(read, 'readCheckId').pattern).toBe(SCENARIO_ID_PATTERN.source);
     expect(prop(read, 'revision').minimum).toBe(MIN_SCENARIO_REVISION);
-    expect([prop(read, 'bindings').minItems, prop(read, 'bindings').maxItems]).toEqual([1, MAX_VERIFICATION_BINDINGS]);
+    // T38c（T38c の Blocker の判断（案 A））: 結び付けの最小は 0（API のシナリオの `{id}` つきの画面の READ だけ。FORM のシナリオは、根の条件で 1 件以上。
+    // 下の「a READ verification without a binding」）。
+    expect([prop(read, 'bindings').minItems, prop(read, 'bindings').maxItems]).toEqual([0, MAX_VERIFICATION_BINDINGS]);
     expect([prop(read, 'expectations').minItems, prop(read, 'expectations').maxItems]).toEqual([1, MAX_VERIFICATION_EXPECTATIONS]);
     expect(prop(scenarioDefs.binding, 'parameterName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);
     expect(prop(scenarioDefs.binding, 'fieldName').maxLength).toBe(MAX_FIELD_NAME_LENGTH);

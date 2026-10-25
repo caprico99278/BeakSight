@@ -1,4 +1,5 @@
 import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
+import { LOAD_PEAK_WINDOW_MS } from './load-meter.js';
 
 /**
  * 1回の `beforeNavigation()` で `sleep` を呼ぶ回数の上限（サイトへの負荷の制御の設計書 4.1、L2-fix-round-1）。
@@ -178,6 +179,64 @@ export function createNavigationPacer(options: NavigationPacerOptions): Navigati
       const sentAtMs = currentTimeMs();
       lastRequestSentAtMs = lastRequestSentAtMs === null ? sentAtMs : Math.max(lastRequestSentAtMs, sentAtMs);
     },
+  });
+}
+
+/**
+ * 1 回の読み込みの前に、間隔とは別に待つ時間の上限（ms。DEF-141）。承認したサービスの Origin への要求の 1 分あたりの上限の窓
+ * （`LOAD_PEAK_WINDOW_MS`）と同じ。待つ時間の口がこれを超える値を返したら、誤りとして読み込みを始めない（待ちが止まらなくなることはない）。
+ */
+export const MAX_ADDITIONAL_NAVIGATION_WAIT_MS = LOAD_PEAK_WINDOW_MS;
+
+/** DEF-141: 次の読み込みの前に、間隔とは別に待つ時間の口（`ServiceRequestBudget.waitBeforeNextLoadMs`）。 */
+export interface NavigationWaitSource {
+  /** 次の読み込みを始める前に待つ時間（ms。0 以上 `MAX_ADDITIONAL_NAVIGATION_WAIT_MS` 以下の整数。待たなくてよければ 0）。 */
+  waitBeforeNextLoadMs(): number;
+}
+
+/** `withAdditionalNavigationWait` の入力。 */
+export interface AdditionalNavigationWaitOptions {
+  readonly source: NavigationWaitSource;
+  /** `ms` ミリ秒待つ関数（間隔の部品と同じ。本番では `src/core/deadline.ts` の `wait`）。 */
+  readonly sleep: (ms: number) => Promise<void>;
+  /** 待つと決めたときに、待つ前に呼ぶ（記録と進みの知らせ。待つ時間を渡す）。 */
+  readonly onWait: (waitMs: number) => void;
+}
+
+/**
+ * 読み込みの間隔の部品に、次の読み込みの前の別の待ちを重ねる（DEF-141。設計書 `2026-10-20-beaksight-service-request-pacing-design.md` 2.2、2.4。
+ * Run Coordinator・発見・READ の確かめが共用する唯一の部品。承認したサービスの Origin への要求の 1 分あたりの上限で待つ）。
+ * - `beforeNavigation()`: 口（`source.waitBeforeNextLoadMs()`）が返す時間が 0 より大きければ、`onWait` を呼んでから、その時間だけ `sleep` で待つ。
+ *   その後、包んだ部品の `beforeNavigation()` に進む（包んだ部品は、待った後の時刻から間隔を数えるので、待ちは重なる。長い方を待つ）。待った時間の
+ *   合計（口の待ちと、包んだ部品の待ち）を返す（呼び出し側は、今どおり期限から除く）。
+ * - 口が 0 以上 `MAX_ADDITIONAL_NAVIGATION_WAIT_MS` 以下の整数を返さなければ、その呼び出しが `RangeError` で reject する（読み込みとして記録しない）。
+ * - 重ねて呼ばれた場合も、呼ばれた順に 1 つずつ処理する（前の呼び出しの完了を待つ鎖にする）。
+ * - 記録（`snapshot`）、間隔の上げ方（`raiseMinimumInterval`）、送った時刻の記録（`recordDocumentRequestSent`）は、包んだ部品のまま（保存の形を変えない。
+ *   口の待ちは、包んだ部品の待ちの記録に入らない。回数と時間は、呼ぶ側が `onWait` で記録する）。
+ */
+export function withAdditionalNavigationWait(pacer: NavigationPacer, options: AdditionalNavigationWaitOptions): NavigationPacer {
+  const { source, sleep, onWait } = options;
+  let previous: Promise<unknown> = Promise.resolve();
+  const pace = async (): Promise<number> => {
+    const waitMs = source.waitBeforeNextLoadMs();
+    if (!isNonNegativeSafeInteger(waitMs) || waitMs > MAX_ADDITIONAL_NAVIGATION_WAIT_MS) {
+      throw new RangeError('the additional wait before a navigation must be an integer of milliseconds within one minute');
+    }
+    if (waitMs > 0) {
+      onWait(waitMs);
+      await sleep(waitMs);
+    }
+    return waitMs + await pacer.beforeNavigation();
+  };
+  return Object.freeze({
+    beforeNavigation(): Promise<number> {
+      const current = previous.then(pace);
+      previous = current.catch(() => undefined);
+      return current;
+    },
+    snapshot: (): NavigationPacerSnapshot => pacer.snapshot(),
+    raiseMinimumInterval: (minIntervalMs: number): void => pacer.raiseMinimumInterval(minIntervalMs),
+    recordDocumentRequestSent: (): void => pacer.recordDocumentRequestSent(),
   });
 }
 

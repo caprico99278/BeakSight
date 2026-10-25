@@ -20,7 +20,7 @@ import { createRunIdFromTime } from '../../src/orchestration/run-id.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { browserOpeningPageAfterNewContext } from '../helpers/browser-opening-page.js';
 import { browserHangingNewContext } from '../helpers/browser-proxies.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 let server: FixtureServer;
@@ -39,7 +39,7 @@ useHeadlessChromium((launched) => {
 });
 
 afterEach(async () => {
-  for (const context of browser.contexts()) {
+  for (const context of testContextsOf(browser)) {
     await context.close();
   }
   vi.restoreAllMocks();
@@ -103,7 +103,7 @@ describe('collectRunEnvironment (R15c)', () => {
       expect(snapshot.blockedRequests).toEqual([]);
     }
     // 作った Context は閉じている。対象のサイトにはアクセスしていない。
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
     expect(server.getRequestObservations()).toEqual([]);
     // 閉じる処理は、どれも期限の中で終わった（RP18 の指摘1）。
     expect(closeFailures).toEqual([]);
@@ -214,7 +214,7 @@ describe('collectRunEnvironment (R15c)', () => {
     for (const ledger of recorded) {
       expect(ledger.snapshot().invariantViolations.map((violation) => violation.code)).toContain('GUARD_INSTALLATION_FAILED');
     }
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
     expect(server.getRequestObservations()).toEqual([]);
   });
 
@@ -249,7 +249,7 @@ describe('collectRunEnvironment (R15c)', () => {
     for (const ledger of recorded) {
       expect(ledger.snapshot().invariantViolations).toEqual([]);
     }
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
   });
 
   // DEF-008（Task 18 の前の整理の設計書 4.4）: 作成か終了が終わらない場合も、期限の中で戻る。扱いは、今の失敗と同じ
@@ -304,7 +304,7 @@ describe('collectRunEnvironment (R15c)', () => {
     for (const ledger of recorded) {
       expect(ledger.snapshot().invariantViolations).toEqual([]);
     }
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
     expect(server.getRequestObservations()).toEqual([]);
   }, DEADLINE_TEST_TIMEOUT_MS);
 
@@ -366,7 +366,7 @@ describe('collectRunEnvironment (R15c)', () => {
     expect(environment.userAgents.desktop).toMatch(/^Mozilla\/5\.0 .*Chrome\//u);
     expect(pageCloseCalls).toEqual([]);
     expect(closeFailures).toEqual([]);
-    expect(browser.contexts()).toEqual([]);
+    expect(testContextsOf(browser)).toEqual([]);
   });
 
   // RP18 の指摘1: page の作成が期限を過ぎ、部品が Context を閉じる処理も期限を過ぎた場合も、その失敗を渡す。

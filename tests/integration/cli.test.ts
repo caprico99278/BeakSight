@@ -18,6 +18,7 @@ import {
   checkpointArtifactRelativePath,
   isBundleFileName,
 } from '../../src/core/artifact-layout.js';
+import { findingsOfAuditArtifact, type AuditArtifactFindingsPart } from '../../src/core/audit-artifact-findings.js';
 import type { Finding, PageAuditResult, RunSummary } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { RUN_STATUS_CATALOG, SEVERITY_CATALOG } from '../../src/presentation/catalog.js';
@@ -100,7 +101,8 @@ describe('CLI run: a COMPLETE Run with site ERROR Findings (Task 17 Step 1)', ()
     result = await runCli('run', '--config', config, '--output', outputDirectory, '--headless');
     runDirectory = await onlyRunDirectory(outputDirectory);
     run = (await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.run))) as RunSummary;
-    findings = ((await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit))) as { readonly findings: readonly Finding[] }).findings;
+    // T44f: audit.json の最上位の findings はページに入っていない Finding だけなので、読む側の決まりで Run のすべての Finding にする。
+    findings = findingsOfAuditArtifact((await readJson(join(runDirectory, RUN_ARTIFACT_FILE_NAMES.audit))) as AuditArtifactFindingsPart);
   }, SUITE_TIMEOUT_MS);
 
   it('exits with 0 for COMPLETE even though the site has ERROR Findings', () => {

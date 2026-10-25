@@ -5,23 +5,25 @@
 // 任せることも、Run Coordinator を差し替える口（`createRunCoordinator`）で確かめる。
 // R5a（中断した Run の再開の設計書 4.7、4.7.1）: 偽の Run Coordinator は、保存の終わり方（`checkpointConclusion()`）も返す。`run` が、保存の
 // セッションと止める印を Run Coordinator に渡すことと、本番の Browser の起動が Playwright の既定のシグナルの処理を止めることも確かめる。
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { unzipSync } from 'fflate';
-import { chromium, type Browser } from 'playwright';
+import { chromium } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+  CHROMIUM_PROFILE_DIRECTORY_PREFIX,
   CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
   CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
   CHROMIUM_PRELOADING_DISABLED_ARGS,
   CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
+  CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS,
 } from '../../src/browser/chromium-launch.js';
+import { writeAuditRunOutputs } from '../../src/cli/audit-run.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { runNoticeLines } from '../../src/cli/output.js';
 import { finishAuditRun, PRODUCTION_RUN_DEPENDENCIES, runAuditCommand } from '../../src/cli/run-command.js';
 import {
-  LEGACY_BUNDLE_FILE_NAME,
   RUN_ARTIFACT_FILE_NAMES,
   artifactFilePath,
   bundleFileName,
@@ -40,6 +42,7 @@ import {
 import { RUN_STATUS_CATALOG } from '../../src/presentation/catalog.js';
 import { CLI_TEXT, labelWithCodeText } from '../../src/presentation/messages.js';
 import { auditRun } from '../helpers/audit-run-fixture.js';
+import { fakePersistentChromium } from '../helpers/fake-persistent-chromium.js';
 import { captureCliOutput } from '../helpers/run-harness.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -104,7 +107,7 @@ describe('finishAuditRun: the exit code comes from the Run Status after the sche
 });
 
 // BN1（バンドルのファイル名の設計書 2.2、4）: Run の後、Run のディレクトリには、最後の実行の終わりの時刻の名前のバンドルが1つだけある。
-// 中断した Run を再開して書き出した後も1つだけで、名前は、再開した実行の終わりの時刻になる（前の回のバンドルと、前の形の名前のバンドルは消える）。
+// 中断した Run を再開して書き出した後も1つだけで、名前は、再開した実行の終わりの時刻になる（前の回のバンドルは消える）。
 describe('finishAuditRun: only the newest bundle is left in the run directory (bundle file name design 2.2)', () => {
   const bundlesIn = async (runDirectory: string): Promise<readonly string[]> => (await readdir(runDirectory)).filter(isBundleFileName);
 
@@ -123,9 +126,7 @@ describe('finishAuditRun: only the newest bundle is left in the run directory (b
     });
     const runDirectory = runArtifactDirectory(outputDirectory, first.run.runId);
 
-    // 最初の実行。前の形の名前のバンドル（この変更の前の版が書いたもの）が残っている Run のディレクトリに書く。
-    await mkdir(runDirectory, { recursive: true });
-    await writeFile(join(runDirectory, LEGACY_BUNDLE_FILE_NAME), 'earlier form', 'utf8');
+    // 最初の実行。
     const firstStdout = captureCliOutput();
     await finishAuditRun(first, outputDirectory, firstStdout.output);
 
@@ -140,6 +141,55 @@ describe('finishAuditRun: only the newest bundle is left in the run directory (b
     expect(lastBundleFileName(resumed.run)).toBe('beaksight-audit-bundle_20261008030930.zip');
     expect(resumedStdout.text()).toContain(artifactFilePath(runDirectory, 'beaksight-audit-bundle_20261008030930.zip'));
     expect(unzipSync(new Uint8Array(await readFile(join(runDirectory, 'beaksight-audit-bundle_20261008030930.zip'))))).toHaveProperty(['run.json']);
+  });
+});
+
+// PRE42-BN（2026-10-24 のユーザーの判断）: 画面のジョブ（プロファイルの名前あり）の書き出し（`writeAuditRunOutputs`。ワーカーが通る監査の中核の書き出し）は、
+// 名前つきのバンドルを書く。再開でプロファイルの名前が変わった後も、前の名前のバンドルを消して1つだけ残す。名前は、成果物の中身（ZIP の中、run.json、
+// audit.json、report.html）に入れない。CLI（名前なし）の形は、今のまま。
+describe('writeAuditRunOutputs: the profile name in the bundle name (PRE42-BN)', () => {
+  const bundlesIn = async (runDirectory: string): Promise<readonly string[]> => (await readdir(runDirectory)).filter(isBundleFileName);
+  const EARLIER_NAME = '前の名前';
+  const PROFILE_NAME = '管理画面';
+
+  it('writes the named bundle, removes the bundle of the earlier name on a resume, and keeps the name out of the contents', async () => {
+    const outputDirectory = join(workDirectory, 'bundle-profile-name');
+    const first = auditRun();
+    const [firstExecution] = first.run.executions;
+    const resumed = auditRun({
+      run: {
+        executions: [
+          { ...firstExecution, endReason: 'STOPPED_BY_RUNTIME_LIMIT' },
+          { startedAt: '2026-10-08T03:00:00.000Z', finishedAt: '2026-10-08T03:09:30.000Z', endReason: 'COMPLETED' },
+        ],
+        finishedAt: '2026-10-08T03:09:30.000Z',
+      },
+    });
+    const runDirectory = runArtifactDirectory(outputDirectory, first.run.runId);
+
+    await writeAuditRunOutputs(first, outputDirectory, undefined, EARLIER_NAME);
+    const firstName = bundleFileName(first.run.executions[first.run.executions.length - 1]?.finishedAt ?? '', EARLIER_NAME);
+    expect(firstName.startsWith(`beaksight-audit-bundle_${EARLIER_NAME}_`)).toBe(true);
+    expect(await bundlesIn(runDirectory)).toEqual([firstName]);
+
+    // 再開した実行（プロファイルの名前が変わった後）。
+    await writeAuditRunOutputs(resumed, outputDirectory, undefined, PROFILE_NAME);
+    const named = `beaksight-audit-bundle_${PROFILE_NAME}_20261008030930.zip`;
+    expect(await bundlesIn(runDirectory)).toEqual([named]);
+    const entries = unzipSync(new Uint8Array(await readFile(join(runDirectory, named))));
+    expect(entries).toHaveProperty(['run.json']);
+    for (const [entryName, bytes] of Object.entries(entries)) {
+      const text = Buffer.from(bytes).toString('utf8');
+      expect(text.includes(PROFILE_NAME) || text.includes(EARLIER_NAME), entryName).toBe(false);
+    }
+    for (const file of Object.values(RUN_ARTIFACT_FILE_NAMES)) {
+      const text = await readFile(join(runDirectory, file), 'utf8');
+      expect(text.includes(PROFILE_NAME) || text.includes(EARLIER_NAME), file).toBe(false);
+    }
+
+    // CLI（名前なし）で書き直すと、今の形の名前になり、名前つきのバンドルは消える。
+    await writeAuditRunOutputs(resumed, outputDirectory);
+    expect(await bundlesIn(runDirectory)).toEqual(['beaksight-audit-bundle_20261008030930.zip']);
   });
 });
 
@@ -269,19 +319,24 @@ describe('runAuditCommand: the production run hands the confirmed Run to finishA
 // `--disable-features` の値を含む1つの引数）と、起動のときの ListAccounts と GCM の checkin の向け先を、使われないローカルの宛先に変える
 // 引数（`CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS`）も渡す。効くことは、tests/integration/chromium-google-connections.test.ts で、実際に渡った値は
 // tests/integration/preloading-disabled.test.ts で確かめる。
+// DEF-124: WebRTC の中継を通らない UDP を止める起動の引数（`CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS`）も渡す。効くことは、
+// tests/integration/webrtc-egress-blocked.test.ts で確かめる。
 describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwright handle the signals', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, stop the Google connections of Chromium itself and disable Shared Workers, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
-    const browser = { marker: 'the fake browser' } as unknown as Browser;
-    const launch = vi.spyOn(chromium, 'launch').mockResolvedValue(browser);
+  it.each([true, false])('launches Chromium with headless %s, with the channel chromium, with the args that stop preloading, stop the Google connections of Chromium itself, disable Shared Workers and stop the non-proxied UDP of WebRTC, and with handleSIGINT, handleSIGTERM and handleSIGHUP false', async (headless) => {
+    // EL-12: 起動は、外部のアプリの起動を止める起動の部品（一時のプロファイルの `launchPersistentContext`）で、値はそのまま渡す。
+    const fake = fakePersistentChromium();
+    const launch = vi.spyOn(chromium, 'launchPersistentContext').mockResolvedValue(fake.context);
 
-    await expect(PRODUCTION_RUN_DEPENDENCIES.launchBrowser({ headless })).resolves.toBe(browser);
+    await expect(PRODUCTION_RUN_DEPENDENCIES.launchBrowser({ headless })).resolves.toBe(fake.browser);
+    await fake.browser.close();
 
     expect(launch).toHaveBeenCalledTimes(1);
-    expect(launch).toHaveBeenCalledWith({
+    expect(String(launch.mock.calls[0]?.[0]).startsWith(join(tmpdir(), CHROMIUM_PROFILE_DIRECTORY_PREFIX))).toBe(true);
+    expect(launch.mock.calls[0]?.[1]).toEqual({
       headless,
       channel: 'chromium',
       args: [
@@ -289,6 +344,7 @@ describe('PRODUCTION_RUN_DEPENDENCIES: the browser launch does not let Playwrigh
         ...CHROMIUM_GOOGLE_SERVICES_DISABLED_ARGS,
         ...CHROMIUM_GOOGLE_ENDPOINTS_REDIRECTED_ARGS,
         ...CHROMIUM_SHARED_WORKERS_DISABLED_ARGS,
+        ...CHROMIUM_WEBRTC_NON_PROXIED_UDP_DISABLED_ARGS,
       ],
       handleSIGINT: false,
       handleSIGTERM: false,

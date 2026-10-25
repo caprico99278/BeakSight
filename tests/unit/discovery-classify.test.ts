@@ -6,7 +6,7 @@
 // - 理由のコードと分類の対応、規則の表が理由のコードのすべてを使うこと、発見の分類の危険な語が Task 25 の既定の危険な語を含むこと。
 // 例の値は、匿名の値（`127.0.0.1`、`example.invalid`）だけを使う。
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import {
   CANDIDATE_CLASSIFICATIONS,
   CANDIDATE_REASON_CLASSIFICATIONS,
@@ -21,10 +21,17 @@ import {
   DISCOVERY_DESTRUCTIVE_WORDS,
   DISCOVERY_SEARCH_WORDS,
   DISCOVERY_STATE_FIELD_WORDS,
+  DISCOVERY_SUBMIT_PRESS_WORDS,
   DISCOVERY_SUBMITTER_WORDS,
   DISCOVERY_UPDATE_WORDS,
 } from '../../src/discovery/classification-words.js';
-import { CANDIDATE_CLASSIFICATION_RULES, classifyCandidate, fieldNameWordsOf, submitterWordsOf } from '../../src/discovery/classify.js';
+import {
+  CANDIDATE_CLASSIFICATION_RULES,
+  classifyCandidate,
+  fieldNameWordsOf,
+  submitterTextHasSubmitWord,
+  submitterWordsOf,
+} from '../../src/discovery/classify.js';
 import { DUPLICATE_IDENTITY_CONFLICT_REASON } from '../../src/discovery/discovery-result.js';
 import {
   NO_JS_BINDING,
@@ -356,6 +363,25 @@ describe('T27a: the classification table and the word lists', () => {
     const before = JSON.stringify(candidate);
     classify(candidate);
     expect(JSON.stringify(candidate)).toBe(before);
+  });
+});
+
+// T44c（設計者の判断）: 「送信」「確定」「submit」の語は、probe の押す順だけの印にする（送信ボタンの語の閉じた一覧に入れない。識別の digest に響かない）。
+describe('T44c: the submit words of the submitter text (only for the press order of the probe)', () => {
+  it('hits 送信, 確定 and submit with the same comparison as the classification words, and keeps them out of the submitter words', () => {
+    expect([...DISCOVERY_SUBMIT_PRESS_WORDS]).toEqual(['submit', '送信', '確定']);
+    expect(Object.isFrozen(DISCOVERY_SUBMIT_PRESS_WORDS)).toBe(true);
+    for (const text of ['送信', '送信する', '内容を確定', 'Submit', 'ＳＵＢＭＩＴ', 'submit form', 'Submits']) {
+      expect(submitterTextHasSubmitWord(text), text).toBe(true);
+    }
+    for (const text of ['', '保存', '表示', 'submitted', 'resubmit', '確認']) {
+      expect(submitterTextHasSubmitWord(text), text).toBe(false);
+    }
+    // 送信ボタンの語（識別の digest に入る）には入らない。
+    for (const word of DISCOVERY_SUBMIT_PRESS_WORDS) {
+      expect((DISCOVERY_SUBMITTER_WORDS as readonly string[]).includes(word), word).toBe(false);
+      expect(submitterWordsOf(word), word).toEqual([]);
+    }
   });
 });
 

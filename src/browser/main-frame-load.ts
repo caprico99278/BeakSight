@@ -11,7 +11,14 @@ import type { DeadlineOutcome } from '../core/deadline.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type { NavigationOutcomeKind } from '../core/evidence-types.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
+import { announceOwnMainFrameNavigation } from '../safety/passive-request-guard.js';
 import { isPlaywrightTimeoutError } from './playwright-errors.js';
+
+/**
+ * DEF-129: BeakSight 自身が main frame を読み込むことを Guard に知らせる部品（owner は `src/safety/passive-request-guard.ts`）。`page.goto` を直接呼ぶ
+ * 読み込み（幅の走査）も、この名前で使う。
+ */
+export { announceOwnMainFrameNavigation };
 
 /**
  * 観測の結果の種類。
@@ -59,6 +66,8 @@ export async function settleMainFrameLoad(
   options: { readonly waitUntil: 'load' | 'domcontentloaded'; readonly timeoutMs: number },
 ): Promise<Exclude<MainFrameLoadSettlement, { readonly status: 'DEADLINE_EXCEEDED' }>> {
   try {
+    // DEF-129: BeakSight 自身の読み込みであることを Guard に知らせる（ページが始めた読み込みの数を数え直す。Guard のない page では数を持つだけ）。
+    announceOwnMainFrameNavigation(page);
     return Object.freeze({
       status: 'FULFILLED',
       value: await page.goto(url, { waitUntil: options.waitUntil, timeout: options.timeoutMs }),
@@ -145,7 +154,8 @@ export function observeMainFrameLoad(
 }
 
 /** main frame のナビゲーションの要求か。`frame()` などが例外を投げる要求（service worker の要求など）は、偽とする。 */
-function isMainFrameNavigationRequest(page: Page, request: Request): boolean {
+/** `request` が `page` の main frame のナビゲーションの要求か（読めなければ偽）。DEF-138: セッションの切れの証拠の経路の記録も使う。 */
+export function isMainFrameNavigationRequest(page: Page, request: Request): boolean {
   try {
     return request.isNavigationRequest() && request.frame() === page.mainFrame();
   } catch {

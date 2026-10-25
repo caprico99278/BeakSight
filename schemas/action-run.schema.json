@@ -1,6 +1,6 @@
 {
   "$id": "urn:beaksight:schema:action-run:1.0",
-  "description": "The record of one write job (action-run.json in the Run directory; Task 30 design 3 'record'; T30a): the scenario and its revision, the consumed execution grant, the seed record of the generated data, the submitted values (synthetic test data, kept in plain text like the values of a READ check definition), the submission state, the response, the result conditions, the record id, the READ verification, the settled reservation, the ActionResult and its reason. The value lists and limits are owned by src/control/actions/action-contracts.ts; the decisions by src/control/actions/action-outcome.ts. No property holds a credential, a cookie, a CSRF token, a hidden value or an authenticated state. The public audit run.json schema is not changed (only its runId is referenced).",
+  "description": "The record of one write job (action-run.json in the Run directory; Task 30 design 3 'record'; T30a): the scenario and its revision, the consumed execution grant, the seed record of the generated data, the submitted values (synthetic test data, kept in plain text like the values of a READ check definition), the submission state, the response, the result conditions, the record id, the READ verification, the settled reservation, the ActionResult and its reason. The value lists and limits are owned by src/control/actions/action-contracts.ts; the decisions by src/control/actions/action-outcome.ts. No property holds a credential, a cookie, a CSRF token, a hidden value or an authenticated state. The public audit run.json schema is not changed (only its runId is referenced). T40c (Task 40 design 3.4): the version 1.1 adds the transport (FORM or API) and the API summary (null for FORM; for API the request shape summary, the key names, the names of the header fields supplied by the page, the record id key and the values of the keys decided by the page as JSON texts, cut to null above the limit); an API record has no result conditions (null). The readers accept 1.1 only (LG-4: the previous version 1.0, a FORM record without these items, is no longer read); the writer writes 1.1. No property holds a header value or the response body.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,10 +25,12 @@
     "reason",
     "startedAt",
     "submittedAt",
-    "finishedAt"
+    "finishedAt",
+    "transport",
+    "api"
   ],
   "properties": {
-    "schemaVersion": { "const": "action-run-schema/1.0" },
+    "schemaVersion": { "enum": ["action-run-schema/1.1"] },
     "jobId": { "$ref": "#/$defs/id" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
     "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
@@ -64,13 +66,18 @@
       "additionalProperties": { "type": "string", "maxLength": 8192 }
     },
     "resultConditions": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["successCondition", "inputErrorCondition"],
-      "properties": {
-        "successCondition": { "$ref": "#/$defs/condition" },
-        "inputErrorCondition": { "$ref": "#/$defs/condition" }
-      }
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["successCondition", "inputErrorCondition"],
+          "properties": {
+            "successCondition": { "$ref": "#/$defs/condition" },
+            "inputErrorCondition": { "$ref": "#/$defs/condition" }
+          }
+        },
+        { "type": "null" }
+      ]
     },
     "submission": { "enum": ["NOT_SENT", "SENT", "UNKNOWN"] },
     "blockReason": { "enum": ["PAYLOAD_MISMATCH", "PRECHECK_FAILED", null] },
@@ -128,8 +135,47 @@
         "targetRecordId": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 64 },
         "updateEvidence": { "anyOf": [{ "$ref": "#/$defs/updateEvidence" }, { "type": "null" }] }
       }
+    },
+    "transport": {
+      "description": "T40c: the transport of the write.",
+      "$ref": "#/$defs/transport"
+    },
+    "api": {
+      "description": "T40c: the API summary (null for FORM).",
+      "anyOf": [{ "$ref": "#/$defs/apiSummary" }, { "type": "null" }]
+    },
+    "precheckDetail": {
+      "description": "T44e (Task 44 design P2-4): the concrete reason of a stop before sending (optional; only with the block reason PRECHECK_FAILED; absent in the records written before). The list is owned by PRECHECK_FAILURE_DETAILS of src/control/actions/action-contracts.ts. It does not change the decision to send.",
+      "enum": [
+        "STOPPED",
+        "SESSION_LOST",
+        "PAGE_UNAVAILABLE",
+        "CANDIDATE_CHANGED",
+        "PRIOR_VALUES_EMPTY",
+        "KNOWN_KEPT_VALUE_MISMATCH",
+        "PRIOR_VALUE_UNUSABLE",
+        "PRIOR_VALUE_CHANGED",
+        "FORM_NOT_READY",
+        "UNEXPECTED_REQUEST",
+        "RECHECK_REFUSED",
+        "AUDIT_STAGE_STOPPED",
+        "PREFLIGHT_FAILED"
+      ]
     }
   },
+  "allOf": [
+    {
+      "description": "T44e: the concrete reason of a stop exists only with the block reason PRECHECK_FAILED.",
+      "if": { "required": ["precheckDetail"], "properties": { "precheckDetail": { "type": "string" } } },
+      "then": { "properties": { "blockReason": { "const": "PRECHECK_FAILED" } } }
+    },
+    {
+      "description": "T40c: an API record has the API summary and no result conditions; a FORM record has no API summary and has the result conditions.",
+      "if": { "properties": { "transport": { "const": "API" } } },
+      "then": { "properties": { "api": { "type": "object" }, "resultConditions": { "type": "null" } } },
+      "else": { "properties": { "api": { "type": "null" }, "resultConditions": { "type": "object" } } }
+    }
+  ],
   "if": { "properties": { "submission": { "const": "NOT_SENT" } } },
   "then": {
     "properties": {
@@ -140,7 +186,8 @@
       "readVerification": { "type": "null" },
       "submittedAt": { "type": "null" },
       "reservationState": { "const": "RELEASED" },
-      "result": { "const": "BLOCKED" }
+      "result": { "const": "BLOCKED" },
+      "api": { "anyOf": [{ "type": "null" }, { "type": "object", "properties": { "pageKeyValues": { "type": "null" } } }] }
     }
   },
   "else": {
@@ -154,6 +201,43 @@
     "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
     "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "compactUtcTimestamp": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "transport": {
+      "description": "T40c: the transports of a scenario (SCENARIO_TRANSPORTS of src/control/approval/scenario-contracts.ts).",
+      "enum": ["FORM", "API"]
+    },
+    "apiNames": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" }
+    },
+    "apiSummary": {
+      "description": "T40c (Task 40 design 3.4): the summary of an API write, made by actionApiSummaryOf of src/control/actions/action-api-summary.ts: the approved request shape (method, origin, path shape, shape digest), the names of the keys of the fields, of the keys decided by the page and of the header fields supplied by the page, the key of the record id in the response body, and the values of the keys decided by the page (each a JSON scalar as its JSON text; null marks a value cut above the limit; the whole item is null when the request was not checked). Never a header value, the response body or a raw value of the body.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "origin", "pathShape", "shapeDigest", "keyNames", "pageKeyNames", "httpFieldNames", "recordIdKey", "pageKeyValues"],
+      "properties": {
+        "method": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiRequest/properties/method" },
+        "origin": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiRequest/properties/origin" },
+        "pathShape": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiRequest/properties/pathShape" },
+        "shapeDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" },
+        "keyNames": { "allOf": [{ "$ref": "#/$defs/apiNames" }, { "type": "array", "minItems": 1 }] },
+        "pageKeyNames": { "$ref": "#/$defs/apiNames" },
+        "httpFieldNames": { "$ref": "#/$defs/apiNames" },
+        "recordIdKey": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" }, { "type": "null" }] },
+        "pageKeyValues": {
+          "anyOf": [
+            {
+              "type": "object",
+              "maxProperties": 64,
+              "propertyNames": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" },
+              "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
+            },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
     "condition": {
       "type": "object",
       "additionalProperties": false,

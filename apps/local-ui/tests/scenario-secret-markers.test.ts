@@ -13,12 +13,14 @@
  */
 import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import {
   DISCOVERY_SITE_PATHS,
   startDiscoverySite,
   type DiscoverySite,
 } from '../../../tests/helpers/discovery-site-fixture.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   installTestAuthWorkerEntry,
@@ -39,6 +41,7 @@ import {
 import { credentialsOf } from './helpers/scenario-marker-flow.ts';
 import { leakedPlaces, textPlace, type SearchedPlace } from './helpers/secret-markers.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
 /** ジョブの終わりを待つ上限と、読み直す間隔（ms）。 */
@@ -105,20 +108,19 @@ const { openPage, expectCleanAndClosePages } = createUiPageKit({
   },
 });
 
-const waitForEnd = async (jobId: string): Promise<{ readonly state: string }> => {
-  const deadline = Date.now() + JOB_TIMEOUT_MS;
-  for (;;) {
-    const job = await valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId });
-    if (job !== null && !job.active) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`ジョブが終わらなかった: ${JSON.stringify(job)}`);
-    }
-    descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
-};
+/** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する。待ち方は補助 `waitForJobViaServerFunctions`。PRE42-CC 組 UI-K2）。 */
+const waitForEnd = (jobId: string): Promise<{ readonly state: string }> => waitForJobViaServerFunctions(
+  (id) => valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId: id }),
+  jobId,
+  (job) => !job.active,
+  {
+    limitMs: JOB_TIMEOUT_MS,
+    stepMs: WAIT_POLL_MS,
+    onPending: async () => {
+      descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+    },
+  },
+);
 
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
@@ -150,7 +152,7 @@ beforeAll(async () => {
   })).toMatchObject({ ok: true });
   expect(await valueOf('saveAuthSetupFn', 'POST', {
     setup: {
-      schemaVersion: 'beaksight-auth-setup/2',
+      ...FORM_NAVIGATION_SETUP_ITEMS,
       profileId: PROFILE_ID,
       profileRevision: FIRST_REVISION,
       loginStartUrl: `${site.origin}${DISCOVERY_SITE_PATHS.login}`,
@@ -253,7 +255,7 @@ describe('T28e: no secret marker on the scenario screens', () => {
     expect(leakedPlaces([{ place: 'control', bytes: Buffer.from(`x${CONTROL_MARKER}y`, 'utf16le') }], [CONTROL_MARKER])).toEqual(['control (utf16le)']);
 
     // サイトに届いた GET と HEAD 以外の要求は、ログインの POST の 1 回だけ。
-    expect(siteOf().requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`))
+    expect(nonReadRequestsOf(siteOf().requests))
       .toEqual([`POST ${DISCOVERY_SITE_PATHS.login}`]);
   }, SCENARIO_TIMEOUT_MS);
 });

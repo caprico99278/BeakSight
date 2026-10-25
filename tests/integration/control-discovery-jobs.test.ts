@@ -13,26 +13,23 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
-import {
-  createAuditJobManager,
-  type AuditJobManager,
-  type AuditWorkerForker,
-} from '../../src/control/job/audit-job-manager.js';
+import type { AuditJobManager, AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import { readDiscoveryIndex } from '../../src/control/job/discovery-index-store.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile } from '../../src/control/store/profile-store.js';
-import { WORKER_PROTOCOL_VERSION, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
+import { workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
 import {
   DISCOVERY_ARTIFACT_SCHEMA_VERSION,
   discoverySummaryOf,
+  withServiceReadRefused,
   type DiscoveryDocument,
   type DiscoveryPageEntry,
 } from '../../src/discovery/discovery-result.js';
@@ -40,11 +37,12 @@ import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode } from '../helpers/fake-audit-worker.js';
 import { blockingAfterStartFork, createCountingFork } from '../helpers/worker-fork.js';
 import {
-  CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
+  withOutputDirectory,
   type JobViewSource,
 } from '../helpers/job-test-support.js';
 import { sampleAction, sampleButton, sampleField, sampleForm } from '../unit/discovery-candidate-samples.js';
@@ -69,7 +67,7 @@ const TEST_TIMEOUT_MS = 60_000;
 const OUTPUT_DIRECTORY_NAME = resolveTestContext(TEST_TARGET_PATH)?.targetConfig.output.directory ?? '';
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -138,25 +136,14 @@ const fakeWorker = (
 ): FakeWorker => {
   const directory = join(workDirectory, name);
   mkdirSync(directory, { recursive: true });
-  return writeFakeWorker(directory, mode, {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
-    heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
+  return writeFakeWorker(directory, mode, fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, {
     discovery: {
       outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY_NAME, name),
       documentText: discovery.documentText,
       summary: discovery.summary,
       runStatus: discovery.runStatus ?? 'COMPLETE',
     },
-  });
+  }));
 };
 
 /** 置き換えの印（偽のワーカーが、`START` のジョブの ID に置き換える）。 */
@@ -173,18 +160,12 @@ async function runDiscoveryJob(
   const discovery = documentOf(JOB_ID_PLACEHOLDER);
   const worker = fakeWorker(mode, { documentText: discovery.text, summary: discovery.summary, ...(discovery.runStatus === undefined ? {} : { runStatus: discovery.runStatus }) }, name);
   await manager?.close();
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
-    resolveContext: (path) => {
-      const context = resolveTestContext(path);
-      return context === undefined
-        ? undefined
-        : { targetConfig: { ...context.targetConfig, output: { directory: join(OUTPUT_DIRECTORY_NAME, name) } } };
-    },
+    workDirectory,
+    worker,
+    resolveContext: withOutputDirectory(resolveTestContext, join(OUTPUT_DIRECTORY_NAME, name)),
     forkWorker,
-    timing: CONTROL_JOB_TEST_TIMING,
   });
   const started = await manager.startDiscovery({ profileId, expectedRevision: MIN_PROFILE_REVISION });
   if (!started.ok) {
@@ -239,7 +220,7 @@ describe('discovery jobs (T27d): the start', () => {
   it('rejects a public profile, a missing request shape and an unknown profile without starting a worker', async () => {
     expect(createProfile(database, publicProfile(PUBLIC_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     const worker = fakeWorker('discovery', { documentText: null, summary: null });
-    manager = createAuditJobManager({ database, repositoryRoot: workDirectory, workerPath: worker.path, resolveContext: resolveTestContext, forkWorker: countingFork, timing: CONTROL_JOB_TEST_TIMING });
+    manager = createFakeWorkerJobManager({ database, workDirectory, worker, resolveContext: resolveTestContext, forkWorker: countingFork });
     expect(await manager.startDiscovery({ profileId: PUBLIC_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION })).toMatchObject({ ok: false, reason: 'MODE_NOT_EXECUTABLE' });
     expect(await manager.startDiscovery({ profileId: 'missing-profile', expectedRevision: MIN_PROFILE_REVISION })).toMatchObject({ ok: false, reason: 'PROFILE_NOT_FOUND' });
     expect(await manager.startDiscovery({ profileId: PROFILE_ID } as never)).toMatchObject({ ok: false, reason: 'INVALID_REQUEST' });
@@ -372,5 +353,51 @@ describe('discovery jobs (T27d): recording discovery.json into the index at the 
     const ended = await runDiscoveryJob('crash', okDocument([readEntry('/admin', [BUTTON])]), 'discovery-crash');
     expect(ended).toMatchObject({ state: 'INTERRUPTED', failureReason: 'WORKER_EXITED' });
     expect(readDiscoveryIndex(database, PROFILE_ID).latestJobId).toBeNull();
+  });
+});
+
+// T37a（Task 37 の設計書 3.1）: 監査の段の口のある発見のジョブ。成果物の監査の段の数（`authentication`）は、IPC の要約と照らし合わせる（合わなければ
+// `DISCOVERY_RESULT_INVALID`）。サービスの読み取りが届かなかった画面（`SERVICE_READ_REFUSED`）は、読み切れた画面の path に入らないので、その画面の前の
+// 候補は `MISSING` にならず `NOT_REVISITED` になる。
+describe('discovery jobs (T37a): the counts of the audit stage and the pages with a refused service read', () => {
+  const AUTHENTICATION = Object.freeze({
+    registeredReadRequestsAllowed: 2,
+    tokenRefreshBlocked: 0,
+    otherNonReadBlocked: 1,
+    serviceUnauthorizedResponses: 0,
+    serviceRequestLimitReached: true,
+  });
+
+  it('finishes when the counts of FINISHED match discovery.json, and fails with DISCOVERY_RESULT_INVALID when they do not', async () => {
+    const pages = [readEntry('/admin', [BUTTON])];
+    const matched = await runDiscoveryJob('authentication', okDocument(pages, { authentication: AUTHENTICATION }));
+    expect(matched).toMatchObject({ state: 'FINISHED', failureReason: null });
+    for (const [name, documentOf] of [
+      ['other-counts', (jobId: string) => ({
+        ...okDocument(pages, { authentication: AUTHENTICATION })(jobId),
+        summary: { pagesRead: 1, pagesNotRead: 0, candidates: 1, authentication: { ...AUTHENTICATION, serviceRequestLimitReached: false } },
+      })],
+      ['missing-counts', (jobId: string) => ({ ...okDocument(pages, { authentication: AUTHENTICATION })(jobId), summary: { pagesRead: 1, pagesNotRead: 0, candidates: 1 } })],
+      ['extra-counts', (jobId: string) => ({ ...okDocument(pages)(jobId), summary: { pagesRead: 1, pagesNotRead: 0, candidates: 1, authentication: AUTHENTICATION } })],
+    ] as const) {
+      const ended = await runDiscoveryJob(name, documentOf);
+      expect(ended, name).toMatchObject({ state: 'FAILED', failureReason: 'DISCOVERY_RESULT_INVALID' });
+    }
+  });
+
+  it('keeps the candidates of a page with a refused service read as NOT_REVISITED, not MISSING', async () => {
+    await runDiscoveryJob('refused-base', okDocument([readEntry('/admin', [BUTTON]), readEntry('/admin/other', [OTHER_BUTTON])]));
+    const refused: DiscoveryPageEntry = {
+      url: `${TEST_ORIGIN}/admin`,
+      state: 'READ',
+      record: withServiceReadRefused({ location: location('/admin'), incompleteReasons: [], candidates: [] }),
+      blockedRequests: 0,
+    };
+    const second = await runDiscoveryJob('refused', okDocument([refused, readEntry('/admin/other', [])], {
+      runStatus: 'PARTIAL', endReason: 'SERVICE_REQUEST_LIMIT_REACHED', authentication: AUTHENTICATION,
+    }));
+    expect(second).toMatchObject({ state: 'FINISHED', resultRunStatus: 'PARTIAL', failureReason: null });
+    expect(readDiscoveryIndex(database, PROFILE_ID).latestReadPagePaths).toEqual(['/admin/other']);
+    expect(driftsOf()).toEqual({ [BUTTON.identityDigest]: 'NOT_REVISITED', [OTHER_BUTTON.identityDigest]: 'MISSING' });
   });
 });

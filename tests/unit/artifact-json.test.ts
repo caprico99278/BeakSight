@@ -1,6 +1,6 @@
 // C16c（Task 14〜17 の設計書 6.1.1、6.1.9。CC-026）: artifact の JSON の書式の唯一の owner。
 // `ArtifactWriter`（run.json、audit.json、page.json）と ChatGPT 用バンドル（ZIP の中の JSON）が、どちらもここを使う。
-// 書式は、字下げ2文字、末尾に LF を1つ、CR なし、UTF-8（BOM なし）である。
+// 書式は、字下げなし、末尾に LF を1つ、CR なし、UTF-8（BOM なし）である（T44f。Task 44 の設計書 P3-1 のユーザーの判断で、字下げ 2 文字から変えた）。
 import { describe, expect, it } from 'vitest';
 import { artifactJsonBytes, serializeArtifactJson } from '../../src/core/artifact-json.js';
 
@@ -12,26 +12,10 @@ const SAMPLE = Object.freeze({
   empty: {},
 });
 
-const EXPECTED = [
-  '{',
-  '  "runId": "RUN-000001",',
-  '  "label": "日本語のラベル",',
-  '  "lines": "first\\r\\nsecond\\rthird\\n",',
-  '  "nested": {',
-  '    "values": [',
-  '      1,',
-  '      "two",',
-  '      null,',
-  '      true',
-  '    ]',
-  '  },',
-  '  "empty": {}',
-  '}',
-  '',
-].join('\n');
+const EXPECTED = '{"runId":"RUN-000001","label":"日本語のラベル","lines":"first\\r\\nsecond\\rthird\\n","nested":{"values":[1,"two",null,true]},"empty":{}}\n';
 
 describe('artifact JSON format (CC-026)', () => {
-  it('indents by two spaces and ends with exactly one LF', () => {
+  it('writes without indentation and ends with exactly one LF (T44f)', () => {
     const text = serializeArtifactJson(SAMPLE);
 
     expect(text).toBe(EXPECTED);

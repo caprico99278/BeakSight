@@ -23,7 +23,6 @@ import {
 } from '../../fixtures/server.js';
 import { EXIT_CODES } from '../../src/cli/exit-codes.js';
 import { finishAuditRun } from '../../src/cli/run-command.js';
-import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
 import { RUN_ARTIFACT_FILE_NAMES, runArtifactDirectory } from '../../src/core/artifact-layout.js';
 import type {
   AuditRunResult,
@@ -36,7 +35,6 @@ import type {
 } from '../../src/core/contracts.js';
 import { deriveRunStatus } from '../../src/core/status.js';
 import { auditRun } from '../helpers/audit-run-fixture.js';
-import { withUnguardedPage } from '../helpers/gate-harness.js';
 import {
   captureCliOutput,
   cliTargetConfig,
@@ -383,24 +381,8 @@ describe('Auditor Gates (Task 18 design 4.3)', () => {
     expect(postForm.result.run.safety.invariantViolationCount).toBe(0);
   });
 
-  it('GATE-A08 (control): without the Guard, the same button does send the POST that the fixture server counts', async () => {
-    // サーバの側の確認が、POST を見つけられることを確かめる。Guard のない Context で、同じボタンを押す。
-    const browser = await runLauncher.launcher({ headless: true });
-    try {
-      const { counters, observations } = await withFixtureServer(async (server) => {
-        await withUnguardedPage(browser, DEFAULT_CONFIG.viewports.primaryDesktop, async (page) => {
-          await page.goto(`${server.origin}${PATHS.mutationButton}`);
-          const posted = page.waitForResponse((response) => new URL(response.url()).pathname === PATHS.mutationEndpoint);
-          await page.getByRole('button', { name: 'Attempt mutation' }).click();
-          await posted;
-        });
-      });
-      expect(counters.post).toBe(1);
-      expect(observations).toContainEqual(expect.objectContaining({ method: 'POST', pathname: PATHS.mutationEndpoint }));
-    } finally {
-      await browser.close();
-    }
-  });
+  // TS-f: GATE-A08 の対照（Guard のない Context で、同じボタンが POST を 1 件送り、ほかの変更系のメソッドは送らない）は、
+  // `gate-fixtures.test.ts` の Task 18 の POST の fixture の対照に、1 か所にまとめた。
 
   it('GATE-A09: the page limit makes the Run PARTIAL with MAX_PAGES_REACHED (the same site without the limit is COMPLETE)', async () => {
     expect(pageLimit.result.run.runStatus).toBe('PARTIAL');

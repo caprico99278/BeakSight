@@ -12,6 +12,7 @@
  *   （GATE-UI01）。日本語の文言は、文言カタログ（`src/presentation/messages.ts`）から取る（GATE-UI06）。
  */
 import { isPortableRelativeArtifactPath } from '../core/artifact-layout.js';
+import type { BeakSightBlockRelation, BeakSightBlockRelationReason } from '../core/beaksight-block-relation.js';
 import type {
   Finding,
   FindingCategory,
@@ -21,9 +22,16 @@ import type {
   Severity,
   ViewportProfile,
 } from '../core/contracts.js';
-import type { InteractionNotVerifiableKind, ScreenshotCaptureType } from '../core/evidence-types.js';
+import {
+  BLOCKED_EVENT_PHASES,
+  type BlockedEventPhase,
+  type InteractionNotVerifiableKind,
+  type ScreenshotCaptureType,
+} from '../core/evidence-types.js';
 import { classifyUrl } from '../crawl/admission-policy.js';
 import {
+  BEAKSIGHT_BLOCK_RELATION_CATALOG,
+  BLOCKED_EVENT_PHASE_CATALOG,
   FINDING_CATEGORY_CATALOG,
   INTERACTION_NOT_VERIFIABLE_KIND_CATALOG,
   INTERACTION_STATUS_CATALOG,
@@ -32,9 +40,17 @@ import {
   SCREENSHOT_CAPTURE_TYPE_CATALOG,
   SEVERITY_CATALOG,
   VIEWPORT_PROFILE_CATALOG,
+  sortByDisplayOrder,
   type DisplaySpec,
 } from '../presentation/catalog.js';
-import { REPORT_COMPONENT_TEXT, ruleVersionText, screenshotLinkText } from '../presentation/messages.js';
+import { formatCount } from '../presentation/format.js';
+import {
+  REPORT_COMPONENT_TEXT,
+  blockedEventPhaseCountText,
+  describeBeakSightBlockRelationReason,
+  ruleVersionText,
+  screenshotLinkText,
+} from '../presentation/messages.js';
 import { REPORT_CLASS_NAMES, REPORT_STYLESHEET, toneClassName } from './html-tokens.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -389,6 +405,10 @@ export interface FindingRowInput {
    * 2回目を `false` にして、`id` が重ならないようにする（U16c で追加）。
    */
   readonly anchored?: boolean;
+  /** BN-c: BeakSight の遮断との関係（表示用モデルの `beaksightBlockRelation` の区分と理由）。SAFETY の Finding と、省略は `null`（印を出さない）。 */
+  readonly blockRelation?: { readonly relation: BeakSightBlockRelation; readonly reason: BeakSightBlockRelationReason } | null;
+  /** BN-R0 の M-3: SAFETY の Finding の止めた事象の、時点の別の件数（表示用モデルの `safetyBlockPhaseCounts`）。省略は `null`。 */
+  readonly safetyBlockPhaseCounts?: Readonly<Record<BlockedEventPhase, number>> | null;
 }
 
 /** Finding の表の列の見出し（`renderFindingRow` のセルの順）。 */
@@ -400,6 +420,29 @@ const referenceList = (items: readonly string[]): string =>
     : `<ul class="${REPORT_CLASS_NAMES.referenceList}">${items.map((item) => `<li>${item}</li>`).join('')}</ul>`;
 
 const categoryLabel = (category: FindingCategory): string => FINDING_CATEGORY_CATALOG[category].label;
+
+/**
+ * BN-c・BN-d: Finding の内容の欄の後ろに付ける、BeakSight の遮断の印（表示は `BEAKSIGHT_BLOCK_RELATION_CATALOG`・`BLOCKED_EVENT_PHASE_CATALOG` の 1 か所）。
+ * - サイト品質の Finding: 区分の印（カタログの `badgeInFindingRow` が真の区分だけ）と、理由の説明。
+ * - SAFETY の Finding（BN-R0 の M-3）: 止めた事象の時点の印（カタログの `badgeInFindingRow` が真の時点で、件数が 1 以上のもの）と件数。
+ */
+const blockMarksHtml = (input: Pick<FindingRowInput, 'blockRelation' | 'safetyBlockPhaseCounts'>): string => {
+  const marks: string[] = [];
+  const relation = input.blockRelation ?? null;
+  if (relation !== null && BEAKSIGHT_BLOCK_RELATION_CATALOG[relation.relation].badgeInFindingRow) {
+    marks.push(`${renderBadge(BEAKSIGHT_BLOCK_RELATION_CATALOG[relation.relation], relation.relation).html} ${mutedText(describeBeakSightBlockRelationReason(relation.reason))}`);
+  }
+  const phaseCounts = input.safetyBlockPhaseCounts ?? null;
+  if (phaseCounts !== null) {
+    for (const phase of sortByDisplayOrder(BLOCKED_EVENT_PHASES, BLOCKED_EVENT_PHASE_CATALOG)) {
+      const spec = BLOCKED_EVENT_PHASE_CATALOG[phase];
+      if (spec.badgeInFindingRow && phaseCounts[phase] > 0) {
+        marks.push(`${renderBadge(spec, phase).html} ${mutedText(blockedEventPhaseCountText(formatCount(phaseCounts[phase])))}`);
+      }
+    }
+  }
+  return marks.map((mark) => ` ${mark}`).join('');
+};
 
 /**
  * Finding の行（`<tr>`）。列は `FINDING_TABLE_COLUMNS` の順（重大度、カテゴリ、内容、ページ、ビューポート、Rule、Evidence、
@@ -419,7 +462,7 @@ export const renderFindingRow = (input: FindingRowInput): SafeHtml<'row'> => {
   const cells = [
     renderSeverityBadge(finding.severity).html,
     escapeHtml(categoryLabel(finding.category)),
-    `<span class="${REPORT_CLASS_NAMES.findingMessage}">${escapeHtml(finding.message)}</span>`,
+    `<span class="${REPORT_CLASS_NAMES.findingMessage}">${escapeHtml(finding.message)}</span>${blockMarksHtml(input)}`,
     page,
     viewport,
     `<code class="${REPORT_CLASS_NAMES.identifier}">${escapeHtml(finding.ruleId)}</code>${ruleVersion}`,

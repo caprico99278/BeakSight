@@ -3,7 +3,7 @@
 // （メモリの状態）で渡す（`discovery-run.test.ts` の組み立てと同じ形）。出力先は呼ぶ側の一時のフォルダ。サーバは 127.0.0.1 だけ。
 import { readFileSync } from 'node:fs';
 import type { Browser } from 'playwright';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
 import type { DiscoveryDocument } from '../../src/discovery/discovery-result.js';

@@ -15,7 +15,8 @@ import { join } from 'node:path';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { wait } from '../../src/core/deadline.js';
 import { createNavigationPacer, type NavigationPacer } from '../../src/crawl/navigation-pacer.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
@@ -29,7 +30,7 @@ import {
   type AutomatedLoginFixture,
   type AutomatedLoginFixtureRequest,
 } from '../helpers/automated-login-fixture.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
 import { createTestCredentialStore, type TestCredentialStore } from '../helpers/test-credential-store.js';
 
@@ -46,8 +47,6 @@ const NAVIGATION_INTERVAL_MS = 2_000;
 const TEST_TIMEOUT_MS = 60_000;
 /** 監査の Run の test の時間の上限（ms。robots.txt、sitemap.xml、Desktop と Mobile の 4 回を、間隔ごとに読む）。 */
 const RUN_TEST_TIMEOUT_MS = 120_000;
-/** Chromium がページのアイコンを取りに行く path（Run の読み込みではないので、間隔の確かめから除く）。 */
-const BROWSER_FAVICON_PATH = '/favicon.ico';
 const p = AUTOMATED_LOGIN_FIXTURE_PATHS;
 
 describe.each(LAUNCHERS)('DEF-102 fix: the automated login stage goes through the navigation pacing (%s)', (_name, launch) => {
@@ -83,7 +82,7 @@ describe.each(LAUNCHERS)('DEF-102 fix: the automated login stage goes through th
   };
 
   const setup = (): AuthSetup => ({
-    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+    ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId: PROFILE_ID,
     profileRevision: 1,
     loginStartUrl: fixture.formUrl('standard', 'success'),
@@ -184,7 +183,8 @@ describe.each(LAUNCHERS)('DEF-102 fix: the automated login stage goes through th
       navigationPacer: pacer,
     }).run();
 
-    const runRequests = fixture.requests.slice(runStart).filter(({ path }) => path !== BROWSER_FAVICON_PATH);
+    // Chromium がページのアイコンを取りに行く path（Run の読み込みではないので、間隔の確かめから除く。CC-067）。
+    const runRequests = fixture.requests.slice(runStart).filter(({ path }) => path !== BROWSER_DEFAULT_FAVICON_PATH);
     expect(runRequests.map(({ method, path }) => `${method} ${path}`)).toEqual([
       'GET /robots.txt',
       'GET /sitemap.xml',

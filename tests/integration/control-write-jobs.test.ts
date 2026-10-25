@@ -18,9 +18,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
 import {
   ACTION_RUN_SCHEMA_VERSION,
   APPROVAL_SUMMARY_SCHEMA_VERSION,
@@ -43,14 +43,12 @@ import {
   settleWriteResult,
   type ApprovalExternalFacts,
 } from '../../src/control/approval/scenario-store.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import type { RuleSetContent } from '../../src/control/data-rules/rule-contracts.js';
 import type { DataSeed } from '../../src/control/data-rules/deterministic-stream.js';
-import {
-  createAuditJobManager,
-  type AuditJobManager,
-} from '../../src/control/job/audit-job-manager.js';
+import type { AuditJobManager } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
 import { checkWriteReport } from '../../src/control/job/write-report-check.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
@@ -68,15 +66,16 @@ import {
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { dateOfCompactUtcTimestamp, formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import { createActionBundle } from '../../src/report/action-bundle.js';
-import { verifiedCreateDocuments } from '../helpers/action-report-samples.js';
+import { sampleApiSummary, verifiedCreateDocuments } from '../helpers/action-report-samples.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { createCountingFork } from '../helpers/worker-fork.js';
 import {
-  CONTROL_JOB_TEST_TIMING,
-  FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
   awaitWorkersExit,
+  createFakeWorkerJobManager,
+  fakeWorkerValuesOf,
   isJobEnded,
   waitForJob,
+  withOutputDirectory,
   type JobViewSource,
 } from '../helpers/job-test-support.js';
 import { CREATE_CANDIDATE, UPDATE_CANDIDATE, UPDATE_TEMPLATED_IDENTITY_DIGEST } from '../unit/approval-samples.js';
@@ -104,7 +103,7 @@ const MANAGER_NOW = '20261012030100';
 const MINUTE_MS = 60_000;
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: GRANT_PROFILE_ID,
   profileRevision: MIN_PROFILE_REVISION,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -125,6 +124,9 @@ const FIXED_CONTENT: RuleSetContent = {
   uniqueKeyFieldNames: ['name'],
 };
 
+/** T37d: テストだけの書き込みで、管理の接続の書き込みを待つ上限（ms）。 */
+const RAW_BUSY_TIMEOUT_MS = 5_000;
+
 let workDirectory = '';
 let database: ControlDatabase;
 let manager: AuditJobManager | undefined;
@@ -137,34 +139,17 @@ const timeAt = (offsetMs: number): string => formatCompactUtcTimestamp(new Date(
 const fakeWorker = (name: string, write: NonNullable<FakeWorkerValues['write']> | null): FakeWorker => {
   const directory = join(workDirectory, 'workers', name);
   mkdirSync(directory, { recursive: true });
-  return writeFakeWorker(directory, 'write', {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
-    heartbeatIntervalMs: FAKE_WORKER_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
-    ...(write === null ? {} : { write }),
-  });
+  return writeFakeWorker(directory, 'write', fakeWorkerValuesOf({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID }, write === null ? {} : { write }));
 };
 
 async function managerWith(worker: FakeWorker): Promise<AuditJobManager> {
   await manager?.close();
-  manager = createAuditJobManager({
+  manager = createFakeWorkerJobManager({
     database,
-    repositoryRoot: workDirectory,
-    workerPath: worker.path,
-    resolveContext: (path) => {
-      const context = resolveTestContext(path);
-      return context === undefined ? undefined : { targetConfig: { ...context.targetConfig, output: { directory: OUTPUT_DIRECTORY } } };
-    },
+    workDirectory,
+    worker,
+    resolveContext: withOutputDirectory(resolveTestContext, OUTPUT_DIRECTORY),
     forkWorker: forks.fork,
-    timing: CONTROL_JOB_TEST_TIMING,
     now: () => clock,
   });
   return manager;
@@ -223,10 +208,13 @@ const actionRunOf = (jobId: string, grantId: string, overrides: Partial<ActionRu
   startedAt: MANAGER_NOW,
   submittedAt: MANAGER_NOW,
   finishedAt: MANAGER_NOW,
+  // T40c: 版 1.1 の FORM の記録（送り方 `FORM`、API の要約なし）。
+  transport: 'FORM',
+  api: null,
   ...overrides,
 });
 
-const writeOf = (overrides: Partial<NonNullable<FakeWorkerValues['write']>> = {}): NonNullable<FakeWorkerValues['write']> => ({
+const writeOf =(overrides: Partial<NonNullable<FakeWorkerValues['write']>> = {}): NonNullable<FakeWorkerValues['write']> => ({
   outputDirectory: resolve(workDirectory, OUTPUT_DIRECTORY),
   recheck: 1,
   onReject: 'report',
@@ -430,6 +418,25 @@ describe('write jobs (T30e): the start', () => {
     expect(readExecutionGrant(database, second.grantId)).toMatchObject({ consumedAt: expect.any(String), reservation: { state: 'RELEASED' } });
     expect(readWriteResult(database, second.jobId)).toMatchObject({ submission: 'NOT_SENT', result: 'BLOCKED', reservationState: 'RELEASED' });
     expect(jobs.getAuditJob(second.jobId)).toMatchObject({ state: 'FAILED', failureReason: 'WRITE_GRANT_REJECTED' });
+  }, TEST_TIMEOUT_MS);
+
+  // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない。定義の行を、版を変えずに画面の path の定義に書き換えた（テスト
+  // だけの操作。承認と許可の確かめは定義の ID と版だけを見るので、開始の照合の READ の確かめまで進む）とき、送らずに拒み、予約を返す。
+  it('rejects the start when the verification READ is a page path definition (WRITE_READ_VERIFICATION_PAGE_TARGET), and leaves no reservation RESERVED', async () => {
+    const { jobId, grantId } = issue(1);
+    const raw = new DatabaseSync(resolveControlDatabasePath(workDirectory), { timeout: RAW_BUSY_TIMEOUT_MS });
+    try {
+      expect(raw.prepare("UPDATE read_checks SET target_identity_digest = NULL, target_page_path = '/members', parameters = '{}' WHERE read_check_id = ?")
+        .run('rc-verify').changes).toBe(1);
+    } finally {
+      raw.close();
+    }
+    const jobs = await managerWith(fakeWorker('page-verification', writeOf()));
+    expect(await jobs.startWriteCreate({ profileId: GRANT_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, scenarioId: 'scenario-1', grantId }))
+      .toMatchObject({ ok: false, reason: 'WRITE_READ_VERIFICATION_PAGE_TARGET' });
+    expect(readWriteResult(database, jobId)).toMatchObject({ submission: 'NOT_SENT', result: 'BLOCKED', reservationState: 'RELEASED' });
+    expect(jobs.getAuditJob(jobId)).toMatchObject({ state: 'FAILED', failureReason: 'WRITE_GRANT_REJECTED' });
+    expect(forks.count()).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   it('uses a grant once when two starts race', async () => {
@@ -1088,5 +1095,36 @@ describe('update write jobs (T31f): the settlement at the end of the job', () =>
     })) }));
     expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FAILED', failureReason: 'WRITE_RESULT_INVALID' });
     expect(readWriteResult(database, jobId)).toMatchObject({ writeKind: 'CREATE', submission: 'UNKNOWN', result: 'UNKNOWN' });
+  }, TEST_TIMEOUT_MS);
+});
+
+// T40c（Task 40 の設計書 3.4。設計者の判断「順の入れ替え」）: FORM の書き込みのジョブの回帰。記録と報告は版 1.1（送り方 `FORM`、API の要約なし）で、締めは
+// 今どおり。LG-4: 前の版 1.0 の記録（送り方を持たない）は使わない（`WRITE_RESULT_INVALID`）。送り方 `API` の記録も、FORM のジョブでは使わない。台帳の行は
+// 送り方 `FORM` で、API の型の要約を持たない。
+describe('write jobs (T40c): the FORM records of the version 1.1, and no record of the version 1.0', () => {
+  it('settles a FORM record of 1.1 as today, and the ledger row has the transport FORM and no API summary', async () => {
+    const { grantId, jobId } = issue(1);
+    const run = actionRunOf(jobId, grantId);
+    expect(run).toMatchObject({ schemaVersion: ACTION_RUN_SCHEMA_VERSION, transport: 'FORM', api: null });
+    const ended = await runWriteJob('form-v11', writeOf({ actionRunText: JSON.stringify(run) }));
+    expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FINISHED', failureReason: null });
+    expect(readWriteResult(database, jobId)).toMatchObject({ result: 'VERIFIED', reservationState: 'COMMITTED', transport: 'FORM', api: null });
+  }, TEST_TIMEOUT_MS);
+
+  it('does not use a FORM record of the previous version 1.0 (no transport, no API summary; settles from the reports)', async () => {
+    const { grantId, jobId } = issue(1);
+    const { transport: _transport, api: _api, ...run } = actionRunOf(jobId, grantId);
+    const ended = await runWriteJob('form-v10', writeOf({ actionRunText: JSON.stringify({ ...run, schemaVersion: 'action-run-schema/1.0' }) }));
+    expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FAILED', failureReason: 'WRITE_RESULT_INVALID' });
+    expect(readWriteResult(database, jobId)).toMatchObject({ submission: 'UNKNOWN', result: 'UNKNOWN', transport: 'FORM', api: null });
+  }, TEST_TIMEOUT_MS);
+
+  it('does not use an API record for a FORM job (settles from the reports)', async () => {
+    const { grantId, jobId } = issue(1);
+    const ended = await runWriteJob('form-with-api', writeOf({ actionRunText: JSON.stringify(actionRunOf(jobId, grantId, {
+      transport: 'API', api: sampleApiSummary(), resultConditions: null, submittedValues: {},
+    })) }));
+    expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FAILED', failureReason: 'WRITE_RESULT_INVALID' });
+    expect(readWriteResult(database, jobId)).toMatchObject({ submission: 'UNKNOWN', result: 'UNKNOWN', transport: 'FORM', api: null });
   }, TEST_TIMEOUT_MS);
 });

@@ -13,7 +13,8 @@ import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { AuditRunDependencies, AuditRunOutcome } from '../../src/cli/audit-run.js';
 import { CONFIG_ERROR_EXIT_CODE, EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../src/cli/exit-codes.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import type { AuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import {
   WORKER_PROTOCOL_VERSION,
@@ -26,8 +27,18 @@ import {
 } from '../../src/control/worker-protocol.js';
 import type { RunId } from '../../src/core/contracts.js';
 import type { RunSummaryView } from '../../src/report/view-model.js';
-import { startAuditWorker, type AuditWorker, type WorkerAutomatedLoginStageRequest, type WorkerChannel } from '../../src/worker/audit-worker-session.js';
-import type { AutomatedLoginStageResult } from '../../src/worker/automated-login.js';
+import { ChromiumLaunchRefusedError } from '../../src/browser/chromium-launch.js';
+import { loginOriginOf } from '../../src/control/auth/automated-login-results.js';
+import {
+  LOGIN_BROWSER_LAUNCH_REFUSED_FAILURE_REASON,
+  startAuditWorker,
+  type AuditWorker,
+  type WorkerAutomatedLoginStageRequest,
+  type WorkerChannel,
+} from '../../src/worker/audit-worker-session.js';
+import { runLoginStage } from '../../src/worker/authenticated-login.js';
+import { runAutomatedLoginStage, type AutomatedLoginStageResult } from '../../src/worker/automated-login.js';
+import { LOGIN_BROWSER_LAUNCH_REFUSED } from '../../src/worker/login-stage-checks.js';
 import type { DiscoveryRunOutcome, DiscoveryRunRequest } from '../../src/worker/discovery-run.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
@@ -41,7 +52,7 @@ const HEARTBEAT_INTERVAL_MS = 1_000;
 const RETRY_AFTER_UNTIL = new Date(Date.UTC(2026, 9, 10, 12, 30, 5));
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-auto',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -206,7 +217,8 @@ describe('audit worker session (T26d-2): the automated login', () => {
     expect(run.manualCalls).toBe(0);
     expect(run.stageRequests).toHaveLength(1);
     const [request] = run.stageRequests;
-    expect(Object.keys(request ?? {}).sort()).toEqual(['approvedTestOrigins', 'automatedLogin', 'config', 'navigationPacer', 'setup', 'signal']);
+    // T36c（意図して直した期待）: スクリプトで送るログインの口に渡す、プロファイルの承認したサービスの Origin を足した。
+    expect(Object.keys(request ?? {}).sort()).toEqual(['approvedServiceOrigins', 'approvedTestOrigins', 'automatedLogin', 'config', 'navigationPacer', 'setup', 'signal']);
     expect(request).toMatchObject({ setup: SETUP, approvedTestOrigins: [ORIGIN], automatedLogin: AUTOMATED_LOGIN });
     expect(authStatesOf(run)).toEqual([
       { state: 'AUTHENTICATED', automatedLogin: { result: 'SUCCEEDED', submitted: 'YES', retryAfterUntil: null, formInvalidReason: null } },
@@ -332,6 +344,7 @@ describe('audit worker session (DEF-102 fix): the navigation pacing across the a
         runStatus: 'COMPLETE',
         exitCode: EXIT_CODES.COMPLETE,
         summary: { pagesRead: 1, pagesNotRead: 0, candidates: 0 },
+        endReason: 'COMPLETED',
       }),
     });
 
@@ -356,5 +369,57 @@ describe('audit worker session (DEF-102 fix): the navigation pacing across the a
     expect(run.stageRequests[0]?.navigationPacer.snapshot().navigationCount).toBe(1);
     expect(run.auditCalledAt[0]).toBeGreaterThanOrEqual(sentAt);
     expect(run.exitCode).toBe(EXIT_CODES.COMPLETE);
+  });
+});
+
+// EL-3（設計書 `2026-10-24-beaksight-external-launch-block-design.md` 3.2。設計者の判断 2026-10-24）: ログイン用の Browser の起動を、起動の部品が閉じた理由
+// （`EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE`。外部のアプリを開かせない設定が効かない）で断ったら、設定の見直し（`AUTH_SETUP_REQUIRED`）でも自動ログインの結果でもなく、
+// ワーカーの今の理由 `UNEXPECTED_FAILURE` で終える（理由のコードは詳細の文に書く。管理データの版と IPC の閉じた一覧は変えない）。偽の起動で断らせる。
+describe('audit worker session (EL-3): the login browser is refused by the launch component', () => {
+  const refusingLauncher = async (): Promise<never> => {
+    throw new ChromiumLaunchRefusedError('EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE', 'the self-check navigation was not blocked (fake)');
+  };
+
+  it('ends the automated login with FAILED (UNEXPECTED_FAILURE) and the reason in the detail, without AUTH_STATE and without the audit', async () => {
+    let credentialReads = 0;
+    const run = await runWorker(startOf('AUDIT'), (request) => runAutomatedLoginStage({
+      config: request.config,
+      setup: request.setup,
+      approvedTestOrigins: request.approvedTestOrigins,
+      approvedServiceOrigins: request.approvedServiceOrigins,
+      expectedCredentialRevision: request.automatedLogin.credentialRevision,
+      readCredentialMetadata: async () => ({ credentialRevision: request.automatedLogin.credentialRevision, loginOrigin: loginOriginOf(SETUP.loginStartUrl) ?? '' }),
+      readCredential: async () => {
+        credentialReads += 1;
+        throw new Error('the credential is not read in this test');
+      },
+      signal: request.signal,
+      navigationPacer: request.navigationPacer,
+    }, { launchAutomatedLoginBrowser: refusingLauncher }));
+
+    expect(failedReasonsOf(run)).toEqual([LOGIN_BROWSER_LAUNCH_REFUSED_FAILURE_REASON]);
+    expect(LOGIN_BROWSER_LAUNCH_REFUSED_FAILURE_REASON).toBe('UNEXPECTED_FAILURE');
+    expect(meaningful(run).flatMap((message) => (message.type === 'FAILED' ? [message.detail] : [])))
+      .toEqual(['the login browser was not launched (EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE)']);
+    expect(authStatesOf(run)).toEqual([]);
+    expect(run.manualCalls).toBe(0);
+    expect(run.auditRuns).toEqual([]);
+    expect(credentialReads).toBe(0);
+    expect(run.exitCode).toBe(FAILURE_EXIT_CODE);
+    expect(run.sent.every((message) => validateWorkerToParentMessage(message).ok)).toBe(true);
+  });
+
+  it('ends the manual login stage with the refusal (not AUTH_SETUP_REQUIRED), and keeps AUTH_SETUP_REQUIRED for other launch failures', async () => {
+    const request = {
+      config: createTestConfig(ORIGIN, '/admin'),
+      setup: { ...SETUP, automatedLogin: null },
+      approvedTestOrigins: [ORIGIN],
+      signal: new AbortController().signal,
+      onAwaitingLogin: () => undefined,
+    };
+    await expect(runLoginStage(request, { launchLoginBrowser: refusingLauncher }))
+      .resolves.toEqual({ kind: LOGIN_BROWSER_LAUNCH_REFUSED, refusal: 'EXTERNAL_LAUNCH_BLOCK_UNAVAILABLE' });
+    await expect(runLoginStage(request, { launchLoginBrowser: () => Promise.reject(new Error('spawn failed')) }))
+      .resolves.toEqual({ kind: 'AUTH_SETUP_REQUIRED' });
   });
 });

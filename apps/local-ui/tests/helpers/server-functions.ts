@@ -24,6 +24,18 @@ export interface ServerFunctionCall {
 /** クライアントと同じ形の、入力の本文。 */
 export const encodeServerFunctionPayload = (data: unknown): string => JSON.stringify(toJSON({ data }));
 
+/**
+ * FM-3: ブラウザの中の要求の URL が、名前の Server Function の要求か（`page.route` で、画面が送る保存の要求を止める・差し替えるときの判定）。
+ * id は、ビルドした画面のサーバの一覧（`readServerFunctionIds`）から引く。
+ */
+export const isServerFunctionUrlOf = (ids: ReadonlyMap<string, string>, name: string, url: URL): boolean => {
+  const id = ids.get(name);
+  if (id === undefined) {
+    throw new Error(`no server function named ${name}`);
+  }
+  return url.pathname === `/_serverFn/${id}`;
+};
+
 /** 応答の本文を読む（seroval の cross JSON の 1 件。読めなければ `undefined`）。 */
 const decode = (body: string): unknown => {
   try {

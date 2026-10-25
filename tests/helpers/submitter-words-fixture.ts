@@ -9,8 +9,8 @@
 //   - `notRead`: 対照。語を、probe が読まない属性（`data-label`、`name`、`input type=submit` の `alt`、`input type=image` の `value`）にだけ置いた
 //     form（語は 0 件になる）。
 // - どの画面も、アイコンに `data:` の URL を指定する（ブラウザ自身のアイコンの要求を出さないため）。画像は `data:` の URL（ネットワークを使わない）。
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 const STATUS_OK = 200;
 const STATUS_NO_CONTENT = 204;
@@ -58,7 +58,7 @@ const BODIES: Readonly<Record<string, string>> = Object.freeze({
 /** fixture のサーバを 127.0.0.1 で起動する。 */
 export async function startSubmitterWordsFixture(): Promise<SubmitterWordsFixture> {
   const requests: SubmitterWordsFixtureRequest[] = [];
-  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+  const server = await startLoopbackHttpServer((request: IncomingMessage, response: ServerResponse) => {
     const path = request.url ?? '/';
     requests.push({ method: request.method ?? '', path });
     request.resume();
@@ -76,16 +76,11 @@ export async function startSubmitterWordsFixture(): Promise<SubmitterWordsFixtur
     response.writeHead(STATUS_OK, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     response.end(body);
   });
-  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
-  const { port } = server.address() as AddressInfo;
-  const origin = `http://127.0.0.1:${port}`;
+  const { origin } = server;
   return {
     origin,
     requests,
     url: (path: string): string => `${origin}${path}`,
-    close: () => new Promise<void>((resolveClose) => {
-      server.closeAllConnections();
-      server.close(() => resolveClose());
-    }),
+    close: () => server.close(),
   };
 }

@@ -1,4 +1,4 @@
-import { isBlockedByClientFailure } from '../browser/playwright-errors.js';
+import { isBlockedByClientFailure } from '../core/blocked-by-client-failures.js';
 import type { RunLoadOriginRequests, RunLoadRecentPerMinute, RunLoadRequests } from '../core/contracts.js';
 import { isNonNegativeSafeInteger, isRecord } from '../core/guards.js';
 import { canonicalPassiveAllowedOrigins, hasAllowedOrigin } from '../safety/request-policy.js';
@@ -16,7 +16,7 @@ export const LOAD_PEAK_WINDOW_MS = 60_000;
  * 要求の終わりの事象（`requestfinished` と `requestfailed`）を、ここに渡すだけで、自分では数えない。
  *
  * 数えないもの（ネットワークに送らなかった要求）:
- * - 失敗の理由が、`route.abort('blockedbyclient')` で止めた要求の理由（`isBlockedByClientFailure`、`src/browser/playwright-errors.ts`。
+ * - 失敗の理由が、`route.abort('blockedbyclient')` で止めた要求の理由（`isBlockedByClientFailure`、`src/core/blocked-by-client-failures.ts`。
  *   完全一致の閉じた一覧）の要求。Guard、またはリソースの届け方の部品が止めた要求である。一覧にない理由の失敗は数える。
  * - Run 全体のキャッシュから返した印（`recordServedFromRunCache`）の付いた要求。
  *
@@ -43,6 +43,17 @@ export interface LoadMeter {
   recentPerMinute(): RunLoadRecentPerMinute;
 }
 
+/**
+ * `createLoadMeter` が作る部品（T35b）。`LoadMeter` に、承認したサービスの Origin の区分の読み出しを足したもの（factory には `LoadMeter` として渡す）。
+ */
+export interface RunLoadMeter extends LoadMeter {
+  /**
+   * T35b（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の記録（`run.json` の `load.approvedServiceOrigins` の値。`otherOrigins` の内数。
+   * 数え方はほかの区分と同じ）。承認したサービスの Origin を渡さなかった部品は `null`（公開の監査とフォームの送信のログインの監査は持たない）。
+   */
+  serviceOriginRequests(): RunLoadOriginRequests | null;
+}
+
 /** `createLoadMeter` の入力。 */
 export interface LoadMeterOptions {
   /** 許可 Origin（設定の `site.allowedOrigins`）。判定は Guard と同じ `hasAllowedOrigin` で行う。 */
@@ -54,6 +65,13 @@ export interface LoadMeterOptions {
    * 1分あたりの最大は、この値と、作り直した後の最大の、大きい方にする。直近の1分の時刻は引き継がない。
    */
   readonly initial?: RunLoadRequests;
+  /**
+   * T35b: 承認したサービスの Origin（スクリプトで送るログインの監査の Run だけ。プロファイルの `approvedServiceOrigins`）。渡したときだけ、その区分を
+   * 数える（`serviceOriginRequests`）。判定は許可 Origin と同じ `hasAllowedOrigin`。
+   */
+  readonly approvedServiceOrigins?: readonly string[];
+  /** T35b: 再開のときに引き継ぐ、承認したサービスの Origin の区分の記録（`serviceOriginRequests()` の値）。省略すると 0 から始める。 */
+  readonly initialServiceOriginRequests?: RunLoadOriginRequests;
 }
 
 /** 1つの区分の、数えている途中の状態。`windowEndTimesMs` は、直近の1分に終わった要求の時刻（古い順）。 */
@@ -79,13 +97,19 @@ interface OriginTally {
  * オブジェクトでないなら `TypeError`、`initial` の値が 0 以上の安全な整数でないなら `RangeError` を投げる。
  * `now()` が 0 以上の安全な整数を返さない場合は、数える呼び出しが `RangeError` を投げる（記録は変えない）。
  */
-export function createLoadMeter(options: LoadMeterOptions): LoadMeter {
+export function createLoadMeter(options: LoadMeterOptions): RunLoadMeter {
   if (!isRecord(options)) {
     throw new TypeError('LoadMeter options must be an object');
   }
-  const { allowedOrigins, now, initial } = options;
+  const { allowedOrigins, now, initial, approvedServiceOrigins, initialServiceOriginRequests } = options;
   if (!Array.isArray(allowedOrigins) || !allowedOrigins.every((origin) => typeof origin === 'string')) {
     throw new TypeError('LoadMeter allowed origins must be an array of strings');
+  }
+  if (
+    approvedServiceOrigins !== undefined
+    && (!Array.isArray(approvedServiceOrigins) || !approvedServiceOrigins.every((origin) => typeof origin === 'string'))
+  ) {
+    throw new TypeError('LoadMeter approved service origins must be an array of strings');
   }
   if (typeof now !== 'function') {
     throw new TypeError('LoadMeter requires a current time function');
@@ -94,6 +118,11 @@ export function createLoadMeter(options: LoadMeterOptions): LoadMeter {
   const canonicalAllowedOrigins = canonicalPassiveAllowedOrigins(new Set(allowedOrigins));
   const allowed = tallyFrom(start.allowedOrigins);
   const other = tallyFrom(start.otherOrigins);
+  // T35b: 承認したサービスの Origin の区分（渡したときだけ）。
+  const canonicalServiceOrigins = approvedServiceOrigins === undefined ? null : canonicalPassiveAllowedOrigins(new Set(approvedServiceOrigins));
+  const service = canonicalServiceOrigins === null
+    ? null
+    : tallyFrom(initialServiceOriginRequests === undefined ? EMPTY_ORIGIN_REQUESTS : validatedOriginRequests(initialServiceOriginRequests));
   let servedFromCache = start.servedFromCache;
   let withheldOtherOrigins = start.withheldOtherOrigins;
   const servedFromRunCache = new WeakSet<object>();
@@ -113,14 +142,12 @@ export function createLoadMeter(options: LoadMeterOptions): LoadMeter {
     }
     const endTimeMs = currentTimeMs();
     lastEndTimeMs = endTimeMs;
-    const tally = hasAllowedOrigin(url, canonicalAllowedOrigins) ? allowed : other;
-    tally.count += 1;
-    const window = tally.windowEndTimesMs;
-    while (window.length > 0 && !isWithinPeakWindow(window[0] ?? endTimeMs, endTimeMs)) {
-      window.shift();
+    const isAllowed = hasAllowedOrigin(url, canonicalAllowedOrigins);
+    countIn(isAllowed ? allowed : other, endTimeMs);
+    // T35b: 承認したサービスの Origin への要求は、`otherOrigins` に加えて、その区分にも数える（内数）。
+    if (service !== null && canonicalServiceOrigins !== null && !isAllowed && hasAllowedOrigin(url, canonicalServiceOrigins)) {
+      countIn(service, endTimeMs);
     }
-    window.push(endTimeMs);
-    tally.peakPerMinute = Math.max(tally.peakPerMinute, window.length);
   };
 
   return Object.freeze({
@@ -151,6 +178,9 @@ export function createLoadMeter(options: LoadMeterOptions): LoadMeter {
         withheldOtherOrigins,
       });
     },
+    serviceOriginRequests(): RunLoadOriginRequests | null {
+      return service === null ? null : originSnapshot(service);
+    },
     recentPerMinute(): RunLoadRecentPerMinute {
       const nowMs = currentTimeMs();
       return Object.freeze({
@@ -159,6 +189,17 @@ export function createLoadMeter(options: LoadMeterOptions): LoadMeter {
       });
     },
   });
+}
+
+/** 区分に、`endTimeMs` に終わった要求を 1 つ数える（直近の 1 分の窓を進め、1 分あたりの最大を更新する）。 */
+function countIn(tally: OriginTally, endTimeMs: number): void {
+  tally.count += 1;
+  const window = tally.windowEndTimesMs;
+  while (window.length > 0 && !isWithinPeakWindow(window[0] ?? endTimeMs, endTimeMs)) {
+    window.shift();
+  }
+  window.push(endTimeMs);
+  tally.peakPerMinute = Math.max(tally.peakPerMinute, window.length);
 }
 
 /** `endTimeMs` に終わった要求が、`nowMs` の時点の直近の1分（`LOAD_PEAK_WINDOW_MS`）に入るか。1分あたりの最大と直近の1分の件数の、窓の決め方。 */

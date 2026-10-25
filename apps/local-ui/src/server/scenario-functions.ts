@@ -25,11 +25,17 @@
  *   組（`pathTemplateOptionsOf`。ID の形の判定は `usableRecordIdOf`）、型の印を足し、欄ごとに「役割を決める欄か」と「変える欄に選べない理由」を足した。
  *   どちらも、下書きの確かめの owner（`validateScenarioDraft`）に、形の正しい UPDATE の指定を持った下書きで聞いて決める（判定を書き写さない）。
  *   詳細の値に、UPDATE の指定と、更新の予定のレコード（`readPlannedUpdateTarget`。なければ null）を足した。保存は今の保存の口のまま。
+ * - FM2a（手を減らす段 2 の設計書 3A.2 の「共通化」）: API の候補のフォームの値（下書きの入力と案）は、純粋な部品
+ *   （`src/control/approval/api-scenario-draft.ts`。自動の下書きと共用）が作る。ここは、管理データから既にあるシナリオの一覧を読んで渡すだけ。
+ * - FM2b（同 3A.2。案 2）: 自動の下書きの案内から開いた更新の作成の画面に、前もって選ぶ台帳と更新の画面の型（URL の引数の案。選択肢にあるものだけ）を
+ *   返す。詳細の値に、自動の下書きが推した値のまま残る項目と根拠（`autoDraftInferredItemsOf` で求め直す。承認に結ばない）を足す。
  */
 import { randomUUID } from 'node:crypto';
 import { createServerFn } from '@tanstack/react-start';
 import {
   APPROVAL_TTL_DAYS,
+  CREATE_SCENARIO_KIND,
+  UPDATE_SCENARIO_KIND,
   DEFAULT_MAX_CREATES_PER_RUN,
   DEFAULT_MAX_CUMULATIVE_CREATES,
   MIN_APPROVAL_TTL_DAYS,
@@ -37,11 +43,23 @@ import {
   RECORD_ID_PLACEHOLDER,
   SCENARIO_KINDS,
   SIDE_EFFECT_CONFIRMATIONS,
+  DRAFT_PROBE_LEDGER_SCENARIO_ID,
+  DRAFT_PROBE_PATH_TEMPLATE,
+  SCENARIO_UPDATE_INPUT_REASONS,
+  UNCONFIRMED_SIDE_EFFECTS,
+  apiScenarioFormOf,
+  apiUpdateDraftPresetOf,
+  autoDraftInferredItemsOf,
+  API_SCENARIO_TRANSPORT,
   approvalDigestDifferencesOf,
   approveScenario,
+  isUsableRecordIdSegment,
+  readScenarioDraftContext,
+  scenarioApiPublicationStateKeysOf,
   createScenario,
   listScenarios,
   missingVerificationItemsOf,
+  requiredVerificationItemsOf,
   readApprovalReceipts,
   isUpdatePathBoundToLedger,
   readPlannedUpdateTarget,
@@ -50,18 +68,29 @@ import {
   readScenarioRevisions,
   readUsedCumulativeWrites,
   revokeScenarioApproval,
+  scenarioTransportOf,
   unconfirmedSideEffectsOf,
   updateScenario,
   validateScenarioDraft,
+  type ApiScenarioFormProposal,
+  type ApiScenarioKeyFieldProposal,
+  type ApiScenarioPageKeyProposal,
   type ApprovalDigestDifference,
   type ApprovalExternalFacts,
   type ApprovalInvalidityReason,
   type ApprovalReceipt,
   type ApprovalReceiptKind,
+  type AutoDraftInferredItem,
+  type DraftValue,
+  type DraftValueGround,
+  type DraftValueOrigin,
   type InputRuleReference,
   type ReadCheckReference,
   type RevocationReason,
+  type ScenarioApiSpec,
   type ScenarioApprovalStatus,
+  type ScenarioDraftContext,
+  type ScenarioTransport,
   type ScenarioDraftRejectionReason,
   type ScenarioKind,
   type ScenarioLimits,
@@ -75,11 +104,12 @@ import {
   type SideEffectConfirmation,
   type SideEffectConfirmations,
 } from '../../../../src/control/approval-view.js';
-import { usableRecordIdOf } from '../../../../src/control/actions/action-outcome.js';
 import { PROFILE_ID_PATTERN } from '../../../../src/control/contracts.js';
 import { isProfileOperationAllowed } from '../../../../src/control/execution-policy.js';
 import {
+  isReadCheckPageTemplatePath,
   pathTemplateOptionsOf,
+  readCheckTargetKindOf,
   type CandidateFieldTag,
   type CandidateFieldType,
   type CandidateKind,
@@ -89,10 +119,12 @@ import {
   type MethodOverride,
   type PathTemplateOption,
 } from '../../../../src/control/discovery-view.js';
+import { defaultRangeFieldNamesOf, planRuleSet, varyingFieldNamesOf } from '../../../../src/control/data-rules-view.js';
 import { listReadChecks } from '../../../../src/control/job/read-check-store.js';
 import { getProfile, type StoredProfile } from '../../../../src/control/store/profile-store.js';
 import { isRecord } from '../../../../src/core/guards.js';
-import { formatCompactUtcTimestamp } from '../../../../src/core/utc-timestamp.js';
+import { recordIdPatternMatchesPagePath } from '../../../../src/core/record-id-path-pattern.js';
+import { ACTIVE_PROFILE_STATUS } from '../../../../src/control/store/profile-records.js';
 import { usesScenarios } from '../display/labels';
 import { scenarioDisplayStateOf, shownInvalidityReasonsOf, type ScenarioDisplayState } from '../display/scenarios';
 import type { InputRuleState } from '../display/data-rules';
@@ -102,15 +134,19 @@ import { localUiStore } from './control-store';
 import {
   candidateFieldViewOf,
   candidateOfDocument,
+  candidateOfDocumentByShape,
   discoveryProfileViewOf,
+  mergedCandidatesOf,
   readDiscoveryDocuments,
   showsOriginsOf,
   type CandidateFieldConstraintView,
   type DiscoveryProfileView,
 } from './discovery-documents';
 import { approvalExternalFactsOf, type ScenarioRequestLocalRejectionReason } from './scenario-facts';
+import { readCheckPagePathsOf } from './read-check-page-context';
+import { readProfileStart } from './start-check-inputs';
 import { requestOf } from './request-validation';
-import { isoTimestampOf } from './timestamps';
+import { isoTimestampOf, nowCompactTimestamp } from './timestamps';
 import { writeJobKindOf } from './write-kinds';
 import { writeResultSummariesOfScenario, type WriteResultSummaryView } from './write-results';
 
@@ -243,6 +279,54 @@ export interface ScenarioFormRulesView {
 /** 照らす READ の定義・照合の READ に選べる定義（取り消していないもの。T30g: 今の版の送る値の名前。値は返さない）。 */
 export interface ScenarioReadCheckOptionView extends ReadCheckReference {
   readonly parameterNames: readonly string[];
+  /** T37d fix round 1: 書き込みの照合の READ に使えるか（候補を読む定義だけ。画面の path を読む定義は使えない）。 */
+  readonly verifiable: boolean;
+  /**
+   * T38f: `{id}` つきの画面の path の定義か（`isReadCheckPageTemplatePath`）。API のシナリオだけ、照合の READ に選べる（結び付けは 0 件。判定は下書きの
+   * 確かめ）。
+   */
+  readonly pageTemplate: boolean;
+}
+
+/** T38f: API の候補の、欄に対応する鍵 1 つ（probe の案。送るかを利用者が確かめる）。FM2a: 案の部品（`api-scenario-draft.ts`）の型。 */
+export type ScenarioApiKeyFieldView = ApiScenarioKeyFieldProposal;
+
+/** T38f: API の候補の、欄に対応しない鍵 1 つ（ページが決める鍵に選べるか）。FM2a: 案の部品の型。 */
+export type ScenarioApiPageKeyView = ApiScenarioPageKeyProposal;
+
+/**
+ * T38f: API の候補のフォームの値（probe の型から作る案。値は持たない）。FM2a: 案は、作成の画面と自動の下書きが共用する純粋な部品
+ * （`src/control/approval/api-scenario-draft.ts` の `apiScenarioFormOf`）が作る。型の要約の案（`proposal`）は、承認の画面と同じ部品 `ScenarioApiShape`
+ * で出す。公開の状態にあたる鍵（DEF-147）は、UPDATE では既定で保つことを近くで知らせる。
+ */
+export interface ScenarioApiFormView extends ApiScenarioFormProposal {
+  /** T40R-fix-B（CC-103）: 送り方（いつも API。型の要約の部品が、表示のカタログのラベルで出す）。 */
+  readonly transport: ScenarioTransport;
+  /**
+   * FM2b（手を減らす段 2 の設計書 3A.2。案 2）: 自動の下書きの案内から開いた更新の、前もって選ぶ値（URL の引数の案のうち、選択肢にあるものだけ。印は、
+   * 同じ部品 `apiUpdateDraftPresetOf` で求め直した値と同じときだけ付ける。承認に結ばない。確かめは今の保存の口）。結び付く台帳の数も返す。登録は null。
+   */
+  readonly preset: ScenarioApiPresetView | null;
+}
+
+/** FM2b: 前もって選ぶ値 1 つ（印は表示だけ）。 */
+export interface ScenarioApiPresetValueView {
+  readonly value: string;
+  readonly origin: DraftValueOrigin | null;
+  readonly ground: DraftValueGround | null;
+}
+
+/** FM2b: 更新の作成の画面で前もって選ぶ値。 */
+export interface ScenarioApiPresetView {
+  readonly ledger: ScenarioApiPresetValueView | null;
+  readonly formPathTemplate: ScenarioApiPresetValueView | null;
+  readonly ledgerOptionCount: number;
+}
+
+/** FM2b: 作成の画面の URL の引数の、前もって選ぶ値の案。 */
+interface ScenarioFormPresetRequest {
+  readonly ledgerScenarioId?: string;
+  readonly formPathTemplate?: string;
 }
 
 /** 作成と変更のフォームの画面の値。 */
@@ -256,6 +340,8 @@ export interface ScenarioFormPageView extends ScenarioProfileFrameView {
   readonly rules: ScenarioFormRulesView;
   /** T31h-1: UPDATE の候補のフォームの値（UPDATE の候補でなければ null）。 */
   readonly update: ScenarioUpdateFormView | null;
+  /** T38f: API の候補のフォームの値（型の digest で行を選んだときだけ。FORM の候補は null）。 */
+  readonly api: ScenarioApiFormView | null;
 }
 
 /** 発見の根拠の写しの欄（値と選択肢は持たない）。 */
@@ -279,7 +365,14 @@ export interface ScenarioContentView {
   readonly state: ScenarioState;
   readonly kind: ScenarioKind;
   readonly candidateIdentityDigest: string;
-  readonly request: ScenarioRequestShape;
+  /** form の要求の形（T38b: API のシナリオは null。API の要求の型は `api`）。 */
+  readonly request: ScenarioRequestShape | null;
+  /** T38c: 送り方。 */
+  readonly transport: ScenarioTransport;
+  /** T38c: API の指定（要求の型、鍵と欄、ページが決める鍵、ヘッダの名前、filter の名前。値は持たない）。FORM のシナリオは null。 */
+  readonly api: ScenarioApiSpec | null;
+  /** DEF-147: API の指定の鍵のうち、公開の状態にあたる鍵（承認の画面の注意の印。FORM のシナリオは空）。 */
+  readonly apiPublicationStateKeys: readonly string[];
   readonly fieldNames: readonly string[];
   readonly readChecks: readonly ReadCheckReference[];
   readonly sideEffectConfirmations: SideEffectConfirmations;
@@ -335,6 +428,10 @@ export interface ScenarioDetailPageView extends ScenarioProfileFrameView {
   readonly inputRuleState: InputRuleState;
   /** 検証の指定の未指定の項目（T30g。空でなければ、実行の許可を出さない。`VERIFICATION_SPEC_MISSING`）。 */
   readonly missingVerification: readonly ScenarioVerificationItem[];
+  /** T40a-fix: 検証の指定で求める項目（画面に出す項目。FORM はすべて、API は ID の取り方と照合の READ だけ。`requiredVerificationItemsOf`）。 */
+  readonly verificationItems: readonly ScenarioVerificationItem[];
+  /** T40R2-fix: 画面から ID を取る型が書き込みの画面にも当たるか（API のシナリオだけ。当たれば注意を出す。`recordIdPatternMatchesPagePath`）。 */
+  readonly recordIdPatternCaution: boolean;
   /** 書き込みを始める画面を出すか（T30g。T31h-2 から、登録（CREATE）と更新（UPDATE）のシナリオで、その書き込みのジョブを始められるプロファイル）。 */
   readonly writeStartAvailable: boolean;
   /** 書き込みの履歴（T30g。新しい順）。 */
@@ -343,6 +440,11 @@ export interface ScenarioDetailPageView extends ScenarioProfileFrameView {
   readonly updateLedger: { readonly scenarioId: string; readonly pagePath: string | null } | null;
   /** T31h-1: 更新の予定のレコードの ID（`readPlannedUpdateTarget`。UPDATE でないか、対象にできるレコードがなければ null）。 */
   readonly plannedUpdateTarget: string | null;
+  /**
+   * FM2b（手を減らす段 2 の設計書 3A.2）: 自動の下書きが推した値のまま残る項目と根拠（API の登録だけ。表示のときに、同じ部品
+   * `autoDraftInferredItemsOf` で求め直す。承認に結ばない）。1 つでも残れば、承認のダイアログにも出す。
+   */
+  readonly inferredItems: readonly AutoDraftInferredItem[];
 }
 
 /** 誤り 1 件（送る欄の誤りはその欄の名前、照らす READ の定義の誤りはその ID）。 */
@@ -370,8 +472,7 @@ export type ScenarioChangeView = { readonly ok: true; readonly scenarioId: strin
 // 値の組み立て
 // ---------------------------------------------------------------------------------------------------------------
 
-/** シナリオを作り・変えてよいプロファイルの状態。 */
-const ACTIVE_PROFILE_STATUS = 'ACTIVE';
+// シナリオを作り・変えてよいプロファイルの状態（`ACTIVE_PROFILE_STATUS`）と今の時刻（`nowCompactTimestamp`）は、owner から読む（FM2R の Minor 13）。
 
 const RULES_VIEW: ScenarioFormRulesView = Object.freeze({
   minLimit: MIN_SCENARIO_LIMIT,
@@ -382,13 +483,8 @@ const RULES_VIEW: ScenarioFormRulesView = Object.freeze({
   sideEffects: SIDE_EFFECT_CONFIRMATIONS,
 });
 
-/** 副作用の確認（どれも確かめていない。選べるかの確かめの下書きに使う）。 */
-const NOTHING_CONFIRMED: SideEffectConfirmations = Object.freeze(
-  Object.fromEntries(SIDE_EFFECT_CONFIRMATIONS.map((item) => [item, false])) as Record<SideEffectConfirmation, boolean>,
-);
-
-/** 今の時刻（管理データの UTC の 14 桁）。 */
-const nowStamp = (label: string): string => formatCompactUtcTimestamp(new Date(), label);
+/** 今の時刻（管理データの UTC の 14 桁。owner は `timestamps.ts`）。 */
+const nowStamp = nowCompactTimestamp;
 
 /** プロファイルの要点と、使えるか。 */
 const frameOf = (stored: StoredProfile): ScenarioProfileFrameView => {
@@ -421,20 +517,6 @@ const scenarioKindOfCandidate = (candidate: DiscoveryCandidate): ScenarioKind | 
   SCENARIO_KINDS.find((kind) => kind === candidate.classification) ?? null;
 
 /**
- * T31h-1: 選べるかを確かめる UPDATE の下書きの、UPDATE の指定（形だけ正しい値。台帳の参照と path の型の誤りは、欄の判定では見ない）。型は、
- * 区切りの全体を印にした path（契約の印を使う。書き写さない）。台帳の参照は、シナリオの id の形に合う、確かめのためだけの名前。
- */
-const PROBE_PATH_TEMPLATE = `/${RECORD_ID_PLACEHOLDER}`;
-const PROBE_LEDGER_SCENARIO_ID = 'scenario-form-probe';
-/** T31h-1: UPDATE の下書きで、フォームの UPDATE の指定の入力で直せる、欄に結び付かない誤り（候補を作れない理由にしない）。 */
-const UPDATE_INPUT_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set([
-  'SCENARIO_UPDATE_TARGET_NOT_FOUND',
-  'SCENARIO_UPDATE_TARGET_NOT_CREATE',
-  'SCENARIO_UPDATE_PATH_MISMATCH',
-  'SCENARIO_UPDATE_RECORD_ID_UNSAFE',
-  'SCENARIO_UPDATE_NO_CHANGED_FIELD',
-]);
-/**
  * T31h-1: UPDATE を受けない画面の欄の誤り（欄に結び付くが、その画面で UPDATE のシナリオを作れない。候補を作れない理由にする）。T31R2-fix-1: 値を
  * 読めない秘密に見える名前の欄がある画面（登録と更新）も、候補を作れない理由にする。
  */
@@ -448,7 +530,8 @@ const ROLE_MISSING_REASON = 'SCENARIO_UPDATE_FIELD_ROLE_MISSING' satisfies Scena
 
 /**
  * 選べるかを確かめる下書き（その欄だけを送る、ほかは既定の値。判定は下書きの確かめの owner に任せる）。T31h-1: UPDATE の候補では、形の正しい UPDATE の
- * 指定を足す（保つ欄は `keepFieldNames`）。
+ * 指定を足す（保つ欄は `keepFieldNames`。形だけ正しい値で、台帳の参照と path の型の誤りは、欄の判定では見ない）。FM2a: 副作用の確認・確かめのためだけの
+ * 台帳の参照と path の型は、API の下書きの部品（`api-scenario-draft.ts`）と同じ値を使う。
  */
 const probeDraftOf = (
   profileId: string,
@@ -460,15 +543,15 @@ const probeDraftOf = (
   candidateIdentityDigest: candidate.identityDigest,
   fieldNames: [...fieldNames],
   readChecks: [],
-  sideEffectConfirmations: NOTHING_CONFIRMED,
+  sideEffectConfirmations: UNCONFIRMED_SIDE_EFFECTS,
   limits: { maxCreatesPerRun: DEFAULT_MAX_CREATES_PER_RUN, maxCumulativeCreates: DEFAULT_MAX_CUMULATIVE_CREATES },
   approvalTtlDays: APPROVAL_TTL_DAYS,
   ...(scenarioKindOfCandidate(candidate) === UPDATE_KIND
     ? {
       update: {
-        targetCreateScenarioId: PROBE_LEDGER_SCENARIO_ID,
-        formPathTemplate: PROBE_PATH_TEMPLATE,
-        actionPathTemplate: PROBE_PATH_TEMPLATE,
+        targetCreateScenarioId: DRAFT_PROBE_LEDGER_SCENARIO_ID,
+        formPathTemplate: DRAFT_PROBE_PATH_TEMPLATE,
+        actionPathTemplate: DRAFT_PROBE_PATH_TEMPLATE,
         keepFieldNames: [...keepFieldNames],
       },
     }
@@ -494,7 +577,7 @@ const draftErrorsOf = (draft: unknown, candidate: DiscoveryCandidate): readonly 
 const candidateRejectionOf = (profileId: string, candidate: DiscoveryCandidate): ScenarioDraftRejectionReason | null => {
   const errors = draftErrorsOf(probeDraftOf(profileId, candidate, []), candidate);
   return errors.find((error) => UPDATE_FORM_REASONS.has(error.code))?.code
-    ?? errors.find((error) => error.fieldName === null && error.readCheckId === null && !UPDATE_INPUT_REASONS.has(error.code))?.code
+    ?? errors.find((error) => error.fieldName === null && error.readCheckId === null && !SCENARIO_UPDATE_INPUT_REASONS.has(error.code))?.code
     ?? null;
 };
 
@@ -548,6 +631,52 @@ const candidateViewOf = (profileId: string, candidate: DiscoveryCandidate): Scen
   };
 };
 
+// ---------------------------------------------------------------------------------------------------------------
+// T38f: API の候補のフォームの値（選べるか・作れない理由は、下書きの確かめの owner に、保存と同じ文脈で任せる）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * API の候補のフォームの値と、候補を作れない理由。FM2a: 案は、作成の画面と自動の下書きが共用する純粋な部品（`apiScenarioFormOf`）が作る。ここは、
+ * 管理データから既にあるシナリオの一覧を読んで渡し、送り方を足すだけ。
+ */
+const apiFormOf = (
+  profileId: string,
+  candidate: DiscoveryCandidate,
+  context: ScenarioDraftContext,
+  request: ScenarioFormPresetRequest = {},
+): { readonly view: ScenarioApiFormView | null; readonly rejection: ScenarioDraftRejectionReason | null } => {
+  const { form, rejection } = apiScenarioFormOf({
+    profileId,
+    candidate,
+    context,
+    scenarios: listScenarios(localUiStore(), profileId)
+      .map((scenario) => ({ scenarioId: scenario.scenarioId, kind: scenario.current.kind, pagePath: scenario.evidence.page.path })),
+  });
+  return { rejection, view: form === null ? null : { ...form, transport: API_SCENARIO_TRANSPORT, preset: presetViewOf(form, request) } };
+};
+
+/**
+ * FM2b: 更新の作成の画面で前もって選ぶ値（URL の引数の案のうち、選択肢にあるものだけ）。印は、自動の下書きと同じ部品で求め直した値と同じときだけ
+ * 付ける。登録は null。
+ */
+const presetViewOf = (form: ApiScenarioFormProposal, request: ScenarioFormPresetRequest): ScenarioApiPresetView | null => {
+  if (form.kind !== UPDATE_KIND) {
+    return null;
+  }
+  const computed = apiUpdateDraftPresetOf(form);
+  const valueOf = (value: string | undefined, options: readonly string[], mark: DraftValue<string> | null): ScenarioApiPresetValueView | null => {
+    if (value === undefined || !options.includes(value)) {
+      return null;
+    }
+    return mark !== null && mark.value === value ? { value, origin: mark.origin, ground: mark.ground } : { value, origin: null, ground: null };
+  };
+  return {
+    ledger: valueOf(request.ledgerScenarioId, form.ledgerOptions.map(({ scenarioId }) => scenarioId), computed.ledger),
+    formPathTemplate: valueOf(request.formPathTemplate, form.formPathTemplates, computed.formPathTemplate),
+    ledgerOptionCount: computed.ledgerOptionCount,
+  };
+};
+
 /** 承認の状態の表示の値。 */
 const statusViewOf = (status: ScenarioApprovalStatus): ScenarioStatusView => ({
   displayState: scenarioDisplayStateOf(status.validity),
@@ -591,8 +720,9 @@ const summaryOf = (scenario: ScenarioView, external: ApprovalExternalFacts | nul
     kind: current.kind,
     pageOrigin: scenario.evidence.page.origin,
     pagePath: scenario.evidence.page.path,
-    actionOrigin: current.request.origin,
-    actionPath: current.request.path,
+    // T38b: API のシナリオは、送り先を API の要求の型（Origin と path の型）から示す。
+    actionOrigin: current.request?.origin ?? current.api?.request.origin ?? '',
+    actionPath: current.request?.path ?? current.api?.request.pathShape ?? '',
     status: scenarioStatusOf(scenario.scenarioId, external),
     lastApprovalExpiresAt: lastApproval === null ? null : isoTimestampOf(lastApproval.expiresAt),
     limits: { ...current.limits },
@@ -639,7 +769,10 @@ const detailOf = async (scenario: ScenarioView, stored: StoredProfile): Promise<
       state: scenario.state,
       kind: current.kind,
       candidateIdentityDigest: current.candidate.identityDigest,
-      request: { ...current.request },
+      request: current.request === null ? null : { ...current.request },
+      transport: scenarioTransportOf(current),
+      api: current.api === undefined ? null : structuredClone(current.api) as ScenarioApiSpec,
+      apiPublicationStateKeys: current.api === undefined ? [] : [...scenarioApiPublicationStateKeysOf(current.api)],
       fieldNames: [...current.fieldNames],
       readChecks: current.readChecks.map(({ readCheckId, revision }) => ({ readCheckId, revision })),
       sideEffectConfirmations: { ...current.sideEffectConfirmations },
@@ -683,29 +816,79 @@ const detailOf = async (scenario: ScenarioView, stored: StoredProfile): Promise<
     lastApprovalRevision: lastApproval?.scenarioRevision ?? null,
     differences: differencesOf(scenario, lastApproval, stored, external),
     inputRuleState: dataRuleFactsOf(scenario).state,
-    missingVerification: [...missingVerificationItemsOf(current.verification)],
+    // T40a-fix: 求める項目は送り方で決まる（API は照合の READ と ID の取り方だけ。同じ判定を発行の口も使う）。
+    missingVerification: [...missingVerificationItemsOf(current.verification, current)],
+    verificationItems: [...requiredVerificationItemsOf(current)],
+    // T40R2-fix（使える度合い）: API のシナリオで、画面から ID を取る型が書き込みの画面（候補の画面）にも当たれば注意を出す（保存は拒まない）。
+    recordIdPatternCaution: current.transport === API_SCENARIO_TRANSPORT
+      && recordIdPatternMatchesPagePath(current.verification.recordId, scenario.evidence.page.path),
     // T31h-2: 登録（CREATE）と更新（UPDATE）のどちらも、プロファイルがその書き込みのジョブを始められるときに、開始の画面へ移れる。
     writeStartAvailable: isProfileOperationAllowed(writeJobKindOf(current.kind), stored.profile.mode, stored.profile.auth),
     writes: await writeResultSummariesOfScenario(scenario.scenarioId),
     updateLedger: updateLedgerOf(scenario),
     plannedUpdateTarget: current.kind === UPDATE_KIND ? readPlannedUpdateTarget(localUiStore(), scenario.scenarioId) : null,
+    inferredItems: await inferredItemsOf(scenario, stored),
   };
 };
 
-/** 登録のシナリオの種類（T30g）。書き込みのジョブの種類は `write-kinds.ts`（T31h-2）。 */
-const CREATE_KIND = 'CREATE' satisfies ScenarioKind;
-/** T31h-1: 更新のシナリオの種類。 */
-const UPDATE_KIND = 'UPDATE' satisfies ScenarioKind;
+/**
+ * FM2b: 自動の下書きが推した値のまま残る項目（API の登録だけ）。最後の発見の候補と読めた画面の path、照合の READ の定義の画面の path、入力の規則の
+ * 実行のたびに変わる欄を集め、同じ部品で求め直す。どれかを読めなければ、その項目は出ない（推測の印を多く出す側に倒さない。表示だけ）。
+ */
+const inferredItemsOf = async (scenario: ScenarioView, stored: StoredProfile): Promise<readonly AutoDraftInferredItem[]> => {
+  const { current, evidence } = scenario;
+  if (scenarioTransportOf(current) !== API_SCENARIO_TRANSPORT) {
+    return [];
+  }
+  const { profileId } = scenario;
+  const { latest } = await readDiscoveryDocuments(profileId);
+  const reading = await readProfileStart(profileId);
+  const readCheckId = current.verification.readVerification?.readCheckId ?? null;
+  const definition = readCheckId === null ? undefined : listReadChecks(localUiStore(), profileId).find((view) => view.readCheckId === readCheckId);
+  const { saved } = dataRuleFactsOf(scenario);
+  let varyingFieldNames: readonly string[] = [];
+  let defaultRangeFieldNames: readonly string[] = [];
+  try {
+    varyingFieldNames = saved === null ? [] : varyingFieldNamesOf(planRuleSet(saved, current, evidence));
+    // FM2R の Minor 11: 範囲の既定の幅を入れた欄（判定は規則の部品の 1 か所。規則の画面と同じ）。
+    defaultRangeFieldNames = saved === null ? [] : defaultRangeFieldNamesOf(saved.fieldRules, current, evidence);
+  } catch (error) {
+    if (!(error instanceof RangeError)) {
+      throw error;
+    }
+  }
+  // FM2R の Minor 11: 更新の画面の型の選択肢（作成の画面と同じ案の部品。最後の発見の文脈で求め直す）。
+  const context = current.kind !== UPDATE_KIND || latest === null ? null : readScenarioDraftContext(localUiStore(), profileId, latest.jobId, scenario.scenarioId);
+  const updateFormPathTemplates = context === null ? [] : apiFormOf(profileId, evidence, context).view?.formPathTemplates ?? [];
+  return autoDraftInferredItemsOf({
+    scenarioId: scenario.scenarioId,
+    scenario: current,
+    // FM2R の Minor 9: 自動の下書きの値が、その後に人の手で変わっていないかを、版の写しの履歴で見る。
+    history: readScenarioRevisions(localUiStore(), scenario.scenarioId).map((view) => view.scenario),
+    evidence,
+    candidates: mergedCandidatesOf(latest),
+    approvedServiceOrigins: stored.profile.approvedServiceOrigins ?? [],
+    readPagePaths: reading === null ? [] : readCheckPagePathsOf(latest, reading),
+    readVerificationPagePath: definition?.definition.targetPagePath ?? null,
+    varyingFieldNames,
+    updateFormPathTemplates,
+    defaultRangeFieldNames,
+  });
+};
 
-/** T31h-1: ID の区切りの値が、レコードの ID の形か（owner は `src/control/actions/action-outcome.ts`）。 */
-const isUsableRecordId = (value: string): boolean => usableRecordIdOf(value) !== null;
+/** 登録・更新のシナリオの種類（T30g、T31h-1。CC-106: 種類の一覧の owner の名前つきの定数）。書き込みのジョブの種類は `write-kinds.ts`（T31h-2）。 */
+const CREATE_KIND = CREATE_SCENARIO_KIND;
+const UPDATE_KIND = UPDATE_SCENARIO_KIND;
 
-/** T31h-1: UPDATE の候補のフォームの値（台帳にできる登録のシナリオ、候補から作れる path の型の組、型の印。UPDATE でなければ null）。 */
+/**
+ * T31h-1: UPDATE の候補のフォームの値（台帳にできる登録のシナリオ、候補から作れる path の型の組、型の印。UPDATE でなければ null）。ID の区切りの値が
+ * レコードの ID の形かは、API の下書きの部品と同じ判定（`isUsableRecordIdSegment`。owner は `src/control/actions/action-outcome.ts`。FM2a）。
+ */
 const updateFormViewOf = (profileId: string, candidate: DiscoveryCandidate): ScenarioUpdateFormView | null => {
   if (scenarioKindOfCandidate(candidate) !== UPDATE_KIND) {
     return null;
   }
-  const templateOptions = pathTemplateOptionsOf(candidate, isUsableRecordId).map((option) => ({ ...option }));
+  const templateOptions = pathTemplateOptionsOf(candidate, isUsableRecordIdSegment).map((option) => ({ ...option }));
   return {
     ledgerOptions: listScenarios(localUiStore(), profileId)
       .filter((scenario) => scenario.current.kind === CREATE_KIND)
@@ -734,14 +917,14 @@ const updateViewOf = (scenario: ScenarioView): ScenarioUpdateView | null => {
     };
 };
 
-/** T31h-1: 台帳のシナリオ（UPDATE の指定がなければ null）。 */
+/** T31h-1: 台帳のシナリオ（UPDATE の指定がなければ null）。T38f: API の UPDATE は、台帳の参照（`api.ledger`）の登録のシナリオ。 */
 const updateLedgerOf = (scenario: ScenarioView): ScenarioDetailPageView['updateLedger'] => {
-  const { update } = scenario.current;
-  if (update === null) {
+  const targetId = scenario.current.update?.targetCreateScenarioId ?? scenario.current.api?.ledger?.targetCreateScenarioId ?? null;
+  if (targetId === null) {
     return null;
   }
-  const ledger = readScenario(localUiStore(), update.targetCreateScenarioId);
-  return { scenarioId: update.targetCreateScenarioId, pagePath: ledger === null ? null : ledger.evidence.page.path };
+  const ledger = readScenario(localUiStore(), targetId);
+  return { scenarioId: targetId, pagePath: ledger === null ? null : ledger.evidence.page.path };
 };
 
 /** 拒んだ結果（理由と、項目ごとの誤りと、再承認の判定の理由）。 */
@@ -796,9 +979,11 @@ interface ProfileKeyRequest {
 interface ScenarioKeyRequest {
   readonly scenarioId: string;
 }
-interface ScenarioFormRequest {
+interface ScenarioFormRequest extends ScenarioFormPresetRequest {
   readonly profileId: string;
   readonly candidateIdentityDigest: string;
+  /** T38f: API の候補の行を選ぶ型の digest（省けば FORM の候補）。 */
+  readonly shapeDigest?: string;
 }
 interface ScenarioCreateRequest {
   readonly draft: Readonly<Record<string, unknown>>;
@@ -848,18 +1033,34 @@ export const scenarioFormPageFn = createServerFn({ method: 'GET' })
     }
     const { profileId } = stored.profile;
     const { latest } = await readDiscoveryDocuments(profileId);
-    const candidate = candidateOfDocument(latest, data.candidateIdentityDigest);
+    const { shapeDigest } = data;
+    // T38f: 型の digest があれば、API の候補の行を型で選ぶ（同じ識別で型が違う行が別に残る）。下書きの確かめは保存と同じ文脈で行う。
+    const candidate = shapeDigest === undefined
+      ? candidateOfDocument(latest, data.candidateIdentityDigest)
+      : candidateOfDocumentByShape(latest, data.candidateIdentityDigest, shapeDigest);
+    const context = latest === null ? null : readScenarioDraftContext(localUiStore(), profileId, latest.jobId, null);
+    const api = shapeDigest === undefined || candidate === null || context === null
+      ? null
+      : apiFormOf(profileId, candidate, context, {
+        ...(data.ledgerScenarioId === undefined ? {} : { ledgerScenarioId: data.ledgerScenarioId }),
+        ...(data.formPathTemplate === undefined ? {} : { formPathTemplate: data.formPathTemplate }),
+      });
     return {
       ...frameOf(stored),
       candidate: candidate === null ? null : candidateViewOf(profileId, candidate),
-      candidateRejection: candidate === null ? CANDIDATE_UNKNOWN_REASON : candidateRejectionOf(profileId, candidate),
+      candidateRejection: candidate === null
+        ? CANDIDATE_UNKNOWN_REASON
+        : shapeDigest === undefined ? candidateRejectionOf(profileId, candidate) : api === null ? CANDIDATE_UNKNOWN_REASON : api.rejection,
       readChecks: listReadChecks(localUiStore(), profileId).map(({ readCheckId, revision, definition }) => ({
         readCheckId,
         revision,
         parameterNames: Object.keys(definition.parameters),
+        verifiable: readCheckTargetKindOf(definition) === 'CANDIDATE',
+        pageTemplate: definition.targetPagePath !== undefined && isReadCheckPageTemplatePath(definition.targetPagePath),
       })),
       rules: RULES_VIEW,
-      update: candidate === null ? null : updateFormViewOf(profileId, candidate),
+      update: candidate === null || shapeDigest !== undefined ? null : updateFormViewOf(profileId, candidate),
+      api: api?.view ?? null,
     };
   });
 

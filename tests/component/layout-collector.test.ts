@@ -19,7 +19,8 @@ import {
   type PassiveStressSessionFactory,
   type StressLayoutOptions,
 } from '../../src/evidence/layout-collector.js';
-import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
+import { fakePlaywrightRequest } from '../helpers/fake-playwright-request.js';
+import { NO_PACING_WAIT, NO_SETTLING_WAIT } from '../helpers/navigation-pacer.js';
 import { TIMER_CLOCK_GRANULARITY_MS } from '../helpers/timer-clock.js';
 
 function rawLayout(width: number, height: number) {
@@ -128,7 +129,11 @@ function neverSettles(): Promise<never> {
 
 /** 間隔を確かめないテストの、幅の走査の引数。期限は、呼び出し時点から、幅の数 × `defaultTimeoutMs` 後。 */
 function unpacedStressOptions(widths: readonly number[]): StressLayoutOptions {
-  return { deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs * widths.length, beforeNavigation: NO_PACING_WAIT };
+  return {
+    deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs * widths.length,
+    beforeNavigation: NO_PACING_WAIT,
+    settleBeforeLayout: NO_SETTLING_WAIT,
+  };
 }
 
 function sessionFactory(events: string[]): PassiveStressSessionFactory {
@@ -191,6 +196,46 @@ describe('responsive layout stress lifecycle', () => {
     await expect(collectLayoutEvidence(invalidPage, { width: 320, height: STRESS_VIEWPORT_HEIGHT })).rejects.toThrow(
       'scrollPosition.scrollY',
     );
+  });
+
+  // T44 P1-5（ユーザーの判断「待ってから測る」）: 幅の走査も、読み込みの後に、最初の読み込みと同じ落ち着きの待ち（`settleBeforeLayout`。Page Auditor が
+  // `waitForPageSettled` と `PAGE_SETTLING_PACING` を渡す）を待ってから形を測る。待ちには、その幅の読み込みの期限を渡す。
+  it('waits for the page to settle after each load and before measuring the layout (P1-5)', async () => {
+    const events: string[] = [];
+    let serial = 0;
+    const factory: PassiveStressSessionFactory = async (viewport) => {
+      serial += 1;
+      const id = serial;
+      const page = {
+        goto: async () => { events.push(`goto:${id}`); },
+        evaluate: async () => {
+          events.push(`measure:${id}`);
+          return rawLayout(viewport.width, viewport.height);
+        },
+      } as unknown as Page;
+      return { page, close: async () => { events.push(`close:${id}`); } };
+    };
+    const options = unpacedStressOptions([320, 768]);
+    const deadlines: number[] = [];
+    const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 768], {
+      ...options,
+      settleBeforeLayout: async (_page, deadlineAtMs) => {
+        deadlines.push(deadlineAtMs);
+        events.push(`settle:${serial}`);
+      },
+    });
+    expect(result.map((entry) => entry.status)).toEqual(['COMPLETE', 'COMPLETE']);
+    expect(events).toEqual(['goto:1', 'settle:1', 'measure:1', 'close:1', 'goto:2', 'settle:2', 'measure:2', 'close:2']);
+    expect(deadlines).toEqual([options.deadlineAtMs, options.deadlineAtMs]);
+  });
+
+  it('is an error to sweep with a settleBeforeLayout that is not a function, before creating a session (P1-5)', async () => {
+    const events: string[] = [];
+    await expect(collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [320], {
+      ...unpacedStressOptions([320]),
+      settleBeforeLayout: 'wait' as unknown as StressLayoutOptions['settleBeforeLayout'],
+    })).rejects.toThrow('settleBeforeLayout');
+    expect(events).toEqual([]);
   });
 
   it('preserves input order while using a fresh owner-closed session for each width', async () => {
@@ -328,6 +373,7 @@ describe('responsive layout stress lifecycle', () => {
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390], {
       deadlineAtMs: Date.now() - 1,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     });
 
     expect(creations).toBe(0);
@@ -367,6 +413,7 @@ describe('responsive layout stress lifecycle', () => {
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [320], {
       deadlineAtMs: Date.now() + 50,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     });
 
     expect(result[0]).toMatchObject({
@@ -420,6 +467,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
 
     const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], {
       deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
+      settleBeforeLayout: NO_SETTLING_WAIT,
       beforeNavigation: async () => {
         paced += 1;
         events.push(`pace:${paced}`);
@@ -449,6 +497,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
 
     const result = await collectStressLayout(sessionFactory(events), 'https://fixture.test/page', [390, 320], {
       deadlineAtMs: Date.now() + 100,
+      settleBeforeLayout: NO_SETTLING_WAIT,
       beforeNavigation: async () => {
         waits += 1;
         await wait(waitedMs);
@@ -483,6 +532,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
 
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [390, 320], {
       deadlineAtMs,
+      settleBeforeLayout: NO_SETTLING_WAIT,
       beforeNavigation: async () => {
         const returnedMs = returnedWaitsMs[waits] ?? 0;
         waits += 1;
@@ -526,6 +576,7 @@ describe('responsive layout stress navigation pacing (load control design 4.1, 4
     await expect(collectStressLayout(factory, 'https://fixture.test/page', [320], {
       deadlineAtMs: Date.now() + LAYOUT_THRESHOLDS.defaultTimeoutMs,
       beforeNavigation: 'wait' as unknown as () => Promise<number>,
+      settleBeforeLayout: NO_SETTLING_WAIT,
     })).rejects.toThrow('beforeNavigation');
     expect(creations).toBe(0);
   });
@@ -595,7 +646,7 @@ function eventEmittingSessionFactory(
       evaluate: async () => rawLayout(viewport.width, viewport.height),
       goto: async (url: string) => {
         events.push(`goto:${id}:${url}:${listeners()}`);
-        const request = { isNavigationRequest: () => true, frame: () => mainFrame };
+        const request = fakePlaywrightRequest({ navigation: true, frame: mainFrame });
         emitter.emit('request', request);
         switch (load.kind) {
           case 'ANSWER': {
@@ -684,6 +735,7 @@ describe('responsive layout stress main frame load observation (site unavailabil
       {
         deadlineAtMs: Date.now() + 50,
         beforeNavigation: NO_PACING_WAIT,
+        settleBeforeLayout: NO_SETTLING_WAIT,
         afterNavigation: (observation, navigationDiagnostics) => {
           observations.push(observation);
           diagnostics.push(navigationDiagnostics);
@@ -725,6 +777,7 @@ describe('responsive layout stress main frame load observation (site unavailabil
         {
           deadlineAtMs: startedAtMs + LONG_STRESS_DEADLINE_MS,
           beforeNavigation: NO_PACING_WAIT,
+          settleBeforeLayout: NO_SETTLING_WAIT,
           sessionOpenTimeoutMs: SHORT_SESSION_OPEN_TIMEOUT_MS,
           afterNavigation: (observation, navigationDiagnostics) => {
             observations.push(observation);
@@ -776,6 +829,7 @@ describe('responsive layout stress main frame load observation (site unavailabil
     const result = await collectStressLayout(factory, 'https://fixture.test/page', [320, 390], {
       deadlineAtMs: Date.now() - 1,
       beforeNavigation: NO_PACING_WAIT,
+      settleBeforeLayout: NO_SETTLING_WAIT,
       afterNavigation: () => {
         calls += 1;
       },

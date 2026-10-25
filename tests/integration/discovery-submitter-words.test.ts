@@ -13,6 +13,7 @@ import { discoverPageCandidates } from '../../src/discovery/discover-page.js';
 import { InFlightRequestCounter } from '../../src/discovery/settle.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { SUBMITTER_WORDS_FIXTURE_PATHS, startSubmitterWordsFixture, type SubmitterWordsFixture } from '../helpers/submitter-words-fixture.js';
 import { createTestConfig, TEST_FACTORY_OPTIONS } from '../helpers/test-config.js';
@@ -21,7 +22,6 @@ const LAUNCHERS = [
   ['the default test Chromium', () => launchHeadlessChromium()],
   ['the CLI launch settings', () => launchCliChromium()],
 ] as const;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 
 /** 候補の、比べる項目（種類、送信先の path、語、分類）。 */
 const summaryOf = (candidate: DiscoveryCandidate): readonly unknown[] =>

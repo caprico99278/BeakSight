@@ -31,9 +31,11 @@
  * - 認証つきの Run の URL の伏せ字（Task 25 の設計書 4.6。T25f）: `urlSecretRedaction` を真にした書き手は、Run のディレクトリに書く値
  *   （`writeRun` の Run、保存のページと状態、診断の記録）のすべての文字列の URL に、伏せ字の owner の `redactUrlSecretsInValue`
  *   （`src/safety/redact.ts`）を、書く前に 1 か所（`#outgoing`）で通す。`writeRun` が返す最終の Run も伏せ字の後の値なので、そこから作る
- *   HTML レポートと ChatGPT 用バンドルにも、伏せ字の前の値は入らない。既定（偽。公開監査）では値を通さない（出力は変わらない）。
+ *   HTML レポートと ChatGPT 用バンドルにも、伏せ字の前の値は入らない。T44g（Task 44 の設計書 P4-1。案 2）: 既定は真（公開の監査も同じ段を通る）。
+ *   加えて、どの書き手でも、記録した要求の URL（network の Evidence・resource timing・Safety の止めた記録）の query のすべての値・値に見える path の区切り・
+ *   fragment の値・userinfo を、同じ 1 か所で伏せる（`redactRecordedRequestUrlsInValue`）。
  */
-import { link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { evidenceOfType } from '../audit/rule-helpers.js';
@@ -41,6 +43,7 @@ import {
   CHECKPOINT_ARTIFACT_DIRECTORY,
   CHECKPOINT_PAGES_ARTIFACT_DIRECTORY,
   DISCOVERY_ARTIFACT_FILE_NAME,
+  ENTRY_CHECK_ARTIFACT_FILE_NAME,
   PAGES_ARTIFACT_DIRECTORY,
   READ_EVIDENCE_ARTIFACT_FILE_NAME,
   ACTION_RUN_ARTIFACT_FILE_NAME,
@@ -64,6 +67,7 @@ import {
   type CheckpointArtifactFile,
 } from '../core/artifact-layout.js';
 import { serializeArtifactJson } from '../core/artifact-json.js';
+import { runOnlyFindingsOf } from '../core/audit-artifact-findings.js';
 import type {
   AuditRunResult,
   EvidenceId,
@@ -81,14 +85,22 @@ import { isRecord } from '../core/guards.js';
 import { isPageId, isRunId } from '../core/ids.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
-import { takeOverLockFile } from '../core/lock-file.js';
+import {
+  createLockFileExclusively,
+  isTakeoverTokenFileName,
+  lockSideFileProcessIdOf,
+  takeOverLockFile,
+  isLiveTakeoverToken,
+  takeoverTokenPathFor,
+  type LockFileCreationOperations,
+} from '../core/lock-file.js';
 import { renameWithRetry } from '../core/rename-retry.js';
-import type { RunLockTakeover } from '../core/process-lock.js';
+import { isProcessRunning, type RunLockTakeover } from '../core/process-lock.js';
 import { validateArtifact, type ArtifactSchemaName, type ArtifactValidationResult } from '../core/schema-validator.js';
 import { deriveRunStatus, requiredArtifactInvalidReason, type RunStatusInput } from '../core/status.js';
 import { isTemporaryFileName, temporaryPathFor } from '../core/temporary-file-name.js';
 import { compareCodeUnits } from '../core/text.js';
-import { redactUrlSecretsInValue } from '../safety/redact.js';
+import { redactRecordedRequestUrlsInValue, redactUrlSecretsInValue, type RecordedRequestUrlRedactionOptions } from '../safety/redact.js';
 
 /** audit.json の `schemaVersion`（`schemas/audit.schema.json`）。 */
 export const AUDIT_ARTIFACT_SCHEMA_VERSION = 'audit-schema/1.0';
@@ -169,7 +181,10 @@ export interface ArtifactWriteResult {
 export interface RunPresentationFiles {
   /** `report.html` の中身。改行は LF にして、UTF-8 で書く。 */
   readonly reportHtml?: string;
-  /** ChatGPT 用バンドル（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。ChatGPT 用バンドルのファイル名の設計書 2.1、2.2）。 */
+  /**
+   * ChatGPT 用バンドル（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。画面のジョブは `beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`。
+   * ChatGPT 用バンドルのファイル名の設計書 2.1、2.2。PRE42-BN）。
+   */
   readonly bundle?: RunPresentationBundle;
 }
 
@@ -182,6 +197,11 @@ export interface RunPresentationBundle {
    * （`src/core/artifact-layout.ts`）で作る。
    */
   readonly lastExecutionFinishedAt: string;
+  /**
+   * PRE42-BN: 画面のジョブのプロファイルの名前（`beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`。名前の部分は `bundleFileNameLabelOf` で
+   * 作る）。ファイル名だけに使い、バンドルの中身・`run.json`・`audit.json` には入れない。省略（CLI の実行）は、名前の部分のない今の形。
+   */
+  readonly profileName?: string | undefined;
 }
 
 /** artifact の入出力の失敗。`path` は、書けなかったファイルかディレクトリ。 */
@@ -322,16 +342,23 @@ export interface CheckpointFileHandle {
 /**
  * 保存とロックの書き出しで使うファイルの操作（`node:fs/promises` の一部。書き出しの順を確かめるテストのための差し替え口）。
  * `open` の `wx` は、ファイルを新しく作る場合だけ開く（すでにあれば `EEXIST`）。`r` は、ディレクトリを `fsync` のために開く。
+ * `link` は、ロックのファイルを中身を書き終えた一時ファイルから排他的に作る（`newPath` がすでにあれば `EEXIST`。SR-1-F、DEF-168）のと、
+ * 取り直しで動かしてしまった他人のロックを戻すのに使う。`unlink` は、そのロックの一時ファイルを消すのに使う。この 2 つは省略でき、省略すると
+ * `node:fs/promises` のもの（ほかの操作だけを差し替えるテストのため）。
  */
 export interface CheckpointFileOperations {
   mkdir(path: string, options: { readonly recursive: true }): Promise<unknown>;
   open(path: string, flags: 'wx' | 'r'): Promise<CheckpointFileHandle>;
   rename(oldPath: string, newPath: string): Promise<void>;
   rm(path: string, options: { readonly force: true }): Promise<void>;
+  link?(existingPath: string, newPath: string): Promise<void>;
+  unlink?(path: string): Promise<void>;
 }
 
-const NODE_CHECKPOINT_FILE_OPERATIONS: CheckpointFileOperations = Object.freeze({ mkdir, open, rename, rm });
+const NODE_CHECKPOINT_FILE_OPERATIONS: Required<CheckpointFileOperations> = Object.freeze({ mkdir, open, rename, rm, link, unlink });
 const CHECKPOINT_FILE_OPERATION_NAMES = Object.freeze(['mkdir', 'open', 'rename', 'rm'] as const);
+/** 省略できるファイルの操作の名前（省略すると `NODE_CHECKPOINT_FILE_OPERATIONS` のもの）。 */
+const OPTIONAL_CHECKPOINT_FILE_OPERATION_NAMES = Object.freeze(['link', 'unlink'] as const);
 
 /** `ArtifactWriter` の設定（どれも省略できる）。 */
 export interface ArtifactWriterOptions {
@@ -345,10 +372,17 @@ export interface ArtifactWriterOptions {
   /** 名前の変更をやり直す前の待ち。省略すると `wait`（`src/core/deadline.ts`）。テストで、実際には待たずに確かめるための差し替え口。 */
   readonly wait?: typeof wait;
   /**
-   * 認証つきの Run の URL の伏せ字（Task 25 の設計書 4.6。T25f）。真なら、Run のディレクトリに書く値の文字列の URL の秘密（userinfo と、
-   * 秘密に見える query の値）を、書く前に伏せる（`redactUrlSecretsInValue`）。省略すると偽（公開監査。値を通さない）。真偽でなければ `TypeError`。
+   * URL の名前で伏せる段（Task 25 の設計書 4.6。T25f）。真なら、Run のディレクトリに書く値の文字列の URL の秘密（userinfo と、秘密に見える query の値）を、
+   * 書く前に伏せる（`redactUrlSecretsInValue`）。T44g（Task 44 の設計書 P4-1。案 2）: 省略すると真（公開の監査も同じ段を通る）。記録した要求の URL の値を
+   * 伏せる段（`redactRecordedRequestUrlsInValue`）は、この指定によらず、いつも通す。真偽でなければ `TypeError`。
    */
   readonly urlSecretRedaction?: boolean;
+  /**
+   * T35c（Task 35 の設計書 3.6）: 承認したサービスの Origin（スクリプトで送るログインの監査の Run だけ）。`urlSecretRedaction` が真のときだけ使い、その
+   * Origin の URL は、query のすべての値と path の値に見える区切りも伏せる（`redactUrlSecretsInValue` の `serviceOrigins`）。省略すると空（今のまま）。
+   * 文字列の配列でなければ `TypeError`。
+   */
+  readonly serviceOrigins?: readonly string[];
 }
 
 // 名前の変更のやり直しの決まり（失敗のコード `RENAME_RETRY_ERROR_CODES`、回数 `RENAME_MAX_ATTEMPTS`、待ち `RENAME_RETRY_DELAY_MS`、
@@ -437,8 +471,14 @@ export interface PreparedJobDocument<TValue> {
   readonly value: TValue;
 }
 
-/** ジョブの成果物（Run のディレクトリの直下の JSON。`#writeJobDocument` が書く）のスキーマの名前。T32e: 書き込みの報告の 2 つを足した。 */
-type JobDocumentSchemaName = Extract<ArtifactSchemaName, 'discovery' | 'read-evidence' | 'action-run' | 'action-evidence' | 'approval-summary'>;
+/**
+ * ジョブの成果物（Run のディレクトリの直下の JSON。`#writeJobDocument` が書く）のスキーマの名前。T32e: 書き込みの報告の 2 つを足した。T43c: 入口の
+ * 確かめの成果物を足した。
+ */
+type JobDocumentSchemaName = Extract<
+  ArtifactSchemaName,
+  'discovery' | 'read-evidence' | 'action-run' | 'action-evidence' | 'approval-summary' | 'entry-check'
+>;
 
 /**
  * 保存の値（と、サイトの不調で止めたときの診断の記録）を、artifact の JSON の書式（`serializeArtifactJson`）の文字列にする。書く文字列を
@@ -682,12 +722,15 @@ async function checkArtifact(schema: ArtifactSchemaName, path: string, id: strin
   };
 }
 
-/** audit.json の中身（`statusInput` は含めない）。 */
+/**
+ * audit.json の中身（`statusInput` は含めない）。T44f（Task 44 の設計書 P3-1 の B）: 最上位の `findings` は、ページの結果に入っていない Finding だけ
+ * （`runOnlyFindingsOf`。ページの Finding はページの中に残る。読む側は `findingsOfAuditArtifact`）。
+ */
 const auditArtifact = (result: AuditRunResult): object => ({
   schemaVersion: AUDIT_ARTIFACT_SCHEMA_VERSION,
   run: result.run,
   pages: result.pages,
-  findings: result.findings,
+  findings: runOnlyFindingsOf(result),
 });
 
 function assertWritableRun(result: AuditRunResult, options: WriteRunOptions): void {
@@ -732,12 +775,37 @@ export class ArtifactWriter {
   readonly #wait: typeof wait;
   /** 認証つきの Run の URL の伏せ字（`ArtifactWriterOptions.urlSecretRedaction`）。 */
   readonly #urlSecretRedaction: boolean;
+  /** T35c: 承認したサービスの Origin（`ArtifactWriterOptions.serviceOrigins`）。 */
+  readonly #serviceOrigins: readonly string[];
   /**
    * この ArtifactWriter の名前の変更（差し替えたファイルの操作の `rename` を、待ち `#wait` で `renameWithRetry` に通したもの）。最後の
    * artifact の書き出し、保存とロックの書き出し、`state.json` から `state.prev.json` への移し替えは、すべてこれを使う。
    */
   readonly #rename: RenameFile = async (oldPath, newPath) =>
     renameWithRetry((from, to) => this.#fileOperations.rename(from, to), this.#wait, oldPath, newPath);
+
+  /**
+   * ロックのファイルの作成（`src/core/lock-file.ts` の `createLockFileExclusively`。SR-1-F、DEF-168）に渡す、ファイルの操作（差し替えた
+   * ファイルの操作の `open`・`link`・`unlink` を通す）。一時ファイルは `wx` で新しく作って中身を書き、`fsync` する。
+   */
+  readonly #lockFileCreationOperations: LockFileCreationOperations = Object.freeze({
+    writeNew: async (temporaryPath: string, content: string) => {
+      await writeAndSync(await this.#fileOperations.open(temporaryPath, 'wx'), content);
+    },
+    link: async (existingPath: string, newPath: string) => {
+      await this.#link(existingPath, newPath);
+    },
+    remove: async (path: string) => {
+      const operations = this.#fileOperations;
+      await (operations.unlink === undefined ? NODE_CHECKPOINT_FILE_OPERATIONS.unlink(path) : operations.unlink(path)).catch(() => undefined);
+    },
+  });
+
+  /** 差し替えたファイルの操作の `link`（省略したときは `node:fs/promises` のもの）。 */
+  async #link(existingPath: string, newPath: string): Promise<void> {
+    const operations = this.#fileOperations;
+    await (operations.link === undefined ? NODE_CHECKPOINT_FILE_OPERATIONS.link(existingPath, newPath) : operations.link(existingPath, newPath));
+  }
 
   /**
    * `options` は省略できる（保存とロックの書き出しのファイルの操作、実行している環境、名前の変更をやり直す前の待ち。テスト用の差し替え口）。
@@ -756,11 +824,16 @@ export class ArtifactWriter {
       fileOperations = NODE_CHECKPOINT_FILE_OPERATIONS,
       platform = process.platform,
       wait: retryWait = wait,
-      urlSecretRedaction = false,
+      // T44g（P4-1。案 2）: 既定は真（公開の監査も、名前で伏せる段を通る）。
+      urlSecretRedaction = true,
+      serviceOrigins = [],
     } = options;
     const operations: unknown = fileOperations;
     if (!isRecord(operations) || !CHECKPOINT_FILE_OPERATION_NAMES.every((name) => typeof operations[name] === 'function')) {
       throw new TypeError(`ArtifactWriter file operations must have ${CHECKPOINT_FILE_OPERATION_NAMES.join(', ')}`);
+    }
+    if (!OPTIONAL_CHECKPOINT_FILE_OPERATION_NAMES.every((name) => operations[name] === undefined || typeof operations[name] === 'function')) {
+      throw new TypeError(`ArtifactWriter file operations ${OPTIONAL_CHECKPOINT_FILE_OPERATION_NAMES.join(', ')} must be functions when given`);
     }
     if (typeof platform !== 'string' || platform.length === 0) {
       throw new TypeError('ArtifactWriter platform must be a non-empty string');
@@ -771,18 +844,27 @@ export class ArtifactWriter {
     if (typeof urlSecretRedaction !== 'boolean') {
       throw new TypeError('ArtifactWriter urlSecretRedaction must be a boolean');
     }
+    if (!Array.isArray(serviceOrigins) || !serviceOrigins.every((origin: unknown) => typeof origin === 'string')) {
+      throw new TypeError('ArtifactWriter serviceOrigins must be strings');
+    }
     this.#fileOperations = fileOperations;
     this.#platform = platform;
     this.#wait = retryWait;
     this.#urlSecretRedaction = urlSecretRedaction;
+    this.#serviceOrigins = Object.freeze([...serviceOrigins]);
   }
 
   /**
-   * Run のディレクトリに書く値（T25f）。`urlSecretRedaction` が真なら、伏せ字の owner の `redactUrlSecretsInValue` を通した写し、偽なら、
-   * 値そのもの（公開監査。今のまま）。書き出しの関数は、値を受けたら最初にここを通す（伏せ字を通す場所を、この 1 か所にする）。
+   * Run のディレクトリに書く値（T25f）。記録した要求の URL の値を伏せ（T44g）、`urlSecretRedaction` が真（既定）なら、伏せ字の owner の
+   * `redactUrlSecretsInValue` も通した写し。書き出しの関数は、値を受けたら最初にここを通す（伏せ字を通す場所を、この 1 か所にする）。
    */
-  #outgoing<TValue>(value: TValue): TValue {
-    return this.#urlSecretRedaction ? redactUrlSecretsInValue(value) : value;
+  #outgoing<TValue>(value: TValue, requestUrlRedaction: RecordedRequestUrlRedactionOptions = {}): TValue {
+    // T44g（P4-1。案 2）: 公開の監査と認証つきの Run の両方で、記録した要求の URL の値を伏せ（構造を知る段）、すべての文字列の URL の秘密に見える名前の値を
+    // 伏せる（名前で伏せる段）。判定は、この前（伏せる前の値）で終わっている。T44R の C-1: 記録した要求の URL と同じ値を持つほかの文字列も伏せる（値で照らす段。
+    // `matchValues`）。再開の保存の状態（巡回の待ち行列の URL）は、identity を変えないよう、値で照らす段を行わない（呼び出し側が偽を渡す）。T44R3 の M-2:
+    // 再開の保存のページは、巡回が知っている URL（`keptUrls`）を照らさない（呼び出し側が渡す）。
+    const requestUrlsRedacted = redactRecordedRequestUrlsInValue(value, requestUrlRedaction);
+    return this.#urlSecretRedaction ? redactUrlSecretsInValue(requestUrlsRedacted, { serviceOrigins: this.#serviceOrigins }) : requestUrlsRedacted;
   }
 
   /**
@@ -872,9 +954,10 @@ export class ArtifactWriter {
    * 表示用モデルから作ったファイル（`report.html`、ChatGPT 用バンドル）を、`writeRun` が書いた Run のディレクトリに書く。
    * 与えられたものだけを、この順に、一時ファイルと rename で書く。書いたファイルの相対パスを返す。入出力の失敗は
    * `ArtifactWriteError` を投げる。
-   * - バンドルの名前は、`bundle.lastExecutionFinishedAt`（最後の実行の終わりの時刻）から `bundleFileName` で作る（ChatGPT 用バンドルの
-   *   ファイル名の設計書 2.1）。時刻が不正なら、何も書かずに `RangeError` を投げる。
-   * - バンドルを書き終えた後に、Run のディレクトリの直下の、ほかのバンドルの名前（`isBundleFileName`。前の形と、日時の違う新しい形）の
+   * - バンドルの名前は、`bundle.lastExecutionFinishedAt`（最後の実行の終わりの時刻）と `bundle.profileName`（画面のジョブのプロファイルの名前。
+   *   PRE42-BN）から `bundleFileName` で作る（ChatGPT 用バンドルのファイル名の設計書 2.1）。時刻が不正なら、何も書かずに `RangeError` を投げる。
+   * - バンドルを書き終えた後に、Run のディレクトリの直下の、ほかのバンドルの名前（`isBundleFileName`。日時の違う形と、プロファイルの名前の
+   *   違う形。LG-4: 日時のない前の形は見分けないので消さない）の
    *   普通のファイルを消す（設計書 2.2。Run のディレクトリには、最新のバンドルを1つだけ残す）。リンク（symlink、junction）は、たどらず、
    *   消さない。ほかのファイルと、下のディレクトリには触れない。消す前に、パスが Run のディレクトリの中にあることを確かめる。
    *   新しいバンドルを書けなかった場合は、古いバンドルを消さない。古いバンドルを消せなかった場合は `ArtifactWriteError`（`path` は、
@@ -890,7 +973,7 @@ export class ArtifactWriter {
     // 書く前に、バンドルの名前を作る（時刻が不正なら、何も書かずに `RangeError`）。
     const bundle = files.bundle === undefined
       ? null
-      : { name: bundleFileName(files.bundle.lastExecutionFinishedAt), bytes: files.bundle.bytes };
+      : { name: bundleFileName(files.bundle.lastExecutionFinishedAt, files.bundle.profileName), bytes: files.bundle.bytes };
     const writtenFiles: string[] = [];
     if (files.reportHtml !== undefined) {
       await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.report), toLf(files.reportHtml), this.#rename);
@@ -993,6 +1076,16 @@ export class ArtifactWriter {
   }
 
   /**
+   * 入口の確かめのジョブの成果物（`src/control/entry-check.ts` の `EntryCheckDocument`。Task 43 の設計書 4.3。T43c）を、Run のディレクトリの
+   * `entry-check.json`（`ENTRY_CHECK_ARTIFACT_FILE_NAME`）に書き、その相対パスを返す。書き方は `writeReadEvidence` と同じ（URL の伏せ字の 1 か所
+   * `#outgoing` を通してから `entry-check` のスキーマで検証し、合わなければ何も書かずに `ArtifactWriteError`）。Run のディレクトリが空なら、何も
+   * 書かずに `TypeError`。report は control を import しない（`control-boundary` (a)）ので、値の型は呼び出し側の型のまま受ける。
+   */
+  async writeEntryCheck<TDocument extends object>(runDirectory: string, document: TDocument): Promise<string> {
+    return this.#writeJobDocument('writeEntryCheck', 'entry-check', ENTRY_CHECK_ARTIFACT_FILE_NAME, runDirectory, document);
+  }
+
+  /**
    * 書き込みのジョブの成果物（`src/control/actions/action-contracts.ts` の `ActionRunDocument`。Task 30 の設計書 3 章の「記録」。T30f）を、Run の
    * ディレクトリの `action-run.json`（`ACTION_RUN_ARTIFACT_FILE_NAME`）に書き、その相対パスを返す。書き方は `writeReadEvidence` と同じ（URL の伏せ字の
    * 1 か所 `#outgoing` を通してから `action-run` のスキーマで検証し、合わなければ何も書かずに `ArtifactWriteError`）。
@@ -1072,15 +1165,20 @@ export class ArtifactWriter {
    * ページの保存（R2 の `createRunCheckpointPage` の値）を、`checkpoint/pages/<pageId>.json` に書く（設計書 4.1、4.3）。
    * 値を `checkpoint-page` のスキーマで検証し、合わなければ何も書かずに `ArtifactWriteError` を投げる。合えば、一時ファイルに書いて
    * `fsync` し、rename する（Windows 以外では、その後にディレクトリも `fsync` する）。書いたファイルの、Run のディレクトリからの
-   * 相対パスを返す。ページの ID がパスに使えない形なら、何も書かずに `RangeError` を投げる。
+   * 相対パスを返す。ページの ID がパスに使えない形なら、何も書かずに `RangeError` を投げる。T44R3 の M-2: `options.keptUrls`（巡回が知っている
+   * URL）は、記録した要求の URL を値で照らす段で照らさない（続けて終えた Run と同じ結果にする）。
    */
-  async writeCheckpointPage<TPage extends CheckpointPageShape>(runDirectory: string, page: TPage): Promise<string> {
+  async writeCheckpointPage<TPage extends CheckpointPageShape>(
+    runDirectory: string,
+    page: TPage,
+    options: { readonly keptUrls?: readonly string[] } = {},
+  ): Promise<string> {
     assertRunDirectory(runDirectory, 'writeCheckpointPage');
     const pageId: unknown = isRecord(page) ? page.pageId : undefined;
     assertPathPageId(pageId);
     const relativePath = checkpointPageArtifactRelativePath(pageId);
     const path = artifactFilePath(runDirectory, relativePath);
-    await this.#writeFileDurably(path, await checkpointJson('checkpoint-page', path, this.#outgoing(page)));
+    await this.#writeFileDurably(path, await checkpointJson('checkpoint-page', path, this.#outgoing(page, { keptUrls: options.keptUrls })));
     return relativePath;
   }
 
@@ -1099,7 +1197,7 @@ export class ArtifactWriter {
     assertRunDirectory(runDirectory, 'writeCheckpointState');
     const path = artifactFilePath(runDirectory, checkpointArtifactRelativePath('state'));
     const previousPath = artifactFilePath(runDirectory, checkpointArtifactRelativePath('previousState'));
-    const data = await checkpointJson('checkpoint', path, this.#outgoing(state));
+    const data = await checkpointJson('checkpoint', path, this.#outgoing(state, { matchValues: false }));
     await this.#writeFileDurably(path, data, async () => {
       try {
         await this.#rename(path, previousPath);
@@ -1164,10 +1262,11 @@ export class ArtifactWriter {
   // -------------------------------------------------------------------------------------------------------------
 
   /**
-   * `checkpoint/run.lock` を排他的に作り（`open` の `wx`）、ロックの中身（R2 の `createRunLock` の値）を JSON で書いて `fsync` する
-   * （Windows 以外では、その後に `checkpoint/` も `fsync` する）。
+   * `checkpoint/run.lock` を、ロックの中身（R2 の `createRunLock` の値）を JSON で書き終えた形でだけ見えるように排他的に作る（同じ
+   * ディレクトリの一時ファイルに書いて `fsync` し、`link` で作る。`createLockFileExclusively`。SR-1-F、DEF-168。Windows 以外では、その後に
+   * `checkpoint/` も `fsync` する）。
    * すでにあれば、例外にせず、何も変えずに、今の中身（JSON として読めなければ `null`）を返す。書いている途中で失敗した場合は、
-   * この呼び出しで作ったロックのファイルを消してから `ArtifactWriteError` を投げる。JSON にできない中身は、何も書かずに `TypeError`。
+   * ロックのファイルを作らず（一時ファイルは消す）、`ArtifactWriteError` を投げる。JSON にできない中身は、何も書かずに `TypeError`。
    */
   async acquireRunLock(runDirectory: string, lock: object): Promise<RunLockAcquisition> {
     assertRunDirectory(runDirectory, 'acquireRunLock');
@@ -1212,19 +1311,22 @@ export class ArtifactWriter {
 
   // -------------------------------------------------------------------------------------------------------------
   // 出力先の開始のロック（DEF-057。Task 24 の設計書 4.6。持つ・離す・古さの判定は `src/cli/audit-run.ts` が、判定の部品は
-  // `run-checkpoint.ts` の `judgeRunLock` を使って行う）。書き方は、Run のロックと同じ（`wx` で作る、一時ファイルから rename で書き換える）。
+  // `run-checkpoint.ts` の `judgeRunLock` を使って行う）。書き方は、Run のロックと同じ（一時ファイルから `link` で排他的に作る、一時ファイルから rename で書き換える）。
   // -------------------------------------------------------------------------------------------------------------
 
   /**
-   * 出力先の開始のロック（`outputStartLockPath(outputDirectory)`）を排他的に作り（`open` の `wx`）、ロックの中身（`createRunLock` の値）を
-   * JSON で書いて `fsync` する。出力先がなければ作る（`recursive`）。作れたら、作る前になかったディレクトリのいちばん上のもの（`createdDirectory`。
+   * 出力先の開始のロック（`outputStartLockPath(outputDirectory)`）を、ロックの中身（`createRunLock` の値）を JSON で書き終えた形でだけ
+   * 見えるように排他的に作る（`acquireRunLock` と同じ。`createLockFileExclusively`）。出力先がなければ作る（`recursive`）。作れたら、作る前になかったディレクトリのいちばん上のもの（`createdDirectory`。
    * 出力先がすでにあれば `null`）を返す（離すときに、空のまま残さないため。`releaseOutputStartLock`）。すでにあれば、例外にせず、何も変えずに、
-   * 今の中身（JSON として読めなければ `null`）を返す。失敗の扱いは `acquireRunLock` と同じ（書いている途中の失敗は、作ったファイルを消してから
+   * 今の中身（JSON として読めなければ `null`）を返す。失敗の扱いは `acquireRunLock` と同じ（書いている途中の失敗は、ロックのファイルを作らずに
    * `ArtifactWriteError`）。
+   * DEF-170: 作る前に、出力先の開始のロックの横のファイル（動かした古いロック、新しいロックの一時ファイル、取り直しの札）のうち、持ち主の
+   * process が死んでいるものを消す（動いているものは消さない。消せなくても進む）。
    */
   async acquireOutputStartLock(outputDirectory: string, lock: object): Promise<OutputStartLockAcquisition> {
     assertOutputDirectory(outputDirectory, 'acquireOutputStartLock');
     const missingDirectory = await topmostMissingDirectory(resolve(outputDirectory));
+    await removeDeadLockSideFiles(outputStartLockPath(outputDirectory));
     const acquisition = await this.#acquireLockFile(outputStartLockPath(outputDirectory), lock);
     return acquisition.acquired ? deepFreeze({ acquired: true, createdDirectory: missingDirectory }) : acquisition;
   }
@@ -1278,7 +1380,11 @@ export class ArtifactWriter {
     }
   }
 
-  /** ロックのファイル（`path`）を排他的に作って中身を書く（`acquireRunLock` と `acquireOutputStartLock` の本体）。 */
+  /**
+   * ロックのファイル（`path`）を、中身を書き終えた形でだけ見えるように排他的に作る（`acquireRunLock` と `acquireOutputStartLock` の本体）。
+   * 手順の判断は `src/core/lock-file.ts` の `createLockFileExclusively`（一時ファイルに書いて `fsync` し、`link` で作り、一時ファイルを消す。
+   * SR-1-F、DEF-168）、ここはファイルの操作を渡すだけ。すでにあれば、今の中身（JSON として読めなければ `null`）を返す。
+   */
   async #acquireLockFile(path: string, lock: object): Promise<RunLockAcquisition> {
     const data = runLockJson(lock);
     try {
@@ -1286,20 +1392,14 @@ export class ArtifactWriter {
     } catch (error) {
       throw new ArtifactWriteError(dirname(path), error);
     }
-    let handle: CheckpointFileHandle;
+    let created: boolean;
     try {
-      handle = await this.#fileOperations.open(path, 'wx');
+      created = await createLockFileExclusively(this.#lockFileCreationOperations, path, data);
     } catch (error) {
-      if (errorCodeOf(error) === 'EEXIST') {
-        return deepFreeze({ acquired: false, existing: await readJsonOrNull(path) });
-      }
       throw new ArtifactWriteError(path, error);
     }
-    try {
-      await writeAndSync(handle, data);
-    } catch (error) {
-      await this.#fileOperations.rm(path, { force: true }).catch(() => undefined);
-      throw new ArtifactWriteError(path, error);
+    if (!created) {
+      return deepFreeze({ acquired: false, existing: await readJsonOrNull(path) });
     }
     await this.#syncDirectory(dirname(path));
     return deepFreeze({ acquired: true });
@@ -1309,13 +1409,15 @@ export class ArtifactWriter {
    * 判定した古いロックのファイル（`path`。読んだ中身が `judged`）を、原子的に取り直す（DEF-060。`takeOverRunLock` と `takeOverOutputStartLock`
    * の本体）。
    * 手順の判断は `src/core/lock-file.ts` の `takeOverLockFile`、ここはファイルの操作を渡すだけ（T24h-3）。
-   * 1. ロックを、一意の名前（`movedStaleLockPathFor`）へ `rename` する。ないなら（`ENOENT`。ほかの起動が先に動かした、持ち主が消した）、
-   *    `CHANGED`。
-   * 2. 動かしたファイルの中身が `judged` と違えば（ほかの起動が新しく作ったロックや、ハートビートで書き換えたロックを動かしてしまった）、
-   *    上書きせずに元の名前へ戻し（`link`。すでにあれば戻さない）、動かした名前を消して、`CHANGED`。
-   * 3. 同じなら、古いロックを動かせたのは自分だけなので、`wx` で新しいロックを作る（`#acquireLockFile`）。作れたら `ACQUIRED`、すでに
-   *    あれば（ほかの起動が先に作った）`LOST`。
-   * 4. 動かした古いファイルは消す。消せなくても進む（警告にしない。名前は一時ファイルの形なので、Run のディレクトリでは再開の後始末が消す）。
+   * 0. 取り直しの札（`takeoverTokenPathFor`）を排他的に作る（DEF-170。取り直しを 1 つずつにする）。作れず、持ち主の process が動いていれば、
+   *    `LOST`（死んでいれば、札を消して 1 回だけやり直す）。
+   * 1. ロックを、一意の名前（`movedStaleLockPathFor`）へ `rename` する。ないなら（`ENOENT`。持ち主が消した）、`CHANGED`。
+   * 2. 動かしたファイルがなくなったか、中身が `judged` と違えば（他人の新しいロックやハートビートで書き換えたロックを動かしてしまった）、
+   *    上書きせずに元の名前へ戻し（`link`。すでにあれば戻さない）、動かした名前を消して、`LOST`（DEF-170。fail-closed）。
+   * 3. 同じなら、新しいロックを排他的に作る（`#acquireLockFile`。`createLockFileExclusively`）。作れたら `ACQUIRED`、すでにあれば（ほかの起動が
+   *    先に作った）`LOST`。
+   * 4. 動かした古いファイルと札は消す。消せなくても進む（警告にしない。動かした名前は一時ファイルの形で、持ち主の process が終われば、Run の
+   *    ディレクトリでは再開の後始末が、出力先では開始のロックの取得が消す）。
    * JSON にできない中身は、何も動かさずに `TypeError`。入出力の失敗は `ArtifactWriteError`。
    */
   async #takeOverLockFile(path: string, judged: unknown, lock: object): Promise<LockTakeover> {
@@ -1334,22 +1436,35 @@ export class ArtifactWriter {
         }
       },
       readJson: readJsonOrNull,
+      exists: async (target) => await lstat(target).then(() => true, () => false),
       createExclusive: async (target) => (await this.#acquireLockFile(target, lock)).acquired,
+      createExclusiveFile: async (target, content) => {
+        try {
+          return await createLockFileExclusively(this.#lockFileCreationOperations, target, content);
+        } catch (error) {
+          throw new ArtifactWriteError(target, error);
+        }
+      },
       restore: async (movedPath, target) => await this.#restoreMovedLock(movedPath, target),
       remove: async (target) => {
         await this.#fileOperations.rm(target, { force: true }).catch(() => undefined);
       },
+      isProcessRunning,
     }, path, judged);
   }
 
   /**
    * 取り直しで動かしてしまった他人のロック（`movedPath`）を、元の名前（`path`）へ、上書きせずに戻す（DEF-060）。`link` で戻し、すでにあれば
-   * （`EEXIST`。ほかの起動が作った）戻さない。`link` を使えないファイルシステムでは、中身を `wx` で書いて戻す。戻せなくても、例外にしない
-   * （戻せなかったロックの持ち主は、ロックのファイルなしで動く。ほかの起動が戻す前に新しいロックを作った、ごく短い間の 3 つの起動の重なりだけで起きる）。
+   * （`EEXIST`。ほかの起動が作った）戻さない。`link` で戻せなければ、読んだ中身でロックを作り直す（`createLockFileExclusively`。中身を
+   * 書き終えた形でだけ見える。SR-1-F、DEF-168）。戻せなくても、例外にしない。
+   * DEF-170: 戻せない（ほかの起動が空いた名前に新しいロックを作った、動かしたファイルがなくなった）と、戻せなかったロックの持ち主は、ロックの
+   * ファイルなしで動く。取り直しの札で取り直しは 1 つずつになったが、札を持たない新しいロックの作成（`#acquireLockFile`）は空いた名前に作れる
+   * ので、起こりうる。そのため、持ち主の側で確かめる（保存のセッションは、再開の後始末の後にロックを読み直し、ハートビートは自分のロックの
+   * ときだけ書き換える）。
    */
   async #restoreMovedLock(movedPath: string, path: string): Promise<void> {
     try {
-      await link(movedPath, path);
+      await this.#link(movedPath, path);
       return;
     } catch (error) {
       if (errorCodeOf(error) === 'EEXIST') {
@@ -1358,7 +1473,7 @@ export class ArtifactWriter {
     }
     try {
       const content = await readFile(movedPath, 'utf8');
-      await writeAndSync(await this.#fileOperations.open(path, 'wx'), content);
+      await createLockFileExclusively(this.#lockFileCreationOperations, path, content);
     } catch {
       // 戻せなかった（上の説明）。
     }
@@ -1434,8 +1549,15 @@ export class ArtifactWriter {
         }
       }
     }
+    // DEF-170: Run のロックの横のファイル（動かした古いロック、新しいロックの一時ファイル、取り直しの札）は、持ち主の process が動いていれば
+    // 消さない（ほかの起動の取り直しの途中のもの）。死んでいれば消す。
+    const lockPath = artifactFilePath(root, checkpointArtifactRelativePath('lock'));
     for (const entry of await listRealDirectory(root, CHECKPOINT_ARTIFACT_DIRECTORY)) {
-      if (entry.isFile() && isTemporaryFileName(entry.name)) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const side = await lockSideFileStateOf(lockPath, entry.name);
+      if ((isTemporaryFileName(entry.name) && side !== 'LIVE') || side === 'DEAD') {
         await remove(`${CHECKPOINT_ARTIFACT_DIRECTORY}/${entry.name}`, false);
       }
     }
@@ -1599,6 +1721,43 @@ async function hasRealDirectorySegments(root: string, relativeDirectory: string)
     }
   }
   return true;
+}
+
+/**
+ * ロックのファイル（`lockPath`）と同じディレクトリのファイル（`fileName`）が、ロックの横のファイルなら、持ち主の process が動いているか
+ * （`LIVE`）、死んでいるか（`DEAD`）。横のファイルでなければ `NONE`（DEF-170）。
+ * - 動かした古いロックと新しいロックの一時ファイル（取り直しの札を動かしたものを含む）: 名前の process の ID（`lockSideFileProcessIdOf`）。
+ * - 取り直しの札（`isTakeoverTokenFileName`）: 中身の process の ID（読めなければ `DEAD`）。
+ */
+async function lockSideFileStateOf(lockPath: string, fileName: string): Promise<'LIVE' | 'DEAD' | 'NONE'> {
+  const processId = lockSideFileProcessIdOf(lockPath, fileName) ?? lockSideFileProcessIdOf(takeoverTokenPathFor(lockPath), fileName);
+  if (processId !== null) {
+    return isProcessRunning(processId) ? 'LIVE' : 'DEAD';
+  }
+  if (!isTakeoverTokenFileName(lockPath, fileName)) {
+    return 'NONE';
+  }
+  // DEF-172: 起動の時刻が違う札と、作ってから時間の経った札は、持ち主の process の ID が動いていても死んだもの（`isLiveTakeoverToken`）。
+  return isLiveTakeoverToken(await readJsonOrNull(join(dirname(lockPath), fileName)), isProcessRunning) ? 'LIVE' : 'DEAD';
+}
+
+/**
+ * ロックのファイル（`lockPath`）の横のファイルのうち、持ち主の process が死んでいるものを消す（DEF-170。出力先の開始のロックの取得の前）。
+ * ディレクトリがない・読めない・消せないときは、何もせずに進む（リンクは消さない）。
+ */
+async function removeDeadLockSideFiles(lockPath: string): Promise<void> {
+  const directory = dirname(lockPath);
+  let entries: readonly Dirent[];
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isFile() && (await lockSideFileStateOf(lockPath, entry.name)) === 'DEAD') {
+      await rm(join(directory, entry.name), { force: true }).catch(() => undefined);
+    }
+  }
 }
 
 /**

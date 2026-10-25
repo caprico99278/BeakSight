@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { evaluateCrossPageRules } from '../../src/audit/cross-page-rules.js';
 import type { BrowserContextFactory, SafetyLedgerFactory } from '../../src/browser/context-factory.js';
 import type { MainFrameLoadObservation } from '../../src/browser/main-frame-load.js';
@@ -30,6 +31,7 @@ import {
 } from '../../src/core/contracts.js';
 import {
   INTERACTION_REASON_CODES_BY_STATUS,
+  PAGE_SCHEMA_VERSION,
   type InteractionCandidateEvidence,
   type InteractionChangeEvidence,
   type InteractionEvidence,
@@ -330,7 +332,8 @@ const recordViolations = (ledger: SafetyLedger, count: number, code: string): vo
 
 const recordBlockedPosts = (ledger: SafetyLedger, count: number, url: string): void => {
   for (let index = 0; index < count; index += 1) {
-    ledger.recordBlockedRequest({ method: 'POST', url, reason: 'NON_READ_METHOD' });
+    // BN-a: 本物の Guard と同じく、要求の種類と時点も記録する（page.json の `page-schema/1.1` の形）。
+    ledger.recordBlockedRequest({ method: 'POST', url, reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' });
   }
 };
 
@@ -412,7 +415,8 @@ function fakePageAuditorFactory(
             type: 'safety',
             pageId,
             viewport: profile,
-            payload: safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE'),
+            // BN-a: 本物の Page Auditor と同じく、読み込みの印を付ける。
+            payload: safetyEventsEvidenceFromSnapshot(ledger.snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' }),
           }, context));
           viewports[profile] = {
             requestedUrl: url,
@@ -446,7 +450,7 @@ function fakePageAuditorFactory(
         }
         const reasonKeys = new Set<string>();
         const result: PageAuditResult & { readonly unexpectedField?: true } = {
-          schemaVersion: 'page-schema/1.0',
+          schemaVersion: PAGE_SCHEMA_VERSION,
           pageId,
           pageUrl: url,
           status: derivePageAuditStatus(VIEWPORT_PROFILES.map((profile) => viewports[profile].status)),
@@ -1296,6 +1300,23 @@ describe('RunCoordinator: PREFLIGHT and Run Status inputs (design 5.6.6)', () =>
       desktop: { audited: 0, partial: 1, failed: 0, skipped: 0 },
       mobile: { audited: 1, partial: 0, failed: 0, skipped: 0 },
     });
+  });
+
+  // T44c（Task 44 の設計書 P1-4。設計者の判断）: ページの未完了の理由ごとのページ数（`run.json` の任意の項目。SKIPPED のページは数えない）。
+  it('records the number of the audited pages for each incomplete reason of the pages, and none when no page has a reason (T44c)', async () => {
+    const site: FakeSite = { [START_PATH]: { partial: true, links: ['/second.html', '/third.html'] }, '/second.html': { partial: true }, '/third.html': {} };
+    const result = await createHarness({ site }).coordinator.run();
+    expect(result.run.pageIncompleteReasonCounts).toEqual([{ code: 'COLLECTOR_INCOMPLETE', pages: 2 }]);
+    const validation = await validateArtifact('run', JSON.parse(JSON.stringify(result.run)));
+    expect(validation.ok ? [] : validation.errors).toEqual([]);
+    const broken = await validateArtifact('run', JSON.parse(JSON.stringify({ ...result.run, pageIncompleteReasonCounts: [{ code: 'NOT_A_CODE', pages: 1 }] })));
+    expect(broken.ok).toBe(false);
+    const complete = await createHarness({ site: { [START_PATH]: {} } }).coordinator.run();
+    expect(complete.run).not.toHaveProperty('pageIncompleteReasonCounts');
+    // 上限で監査しなかった（SKIPPED の）ページの理由は、Run の理由にあるので数えない。
+    const limited = await createHarness({ site: { [START_PATH]: { links: ['/a.html', '/b.html'] }, '/a.html': {}, '/b.html': {} }, config: { crawl: { maxPages: 1 } } })
+      .coordinator.run();
+    expect(limited.run).not.toHaveProperty('pageIncompleteReasonCounts');
   });
 
   it('counts an unexpected exception as an unhandled failure, finishes the Run, and closes the browser', async () => {
@@ -2707,9 +2728,11 @@ describe('RunCoordinator: resuming a Run from its checkpoint (resumable run desi
     await expectValidRun(result);
     // 保存のセッションは、前の回の Run のディレクトリで、再開の始め方（終わったページの ID）で始める。PREFLIGHT の前である。
     expect(recorder.calls[0]).toEqual({ kind: 'start', runDirectory: resumeFrom.runDirectory, mode: 'RESUME', auditCalls: 0, directoryExisted: true });
+    // SR-1-F5: 再開を選んだときの保存を渡し、ロックを取った後に保存が同じかをセッションに確かめさせる（`expectedState`）。
     expect(recorder.session.start).toHaveBeenCalledWith(resumeFrom.runDirectory, {
       mode: 'RESUME',
       completedPageIds: resumeFrom.checkpoint.completedPageIds,
+      expectedState: resumeFrom.checkpoint,
     });
     expect(recorder.session.start.mock.invocationCallOrder[0]).toBeLessThan(harness.preflight.mock.invocationCallOrder[0] ?? 0);
     // Run のディレクトリは作らない（前の回のものを使う）。PREFLIGHT は、そのディレクトリで行う。
@@ -4988,9 +5011,7 @@ describe('RunCoordinator: the diagnostic of a page stopped by site unavailabilit
   it('waits until the writer finishes before it closes the Browser', async () => {
     const finished = vi.fn();
     const { writer } = diagnosticWriter(async () => {
-      await new Promise<void>((resolveWait) => {
-        setTimeout(resolveWait, 10);
-      });
+      await wait(10);
       finished();
     });
     const harness = createHarness({ site: observedUnavailableAt('/b.html'), writeSiteUnavailableDiagnostic: writer });

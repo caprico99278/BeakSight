@@ -9,6 +9,7 @@
  *   変える場合は、使っているテストを確かめる。
  */
 import { screenshotRelativePath } from '../../src/core/artifact-layout.js';
+import { isBlockedByClientFailure } from '../../src/core/blocked-by-client-failures.js';
 import type {
   AuditRunResult,
   EvidenceId,
@@ -32,13 +33,17 @@ import type {
 } from '../../src/core/contracts.js';
 import {
   INTERACTION_REASON_CODES_BY_STATUS,
+  PAGE_SCHEMA_VERSION,
   SAFETY_EVENT_KINDS,
   type DomEvidence,
   type InteractionCandidateEvidence,
   type InteractionChangeEvidence,
   type InteractionNotVerifiableKind,
   type InteractionReasonCode,
+  type NetworkFailureEvidence,
+  type NetworkTimingEvidence,
   type NormalizedHttpUrlEvidence,
+  type PageErrorEvidence,
   type RobotsTxtMetadataEvidence,
   type SafetyEventKind,
   type SafetyEventsEvidence,
@@ -289,8 +294,80 @@ export function safety(
   overrides: Partial<SafetyEventsEvidence> = {},
 ): EvidenceRecordFor<'safety'> {
   // Ledger の結果は深く凍結されているので、複製して凍結しない値にする。
-  const empty = structuredClone(safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE'));
+  // LG-4: page-schema/1.1 の印（読み込みの種類）を持つ（前の版は捨てた）。
+  const empty = structuredClone(safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' }));
   return record('safety', sequence, pageId, viewport, { ...empty, ...overrides });
+}
+
+/** BN-c: 観測しなかった時間の内訳（network の Evidence の見本の `timing`）。 */
+const UNOBSERVED_TIMING: NetworkTimingEvidence = Object.freeze({
+  startTime: -1,
+  domainLookupStart: -1,
+  domainLookupEnd: -1,
+  connectStart: -1,
+  secureConnectionStart: -1,
+  connectEnd: -1,
+  requestStart: -1,
+  responseStart: -1,
+  responseEnd: -1,
+});
+
+/**
+ * BN-c: network の Evidence の失敗の 1 行（GET、文書でない要求、main frame、`requestId` は URL と種類から作る）。`overrides` は項目を上書きする。
+ * LG-4: page-schema/1.1 の印を必ず持つ（BeakSight の遮断かは書き手と同じ判定 `isBlockedByClientFailure`、時点は `LOAD`）。
+ */
+export function networkFailure(
+  url: string,
+  resourceType: string,
+  errorText: string,
+  overrides: Partial<NetworkFailureEvidence> = {},
+): NetworkFailureEvidence {
+  return {
+    requestId: `request-${resourceType}-${url}`,
+    url,
+    method: 'GET',
+    resourceType,
+    errorText,
+    timing: { ...UNOBSERVED_TIMING },
+    truncated: false,
+    isNavigationRequest: false,
+    isMainFrame: true,
+    blockedByBeakSight: isBlockedByClientFailure(errorText),
+    phase: 'LOAD',
+    ...overrides,
+  };
+}
+
+/** BN-c: network の Evidence（要求と応答は空、失敗は `failures`）。 */
+export function network(
+  sequence: number,
+  pageId: PageId,
+  viewport: ViewportProfile,
+  failures: readonly NetworkFailureEvidence[] = [],
+): EvidenceRecordFor<'network'> {
+  return record('network', sequence, pageId, viewport, {
+    requests: [],
+    responses: [],
+    failures,
+    omittedRequestCount: 0,
+    omittedResponseCount: 0,
+    omittedFailureCount: 0,
+  });
+}
+
+/** BN-c: console の Evidence（console の文は空、捕捉されない例外は `pageErrors`）。 */
+export function consoleEvidence(
+  sequence: number,
+  pageId: PageId,
+  viewport: ViewportProfile,
+  pageErrors: readonly PageErrorEvidence[] = [],
+): EvidenceRecordFor<'console'> {
+  return record('console', sequence, pageId, viewport, {
+    consoleMessages: [],
+    pageErrors,
+    omittedConsoleMessageCount: 0,
+    omittedPageErrorCount: 0,
+  });
 }
 
 /**
@@ -312,11 +389,11 @@ export type SafetyEventLists = Pick<SafetyEventsEvidence, SafetyEventKind>;
  */
 export function safetyEventSamples(): SafetyEventLists {
   return {
-    blockedRequests: [{ method: 'POST', url: fixtureUrl('/api/submit'), reason: 'NON_READ_METHOD' }],
+    blockedRequests: [{ method: 'POST', url: fixtureUrl('/api/submit'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' }],
     blockedNavigations: [
-      { method: 'GET', url: `https://external.test/?q=${HOSTILE_STRINGS.scriptTag}`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION' },
+      { method: 'GET', url: `https://external.test/?q=${HOSTILE_STRINGS.scriptTag}`, reason: 'EXTERNAL_MAIN_FRAME_NAVIGATION', phase: 'LOAD' },
     ],
-    blockedWebSockets: [{ url: 'ws://127.0.0.1:4173/socket', reason: 'PASSIVE_WEBSOCKET' }],
+    blockedWebSockets: [{ url: 'ws://127.0.0.1:4173/socket', reason: 'PASSIVE_WEBSOCKET', phase: 'LOAD' }],
     blockedExternalActions: [
       { candidateId: 'candidate-mailto', url: SPECIAL_SCHEME_URLS.mailto, reason: 'EXTERNAL_ACTION' },
       { candidateId: 'candidate-tel', url: SPECIAL_SCHEME_URLS.tel, reason: 'EXTERNAL_ACTION' },
@@ -350,8 +427,8 @@ export type HttpSafetyEventKind = 'blockedRequests' | 'blockedExternalActions' |
 export function httpSafetyEventSamples(): Pick<SafetyEventLists, HttpSafetyEventKind> {
   return {
     blockedRequests: [
-      { method: 'POST', url: fixtureUrl('/api/contact'), reason: 'NON_READ_METHOD' },
-      { method: 'POST', url: 'https://external.test/api/collect', reason: 'NON_READ_METHOD' },
+      { method: 'POST', url: fixtureUrl('/api/contact'), reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
+      { method: 'POST', url: 'https://external.test/api/collect', reason: 'NON_READ_METHOD', resourceType: 'fetch', phase: 'LOAD' },
     ],
     blockedExternalActions: [
       { candidateId: 'candidate-internal-action', url: fixtureUrl('/action.html'), reason: 'EXTERNAL_ACTION' },
@@ -439,7 +516,7 @@ export function page(
 ): PageAuditResult {
   const pageUrl = fixtureUrl(path);
   return {
-    schemaVersion: 'page-schema/1.0',
+    schemaVersion: PAGE_SCHEMA_VERSION,
     pageId,
     pageUrl,
     status,
@@ -632,6 +709,60 @@ export function auditRun(options: AuditRunOptions = {}): AuditRunResult {
     findings: options.findings ?? pages.flatMap((value) => value.findings),
     statusInput: runStatusInput(options.statusInput),
   };
+}
+
+/** BN-c・BN-d: `beaksightBlockAuditRun` の止めた script の URL と、止めた要求の失敗の理由。 */
+export const BLOCK_SAMPLE_SCRIPT_URL = fixtureUrl('/assets/app.js');
+export const BLOCK_SAMPLE_BLOCKED_TEXT = 'net::ERR_BLOCKED_BY_CLIENT.Inspector';
+
+/**
+ * BN-c・BN-d（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.3・3.5）: BeakSight の遮断と指摘の関係の 3 つの区分と SAFETY を持つ Run の見本。
+ * スキーマに合い、Run Status は `COMPLETE`。表示用モデル・HTML・バンドルのテストが使う。
+ * - PAGE-000001（desktop）: 読み込みの最中に BeakSight が止めた script（network の失敗）と、ページを離れた後に止めた DELETE（時点 `CLOSING`）。Finding は、
+ *   止めた script の `SCRIPT_LOAD_FAILED`（`CAUSED`。ERROR）、`MISSING_TITLE`（`POSSIBLE`。WARN）、`HTTP_4XX`（`NONE`。敏感でない。ERROR）、SAFETY の 1 件
+ *   （閉じる途中の DELETE）。
+ * - PAGE-000002（desktop）: 遮断なし。Finding は `MISSING_TITLE`（`NONE`。WARN）。
+ * - Finding の並び（ID の 1〜5）: CAUSED、POSSIBLE、NONE、NONE、SAFETY。
+ */
+export function beaksightBlockAuditRun(): AuditRunResult {
+  const p1Dom = dom(1, PAGE_1, 'desktop', 'p1', { title: null });
+  const p1Network = network(2, PAGE_1, 'desktop', [
+    networkFailure(BLOCK_SAMPLE_SCRIPT_URL, 'script', BLOCK_SAMPLE_BLOCKED_TEXT, { blockedByBeakSight: true, phase: 'LOAD' }),
+  ]);
+  // ページを離れた後に止めた DELETE（閉じる途中の遮断。SAFETY の Finding の事象。BN-R0 の M-3）。
+  const p1Safety = safety(3, PAGE_1, 'desktop', {
+    load: { kind: 'PAGE_AUDIT' },
+    blockedRequestsByMethod: { DELETE: 1 },
+    blockedRequests: [{ method: 'DELETE', url: fixtureUrl('/api/session'), reason: 'NON_READ_METHOD', resourceType: 'xhr', phase: 'CLOSING' }],
+  });
+  const p2Dom = dom(4, PAGE_2, 'desktop', 'p2', { title: null });
+  const p2Safety = safety(5, PAGE_2, 'desktop', { load: { kind: 'PAGE_AUDIT' } });
+  const findings = [
+    finding(1, 'ERROR', 'RESOURCE', PAGE_1, [idOf(p1Network)], {
+      ruleId: 'SCRIPT_LOAD_FAILED',
+      message: `script の読み込みに失敗しました（URL: ${BLOCK_SAMPLE_SCRIPT_URL}、エラー: ${BLOCK_SAMPLE_BLOCKED_TEXT}）。`,
+    }),
+    finding(2, 'WARN', 'DOM', PAGE_1, [idOf(p1Dom)], { ruleId: 'MISSING_TITLE', message: '<title> 要素がありません。' }),
+    finding(3, 'ERROR', 'HTTP', PAGE_1, [idOf(p1Network)], { ruleId: 'HTTP_4XX', message: 'ページのナビゲーションの応答が HTTP ステータス 404 でした。' }),
+    finding(4, 'WARN', 'DOM', PAGE_2, [idOf(p2Dom)], { ruleId: 'MISSING_TITLE', message: '<title> 要素がありません。' }),
+    finding(5, 'SAFETY', 'SAFETY', PAGE_1, [idOf(p1Safety)], { ruleId: 'SAFETY_NON_READ_REQUEST_BLOCKED' }),
+  ] as const;
+  return auditRun({
+    run: {
+      discoveredPageCount: 2,
+      auditedPageCount: 2,
+      viewportPageCounts: {
+        desktop: { audited: 2, partial: 0, failed: 0, skipped: 0 },
+        mobile: { audited: 2, partial: 0, failed: 0, skipped: 0 },
+      },
+    },
+    pages: [
+      // BN-a の印（`load`・`blockedByBeakSight`・`phase`）を持つので、page.json の今の版にする。
+      page(PAGE_1, '/', 'AUDITED', [p1Dom, p1Network, p1Safety], [findings[0], findings[1], findings[2], findings[4]], { schemaVersion: PAGE_SCHEMA_VERSION }),
+      page(PAGE_2, '/second.html', 'AUDITED', [p2Dom, p2Safety], [findings[3]], { schemaVersion: PAGE_SCHEMA_VERSION }),
+    ],
+    findings: [...findings],
+  });
 }
 
 /**

@@ -4,7 +4,8 @@
 //   `CREDENTIAL_PROTECTION_UNAVAILABLE`、`AUTO_LOGIN_HELD`、`AUTO_LOGIN_RATE_LIMITED`（次に始められる時刻つき）と、通る場合。
 // 例の値は、匿名の値（`example.invalid`）だけを使う。値（ユーザー名とパスワード）は、この確かめに渡さない（メタデータだけ）。
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import { AUTH_SETUP_SCHEMA_VERSION_2, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile } from '../../src/control/contracts.js';
 import type { CredentialMetadata } from '../../src/control/credentials/credential-store.js';
 import {
@@ -32,7 +33,7 @@ const profile: SiteProfile = {
 };
 
 const authSetup: AuthSetup = {
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision: 2,
   loginStartUrl: `${TEST_ORIGIN}/login?next=%2Fadmin`,

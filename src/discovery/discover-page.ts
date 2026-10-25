@@ -10,8 +10,9 @@
 // 4. probe（isolated world の 1 回の読み取り。`isolated-read.ts` の `readInIsolatedWorld`。DEF-087）→ JS の結び付き（CDP。main world の
 //    objectId で読む。`listeners.ts`）→ T27a の分類（`classifyCandidate`）と指紋（`computeCandidateDigests`）。
 //    読み取りが失敗したら、候補を出さずに `INCOMPLETE_READ_FAILED`。
-// 画面の記録（`DiscoveryPageRecord`）は、成果物 `discovery.json`（T27d）の 1 画面分の形: 画面の Origin と path（http(s) でなければ null）、
-// 読み切れなかった理由（重複なし、閉じた一覧の順）、候補（どの候補にも、画面の理由を同じく付ける）。候補 0 件の不完全な画面も表せる。
+// 画面の記録は、成果物 `discovery.json`（T27d）の 1 画面分の形（純粋な部品 `discovery-result.ts` の `DiscoveryReadPageRecord`。型は 1 つ。
+// PRE42-CC 組 5b。CC-070 (a)）: 画面の Origin と path（http(s) でなければ null）、読み切れなかった理由（重複なし、閉じた一覧の順）、候補（どの
+// 候補にも、画面の理由を同じく付ける）。候補 0 件の不完全な画面も表せる。
 import type { Page } from 'playwright';
 import { awaitBeforeDeadline } from '../core/deadline.js';
 import {
@@ -28,6 +29,7 @@ import {
   type IncompleteReason,
 } from './candidate-contracts.js';
 import { classifyCandidate, type CandidateClassificationPolicy } from './classify.js';
+import type { DiscoveryReadPageRecord } from './discovery-result.js';
 import { computeCandidateDigests } from './fingerprint.js';
 import { readCandidateListeners } from './listeners.js';
 import { locationOfUrl, probePageCandidates, type ProbedCandidate } from './probe.js';
@@ -51,16 +53,6 @@ export interface DiscoverPageOptions {
   readonly settlePolicy?: DiscoverySettlePolicy | undefined;
 }
 
-/** 成果物 `discovery.json` の 1 画面分の記録。 */
-export interface DiscoveryPageRecord {
-  /** 画面の Origin と path（読んだ時点の page の URL。http(s) でなければ null）。 */
-  readonly location: CandidateLocation | null;
-  /** 読み切れなかった理由（重複なし、`INCOMPLETE_REASONS` の順。読み切れたら空）。 */
-  readonly incompleteReasons: readonly IncompleteReason[];
-  /** 候補（probe の順: form（送信ボタンごと）、form の外のボタン）。 */
-  readonly candidates: readonly DiscoveryCandidate[];
-}
-
 /** 結び付きの記録の空の値（落ち着きの待ちの digest の計算に使う。識別の digest は結び付きを含まない）。 */
 const NO_JS_BINDING: CandidateJsBinding = Object.freeze({
   form: [], submitter: [], ancestor: [], document: [], window: [], inlineHandler: false,
@@ -74,7 +66,7 @@ const pageRecord = (
   location: CandidateLocation | null,
   reasons: ReadonlySet<IncompleteReason>,
   candidates: readonly DiscoveryCandidate[],
-): DiscoveryPageRecord => Object.freeze({ location, incompleteReasons: orderedReasons(reasons), candidates: Object.freeze([...candidates]) });
+): DiscoveryReadPageRecord => Object.freeze({ location, incompleteReasons: orderedReasons(reasons), candidates: Object.freeze([...candidates]) });
 
 /** page の URL の画面（http(s) でなければ null）。 */
 const pageLocationOf = (page: Page): CandidateLocation | null => {
@@ -103,10 +95,18 @@ const discoveredOf = (
 });
 
 /**
- * 凍結の条件（`activateInteractionFreeze` の条件と同じ: page がただ 1 つの開いた page で、読み込みの済んだ http(s) の URL で、Guard の準備が
- * でき、凍結の前の段階）。確かめるだけで、ページにも Guard にも何もしない（例外を投げない）。
+ * probe の候補の識別の digest（結び付きと理由を除いた形で求める。識別の digest は結び付きと理由を含まないので、分類した候補の digest と同じ値）。
+ * 落ち着きの待ちの digest の集合と、T37c の送らずに観察する probe の押す前の読み直し（`src/interaction/submission-probe.ts`。同じ候補を探す）が使う。
  */
-const freezeConditionsHold = async (page: Page): Promise<boolean> => {
+export const probedCandidateIdentityDigestOf = (location: CandidateLocation, probed: ProbedCandidate): string =>
+  computeCandidateDigests(discoveredOf(location, probed, NO_JS_BINDING, [])).identityDigest;
+
+/**
+ * 凍結の条件（`activateInteractionFreeze` の条件と同じ: page がただ 1 つの開いた page で、読み込みの済んだ http(s) の URL で、Guard の準備が
+ * でき、凍結の前の段階）。確かめるだけで、ページにも Guard にも何もしない（例外を投げない）。CC-099（T37c fix round 1）: 公開した（落ち着きと凍結の
+ * 部品 `settleAndFreezePage` が使う）。
+ */
+export const freezeConditionsHold = async (page: Page): Promise<boolean> => {
   if (page.isClosed()) {
     return false;
   }
@@ -126,13 +126,26 @@ const freezeConditionsHold = async (page: Page): Promise<boolean> => {
 };
 
 /**
- * 1 つの画面の候補を、読むだけで見つける（例外を投げない）。ページを操作しない。凍結の後に読む。
+ * 落ち着きと凍結の結果（CC-099）。`FROZEN` は凍結した（`location` は凍結の時点の画面）。`UNAVAILABLE` は凍結の条件が満たされない・凍結が失敗した
+ * （`reasons` に `INCOMPLETE_FREEZE_UNAVAILABLE`。何も読まない）。どちらも、落ち着きの時間切れなら `INCOMPLETE_SETTLE_TIMEOUT` を持つ。
  */
-export async function discoverPageCandidates(page: Page, options: DiscoverPageOptions): Promise<DiscoveryPageRecord> {
+export type SettledFreezeOutcome =
+  | { readonly status: 'FROZEN'; readonly location: CandidateLocation; readonly reasons: ReadonlySet<IncompleteReason> }
+  | { readonly status: 'UNAVAILABLE'; readonly location: CandidateLocation | null; readonly reasons: ReadonlySet<IncompleteReason> };
+
+/**
+ * 落ち着きの待ちと凍結だけを行う（ファイルの先頭の 1〜3。CC-099（T37c fix round 1）で `discoverPageCandidates` から切り出した。振る舞いは変えない）。
+ * 凍結の後の読み取り（probe と JS の結び付き）はしない。入口の確かめ（`src/worker/entry-check-page.ts`）は、候補を読まずに、これだけを使う。例外を
+ * 投げない。
+ */
+export async function settleAndFreezePage(
+  page: Page,
+  options: Pick<DiscoverPageOptions, 'requestCounter' | 'settlePolicy'>,
+): Promise<SettledFreezeOutcome> {
   const reasons = new Set<IncompleteReason>();
   if (!(await freezeConditionsHold(page))) {
     reasons.add('INCOMPLETE_FREEZE_UNAVAILABLE');
-    return pageRecord(page.isClosed() ? null : pageLocationOf(page), reasons, []);
+    return { status: 'UNAVAILABLE', location: page.isClosed() ? null : pageLocationOf(page), reasons };
   }
 
   const counter = options.requestCounter ?? new InFlightRequestCounter(page);
@@ -143,7 +156,7 @@ export async function discoverPageCandidates(page: Page, options: DiscoverPageOp
       if (location === null || probe.status !== 'READ') {
         return null;
       }
-      return probe.candidates.map((probed) => computeCandidateDigests(discoveredOf(location, probed, NO_JS_BINDING, [])).identityDigest);
+      return probe.candidates.map((probed) => probedCandidateIdentityDigestOf(location, probed));
     }, options.settlePolicy ?? DISCOVERY_SETTLE_POLICY);
     if (settled.status === 'TIMED_OUT') {
       reasons.add('INCOMPLETE_SETTLE_TIMEOUT');
@@ -157,15 +170,28 @@ export async function discoverPageCandidates(page: Page, options: DiscoverPageOp
   const location = pageLocationOf(page);
   if (location === null || !(await freezeConditionsHold(page))) {
     reasons.add('INCOMPLETE_FREEZE_UNAVAILABLE');
-    return pageRecord(location, reasons, []);
+    return { status: 'UNAVAILABLE', location, reasons };
   }
   try {
     await activateInteractionFreeze(page);
   } catch {
     // Guard は、条件が満たされない凍結を違反として記録し、Context を無効にする（fail-closed）。読まない。
     reasons.add('INCOMPLETE_FREEZE_UNAVAILABLE');
-    return pageRecord(location, reasons, []);
+    return { status: 'UNAVAILABLE', location, reasons };
   }
+  return { status: 'FROZEN', location, reasons };
+}
+
+/**
+ * 1 つの画面の候補を、読むだけで見つける（例外を投げない）。ページを操作しない。凍結の後に読む。
+ */
+export async function discoverPageCandidates(page: Page, options: DiscoverPageOptions): Promise<DiscoveryReadPageRecord> {
+  const frozen = await settleAndFreezePage(page, options);
+  const reasons = new Set<IncompleteReason>(frozen.reasons);
+  if (frozen.status !== 'FROZEN') {
+    return pageRecord(frozen.location, reasons, []);
+  }
+  const { location } = frozen;
 
   const probe = await probePageCandidates(page, Date.now() + DISCOVERY_READ_TIMEOUT_MS);
   if (probe.status !== 'READ') {

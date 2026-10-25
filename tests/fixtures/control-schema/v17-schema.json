@@ -1,0 +1,3008 @@
+{
+  "$comment": "LG-2（2026-10-24）: 版 1→17 の段（LG-2 で捨てる前のコード）で空の所から作った管理データの形。scratchpad の lg-2 の capture.test.ts で写した。 objects は sqlite_schema の type・name・tbl_name・sql（type・name の順）。tables は表ごとの pragma_table_info（列の順）・pragma_index_list と pragma_index_info・pragma_foreign_key_list。手で直さない。",
+  "applicationId": 1114329972,
+  "userVersion": 17,
+  "storeMetaKeys": [
+    "created_at",
+    "created_schema_version"
+  ],
+  "objects": [
+    {
+      "type": "index",
+      "name": "approval_receipts_scenario_recorded",
+      "tbl_name": "approval_receipts",
+      "sql": "CREATE INDEX approval_receipts_scenario_recorded ON approval_receipts (scenario_id, recorded_at)"
+    },
+    {
+      "type": "index",
+      "name": "approval_receipts_single_revocation",
+      "tbl_name": "approval_receipts",
+      "sql": "CREATE UNIQUE INDEX approval_receipts_single_revocation ON approval_receipts (target_receipt_id) WHERE target_receipt_id IS NOT NULL"
+    },
+    {
+      "type": "index",
+      "name": "auto_login_attempts_profile_started",
+      "tbl_name": "auto_login_attempts",
+      "sql": "CREATE INDEX auto_login_attempts_profile_started ON auto_login_attempts (profile_id, started_at)"
+    },
+    {
+      "type": "index",
+      "name": "auto_login_holds_single_active",
+      "tbl_name": "auto_login_holds",
+      "sql": "CREATE UNIQUE INDEX auto_login_holds_single_active ON auto_login_holds (profile_id) WHERE cleared_at IS NULL"
+    },
+    {
+      "type": "index",
+      "name": "credential_events_profile_recorded",
+      "tbl_name": "credential_events",
+      "sql": "CREATE INDEX credential_events_profile_recorded ON credential_events (profile_id, recorded_at)"
+    },
+    {
+      "type": "index",
+      "name": "discovery_candidates_profile_last_seen",
+      "tbl_name": "discovery_candidates",
+      "sql": "CREATE INDEX discovery_candidates_profile_last_seen ON discovery_candidates (profile_id, last_seen_at)"
+    },
+    {
+      "type": "index",
+      "name": "discovery_jobs_profile_recorded",
+      "tbl_name": "discovery_jobs",
+      "sql": "CREATE INDEX discovery_jobs_profile_recorded ON discovery_jobs (profile_id, recorded_at)"
+    },
+    {
+      "type": "index",
+      "name": "execution_grants_single_open",
+      "tbl_name": "execution_grants",
+      "sql": "CREATE UNIQUE INDEX execution_grants_single_open ON execution_grants (scenario_id) WHERE consumed_at IS NULL AND invalidated_at IS NULL"
+    },
+    {
+      "type": "index",
+      "name": "jobs_created_at",
+      "tbl_name": "jobs",
+      "sql": "CREATE INDEX jobs_created_at ON jobs (created_at)"
+    },
+    {
+      "type": "index",
+      "name": "jobs_single_active",
+      "tbl_name": "jobs",
+      "sql": "CREATE UNIQUE INDEX jobs_single_active ON jobs ((state IN ('STARTING', 'RUNNING', 'STOPPING'))) WHERE state IN ('STARTING', 'RUNNING', 'STOPPING')"
+    },
+    {
+      "type": "index",
+      "name": "read_check_results_check_recorded",
+      "tbl_name": "read_check_results",
+      "sql": "CREATE INDEX read_check_results_check_recorded ON read_check_results (read_check_id, recorded_at)"
+    },
+    {
+      "type": "index",
+      "name": "read_checks_profile_created",
+      "tbl_name": "read_checks",
+      "sql": "CREATE INDEX read_checks_profile_created ON read_checks (profile_id, created_at)"
+    },
+    {
+      "type": "index",
+      "name": "rule_sets_profile_created",
+      "tbl_name": "rule_sets",
+      "sql": "CREATE INDEX rule_sets_profile_created ON rule_sets (profile_id, created_at)"
+    },
+    {
+      "type": "index",
+      "name": "scenarios_profile_created",
+      "tbl_name": "scenarios",
+      "sql": "CREATE INDEX scenarios_profile_created ON scenarios (profile_id, created_at)"
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_approval_receipts_1",
+      "tbl_name": "approval_receipts",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_auth_setups_1",
+      "tbl_name": "auth_setups",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_auto_login_attempts_1",
+      "tbl_name": "auto_login_attempts",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_discovery_candidates_1",
+      "tbl_name": "discovery_candidates",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_discovery_jobs_1",
+      "tbl_name": "discovery_jobs",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_execution_grants_1",
+      "tbl_name": "execution_grants",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_execution_grants_2",
+      "tbl_name": "execution_grants",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_jobs_1",
+      "tbl_name": "jobs",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_profile_display_settings_1",
+      "tbl_name": "profile_display_settings",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_profile_revisions_1",
+      "tbl_name": "profile_revisions",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_profiles_1",
+      "tbl_name": "profiles",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_read_check_results_1",
+      "tbl_name": "read_check_results",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_read_checks_1",
+      "tbl_name": "read_checks",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_rule_set_revisions_1",
+      "tbl_name": "rule_set_revisions",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_rule_sets_1",
+      "tbl_name": "rule_sets",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_rule_sets_2",
+      "tbl_name": "rule_sets",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_scenario_revisions_1",
+      "tbl_name": "scenario_revisions",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_scenarios_1",
+      "tbl_name": "scenarios",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_store_meta_1",
+      "tbl_name": "store_meta",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_write_results_1",
+      "tbl_name": "write_results",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_write_results_2",
+      "tbl_name": "write_results",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "write_reservations_scenario_state",
+      "tbl_name": "write_reservations",
+      "sql": "CREATE INDEX write_reservations_scenario_state ON write_reservations (scenario_id, state)"
+    },
+    {
+      "type": "index",
+      "name": "write_reservations_single_per_grant",
+      "tbl_name": "write_reservations",
+      "sql": "CREATE UNIQUE INDEX write_reservations_single_per_grant ON write_reservations (grant_id)"
+    },
+    {
+      "type": "index",
+      "name": "write_results_profile",
+      "tbl_name": "write_results",
+      "sql": "CREATE INDEX write_results_profile ON write_results (profile_id)"
+    },
+    {
+      "type": "index",
+      "name": "write_results_scenario_recorded",
+      "tbl_name": "write_results",
+      "sql": "CREATE INDEX write_results_scenario_recorded ON write_results (scenario_id, recorded_at)"
+    },
+    {
+      "type": "table",
+      "name": "approval_receipts",
+      "tbl_name": "approval_receipts",
+      "sql": "CREATE TABLE approval_receipts (\n    receipt_id TEXT PRIMARY KEY NOT NULL CHECK (length(receipt_id) > 0 AND receipt_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    kind TEXT NOT NULL CHECK (kind IN ('APPROVAL', 'REVOCATION')),\n    scenario_revision INTEGER CHECK (scenario_revision IS NULL OR scenario_revision >= 1),\n    approval_digest TEXT CHECK (approval_digest IS NULL OR (length(approval_digest) = 71 AND substr(approval_digest, 1, 7) = 'sha256:' AND substr(approval_digest, 8) NOT GLOB '*[^0-9a-f]*')),\n    target_receipt_id TEXT REFERENCES approval_receipts (receipt_id),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    expires_at TEXT CHECK (expires_at IS NULL OR (length(expires_at) = 14 AND expires_at NOT GLOB '*[^0-9]*')),\n    document TEXT NOT NULL CHECK (json_valid(document) AND json_type(document) = 'object'),\n    CHECK ((kind = 'APPROVAL') = (scenario_revision IS NOT NULL)),\n    CHECK ((kind = 'APPROVAL') = (approval_digest IS NOT NULL)),\n    CHECK ((kind = 'APPROVAL') = (expires_at IS NOT NULL)),\n    CHECK ((kind = 'REVOCATION') = (target_receipt_id IS NOT NULL)),\n    CHECK (expires_at IS NULL OR recorded_at < expires_at)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "auth_setups",
+      "tbl_name": "auth_setups",
+      "sql": "CREATE TABLE auth_setups (\n    profile_id TEXT PRIMARY KEY NOT NULL REFERENCES profiles (profile_id),\n    profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),\n    document TEXT NOT NULL CHECK (json_valid(document)),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*')\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "auto_login_attempts",
+      "tbl_name": "auto_login_attempts",
+      "sql": "CREATE TABLE auto_login_attempts (\n    attempt_id INTEGER PRIMARY KEY NOT NULL,\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    job_id TEXT NOT NULL UNIQUE CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    started_at TEXT NOT NULL CHECK (length(started_at) = 14 AND started_at NOT GLOB '*[^0-9]*'),\n    credential_revision INTEGER NOT NULL CHECK (credential_revision >= 1),\n    result TEXT CHECK (result IS NULL OR result IN ('SUCCEEDED', 'INVALID_CREDENTIALS', 'ACCOUNT_LOCKED', 'MFA_REQUIRED', 'CREDENTIAL_EXPIRED', 'RATE_LIMITED', 'AUTH_RESULT_UNKNOWN', 'LOGIN_FORM_INVALID', 'LOGIN_FORM_INPUT_FAILED', 'CREDENTIAL_CHANGED', 'CREDENTIAL_UNAVAILABLE', 'UNEXPECTED_LOGIN_REQUEST')),\n    submitted TEXT CHECK (submitted IS NULL OR submitted IN ('YES', 'NO', 'UNKNOWN')),\n    retry_after_until TEXT CHECK (retry_after_until IS NULL OR (length(retry_after_until) = 14 AND retry_after_until NOT GLOB '*[^0-9]*')),\n    result_recorded_at TEXT CHECK (result_recorded_at IS NULL OR (length(result_recorded_at) = 14 AND result_recorded_at NOT GLOB '*[^0-9]*')),\n    form_invalid_reason TEXT CHECK (form_invalid_reason IS NULL OR form_invalid_reason IN ('SELECTOR_NOT_UNIQUE', 'USERNAME_FIELD_INVALID', 'PASSWORD_FIELD_INVALID', 'SUBMIT_BUTTON_INVALID', 'NOT_SAME_FORM', 'METHOD_NOT_POST', 'ACTION_NOT_ALLOWED', 'FORM_TARGET_NOT_SELF', 'FORM_UNREADABLE')),\n    CHECK (form_invalid_reason IS NULL OR result = 'LOGIN_FORM_INVALID'),\n    CHECK ((result IS NULL) = (submitted IS NULL)),\n    CHECK ((result IS NULL) = (result_recorded_at IS NULL)),\n    CHECK (retry_after_until IS NULL OR result = 'RATE_LIMITED'),\n    CHECK (result IS NULL OR result <> 'SUCCEEDED' OR submitted = 'YES')\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "auto_login_holds",
+      "tbl_name": "auto_login_holds",
+      "sql": "CREATE TABLE auto_login_holds (\n    hold_id INTEGER PRIMARY KEY NOT NULL,\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    reason TEXT NOT NULL CHECK (reason IN ('INVALID_CREDENTIALS', 'ACCOUNT_LOCKED', 'MFA_REQUIRED', 'CREDENTIAL_EXPIRED', 'RATE_LIMITED', 'AUTH_RESULT_UNKNOWN', 'LOGIN_FORM_INVALID', 'LOGIN_FORM_INPUT_FAILED', 'CREDENTIAL_CHANGED', 'CREDENTIAL_UNAVAILABLE', 'UNEXPECTED_LOGIN_REQUEST')),\n    held_at TEXT NOT NULL CHECK (length(held_at) = 14 AND held_at NOT GLOB '*[^0-9]*'),\n    attempt_id INTEGER NOT NULL CHECK (attempt_id > 0),\n    cleared_at TEXT CHECK (cleared_at IS NULL OR (length(cleared_at) = 14 AND cleared_at NOT GLOB '*[^0-9]*'))\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "control_instance",
+      "tbl_name": "control_instance",
+      "sql": "CREATE TABLE control_instance (\n    slot INTEGER PRIMARY KEY NOT NULL CHECK (slot = 1),\n    process_id INTEGER NOT NULL CHECK (process_id > 0),\n    booted_at_ms INTEGER NOT NULL CHECK (booted_at_ms >= 0),\n    acquired_at_ms INTEGER NOT NULL CHECK (acquired_at_ms >= 0),\n    heartbeat_at_ms INTEGER NOT NULL CHECK (heartbeat_at_ms >= 0),\n    port INTEGER CHECK (port IS NULL OR port BETWEEN 1 AND 65535)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "credential_events",
+      "tbl_name": "credential_events",
+      "sql": "CREATE TABLE credential_events (\n    event_id INTEGER PRIMARY KEY NOT NULL,\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    kind TEXT NOT NULL CHECK (kind IN ('CREATED', 'USERNAME_CHANGED', 'PASSWORD_CHANGED', 'BOTH_CHANGED', 'DELETED', 'HOLD_CLEARED')),\n    credential_revision INTEGER CHECK (credential_revision IS NULL OR credential_revision >= 1)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "discovery_candidates",
+      "tbl_name": "discovery_candidates",
+      "sql": "CREATE TABLE discovery_candidates (\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    identity_digest TEXT NOT NULL CHECK (length(identity_digest) = 71 AND substr(identity_digest, 1, 7) = 'sha256:' AND substr(identity_digest, 8) NOT GLOB '*[^0-9a-f]*'),\n    rule_digest TEXT NOT NULL CHECK (length(rule_digest) = 71 AND substr(rule_digest, 1, 7) = 'sha256:' AND substr(rule_digest, 8) NOT GLOB '*[^0-9a-f]*'),\n    classification TEXT NOT NULL CHECK (classification IN ('READ', 'CREATE', 'UPDATE', 'NOT_EXECUTABLE', 'NEEDS_BINDING', 'UNSUPPORTED_READ_TRANSPORT', 'BLOCKED_EXTERNAL', 'DISPLAY_ONLY')),\n    reason_code TEXT NOT NULL CHECK (reason_code IN ('ACTION_OUTSIDE_ALLOWED_ORIGINS', 'DESTRUCTIVE', 'READ_GET_FORM', 'GET_WITH_PASSWORD_FIELD', 'GET_WITH_MULTIPART', 'POST_SEARCH', 'GRAPHQL_ENDPOINT', 'JS_BOUND', 'JS_DELEGATED', 'NO_KNOWN_ACTION', 'DIALOG_METHOD', 'METHOD_OVERRIDE_UNRECOGNIZED', 'UPDATE_METHOD', 'UPDATE_WORD', 'CREATE_WORD', 'UNCLASSIFIED', 'DUPLICATE_IDENTITY_CONFLICT')),\n    page_path TEXT NOT NULL CHECK (length(page_path) BETWEEN 1 AND 2048 AND substr(page_path, 1, 1) = '/'),\n    action_path TEXT CHECK (action_path IS NULL OR (length(action_path) BETWEEN 1 AND 2048 AND substr(action_path, 1, 1) = '/')),\n    form_method TEXT CHECK (form_method IS NULL OR form_method IN ('GET', 'POST', 'DIALOG')),\n    method_override TEXT CHECK (method_override IS NULL OR method_override IN ('PUT', 'PATCH', 'DELETE')),\n    has_state_field INTEGER NOT NULL CHECK (has_state_field IN (0, 1)),\n    first_seen_job_id TEXT NOT NULL CHECK (length(first_seen_job_id) > 0 AND first_seen_job_id NOT GLOB '*[^a-z0-9-]*'),\n    first_seen_at TEXT NOT NULL CHECK (length(first_seen_at) = 14 AND first_seen_at NOT GLOB '*[^0-9]*'),\n    last_seen_job_id TEXT NOT NULL CHECK (length(last_seen_job_id) > 0 AND last_seen_job_id NOT GLOB '*[^a-z0-9-]*'),\n    last_seen_at TEXT NOT NULL CHECK (length(last_seen_at) = 14 AND last_seen_at NOT GLOB '*[^0-9]*'),\n    last_changed_job_id TEXT CHECK (last_changed_job_id IS NULL OR (length(last_changed_job_id) > 0 AND last_changed_job_id NOT GLOB '*[^a-z0-9-]*')), templated_identity_digests TEXT\n    CHECK (templated_identity_digests IS NULL OR (json_valid(templated_identity_digests) AND json_type(templated_identity_digests) = 'array')), shape_digests TEXT\n    CHECK (shape_digests IS NULL OR (json_valid(shape_digests) AND json_type(shape_digests) = 'array'\n      AND json_array_length(shape_digests) <= 3)), key_field_digests TEXT\n    CHECK (key_field_digests IS NULL OR (json_valid(key_field_digests) AND json_type(key_field_digests) = 'array'\n      AND json_array_length(key_field_digests) <= 3)),\n    PRIMARY KEY (profile_id, identity_digest),\n    CHECK (classification = CASE reason_code WHEN 'ACTION_OUTSIDE_ALLOWED_ORIGINS' THEN 'BLOCKED_EXTERNAL' WHEN 'DESTRUCTIVE' THEN 'NOT_EXECUTABLE' WHEN 'READ_GET_FORM' THEN 'READ' WHEN 'GET_WITH_PASSWORD_FIELD' THEN 'UNSUPPORTED_READ_TRANSPORT' WHEN 'GET_WITH_MULTIPART' THEN 'UNSUPPORTED_READ_TRANSPORT' WHEN 'POST_SEARCH' THEN 'UNSUPPORTED_READ_TRANSPORT' WHEN 'GRAPHQL_ENDPOINT' THEN 'UNSUPPORTED_READ_TRANSPORT' WHEN 'JS_BOUND' THEN 'NEEDS_BINDING' WHEN 'JS_DELEGATED' THEN 'NEEDS_BINDING' WHEN 'NO_KNOWN_ACTION' THEN 'DISPLAY_ONLY' WHEN 'DIALOG_METHOD' THEN 'DISPLAY_ONLY' WHEN 'METHOD_OVERRIDE_UNRECOGNIZED' THEN 'DISPLAY_ONLY' WHEN 'UPDATE_METHOD' THEN 'UPDATE' WHEN 'UPDATE_WORD' THEN 'UPDATE' WHEN 'CREATE_WORD' THEN 'CREATE' WHEN 'UNCLASSIFIED' THEN 'DISPLAY_ONLY' WHEN 'DUPLICATE_IDENTITY_CONFLICT' THEN 'DISPLAY_ONLY' END),\n    CHECK ((action_path IS NULL) = (form_method IS NULL)),\n    CHECK (method_override IS NULL OR form_method IS NOT NULL),\n    CHECK (first_seen_at <= last_seen_at)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "discovery_jobs",
+      "tbl_name": "discovery_jobs",
+      "sql": "CREATE TABLE discovery_jobs (\n    job_id TEXT PRIMARY KEY NOT NULL CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    read_page_paths TEXT NOT NULL CHECK (json_valid(read_page_paths) AND json_type(read_page_paths) = 'array'\n      AND json_array_length(read_page_paths) <= 10000)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "execution_grants",
+      "tbl_name": "execution_grants",
+      "sql": "CREATE TABLE execution_grants (\n    grant_id TEXT PRIMARY KEY NOT NULL CHECK (length(grant_id) > 0 AND grant_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    scenario_revision INTEGER NOT NULL CHECK (scenario_revision >= 1),\n    approval_receipt_id TEXT NOT NULL REFERENCES approval_receipts (receipt_id),\n    job_id TEXT NOT NULL UNIQUE CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    issued_at TEXT NOT NULL CHECK (length(issued_at) = 14 AND issued_at NOT GLOB '*[^0-9]*'),\n    expires_at TEXT NOT NULL CHECK (length(expires_at) = 14 AND expires_at NOT GLOB '*[^0-9]*'),\n    consumed_at TEXT CHECK (consumed_at IS NULL OR (length(consumed_at) = 14 AND consumed_at NOT GLOB '*[^0-9]*')),\n    invalidated_at TEXT CHECK (invalidated_at IS NULL OR (length(invalidated_at) = 14 AND invalidated_at NOT GLOB '*[^0-9]*')), target_record_id TEXT\n    CHECK (target_record_id IS NULL OR (length(target_record_id) BETWEEN 1 AND 64 AND target_record_id NOT GLOB '*[^A-Za-z0-9_-]*')),\n    CHECK (issued_at < expires_at),\n    CHECK (consumed_at IS NULL OR invalidated_at IS NULL),\n    CHECK (consumed_at IS NULL OR consumed_at >= issued_at),\n    CHECK (invalidated_at IS NULL OR invalidated_at >= issued_at)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "jobs",
+      "tbl_name": "jobs",
+      "sql": "CREATE TABLE \"jobs\" (\n    job_id TEXT PRIMARY KEY NOT NULL CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),\n    state TEXT NOT NULL CHECK (state IN ('STARTING', 'RUNNING', 'STOPPING', 'FINISHED', 'FAILED', 'INTERRUPTED')),\n    start_new INTEGER NOT NULL CHECK (start_new IN (0, 1)),\n    run_id TEXT CHECK (run_id IS NULL OR length(run_id) > 0),\n    run_directory TEXT CHECK (run_directory IS NULL OR length(run_directory) BETWEEN 1 AND 1024),\n    exit_code INTEGER CHECK (exit_code IS NULL OR exit_code BETWEEN 0 AND 255),\n    run_status TEXT CHECK (run_status IS NULL OR run_status IN ('COMPLETE', 'PARTIAL', 'FAILED', 'ABORTED_BY_SAFETY')),\n    end_kind TEXT CHECK (end_kind IS NULL OR end_kind IN ('RAN', 'RUN_ACTIVE', 'VERSION_MISMATCH', 'RUN_DIRECTORY_UNAVAILABLE', 'RESUME_UNAVAILABLE')),\n    last_progress TEXT CHECK (last_progress IS NULL OR json_valid(last_progress)),\n    last_notice TEXT CHECK (last_notice IS NULL OR json_valid(last_notice)),\n    worker_pid INTEGER CHECK (worker_pid IS NULL OR worker_pid > 0),\n    created_at TEXT NOT NULL CHECK (length(created_at) = 14 AND created_at NOT GLOB '*[^0-9]*'),\n    started_at TEXT CHECK (started_at IS NULL OR (length(started_at) = 14 AND started_at NOT GLOB '*[^0-9]*')),\n    finished_at TEXT CHECK (finished_at IS NULL OR (length(finished_at) = 14 AND finished_at NOT GLOB '*[^0-9]*')),\n    last_heartbeat_at TEXT CHECK (last_heartbeat_at IS NULL OR (length(last_heartbeat_at) = 14 AND last_heartbeat_at NOT GLOB '*[^0-9]*')),\n    stop_requested_at TEXT CHECK (stop_requested_at IS NULL OR (length(stop_requested_at) = 14 AND stop_requested_at NOT GLOB '*[^0-9]*')),\n    failure_reason TEXT CHECK (failure_reason IS NULL OR failure_reason IN ('CONFIG_ERROR', 'ARTIFACT_WRITE_FAILED', 'UNEXPECTED_FAILURE', 'PROTOCOL_VIOLATION', 'START_TIMEOUT', 'CONFIG_CHANGED', 'AUTH_SETUP_CHANGED', 'AUTH_SETUP_REQUIRED', 'UNSUPPORTED_AUTH_STATE', 'LOGIN_TIMEOUT', 'LOGIN_ATTEMPTS_EXCEEDED', 'WORKER_START_FAILED', 'WORKER_NOT_READY', 'WORKER_EXITED', 'WORKER_UNRESPONSIVE', 'STOP_TIMEOUT', 'SERVER_RESTARTED', 'SERVER_SHUTDOWN', 'INVALID_CREDENTIALS', 'ACCOUNT_LOCKED', 'MFA_REQUIRED', 'CREDENTIAL_EXPIRED', 'RATE_LIMITED', 'AUTH_RESULT_UNKNOWN', 'LOGIN_FORM_INVALID', 'LOGIN_FORM_INPUT_FAILED', 'CREDENTIAL_CHANGED', 'CREDENTIAL_UNAVAILABLE', 'UNEXPECTED_LOGIN_REQUEST', 'JOB_KIND_NOT_SUPPORTED', 'DISCOVERY_RESULT_INVALID', 'READ_CHECK_RESULT_INVALID', 'WRITE_GRANT_REJECTED', 'WRITE_RESULT_INVALID', 'ENTRY_CHECK_RESULT_INVALID')),\n    last_auth_state TEXT CHECK (last_auth_state IS NULL OR last_auth_state IN ('AWAITING_LOGIN', 'AUTHENTICATED', 'AUTH_SETUP_REQUIRED', 'UNSUPPORTED_AUTH_STATE', 'SESSION_LOST', 'LOGIN_TIMEOUT', 'LOGIN_ATTEMPTS_EXCEEDED', 'AUTOMATED_LOGIN_FAILED')),\n    session_lost_url TEXT CHECK (session_lost_url IS NULL OR length(session_lost_url) BETWEEN 1 AND 2048),\n    job_kind TEXT NOT NULL CHECK (job_kind IN ('AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK')),\n    write_report_check TEXT\n      CHECK (write_report_check IS NULL OR (write_report_check IN ('VALID', 'REPORT_MISSING', 'REPORT_INVALID', 'REPORT_MISMATCH', 'APPROVAL_FACTS_MISMATCH', 'BUNDLE_MISMATCH', 'RESULT_INVALID')\n        AND job_kind IN ('WRITE_CREATE', 'WRITE_UPDATE'))),\n    login_stage_summary TEXT\n      CHECK (login_stage_summary IS NULL OR (json_valid(login_stage_summary) AND json_type(login_stage_summary) = 'object'\n        AND length(login_stage_summary) <= 32768)), session_loss TEXT\n    CHECK (session_loss IS NULL OR (json_valid(session_loss) AND json_type(session_loss) = 'object'\n      AND length(session_loss) <= 65536)),\n    CHECK ((state IN ('FINISHED', 'FAILED', 'INTERRUPTED')) = (finished_at IS NOT NULL)),\n    CHECK ((state IN ('FAILED', 'INTERRUPTED')) = (failure_reason IS NOT NULL))\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "profile_display_settings",
+      "tbl_name": "profile_display_settings",
+      "sql": "CREATE TABLE profile_display_settings (\n    profile_id TEXT PRIMARY KEY NOT NULL REFERENCES profiles (profile_id),\n    show_job_browser INTEGER NOT NULL CHECK (show_job_browser IN (0, 1)),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*')\n  , audit_send_policy TEXT NOT NULL DEFAULT 'READ_ONLY'\n    CHECK (audit_send_policy IN ('READ_ONLY', 'PASS_EXCEPT_DELETE'))) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "profile_revisions",
+      "tbl_name": "profile_revisions",
+      "sql": "CREATE TABLE profile_revisions (\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    document TEXT NOT NULL CHECK (json_valid(document)),\n    change_kind TEXT NOT NULL CHECK (change_kind IN ('CREATED', 'UPDATED', 'RETIRED')),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    PRIMARY KEY (profile_id, revision)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "profiles",
+      "tbl_name": "profiles",
+      "sql": "CREATE TABLE profiles (\n    profile_id TEXT PRIMARY KEY NOT NULL,\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'RETIRED')),\n    document TEXT NOT NULL CHECK (json_valid(document)),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*')\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "read_check_results",
+      "tbl_name": "read_check_results",
+      "sql": "CREATE TABLE \"read_check_results\" (\n    result_id INTEGER PRIMARY KEY NOT NULL,\n    job_id TEXT NOT NULL CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    read_check_id TEXT NOT NULL REFERENCES \"read_checks\" (read_check_id),\n    read_check_revision INTEGER NOT NULL CHECK (read_check_revision >= 1),\n    result TEXT NOT NULL CHECK (result IN ('MATCHED', 'NOT_MATCHED', 'UNDETERMINED', 'READ_BLOCKED_BY_POLICY', 'READ_CANDIDATE_DRIFTED', 'READ_CANDIDATE_NOT_READ')),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    UNIQUE (job_id, read_check_id)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "read_checks",
+      "tbl_name": "read_checks",
+      "sql": "CREATE TABLE \"read_checks\" (\n    read_check_id TEXT PRIMARY KEY NOT NULL CHECK (length(read_check_id) > 0 AND read_check_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    target_identity_digest TEXT CHECK (target_identity_digest IS NULL OR (length(target_identity_digest) = 71 AND substr(target_identity_digest, 1, 7) = 'sha256:' AND substr(target_identity_digest, 8) NOT GLOB '*[^0-9a-f]*')),\n    parameters TEXT NOT NULL CHECK (json_valid(parameters) AND json_type(parameters) = 'object'),\n    expectations TEXT NOT NULL CHECK (json_valid(expectations) AND json_type(expectations) = 'array'),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    created_at TEXT NOT NULL CHECK (length(created_at) = 14 AND created_at NOT GLOB '*[^0-9]*'),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*'),\n    canceled_at TEXT CHECK (canceled_at IS NULL OR (length(canceled_at) = 14 AND canceled_at NOT GLOB '*[^0-9]*')),\n    target_page_path TEXT CHECK (target_page_path IS NULL OR (length(target_page_path) BETWEEN 1 AND 1024 AND substr(target_page_path, 1, 1) = '/' AND substr(target_page_path, 2, 1) <> '/' AND instr(target_page_path, '?') = 0 AND instr(target_page_path, '#') = 0 AND instr(target_page_path, char(92)) = 0 AND target_page_path NOT GLOB ('*[' || char(9, 10, 11, 12, 13, 32) || ']*'))),\n    CHECK (created_at <= updated_at),\n    CHECK ((target_identity_digest IS NULL) <> (target_page_path IS NULL)),\n    CHECK (target_page_path IS NULL OR parameters = '{}')\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "rule_set_revisions",
+      "tbl_name": "rule_set_revisions",
+      "sql": "CREATE TABLE rule_set_revisions (\n    rule_set_id TEXT NOT NULL REFERENCES rule_sets (rule_set_id),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    document TEXT NOT NULL CHECK (json_valid(document) AND json_type(document) = 'object'),\n    digest TEXT NOT NULL CHECK (length(digest) = 71 AND substr(digest, 1, 7) = 'sha256:' AND substr(digest, 8) NOT GLOB '*[^0-9a-f]*'),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    PRIMARY KEY (rule_set_id, revision)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "rule_sets",
+      "tbl_name": "rule_sets",
+      "sql": "CREATE TABLE rule_sets (\n    rule_set_id TEXT PRIMARY KEY NOT NULL CHECK (length(rule_set_id) > 0 AND rule_set_id NOT GLOB '*[^a-z0-9-]*'),\n    scenario_id TEXT NOT NULL UNIQUE REFERENCES scenarios (scenario_id),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    created_at TEXT NOT NULL CHECK (length(created_at) = 14 AND created_at NOT GLOB '*[^0-9]*'),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*'),\n    CHECK (created_at <= updated_at)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "scenario_revisions",
+      "tbl_name": "scenario_revisions",
+      "sql": "CREATE TABLE scenario_revisions (\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    document TEXT NOT NULL CHECK (json_valid(document) AND json_type(document) = 'object'),\n    evidence TEXT NOT NULL CHECK (json_valid(evidence) AND json_type(evidence) = 'object'),\n    discovery_job_id TEXT NOT NULL CHECK (length(discovery_job_id) > 0 AND discovery_job_id NOT GLOB '*[^a-z0-9-]*'),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    PRIMARY KEY (scenario_id, revision)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "scenarios",
+      "tbl_name": "scenarios",
+      "sql": "CREATE TABLE scenarios (\n    scenario_id TEXT PRIMARY KEY NOT NULL CHECK (length(scenario_id) > 0 AND scenario_id NOT GLOB '*[^a-z0-9-]*'),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    revision INTEGER NOT NULL CHECK (revision >= 1),\n    state TEXT NOT NULL CHECK (state IN ('DRAFT', 'APPROVED', 'REVOKED')),\n    last_approval_receipt_id TEXT CHECK (last_approval_receipt_id IS NULL OR (length(last_approval_receipt_id) > 0 AND last_approval_receipt_id NOT GLOB '*[^a-z0-9-]*')),\n    created_at TEXT NOT NULL CHECK (length(created_at) = 14 AND created_at NOT GLOB '*[^0-9]*'),\n    updated_at TEXT NOT NULL CHECK (length(updated_at) = 14 AND updated_at NOT GLOB '*[^0-9]*'),\n    CHECK (created_at <= updated_at),\n    CHECK (state = 'DRAFT' OR last_approval_receipt_id IS NOT NULL)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "store_meta",
+      "tbl_name": "store_meta",
+      "sql": "CREATE TABLE store_meta (\n    key TEXT PRIMARY KEY NOT NULL,\n    value TEXT NOT NULL\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "write_reservations",
+      "tbl_name": "write_reservations",
+      "sql": "CREATE TABLE write_reservations (\n    reservation_id INTEGER PRIMARY KEY NOT NULL,\n    grant_id TEXT NOT NULL REFERENCES execution_grants (grant_id),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    count INTEGER NOT NULL CHECK (count BETWEEN 1 AND 1),\n    state TEXT NOT NULL CHECK (state IN ('RESERVED', 'RELEASED', 'COMMITTED', 'UNKNOWN')),\n    reserved_at TEXT NOT NULL CHECK (length(reserved_at) = 14 AND reserved_at NOT GLOB '*[^0-9]*'),\n    settled_at TEXT CHECK (settled_at IS NULL OR (length(settled_at) = 14 AND settled_at NOT GLOB '*[^0-9]*')),\n    CHECK ((state = 'RESERVED') = (settled_at IS NULL)),\n    CHECK (settled_at IS NULL OR settled_at >= reserved_at)\n  ) STRICT"
+    },
+    {
+      "type": "table",
+      "name": "write_results",
+      "tbl_name": "write_results",
+      "sql": "CREATE TABLE \"write_results\" (\n    job_id TEXT PRIMARY KEY NOT NULL CHECK (length(job_id) > 0 AND job_id NOT GLOB '*[^a-z0-9-]*'),\n    grant_id TEXT NOT NULL UNIQUE REFERENCES execution_grants (grant_id),\n    profile_id TEXT NOT NULL REFERENCES profiles (profile_id),\n    scenario_id TEXT NOT NULL REFERENCES scenarios (scenario_id),\n    scenario_revision INTEGER NOT NULL CHECK (scenario_revision >= 1),\n    write_kind TEXT NOT NULL CHECK (write_kind IN ('CREATE', 'UPDATE')),\n    target_record_id TEXT CHECK (target_record_id IS NULL OR (length(target_record_id) BETWEEN 1 AND 64 AND target_record_id NOT GLOB '*[^A-Za-z0-9_-]*')),\n    seed_record TEXT CHECK (seed_record IS NULL OR (json_valid(seed_record) AND json_type(seed_record) = 'object')),\n    submitted_values TEXT NOT NULL CHECK (json_valid(submitted_values) AND json_type(submitted_values) = 'object'),\n    unique_key TEXT CHECK (unique_key IS NULL OR length(unique_key) > 0),\n    phone_numbers TEXT NOT NULL CHECK (json_valid(phone_numbers) AND json_type(phone_numbers) = 'array'),\n    submission TEXT CHECK (submission IS NULL OR submission IN ('NOT_SENT', 'SENT', 'UNKNOWN')),\n    block_reason TEXT CHECK (block_reason IS NULL OR block_reason IN ('PAYLOAD_MISMATCH', 'PRECHECK_FAILED')),\n    http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),\n    response_judgement TEXT CHECK (response_judgement IS NULL OR response_judgement IN ('SUCCESS', 'INPUT_ERROR', 'RATE_LIMITED', 'SERVER_ERROR', 'NO_CONDITION_MATCHED', 'MULTIPLE_CONDITIONS_MATCHED', 'SESSION_LOST', 'REPOST_REDIRECT', 'RESPONSE_NOT_DELIVERED')),\n    record_id TEXT CHECK (record_id IS NULL OR length(record_id) BETWEEN 1 AND 256),\n    read_verification TEXT CHECK (read_verification IS NULL OR read_verification IN ('MATCHED', 'NOT_MATCHED', 'UNDETERMINED', 'READ_BLOCKED_BY_POLICY', 'READ_CANDIDATE_DRIFTED', 'READ_CANDIDATE_NOT_READ')),\n    update_evidence TEXT CHECK (update_evidence IS NULL OR (json_valid(update_evidence) AND json_type(update_evidence) = 'object')),\n    result TEXT CHECK (result IS NULL OR result IN ('VERIFIED', 'PARTIAL', 'BLOCKED', 'UNKNOWN', 'FAILED')),\n    reason TEXT CHECK (reason IS NULL OR reason IN ('PAYLOAD_MISMATCH', 'PRECHECK_FAILED', 'NO_RESPONSE', 'INPUT_ERROR', 'RATE_LIMITED', 'SERVER_ERROR', 'NO_CONDITION_MATCHED', 'MULTIPLE_CONDITIONS_MATCHED', 'SESSION_LOST', 'REPOST_REDIRECT', 'RESPONSE_NOT_DELIVERED', 'RECORD_ID_NOT_FOUND', 'RECORD_ID_UNSAFE', 'READ_VERIFICATION_MATCHED', 'READ_VERIFICATION_NOT_MATCHED', 'READ_VERIFICATION_UNDETERMINED', 'RECORD_ID_MISMATCH', 'UNEXPECTED_FIELD_CHANGE', 'UPDATE_POSTCHECK_UNDETERMINED')),\n    reservation_state TEXT CHECK (reservation_state IS NULL OR reservation_state IN ('COMMITTED', 'UNKNOWN', 'RELEASED')),\n    recorded_at TEXT NOT NULL CHECK (length(recorded_at) = 14 AND recorded_at NOT GLOB '*[^0-9]*'),\n    submitted_at TEXT CHECK (submitted_at IS NULL OR (length(submitted_at) = 14 AND submitted_at NOT GLOB '*[^0-9]*')),\n    settled_at TEXT CHECK (settled_at IS NULL OR (length(settled_at) = 14 AND settled_at NOT GLOB '*[^0-9]*')),\n    transport TEXT NOT NULL DEFAULT 'FORM' CHECK (transport IN ('FORM', 'API')),\n    api_shape_digest TEXT CHECK (api_shape_digest IS NULL OR (length(api_shape_digest) = 71 AND substr(api_shape_digest, 1, 7) = 'sha256:' AND substr(api_shape_digest, 8) NOT GLOB '*[^0-9a-f]*')),\n    api_method TEXT CHECK (api_method IS NULL OR api_method IN ('POST', 'PATCH')),\n    api_origin TEXT CHECK (api_origin IS NULL OR length(api_origin) BETWEEN 1 AND 2048),\n    api_path_shape TEXT CHECK (api_path_shape IS NULL OR (length(api_path_shape) BETWEEN 1 AND 1024\n      AND substr(api_path_shape, 1, 1) = '/')),\n    CHECK ((settled_at IS NULL) = (result IS NULL)),\n    CHECK ((result IS NULL) = (reason IS NULL)),\n    CHECK ((result IS NULL) = (reservation_state IS NULL)),\n    CHECK ((result IS NULL) = (submission IS NULL)),\n    CHECK (result IS NOT NULL OR (block_reason IS NULL AND http_status IS NULL AND response_judgement IS NULL AND record_id IS NULL\n      AND read_verification IS NULL AND submitted_at IS NULL)),\n    CHECK (submission IS NULL OR (submission = 'NOT_SENT') = (block_reason IS NOT NULL)),\n    CHECK (submission IS NOT 'NOT_SENT' OR (result = 'BLOCKED' AND reservation_state = 'RELEASED'\n      AND http_status IS NULL AND response_judgement IS NULL AND record_id IS NULL AND read_verification IS NULL AND submitted_at IS NULL)),\n    CHECK (submission IS NULL OR submission = 'NOT_SENT'\n      OR (result IS NOT 'BLOCKED' AND reservation_state IS NOT 'RELEASED')),\n    CHECK (result IS NOT 'VERIFIED' OR (response_judgement = 'SUCCESS' AND record_id IS NOT NULL\n      AND read_verification = 'MATCHED')),\n    CHECK (submitted_at IS NULL OR submitted_at >= recorded_at),\n    CHECK (settled_at IS NULL OR settled_at >= recorded_at),\n    CHECK ((write_kind = 'UPDATE') = (target_record_id IS NOT NULL)),\n    CHECK (update_evidence IS NULL OR (write_kind = 'UPDATE' AND result IS NOT NULL)),\n    CHECK (write_kind IS NOT 'UPDATE' OR result IS NOT 'VERIFIED' OR update_evidence IS NOT NULL),\n    CHECK ((transport = 'API') = (api_shape_digest IS NOT NULL)),\n    CHECK ((api_shape_digest IS NULL) = (api_method IS NULL) AND (api_shape_digest IS NULL) = (api_origin IS NULL)\n      AND (api_shape_digest IS NULL) = (api_path_shape IS NULL))\n  ) STRICT"
+    }
+  ],
+  "tables": {
+    "approval_receipts": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "receipt_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "scenario_revision",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "approval_digest",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "target_receipt_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "expires_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "approval_receipts_scenario_recorded",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "scenario_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 7,
+              "name": "recorded_at"
+            }
+          ]
+        },
+        {
+          "name": "approval_receipts_single_revocation",
+          "unique": 1,
+          "origin": "c",
+          "partial": 1,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 6,
+              "name": "target_receipt_id"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_approval_receipts_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "receipt_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "approval_receipts",
+          "from": "target_receipt_id",
+          "to": "receipt_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 2,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "auth_setups": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_auth_setups_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "auto_login_attempts": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "attempt_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "started_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "credential_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "result",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "submitted",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "retry_after_until",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "result_recorded_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "form_invalid_reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "auto_login_attempts_profile_started",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 3,
+              "name": "started_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_auto_login_attempts_1",
+          "unique": 1,
+          "origin": "u",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "job_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "auto_login_holds": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "hold_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "reason",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "held_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "attempt_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "cleared_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "auto_login_holds_single_active",
+          "unique": 1,
+          "origin": "c",
+          "partial": 1,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "control_instance": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "slot",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "process_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "booted_at_ms",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "acquired_at_ms",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "heartbeat_at_ms",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "port",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [],
+      "foreignKeys": []
+    },
+    "credential_events": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "event_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "credential_revision",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "credential_events_profile_recorded",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 2,
+              "name": "recorded_at"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "discovery_candidates": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "identity_digest",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2
+        },
+        {
+          "cid": 2,
+          "name": "rule_digest",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "classification",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "reason_code",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "page_path",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "action_path",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "form_method",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "method_override",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "has_state_field",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 10,
+          "name": "first_seen_job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 11,
+          "name": "first_seen_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 12,
+          "name": "last_seen_job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 13,
+          "name": "last_seen_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 14,
+          "name": "last_changed_job_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 15,
+          "name": "templated_identity_digests",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 16,
+          "name": "shape_digests",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 17,
+          "name": "key_field_digests",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "discovery_candidates_profile_last_seen",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 13,
+              "name": "last_seen_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_discovery_candidates_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "identity_digest"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "discovery_jobs": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "read_page_paths",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "discovery_jobs_profile_recorded",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 2,
+              "name": "recorded_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_discovery_jobs_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "job_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "execution_grants": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "grant_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "scenario_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "approval_receipt_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "issued_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "expires_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "consumed_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "invalidated_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 10,
+          "name": "target_record_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "execution_grants_single_open",
+          "unique": 1,
+          "origin": "c",
+          "partial": 1,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "scenario_id"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_execution_grants_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "grant_id"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_execution_grants_2",
+          "unique": 1,
+          "origin": "u",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 5,
+              "name": "job_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "approval_receipts",
+          "from": "approval_receipt_id",
+          "to": "receipt_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 2,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "jobs": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "profile_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "state",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "start_new",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "run_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "run_directory",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "exit_code",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "run_status",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "end_kind",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 10,
+          "name": "last_progress",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 11,
+          "name": "last_notice",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 12,
+          "name": "worker_pid",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 13,
+          "name": "created_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 14,
+          "name": "started_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 15,
+          "name": "finished_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 16,
+          "name": "last_heartbeat_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 17,
+          "name": "stop_requested_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 18,
+          "name": "failure_reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 19,
+          "name": "last_auth_state",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 20,
+          "name": "session_lost_url",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 21,
+          "name": "job_kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 22,
+          "name": "write_report_check",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 23,
+          "name": "login_stage_summary",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 24,
+          "name": "session_loss",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "jobs_created_at",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 13,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "jobs_single_active",
+          "unique": 1,
+          "origin": "c",
+          "partial": 1,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": -2,
+              "name": null
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_jobs_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "job_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "profile_display_settings": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "show_job_browser",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "audit_send_policy",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'READ_ONLY'",
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_profile_display_settings_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "profile_revisions": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2
+        },
+        {
+          "cid": 2,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "change_kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_profile_revisions_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "revision"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "profiles": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "status",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_profiles_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "profile_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": []
+    },
+    "read_check_results": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "result_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "read_check_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "read_check_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "result",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "read_check_results_check_recorded",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "read_check_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 5,
+              "name": "recorded_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_read_check_results_1",
+          "unique": 1,
+          "origin": "u",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "job_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 2,
+              "name": "read_check_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "read_checks",
+          "from": "read_check_id",
+          "to": "read_check_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "read_checks": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "read_check_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "target_identity_digest",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "parameters",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "expectations",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "created_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "canceled_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "target_page_path",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "read_checks_profile_created",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 6,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_read_checks_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "read_check_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "rule_set_revisions": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "rule_set_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2
+        },
+        {
+          "cid": 2,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "digest",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_rule_set_revisions_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "rule_set_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "revision"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 2,
+          "seq": 0,
+          "table": "rule_sets",
+          "from": "rule_set_id",
+          "to": "rule_set_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "rule_sets": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "rule_set_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "created_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "rule_sets_profile_created",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 4,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_sets_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "rule_set_id"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_rule_sets_2",
+          "unique": 1,
+          "origin": "u",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "scenario_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "scenario_revisions": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 2
+        },
+        {
+          "cid": 2,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "document",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "evidence",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "discovery_job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_scenario_revisions_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "scenario_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 1,
+              "name": "revision"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "scenarios": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "state",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "last_approval_receipt_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "created_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "updated_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "scenarios_profile_created",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "profile_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 5,
+              "name": "created_at"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_scenarios_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "scenario_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "store_meta": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "key",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "value",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_store_meta_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "key"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": []
+    },
+    "write_reservations": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "reservation_id",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "grant_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "count",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "state",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "reserved_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "settled_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "write_reservations_scenario_state",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 3,
+              "name": "scenario_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 5,
+              "name": "state"
+            }
+          ]
+        },
+        {
+          "name": "write_reservations_single_per_grant",
+          "unique": 1,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "grant_id"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 2,
+          "seq": 0,
+          "table": "execution_grants",
+          "from": "grant_id",
+          "to": "grant_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    "write_results": {
+      "columns": [
+        {
+          "cid": 0,
+          "name": "job_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "grant_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 2,
+          "name": "profile_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 3,
+          "name": "scenario_id",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 4,
+          "name": "scenario_revision",
+          "type": "INTEGER",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 5,
+          "name": "write_kind",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 6,
+          "name": "target_record_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 7,
+          "name": "seed_record",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 8,
+          "name": "submitted_values",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 9,
+          "name": "unique_key",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 10,
+          "name": "phone_numbers",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 11,
+          "name": "submission",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 12,
+          "name": "block_reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 13,
+          "name": "http_status",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 14,
+          "name": "response_judgement",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 15,
+          "name": "record_id",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 16,
+          "name": "read_verification",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 17,
+          "name": "update_evidence",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 18,
+          "name": "result",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 19,
+          "name": "reason",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 20,
+          "name": "reservation_state",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 21,
+          "name": "recorded_at",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 22,
+          "name": "submitted_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 23,
+          "name": "settled_at",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 24,
+          "name": "transport",
+          "type": "TEXT",
+          "notnull": 1,
+          "dflt_value": "'FORM'",
+          "pk": 0
+        },
+        {
+          "cid": 25,
+          "name": "api_shape_digest",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 26,
+          "name": "api_method",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 27,
+          "name": "api_origin",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        },
+        {
+          "cid": 28,
+          "name": "api_path_shape",
+          "type": "TEXT",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ],
+      "indexes": [
+        {
+          "name": "sqlite_autoindex_write_results_1",
+          "unique": 1,
+          "origin": "pk",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 0,
+              "name": "job_id"
+            }
+          ]
+        },
+        {
+          "name": "sqlite_autoindex_write_results_2",
+          "unique": 1,
+          "origin": "u",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 1,
+              "name": "grant_id"
+            }
+          ]
+        },
+        {
+          "name": "write_results_profile",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 2,
+              "name": "profile_id"
+            }
+          ]
+        },
+        {
+          "name": "write_results_scenario_recorded",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0,
+          "columns": [
+            {
+              "seqno": 0,
+              "cid": 3,
+              "name": "scenario_id"
+            },
+            {
+              "seqno": 1,
+              "cid": 21,
+              "name": "recorded_at"
+            }
+          ]
+        }
+      ],
+      "foreignKeys": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "scenarios",
+          "from": "scenario_id",
+          "to": "scenario_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 1,
+          "seq": 0,
+          "table": "profiles",
+          "from": "profile_id",
+          "to": "profile_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        },
+        {
+          "id": 2,
+          "seq": 0,
+          "table": "execution_grants",
+          "from": "grant_id",
+          "to": "grant_id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    }
+  }
+}

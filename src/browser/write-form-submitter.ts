@@ -32,8 +32,10 @@
  *    `fill`、select は `selectOption`（値で）、checkbox は生成した値の欄だけ `check` して残りを `uncheck`（値が null なら全部 `uncheck`）、radio は
  *    生成した値の欄を `check`（null なら、どれも選ばれていないことを求める）。file の欄は触らない（空のまま）。入れた後に、もう一度確かめ、値が
  *    生成した値のとおりか読み直す（`VALUE_NOT_APPLIED`）。
- * 3. `submitWriteForm`: 押す直前にもう一度確かめ、値を読み直してから、決めた送信ボタンを Playwright の `click` で押す（押した後のナビゲーションは
- *    待たない）。押した後の失敗は `SUBMIT_FAILED`（`clickAttempted: true`。送信が分からない）。
+ *    T40R-fix-A: このとき開くのは窓の観察の段（承認の形の POST も Guard が通さずに止めて数える）。
+ * 3. `submitWriteForm`: 押す直前にもう一度確かめ、値を読み直してから、T40R-fix-A から、値を入れたときの部品で送信の窓の送信の段を開いて
+ *    （`WriteStageMonitor.openSubmissionPhase`。開けなければ押さずに `FORM_CHANGED`）、決めた送信ボタンを Playwright の `click` で押す（押した後の
+ *    ナビゲーションは待たない）。押した後の失敗は `SUBMIT_FAILED`（`clickAttempted: true`。送信が分からない）。
  * 4. T31g-1（Task 31 の設計書 3 章の「更新の前の読み取り」「欄の役割」「値の照らし方」「削除にあたる変更の遮断」「同じ名前の hidden と checkbox
  *    の組」。UPDATE の口。`WriteUpdateFormSpec` は、変える欄と保つ欄の名前を持つ）:
  *    - `readUpdateFormValues`（前の値と後の値の読み取り。ワーカーが凍結した Context で、更新の前と後に使う）: 1 の確かめと同じ読み取りの部品
@@ -111,7 +113,7 @@ import {
 } from '../safety/write-payload-policy.js';
 import { isPageIssuedTokenFieldName, isSecretLikeStateField, isUnreadableSecretField } from '../discovery/read-check-contracts.js';
 import { elementPathSelectorOf } from './element-path-engine.js';
-import { FORM_POST_METHOD, FORM_SELF_TARGETS, FORM_STEP_TIMEOUT_MS } from './form-submission-common.js';
+import { FORM_POST_METHOD, FORM_SELF_TARGETS, FORM_STEP_TIMEOUT_MS, lineFeedForm, sameValue } from './form-submission-common.js';
 
 /** フォームを読む・値を入れる・送る、それぞれの時間の上限（ms。ログインの入力の部品と同じ値）。 */
 export const WRITE_FORM_STEP_TIMEOUT_MS = FORM_STEP_TIMEOUT_MS;
@@ -543,6 +545,9 @@ interface InspectedState {
   readonly update?: { readonly roles: UpdateRoles; readonly prior: UpdateFormValues } | undefined;
 }
 const inspectedStates = new WeakMap<InspectedWriteForm, InspectedState>();
+
+/** T40R-fix-A: 値を入れたときに送信の窓を開いた、書き込みの段の部品（押す直前に、同じ部品で送信の段を開く）。 */
+const windowMonitors = new WeakMap<InspectedWriteForm, WriteStageMonitor>();
 
 type Decision =
   | { readonly ok: true; readonly layout: WriteFormLayout; readonly form: ReadForm }
@@ -1107,8 +1112,6 @@ async function runOnTrackedElements<T>(
 /** 位置を表の鍵にするときの区切り。 */
 const PATH_KEY_SEPARATOR = '/';
 
-/** 改行の比べのための形（textarea の値は LF。CR LF と CR を LF にする）。 */
-const lineFeedForm = (text: string): string => text.split('\r\n').join('\n').split('\r').join('\n');
 
 /**
  * 生成した値を入れる操作の一覧（入れられない値なら `VALUE_NOT_SUPPORTED`）。`form` は、入れる直前に読んだ form（checkbox・radio の選択肢と状態）。
@@ -1207,7 +1210,9 @@ export async function fillWriteForm(
     return { ok: false, reason: 'SPEC_INVALID' };
   }
   try {
+    // T40R-fix-A: 開くのは窓の観察の段（値を入れる間。承認の形の POST も通さずに止めて数える）。送信の段は、押す直前に `submitWriteForm` が開く。
     await monitor.openSubmissionWindow(page);
+    windowMonitors.set(form, monitor);
     const before = await reinspect(page, state, timeoutMs);
     if (before === null) {
       return { ok: false, reason: 'FORM_CHANGED' };
@@ -1281,6 +1286,12 @@ export async function submitWriteForm(
     let clickAttempted = false;
     const clicked = await runOnTrackedElements(page, state, timeoutMs, async (locate) => {
       const submitter = await locate(submitterPath);
+      // T40R-fix-A（Task 40 の設計書 7 章の T40R の I-1）: 押す直前に、値を入れたときの部品で送信の窓の送信の段を開く（Guard が承認の形の POST を照合に
+      // かけて 1 回だけ通すのは、この後だけ）。開けなければ（窓が開いていない、値を入れていない）押さない。
+      const monitor = windowMonitors.get(form);
+      if (monitor === undefined || !monitor.openSubmissionPhase()) {
+        throw new SignaledElementMissing();
+      }
       clickAttempted = true;
       await submitter.click({ timeout: timeoutMs, noWaitAfter: true });
     });
@@ -1586,11 +1597,9 @@ function updateValuesOf(form: ReadForm, roles: UpdateRoles): ReadValues {
 }
 
 /**
- * 2 つの値が同じか（完全な一致。改行だけ CR LF・CR・LF を同じと見なす。Task 31 の設計書 3 章の「値の照らし方」。null は null とだけ同じ）。
- * 入力の前の確かめと、更新の後の照合（T31g-2）が使う唯一の比べ方。
+ * 2 つの値が同じか（T39d で `form-submission-common.ts` に移した唯一の比べ方を、今の参照先（ワーカーの書き込みの流れ）のために公開し直す）。
  */
-export const sameValue = (left: string | null, right: string | null): boolean =>
-  (left === null || right === null ? left === right : lineFeedForm(left) === lineFeedForm(right));
+export { sameValue };
 
 /** 前の値の形が、役割の欄のとおりか（変える欄と保つ欄、状態の hidden、組の hidden のすべての値がある）。 */
 function isPriorOf(prior: unknown, roles: UpdateRoles): prior is UpdateFormValues {

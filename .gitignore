@@ -17,9 +17,13 @@ beaksight-output/
 # Local control data of the local UI (SQLite). Machine-specific; never commit.
 /local-data/
 
-# Leftover sandboxed git history / internal agent work history — not part of this repo.
+# Leftover sandboxed git history — not part of this repo.
 .git-sandbox-backup/
-.superpowers/sdd/
+
+# Work records of the designer and implementers (progress, defects, briefs, reports).
+# They describe the audited site in detail, so they are never committed or published
+# (2026-10-25: removed from the public history). The whole folder is excluded.
+/.superpowers/
 
 # Claude Code settings, skills, and hooks (local development environment only)
 .claude/

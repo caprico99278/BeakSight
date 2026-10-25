@@ -19,6 +19,12 @@ export function createTestNavigationPacer(config: AuditConfig): NavigationPacer 
 export const NO_PACING_WAIT = async (): Promise<number> => 0;
 
 /**
+ * T44 P1-5: 待たない、幅の走査の読み込みの後の落ち着きの待ち（`StressLayoutOptions.settleBeforeLayout`）。省略できないので、待ちを確かめないテストは、
+ * 待たないことを、この関数で明示して渡す。
+ */
+export const NO_SETTLING_WAIT = async (): Promise<void> => undefined;
+
+/**
  * `pacer` の読み込みの開始の待ち（`beforeNavigation`）だけを `beforeNavigation` に差し替え、ほかの操作（記録の写し、間隔の引き上げ、
  * 送った時刻の記録）は `pacer` にそのまま渡す pacer（DEF-100 fix。テストが開始の時刻や呼び出しの順を記録するための包み）。送った時刻の記録は、
  * `pacer` に渡す前に `onDocumentRequestSent` を呼ぶ（テストが送った時刻を記録するため）。

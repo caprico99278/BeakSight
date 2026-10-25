@@ -25,8 +25,16 @@ import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import type { UiServerEndReason } from '../../../src/control/ui-server-log.ts';
 import type { LocalUiStartFailure } from '../../../src/presentation/messages.ts';
 import type * as LauncherBridge from '../src/server/launcher-bridge.ts';
+import {
+  UI_PRESENCE_CHECK_INTERVAL_MS,
+  UI_PRESENCE_CLOSED_GRACE_MS,
+  UI_PRESENCE_SILENCE_LIMIT_MS,
+} from '../src/security/ui-presence.ts';
+import { errorMessageOrString } from './error-message.ts';
+import { createPresenceMonitor, handlePresenceRequest, type PresenceMonitor } from './presence.ts';
 import { LOCAL_UI_LISTEN_HOST, createSessionToken, formatTokenUrl, guardNodeRequest, type LocalUiGuardOptions } from './request-guard.ts';
 import { createTwoStepShutdown } from './shutdown.ts';
 
@@ -76,6 +84,10 @@ type Bridge = Pick<
   | 'LOCAL_UI_CONSOLE_TEXT'
   | 'LOCAL_UI_JOB_CONSOLE_TEXT'
   | 'describeLocalUiStartFailure'
+  | 'recordLocalUiServerUnexpectedError'
+  | 'recordLocalUiServerShutdown'
+  | 'recordLocalUiServerExit'
+  | 'setLocalUiServerLogSecrets'
 >;
 
 /** static で配るファイルの拡張子と Content-Type。ここにない拡張子は配らない。 */
@@ -119,7 +131,11 @@ function isBridge(value: unknown): value is Bridge {
     && 'LOCAL_UI_JOB_CONSOLE_TEXT' in value && typeof value.LOCAL_UI_JOB_CONSOLE_TEXT === 'object'
     && 'LOCAL_UI_GUARD_REJECTION_TEXT' in value && typeof value.LOCAL_UI_GUARD_REJECTION_TEXT === 'object'
     && 'LOCAL_UI_CONSOLE_TEXT' in value && typeof value.LOCAL_UI_CONSOLE_TEXT === 'object'
-    && 'describeLocalUiStartFailure' in value && typeof value.describeLocalUiStartFailure === 'function';
+    && 'describeLocalUiStartFailure' in value && typeof value.describeLocalUiStartFailure === 'function'
+    && 'recordLocalUiServerUnexpectedError' in value && typeof value.recordLocalUiServerUnexpectedError === 'function'
+    && 'recordLocalUiServerShutdown' in value && typeof value.recordLocalUiServerShutdown === 'function'
+    && 'recordLocalUiServerExit' in value && typeof value.recordLocalUiServerExit === 'function'
+    && 'setLocalUiServerLogSecrets' in value && typeof value.setLocalUiServerLogSecrets === 'function';
 }
 
 /** 2 つ目の入口を読み込む。 */
@@ -234,15 +250,27 @@ async function writeFetchResponse(fetchResponse: Response, response: ServerRespo
   await pipeline(Readable.fromWeb(fetchResponse.body as import('node:stream/web').ReadableStream<Uint8Array>), response);
 }
 
-/** 画面のサーバを `127.0.0.1:<port>` で起動する（管理データは準備済みであること）。port が使用中なら失敗する。 */
-export async function startLocalUiServer(bridge: Bridge, port: number = LOCAL_UI_DEFAULT_PORT): Promise<LocalUiServer> {
+/**
+ * 画面のサーバを `127.0.0.1:<port>` で起動する（管理データは準備済みであること）。port が使用中なら失敗する。UI-close: 要求の守りを通った要求の
+ * うち、管理画面のページの知らせの口（`presence.ts`）は、`presence`（止める決まりの判定）へ渡す。
+ */
+export async function startLocalUiServer(
+  bridge: Bridge,
+  port: number = LOCAL_UI_DEFAULT_PORT,
+  presence: PresenceMonitor | null = null,
+): Promise<LocalUiServer> {
   const entry = await loadServerEntry();
   const origin = `http://${LOCAL_UI_LISTEN_HOST}:${port}`;
   const guard: LocalUiGuardOptions = { port, token: createSessionToken(), rejectionText: bridge.LOCAL_UI_GUARD_REJECTION_TEXT };
+  // DEF-146: token（URL の値と cookie の値）は、終わりの記録のファイルに書かない値として渡す。
+  bridge.setLocalUiServerLogSecrets([guard.token]);
   const server: Server = createServer((request, response) => {
     void (async () => {
       try {
         if (!guardNodeRequest(guard, request, response)) {
+          return;
+        }
+        if (handlePresenceRequest(presence, origin, request, response)) {
           return;
         }
         const pathname = new URL(request.url ?? '/', origin).pathname;
@@ -299,6 +327,17 @@ function parsePortArgument(argv: readonly string[]): PortArgument {
   return { ok: true, port };
 }
 
+/**
+ * UI-close: 止める決まりの時間の引数（`--ui-close-grace-ms <ms>`、`--ui-silence-limit-ms <ms>`、`--ui-presence-check-ms <ms>`）を読む。テストが短い値を
+ * 注入するためのもの。ない・正の整数でない値は、名前つきの既定（`src/security/ui-presence.ts`）にする。
+ */
+function durationArgument(argv: readonly string[], name: string, fallback: number): number {
+  const index = argv.indexOf(name);
+  const raw = index === -1 ? '' : argv[index + 1] ?? '';
+  const value = PORT_ARGUMENT_PATTERN.test(raw) ? Number(raw) : Number.NaN;
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
 /** 待ち受けの失敗を、起動できなかった理由にする（T23h の M2）。 */
 function listenFailureOf(error: unknown, port: number): LocalUiStartFailure {
   const code = typeof error === 'object' && error !== null && 'code' in error ? error.code : undefined;
@@ -308,7 +347,7 @@ function listenFailureOf(error: unknown, port: number): LocalUiStartFailure {
   if (code === 'EACCES') {
     return { kind: 'PORT_PERMISSION_DENIED', port };
   }
-  return { kind: 'START_FAILED', detail: error instanceof Error ? error.message : String(error) };
+  return { kind: 'START_FAILED', detail: errorMessageOrString(error) };
 }
 
 /** 起動できなかった理由を出して、0 でない終了コードにする。 */
@@ -331,6 +370,15 @@ if (isMain) {
     process.exitCode = START_FAILED_EXIT_CODE;
   }
   if (bridge !== undefined) {
+    const logBridge = bridge;
+    // DEF-146: 予期しない例外（uncaughtException・unhandledRejection）で終わるときと、終わりの記録のないまま process が終わるときを、終わりの記録の
+    // ファイルに書く（`uncaughtExceptionMonitor` は、Node の既定の落ち方を変えない）。
+    process.on('uncaughtExceptionMonitor', (error, origin) => {
+      logBridge.recordLocalUiServerUnexpectedError(origin, error, logBridge.runningLocalUiAuditJobCount());
+    });
+    process.on('exit', (code) => {
+      logBridge.recordLocalUiServerExit(code, logBridge.runningLocalUiAuditJobCount());
+    });
     const portArgument = parsePortArgument(process.argv.slice(2));
     if (!portArgument.ok) {
       reportStartFailure(bridge, { kind: 'PORT_INVALID', value: portArgument.value });
@@ -360,20 +408,32 @@ if (isMain) {
           }
         } catch (error: unknown) {
           ready.closeLocalUiStore();
-          reportStartFailure(ready, { kind: 'START_FAILED', detail: error instanceof Error ? error.message : String(error) });
+          reportStartFailure(ready, { kind: 'START_FAILED', detail: errorMessageOrString(error) });
         }
         if (recovered !== undefined) {
           try {
             // T26e（Task 26 の設計書 4.1 の「起動のとき」）: 資格情報のフォルダに残った一時のファイルを消し、暗号化が使えるかを 1 回確かめる
             // （結果は環境の状態の画面に出す。使えなくても起動は止めない。例外を投げない）。
             await ready.prepareLocalUiCredentials();
-            const server = await startLocalUiServer(ready, portArgument.port);
+            // UI-close: 管理画面のブラウザが閉じられ、動いているジョブがなければ、Ctrl+C と同じ止め方（1 回目）で止める。
+            const argv = process.argv.slice(2);
+            let stopWhenClosed: (() => void) | undefined;
+            const presence = createPresenceMonitor({
+              closedGraceMs: durationArgument(argv, '--ui-close-grace-ms', UI_PRESENCE_CLOSED_GRACE_MS),
+              silenceLimitMs: durationArgument(argv, '--ui-silence-limit-ms', UI_PRESENCE_SILENCE_LIMIT_MS),
+              runningJobCount: ready.runningLocalUiAuditJobCount,
+              onIdle: () => {
+                console.log(ready.LOCAL_UI_CONSOLE_TEXT.closedByUi);
+                stopWhenClosed?.();
+              },
+            });
+            const server = await startLocalUiServer(ready, portArgument.port, presence);
             if (recovered > 0) {
               console.log(ready.LOCAL_UI_JOB_CONSOLE_TEXT.recoveredJobs(ready.formatCount(recovered)));
             }
             console.log(ready.LOCAL_UI_CONSOLE_TEXT.tokenUrl(server.tokenUrl));
             console.log(ready.LOCAL_UI_CONSOLE_TEXT.tokenNotice);
-            const stop = createTwoStepShutdown({
+            const stop = createTwoStepShutdown<UiServerEndReason>({
               runningJobCount: ready.runningLocalUiAuditJobCount,
               text: {
                 jobsStopping: ready.LOCAL_UI_JOB_CONSOLE_TEXT.jobsStopping(ready.formatDuration(ready.AUDIT_JOB_SHUTDOWN_WAIT_MS)),
@@ -384,9 +444,13 @@ if (isMain) {
               closeServer: () => server.close(),
               closeStore: ready.closeLocalUiStore,
               exit: (code) => process.exit(code),
+              // DEF-146: 止める決まりの終わり（終わり方と、動いていたジョブの数）を、終わりの記録のファイルに書く。
+              recordEnd: (reason, immediate, runningJobs) => ready.recordLocalUiServerShutdown(reason ?? 'OTHER', immediate, runningJobs),
             });
-            process.on('SIGINT', stop);
-            process.on('SIGTERM', stop);
+            process.on('SIGINT', () => stop('CTRL_C'));
+            process.on('SIGTERM', () => stop('SIGTERM'));
+            stopWhenClosed = () => stop('UI_CLOSED');
+            setInterval(() => presence.check(), durationArgument(argv, '--ui-presence-check-ms', UI_PRESENCE_CHECK_INTERVAL_MS)).unref();
           } catch (error: unknown) {
             await ready.shutdownLocalUiAuditJobs(0);
             ready.closeLocalUiStore();

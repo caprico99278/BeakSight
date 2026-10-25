@@ -99,7 +99,7 @@ doc/spec/local-setup.md     # 環境の準備と初期化の手順（4.6）
 4. `new DatabaseSync(path, { timeout: CONTROL_DB_BUSY_TIMEOUT_MS })` で開く（選択肢は常にオブジェクトで渡す。`undefined` を渡すと実行時に失敗するため）。
 5. `PRAGMA journal_mode=WAL` を行い、結果が `wal` であることを確かめる（違えば止める）。`synchronous` は既定（FULL）のまま。
 6. `PRAGMA application_id` を確かめる。0（新しいファイル）なら BeakSight の値を書く。別の値なら「BeakSight の管理データではない」として止める。
-7. 版の管理（migration）: `PRAGMA user_version` を読む。アプリが知る版より大きければ「新しい版の BeakSight で作られた」として止める（書かない）。小さければ、版ごとに `BEGIN IMMEDIATE` → DDL → `PRAGMA user_version=N` → `COMMIT` を行う。失敗したら必ず `ROLLBACK` する（自動では戻らないことを調査で確かめた）。`user_version` が 0 なのに表がある場合は止める。
+7. 版の管理（migration）: `PRAGMA user_version` を読む。アプリが知る版より大きければ「新しい版の BeakSight で作られた」として止める（書かない）。小さければ、版ごとに `BEGIN IMMEDIATE` → DDL → `PRAGMA user_version=N` → `COMMIT` を行う。失敗したら必ず `ROLLBACK` する（自動では戻らないことを調査で確かめた）。`user_version` が 0 なのに表がある場合は止める。LG-2（2026-10-24。設計書 `2026-10-24-beaksight-test-suite-tiers-design.md` 3.7.1）で、空の所からは基準の版 17 の文で作る形に改めた（版 1〜16 の段は捨てた）。版 1〜16 の管理データは、何も書かずに `DATABASE_FROM_OLDER_VERSION` で止める。版 18 から後は、今までどおり版ごとに 1 つのトランザクションで上げる。
 8. `PRAGMA quick_check` が `ok` であることを確かめる。
 
 止めるときの誤りは、閉じた一覧の理由の値（例: `NODE_SQLITE_UNAVAILABLE`、`NODE_VERSION_UNSUPPORTED`、`DATA_DIRECTORY_NOT_DIRECTORY`、`NOT_A_SQLITE_FILE`、`NOT_A_BEAKSIGHT_DATABASE`、`DATABASE_FROM_NEWER_VERSION`、`DATABASE_LOCKED`、`DATABASE_READ_ONLY`、`DATABASE_INTEGRITY_FAILED`、`MIGRATION_FAILED`）と、利用者への日本語の説明（`src/presentation/messages.ts`）で表す。SQLite の errcode 14 は「フォルダがない」と「別のプログラムがファイルを開いている」の両方で出るので、フォルダの有無を先に確かめて文を分ける。
@@ -219,13 +219,13 @@ doc/spec/local-setup.md     # 環境の準備と初期化の手順（4.6）
 | 新しく作る共通部品 | 管理データの部品、環境の確かめ、起動の部品（Host・token・header・static） | `src/control/store/`、`src/control/environment/`、`apps/local-ui/launcher/` | 新設。台帳に追記 |
 
 - 後続の Task で使う見込み: 管理データの部品は Task 24（Job、Run の管理）、Task 28（承認、件数の予約。原子的なトランザクション）で表を足す。起動の部品の保護は、Task 24 以降の Server Routes（成果物の配信）でも使う。
-- 変更容易性: 表を足すときは、版の管理に版を 1 つ足すだけにする。モードや状態を足すときは、Task 22 の一覧と表示カタログだけを変える。
+- 変更容易性: 表を足すときは、版の管理に版を 1 つ足すだけにする（LG-2 の後は、基準の版 17 の後に、版 18 から段を足す）。モードや状態を足すときは、Task 22 の一覧と表示カタログだけを変える。
 
 ## 7. テスト設計
 
 - **環境の確かめ**: Node の版が低い場合と `node:sqlite` がない場合（`--no-experimental-sqlite` の子 process で再現）に、理由の値と日本語の説明で止まる。CLI の `run` と `validate-config` が `node:sqlite` を読み込まない（子 process で確かめる）。下限の版が `engines` と一致する。
 - **何もない状態からの準備**: フォルダがない、ファイルがない、0 byte、SQLite でないファイル（上書きしないことをハッシュで確かめる）、`application_id` が違う、`user_version` が新しい、`user_version` が 0 で表がある、読み取り専用、フォルダの位置にファイルがある、日本語と空白のパス、2 回目の実行（冪等）。
-- **版の管理**: 途中で失敗する DDL が元に戻る（表も版も）。
+- **版の管理**: 途中で失敗する DDL が元に戻る（表も版も）。LG-2 の後: 新しく作った管理データの形が、写し取った版 17 の形（fixture）と同じ。版 1〜16 の管理データは何も書かずに止まる。
 - **書き込み**: プロファイルの作成・更新・取り消し、改訂の単調増加（同時に 2 つの process から更新して、片方だけが成功し、もう片方が改訂の不一致で拒否される）、不正なプロファイルは保存されない、履歴が残る。
 - **落ちたとき**: 書き込みの途中で子 process を強制終了 → 開き直して `quick_check` が ok、途中の書き込みがない（名前つきの回数）。
 - **Git の外**: `.gitignore` と場所の確かめ。

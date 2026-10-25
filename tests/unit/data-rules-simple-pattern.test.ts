@@ -13,6 +13,7 @@ import {
   parseSimplePattern,
 } from '../../src/control/data-rules/simple-pattern.js';
 import { textConstraintCheckOf } from '../../src/control/data-rules/text-constraints.js';
+import { startCpuStopwatch } from '../architecture/source-scan.js';
 
 const matches = (pattern: string, value: string): boolean | null => {
   const parsed = parseSimplePattern(pattern);
@@ -79,11 +80,12 @@ describe('simple pattern: patterns outside the grammar (T29c fix round 1)', () =
 
   it('turns a pattern outside the grammar into PATTERN for every value, quickly and without a regular expression', () => {
     const check = textConstraintCheckOf({ pattern: `(a+)+${'a'.repeat(400)}$`, minlength: null, maxlength: null });
-    const started = performance.now();
+    // 速さは CPU の時間で測る（並行の混雑で延びる壁時計で測らない。TS-d）。
+    const stopwatch = startCpuStopwatch();
     for (let index = 0; index < 1_000; index += 1) {
       expect(check(`${'a'.repeat(40)}!`)).toBe('PATTERN');
     }
-    expect(performance.now() - started).toBeLessThan(500);
+    expect(stopwatch.elapsedMs()).toBeLessThan(500);
   });
 
   it('applies a pattern of the grammar in the text constraints', () => {
@@ -117,10 +119,11 @@ describe('simple pattern: the limits of the work (T29R-fix-1: M-3)', () => {
     const parsed = parseSimplePattern(`${DIGITS_ONE_OR_MORE.repeat(MAX_SIMPLE_PATTERN_VARIABLE_QUANTIFIERS)}[a-z]`);
     expect(parsed).not.toBeNull();
     const value = '1'.repeat(MAX_SIMPLE_PATTERN_VALUE_LENGTH);
-    const started = performance.now();
+    // 速さは CPU の時間で測る（TS-d）。
+    const stopwatch = startCpuStopwatch();
     for (let run = 0; run < WORST_CASE_RUNS; run += 1) {
       expect(parsed === null ? null : matchesSimplePattern(parsed, value)).toBe(false);
     }
-    expect(performance.now() - started).toBeLessThan(WORST_CASE_LIMIT_MS);
+    expect(stopwatch.elapsedMs()).toBeLessThan(WORST_CASE_LIMIT_MS);
   });
 });

@@ -8,10 +8,10 @@
 //   Content-Length、Connection）を付け直す。
 // - 展開: gzip・deflate・br を展開して返し、`Content-Encoding` を残さない。
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
-import { createServer as createHttpsServer } from 'node:https';
-import type { AddressInfo, Socket } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Socket } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { startEgressProxy, type EgressProxy } from '../../src/safety/egress-proxy.js';
 import {
   WRITE_SUBMISSION_ADDED_HEADER_NAMES,
@@ -19,6 +19,7 @@ import {
   type WriteSubmissionOptions,
   type WriteSubmissionRequest,
 } from '../../src/safety/write-submission-sender.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { LOOPBACK_TEST_CERTIFICATE, LOOPBACK_TEST_KEY } from '../helpers/tls-test-certificate.js';
 
 const SHORT_TIMEOUT_MS = 1_000;
@@ -49,15 +50,11 @@ afterEach(async () => {
 });
 
 async function startServer(tls: boolean): Promise<TestServer> {
-  const sockets = new Set<Socket>();
   const state: TestServer = {
     origin: '',
     received: [],
     mode: 'ok',
-    close: async () => {
-      sockets.forEach((socket) => socket.destroy());
-      await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
-    },
+    close: () => server.close(),
   };
   const handler = (request: IncomingMessage, response: ServerResponse): void => {
     const chunks: Buffer[] = [];
@@ -102,15 +99,9 @@ async function startServer(tls: boolean): Promise<TestServer> {
       }
     });
   };
-  const server: Server = tls ? createHttpsServer({ cert: LOOPBACK_TEST_CERTIFICATE, key: LOOPBACK_TEST_KEY }, handler) : createHttpServer(handler);
-  server.on('connection', (socket: Socket) => {
-    sockets.add(socket);
-    socket.on('error', () => undefined);
-    socket.on('close', () => sockets.delete(socket));
-  });
-  server.on('secureConnection', (socket: Socket) => socket.on('error', () => undefined));
-  await new Promise<void>((resolvePromise) => server.listen({ host: '127.0.0.1', port: 0 }, () => resolvePromise()));
-  (state as { origin: string }).origin = `${tls ? 'https' : 'http'}://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const server = await startLoopbackHttpServer(handler, { tls: tls ? { cert: LOOPBACK_TEST_CERTIFICATE, key: LOOPBACK_TEST_KEY } : undefined });
+  server.server.on('secureConnection', (socket: Socket) => socket.on('error', () => undefined));
+  (state as { origin: string }).origin = server.origin;
   cleanups.push(() => state.close());
   return state;
 }
@@ -198,7 +189,7 @@ describe.each([['http', false], ['https', true]] as const)('DEF-099: the write s
     server.mode = 'drop';
     const outcome = await sendWriteSubmissionOnce(requestOf(server.origin), optionsOf(await startProxy()));
     expect(outcome).toEqual({ kind: 'NO_RESPONSE', reason: 'CONNECTION_CLOSED' });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+    await wait(500);
     expect(server.received).toHaveLength(1);
   });
 
@@ -240,12 +231,12 @@ describe.each([['http', false], ['https', true]] as const)('DEF-099 fix round 1:
     const started = Date.now();
     const sending = sendWriteSubmissionOnce(requestOf(server.origin), optionsOf(await startProxy(), { signal: controller.signal }));
     while (server.received.length === 0) {
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+      await wait(20);
     }
     controller.abort();
     expect(await sending).toEqual({ kind: 'NO_RESPONSE', reason: 'ABORTED' });
     expect(Date.now() - started).toBeLessThan(SHORT_TIMEOUT_MS * 10);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 300));
+    await wait(300);
     expect(server.received).toHaveLength(1);
   });
 });

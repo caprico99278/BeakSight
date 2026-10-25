@@ -13,6 +13,8 @@
  *     （`phase: 'REQUEST_POLICY'`）に知らせる（上流の方針より先に確かめる）。CONNECT は中身が見えないので、要求の方針を当てない。
  *     要求の回数の上限（`requestBudget`。DEF-099 fix。書き込みの段の Context の承認の送信先への POST）があれば、要求の方針と上流の方針を
  *     通った絶対形の要求のうち当たるものを上限まで通し、超えたものを `403` で拒み、`onRejected`（`phase: 'REQUEST_BUDGET'`）に知らせる。
+ *     CONNECT の受け入れ（`tunnelAdmission`。DEF-125）があれば、Guard が通した要求の宛先（`admitTunnelDestinationOf`）への CONNECT だけを通し、
+ *     ほかは知らせを `waitMs` まで待ってから `403` で拒み、`onRejected`（`phase: 'TUNNEL_NOT_ADMITTED'`）に知らせる（上流の方針より先に確かめる）。
  *   - `freeze()`: `FROZEN` にし、今つながっているすべてのソケット（クライアント側と上流側。CONNECT のトンネルと keep-alive を含む）を
  *     破棄する。以後は、すべての要求と CONNECT を `403` で拒み、`onRejected`（`phase: 'FROZEN'`）に知らせる。
  *   - `close()`: `CLOSED` にし、すべてのソケットを破棄して、待ち受けを閉じる。重ねて呼んでもよい。
@@ -32,7 +34,8 @@
  * - 失敗の口 `onError`: 待ち受けの後の `error` だけを知らせる。ソケットごとの失敗は、そのソケットを破棄するだけで、知らせない。
  *   口（`onRejected`、`onError`）の例外は封じ込める。
  * - 上流の方針の既定（`ALLOW_ALL_EGRESS_UPSTREAMS`）は、すべての host を許す（production。ページが読み込むほかの Origin のリソースは、
- *   中継を通しても露出が増えない）。テストは、127.0.0.1 だけを許す方針を注入する。
+ *   中継を通しても露出が増えない）。テストは、127.0.0.1 だけを許す方針を注入する。CONNECT の宛先を Guard が通したものに絞るのは、上流の方針では
+ *   なく、CONNECT の受け入れ（DEF-125）である。
  * - TLS は解かない（中身の検査は Guard の仕事）。HTTP/2 と HTTP/3 は使われない（Chromium は HTTP の中継には HTTP/1.1 で話す。推測）。
  */
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -53,9 +56,10 @@ export type EgressProxyState = (typeof EGRESS_PROXY_STATES)[number];
 
 /**
  * 中継が要求を拒んだ段階の閉じた一覧（`OPEN` は上流の方針の拒否、`FROZEN` は凍結の後の拒否、`REQUEST_POLICY` は `OPEN` の間に要求の方針
- * （method と URL。DEF-085）で拒んだもの）。
+ * （method と URL。DEF-085）で拒んだもの、`TUNNEL_NOT_ADMITTED` は `OPEN` の間に、Guard が通した宛先でない CONNECT を拒んだもの（DEF-125。
+ * `tunnelAdmission`））。
  */
-export const EGRESS_REJECTION_PHASES = Object.freeze(['OPEN', 'FROZEN', 'REQUEST_POLICY', 'REQUEST_BUDGET'] as const);
+export const EGRESS_REJECTION_PHASES = Object.freeze(['OPEN', 'FROZEN', 'REQUEST_POLICY', 'REQUEST_BUDGET', 'TUNNEL_NOT_ADMITTED'] as const);
 export type EgressRejectionPhase = (typeof EGRESS_REJECTION_PHASES)[number];
 
 /** 中継が拒んだ 1 件の要求。`url` は、絶対形の要求ならその URL、CONNECT なら `host:port`。 */
@@ -83,6 +87,17 @@ export interface EgressRequestBudget {
   readonly limit: number;
 }
 
+/**
+ * CONNECT の受け入れ（DEF-125）。ある場合だけ、中継は、Guard が通した要求の宛先（`admitTunnelDestinationOf` で知らせた host とポート）への CONNECT
+ * だけを通す。知らせのない宛先への CONNECT は、`waitMs` まで知らせを待ち（Chromium は、Guard の判定より先に、ナビゲーションの宛先へ CONNECT を
+ * 始めることがある。DEF-125-fix の実験）、知らせが来れば通し、来なければ `403` で拒んで `onRejected`（`phase: 'TUNNEL_NOT_ADMITTED'`）に知らせる
+ * （上流には接続しない）。待つ間に凍結・閉じる処理が来たら、ソケットを壊すだけで、受け入れの拒否としては知らせない。
+ */
+export interface EgressTunnelAdmission {
+  /** 知らせのない CONNECT が、知らせを待つ時間（ms。0 以上の安全な整数）。 */
+  readonly waitMs: number;
+}
+
 /** production の上流の方針: すべての host を許す。 */
 export const ALLOW_ALL_EGRESS_UPSTREAMS: EgressUpstreamPolicy = () => true;
 
@@ -105,6 +120,8 @@ export interface EgressProxyOptions {
    * - `BAD_GATEWAY`: 上流の失敗に `502` を返す（Interaction の Context の今の作り。変えるかは設計者の判断を待つ）。
    */
   readonly upstreamFailureMode?: EgressUpstreamFailureMode | undefined;
+  /** CONNECT の受け入れ（DEF-125。`EgressTunnelAdmission`）。省略すると、上流の方針に合う CONNECT をすべて通す（今のまま）。 */
+  readonly tunnelAdmission?: EgressTunnelAdmission | undefined;
   /** 拒んだ要求の記録の口。 */
   readonly onRejected: (rejection: EgressRejection) => void;
   /** 待ち受けの後の中継の失敗の口。 */
@@ -121,6 +138,12 @@ export interface EgressProxy {
    * （`BAD_GATEWAY` ではいつも `null`）。覚えていなければ `null`。上限は `MAX_EGRESS_UPSTREAM_ADDRESS_ENTRIES`。
    */
   upstreamAddressOf(host: string, port: number): EgressUpstreamAddress | null;
+  /**
+   * Guard が通した要求の URL の宛先（host と、ポート。ポートのない URL は scheme の既定。`http:`・`ws:` は 80、`https:`・`wss:` は 443）を、CONNECT を
+   * 通す宛先に加える（DEF-125。`tunnelAdmission` のときだけ意味を持つ）。その宛先の知らせを待っている CONNECT は、すぐに進む。`http:`・`https:`・
+   * `ws:`・`wss:` の URL でなければ、何もしない。
+   */
+  admitTunnelDestinationOf(url: string): void;
   freeze(): void;
   close(): Promise<void>;
 }
@@ -129,6 +152,8 @@ export interface EgressProxy {
 const LOOPBACK_HOST = '127.0.0.1';
 /** `http:` の既定のポート。 */
 const DEFAULT_HTTP_PORT = 80;
+/** `https:` の既定のポート（DEF-125。CONNECT を通す宛先の鍵）。 */
+const DEFAULT_HTTPS_PORT = 443;
 /** 転送しないホップごとのヘッダ（RFC 9110 7.6.1 と、proxy の慣習の `Proxy-*`）。小文字で比べる。 */
 const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
   'connection',
@@ -182,11 +207,16 @@ function tunnelTargetOf(authority: string | undefined): Omit<ForwardTarget, 'pat
     return null;
   }
   const url = new URL(`http://${authority}`);
-  if (url.hostname.length === 0 || url.port.length === 0) {
+  // DEF-133: authority に書かれたポートがあるかは、authority の末尾で見る（`http:` で解析すると、既定のポート 80 は `url.port` が空になる）。
+  // ポートの値は URL の解析の結果を使い、空なら `http:` の既定のポート（80）である。host は URL の hostname（受け入れの鍵 `tunnelDestinationKeyOf` と同じ形）。
+  if (url.hostname.length === 0 || !AUTHORITY_PORT_SUFFIX.test(authority)) {
     return null;
   }
-  return { host: url.hostname, port: Number(url.port) };
+  return { host: url.hostname, port: url.port.length === 0 ? DEFAULT_HTTP_PORT : Number(url.port) };
 }
+
+/** authority の末尾のポート（`:` と数字）。IPv6 の `[...]` の中のコロンには当たらない（末尾が `]` のときは当たらない）。 */
+const AUTHORITY_PORT_SUFFIX = /:\d+$/u;
 
 /** ホップごとのヘッダを除いたヘッダ。 */
 function endToEndHeaders(headers: IncomingHttpHeaders): IncomingHttpHeaders {
@@ -276,6 +306,33 @@ export interface EgressUpstreamAddress {
 
 /** 表の鍵（要求の host を小文字にしたものと port）。host は URL の hostname の形（IPv6 は `[...]`）。 */
 const upstreamAddressKey = (host: string, port: number): string => `${host.toLowerCase()} ${port}`;
+
+/**
+ * CONNECT を通す宛先として受ける URL の scheme と、ポートのない URL の既定のポート（DEF-125）。Chromium は、http の中継に、https と wss だけでなく
+ * ws（`ws:`）も CONNECT で通す。`http:` は絶対形の要求で来るが、同じ宛先への CONNECT を受けても露出は増えないので、同じに扱う。
+ */
+const TUNNEL_DEFAULT_PORTS: ReadonlyMap<string, number> = new Map([
+  ['http:', DEFAULT_HTTP_PORT],
+  ['ws:', DEFAULT_HTTP_PORT],
+  ['https:', DEFAULT_HTTPS_PORT],
+  ['wss:', DEFAULT_HTTPS_PORT],
+]);
+
+/**
+ * URL の宛先の、CONNECT を通す宛先の鍵（DEF-125。`upstreamAddressKey` と同じ形。CONNECT の authority の解析 `tunnelTargetOf` と同じく、WHATWG URL の
+ * hostname を使う）。`TUNNEL_DEFAULT_PORTS` の scheme の URL でなければ `null`。
+ */
+function tunnelDestinationKeyOf(url: string): string | null {
+  if (!URL.canParse(url)) {
+    return null;
+  }
+  const parsed = new URL(url);
+  const defaultPort = TUNNEL_DEFAULT_PORTS.get(parsed.protocol);
+  if (defaultPort === undefined || parsed.hostname.length === 0) {
+    return null;
+  }
+  return upstreamAddressKey(parsed.hostname, parsed.port.length === 0 ? defaultPort : Number(parsed.port));
+}
 
 /** `socket` を、失敗を外に出さずに破棄する。 */
 function destroyQuietly(socket: Duplex): void {
@@ -382,6 +439,12 @@ class EgressProxyImpl implements EgressProxy {
   readonly #upstreamAddresses = new Map<string, EgressUpstreamAddress>();
   /** クライアントの接続ごとの、今の要求の上流の接続（`PASS_THROUGH` の転送。fix round 3）。 */
   readonly #clientRelays = new WeakMap<Duplex, Socket>();
+  /** CONNECT の受け入れ（DEF-125）。なければ `undefined`（今のまま）。 */
+  readonly #tunnelAdmission: EgressTunnelAdmission | undefined;
+  /** Guard が通した宛先の鍵（`tunnelDestinationKeyOf`。DEF-125）。 */
+  readonly #admittedTunnels = new Set<string>();
+  /** 知らせを待っている CONNECT の終わらせ方（宛先の鍵ごと。引数は、知らせが来たか。DEF-125）。 */
+  readonly #admissionWaiters = new Map<string, Set<(admitted: boolean) => void>>();
   #state: EgressProxyState = 'OPEN';
   #port = 0;
   #closing: Promise<void> | null = null;
@@ -393,6 +456,7 @@ class EgressProxyImpl implements EgressProxy {
       ? undefined
       : Object.freeze({ matches: options.requestBudget.matches, limit: options.requestBudget.limit });
     this.#upstreamFailureMode = options.upstreamFailureMode ?? 'BAD_GATEWAY';
+    this.#tunnelAdmission = options.tunnelAdmission === undefined ? undefined : Object.freeze({ waitMs: options.tunnelAdmission.waitMs });
     this.#onRejected = options.onRejected;
     this.#onError = options.onError;
     // DEF-085 fix round 3: `PASS_THROUGH` は、Chromium が送る要求を、Chromium と同じくらい寛容に読む（大きな Cookie の要求を含む）。
@@ -469,18 +533,35 @@ class EgressProxyImpl implements EgressProxy {
     });
   }
 
+  admitTunnelDestinationOf(url: string): void {
+    const key = typeof url === 'string' ? tunnelDestinationKeyOf(url) : null;
+    if (key === null) {
+      return;
+    }
+    this.#admittedTunnels.add(key);
+    const waiters = this.#admissionWaiters.get(key);
+    if (waiters !== undefined) {
+      this.#admissionWaiters.delete(key);
+      for (const finish of [...waiters]) {
+        finish(true);
+      }
+    }
+  }
+
   freeze(): void {
     if (this.#state !== 'OPEN') {
       return;
     }
     this.#state = 'FROZEN';
     this.#destroyAllSockets();
+    this.#endAdmissionWaits();
   }
 
   close(): Promise<void> {
     if (this.#closing === null) {
       this.#state = 'CLOSED';
       this.#destroyAllSockets();
+      this.#endAdmissionWaits();
       this.#closing = new Promise<void>((resolve) => {
         this.#server.close(() => resolve());
         this.#destroyAllSockets();
@@ -503,6 +584,46 @@ class EgressProxyImpl implements EgressProxy {
     for (const socket of [...this.#sockets]) {
       socket.destroy();
     }
+  }
+
+  /** 知らせを待っているすべての CONNECT の待ちを終える（凍結と閉じる処理。DEF-125。ソケットは `#destroyAllSockets` が壊す）。 */
+  #endAdmissionWaits(): void {
+    const waiters = [...this.#admissionWaiters.values()].flatMap((set) => [...set]);
+    this.#admissionWaiters.clear();
+    for (const finish of waiters) {
+      finish(false);
+    }
+  }
+
+  /**
+   * 知らせのない宛先 `key` への CONNECT の、知らせを待つ（DEF-125）。知らせが来たら `true`、`waitMs` が過ぎるか、クライアントの接続が閉じるか、
+   * 凍結・閉じる処理が来たら `false` で、`then` を 1 回だけ呼ぶ。
+   */
+  #awaitTunnelAdmission(key: string, waitMs: number, clientSocket: Duplex, then: (admitted: boolean) => void): void {
+    let waiters = this.#admissionWaiters.get(key);
+    if (waiters === undefined) {
+      waiters = new Set();
+      this.#admissionWaiters.set(key, waiters);
+    }
+    const ownWaiters = waiters;
+    let settled = false;
+    const finish = (admitted: boolean): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      clientSocket.off('close', onClientClose);
+      ownWaiters.delete(finish);
+      if (ownWaiters.size === 0 && this.#admissionWaiters.get(key) === ownWaiters) {
+        this.#admissionWaiters.delete(key);
+      }
+      then(admitted);
+    };
+    const onClientClose = (): void => finish(false);
+    const timer = setTimeout(() => finish(false), waitMs);
+    clientSocket.once('close', onClientClose);
+    ownWaiters.add(finish);
   }
 
   #reportError(error: unknown): void {
@@ -724,6 +845,36 @@ class EgressProxyImpl implements EgressProxy {
       endWith(clientSocket, BAD_REQUEST_RESPONSE);
       return;
     }
+    // DEF-125: CONNECT の受け入れがあれば、Guard が通した宛先だけを通す（上流の方針より先に確かめる）。知らせがまだなければ、`waitMs` まで待つ。
+    const admission = this.#tunnelAdmission;
+    const key = upstreamAddressKey(target.host, target.port);
+    if (admission !== undefined && !this.#admittedTunnels.has(key)) {
+      if (clientSocket.destroyed) {
+        return;
+      }
+      this.#awaitTunnelAdmission(key, admission.waitMs, clientSocket, (admitted) => {
+        if (this.#state !== 'OPEN') {
+          // 待つ間の凍結・閉じる処理: ソケットは壊れている（受け入れの拒否としては知らせない）。
+          destroyQuietly(clientSocket);
+          return;
+        }
+        if (!admitted) {
+          this.#reject('CONNECT', authority, 'TUNNEL_NOT_ADMITTED');
+          endWith(clientSocket, FORBIDDEN_RESPONSE);
+          return;
+        }
+        if (clientSocket.destroyed) {
+          return;
+        }
+        this.#openTunnel(authority, target, clientSocket, head);
+      });
+      return;
+    }
+    this.#openTunnel(authority, target, clientSocket, head);
+  }
+
+  /** CONNECT のトンネルを開く（上流の方針を確かめてから、上流へ接続する。DEF-125 で `#handleConnect` から分けた。振る舞いは今までどおり）。 */
+  #openTunnel(authority: string, target: Omit<ForwardTarget, 'path'>, clientSocket: Duplex, head: Buffer): void {
     if (!this.#upstreamPolicy(target.host, target.port)) {
       this.#reject('CONNECT', authority, 'OPEN');
       endWith(clientSocket, FORBIDDEN_RESPONSE);
@@ -799,6 +950,10 @@ export async function startEgressProxy(options: EgressProxyOptions): Promise<Egr
     && !(EGRESS_UPSTREAM_FAILURE_MODES as readonly unknown[]).includes(options.upstreamFailureMode)
   ) {
     throw new TypeError('Egress proxy upstream failure mode must be one of EGRESS_UPSTREAM_FAILURE_MODES');
+  }
+  if (options.tunnelAdmission !== undefined && (typeof options.tunnelAdmission !== 'object' || options.tunnelAdmission === null
+    || !Number.isSafeInteger(options.tunnelAdmission.waitMs) || options.tunnelAdmission.waitMs < 0)) {
+    throw new TypeError('Egress proxy tunnel admission must have a non-negative integer wait');
   }
   const proxy = new EgressProxyImpl(options);
   await proxy.listen();

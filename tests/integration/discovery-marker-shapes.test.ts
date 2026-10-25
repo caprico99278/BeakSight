@@ -22,13 +22,13 @@ import {
   type DiscoverySite,
 } from '../helpers/discovery-site-fixture.js';
 import { runDiscoveryOnSite } from '../helpers/discovery-site-run.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 
 const LAUNCHERS = [
   ['the default test Chromium', () => launchHeadlessChromium()],
   ['the CLI launch settings', () => launchCliChromium()],
 ] as const;
 const TEST_TIMEOUT_MS = 120_000;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 /** 目印の形の画面の form の数と、読む画面の数（目印の形の画面だけ。リンクはない）。 */
 const MARKER_SHAPE_FORMS = 3;
 const ONE_PAGE = 1;

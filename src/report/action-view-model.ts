@@ -8,6 +8,12 @@
  * - 表示（ラベル、順、色）はカタログ、文言は `ACTION_REPORT_TEXT`、日時と数は書式の部品（`formatDateTime`・`formatInteger`）から取る。値で分岐しない
  *   （結果や理由を足しても、ここを変えずに描ける。`tests/unit/action-report-changeability.test.ts`）。
  * - 1 回だけ組み立てる。HTML（`action-report.ts`）は、この表示用モデルを描くだけにする。判定はしない（結果と理由は文書のまま）。
+ * - T40d（Task 40 の設計書 3.4、3.5）: 版 1.1 の API の要約（証拠の `transport`・`api`）から、API の節（`api`）を組み立てる。送り方のラベルはカタログ
+ *   （`SCENARIO_TRANSPORT_CATALOG`）、項目名と文言は `ACTION_REPORT_TEXT.api`。API の要約がない文書（FORM）は `api` が null で、ほかの
+ *   値は今までと同じ（HTML も変わらない）。送り方の値で分岐しない（要約があるかで決める）。成否の条件と入力の誤りの条件は報告に出さず、API では
+ *   判定のしかたの説明を出す。ページが決める鍵の値は、null の印を「上限を超えたので残していない」、値の全体がない回を「値がない」として示す。
+ * - T41e（Task 41 の設計書 3.5）: API の更新は、API の節と更新の前後の差分（`update`。form の更新と同じ組み立て）を両方持つ。値の一覧にないページが決める
+ *   鍵は「更新では値を残さない（送る前の値と照らした）」として示す。保つ欄は一致だけを示し、値は出さない。
  */
 import { parseCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import {
@@ -20,6 +26,7 @@ import {
   READ_CHECK_RESULT_CATALOG,
   RESPONSE_JUDGEMENT_CATALOG,
   SCENARIO_KIND_CATALOG,
+  SCENARIO_TRANSPORT_CATALOG,
   SETTLED_RESERVATION_STATE_CATALOG,
   SIDE_EFFECT_CONFIRMATION_CATALOG,
   SUBMISSION_STATE_CATALOG,
@@ -27,7 +34,7 @@ import {
   type DisplaySpec,
 } from '../presentation/catalog.js';
 import { formatDateTime, formatInteger, formatNotObserved } from '../presentation/format.js';
-import { ACTION_REPORT_TEXT, READ_CHECK_DETAIL_DESCRIPTIONS } from '../presentation/messages.js';
+import { ACTION_REPORT_TEXT, READ_CHECK_DETAIL_DESCRIPTIONS, listText } from '../presentation/messages.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 入力（描くのに要る項目だけの構造の型）
@@ -93,6 +100,22 @@ export interface ActionGuardInput {
   readonly responseDeliveryCanceled: boolean;
 }
 
+/**
+ * API の要約（T40d。`action-evidence.json` 1.1 の `api`。契約は `ActionApiSummary`）。ページが決める鍵の値は、JSON の scalar を JSON の文字列にした形で、
+ * 上限を超えた値は null の印。照合まで進まなかった回は、値の全体が null。
+ */
+export interface ActionApiReportInput {
+  readonly method: string;
+  readonly origin: string;
+  readonly pathShape: string;
+  readonly shapeDigest: string;
+  readonly keyNames: readonly string[];
+  readonly pageKeyNames: readonly string[];
+  readonly httpFieldNames: readonly string[];
+  readonly recordIdKey: string | null;
+  readonly pageKeyValues: Readonly<Record<string, string | null>> | null;
+}
+
 /** `action-evidence.json` のうち、報告に要る項目。 */
 export interface ActionEvidenceReportInput {
   readonly jobId: string;
@@ -124,6 +147,9 @@ export interface ActionEvidenceReportInput {
   readonly reason: ActionOutcomeReasonValue;
   readonly startedAt: string;
   readonly finishedAt: string;
+  /** T40d: 送り方と API の要約（FORM の要約は null）。 */
+  readonly transport?: keyof typeof SCENARIO_TRANSPORT_CATALOG;
+  readonly api?: ActionApiReportInput | null;
 }
 
 /** `approval-summary.json` のうち、報告に要る項目。 */
@@ -226,6 +252,28 @@ export interface ApprovalView {
   readonly automatedActions: readonly DisplaySpec[];
 }
 
+/** ページが決める鍵 1 つと、その値の表示（`kept` が偽なら、値の代わりの文言）。 */
+export interface ApiPageKeyView {
+  readonly key: string;
+  readonly valueText: string;
+  readonly kept: boolean;
+}
+
+/** API の要約の節（T40d）。 */
+export interface ActionApiView {
+  readonly transport: CodedView;
+  /** 判定のしかたの説明（成否の条件と入力の誤りの条件は使わない）。 */
+  readonly judgementNote: string;
+  readonly method: string;
+  readonly origin: string;
+  readonly pathShape: string;
+  readonly shapeDigest: string;
+  readonly keyNamesText: string;
+  readonly httpFieldNamesText: string;
+  readonly recordIdKeyText: string;
+  readonly pageKeys: readonly ApiPageKeyView[];
+}
+
 /** 書き込みの報告の表示用モデル。 */
 export interface ActionViewModel {
   readonly title: string;
@@ -256,6 +304,8 @@ export interface ActionViewModel {
     readonly submittedAtText: string;
     readonly values: readonly { readonly name: string; readonly value: string }[];
   };
+  /** T40d: API の要約の節（API の要約のない文書は null）。 */
+  readonly api: ActionApiView | null;
   readonly response: { readonly httpStatusText: string; readonly judgement: CodedView | null; readonly judgedAtText: string } | null;
   readonly update: {
     readonly targetRecordId: string;
@@ -394,6 +444,48 @@ const updateOf = (update: ActionEvidenceReportInput['update']): ActionViewModel[
   };
 };
 
+/** 名前の一覧の表示（空なら「なし」）。 */
+const namesText = (names: readonly string[]): string => (names.length === 0 ? ACTION_REPORT_TEXT.api.none : listText(names));
+
+/**
+ * ページが決める鍵ごとの値の表示（鍵の順は要約のまま）。値の全体がない回（送らなかった、照合まで進まなかった）は「値がない」、null の印は「上限を
+ * 超えたので残していない」。
+ */
+const pageKeysOf = (api: ActionApiReportInput): readonly ApiPageKeyView[] => {
+  const values = api.pageKeyValues;
+  return api.pageKeyNames.map((key) => {
+    if (values === null) {
+      return { key, valueText: ACTION_REPORT_TEXT.api.pageKeyValuesNotRecorded, kept: false };
+    }
+    // T41e: 値の一覧にない鍵は、値を残さない鍵（更新では、送る前の値と照らし、値は残さない。T41c）。
+    if (!Object.hasOwn(values, key)) {
+      return { key, valueText: ACTION_REPORT_TEXT.api.pageKeyValueNotKeptForUpdate, kept: false };
+    }
+    const value = values[key] ?? null;
+    return value === null ? { key, valueText: ACTION_REPORT_TEXT.api.pageKeyValueCut, kept: false } : { key, valueText: value, kept: true };
+  });
+};
+
+/** API の要約の節（要約と送り方のない文書は null。送り方の値では分岐しない）。 */
+const apiOf = (evidence: ActionEvidenceReportInput): ActionApiView | null => {
+  const { api, transport } = evidence;
+  if (api === undefined || api === null || transport === undefined) {
+    return null;
+  }
+  return {
+    transport: codedOf(SCENARIO_TRANSPORT_CATALOG, transport),
+    judgementNote: ACTION_REPORT_TEXT.api.judgementNote,
+    method: api.method,
+    origin: api.origin,
+    pathShape: api.pathShape,
+    shapeDigest: api.shapeDigest,
+    keyNamesText: namesText(api.keyNames),
+    httpFieldNamesText: namesText(api.httpFieldNames),
+    recordIdKeyText: api.recordIdKey ?? ACTION_REPORT_TEXT.api.recordIdKeyUnset,
+    pageKeys: pageKeysOf(api),
+  };
+};
+
 const approvalOf = (summary: ApprovalSummaryReportInput): ApprovalView => {
   const rule = summary.inputRuleReference;
   const sideEffectItems = sortByDisplayOrder(
@@ -462,6 +554,7 @@ export const buildActionViewModel = (input: ActionReportInput): ActionViewModel 
       submittedAtText: timeText(submission.submittedAt),
       values: Object.entries(submission.submittedValues).map(([name, value]) => ({ name, value })),
     },
+    api: apiOf(evidence),
     response: response === null
       ? null
       : {

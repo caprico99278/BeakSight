@@ -35,6 +35,7 @@ import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import type { WriteFormEnctype } from '../../src/safety/write-payload-policy.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { QUIET_PERIOD_MS } from '../helpers/gate-harness.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 import {
   UPDATE_FORM_PATHS,
   UPDATE_FORM_VALUES,
@@ -103,7 +104,7 @@ const EXPECTED_PRIOR: Omit<UpdateFormValues, 'passthroughValues'> = {
 
 /** サーバに届いた POST。 */
 const posts = (requests: readonly UpdateFormFixtureRequest[]): string[] => requests
-  .filter((entry) => entry.method !== 'GET' && entry.method !== 'HEAD')
+  .filter((entry) => !READ_METHODS.has(entry.method))
   .map((entry) => `${entry.method} ${entry.path}`);
 
 /** multipart の本文を、名前と値（UTF-8）に分ける（テストの補助）。 */

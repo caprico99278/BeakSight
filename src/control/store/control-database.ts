@@ -4,20 +4,21 @@
 //   2. 置き場所のフォルダがなければ作る。フォルダの位置にフォルダでないものがあれば止める。
 //   3. ファイルがあり、大きさが 0 でなければ、先頭 16 byte が SQLite の印かを確かめる。違えば止める。
 //   4. 選択肢を常にオブジェクトで渡して開く（`undefined` を渡すと実行時に失敗する。調査の事実）。
-//   5. 誰のデータベースか、どの版かを読んで確かめる（何も書かないうちに。ほかのプログラムのファイルを WAL に変えないため、
-//      設計書の 6 と 7 の確かめの一部を、5 の WAL より先に行う）。
+//   5. 誰のデータベースか、どの版かを読んで確かめる（何も書かないうちに。ほかのプログラムのファイルと、基準の版より前の版の管理データ
+//      （LG-2。`DATABASE_FROM_OLDER_VERSION`）を WAL に変えないため、設計書の 6 と 7 の確かめの一部を、5 の WAL より先に行う）。
 //   6. `PRAGMA journal_mode=WAL` の結果が `wal` か。`synchronous` は既定（FULL）のまま。
-//   7. 版の管理（`runControlMigrations`。版 1 で `application_id` を書く）。
+//   7. 版の管理（`runControlMigrations`。空のデータベースは基準の版 17 で作り、`application_id` を書く）。
 //   8. `PRAGMA quick_check` が `ok` か。
 // 止めるときは `ControlStoreError`（閉じた一覧の理由）。利用者のファイルを上書き・削除・移動しない。
 // 途中で止めたときは、開いた接続を閉じてから投げる。
 import { accessSync, closeSync, constants, mkdirSync, openSync, readSync, statSync, type Stats } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
-import { errorCodeOf } from '../../core/errors.js';
+import { errorCodeOf, errorMessageOrString } from '../../core/errors.js';
 import { checkControlEnvironment } from '../environment/control-environment.js';
 import {
   assertControlDatabaseIdentity,
   CONTROL_MIGRATIONS,
+  CONTROL_SCHEMA_BASE,
   CONTROL_SCHEMA_VERSION,
   readControlDatabaseIdentity,
   runControlMigrations,
@@ -179,7 +180,7 @@ export const runQuickCheck = (connection: SqliteConnection): QuickCheckResult =>
     if (classifySqliteFailure(error) !== 'DATABASE_INTEGRITY_FAILED') {
       throw error;
     }
-    messages = [error instanceof Error ? error.message : String(error)];
+    messages = [errorMessageOrString(error)];
   }
   return Object.freeze({
     ok: messages.length === 1 && messages[0] === QUICK_CHECK_OK,
@@ -238,8 +239,8 @@ export const openControlDatabase = (databasePath: string): ControlDatabase => {
   }
 
   try {
-    // 5. 誰のデータベースか、どの版か（読むだけ）。
-    assertControlDatabaseIdentity(readControlDatabaseIdentity(connection), CONTROL_SCHEMA_VERSION);
+    // 5. 誰のデータベースか、どの版か（読むだけ。基準の版より前の版は、ここで止める）。
+    assertControlDatabaseIdentity(readControlDatabaseIdentity(connection), CONTROL_SCHEMA_VERSION, CONTROL_SCHEMA_BASE.version);
     // 6〜8.
     ensureWalJournalMode(connection);
     const outcome = runControlMigrations(connection, CONTROL_MIGRATIONS);

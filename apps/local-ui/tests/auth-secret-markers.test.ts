@@ -2,7 +2,8 @@
  * 秘密の目印の検査（端から端まで。Task 25 の設計書 4.6、6 章。T25f）。ビルドした画面を一時の root の起動の部品で起動し、画面から認証つきの監査
  * （`TEST_AUTH_PASSIVE`、`MANUAL_SESSION`）を最後まで行って、秘密の目印が、どこにも出ないことを、バイトで検索して確かめる。
  * - 目印: Cookie の値（回転で替えた値を含む）、localStorage の値、ログインの POST の本文の資格情報（利用者名とパスワード）、URL の query に入れた
- *   token の値（リンク、画像、移動の先の `code` と `state`）。どれも、fixture のサイトが起動のたびに作るランダムな仮の値（値を出力しない）。
+ *   token の値（リンク、画像、移動の先の `code` と `state`）、DEF-139 からは最後まで終わる場面の IndexedDB の値。どれも、fixture のサイトが起動のたびに
+ *   作るランダムな仮の値（値を出力しない）。
  * - 検索する場所: Run のディレクトリのすべてのファイル（保存と、ZIP を展開した中身を含む）、管理データのファイルと WAL（と、すべての表のすべての行）、
  *   画面のサーバの標準出力と標準エラー、ワーカーの標準出力と標準エラー、IPC の記録（ワーカーが親へ送ったメッセージのすべて）、画面の HTML と
  *   Server Function の応答（ジョブの行を含む）。
@@ -26,7 +27,9 @@ import {
   startAuthenticatedSite,
   type AuthenticatedSite,
 } from '../../../tests/helpers/authenticated-site-fixture.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
+import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
   WORKER_RECORD_FILES,
@@ -154,7 +157,7 @@ const authProfileDocument = (profileId: string, targetConfigPath: string, origin
 
 /** 認証の設定の文書（ログアウトを読まないパスに、管理画面を読む範囲に）。 */
 const authSetupDocument = (profileId: string, origin: string): Record<string, unknown> => ({
-  schemaVersion: 'beaksight-auth-setup/2',
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${origin}${AUTH_SITE_PATHS.login}`,
@@ -286,12 +289,12 @@ const requestsWith = (site: AuthenticatedSite, value: string | undefined): numbe
   site.requests.filter(({ path }) => value !== undefined && path.includes(value)).length;
 
 /** fixture のサイトに届いた、GET と HEAD 以外の要求（`<method> <path>`）。 */
-const nonReadRequests = (site: AuthenticatedSite): readonly string[] =>
-  site.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD').map(({ method, path }) => `${method} ${path}`);
+const nonReadRequests = (site: AuthenticatedSite): readonly string[] => nonReadRequestsOf(site.requests);
 
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
-  completeSite = await startAuthenticatedSite({ loginForm: true, rotate: true, queryTokens: true });
+  // DEF-139: ログインの後の画面が IndexedDB に目印を書き、2 ページ目はその記録がなければログインの画面へ移す（IndexedDB の値の目印も検索する）。
+  completeSite = await startAuthenticatedSite({ loginForm: true, rotate: true, queryTokens: true, indexedDbGate: true });
   lostSite = await startAuthenticatedSite({
     loginForm: true,
     rotate: true,
@@ -332,6 +335,11 @@ describe('T25f: no secret marker anywhere after an authenticated audit from the 
     const site = siteOf(completeSite);
     const { page, jobId } = await runAudit(COMPLETE_PROFILE, site, true, 'AUTHENTICATED');
     expect(await page.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('COMPLETE');
+    // DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 3 章の 2）: ジョブの画面の「ログインの段」の欄に、ログインの後の状態の名前の
+    // 記録が出る（IndexedDB のデータベースを引き継いだ行。値は出ない。下の目印の検索で確かめる）。
+    await page.getByTestId('job-login-state-names').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('job-login-state-indexed-db').locator('tr[data-outcome="CARRIED"]').count()).toBe(1);
+    expect(await page.getByTestId('job-login-state-cookies').locator('tr[data-outcome="CARRIED"]').count()).toBeGreaterThan(0);
     await page.close();
     expect(site.successfulLogins).toBe(1);
     expect(nonReadRequests(site)).toEqual([`POST ${AUTH_SITE_PATHS.login}`]);
@@ -363,10 +371,20 @@ describe('T25f: no secret marker anywhere after an authenticated audit from the 
     const stopped = await runAudit(LOST_PROFILE, site, true, 'SESSION_LOST');
     expect(await stopped.page.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
     expect(await stopped.page.getByTestId('job-session-lost-url').textContent()).toBe(`${site.originA}${AUTH_SITE_TOKEN_PATHS.item}`);
+    // DEF-138: 止まったページの URL の近くに、セッションが切れたと判定した読み込みの記録（頼んだページの path と query の名前だけ）が出る。
+    expect(await stopped.page.getByTestId('job-session-loss').count()).toBe(1);
+    expect(await stopped.page.getByTestId('job-session-loss-requested').textContent()).toMatch(new RegExp(`^${AUTH_SITE_TOKEN_PATHS.item}(?:\\?|$)`, 'u'));
     await stopped.page.close();
 
-    // 止まった Run: 保存が残り、目印はどこにもなく、保存のページには伏せ字の印が現れる。
+    // 止まった Run: 保存が残り、目印はどこにもなく、保存のページには伏せ字の印が現れる。DEF-138: 証拠は run.json・管理データ（WAL を含む）・IPC の記録・
+    // 画面にあり、そのどこにも目印はない（下の `leakedPlaces`）。
     const stoppedPlaces = await searchedPlaces(LOST_PROFILE, stopped.jobId);
+    const stoppedRunJson = stoppedPlaces.find(({ place }) => place.startsWith('run:') && place.endsWith(`/${RUN_ARTIFACT_FILE_NAMES.run}`));
+    const stoppedRun = JSON.parse(Buffer.from(stoppedRunJson?.bytes ?? new Uint8Array()).toString('utf8')) as {
+      readonly authentication?: { readonly sessionLoss?: { readonly requestedPath: string | null } };
+    };
+    expect(stoppedRun.authentication?.sessionLoss?.requestedPath).toMatch(new RegExp(`^${AUTH_SITE_TOKEN_PATHS.item}(?:\\?|$)`, 'u'));
+    expect(stoppedPlaces.some(({ place, bytes }) => place.endsWith(WORKER_RECORD_FILES.ipc) && containsBytes(bytes, '"sessionLoss"'))).toBe(true);
     const checkpointFiles = stoppedPlaces.filter(({ place }) => place.startsWith('run:') && place.includes('/checkpoint/'));
     expect(checkpointFiles.length).toBeGreaterThan(0);
     expect(checkpointFiles.some(({ bytes }) => containsBytes(bytes, `token=${REDACTED}`))).toBe(true);

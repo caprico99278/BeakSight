@@ -188,6 +188,9 @@ const UI06_EXCLUDED_FILES: ReadonlyMap<string, string> = new Map([
   ['src/control/data-rules/external-delivery-words.ts', '入力の規則で照らす外部到達の語の一覧（表示の文言ではない）'],
   // T29c（Task 29 の設計書 3 章）: 業務テンプレートで、欄の名前と照らす日本語の語の閉じた一覧（利用者に見せる文言ではない）。
   ['src/control/data-rules/business-templates.ts', '業務テンプレートの意味の推しで照らす語の一覧（表示の文言ではない）'],
+  // T38R2-fix（Task 38 の設計書 7 章の最後の行。M-1）: API の書き込みの本文の鍵の名前と照らす、秘密に見える日本語の語の閉じた一覧（方針 6。利用者に
+  // 見せる文言ではない）。
+  ['src/core/secret-query-names.ts', '秘密に見える名前の方針で照らす語の一覧（表示の文言ではない）'],
 ]);
 
 /** GATE-UI06 の除外の、Rule の定義のファイル（Finding の `message` は Rule が持つ）。 */

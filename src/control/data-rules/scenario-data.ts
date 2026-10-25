@@ -6,21 +6,27 @@
 // - 欄ごとの列: 用途（`purpose`）に、欄の名前と試しの番号（`attempt`）を鍵を並べた JSON にしたものを使う。氏名とフリガナは、同じ人（姓と名の組）を
 //   1 つの列（`person`）から選ぶ。
 // - 値: 「送らない」側（通知の欄）、人の固定の一覧（優先）、汎用の規則の値の空間、氏名、辞書、メール（`sample` と数字の局所部の
-//   `@example.invalid`）、電話（`090-0XXX-XXXX` か `0900XXXXXXX`。使った番号（数字だけで比べる）と重ならない番号を、列から作り直す）。
+//   `@example.invalid`）、電話（`090-0XXX-XXXX` か `0900XXXXXXX`。使った番号（数字だけで比べる）と重ならない番号を、列から作り直す）、番号・コード
+//   （FM2c。欄の pattern の桁数の数字）。保存した規則の基準日からの幅（FM2c）は、入力の基準日から値の範囲を求める。
 // - 関係: 終了 > 開始（同じ値の空間なら入れ替え、そうでなければ作り直し）、合計 = 単価 × 数量（判定が求めた、合計の欄の制約に合う単価と数量の
 //   組から選ぶ。T29R-fix-1 の M-2）、
 //   フリガナは氏名と同じ人（同じ組から作るので、いつも成り立つ）。
 // - 一意性: 一意にする欄の組の値（`uniqueKeyOf`）が、使った組（`usedUniqueKeys`。Task 30 が送った記録から渡す）とぶつかれば、試しの番号を進めて
 //   作り直す。`MAX_UNIQUE_RETRIES` 回の作り直しでも作れなければ `RULE_CONFLICT` の `UNIQUE_COMBINATIONS_EXHAUSTED`（関係が成り立たなければ
 //   `RELATION_UNSATISFIABLE`）。
+// - T38e（Task 38 の設計書 3.6）: API のシナリオの値は、本文の鍵（`fieldNames`）ごと（値を入れる先の欄は `api.keyFields[].field`。ページが決める
+//   鍵の値は作らない）。値は文字列のまま返す（DOM の欄に入れ、ページの JS が JSON を組み立てる）。作った値が鍵の JSON の型に変えられなければ
+//   （`json-value.ts`。判定が拒むので、判定の見込みを外れた値だけ。例: 絶対値が 0.000001 未満の数）、止めて `JSON_VALUE_TYPE_MISMATCH`。値を
+//   入れない欄（null）は確かめない。
 import { deepFreeze } from '../../core/immutable.js';
 import { sortedKeysJsonOf } from '../../core/sorted-keys-json.js';
 import { compareCodeUnits } from '../../core/text.js';
-import type { ScenarioRevision } from '../approval/scenario-contracts.js';
+import type { ScenarioApiSpec, ScenarioRevision } from '../approval/scenario-contracts.js';
 import type { CandidateField, DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import { createDataSeed, createDeterministicStream, type DataSeed, type DataSeedInput } from './deterministic-stream.js';
-import { derivedTotalFits, personValueOf, planRuleSet, relationCompareType, type FieldPlan } from './field-evaluation.js';
+import { derivedTotalFits, evaluationApiSpecOf, personValueOf, planRuleSet, relationCompareType, type FieldPlan } from './field-evaluation.js';
 import { compareFieldValues, generateGenericValue, isGenericBaseDate, multiplyDecimalIntegers } from './generic-values.js';
+import { isJsonValueConvertible } from './json-value.js';
 import { computeRuleSetDigest } from './rule-digest.js';
 import {
   MAX_UNIQUE_RETRIES,
@@ -40,10 +46,13 @@ import {
 /** 生成の入力。 */
 export interface ScenarioDataInput {
   readonly ruleSet: RuleSetRevision;
-  /** T31d: UPDATE のシナリオは、変える欄（`fieldNames`）だけの値を返す（保つ欄の値は作らない。UPDATE の指定の `keepFieldNames`）。 */
+  /**
+   * T31d: UPDATE のシナリオは、変える欄（`fieldNames`）だけの値を返す（保つ欄の値は作らない。UPDATE の指定の `keepFieldNames`）。
+   * T38e: API のシナリオは、送り方と API の指定も見る（本文の鍵ごとの値）。
+   */
   readonly scenario: Pick<
     ScenarioRevision,
-    'scenarioId' | 'profileId' | 'revision' | 'kind' | 'candidate' | 'fieldNames' | 'sideEffectConfirmations' | 'update'
+    'scenarioId' | 'profileId' | 'revision' | 'kind' | 'candidate' | 'fieldNames' | 'sideEffectConfirmations' | 'update' | 'transport' | 'api'
   >;
   /** シナリオの対象の候補（最後の発見の候補の写し）。 */
   readonly candidate: DiscoveryCandidate;
@@ -93,8 +102,22 @@ type AttemptOutcome =
   | { readonly kind: 'STOP'; readonly report: FieldProblemReport };
 
 const report = (fieldName: string, problem: RuleProblem): FieldProblemReport => ({ fieldName, problem });
+/** 10 進の 1 桁の最大（番号・コードの桁。FM2c）。 */
+const MAX_DECIMAL_DIGIT = 9;
 const RELATION_UNSATISFIABLE: RuleProblem = { code: 'RULE_CONFLICT', detail: 'RELATION_UNSATISFIABLE' };
 const UNIQUE_EXHAUSTED: RuleProblem = { code: 'RULE_CONFLICT', detail: 'UNIQUE_COMBINATIONS_EXHAUSTED' };
+const JSON_VALUE_TYPE_MISMATCH: RuleProblem = { code: 'RULE_CONFLICT', detail: 'JSON_VALUE_TYPE_MISMATCH' };
+
+/** T38e: API のシナリオの作った値（文字列だけ）のうち、鍵の JSON の型に変えられない最初の鍵（FORM のシナリオと、なければ null）。 */
+const jsonMismatchKeyOf = (values: Readonly<Record<string, string | null>>, api: ScenarioApiSpec | null): string | null => {
+  if (api === null) {
+    return null;
+  }
+  return api.keyFields.find(({ key, type }) => {
+    const value = values[key];
+    return typeof value === 'string' && !isJsonValueConvertible(value, type);
+  })?.key ?? null;
+};
 
 /** 2 つの汎用の値の空間が同じか（終了と開始を入れ替えてよいか）。 */
 const sameSpace = (left: FieldPlan | undefined, right: FieldPlan | undefined): boolean => {
@@ -228,6 +251,15 @@ const attemptOnce = (
         phoneNumbers.push(value);
         break;
       }
+      case 'DIGIT_CODE': {
+        // FM2c: 番号・コード（桁ごとに 0〜9 を列から選ぶ。欄の制約に合わなければ作り直す）。
+        const value = Array.from({ length: plan.digits }, () => String(stream.nextIntInclusive(0, MAX_DECIMAL_DIGIT))).join('');
+        if (plan.issueOf(value) !== null) {
+          return { kind: 'RETRY', report: report(fieldName, { code: 'NEEDS_RULE_INPUT', detail: 'PATTERN_UNSUPPORTED' }) };
+        }
+        values[fieldName] = value;
+        break;
+      }
       case 'DERIVED_TOTAL':
       case undefined:
         break;
@@ -264,7 +296,9 @@ export const generateScenarioData = (input: ScenarioDataInput): ScenarioDataResu
   if (!isGenericBaseDate(baseDate)) {
     throw new RangeError('the base date must be a real YYYY-MM-DD date');
   }
-  const planned = planRuleSet(ruleSet, scenario, candidate);
+  // FM2c: 保存した規則の基準日からの幅は、この基準日から値の範囲を求める。
+  const planned = planRuleSet(ruleSet, scenario, candidate, baseDate);
+  const api = evaluationApiSpecOf(scenario);
   if (!planned.evaluation.executable) {
     return failed(planned.evaluation.fields.flatMap((field) => (field.problem === null ? [] : [report(field.fieldName, field.problem)])));
   }
@@ -283,6 +317,10 @@ export const generateScenarioData = (input: ScenarioDataInput): ScenarioDataResu
     if (outcome.kind === 'RETRY') {
       last = outcome.report;
       continue;
+    }
+    const mismatchKey = jsonMismatchKeyOf(outcome.values, api);
+    if (mismatchKey !== null) {
+      return failed([report(mismatchKey, JSON_VALUE_TYPE_MISMATCH)]);
     }
     const uniqueKey = uniqueNames.length === 0 ? null : uniqueKeyOf(outcome.values, uniqueNames);
     if (uniqueKey !== null && usedKeys.has(uniqueKey)) {

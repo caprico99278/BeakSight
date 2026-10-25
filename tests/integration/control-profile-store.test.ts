@@ -105,7 +105,7 @@ const snapshot = (): string => JSON.stringify({ profiles: profileRows(), revisio
 const create = (profile: SiteProfile, date = CREATED_AT): ProfileStoreResult => createProfile(database, profile, optionsAt(date));
 
 describe('Control store version 1 tables (design 4.3)', () => {
-  it('creates profiles, profile_revisions and store_meta as STRICT tables', () => {
+  it('creates every table of the current version (profiles, profile_revisions, store_meta and the tables of the later versions) as STRICT tables', () => {
     const tables = database.connection.prepare("SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
     expect(tables).toEqual([
       // T28c: 管理データの版 6 の承認と撤回の記録の表（Task 28 の設計書 4.2）。
@@ -127,6 +127,8 @@ describe('Control store version 1 tables (design 4.3)', () => {
       { name: 'execution_grants', strict: 1 },
       // T24e: 管理データの版 2 の監査のジョブの表（Task 24 の設計書 4.4）。
       { name: 'jobs', strict: 1 },
+      // FM-2: 管理データの版 15 のプロファイルごとの表示の設定の表（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2。DEF-152）。
+      { name: 'profile_display_settings', strict: 1 },
       { name: 'profile_revisions', strict: 1 },
       { name: 'profiles', strict: 1 },
       // T27c: 管理データの版 5 の READ の確かめの結果と定義の表（Task 27 の設計書 4.6）。

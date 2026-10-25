@@ -27,8 +27,16 @@ import {
   type IncompleteReason,
   type ListenerKind,
   type ReadEvidenceDocument,
+  type SubmissionProbeReason,
+  type SubmissionProbeRecord,
+  type SubmissionProbeResult,
 } from '../../../../src/control/discovery-view.js';
-import { candidateOfDiscoveryDocument, mergedDiscoveryCandidatesOf } from '../../../../src/control/discovery-candidate-lookup.js';
+import {
+  candidateOfDiscoveryDocument,
+  candidateOfDiscoveryDocumentByShape,
+  mergedDiscoveryCandidatesOf,
+  submissionProbesOfDiscoveryDocument,
+} from '../../../../src/control/discovery-candidate-lookup.js';
 import { readDiscoveryIndex, type DiscoveryIndexView } from '../../../../src/control/job/discovery-index-store.js';
 import { isReadCheckTargetClassification } from '../../../../src/control/read-check-policy.js';
 import type { ProfileStatus } from '../../../../src/control/store/profile-records.js';
@@ -99,6 +107,16 @@ export interface DiscoveryCandidateDetailView {
   readonly listenerKinds: readonly ListenerKind[];
   readonly inlineHandler: boolean;
   readonly incompleteReasons: readonly IncompleteReason[];
+  /** T37c: 送らずに観察する probe の結果（型ごとの行の順。probe の対象でなければ空）。 */
+  readonly submissionProbes: readonly SubmissionProbeView[];
+}
+
+/** T37c（Task 37 の設計書 3.6）: 送らずに観察する probe の結果 1 件の要点（値は持たない。型の名前だけ）。 */
+export interface SubmissionProbeView {
+  readonly result: SubmissionProbeResult;
+  readonly reason: SubmissionProbeReason | null;
+  /** 型があるときだけ（method、path の型、本文の鍵の名前）。 */
+  readonly shape: { readonly method: string; readonly pathShape: string; readonly bodyKeyNames: readonly string[] } | null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -165,6 +183,14 @@ export const mergedCandidatesOf: (document: DiscoveryDocument | null) => readonl
 export const candidateOfDocument: (document: DiscoveryDocument | null, identityDigest: string) => DiscoveryCandidate | null =
   candidateOfDiscoveryDocument;
 
+/** T38f: 文書の、識別の digest と型の digest の候補の行（なければ null。読み方の owner の公開し直し。API のシナリオの作成と変更の画面）。 */
+export const candidateOfDocumentByShape: (document: DiscoveryDocument | null, identityDigest: string, shapeDigest: string) => DiscoveryCandidate | null =
+  candidateOfDiscoveryDocumentByShape;
+
+/** T37c: 文書の、識別の digest の候補の probe の結果（型ごとの行の順。読み方の owner の公開し直し）。 */
+export const submissionProbesOfDocument: (document: DiscoveryDocument | null, identityDigest: string) => readonly SubmissionProbeRecord[] =
+  submissionProbesOfDiscoveryDocument;
+
 // ---------------------------------------------------------------------------------------------------------------
 // 画面に返す値への写し
 // ---------------------------------------------------------------------------------------------------------------
@@ -196,8 +222,17 @@ export const candidateFieldViewOf = (candidate: DiscoveryCandidate, field: Candi
   };
 };
 
-/** 候補の詳しい内容を、画面に返す値にする。 */
-export const candidateDetailViewOf = (candidate: DiscoveryCandidate): DiscoveryCandidateDetailView => {
+/** T37c: probe の結果を、画面に返す値にする（項目を選んで写す。ヘッダの名前と目印の対応は返さない）。 */
+export const submissionProbeViewOf = (probe: SubmissionProbeRecord): SubmissionProbeView => ({
+  result: probe.result,
+  reason: probe.reason,
+  shape: probe.shape === null
+    ? null
+    : { method: probe.shape.method, pathShape: probe.shape.pathShape, bodyKeyNames: probe.shape.body.keys.map(({ name }) => name) },
+});
+
+/** 候補の詳しい内容を、画面に返す値にする（T37c: `probes` は、同じ識別の digest の行の probe の結果。読み方の owner の `submissionProbesOfDocument`）。 */
+export const candidateDetailViewOf = (candidate: DiscoveryCandidate, probes: readonly SubmissionProbeRecord[] = []): DiscoveryCandidateDetailView => {
   const binding = candidate.jsBinding;
   return {
     kind: candidate.kind,
@@ -212,6 +247,7 @@ export const candidateDetailViewOf = (candidate: DiscoveryCandidate): DiscoveryC
     listenerKinds: [...new Set([...binding.form, ...binding.submitter, ...binding.ancestor, ...binding.document, ...binding.window])],
     inlineHandler: binding.inlineHandler,
     incompleteReasons: [...candidate.incompleteReasons],
+    submissionProbes: probes.map(submissionProbeViewOf),
   };
 };
 

@@ -1,5 +1,6 @@
 import type { Browser, Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
+import { wait } from '../../src/core/deadline.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { collectAccessibilityEvidence } from '../../src/evidence/accessibility-collector.js';
 import { assertPassiveRequestGuardActive } from '../../src/safety/passive-request-guard.js';
@@ -43,7 +44,7 @@ describe('DEF-001: axe in a guarded Passive Context', () => {
       } finally {
         context.off('page', onPage);
       }
-      await new Promise((resolve) => setTimeout(resolve, GUARD_EVENT_SETTLE_MS));
+      await wait(GUARD_EVENT_SETTLE_MS);
 
       let guardActive = true;
       try {

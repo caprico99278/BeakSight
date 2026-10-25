@@ -16,8 +16,8 @@
 //   トークンは読み込みのたびに変わる（目印の接頭辞はそのまま）。
 // - どの画面も、アイコンに `data:` の URL を指定する（ブラウザ自身のアイコンの要求を出さないため）。
 import { randomBytes } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 const STATUS_OK = 200;
 const STATUS_NO_CONTENT = 204;
@@ -365,7 +365,7 @@ export async function startDiscoveryFixture(): Promise<DiscoveryFixture> {
   });
   const bodies = pageBodies(markers);
   const requests: DiscoveryFixtureRequest[] = [];
-  const server = createServer((request: IncomingMessage, response: ServerResponse) => {
+  const server = await startLoopbackHttpServer((request: IncomingMessage, response: ServerResponse) => {
     void (async (): Promise<void> => {
       const path = request.url ?? '/';
       const body = await readBody(request);
@@ -393,17 +393,12 @@ export async function startDiscoveryFixture(): Promise<DiscoveryFixture> {
       response.end(render());
     })();
   });
-  await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
-  const { port } = server.address() as AddressInfo;
-  const origin = `http://127.0.0.1:${port}`;
+  const { origin } = server;
   return {
     origin,
     markers,
     requests,
     url: (path: string): string => `${origin}${path}`,
-    close: () => new Promise<void>((resolveClose) => {
-      server.closeAllConnections();
-      server.close(() => resolveClose());
-    }),
+    close: () => server.close(),
   };
 }

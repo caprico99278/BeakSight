@@ -5,10 +5,12 @@
 // - 承認の判定の今の事実: 規則の新しい版を保存すると、参照を付け直す前でも `INPUT_RULES_CHANGED`。
 // - 許可の発行: 規則の不足は `NEEDS_RULE_INPUT`（欄ごとの問題を添える）、すべて決まれば通る。
 // - 開き直しの後も、規則と参照が残る。
+// - FM2c: 推した規則（出どころの印 `INFERRED`）を保存すると digest に入り、承認に結ばれる。保存してある版 1 の文書は、版 1 の digest のまま読める。
 // 一時のフォルダだけを使い、終わったら消す。例の値は匿名の値だけ。
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   attachInputRuleReference,
@@ -18,8 +20,12 @@ import {
   type ExecutionGrantResult,
 } from '../../src/control/approval/scenario-store.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
-import type { RuleSetContent } from '../../src/control/data-rules/rule-contracts.js';
+import {
+  RULE_SET_SCHEMA_VERSION,
+  type RuleSetContent,
+} from '../../src/control/data-rules/rule-contracts.js';
 import { computeRuleSetDigest } from '../../src/control/data-rules/rule-digest.js';
+import { inferRuleSetContent } from '../../src/control/data-rules/rule-set-inference.js';
 import { ruleFieldNameRejectsFixedValues } from '../../src/control/data-rules/rule-set-policy.js';
 import {
   readLatestRuleSet,
@@ -41,6 +47,8 @@ import {
   ruleSetIdOf,
 } from './execution-grant-fixtures.js';
 
+/** 版 1 の文書の行に書き換える生の接続の、待ちの上限（FM2c）。 */
+const RAW_TIMEOUT_MS = 5_000;
 const SAVED_AT = '20261012040000';
 const LATER_AT = '20261012050000';
 const STATUS_AT = new Date(Date.parse('2026-10-12T06:00:00Z'));
@@ -245,6 +253,52 @@ describe('rule store (T29d): the two steps, the current facts and the issue', ()
     });
     prepareScenario(database, latest, 'scenario-2', { ruleContent: FIXED_CONTENT });
     expect(issue('scenario-2', 'grant-2').ok).toBe(true);
+  });
+
+  it('binds the inferred rules to the approval through the digest, and issues with them (FM2c)', () => {
+    const scenario = prepareScenario(database, latest, 'scenario-1', { attach: false, approve: false });
+    const inferred = inferRuleSetContent(scenario.current, scenario.evidence);
+    expect(inferred.content.fieldRules.map(({ fieldName, origin }) => [fieldName, origin])).toEqual([['name', 'INFERRED'], ['plan', 'INFERRED']]);
+    const first = saveRuleSetAndAttach(database, { ...saveOf({ content: inferred.content }), expectedScenarioRevision: scenario.revision });
+    expect(first.ruleSet.ok && first.attachment?.ok).toBe(true);
+    const stored = readLatestRuleSet(database, 'scenario-1');
+    if (stored === null) {
+      throw new Error('the rule set was not stored');
+    }
+    expect(stored.ruleSet).toMatchObject({ schemaVersion: RULE_SET_SCHEMA_VERSION, fieldRules: inferred.content.fieldRules });
+    expect(stored.reference.digest).toBe(computeRuleSetDigest(stored.ruleSet));
+    expect(readScenario(database, 'scenario-1')?.current.inputRuleReference).toEqual(stored.reference);
+    // 同じ規則を、出どころの印だけ変えて保存すると、digest が変わる（推した規則の印も承認に結ぶ）。
+    const human = saveRuleSet(database, saveOf({
+      expectedRevision: 1, at: LATER_AT,
+      content: { ...inferred.content, fieldRules: inferred.content.fieldRules.map((rule) => ({ ...rule, origin: 'HUMAN' as const })) },
+    }));
+    expect(human.ok && human.reference.digest).not.toBe(stored.reference.digest);
+    // 推した規則だけで、送る欄がすべて決まれば、実行の許可を発行できる。
+    prepareScenario(database, latest, 'scenario-2', { ruleContent: inferRuleSetContent(scenario.current, scenario.evidence).content });
+    expect(issue('scenario-2', 'grant-2').ok).toBe(true);
+  });
+
+  // LG-3（2026-10-24 の設計 3.7.2）: 版 1 の文書の行（FM2c の前に保存した形）は、読み替えずに、契約の形の誤りとして管理データの誤り
+  // （`DATABASE_INTEGRITY_FAILED`）で止まる（人の規則として黙って読まない）。
+  it('stops at a stored version 1 document with DATABASE_INTEGRITY_FAILED (LG-3)', () => {
+    prepareScenario(database, latest, 'scenario-1', { attach: false, approve: false });
+    const saved = saveRuleSet(database, saveOf({ content: FIXED_CONTENT }));
+    if (!saved.ok) {
+      throw new Error('the rule set was not saved');
+    }
+    const v1Document = { ...JSON.parse(JSON.stringify(saved.ruleSet)) as Record<string, unknown>, schemaVersion: 'beaksight-data-rule/1' };
+    const raw = new DatabaseSync(databasePath(), { timeout: RAW_TIMEOUT_MS });
+    try {
+      raw.prepare('UPDATE rule_set_revisions SET document = ? WHERE rule_set_id = ? AND revision = ?')
+        .run(JSON.stringify(v1Document), saved.ruleSet.ruleSetId, saved.ruleSet.revision);
+    } finally {
+      raw.close();
+    }
+    for (const read of [() => readLatestRuleSet(database, 'scenario-1'), () => readRuleSetRevisions(database, 'scenario-1')]) {
+      expect(read).toThrow(expect.objectContaining({ reason: 'DATABASE_INTEGRITY_FAILED' }));
+      expect(read).toThrow(/does not match the contract/u);
+    }
   });
 
   it('keeps the rules and the reference after reopening the database', () => {

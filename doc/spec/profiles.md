@@ -17,6 +17,49 @@
 - 本番とテスト環境は、別のプロファイルにします。
 - URL の文字列や名前（`test`、`staging` など）だけで、BeakSight がテスト環境と見なすことはありません。テスト環境かどうかは、プロファイルの `environment` と、環境の確認の参照（`environmentEvidenceRef`）で決めます。
 
+## 管理画面でのプロファイルの作り方
+
+左のメニューの「新しいプロファイル」で作ります。画面の先頭の「対象のサイトの設定」で、次のどちらかを選びます。
+
+| 選び方 | 内容 |
+| --- | --- |
+| 開始の URL から新しく作る（既定） | 「開始の URL」を入れると、画面がその場で案を埋めます。保存すると、対象の設定のファイルを作ってから、プロファイルを保存します。 |
+| すでにある設定のファイルを使う | 「設定のファイル」で、`config/targets/` か `local/targets/` の中の JSON を選びます（前の使い方。CLI で使っている設定のファイルも選べます）。選ぶと、その場で設定の誤りを確かめます。 |
+
+### 開始の URL からの案
+
+- 「開始の URL」を入れると、次の欄に案を埋めます。案は保存するまで案のままで、変えたい欄だけを直します。
+  - 「名前（profileId）」: ホスト名を、名前の決まり（小文字の英数字とハイフン）に合う形に直したもの。合う形にできなければ空です。
+  - 「許可 Origin（1 行に 1 つ）」: 開始の URL の Origin。ほかの Origin を足すときは、1 行に 1 つ書きます。
+  - 「テスト環境の Origin（1 行に 1 つ）」: テスト環境のモードのとき、許可 Origin を写します。
+- 利用者が直した欄は、その後に開始の URL を変えても、案に追従しません。欄を空に戻すと、また追従します。
+- 開始の URL は、設定のファイルと同じ決まり（`http:` か `https:`、利用者名とパスワードを含まない）で確かめます。fragment（`#` の後）も持てません。
+
+### 作るファイル
+
+- 保存すると、`local/targets/<名前>.json` を作ります（画面の「保存すると作る設定のファイル」に出ます）。中身は、`target.id`（名前）、`site.startUrl`、`site.allowedOrigins`、負荷（`crawl`）と出力（`output`）です。負荷は、最初の監査のための控えめな値で作ります。ページの上限（`crawl.maxPages`）は 3、ページの読み込みの間隔（`crawl.minNavigationIntervalMs`）は 10 秒（`10000`）です（`GENERATED_TARGET_CRAWL_LIMITS`）。ほかの負荷の項目と出力は既定値です（「[既定値](configuration.md#既定値)」）。CLI の既定値（ページの上限 500、間隔 5 秒）は変わりません。
+- **読む範囲を広げるときは、作ったファイルを直します。** `crawl.maxPages` と `crawl.minNavigationIntervalMs` などを、サイトの運営者と決めた値にします（「[サイトへの負荷](site-load.md)」）。ページの上限・時間の上限・読み込みの間隔の 3 つは、プロファイルの詳細の「監査の負荷」でも変えられます（「[管理画面](local-ui.md#サイトへの負荷の決まり)」）。ほかの項目は、画面からは変えられません。ファイルを直したら `node dist/cli/index.js validate-config --config local/targets/<名前>.json` で確かめます。
+- 同じ名前のファイルがあれば、上書きせずに止めます（`TARGET_CONFIG_EXISTS`。プロファイルも作りません）。
+- 名前が Windows の予約名（`con`、`nul`、`aux`、`prn`、`com1`〜`com9`、`lpt1`〜`lpt9` など。大文字と小文字を問いません）のときは、作りません（`TARGET_CONFIG_NAME_RESERVED`。プロファイルも作りません）。名前を入れた時点で、「保存すると作る設定のファイル」に理由が出ます。保存を押しても、欄の誤りとして止まります。
+- 置き場所のフォルダ（`local` か `local/targets`）が、ほかの場所へのリンク（junction・シンボリックリンク）か、フォルダでないときは、何も書かずに止まります（`TARGET_CONFIG_LOCATION_UNSAFE`。プロファイルも作りません）。フォルダがなければ作り、作った後にもう一度確かめます。
+- 書く前に、プロファイルの決まりと設定の決まりで確かめます（合わなければ `TARGET_SITE_INVALID` か `TARGET_CONFIG_INVALID`。ファイルは作りません）。書いた後に読み直してから、プロファイルを保存します。プロファイルの保存に失敗したときは、作ったファイルの中身が同じときだけ消します（途中にリンクがあれば消しません）。
+- ファイルは、一時のファイルに書いてから、ハードリンクで置きます（同じ名前のファイルを上書きしないため）。ハードリンクを張れない置き場所（`local/targets/` のフォルダ）では、書けずに止まります（`TARGET_CONFIG_WRITE_FAILED`。プロファイルも作りません）。
+
+### 欄の出し分けと初めの値
+
+- 「監査モード」を選ぶと、「環境」と「認証の方式」の初めの値を、受ける組み合わせ（下の「[受ける組み合わせ](#受ける組み合わせ)」）に合わせます。
+- 「テスト環境の Origin」の欄は、テスト環境のモード（`TEST_AUTH_PASSIVE`・`TEST_APPROVED_WRITE`）のときだけ出します。
+- 「テスト環境であることを確かめた記録の参照」の欄は、環境がテスト環境（`TEST`）のときだけ出します（公開の監査のモードで環境をテスト環境にしたときも出ます）。
+- 隠した欄の値は送りません。隠した欄に関わる保存の誤りは、フォームの上に出します。
+
+### 保存の後
+
+- 保存すると、「次の手順」のリンク（認証の設定を開く、資格情報を登録する、ログインを確かめる、監査を始める）と、「プロファイルの「次にすること」を見る」が出ます。
+- プロファイルの詳細の欄「次にすること」に、「認証の設定」「資格情報」「ログインの確かめ」「監査の開始」の 4 つの手順を、「済み」「要る」「古い（直す）」「要らない」で並べます。「要る」と「古い（直す）」の手順には、その画面を開くリンク（「…を開く」「…を直す」）が付きます。上から順に済ませます。
+- プロファイルの詳細の欄「監査を始める」から、監査を始められます。始められないとき（書き込みのモード、取り消したプロファイル、今は実行できない認証の方式など）は、ボタンを消さずに理由を出します。
+- 「サイトとプロファイル」の一覧でも、監査を始められない行には、短い理由を出します。
+- ログインの確かめが成功した後にも、「次の手順」のリンクが出ます。
+
 ## プロファイルの形
 
 ```json
@@ -33,7 +76,7 @@
 }
 ```
 
-すべての項目が必須です。知らない項目があると、拒否されます。
+`approvedServiceOrigins` のほかは、すべての項目が必須です。知らない項目があると、拒否されます。
 
 | 項目 | 意味 |
 | --- | --- |
@@ -46,6 +89,7 @@
 | `auth` | 認証の方式（`NONE`、`MANUAL_SESSION`、`AUTOMATED_LOGIN`）。 |
 | `approvedTestOrigins` | テスト環境の認証・書き込みのモードで、認証と書き込みを許す Origin の一覧。 |
 | `environmentEvidenceRef` | テスト環境が本番から隔離されていることを確かめた記録への、秘密を含まない参照（記録の ID など）。隔離が未確認のときは、未確認であることが分かる参照。ないときは `null`。 |
+| `approvedServiceOrigins` | 任意。スクリプトで送るログインの、認証のサービスと API の Origin の一覧（画面の名前「承認したサービスの Origin（1 行に 1 つ）」）。ないときは空と同じです。下の「[`approvedServiceOrigins`](#approvedserviceorigins)」。 |
 
 ## 監査モード、環境、認証の方式
 
@@ -165,6 +209,16 @@
 - `TEST` の環境の `PUBLIC_PASSIVE` では、任意です。`TEST_AUTH_PASSIVE` と `TEST_APPROVED_WRITE` では、必須です。
 - BeakSight が判定するのは、参照があるかと、その形だけです。参照の中身（確かめた記録か、未確認の印か）は読みません。そのため、未確認の参照でも、書き込みの実行の許可を拒みません。書き込み（`TEST_APPROVED_WRITE`）に進む前に、隔離の扱いを人が判断します（「[実テスト環境の手順](real-test-environment.md)」）。
 
+### `approvedServiceOrigins`
+
+- スクリプトで送るログイン（「[スクリプトで送るログイン](authenticated-audit.md#スクリプトで送るログイン)」）で、画面のスクリプトが送る先の、認証のサービスと API の Origin です。任意の項目で、ないときは空と同じです。項目のないプロファイルは、今までと同じ文書のままです。
+- `TEST_AUTH_PASSIVE` と `TEST_APPROVED_WRITE` だけで書けます。`PUBLIC_PASSIVE` では空にします（`PROFILE_SERVICE_ORIGIN_INVALID`）。
+- 4 件までです。同じ値を 2 回書けません（どちらも `PROFILE_SCHEMA_INVALID`）。
+- 書き方は `approvedTestOrigins` と同じです。Origin の正規の書き方で、scheme は `https:`。`http:` は、host がループバックのアドレスのときだけ受けます（`PROFILE_SERVICE_ORIGIN_INVALID`）。
+- 参照するターゲット JSON の `site.allowedOrigins`（監査で読む範囲）に含まれる Origin は書けません（`PROFILE_SERVICE_ORIGIN_INSIDE_TARGET`）。サービスの Origin を書いても、巡回の対象、読み込みの数え方、robots.txt と sitemap.xml の取得の対象は広げません。
+- ログインの段では、この Origin への読み取り（ページの移動でないもの）と、認証の設定に登録した送信だけを通します。監査の段の扱いは今までどおりです（許可 Origin の外への読み取りは送ります）。
+- この項目を変えると、プロファイルの改訂が進みます。認証の設定は保存し直しが要り、書き込みのシナリオの承認は「要再承認」になります（どの項目の編集でも同じです）。
+
 ## 拒否のコード
 
 拒否したときは、次のコード（1 件以上）と、英語の技術的な詳細を返します。管理画面は、項目ごとに日本語の理由を表示します。
@@ -180,6 +234,8 @@
 | `PROFILE_TEST_ORIGIN_INVALID` | `approvedTestOrigins` の値の書き方か scheme の誤り。`PUBLIC_PASSIVE` で `approvedTestOrigins` が空でない場合も、このコードです。 |
 | `PROFILE_TEST_ORIGIN_OUTSIDE_TARGET` | `approvedTestOrigins` の値が、参照するターゲット JSON の `site.allowedOrigins` に含まれない。 |
 | `PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED` | `TEST_AUTH_PASSIVE` か `TEST_APPROVED_WRITE` で、`environmentEvidenceRef` が `null`。値が空白とゼロ幅の文字だけの場合、UTF-16 のコード単位で 200 を超える場合、改行・制御文字・文字の向きを変える文字・対になっていないサロゲートを含む場合も、このコードです。 |
+| `PROFILE_SERVICE_ORIGIN_INVALID` | `approvedServiceOrigins` の値の書き方か scheme の誤り。`PUBLIC_PASSIVE` で空でない場合も、このコードです。 |
+| `PROFILE_SERVICE_ORIGIN_INSIDE_TARGET` | `approvedServiceOrigins` の値が、参照するターゲット JSON の `site.allowedOrigins` に含まれる。 |
 | `PROFILE_REVISION_NOT_ADVANCED` | 改訂の `revision` が、前の改訂より大きくない。前か次の `revision` が、1 以上の正確に扱える整数でない（比べられない）。または、前の改訂と `profileId` が違う。 |
 
 形が正しいときは、当たった規則のコードを、すべて返します（例: `PUBLIC` の環境の `TEST_AUTH_PASSIVE` と `NONE` は、`PROFILE_MODE_ENVIRONMENT_MISMATCH` と `PROFILE_AUTH_MISMATCH` の両方を返します。`approvedTestOrigins` や `environmentEvidenceRef` にも誤りがあれば、そのコードも返します）。
@@ -197,6 +253,5 @@
 プロファイルのない、これまでのターゲット JSON だけの監査は、つねに `PUBLIC_PASSIVE` です。
 
 - ターゲット JSON には、監査モードを書けません。`mode`、`environment`、`auth`、`profile` などの項目を書くと、知らない項目として設定のエラー（`unknown configuration key`）になります。
-- プロファイルのないターゲット JSON は、次のプロファイルと同じに扱います: `environment` が `PUBLIC`、`mode` が `PUBLIC_PASSIVE`、`auth` が `NONE`、`approvedTestOrigins` が空、`environmentEvidenceRef` が `null`、`revision` が `1`。
-- このときの `profileId` は、`target.id` から作ります。小文字にし、小文字の英数字とハイフン以外を `-` にし、続く `-` を 1 つにまとめ、先頭の `-` を除き、63 文字までにします（例: `Example_Site` は `example-site`）。それでも上の形に合わなければ、`legacy-target` にします。
+- プロファイルのないターゲット JSON での監査（CLI）は、認証のない公開の監査です。管理データにプロファイルを作りません。
 - 公開の監査の判定（Guard）、URL の扱い、停止と再開、出力の形式（「[出力](output.md)」）は、プロファイルの追加の前と変わりません。

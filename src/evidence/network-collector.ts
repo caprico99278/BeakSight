@@ -1,6 +1,8 @@
 import type { Frame, Page, Request, Response } from 'playwright';
+import { isBlockedByClientFailure } from '../core/blocked-by-client-failures.js';
 import { safeErrorMessage } from '../core/errors.js';
 import type {
+  BlockedEventPhase,
   HeaderEvidence,
   NetworkEvidence,
   NetworkFailureEvidence,
@@ -274,8 +276,25 @@ function isMainFrameRequest(page: Page, request: Request): boolean | null {
   return frame === mainFrame;
 }
 
+/**
+ * BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 3）: `NetworkCollector.attach` の省略できる指定。
+ * - `phaseOf`: 失敗を記録する時点の印を読む口（呼び出し側が、Guard の時点の決め方 `pageEventPhaseOf` を渡す）。省略は `LOAD`（Guard のない page）。口の例外も `LOAD`。
+ */
+export interface NetworkCollectorOptions {
+  readonly phaseOf?: (() => BlockedEventPhase) | undefined;
+}
+
+const LOAD_PHASE: BlockedEventPhase = 'LOAD';
+
 export class NetworkCollector {
-  static attach(page: Page): CollectorHandle<NetworkEvidence> {
+  static attach(page: Page, options: NetworkCollectorOptions = {}): CollectorHandle<NetworkEvidence> {
+    const phaseOf = (): BlockedEventPhase => {
+      try {
+        return options.phaseOf?.() ?? LOAD_PHASE;
+      } catch {
+        return LOAD_PHASE;
+      }
+    };
     let nextRequestSequence = 1;
     const requestIds = new WeakMap<Request, string>();
     const requestRecords = new WeakMap<Request, MutableNetworkRequestEvidence>();
@@ -367,7 +386,8 @@ export class NetworkCollector {
       }
       const url = truncateText(request.url(), MAX_URL_LENGTH);
       const method = truncateText(request.method(), MAX_HTTP_METHOD_LENGTH);
-      const errorText = truncateText(request.failure()?.errorText ?? 'UNKNOWN_REQUEST_FAILURE', MAX_ERROR_MESSAGE_LENGTH);
+      const failureText = request.failure()?.errorText ?? 'UNKNOWN_REQUEST_FAILURE';
+      const errorText = truncateText(failureText, MAX_ERROR_MESSAGE_LENGTH);
       failures.push(Object.freeze({
         requestId: requestRecord.requestId,
         url: url.text,
@@ -378,6 +398,9 @@ export class NetworkCollector {
         isNavigationRequest: requestRecord.isNavigationRequest,
         isMainFrame: requestRecord.isMainFrame,
         truncated: url.truncated || method.truncated || errorText.truncated,
+        // BN-a: BeakSight が止めた要求の失敗か（切り詰める前の文を、遮断の失敗の理由の唯一の判定で照らす）と、記録した時点。
+        blockedByBeakSight: isBlockedByClientFailure(failureText),
+        phase: phaseOf(),
       }));
     };
     const onRequestFinished = (request: Request): void => {

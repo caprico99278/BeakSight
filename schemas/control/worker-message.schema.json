@@ -5,12 +5,16 @@
     { "$ref": "#/$defs/start" },
     { "$ref": "#/$defs/stop" },
     { "$ref": "#/$defs/writeRecheckResult" },
+    { "$ref": "#/$defs/loginConfirmed" },
+    { "$ref": "#/$defs/nextStage" },
+    { "$ref": "#/$defs/chainEnd" },
     { "$ref": "#/$defs/ready" },
     { "$ref": "#/$defs/runStarted" },
     { "$ref": "#/$defs/progress" },
     { "$ref": "#/$defs/notice" },
     { "$ref": "#/$defs/authState" },
     { "$ref": "#/$defs/heartbeat" },
+    { "$ref": "#/$defs/runFinalizing" },
     { "$ref": "#/$defs/finished" },
     { "$ref": "#/$defs/failed" },
     { "$ref": "#/$defs/writeRecheckRequest" },
@@ -29,7 +33,7 @@
         "protocol": { "$ref": "#/$defs/protocol" },
         "type": { "const": "START" },
         "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
-        "jobKind": { "enum": ["AUDIT", "LOGIN_CHECK", "DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE"] },
+        "jobKind": { "enum": ["AUDIT", "LOGIN_CHECK", "DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE", "ENTRY_CHECK"] },
         "targetConfigPath": { "$ref": "#/$defs/path" },
         "startNew": { "type": "boolean" },
         "targetConfigSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
@@ -40,7 +44,30 @@
           "maxItems": 20,
           "items": { "$ref": "#/$defs/startReadCheck" }
         },
-        "write": { "$ref": "#/$defs/startWrite" }
+        "write": { "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }] },
+        "showJobBrowser": {
+          "description": "FM-2: launch the job browser headed (the display setting of the profile, read by the parent when the job starts). Only for the job kinds that launch the run browser.",
+          "type": "boolean"
+        },
+        "auditSendPolicy": {
+          "description": "AS-b: the audit send policy of the profile (read by the parent when the job starts; the value list is owned by src/core/audit-send-policy.ts). Only for the audit, discovery and READ check jobs. The worker applies it as an override of audit.sendPolicy; absent means READ_ONLY.",
+          "enum": ["READ_ONLY", "PASS_EXCEPT_DELETE"]
+        },
+        "profileName": {
+          "description": "PRE42-BN: the profile name (read by the parent when the job starts), used only in the file name of the ChatGPT bundle (the name part is made by src/core/artifact-layout.ts). Only for the audit job. Absent means the bundle name without the name part.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "chain": {
+          "description": "FM2d: the stage sequence of the chained run (one login, then the stages in one worker). The closed list of the sequences and the first stage being the job kind are checked by worker-protocol.ts. Only with the authentication.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stages"],
+          "properties": {
+            "stages": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "$ref": "#/$defs/chainStageKind" } }
+          }
+        }
       }
     },
     "startWrite": {
@@ -154,6 +181,67 @@
         "approvalFacts": { "$ref": "urn:beaksight:schema:approval-summary:1.0#/$defs/facts" }
       }
     },
+    "startApiWrite": {
+      "description": "The write specification of a WRITE_CREATE START of an API scenario (T40a; Task 40 design 3.2, 4). The parent puts it after it consumed the execution grant, generated the values and recorded the attempt, as for the form write specification. The API spec is the approved spec of the scenario (the request shape, the keys with their JSON types and input fields, the keys the page decides, the header names the page supplies and the way to take the record id), referenced from the scenario schema and not copied. The values are the generated values of the keys of the fields only (no value of a key the page decides; the worker reads them from the sent request). The submitter identity digest is the identity digest of the candidate on the page of the write. The verification READ may be a page path template with {id} (only for an API scenario; the worker puts the record id it took). Never a credential, a cookie, an authorization value, a CSRF token or a hidden value. worker-protocol.ts checks the rules the schema cannot express (CREATE only, POST, the approved service origin, the keys of the values and their JSON types, the template READ).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "scenarioId", "scenarioRevision", "grantId", "profileId", "seedRecord", "formPage", "candidate", "submitterIdentityDigest", "api", "values", "verification", "readVerification", "approvalFacts"],
+      "properties": {
+        "transport": { "const": "API" },
+        "scenarioId": { "$ref": "#/$defs/startWrite/properties/scenarioId" },
+        "scenarioRevision": { "$ref": "#/$defs/startWrite/properties/scenarioRevision" },
+        "grantId": { "$ref": "#/$defs/startWrite/properties/grantId" },
+        "profileId": { "$ref": "#/$defs/startWrite/properties/profileId" },
+        "seedRecord": { "$ref": "#/$defs/startWrite/properties/seedRecord" },
+        "formPage": { "$ref": "#/$defs/startWrite/properties/formPage" },
+        "candidate": { "$ref": "#/$defs/startWrite/properties/candidate" },
+        "submitterIdentityDigest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "api": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/api" },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 64,
+          "propertyNames": { "minLength": 1, "maxLength": 64 },
+          "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
+        },
+        "verification": {
+          "description": "T40a-fix (Task 40 design 7, the designer's decision on the verification spec of an API scenario): the success and the input error conditions are not used for an API write (always null); the record id way of the verification spec may be null when the API spec takes the record id from a key of the response body (worker-protocol.ts rejects both null).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["successCondition", "inputErrorCondition", "recordId"],
+          "properties": {
+            "successCondition": { "type": "null" },
+            "inputErrorCondition": { "type": "null" },
+            "recordId": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/recordId" }, { "type": "null" }] }
+          }
+        },
+        "readVerification": { "$ref": "#/$defs/startReadCheck" },
+        "approvalFacts": { "$ref": "#/$defs/startWrite/properties/approvalFacts" },
+        "update": {
+          "description": "T41b (Task 41 design 3.2, 8 the designer's decision (2)): the update block of a WRITE_UPDATE START of an API scenario, required for WRITE_UPDATE only: the id of the target record copied from the execution grant (the same definition as the update block of a form). No value of a kept key or of a key the page decides (the worker reads them from the page). worker-protocol.ts checks the rules the schema cannot express (PATCH, the filter, the ledger, the kept keys, the templated identity digest, the concrete page path).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targetRecordId", "knownKeptValues"],
+          "properties": {
+            "targetRecordId": { "$ref": "#/$defs/startWrite/properties/update/properties/targetRecordId" },
+            "knownKeptValues": {
+              "description": "T41R3-fix-B (Task 41 design 8, T41R3 C-3 and the user decision to compare an API update with the ledger; it replaced the T41R2-fix-B list of names): the last value known by the ledger (the registration and the verified updates, the empty value too) of each kept key. The values are the test values BeakSight made, as for the values. worker-protocol.ts checks that the keys are kept keys of the API spec, each once.",
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "value"],
+                "properties": {
+                  "key": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/apiKey" },
+                  "value": { "type": "string", "maxLength": 8192 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "startReadCheck": {
       "description": "One READ check definition of START (Task 27 design 4.5; T27e). The definition content is the read-check-definition schema, referenced and not copied. The worker never reads the control data, so the parent puts the definitions here. Secret-like parameter names are rejected by worker-protocol.ts.",
       "type": "object",
@@ -184,11 +272,18 @@
       "additionalProperties": false,
       "required": ["setup", "approvedTestOrigins", "authenticationSha256"],
       "properties": {
-        "setup": { "$ref": "urn:beaksight:schema:control:auth-setup:2" },
+        "setup": { "$ref": "urn:beaksight:schema:control:auth-setup:3" },
         "approvedTestOrigins": {
           "type": "array",
           "minItems": 1,
           "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "approvedServiceOrigins": {
+          "description": "The approved service origins of the profile (T34a; Task 34 design 3.1, 3.2). Optional; absent is the same as empty. Not in authenticationSha256.",
+          "type": "array",
+          "maxItems": 4,
           "uniqueItems": true,
           "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
         },
@@ -226,6 +321,43 @@
         "type": { "const": "WRITE_RECHECK_RESULT" },
         "allowed": { "type": "boolean" },
         "reason": { "anyOf": [{ "enum": ["GRANT_INVALID", "FACTS_UNAVAILABLE", "RECHECK_REPEATED"] }, { "type": "null" }] }
+      }
+    },
+    "loginConfirmed": {
+      "description": "The user finished the manual login (parent to worker; ML-a, the manual login pass-through design 2.2). Sent once while the manual login job awaits the login; no item.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "LOGIN_CONFIRMED" }
+      }
+    },
+    "chainStageKind": {
+      "description": "FM2d: a stage kind of the chained run (WORKER_CHAIN_STAGE_KINDS).",
+      "enum": ["AUDIT", "DISCOVERY", "READ_CHECK"]
+    },
+    "nextStage": {
+      "description": "FM2d: start the next stage of the chained run (parent to worker). Sent once after the FINISHED of a middle stage, after the parent closed the job row of the stage and created the job row of the next stage. The READ check stage has the definitions (the same shape as the START readChecks).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "jobId", "jobKind"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "NEXT_STAGE" },
+        "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
+        "jobKind": { "enum": ["DISCOVERY", "READ_CHECK"] },
+        "readChecks": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/startReadCheck" } }
+      }
+    },
+    "chainEnd": {
+      "description": "FM2d: do not start the next stage of the chained run (parent to worker); no item. The worker ends with the exit code of the stage it finished.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "CHAIN_END" }
       }
     },
     "writeRecheckRequest": {
@@ -360,6 +492,18 @@
         "minIntervalMs": { "$ref": "#/$defs/count" }
       }
     },
+    "serviceRequestPacingWait": {
+      "description": "DEF-141: the audit waits before the next load by the per minute limit of the requests to the approved service origins (the wait, and the times and the total of the waits of the whole Run including this one).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "waitMs", "waitCount", "totalWaitMs"],
+      "properties": {
+        "kind": { "const": "SERVICE_REQUEST_PACING_WAIT" },
+        "waitMs": { "type": "integer", "minimum": 1, "maximum": 60000 },
+        "waitCount": { "type": "integer", "minimum": 1 },
+        "totalWaitMs": { "type": "integer", "minimum": 1 }
+      }
+    },
     "notice": {
       "type": "object",
       "additionalProperties": false,
@@ -368,7 +512,11 @@
         "protocol": { "$ref": "#/$defs/protocol" },
         "type": { "const": "NOTICE" },
         "notice": {
-          "oneOf": [{ "$ref": "#/$defs/siteUnavailableRecheck" }, { "$ref": "#/$defs/siteUnavailableSlowdown" }]
+          "oneOf": [
+            { "$ref": "#/$defs/siteUnavailableRecheck" },
+            { "$ref": "#/$defs/siteUnavailableSlowdown" },
+            { "$ref": "#/$defs/serviceRequestPacingWait" }
+          ]
         }
       }
     },
@@ -383,7 +531,229 @@
           "enum": ["AWAITING_LOGIN", "AUTHENTICATED", "AUTH_SETUP_REQUIRED", "UNSUPPORTED_AUTH_STATE", "SESSION_LOST", "LOGIN_TIMEOUT", "LOGIN_ATTEMPTS_EXCEEDED", "AUTOMATED_LOGIN_FAILED"]
         },
         "sessionLostUrl": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 2048 }, { "type": "null" }] },
-        "automatedLogin": { "$ref": "#/$defs/automatedLoginReport" }
+        "automatedLogin": { "$ref": "#/$defs/automatedLoginReport" },
+        "scriptLogin": { "$ref": "#/$defs/scriptLoginCounts" },
+        "blockedRequests": { "$ref": "#/$defs/loginStageBlockedRequests" },
+        "loginObservation": { "$ref": "#/$defs/loginObservation" },
+        "passedRequests": {
+          "description": "ML-a: the non-read requests passed in the manual login stage, in the same form as the blocked requests (the reason is the one they would have been blocked with); never a value.",
+          "$ref": "#/$defs/loginStageBlockedRequests"
+        },
+        "sessionLoss": {
+          "description": "DEF-138: the evidence of the load where the session was lost (SESSION_LOST only; the same shape as authentication.sessionLoss of run.json); never a whole URL, a query value, a token or a cookie value.",
+          "$ref": "urn:beaksight:schema:run:1.0#/$defs/sessionLoss"
+        },
+        "loginStateNames": { "$ref": "#/$defs/loginStateNames" }
+      }
+    },
+    "loginStateNameShape": {
+      "description": "DEF-139: the shape of a name (the general words at the ends only, as the login observation); null when the name has no such shape. Never the whole name.",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["prefix", "suffix"],
+          "properties": {
+            "prefix": { "type": "string", "minLength": 0, "maxLength": 65 },
+            "suffix": { "type": "string", "minLength": 0, "maxLength": 65 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "loginStateNameOutcome": { "enum": ["CARRIED", "OUTSIDE_APPROVED"] },
+    "loginStateStorageNames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rows", "unlisted"],
+      "properties": {
+        "rows": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["origin", "shape", "outcome", "count"],
+            "properties": {
+              "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+              "shape": { "$ref": "#/$defs/loginStateNameShape" },
+              "outcome": { "$ref": "#/$defs/loginStateNameOutcome" },
+              "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+            }
+          }
+        },
+        "unlisted": { "$ref": "#/$defs/count" }
+      }
+    },
+    "loginStateNames": {
+      "description": "DEF-139 (design 2.1): the names of the browser state after the login stage and whether each was carried to the audit. Cookies: the domain, the path, host-only and the name shape; local storage keys and IndexedDB databases: the origin and the name shape. Never a value, the contents or a whole name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cookies", "localStorage", "indexedDB"],
+      "properties": {
+        "cookies": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rows", "unlisted"],
+          "properties": {
+            "rows": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["domain", "path", "hostOnly", "shape", "outcome", "count"],
+                "properties": {
+                  "domain": { "type": "string", "minLength": 0, "maxLength": 254 },
+                  "path": { "type": "string", "minLength": 0, "maxLength": 256 },
+                  "hostOnly": { "type": "boolean" },
+                  "shape": { "$ref": "#/$defs/loginStateNameShape" },
+                  "outcome": { "$ref": "#/$defs/loginStateNameOutcome" },
+                  "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+                }
+              }
+            },
+            "unlisted": { "$ref": "#/$defs/count" }
+          }
+        },
+        "localStorage": { "$ref": "#/$defs/loginStateStorageNames" },
+        "indexedDB": { "$ref": "#/$defs/loginStateStorageNames" }
+      }
+    },
+    "loginObservation": {
+      "description": "What the login stage observed (T43d; Task 43 design 4.4; T43R-fix C-1): the prefixes and the suffixes of the new local storage key names of the login page origin (the first and the last parts only; never the middle part, the whole name or a value), the proposal of the success screen selector (a CSS of a logout attribute and a logout word of the closed list; never the element text), and the number of the proposals discarded because they carried the login credential (automated login).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "storageKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "shapes", "omitted"],
+          "properties": {
+            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "shapes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["prefix", "suffix"],
+                "properties": {
+                  "prefix": { "type": "string", "minLength": 0, "maxLength": 65 },
+                  "suffix": { "type": "string", "minLength": 0, "maxLength": 65 }
+                }
+              }
+            },
+            "omitted": { "$ref": "#/$defs/count" }
+          }
+        },
+        "successSelector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["selector", "kind", "logoutWord"],
+          "properties": {
+            "selector": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "kind": { "enum": ["LOGOUT_CONTROL"] },
+            "logoutWord": { "enum": ["logout", "signout", "sign-out", "log-out", "ログアウト"] }
+          }
+        },
+        "credentialDiscarded": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "loginFields": {
+          "description": "FM2e (fewer manual steps design 3A.4): the CSS proposals of the three login fields (user name, password, submit) detected at the start of the manual login stage, each only when the field has exactly one visible candidate (null otherwise). Never a field value.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["username", "password", "submit"],
+          "properties": {
+            "username": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+            "password": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+            "submit": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }
+          }
+        }
+      }
+    },
+    "loginStageBlockedRequests": {
+      "description": "The non-read requests blocked in the login stage (T34e; Task 34 design 3.5). The origin and the path only; never a query, a fragment, a body or a value. A path with a secret-like name part is the redacted marker.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "unlisted"],
+      "properties": {
+        "requests": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["origin", "path", "resourceType", "reason", "count"],
+            "properties": {
+              "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+              "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+              "resourceType": {
+                "enum": ["document", "stylesheet", "image", "media", "font", "script", "texttrack", "xhr", "fetch", "prefetch", "eventsource", "websocket", "manifest", "signedexchange", "ping", "cspviolationreport", "preflight", "fedcm", "other"]
+              },
+              "reason": {
+                "enum": ["TOKEN_REQUEST_OVER_LIMIT", "TOKEN_REQUEST_NOT_SCRIPT", "TOKEN_REQUEST_QUERY_MISMATCH", "SIDE_REQUEST_OVER_LIMIT", "SIDE_REQUEST_NOT_SCRIPT", "UNREGISTERED_NON_READ", "NON_READ_METHOD"]
+              },
+              "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+              "beforeToken": {
+                "description": "ML-a-fix: the row was first seen before the first token request of the login stage (the passed requests of the manual login stage only; true only; never a value).",
+                "const": true
+              },
+              "query": {
+                "description": "T43d: the query names (never a value) and the value of a name in the closed list (grant_type) when it is a short fixed word.",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["names", "omitted", "values"],
+                "properties": {
+                  "names": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+                  "omitted": { "$ref": "#/$defs/count" },
+                  "values": {
+                    "type": "array",
+                    "maxItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["name", "value"],
+                      "properties": {
+                        "name": { "enum": ["grant_type"] },
+                        "value": { "type": "string", "minLength": 1, "maxLength": 32 }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "unlisted": { "$ref": "#/$defs/count" }
+      }
+    },
+    "scriptLoginCounts": {
+      "description": "The counts of the script login stage (Task 34 design 3.5). Counts only; never a URL, a body or a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokenRequestsAllowed", "sideRequestsAllowed", "serviceOriginReads", "blockedByReason"],
+      "properties": {
+        "tokenRequestsAllowed": { "$ref": "#/$defs/count" },
+        "sideRequestsAllowed": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/count" } },
+        "serviceOriginReads": { "$ref": "#/$defs/count" },
+        "blockedByReason": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["TOKEN_REQUEST_OVER_LIMIT", "TOKEN_REQUEST_NOT_SCRIPT", "TOKEN_REQUEST_QUERY_MISMATCH", "SIDE_REQUEST_OVER_LIMIT", "SIDE_REQUEST_NOT_SCRIPT", "UNREGISTERED_NON_READ", "LOGIN_CREDENTIAL_IN_REQUEST"],
+          "properties": {
+            "TOKEN_REQUEST_OVER_LIMIT": { "$ref": "#/$defs/count" },
+            "TOKEN_REQUEST_NOT_SCRIPT": { "$ref": "#/$defs/count" },
+            "TOKEN_REQUEST_QUERY_MISMATCH": { "$ref": "#/$defs/count" },
+            "SIDE_REQUEST_OVER_LIMIT": { "$ref": "#/$defs/count" },
+            "SIDE_REQUEST_NOT_SCRIPT": { "$ref": "#/$defs/count" },
+            "UNREGISTERED_NON_READ": { "$ref": "#/$defs/count" },
+            "LOGIN_CREDENTIAL_IN_REQUEST": {
+              "description": "The requests carrying the login credentials blocked on an automated login (T36c). Required on the IPC (T36R-fix); a version 11 control data row stored before T36c lacks this key and is read as zero by the job store. Never a row reason.",
+              "$ref": "#/$defs/count"
+            }
+          }
+        }
       }
     },
     "automatedLoginReport": {
@@ -415,6 +785,16 @@
         "type": { "const": "HEARTBEAT" }
       }
     },
+    "runFinalizing": {
+      "description": "DEF-143: the worker enters the finalizing stage of the Run (aggregation, writing the outputs, cleaning up after a stop). The parent uses the longer heartbeat limit of the finalizing stage after it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "RUN_FINALIZING" }
+      }
+    },
     "outcome": {
       "type": "object",
       "additionalProperties": false,
@@ -436,7 +816,28 @@
         "type": { "const": "FINISHED" },
         "outcome": { "$ref": "#/$defs/outcome" },
         "discovery": { "$ref": "#/$defs/discoverySummary" },
-        "readCheck": { "$ref": "#/$defs/readCheckSummary" }
+        "readCheck": { "$ref": "#/$defs/readCheckSummary" },
+        "entryCheck": { "$ref": "#/$defs/entryCheckSummary" },
+        "incompleteReasonCodes": {
+          "description": "FM2d: the incomplete reason codes of a stage of the chained run (codes only; no detail, no URL; INCOMPLETE_REASON_CODES of src/core/contracts.ts). Only for the outcome kind RAN.",
+          "type": "array",
+          "maxItems": 41,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["DEADLINE_EXCEEDED", "EVALUATION_FAILED", "PAGE_CLOSED", "NAVIGATION_FAILED", "DOM_READINESS_FAILED", "SCROLL_TARGET_UNRESOLVED", "SCROLL_NOT_ADVANCED", "INNER_SCROLL_CONTAINER_NOT_TRAVERSED", "INNER_SCROLL_SCAN_LIMIT_REACHED", "SCROLL_TARGET_UNSTABLE", "POSITION_NOT_AT_ORIGIN", "LAYOUT_COMPARISON_LIMIT_REACHED", "RESOURCE_LIMIT_REACHED", "INVALID_BROWSER_DATA", "PAGE_NAVIGATION_LIMIT_REACHED", "PAGE_SUBRESOURCE_LIMIT_REACHED", "PREFLIGHT_FAILED", "RUN_DIRECTORY_UNAVAILABLE", "SAFETY_INVARIANT_VIOLATION", "SAFETY_LEDGER_TRUNCATED", "UNHANDLED_FAILURE", "MAX_PAGES_REACHED", "MAX_DEPTH_REACHED", "MAX_RUNTIME_REACHED", "REQUIRED_ARTIFACT_INVALID", "EXECUTION_INCOMPLETE", "REQUIRED_WORK_SKIPPED", "REQUIRED_WORK_BLOCKED", "REQUIRED_WORK_TIMED_OUT", "REQUIRED_WORK_NOT_OBSERVED", "REQUIRED_WORK_NOT_VERIFIED", "REQUIRED_WORK_FAILED", "COLLECTOR_INCOMPLETE", "RULE_EVALUATION_FAILED", "PAGE_CRASHED", "SAFETY_VIOLATION_ABORT", "CHECKPOINT_WRITE_FAILED", "RUN_INTERRUPTED", "SITE_UNAVAILABLE", "AUTH_SESSION_LOST", "SERVICE_REQUEST_LIMIT_REACHED"]
+          }
+        }
+      }
+    },
+    "entryCheckSummary": {
+      "description": "T43c (Task 43 design 4.3): the summary of entry-check.json of an entry check job (the end reason, whether the page looks like a login page, and the number of the proposed selectors). Never a URL, a selector or a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endReason", "loginPage", "proposedSelectors"],
+      "properties": {
+        "endReason": { "enum": ["READ", "LEFT_ALLOWED_ORIGINS", "READ_FAILED", "NAVIGATION_FAILED", "PREFLIGHT_FAILED", "STOPPED", "SAFETY_VIOLATION"] },
+        "loginPage": { "type": ["boolean", "null"] },
+        "proposedSelectors": { "type": "integer", "minimum": 0, "maximum": 3 }
       }
     },
     "readCheckSummary": {
@@ -445,7 +846,9 @@
       "required": ["checks", "executed"],
       "properties": {
         "checks": { "type": "integer", "minimum": 0, "maximum": 20 },
-        "executed": { "type": "integer", "minimum": 0, "maximum": 20 }
+        "executed": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "authentication": { "$ref": "#/$defs/auditStageSummary" },
+        "safetyViolation": { "$ref": "#/$defs/jobSafetyViolation" }
       }
     },
     "discoverySummary": {
@@ -455,8 +858,18 @@
       "properties": {
         "pagesRead": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "pagesNotRead": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "candidates": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+        "candidates": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "authentication": { "$ref": "#/$defs/auditStageSummary" },
+        "safetyViolation": { "$ref": "#/$defs/jobSafetyViolation" }
       }
+    },
+    "jobSafetyViolation": {
+      "description": "Optional (DEF-144): the content of the invariant violation that stopped a discovery or READ check job (the same value as safetyViolation of discovery.json and read-evidence.json; the shape of run.json). Never a body, a query value, a cookie or a token.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/jobSafetyViolation"
+    },
+    "auditStageSummary": {
+      "description": "Optional (T37a; Task 37 design 3.1): the counts of the audit stage of a discovery or READ check job (the same shape as authentication of run.json, discovery.json and read-evidence.json). Counts only; never a URL or a value.",
+      "$ref": "urn:beaksight:schema:run:1.0#/$defs/auditStageCounts"
     },
     "failed": {
       "type": "object",

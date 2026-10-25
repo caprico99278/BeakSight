@@ -9,7 +9,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { LOGIN_FORM_INVALID_REASONS } from '../../src/browser/login-form-submitter.js';
-import { AUTH_SETUP_SCHEMA_VERSION_2, AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
+import {AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS, type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import {
   AUTOMATED_LOGIN_FAILURE_RESULTS,
   AUTOMATED_LOGIN_RESULTS,
@@ -45,7 +46,7 @@ const CREDENTIAL_ROOT = resolve(process.cwd(), 'example-root');
 const RETRY_AFTER_UNTIL = '20261010120000';
 
 const MANUAL_SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-auto',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,

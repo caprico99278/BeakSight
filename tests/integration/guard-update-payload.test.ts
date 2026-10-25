@@ -140,6 +140,8 @@ describe.each(CHROMIUM_LAUNCHES)('T31c: the update payload in the write stage of
     await page.goto(server.formUrl(variant, enctype));
     await monitor.openSubmissionWindow(page);
     await page.fill('#customer_name', NEW_NAME);
+    // T40R-fix-A: 値を入れる間は窓の観察の段。押す直前に送信の段を開く（書き込みの入力の部品と同じ順）。
+    monitor.openSubmissionPhase();
     await Promise.all([
       page.waitForEvent('framenavigated', { timeout: NAVIGATION_SETTLE_TIMEOUT_MS }).catch(() => undefined),
       page.click('#go'),

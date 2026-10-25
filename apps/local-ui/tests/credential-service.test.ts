@@ -13,16 +13,16 @@ import { mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  AUTH_SETUP_SCHEMA_VERSION_2,
-  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
+import {  AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { SITE_PROFILE_SCHEMA_VERSION, type SiteProfile } from '../../../src/control/contracts.js';
 import {
   CREDENTIAL_DIRECTORY_NAME,
   CREDENTIAL_PARENT_DIRECTORY_NAME,
   MAX_CREDENTIAL_VALUE_LENGTH,
+  MIN_CREDENTIAL_VALUE_LENGTH,
   createCredentialStoreWith,
   type CredentialStore,
 } from '../../../src/control/credentials/credential-store.js';
@@ -83,7 +83,7 @@ const profileOf = (profileId: string, auth: SiteProfile['auth'], revision = FIRS
 });
 
 const automatedSetupOf = (loginOrigin: string, revision = FIRST_REVISION): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: AUTO_PROFILE,
   profileRevision: revision,
   loginStartUrl: `${loginOrigin}/login`,
@@ -208,12 +208,16 @@ describe('T26e: the credential page values', () => {
       eligible: true,
       environment: 'AVAILABLE',
       maxValueLength: MAX_CREDENTIAL_VALUE_LENGTH,
+      // T36c（Task 36 の設計者の判断 2）: 欄の説明の下限も、サーバが渡す（意図して足した期待）。
+      minValueLength: MIN_CREDENTIAL_VALUE_LENGTH,
       currentLoginOrigin: TEST_ORIGIN,
       credential: null,
       originMatches: null,
       readError: null,
       hold: null,
       inUse: false,
+      // FM2e（意図して足した期待）: 1 回の操作で自動ログインの設定を終える欄は、手動のログインのプロファイルだけ（自動ログインのプロファイルは `null`）。
+      automatedLoginSetup: null,
     });
     expect(await credentialPageOf(deps(), 'not-there')).toBeNull();
   });
@@ -245,6 +249,10 @@ describe('T26e: registering a credential', () => {
   it('requires both the user name and the password, and records nothing on a rejection', async () => {
     expect(await register({ username: '' })).toEqual({ ok: false, reason: 'CREDENTIAL_VALUE_EMPTY', field: 'username' });
     expect(await register({ password: '', passwordConfirmation: '' })).toEqual({ ok: false, reason: 'CREDENTIAL_VALUE_EMPTY', field: 'password' });
+    // T36c（設計者の判断 2）: 下限より短い値は拒む（項目の名前だけ）。
+    const short = 'x'.repeat(MIN_CREDENTIAL_VALUE_LENGTH - 1);
+    expect(await register({ username: short })).toEqual({ ok: false, reason: 'CREDENTIAL_VALUE_TOO_SHORT', field: 'username' });
+    expect(await register({ password: short, passwordConfirmation: short })).toEqual({ ok: false, reason: 'CREDENTIAL_VALUE_TOO_SHORT', field: 'password' });
     expect(existsSync(credentials.store.directory)).toBe(false);
     expect(eventKinds()).toEqual([]);
   });

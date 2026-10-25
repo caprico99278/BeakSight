@@ -46,6 +46,7 @@ const evidenceOf = (): ActionEvidenceDocument => ({
   readVerification: {
     readCheckId: 'rc-verify',
     readCheckRevision: 1,
+    targetKind: 'CANDIDATE',
     targetIdentityDigest: `sha256:${'a'.repeat(64)}`,
     state: 'EXECUTED',
     result: 'MATCHED',
@@ -62,6 +63,9 @@ const evidenceOf = (): ActionEvidenceDocument => ({
   reason: 'READ_VERIFICATION_MATCHED',
   startedAt: '20261015010000',
   finishedAt: '20261015010030',
+  // T40c: 版 1.1 の送り方と API の要約（FORM）。
+  transport: 'FORM',
+  api: null,
 });
 
 const summaryOf = (): ApprovalSummaryDocument => ({
@@ -83,7 +87,8 @@ afterEach(() => {
 
 describe('T32e: writing the two JSON files of the write report through the ArtifactWriter', () => {
   it('writes the documents checked by the schemas and returns their relative paths (no temporary file left)', async () => {
-    const writer = new ArtifactWriter();
+    // T44g: 既定の書き手は名前で伏せる段を通すので、書いた値をそのまま比べるために、その段を外した書き手で書く。
+    const writer = new ArtifactWriter({ urlSecretRedaction: false });
     expect(await writer.writeActionEvidence(runDirectory, evidenceOf())).toBe(ACTION_EVIDENCE_ARTIFACT_FILE_NAME);
     expect(await writer.writeApprovalSummary(runDirectory, summaryOf())).toBe(APPROVAL_SUMMARY_ARTIFACT_FILE_NAME);
     expect(JSON.parse(readFileSync(artifactFilePath(runDirectory, ACTION_EVIDENCE_ARTIFACT_FILE_NAME), 'utf8'))).toEqual(evidenceOf());

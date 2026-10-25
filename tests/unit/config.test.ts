@@ -10,6 +10,7 @@ import {
   INTERACTION_PERSISTENCE_WINDOW_MS,
   INTERACTION_STABILITY_WINDOW_MS,
   INTERACTION_TIMEOUT_COUNT_PER_CANDIDATE,
+  MAX_CRAWL_MAX_PAGES,
   MAX_URL_LENGTH,
   MIN_INTERACTION_TIMEOUT_EXCLUSIVE_MS,
 } from '../../src/core/limits.js';
@@ -113,6 +114,18 @@ describe('configuration', () => {
     const result = validateConfig({ ...config, crawl: { ...config.crawl, [key]: value } });
 
     expect(result).toMatchObject({ ok: false, errors: [`crawl.${key} must be a positive integer`] });
+  });
+
+  // T44R（Task 44 のレビューの M-3）: ページの上限には上限（名前つきの定数）を置く。サービスの Origin への要求の 1 回の Run の上限（ページの上限から作る）が、
+  // 安全な整数を超えないようにするため。
+  it('rejects crawl.maxPages above MAX_CRAWL_MAX_PAGES, and accepts the bound itself (T44R M-3)', () => {
+    const config = validConfig();
+    expect(MAX_CRAWL_MAX_PAGES).toBe(100_000);
+    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: MAX_CRAWL_MAX_PAGES + 1 } }))
+      .toMatchObject({ ok: false, errors: [`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`] });
+    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: Number.MAX_SAFE_INTEGER } }))
+      .toMatchObject({ ok: false, errors: [`crawl.maxPages must be at most ${MAX_CRAWL_MAX_PAGES}`] });
+    expect(validateConfig({ ...config, crawl: { ...config.crawl, maxPages: MAX_CRAWL_MAX_PAGES } }).ok).toBe(true);
   });
 
   // P14a（Task 14〜17 の設計書 4.5.7）: 時間の設定は、正の整数に限る。`auditInteraction` などが正の整数を要求するため。

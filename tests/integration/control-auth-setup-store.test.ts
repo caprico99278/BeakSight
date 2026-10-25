@@ -1,21 +1,18 @@
-// 認証の設定の保存（管理データの版 3 の `auth_setups`。Task 25 の設計書 4.1 の「保存」。T25a round 1）の結合テスト。
-// - 版 1 と版 2 のデータベースが、`openControlDatabase` で版 3 に上がる（前の版の行は残る）。表は `STRICT` で、CHECK と外部キーを持つ。
+// 認証の設定の保存（管理データの `auth_setups`。Task 25 の設計書 4.1 の「保存」。T25a round 1）の結合テスト。
+// - 表は `STRICT` で、CHECK と外部キーを持つ（LG-2 で、前の版の管理データからの上げの確かめは捨てた）。
 // - 保存（`saveAuthSetup`）の前に、保存してあるプロファイルを今の文脈で検証し直し、`validateAuthSetup` を通す。通らなければ書かない。
 // - 保存と読み（`getAuthSetup`）の往復。プロファイルの改訂が変わった設定は、読むときに `STALE` と分かる。
 // - 一時のフォルダだけを使い、終わったら消す。表の中身の確かめと壊れた文書の再現は、テストの側から生の接続で行う。
-// - T26b（Task 26 の設計書 4.3）: 保存は版 2（`beaksight-auth-setup/2`）で書く。版 1 の文書の行は、読むときに `automatedLogin: null` の
-//   版 2 として返し、行は書き換えない。自動ログインのプロファイルの版 2 の設定の往復。
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+// - LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 保存も読み出しも版 3（`beaksight-auth-setup/3`）だけ。版 1・版 2 の文書の行は、読み替えずに
+//   `DATABASE_INTEGRITY_FAILED` で止まる（T26b の「版 1 を版 2 として読む」は捨てた）。自動ログインのプロファイルの設定の往復。
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  AUTH_SETUP_SCHEMA_VERSION,
-  AUTH_SETUP_SCHEMA_VERSION_2,
+  AUTH_SETUP_SCHEMA_VERSION_3,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
-  type AuthSetupV1,
 } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import {
@@ -27,10 +24,10 @@ import {
 } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
-import { CONTROL_MIGRATIONS, CONTROL_SCHEMA_VERSION, runControlMigrations } from '../../src/control/store/migrations.js';
-import { createProfile, getProfile, retireProfile, updateProfile } from '../../src/control/store/profile-store.js';
+import { createProfile, retireProfile, updateProfile } from '../../src/control/store/profile-store.js';
 import { ControlStoreError } from '../../src/control/store/store-errors.js';
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
+import { FORM_NAVIGATION_SETUP_ITEMS, previousVersionSetupDocumentOf } from '../helpers/auth-setup-samples.js';
 import {
   TEST_ORIGIN,
   publicProfile,
@@ -39,13 +36,6 @@ import {
   testAuthProfile,
 } from './control-profile-fixtures.js';
 
-/** 版 3（認証の設定の表）。 */
-const AUTH_SETUPS_SCHEMA_VERSION = 3;
-/** 版 1（プロファイルの表）。 */
-const PROFILES_SCHEMA_VERSION = 1;
-/** 版 2（ジョブの表）。 */
-const JOBS_SCHEMA_VERSION = 2;
-const RAW_TIMEOUT_MS = 0;
 const PROFILE_ID = 'example-auth';
 const PUBLIC_PROFILE_ID = 'example-public';
 const NEXT_REVISION = MIN_PROFILE_REVISION + 1;
@@ -56,7 +46,7 @@ const LEGACY_CREATED_AT = '20261009000000';
 const AUTOMATED_PROFILE_ID = 'example-automated';
 
 const setupFor = (profileRevision: number, overrides: Partial<AuthSetup> = {}): AuthSetup => ({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: PROFILE_ID,
   profileRevision,
   loginStartUrl: `${TEST_ORIGIN}/admin/login`,
@@ -71,13 +61,7 @@ const setupFor = (profileRevision: number, overrides: Partial<AuthSetup> = {}): 
   ...overrides,
 });
 
-/** 版 1 の文書（T25 の時点で保存された行の中身）。 */
-const v1SetupFor = (profileRevision: number): AuthSetupV1 => {
-  const { automatedLogin: _omitted, ...rest } = setupFor(profileRevision);
-  return { ...rest, schemaVersion: AUTH_SETUP_SCHEMA_VERSION };
-};
-
-/** 自動ログインのプロファイルの版 2 の設定。 */
+/** 自動ログインのプロファイルの設定。 */
 const automatedSetupFor = (profileRevision: number): AuthSetup => setupFor(profileRevision, {
   profileId: AUTOMATED_PROFILE_ID,
   maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -96,7 +80,6 @@ const automatedSetupFor = (profileRevision: number): AuthSetup => setupFor(profi
 
 let workDirectory = '';
 let database: ControlDatabase | undefined;
-const connections: DatabaseSync[] = [];
 
 beforeEach(() => {
   workDirectory = mkdtempSync(join(tmpdir(), 'beaksight-control-auth-setups-'));
@@ -107,23 +90,12 @@ afterEach(() => {
     closeControlDatabase(database);
     database = undefined;
   }
-  for (const connection of connections.splice(0)) {
-    if (connection.isOpen) {
-      connection.close();
-    }
-  }
   rmSync(workDirectory, { recursive: true, force: true });
 });
 
 const databasePath = (): string => resolveControlDatabasePath(workDirectory);
 
-const rawConnection = (): DatabaseSync => {
-  const connection = new DatabaseSync(databasePath(), { timeout: RAW_TIMEOUT_MS, enableForeignKeyConstraints: true });
-  connections.push(connection);
-  return connection;
-};
-
-/** 版 3 のデータベースを開き、認証つきのプロファイル（改訂 1）と公開のプロファイルを作る。 */
+/** 今の版のデータベースを開き、認証つきのプロファイル（改訂 1）と公開のプロファイルを作る。 */
 const openPrepared = (): ControlDatabase => {
   const opened = openControlDatabase(databasePath());
   database = opened;
@@ -153,58 +125,8 @@ interface AuthSetupRow {
 const rowsOf = (opened: ControlDatabase): readonly AuthSetupRow[] =>
   opened.connection.prepare('SELECT * FROM auth_setups ORDER BY profile_id').all() as unknown as AuthSetupRow[];
 
-const pragmaOf = (connection: DatabaseSync, name: string): unknown =>
-  (connection.prepare(`PRAGMA ${name}`).get() as Record<string, unknown>)[name];
-
-const tableCount = (connection: DatabaseSync, name: string): number =>
-  (connection.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE type = 'table' AND name = ?").get(name) as { n: number }).n;
-
-/** `versions` 個の版だけを済ませたデータベースを作り、版 1 の表にプロファイルを 1 つ入れる（生の接続。閉じて返す）。 */
-const prepareAtVersion = (versions: number): void => {
-  mkdirSync(dirname(databasePath()), { recursive: true });
-  const raw = rawConnection();
-  raw.exec('PRAGMA journal_mode = WAL');
-  expect(runControlMigrations(raw, CONTROL_MIGRATIONS.slice(0, versions))).toEqual({ foundSchemaVersion: 0, schemaVersion: versions });
-  raw.prepare('INSERT INTO profiles (profile_id, revision, status, document, updated_at) VALUES (?, ?, ?, ?, ?)')
-    .run(PROFILE_ID, MIN_PROFILE_REVISION, 'ACTIVE', JSON.stringify(testAuthProfile(PROFILE_ID, MIN_PROFILE_REVISION)), LEGACY_CREATED_AT);
-  raw.close();
-};
-
-describe('Control store version 3: the auth_setups table', () => {
-  // T26c（設計書の変更履歴の「Blocker: T26c」の行）: 版 4（自動ログインの表）を足したので、「版 3 が最新」の固定を、「版 3 が一覧の 3 番目にあり、
-  // 中身が変わっていない」の確かめに移した（T25a round 1 の版 2 と同じ形。最新の版は `CONTROL_SCHEMA_VERSION` の定数で確かめる）。
-  it('has version 3 as the third entry after versions 1 and 2, with its contents unchanged', () => {
-    expect(CONTROL_MIGRATIONS.slice(0, AUTH_SETUPS_SCHEMA_VERSION).map(({ version }) => version))
-      .toEqual([PROFILES_SCHEMA_VERSION, JOBS_SCHEMA_VERSION, AUTH_SETUPS_SCHEMA_VERSION]);
-    expect(CONTROL_SCHEMA_VERSION).toBe(CONTROL_MIGRATIONS.at(-1)?.version);
-    expect(CONTROL_SCHEMA_VERSION).toBeGreaterThanOrEqual(AUTH_SETUPS_SCHEMA_VERSION);
-    const version3 = CONTROL_MIGRATIONS[AUTH_SETUPS_SCHEMA_VERSION - 1];
-    expect(version3?.seed).toBeUndefined();
-    const createdNames = (version3?.statements ?? [])
-      .map((statement) => /^CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX)\s+(\w+)/u.exec(statement)?.[1])
-      .filter((name) => name !== undefined);
-    expect(createdNames).toEqual(['auth_setups', 'jobs_v3', 'jobs_single_active', 'jobs_created_at']);
-  });
-
-  it.each([
-    ['version 1', PROFILES_SCHEMA_VERSION],
-    ['version 2', JOBS_SCHEMA_VERSION],
-  ])('upgrades a database at %s to the latest version (through version 3) and keeps the earlier rows', (_name, versions) => {
-    prepareAtVersion(versions);
-    const opened = openControlDatabase(databasePath());
-    database = opened;
-    expect(opened.foundSchemaVersion).toBe(versions);
-    expect(opened.schemaVersion).toBe(CONTROL_SCHEMA_VERSION);
-    expect(getProfile(opened, PROFILE_ID)?.profile.profileId).toBe(PROFILE_ID);
-    expect(save(opened, setupFor(MIN_PROFILE_REVISION)).ok).toBe(true);
-    closeControlDatabase(opened);
-    database = undefined;
-    const reopened = rawConnection();
-    expect(pragmaOf(reopened, 'user_version')).toBe(CONTROL_SCHEMA_VERSION);
-    expect(tableCount(reopened, 'auth_setups')).toBe(1);
-    expect(tableCount(reopened, 'jobs')).toBe(1);
-  });
-
+// LG-2: 版 1〜16 の段は捨てた（前の版からの上げの確かめも捨てた）。認証の設定の表の今の形だけを、今の版の管理データで確かめる。
+describe('Control store: the auth_setups table', () => {
   it('is STRICT, and rejects rows that break the CHECKs or the foreign key', () => {
     const opened = openPrepared();
     const strict = opened.connection.prepare("SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = 'auth_setups'").get();
@@ -360,20 +282,23 @@ describe('saveAuthSetup and getAuthSetup', () => {
     }
   });
 
-  it('stops with DATABASE_INTEGRITY_FAILED for a document that is neither version 1 nor version 2 (T26b)', () => {
+  // LG-3b: 前の版（版 1・版 2）の文書の行は、読み替えずに管理データの誤りで止まる（黙って版 3 として読まない）。
+  it('stops with DATABASE_INTEGRITY_FAILED for a document of version 1 or version 2, or of another shape (LG-3)', () => {
     const opened = openPrepared();
     expect(save(opened, setupFor(MIN_PROFILE_REVISION)).ok).toBe(true);
     const update = opened.connection.prepare('UPDATE auth_setups SET document = ? WHERE profile_id = ?');
     const { automatedLogin: _omitted, ...withoutAutomatedLogin } = setupFor(MIN_PROFILE_REVISION);
     for (const document of [
+      // 版 1 の文書（T25 の時点で保存された行の中身）。
+      JSON.stringify(previousVersionSetupDocumentOf(setupFor(MIN_PROFILE_REVISION), 1)),
+      // 版 2 の文書（T26b の時点で保存された行の中身）。
+      JSON.stringify(previousVersionSetupDocumentOf(setupFor(MIN_PROFILE_REVISION), 2)),
       // 版 1 の文字列に、版 2 の項目を足した文書。
-      JSON.stringify({ ...v1SetupFor(MIN_PROFILE_REVISION), automatedLogin: null }),
-      // 版 2 の文字列で、`automatedLogin` のない文書。
+      JSON.stringify({ ...previousVersionSetupDocumentOf(setupFor(MIN_PROFILE_REVISION), 1), automatedLogin: null }),
+      // 版 3 の文字列で、`automatedLogin` のない文書。
       JSON.stringify(withoutAutomatedLogin),
       // 知らない版。
-      JSON.stringify({ ...setupFor(MIN_PROFILE_REVISION), schemaVersion: 'beaksight-auth-setup/3' }),
-      // 版 1 の文書で、行と合わない。
-      JSON.stringify(v1SetupFor(NEXT_REVISION)),
+      JSON.stringify({ ...setupFor(MIN_PROFILE_REVISION), schemaVersion: 'beaksight-auth-setup/4' }),
     ]) {
       update.run(document, PROFILE_ID);
       let caught: unknown;
@@ -395,77 +320,21 @@ describe('saveAuthSetup and getAuthSetup', () => {
   });
 });
 
-describe('T26b: the auth setup version 2 in the store', () => {
-  /** 版 1 の文書を、テストの側から生の接続で行に書く（T25 の時点で保存された行の再現）。 */
-  const writeV1Row = (opened: ControlDatabase, profileRevision: number): string => {
-    const document = JSON.stringify(v1SetupFor(profileRevision));
-    opened.connection.prepare('INSERT INTO auth_setups (profile_id, profile_revision, document, updated_at) VALUES (?, ?, ?, ?)')
-      .run(PROFILE_ID, profileRevision, document, LEGACY_CREATED_AT);
-    return document;
-  };
-
-  it('writes version 2 (automatedLogin null for a MANUAL_SESSION profile)', () => {
+// LG-3b: T26b の版 1 の行の読み替え（版 2 として読む・保存し直すまで書き換えない）の確かめは捨てた（上の `DATABASE_INTEGRITY_FAILED` の確かめ）。
+describe('T26b: the auth setup in the store', () => {
+  it('writes version 3 (automatedLogin null for a MANUAL_SESSION profile)', () => {
     const opened = openPrepared();
     expect(save(opened, setupFor(MIN_PROFILE_REVISION)).ok).toBe(true);
     const [row] = rowsOf(opened);
     const document = JSON.parse(row?.document ?? 'null') as Record<string, unknown>;
-    expect(document['schemaVersion']).toBe(AUTH_SETUP_SCHEMA_VERSION_2);
+    expect(document['schemaVersion']).toBe(AUTH_SETUP_SCHEMA_VERSION_3);
     expect(Object.hasOwn(document, 'automatedLogin')).toBe(true);
     expect(document['automatedLogin']).toBeNull();
   });
 
-  it('reads a version 1 row as version 2 with automatedLogin null, and does not rewrite the row', () => {
+  it.each([1, 2] as const)('rejects saving a version %s document and writes nothing (LG-3)', (version) => {
     const opened = openPrepared();
-    const document = writeV1Row(opened, MIN_PROFILE_REVISION);
-    const read = getAuthSetup(opened, PROFILE_ID);
-    expect(read).toEqual({
-      setup: setupFor(MIN_PROFILE_REVISION),
-      updatedAt: LEGACY_CREATED_AT,
-      freshness: 'CURRENT',
-      profileRevision: MIN_PROFILE_REVISION,
-    });
-    expect(Object.keys(read?.setup ?? {})).toEqual(Object.keys(setupFor(MIN_PROFILE_REVISION)));
-    expect(Object.isFrozen(read)).toBe(true);
-    expect(Object.isFrozen(read?.setup)).toBe(true);
-    expect(rowsOf(opened)).toEqual([{
-      profile_id: PROFILE_ID,
-      profile_revision: MIN_PROFILE_REVISION,
-      document,
-      updated_at: LEGACY_CREATED_AT,
-    }]);
-    expect(opened.connection.isTransaction).toBe(false);
-  });
-
-  it('keeps the CURRENT and STALE judgement for a version 1 row', () => {
-    const opened = openPrepared();
-    writeV1Row(opened, MIN_PROFILE_REVISION);
-    expect(updateProfile(opened, { profile: testAuthProfile(PROFILE_ID, NEXT_REVISION), expectedRevision: MIN_PROFILE_REVISION }, {
-      resolveContext: resolveTestContext,
-    }).ok).toBe(true);
-    const stale = getAuthSetup(opened, PROFILE_ID);
-    expect(stale?.freshness).toBe('STALE');
-    expect(stale?.profileRevision).toBe(NEXT_REVISION);
-    expect(stale?.setup.schemaVersion).toBe(AUTH_SETUP_SCHEMA_VERSION_2);
-    expect(stale?.setup.profileRevision).toBe(MIN_PROFILE_REVISION);
-  });
-
-  it('rewrites a version 1 row as version 2 only when the setup is saved again', () => {
-    const opened = openPrepared();
-    writeV1Row(opened, MIN_PROFILE_REVISION);
-    const read = getAuthSetup(opened, PROFILE_ID);
-    expect(read).not.toBeNull();
-    expect(save(opened, read?.setup, RESAVED_AT).ok).toBe(true);
-    expect(rowsOf(opened)).toEqual([{
-      profile_id: PROFILE_ID,
-      profile_revision: MIN_PROFILE_REVISION,
-      document: JSON.stringify(setupFor(MIN_PROFILE_REVISION)),
-      updated_at: formatCompactUtcTimestamp(RESAVED_AT, 'test'),
-    }]);
-  });
-
-  it('rejects saving a version 1 document (the store turns version 1 into version 2 only when it reads)', () => {
-    const opened = openPrepared();
-    const rejection = rejectionOf(save(opened, v1SetupFor(MIN_PROFILE_REVISION)));
+    const rejection = rejectionOf(save(opened, previousVersionSetupDocumentOf(setupFor(MIN_PROFILE_REVISION), version)));
     expect(rejection.reason).toBe('AUTH_SETUP_INVALID');
     expect([...new Set(rejection.errors.map(({ code }) => code))]).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
     expect(rowsOf(opened)).toEqual([]);
@@ -490,5 +359,39 @@ describe('T26b: the auth setup version 2 in the store', () => {
     expect(notAllowed.errors.map(({ code }) => code)).toEqual(['AUTH_SETUP_AUTOMATED_LOGIN_NOT_ALLOWED']);
     expect(getAuthSetup(opened, AUTOMATED_PROFILE_ID)?.setup).toEqual(setup);
     expect(getAuthSetup(opened, PROFILE_ID)).toBeNull();
+  });
+});
+
+// T34a（Task 34 の設計書 3.2）: 認証の設定の版 3 は、保存して、そのままの版で読む。
+describe('T34a: the auth setup version 3 in the store', () => {
+  const SCRIPT_PROFILE_ID = 'example-script';
+  const SERVICE_ORIGIN = 'https://auth.example.invalid';
+
+  const scriptSetupFor = (profileRevision: number): AuthSetup => ({
+    ...setupFor(profileRevision),
+    profileId: SCRIPT_PROFILE_ID,
+    loginPostEndpoints: [],
+    loginTransport: 'SCRIPT_REQUEST',
+    scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+    loginSideRequests: [{ origin: SERVICE_ORIGIN, path: '/rest/v1/rpc/resolve', method: 'POST', maxPerLoginStage: 1 }],
+    successStorageKey: { origin: TEST_ORIGIN, prefix: 'sb-', suffix: '-auth-token' },
+  } as AuthSetup);
+
+  it('saves a version 3 setup of a profile with service origins and reads it back as version 3', () => {
+    const opened = openPrepared();
+    expect(createProfile(opened, { ...testAuthProfile(SCRIPT_PROFILE_ID, MIN_PROFILE_REVISION), approvedServiceOrigins: [SERVICE_ORIGIN] },
+      { resolveContext: resolveTestContext }).ok).toBe(true);
+    const setup = scriptSetupFor(MIN_PROFILE_REVISION);
+    expect(save(opened, setup).ok).toBe(true);
+    const row = rowsOf(opened).find(({ profile_id: profileId }) => profileId === SCRIPT_PROFILE_ID);
+    expect(JSON.parse(row?.document ?? '{}')).toEqual(setup);
+    expect(getAuthSetup(opened, SCRIPT_PROFILE_ID)).toMatchObject({ setup, freshness: 'CURRENT' });
+  });
+
+  it('rejects a script login setup for a profile without service origins', () => {
+    const opened = openPrepared();
+    const rejection = rejectionOf(save(opened, { ...scriptSetupFor(MIN_PROFILE_REVISION), profileId: PROFILE_ID }));
+    expect(rejection.reason).toBe('AUTH_SETUP_INVALID');
+    expect(rejection.errors.map(({ code }) => code)).toContain('AUTH_SETUP_SERVICE_ORIGIN_NOT_APPROVED');
   });
 });

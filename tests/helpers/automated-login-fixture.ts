@@ -13,9 +13,9 @@
 //   当たらない画面・2 つの条件に当たる画面・状態のない成功・2 回目の POST を送ろうとする画面・止めるまで応答しない、応答の前に接続を切る
 //   （DEF-099 fix round 1）、を返す。
 // - 資格情報は、テストが渡す目印（実行ごとのランダムな値）。値は、記録の本文の中にしか残さない（出力しない）。
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 const STATUS_OK = 200;
 const STATUS_SEE_OTHER = 303;
@@ -102,6 +102,8 @@ export const AUTOMATED_LOGIN_FORM_VARIANTS = Object.freeze([
   'formaction',
   'formmethod-get',
   'split',
+  // T36a: 3 つの要素が form の外にある画面（form の要素がない）。
+  'no-form',
   'password-text',
   'username-textarea',
   'duplicate',
@@ -302,6 +304,8 @@ function formHtml(variant: AutomatedLoginFormVariant, action: string, otherActio
       return `${open()}${USER}${PASS}<button id="go" type="submit" formmethod="get">login</button></form>`;
     case 'split':
       return `${open()}${USER}${GO}</form><form id="other-form" method="post" action="${action}">${PASS}</form>`;
+    case 'no-form':
+      return `<div id="login-box">${USER}${PASS}${GO}</div>`;
     case 'password-text':
       return `${open()}${USER}<input name="pass" id="pass" type="text">${GO}</form>`;
     case 'username-textarea':
@@ -338,7 +342,6 @@ function formHtml(variant: AutomatedLoginFormVariant, action: string, otherActio
 
 export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureOptions): Promise<AutomatedLoginFixture> {
   const requests: AutomatedLoginFixtureRequest[] = [];
-  const sockets = new Set<Duplex>();
   const heldResponses: ServerResponse[] = [];
   let port = 0;
   const originA = (): string => `http://127.0.0.1:${port}`;
@@ -487,7 +490,7 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
     sendHtml(response, 'not found', STATUS_NOT_FOUND);
   };
 
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     handle(request, response).catch(() => {
       if (!response.headersSent) {
         response.writeHead(STATUS_INTERNAL_SERVER_ERROR);
@@ -495,15 +498,10 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
       response.end();
     });
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  port = (server.address() as AddressInfo).port;
+  port = server.port;
 
   // T26g-1: 別の Origin のサーバ C。届いた要求をすべて記録し、何も起こさない画面を返す。WebSocket の upgrade も記録して、すぐに切る。
-  const thirdServer = createServer((request, response) => {
+  const thirdServer = await startLoopbackHttpServer((request, response) => {
     readBody(request).then((body) => {
       const url = new URL(request.url ?? '/', 'http://fixture.invalid');
       requests.push({ site: 'C', method: request.method ?? 'GET', path: `${url.pathname}${url.search}`, body, atMs: Date.now() });
@@ -515,15 +513,9 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
     requests.push({ site, method: WEBSOCKET_UPGRADE_METHOD, path: `${url.pathname}${url.search}`, body: '', atMs: Date.now() });
     socket.destroy();
   };
-  thirdServer.on('upgrade', recordUpgrade('C'));
-  server.on('upgrade', recordUpgrade('A'));
-  thirdServer.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve) => thirdServer.listen(0, '127.0.0.1', resolve));
-  const thirdPort = (thirdServer.address() as AddressInfo).port;
-  const originC = (): string => `http://127.0.0.1:${thirdPort}`;
+  thirdServer.server.on('upgrade', recordUpgrade('C'));
+  server.server.on('upgrade', recordUpgrade('A'));
+  const originC = (): string => thirdServer.origin;
 
   return {
     get originA() {
@@ -542,11 +534,8 @@ export async function startAutomatedLoginFixture(options: AutomatedLoginFixtureO
       for (const response of heldResponses.splice(0)) {
         response.destroy();
       }
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await new Promise<void>((resolve) => thirdServer.close(() => resolve()));
+      // 2 つのサーバの接続を、どちらかの閉じる処理を待つ前に切る（`close` は呼んだときに接続を切る）。
+      await Promise.all([server.close(), thirdServer.close()]);
     },
   };
 }

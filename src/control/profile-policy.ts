@@ -1,7 +1,6 @@
 // 監査プロファイルの判定の唯一の owner（Task 22 の設計書 4.2、4.3。ロードマップ 3.1、3.2 の I01〜I04、I14、11 の RF1）。
 // - プロファイルの検証（`validateSiteProfile`）: スキーマで形を確かめた後、組み合わせの表と各値の規則を確かめる。すべて fail-closed で、
 //   当たった規則はすべて誤りとして返す。
-// - 旧ターゲット JSON の解決（`resolveLegacyTargetProfile`）: つねに `PUBLIC_PASSIVE`・`NONE`・空の Origin（I01）。
 // - 改訂の単調増加（`assertProfileRevisionAdvance`）。保存は Task 23 の owner。次の改訂は `validateSiteProfile` が受けた値（実行時の
 //   閉じた一覧 `validatedProfiles` にある値）だけを受け、前の改訂は形を確かめ、改訂の番号は安全な整数どうしだけを比べる（T22d。T22R の I1）。
 // - 取り消しの次の改訂の写し（`retiredRevisionOf`。T23c round 1）。保存してあった値の形だけを確かめ、改訂を 1 つ進めた凍結した写しを返す。
@@ -20,10 +19,6 @@ import {
   MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH,
   MIN_PROFILE_REVISION,
   PROFILE_ID_PATTERN,
-  SITE_PROFILE_SCHEMA_VERSION,
-  type AuditMode,
-  type AuthStrategy,
-  type EnvironmentKind,
   type ProfileValidationError,
   type ProfileValidationErrorCode,
   type ProfileValidationResult,
@@ -32,37 +27,18 @@ import {
   type ValidatedSiteProfile,
 } from './contracts.js';
 import { validateControlDocument } from './control-schema-validator.js';
+import { AUTH_STRATEGIES_BY_MODE, ENVIRONMENTS_BY_MODE, TEST_ORIGIN_MODES, environmentAcceptsEvidence } from './profile-combinations.js';
+import { TARGET_CONFIG_DIRECTORIES, TARGET_CONFIG_EXTENSION } from './target-config-locations.js';
 
 /** 検証の文脈。参照するターゲット JSON を読み込んだ結果（`loadConfig` の結果）を、呼び出し側が渡す。 */
 export interface ProfileValidationContext {
   readonly targetConfig: AuditConfig;
 }
 
-/** モードごとに受ける環境（設計書 4.3 の表）。表にない組み合わせは `PROFILE_MODE_ENVIRONMENT_MISMATCH`。 */
-const ENVIRONMENTS_BY_MODE: Readonly<Record<AuditMode, readonly EnvironmentKind[]>> = Object.freeze({
-  PUBLIC_PASSIVE: Object.freeze(['PUBLIC', 'TEST'] as const),
-  TEST_AUTH_PASSIVE: Object.freeze(['TEST'] as const),
-  TEST_APPROVED_WRITE: Object.freeze(['TEST'] as const),
-});
+// 組み合わせの表（モードごとの環境と認証の方式）、テスト環境の Origin を必須にするモード、環境の証拠を持たない環境は、`profile-combinations.ts`
+// が唯一の owner（T43a fix round 1。画面の作成の欄も同じ表を読む）。ここは表を使って判定するだけ（写しを持たない）。
 
-/** モードごとに受ける認証の方式（設計書 4.3 の表）。表にない組み合わせは `PROFILE_AUTH_MISMATCH`。 */
-const AUTH_STRATEGIES_BY_MODE: Readonly<Record<AuditMode, readonly AuthStrategy[]>> = Object.freeze({
-  PUBLIC_PASSIVE: Object.freeze(['NONE'] as const),
-  TEST_AUTH_PASSIVE: Object.freeze(['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const),
-  TEST_APPROVED_WRITE: Object.freeze(['MANUAL_SESSION', 'AUTOMATED_LOGIN'] as const),
-});
-
-/** テスト環境の Origin と環境の証拠を必須にするモード（認証・書き込みのモード）。 */
-const TEST_ORIGIN_MODES: readonly AuditMode[] = Object.freeze(['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE'] as const);
-
-/** 環境の証拠を持たない環境（公開の環境）。 */
-const ENVIRONMENT_WITHOUT_EVIDENCE: EnvironmentKind = 'PUBLIC';
-
-/** プロファイルが参照してよいターゲット JSON のディレクトリ（区切りは `/`。末尾の `/` を含む）。 */
-const TARGET_CONFIG_DIRECTORIES: readonly string[] = Object.freeze(['config/targets/', 'local/targets/']);
-
-/** ターゲット JSON の拡張子。 */
-const TARGET_CONFIG_EXTENSION = '.json';
+// プロファイルが参照してよいターゲット JSON のディレクトリと拡張子は、`target-config-locations.ts` が唯一の owner（T43b fix round 1）。
 
 /** 親の区切り（`..`）。名前の中にあっても拒む（fail-closed）。 */
 const PARENT_SEGMENT = '..';
@@ -81,18 +57,6 @@ const TARGET_CONFIG_PATH_CHARACTERS = /^[A-Za-z0-9._/-]+$/u;
  * （U+200B〜U+200D、U+2060、U+FEFF）。これらだけの値は、空と同じに扱う。
  */
 const EVIDENCE_INVISIBLE_CHARACTERS = /[\s\u200b-\u200d\u2060\ufeff]/gu;
-
-/** 旧ターゲット JSON の `target.id` から `profileId` を作れないときの、決まった値。 */
-export const LEGACY_FALLBACK_PROFILE_ID = 'legacy-target';
-
-/** `PROFILE_ID_PATTERN` が受ける最大の長さ（先頭の 1 文字と、続く最大 62 文字）。 */
-const MAX_PROFILE_ID_LENGTH = 63;
-
-/** `profileId` に書けない文字（小文字の英数字とハイフン以外）。 */
-const PROFILE_ID_FORBIDDEN_CHARACTERS = /[^a-z0-9-]/gu;
-const PROFILE_ID_HYPHEN_RUNS = /-{2,}/gu;
-const PROFILE_ID_LEADING_HYPHENS = /^-+/u;
-const PROFILE_ID_SEPARATOR = '-';
 
 const errorOf = (code: ProfileValidationErrorCode, detail: string): ProfileValidationError => Object.freeze({ code, detail });
 
@@ -200,6 +164,35 @@ const testOriginErrors = (profile: SiteProfile, context: ProfileValidationContex
   return errors;
 };
 
+/**
+ * 承認したサービスの Origin の誤り（T34a。Task 34 の設計書 3.1）。テスト環境の 2 つのモードでないプロファイルは、空か項目なしだけ。形は、テスト環境の
+ * Origin と同じ決まり（`isAcceptedTestOriginForm`。HTTPS の Origin の正規の直列化か、loopback の host の http）。ターゲット設定の
+ * `site.allowedOrigins` に入っている Origin は、テスト環境の Origin と重なるので拒む（サービスの Origin は、クロールの対象を広げない）。件数の上限と
+ * 重なりはスキーマ（`PROFILE_SCHEMA_INVALID`）。
+ */
+const serviceOriginErrors = (profile: SiteProfile, context: ProfileValidationContext): readonly ProfileValidationError[] => {
+  const values = profile.approvedServiceOrigins ?? [];
+  if (!TEST_ORIGIN_MODES.includes(profile.mode)) {
+    return values.length === 0
+      ? []
+      : [errorOf('PROFILE_SERVICE_ORIGIN_INVALID', `approvedServiceOrigins must be empty for mode ${profile.mode}`)];
+  }
+  return values.flatMap((value, index) => {
+    if (!isAcceptedTestOriginForm(value)) {
+      return [errorOf(
+        'PROFILE_SERVICE_ORIGIN_INVALID',
+        `approvedServiceOrigins[${index}] must be a canonical https origin, or an http origin on a loopback host`,
+      )];
+    }
+    return isOriginInAllowedOrigins(context.targetConfig.site.allowedOrigins, value)
+      ? [errorOf(
+        'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
+        `approvedServiceOrigins[${index}] is included in site.allowedOrigins of the target configuration (a service origin is not a test origin)`,
+      )]
+      : [];
+  });
+};
+
 /** 環境の証拠の参照の誤り。 */
 const evidenceErrors = (profile: SiteProfile): readonly ProfileValidationError[] => {
   const evidence = profile.environmentEvidenceRef;
@@ -208,7 +201,7 @@ const evidenceErrors = (profile: SiteProfile): readonly ProfileValidationError[]
     if (TEST_ORIGIN_MODES.includes(profile.mode)) {
       errors.push(errorOf('PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED', `environmentEvidenceRef is required for mode ${profile.mode}`));
     }
-  } else if (profile.environment === ENVIRONMENT_WITHOUT_EVIDENCE) {
+  } else if (!environmentAcceptsEvidence(profile.environment)) {
     errors.push(errorOf('PROFILE_MODE_ENVIRONMENT_MISMATCH', `environmentEvidenceRef must be null in environment ${profile.environment}`));
   } else if (!isUsableEvidenceRef(evidence)) {
     errors.push(errorOf(
@@ -236,7 +229,13 @@ const ruleErrors = (profile: SiteProfile, context: ProfileValidationContext): re
         + `${TARGET_CONFIG_DIRECTORIES.join(' or ')}`,
     ));
   }
-  return [...errors, ...combinationErrors(profile), ...testOriginErrors(profile, context), ...evidenceErrors(profile)];
+  return [
+    ...errors,
+    ...combinationErrors(profile),
+    ...testOriginErrors(profile, context),
+    ...serviceOriginErrors(profile, context),
+    ...evidenceErrors(profile),
+  ];
 };
 
 /**
@@ -261,38 +260,6 @@ export const validateSiteProfile = (input: unknown, context: ProfileValidationCo
   const errors = ruleErrors(profile, context);
   return errors.length > 0 ? rejected(errors) : accepted(profile);
 };
-
-/**
- * 旧ターゲット JSON の `target.id` から、`PROFILE_ID_PATTERN` に合う `profileId` を作る。
- * 小文字にする → 小文字の英数字とハイフン以外を `-` にする → 続く `-` を 1 つにまとめる → 先頭の `-` を除く → 最大の長さで切る。
- * 結果が空か、パターンに合わなければ `LEGACY_FALLBACK_PROFILE_ID`。
- */
-const legacyProfileIdOf = (targetId: string): string => {
-  const candidate = targetId
-    .toLowerCase()
-    .replace(PROFILE_ID_FORBIDDEN_CHARACTERS, PROFILE_ID_SEPARATOR)
-    .replace(PROFILE_ID_HYPHEN_RUNS, PROFILE_ID_SEPARATOR)
-    .replace(PROFILE_ID_LEADING_HYPHENS, '')
-    .slice(0, MAX_PROFILE_ID_LENGTH);
-  return PROFILE_ID_PATTERN.test(candidate) ? candidate : LEGACY_FALLBACK_PROFILE_ID;
-};
-
-/**
- * プロファイルのない旧ターゲット JSON を、公開の監査（`PUBLIC_PASSIVE`・`NONE`・空の Origin・証拠なし）のプロファイルに解決する（I01）。
- * 権限を増やす入力を受けない。`targetConfigPath` は呼び出し側の値のまま（形は `validateSiteProfile` が判定する）。
- */
-export const resolveLegacyTargetProfile = (config: AuditConfig, targetConfigPath: string): SiteProfile =>
-  deepFreeze({
-    schemaVersion: SITE_PROFILE_SCHEMA_VERSION,
-    profileId: legacyProfileIdOf(config.target.id),
-    revision: MIN_PROFILE_REVISION,
-    targetConfigPath,
-    environment: 'PUBLIC',
-    mode: 'PUBLIC_PASSIVE',
-    auth: 'NONE',
-    approvedTestOrigins: [],
-    environmentEvidenceRef: null,
-  });
 
 /** 改訂の確かめの片側（前か次）の写しと、形の誤り。写せない値は、写しが `undefined`。 */
 interface RevisionSide {

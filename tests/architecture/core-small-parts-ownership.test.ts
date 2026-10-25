@@ -12,6 +12,7 @@
  *   （`ENOENT` など）との比べ）。型の付いた引数の `error.code` と、定数との比べは数えない（近似）。文字列を残す本文（`code`）で探す形は、
  *   文字列の中も数える（厳しい側の近似）。
  * - (d) CC-058: `--headless` に当たる設定の上書き（`browser: { headed: false }` の形）は、`src/config/config-overrides.ts` だけに書く。
+ *   PRE42-CC 組 5a: `--headed` に当たる上書き（`browser: { headed: true }` の形）も同じ owner だけに書く（`HEADED_CONFIG_OVERRIDES`）。
  * - (e) CCX-12（CC-078 の後半）: 鍵を並べる処理（`withSortedKeys`・`sortedKeysJsonOf` の定義と、`Object.keys(…).sort(`・
  *   `Object.entries(…).sort(`・`Object.getOwnPropertyNames(…).sort(` の形。`toSorted` も）は、`src/core/sorted-keys-json.ts` だけに書く。
  * - (f) CCX-12（CC-076）: `_method` の欄の名前の判定（`isMethodOverrideFieldName` の定義と、`METHOD_OVERRIDE_FIELD_NAME` か `'_method'` の
@@ -21,11 +22,33 @@
  * - (g) CCX-25（CC-087 の前半）: JSON Pointer（RFC 6901）の区切りの書き方と戻し方（`escapeJsonPointerSegment`・`unescapeJsonPointerSegment`・
  *   `jsonPointerOf`・`jsonPointerSegmentsOf` の定義と、書き方の文字列 `'~0'`・`'~1'`）は、`src/core/json-pointer.ts` だけに書く。
  *   再 export と呼び出しは数えない。文字列は、それだけの文字列（`'~0'` など）を数える（文字列を残す本文 `code` で探す）。
+ * - (h) PRE42-CC 組 5a（CC-048）: 実行の記録の「最後の実行」を選ぶ形（`…executions.at(-1)`・`…executions[….length - 1]`。名前に
+ *   `executions` を含む値。大文字小文字を問わない）は、表示用モデルの `executionsView`（`src/report/view-model.ts`）の 1 か所だけに書く。
+ *   表示用モデルを読めない所の、別の記録の読み取りは、ファイルと形の組で、理由を付けて除外する（同じファイルでも、新しい所は検出する）。
+ *   CLI の古い補助 `lastExecutionFinishedAt` の定義も数える（CLI は表示用モデルの `executions.lastFinishedAt` を読む）。
+ *   PRE42-CC 組 UI-K（CC-048 の画面の側）: 選び方を純粋な `lastRunExecutionOf`（`src/core/run-executions.ts`）の 1 か所に移した。表示用モデルの
+ *   `executionsView`、画面のサーバ（`run.json` の読み取り）、再開の判定（チェックポイントの読み取り）は、どれもそれを使う（除外は 0 件）。
+ * - (i) PRE42-CC 組 5a（台帳の N1 の B）: 誤りの値を「`Error` なら `message`、そうでなければ `String(…)`」にする式
+ *   （`x instanceof Error ? x.message : String(x)`）と `errorMessageOrString` の定義は、`src/core/errors.ts` だけに書く。
+ *   画面の起動の部品（`apps/local-ui/launcher/`）は、実行時に core を読めないので、対象の外（設計者の判断。launcher の中に補助を 1 つ置く）。
+ *   PRE42-CC 組 R: launcher の中では、同じ式と `errorMessageOrString` の定義を、launcher の補助（`apps/local-ui/launcher/error-message.ts`）
+ *   だけに書く（`serve.ts`・`vite-guard-plugin.ts` は、それを読む）。
  * - 対象は `src/**` と、画面の `apps/local-ui/src/**`（`.ts`、`.tsx`）。読み込みと走査は、このファイルの読み込み時に 1 回だけ。
  *   ファイル全体を 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
-import { LOCAL_UI_SOURCE_DIRECTORY, loadLocalUiSourceFiles, loadSourceFiles, scanSource, type SourceFile } from './source-scan.js';
+import {
+  LOCAL_UI_SOURCE_DIRECTORY,
+  MAX_GATE_MS,
+  loadLocalUiSourceFiles,
+  loadSourceFiles,
+  loadTypeScriptFilesUnder,
+  sourceFileOf,
+  startCpuStopwatch,
+  unusedExclusionsOf,
+  violationsOf,
+  type SourceFile,
+} from './source-scan.js';
 
 /** 画面のソース（`apps/local-ui/src/**` の `.ts` と `.tsx`）は、`source-scan.ts` の `loadLocalUiSourceFiles` で 1 回だけ読み込み、走査する。 */
 const SOURCE_FILES: readonly SourceFile[] = [...loadSourceFiles(), ...loadLocalUiSourceFiles()];
@@ -83,8 +106,8 @@ const findErrorCodeReaders = (file: SourceFile): readonly string[] => [
   ...matchesOf(file.code, INLINE_ERROR_CODE_CODE_SHAPES),
 ];
 
-/** (d) `--headless` に当たる設定の上書きの形（`code`。コメントを除く）。 */
-const HEADLESS_OVERRIDE_SHAPE = /\bbrowser\s*:\s*\{\s*headed\s*:\s*false\s*,?\s*\}/gu;
+/** (d) `--headless`・`--headed` に当たる設定の上書きの形（`code`。コメントを除く）。 */
+const HEADLESS_OVERRIDE_SHAPE = /\bbrowser\s*:\s*\{\s*headed\s*:\s*(?:true|false)\s*,?\s*\}/gu;
 const findHeadlessOverrides = (file: SourceFile): readonly string[] =>
   [...file.code.matchAll(HEADLESS_OVERRIDE_SHAPE)].map((match) => match[0].replace(/\s+/gu, ' '));
 
@@ -116,12 +139,45 @@ const findJsonPointerEscapes = (file: SourceFile): readonly string[] => [
   ...matchesOf(file.code, [JSON_POINTER_ESCAPE_LITERAL]),
 ];
 
+/** (h) 「最後の実行」を選ぶ形（`bare`）と、CLI の古い補助の定義。 */
+const LAST_EXECUTION_SHAPES: readonly RegExp[] = [
+  /(?:[\w$]+\s*\??\.\s*)*[\w$]*executions\s*\??\.\s*at\s*\(\s*-\s*1\s*\)/giu,
+  /(?:[\w$]+\s*\??\.\s*)*[\w$]*executions\s*(?:\?\.\s*)?\[\s*(?:[\w$]+\s*\??\.\s*)*[\w$]*executions\s*\??\.\s*length\s*-\s*1\s*\]/giu,
+];
+/** 前の段で、`executions` を含まない本文を除く（形の正規表現は前に名前の連なりを読むので、すべての本文に当てると遅い）。 */
+const MENTIONS_EXECUTIONS = /executions/iu;
+const findLastExecutionSelections = (file: SourceFile): readonly string[] => [
+  ...definitionsOf(file.bare, ['lastExecutionFinishedAt']),
+  ...(MENTIONS_EXECUTIONS.test(file.bare) ? matchesOf(file.bare, LAST_EXECUTION_SHAPES) : []),
+];
+const LAST_EXECUTION_OWNER = 'src/core/run-executions.ts';
+/** (h) owner の中の、ただ 1 つの選び方（`lastRunExecutionOf`。組 UI-K）。 */
+const LAST_EXECUTION_OWNER_SELECTIONS: readonly string[] = ['executions.at(-1)'];
+/**
+ * (h) の除外（`<ファイル>: <形>` と理由）。除外の一覧は、このファイルの中の 1 か所だけ。組 UI-K: 再開の判定（`run-coordinator.ts`）と画面のサーバ
+ * （`audit-job-functions.ts`）の 2 件は、owner の `lastRunExecutionOf` を使うようにしたので消した。
+ */
+const LAST_EXECUTION_EXCLUSIONS: ReadonlyMap<string, string> = new Map([]);
+
+/** (i) 誤りの値を「`Error` なら `message`、そうでなければ `String(…)`」にする式（`bare`）と、`errorMessageOrString` の定義。 */
+const ERROR_MESSAGE_OR_STRING_SHAPE = /\binstanceof\s+Error\s*\?\s*([\w$]+)\s*\.\s*message\s*:\s*String\s*\(\s*\1\s*\)/gu;
+const findErrorMessageOrStrings = (file: SourceFile): readonly string[] => [
+  ...definitionsOf(file.bare, ['errorMessageOrString']),
+  ...matchesOf(file.bare, [ERROR_MESSAGE_OR_STRING_SHAPE]),
+];
+
+/** (i) 画面の起動の部品（実行時に core を読めない）と、その中の補助の owner（PRE42-CC 組 R）。読み込みと走査は 1 回だけ。 */
+const LAUNCHER_DIRECTORY = 'apps/local-ui/launcher';
+const LAUNCHER_ERROR_MESSAGE_OWNER = `${LAUNCHER_DIRECTORY}/error-message.ts`;
+const LAUNCHER_FILES: readonly SourceFile[] = loadTypeScriptFilesUnder(LAUNCHER_DIRECTORY);
+
 const violationsOutside = (owner: string, find: (file: SourceFile) => readonly string[]): readonly string[] =>
-  SOURCE_FILES.filter((file) => file.path !== owner).flatMap((file) => find(file).map((match) => `${file.path}: ${match}`));
+  violationsOf(SOURCE_FILES.filter((file) => file.path !== owner), find);
 
 const ownerFile = (owner: string): SourceFile | undefined => SOURCE_FILES.find((file) => file.path === owner);
 
-const sample = (path: string, content: string): SourceFile => ({ path, content, ...scanSource(content) });
+/** 対照の例のファイル（`source-scan.ts` の `sourceFileOf`。PRE42-CC 組 G）。 */
+const sample = sourceFileOf;
 
 describe('CCX-11 detectors', () => {
   it('(a) detects definitions of the compact timestamp readers and Date.UTC calls, and ignores comments, strings and uses', () => {
@@ -200,7 +256,7 @@ describe('CCX-11 detectors', () => {
     ]);
   });
 
-  it('(d) detects the headless override shape, and ignores comments and other browser settings', () => {
+  it('(d) detects the headless and headed override shapes, and ignores comments and other browser settings', () => {
     const file = sample('src/worker/sample.ts', [
       'export const OVERRIDES = deepFreeze({ browser: { headed: false } });',
       'const b = { browser: {',
@@ -208,9 +264,10 @@ describe('CCX-11 detectors', () => {
       '} };',
       'const c = { browser: { headed: true } };',
       "const d = { browser: { headed: false, locale: 'ja-JP' } };",
-      '// { browser: { headed: false } }',
+      'const e = { browser: { headed: values.headed } };',
+      '// { browser: { headed: true } }',
     ].join('\n'));
-    expect(findHeadlessOverrides(file)).toEqual(['browser: { headed: false }', 'browser: { headed: false, }']);
+    expect(findHeadlessOverrides(file)).toEqual(['browser: { headed: false }', 'browser: { headed: false, }', 'browser: { headed: true }']);
   });
 
   it('(e) detects the key sorting (CCX-12), and ignores comments, strings and other sorts', () => {
@@ -283,13 +340,53 @@ describe('CCX-11 detectors', () => {
       '`~1`',
     ]);
   });
+
+  it('(h) detects the last execution selections and the old CLI helper (CC-048), and ignores comments, strings and other lists', () => {
+    const file = sample('src/cli/sample.ts', [
+      "const ended = run.executions.at(-1)?.endReason === 'STOPPED_BY_SITE_UNAVAILABLE';",
+      'const last = summary.run.executions?.at( - 1 );',
+      'const last2 = run.executions[run.executions.length - 1];',
+      'const last3 = resumedExecutions.at(-1) ?? first;',
+      'const lastExecutionFinishedAt = (executions: readonly RunExecution[]): string => executions[0].finishedAt;',
+      'const first = run.executions.at(0);',
+      'const page = pages.at(-1);',
+      'const finished = viewModel.summary.executions.lastFinishedAt;',
+      '// run.executions.at(-1)',
+      "const text = 'executions.at(-1)';",
+    ].join('\n'));
+    expect(findLastExecutionSelections(file)).toEqual([
+      'const lastExecutionFinishedAt',
+      'run.executions.at(-1)',
+      'summary.run.executions?.at( - 1 )',
+      'resumedExecutions.at(-1)',
+      'run.executions[run.executions.length - 1]',
+    ]);
+  });
+
+  it('(i) detects the error message or string expression (N1), and ignores comments, strings and other fallbacks', () => {
+    const file = sample('apps/local-ui/src/server/sample.ts', [
+      'const a = error instanceof Error ? error.message : String(error);',
+      'const b = cause instanceof Error ? cause . message : String( cause );',
+      'export const errorMessageOrString = (error: unknown): string => String(error);',
+      'const c = error instanceof Error ? error.message : String(other);',
+      "const d = error instanceof Error ? error.message : 'unknown';",
+      'const e = errorMessageOrString(error);',
+      '// error instanceof Error ? error.message : String(error)',
+      "const text = 'error instanceof Error ? error.message : String(error)';",
+    ].join('\n'));
+    expect(findErrorMessageOrStrings(file)).toEqual([
+      'const errorMessageOrString',
+      'instanceof Error ? error.message : String(error)',
+      'instanceof Error ? cause . message : String( cause )',
+    ]);
+  });
 });
 
 describe('CCX-11 Gate: small parts have one owner each', () => {
   it('reads the owners once', () => {
     for (const owner of [
       UTC_TIMESTAMP_OWNER, SHA256_OWNER, RENAME_RETRY_OWNER, ERROR_CODE_OWNER, CONFIG_OVERRIDES_OWNER, SORTED_KEYS_OWNER, METHOD_OVERRIDE_OWNER,
-      JSON_POINTER_OWNER,
+      JSON_POINTER_OWNER, LAST_EXECUTION_OWNER,
     ]) {
       expect(ownerFile(owner), owner).toBeDefined();
     }
@@ -313,9 +410,12 @@ describe('CCX-11 Gate: small parts have one owner each', () => {
     expect(findErrorCodeReaders(ownerFile(ERROR_CODE_OWNER) ?? sample(ERROR_CODE_OWNER, ''))).not.toEqual([]);
   });
 
-  it('(d) the headless override is written only in src/config/config-overrides.ts (CC-058)', () => {
+  it('(d) the headless and headed overrides are written only in src/config/config-overrides.ts (CC-058)', () => {
     expect(violationsOutside(CONFIG_OVERRIDES_OWNER, findHeadlessOverrides)).toEqual([]);
-    expect(findHeadlessOverrides(ownerFile(CONFIG_OVERRIDES_OWNER) ?? sample(CONFIG_OVERRIDES_OWNER, ''))).not.toEqual([]);
+    expect(findHeadlessOverrides(ownerFile(CONFIG_OVERRIDES_OWNER) ?? sample(CONFIG_OVERRIDES_OWNER, ''))).toEqual([
+      'browser: { headed: false }',
+      'browser: { headed: true }',
+    ]);
   });
 
   it('(e) the keys are sorted only in src/core/sorted-keys-json.ts (CC-078)', () => {
@@ -331,5 +431,39 @@ describe('CCX-11 Gate: small parts have one owner each', () => {
   it('(g) the JSON Pointer segments are escaped and unescaped only in src/core/json-pointer.ts (CC-087)', () => {
     expect(violationsOutside(JSON_POINTER_OWNER, findJsonPointerEscapes)).toEqual([]);
     expect(findJsonPointerEscapes(ownerFile(JSON_POINTER_OWNER) ?? sample(JSON_POINTER_OWNER, ''))).not.toEqual([]);
+  });
+
+  it('(h) the last execution is chosen only in lastRunExecutionOf of src/core/run-executions.ts (CC-048, PRE42-CC group UI-K)', () => {
+    const found = violationsOutside(LAST_EXECUTION_OWNER, findLastExecutionSelections);
+    expect(found.filter((entry) => !LAST_EXECUTION_EXCLUSIONS.has(entry))).toEqual([]);
+    expect(findLastExecutionSelections(ownerFile(LAST_EXECUTION_OWNER) ?? sample(LAST_EXECUTION_OWNER, ''))).toEqual(LAST_EXECUTION_OWNER_SELECTIONS);
+  });
+
+  it('(h) every exclusion of the last execution selections is still used, so that stale exclusions do not hide new ones', () => {
+    expect(unusedExclusionsOf(LAST_EXECUTION_EXCLUSIONS.keys(), violationsOutside(LAST_EXECUTION_OWNER, findLastExecutionSelections))).toEqual([]);
+  });
+
+  it('(i) the error message or string expression is written only in src/core/errors.ts (N1)', () => {
+    expect(violationsOutside(ERROR_CODE_OWNER, findErrorMessageOrStrings)).toEqual([]);
+    expect(findErrorMessageOrStrings(ownerFile(ERROR_CODE_OWNER) ?? sample(ERROR_CODE_OWNER, ''))).toEqual([
+      'const errorMessageOrString',
+      'instanceof Error ? error.message : String(error)',
+    ]);
+  });
+
+  it('(i) in the launcher, the error message or string expression is written only in launcher/error-message.ts (N1, PRE42-CC group R)', () => {
+    const stopwatch = startCpuStopwatch();
+    // 空の走査で PASS しない（起動の部品の 2 つの入口が見えている）。
+    expect(LAUNCHER_FILES.map((file) => file.path)).toEqual(expect.arrayContaining([
+      `${LAUNCHER_DIRECTORY}/serve.ts`,
+      `${LAUNCHER_DIRECTORY}/vite-guard-plugin.ts`,
+    ]));
+    expect(violationsOf(LAUNCHER_FILES.filter((file) => file.path !== LAUNCHER_ERROR_MESSAGE_OWNER), findErrorMessageOrStrings)).toEqual([]);
+    const owner = LAUNCHER_FILES.find((file) => file.path === LAUNCHER_ERROR_MESSAGE_OWNER) ?? sample(LAUNCHER_ERROR_MESSAGE_OWNER, '');
+    expect(findErrorMessageOrStrings(owner)).toEqual([
+      'const errorMessageOrString',
+      'instanceof Error ? error.message : String(error)',
+    ]);
+    expect(stopwatch.elapsedMs()).toBeLessThan(MAX_GATE_MS * Math.max(LAUNCHER_FILES.length, 1));
   });
 });

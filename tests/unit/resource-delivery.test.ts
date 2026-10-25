@@ -786,4 +786,35 @@ describe('decideResourceDelivery', () => {
     expect(decide('REVISIT', request(), new ResourceCache(), new Set(['not a URL', 'mailto:help@example.com'])))
       .toEqual({ kind: 'WITHHOLD' });
   });
+
+  // T44b（Task 44 の設計書 3.1 の P1-1）: 送信の扱い `PASS_EXCEPT_DELETE` の幅の走査（`revisitSends`）は、読み取りでない要求と、承認したサービスの Origin への
+  // 要求を送る。キャッシュにある GET はキャッシュから返し、ほかの許可 Origin の外への読み取りは今どおり送らない。
+  describe('REVISIT の役割の revisitSends（T44b）', () => {
+    const serviceOrigin = 'https://api.example.net';
+    const revisitSends = Object.freeze({ serviceOrigins: new Set([serviceOrigin]) as ReadonlySet<string> });
+    const decideWithSends = (facts: ResourceDeliveryRequestFacts, cache: ResourceCache = filledCache()) =>
+      decideResourceDelivery({ role: 'REVISIT', cache, allowedOrigins, request: facts, revisitSends });
+
+    it('承認したサービスの Origin への読み取りは、キャッシュになければ NETWORK', () => {
+      expect(decideWithSends(request({ url: `${serviceOrigin}/rest/v1/members`, resourceType: 'fetch' }))).toEqual({ kind: 'NETWORK' });
+      expect(decideWithSends(request({ url: `${serviceOrigin}/image.png` }))).toEqual({ kind: 'NETWORK' });
+    });
+
+    it('読み取りでない要求は、送り先によらず NETWORK', () => {
+      expect(decideWithSends(request({ method: 'POST', url: `${OTHER_ORIGIN}/collect`, resourceType: 'fetch' }))).toEqual({ kind: 'NETWORK' });
+      expect(decideWithSends(request({ method: 'PUT', url: `${serviceOrigin}/rest/v1/items`, resourceType: 'xhr' }))).toEqual({ kind: 'NETWORK' });
+    });
+
+    it('ほかの許可 Origin の外への読み取りは、今どおり WITHHOLD。キャッシュにある GET は FROM_RUN_CACHE', () => {
+      const cache = filledCache();
+      expect(decideWithSends(request({ url: otherImageUrl }), cache)).toEqual({ kind: 'WITHHOLD' });
+      expect(decideWithSends(request({ url: OTHER_SCRIPT_URL, resourceType: 'script' }), cache))
+        .toEqual({ kind: 'FROM_RUN_CACHE', resource: cache.lookup(OTHER_SCRIPT_URL) });
+    });
+
+    it('revisitSends がなければ、サービスの Origin への読み取りと読み取りでない要求は今どおり WITHHOLD', () => {
+      expect(decide('REVISIT', request({ url: `${serviceOrigin}/rest/v1/members`, resourceType: 'fetch' }))).toEqual({ kind: 'WITHHOLD' });
+      expect(decide('REVISIT', request({ method: 'POST', url: `${OTHER_ORIGIN}/collect`, resourceType: 'fetch' }))).toEqual({ kind: 'WITHHOLD' });
+    });
+  });
 });

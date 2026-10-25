@@ -1,10 +1,23 @@
 {
   "$id": "urn:beaksight:schema:control:ui-profile-create:1",
-  "description": "Local UI Server Function input: create a profile. The profile document itself is validated by validateSiteProfile.",
+  "description": "Local UI Server Function input: create a profile. The profile document itself is validated by validateSiteProfile. T43b: with newTargetSite, the server first creates local/targets/<profileId>.json (checked by src/config/target-config-draft.ts and validateConfig) and the profile points to it.",
   "type": "object",
   "additionalProperties": false,
   "required": ["profile"],
   "properties": {
-    "profile": { "type": "object" }
+    "profile": { "type": "object" },
+    "newTargetSite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startUrl", "allowedOrigins"],
+      "properties": {
+        "startUrl": { "type": "string", "maxLength": 2048 },
+        "allowedOrigins": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "type": "string", "maxLength": 2048 }
+        }
+      }
+    }
   }
 }

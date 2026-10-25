@@ -1,16 +1,25 @@
 import { useState } from 'react';
 import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
-import { formatCount, formatDateTime } from '../../../../../src/presentation/format.js';
+import {
+  AUTO_LOGIN_DAILY_MAX_ATTEMPTS,
+  AUTO_LOGIN_DAILY_WINDOW_MS,
+  AUTO_LOGIN_MIN_INTERVAL_MS,
+} from '../../../../../src/control/job/auto-login-limits.js';
+import { ACTIVE_PROFILE_STATUS } from '../../../../../src/control/store/profile-records.js';
+import { formatDateTime, formatDuration, formatInteger, formatTimes } from '../../../../../src/presentation/format.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
   CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS,
+  LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT,
   LOCAL_UI_CREDENTIAL_TEXT,
   LOCAL_UI_LOGIN_CHECK_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../../../src/presentation/messages.js';
+import { AutomatedLoginSetupForm } from '../../components/AutomatedLoginSetupForm';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { CredentialValueField } from '../../components/CredentialValueField';
+import { NextStepLinks } from '../../components/NextSteps';
 import { Notice } from '../../components/Notice';
 import { PageFrame } from '../../components/PageFrame';
 import {
@@ -31,8 +40,10 @@ import {
   type CredentialRequestView,
 } from '../../server/credential-functions';
 
-/** 保存の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。 */
-const DONE_NOTICES = Object.freeze(['registered', 'changed', 'replaced', 'removed', 'changedAndHoldCleared', 'replacedAndHoldCleared'] as const);
+/** 保存の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。FM2e: 1 回の操作で自動ログインに切り替えた後（`automatedLoginSetUp`）。 */
+const DONE_NOTICES = Object.freeze([
+  'registered', 'changed', 'replaced', 'removed', 'changedAndHoldCleared', 'replacedAndHoldCleared', 'automatedLoginSetUp',
+] as const);
 type DoneNotice = (typeof DONE_NOTICES)[number];
 const isDoneNotice = (value: unknown): value is DoneNotice => DONE_NOTICES.some((notice) => notice === value);
 
@@ -58,7 +69,28 @@ const DONE_TEXT: Readonly<Record<DoneNotice, readonly string[]>> = Object.freeze
   removed: [text.remove.done],
   changedAndHoldCleared: [text.change.done, text.clearHold.done],
   replacedAndHoldCleared: [text.replace.done, text.clearHold.done],
+  automatedLoginSetUp: [LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.done],
 });
+
+/**
+ * FM2e: 1 回の操作で自動ログインに切り替えた後の、「ログインを確かめる」の知らせ（自動では始めない。自動ログインの間隔と上限に数えるため、利用者が押す）。
+ * ボタンは、保存の後に出す「次の手順」（`NextStepLinks` の資格情報の後の段。ログインを確かめる）を使う（同じボタンを 2 つ出さない）。
+ */
+function AutomatedLoginSetUpNext() {
+  return (
+    <Notice kind="caution">
+      <p data-testid="automated-login-setup-login-check-note">{LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.loginCheckNote}</p>
+      <p>{LOGIN_CHECK_LIMIT_NOTE}</p>
+    </Notice>
+  );
+}
+
+/** 自動ログインの上限の説明（ログインの確かめの画面と同じ文言と、上限の名前つきの定数）。 */
+const LOGIN_CHECK_LIMIT_NOTE = LOCAL_UI_LOGIN_CHECK_TEXT.limitNote(
+  formatDuration(AUTO_LOGIN_MIN_INTERVAL_MS),
+  formatDuration(AUTO_LOGIN_DAILY_WINDOW_MS),
+  formatTimes(AUTO_LOGIN_DAILY_MAX_ATTEMPTS),
+);
 
 
 /** 拒否の表示（説明と手順。項目の誤りは、その欄にも出す）。 */
@@ -155,12 +187,13 @@ function CredentialPage() {
   const [removeRejection, setRemoveRejection] = useState<CredentialRequestRejection | null>(null);
   const { profile, credential } = page;
   const status = profileStatusDisplay(profile.status);
-  const active = profile.status === 'ACTIVE';
+  const active = profile.status === ACTIVE_PROFILE_STATUS;
   const savable = page.eligible && active && page.environment === 'AVAILABLE' && page.currentLoginOrigin !== null;
   const replaceNeeded = credential !== null && page.originMatches === false;
   const environment = credentialEnvironmentDisplay(page.environment);
-  // 欄の長さの説明（上限は資格情報のファイルの部品の名前つきの定数を、サーバが渡す）。
-  const valueLengthHint = text.valueLengthHint(formatCount(page.maxValueLength));
+  // 欄の長さの説明（上限と下限は資格情報のファイルの部品の名前つきの定数を、サーバが渡す。T36c で下限を足した）。
+  // T36R-fix（DEF-123）: 長さは単位のない整数の書式（件数の単位を付けない）。
+  const valueLengthHint = text.valueLengthHint(formatInteger(page.minValueLength), formatInteger(page.maxValueLength));
 
   const setValue = (key: keyof ValueState, value: string): void => {
     setValues((current) => ({ ...current, [key]: value }));
@@ -249,6 +282,11 @@ function CredentialPage() {
           {DONE_TEXT[done].map((line) => <p key={line} data-testid="credential-done" data-notice={done}>{line}</p>)}
         </Notice>
       )}
+      {done === 'automatedLoginSetUp' && page.eligible && active ? <AutomatedLoginSetUpNext /> : null}
+      {/* T43a（Task 43 の設計書 4.1）: 資格情報を保存した後（削除の後は除く）に、次の手順（ログインの確かめ）と「次にすること」へのリンク。 */}
+      {done === undefined || done === 'removed' || !page.eligible || !active ? null : (
+        <NextStepLinks profileId={profile.profileId} after="CREDENTIAL" mode={profile.mode} auth={profile.auth} />
+      )}
       <section className="panel">
         <h2 className="panel-heading">{profile.profileId}</h2>
         <dl className="facts">
@@ -261,9 +299,32 @@ function CredentialPage() {
 
       {!page.eligible ? (
         <>
-          <Notice kind="caution">
-            <p data-testid="credential-not-eligible">{text.notEligible}</p>
-          </Notice>
+          {/* FM2e（手を減らす段 2 の設計書 3A.4）: 手動のログインのプロファイルは、1 回の操作で自動ログインに切り替える欄を出す（残った資格情報の
+              ファイルがあれば、先に消す。暗号化を使えない、ジョブが動いている間は出さない）。 */}
+          {page.automatedLoginSetup !== null && removeSection === null ? null : (
+            <Notice kind="caution">
+              <p data-testid="credential-not-eligible">{text.notEligible}</p>
+            </Notice>
+          )}
+          {page.automatedLoginSetup !== null && removeSection === null && page.environment !== 'AVAILABLE' ? (
+            <Notice kind="caution" heading={text.unavailableHeading}>
+              <p data-testid="credential-unavailable" data-state={page.environment}>{environment.description}</p>
+            </Notice>
+          ) : null}
+          {page.automatedLoginSetup !== null && removeSection === null && page.environment === 'AVAILABLE' && page.inUse ? (
+            <Notice kind="caution" heading={text.inUseHeading}>
+              <p data-testid="credential-in-use">{text.inUseBody}</p>
+            </Notice>
+          ) : null}
+          {page.automatedLoginSetup !== null && removeSection === null && page.environment === 'AVAILABLE' && !page.inUse ? (
+            <>
+              <Notice kind="caution" heading={text.testAccountOnlyHeading}>
+                <p data-testid="credential-test-account-only">{text.testAccountOnlyBody}</p>
+                <p>{text.browserSaveNote}</p>
+              </Notice>
+              <AutomatedLoginSetupForm page={page} setup={page.automatedLoginSetup} onSaved={() => showDone('automatedLoginSetUp')} />
+            </>
+          ) : null}
           {/* T26g-2 round 1: 自動ログインでないプロファイルに残ったファイルは、削除の操作だけを出す。 */}
           {removeSection === null ? null : (
             <>

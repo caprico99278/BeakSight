@@ -24,6 +24,7 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
+import { cspViolationsOf, recordCspViolations } from './helpers/ui-page.ts';
 
 /** websocket の upgrade の要求を送り、応答の状態（101 なら upgrade した）を返す。 */
 const upgradeStatus = (port: number, host: string, cookieHeader: string | undefined): Promise<number> =>
@@ -241,11 +242,7 @@ describe('dev server: listening and the guard', () => {
       page.on('websocket', (socket) => socket.on('framereceived', () => {
         hmrFrames += 1;
       }));
-      await page.addInitScript(() => {
-        const violations: string[] = [];
-        Object.defineProperty(window, '__cspViolations', { value: violations });
-        document.addEventListener('securitypolicyviolation', (event) => violations.push(`${event.violatedDirective} ${event.blockedURI}`));
-      });
+      await page.addInitScript(recordCspViolations);
       const consoleErrors: string[] = [];
       page.on('console', (message) => {
         if (message.type() === 'error') {
@@ -258,8 +255,8 @@ describe('dev server: listening and the guard', () => {
       // hydrate した後の画面の移動（loader の Server Function の GET を通る）。
       await page.getByRole('link', { name: LOCAL_UI_TEXT.pages.environment }).click();
       await page.getByTestId('environment-status').waitFor({ timeout: PAGE_TIMEOUT_MS });
-      const violations = await page.evaluate(() => (window as unknown as { __cspViolations: string[] }).__cspViolations);
-      expect(violations).toEqual([]);
+      // 記録がなければ（init script が動かなかった文書）誤りにする。
+      expect(await cspViolationsOf(page, true)).toEqual([]);
       expect(consoleErrors).toEqual([]);
       // HMR の websocket が、cookie つきで繋がった（Vite から 'connected' などの frame を受けた）。
       expect(hmrFrames).toBeGreaterThan(0);

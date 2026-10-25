@@ -19,11 +19,16 @@
  * - (x)（CCX-5。台帳の CC-065）: 資格情報を保存できるプラットフォームの値（`process.platform` の `'win32'`）を、文字列リテラルとして書くのは
  *   owner の `src/control/credentials/credential-platform.ts` だけ（`CREDENTIAL_PLATFORM` の定義がちょうど 1 つ）。`src/` と画面のコード
  *   （`apps/local-ui/src`）の両方に当てる。除外は、意味の違う 2 か所だけ（`PLATFORM_LITERAL_EXCEPTIONS` に理由を書く）。
+ * - (y)（PRE42-CC 組 3。N4-8c）: 暗号化の往復の確かめの結果（`CredentialProtectionState`）の値の名前つきの定数は、`credential-platform.ts` の
+ *   `CREDENTIAL_PROTECTION_AVAILABLE` だけ（定義がちょうど 1 つ）。owner の外（`src/` と画面）では、`'AVAILABLE' satisfies CredentialProtectionState`、
+ *   `: CredentialProtectionState = 'AVAILABLE'` の形の定数を置かない（値の一覧そのものは `credential-store.ts` の `CREDENTIAL_PROTECTION_STATES`）。
  * - ファイル全体を 1 秒以内に終える。
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { CREDENTIAL_PROTECTION_STATES } from '../../src/control/credentials/credential-store.js';
+import { CHILD_PROCESS_MODULE, CHILD_PROCESS_RUNTIME_FILES } from './child-process-policy.js';
 import {
   REPOSITORY_ROOT,
   findCallSites,
@@ -47,7 +52,11 @@ const CREDENTIAL_DIRECTORY = 'src/control/credentials/';
 const PROTECTOR_PATH = 'src/control/credentials/dpapi-protector.ts';
 const STORE_PATH = 'src/control/credentials/credential-store.ts';
 const CREDENTIAL_OWNERS: ReadonlySet<string> = new Set([PROTECTOR_PATH, STORE_PATH]);
-const CHILD_PROCESS_USERS: ReadonlySet<string> = new Set(['src/control/job/audit-job-manager.ts', PROTECTOR_PATH, STORE_PATH]);
+/**
+ * (r) `node:child_process` を参照してよいファイル: 共通の一覧（`child-process-policy.ts` の `CHILD_PROCESS_RUNTIME_FILES`。ジョブの管理と
+ * `dpapi-protector.ts`）に、この Gate の追加（資格情報のファイルの部品 `credential-store.ts`）を足したもの（PRE42-CC 組 G。新 Gate の 12）。
+ */
+const CHILD_PROCESS_USERS: ReadonlySet<string> = new Set([...CHILD_PROCESS_RUNTIME_FILES, STORE_PATH]);
 
 /** 偽物を渡す内部の作りと、子プロセスの起動の部品の名前（資格情報の 2 つの部品の外に現れない）。 */
 const INTERNAL_NAMES: readonly string[] = [
@@ -64,9 +73,10 @@ const FAKE_DEFINING_TESTS: readonly string[] = ['tests/unit/dpapi-protector.test
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-const CHILD_PROCESS_MODULE = /^(?:node:)?child_process$/u;
-
-/** (r) `child_process` の参照（import の指定子と、`require`・`getBuiltinModule`・動的 import の文字列）。 */
+/**
+ * (r) `child_process` の参照（import の指定子と、`require`・`getBuiltinModule`・動的 import の文字列）。モジュールの名前の形は
+ * `child-process-policy.ts` の `CHILD_PROCESS_MODULE`（`source-scan.ts` の `modulePattern`。下位のパスと、文字列の中の `node:child_process` も当てる）。
+ */
 const findChildProcessReferences = (source: ScannedSource): readonly string[] => [
   ...findImportSpecifiers(source.code).filter((specifier) => CHILD_PROCESS_MODULE.test(specifier)),
   ...source.literals.filter((literal) => CHILD_PROCESS_MODULE.test(literal)).map((literal) => `literal ${literal}`),
@@ -112,6 +122,16 @@ const findWin32Literals = (source: ScannedSource): readonly string[] => source.l
  * - `screenshot-collector.ts`: Windows のパスは大文字と小文字を区別しない（パスの比べ方。資格情報の保存の可否とは無関係）。
  */
 const PLATFORM_LITERAL_EXCEPTIONS: ReadonlySet<string> = new Set(['src/report/artifact-writer.ts', 'src/evidence/screenshot-collector.ts']);
+
+/** (y) 暗号化の往復の確かめの結果の値の、名前つきの定数の定義（owner は `credential-platform.ts`）。 */
+const PROTECTION_AVAILABLE_DEFINITION = /\bexport\s+const\s+CREDENTIAL_PROTECTION_AVAILABLE\s*=\s*'AVAILABLE'\s+satisfies\s+CredentialProtectionState\b/gu;
+/** (y) 型で確かめた、暗号化の往復の確かめの結果の値の定数（owner の外に置かない）。 */
+const PROTECTION_STATE_CONSTANTS: readonly RegExp[] = [
+  new RegExp(`'(?:${CREDENTIAL_PROTECTION_STATES.join('|')})'\\s+satisfies\\s+CredentialProtectionState\\b`, 'gu'),
+  new RegExp(`:\\s*CredentialProtectionState\\s*=\\s*'(?:${CREDENTIAL_PROTECTION_STATES.join('|')})'`, 'gu'),
+];
+const findProtectionStateConstants = (source: ScannedSource): readonly string[] =>
+  PROTECTION_STATE_CONSTANTS.flatMap((pattern) => [...source.code.matchAll(pattern)].map((match) => match[0]));
 
 const fileAt = (path: string) => SOURCE_FILES.find((file) => file.path === path);
 
@@ -223,6 +243,18 @@ describe('Credential boundary (T26a)', () => {
     expect(violations).toEqual([]);
   });
 
+  // PRE42-CC 組 3（N4-8c）: 暗号化の往復の確かめの結果の値の名前つきの定数は、credential-platform.ts の 1 か所だけ。
+  it('(y) only credential-platform.ts defines the named credential protection state constant (PRE42-CC, N4-8c)', () => {
+    const violations = [...SOURCE_FILES, ...APP_SOURCE_FILES]
+      .filter(({ path }) => path !== PLATFORM_OWNER_PATH)
+      .flatMap((file) => [
+        ...findProtectionStateConstants(file).map((found) => `${file.path}: ${found}`),
+        ...[...file.code.matchAll(PROTECTION_AVAILABLE_DEFINITION)].map((match) => `${file.path}: ${match[0]}`),
+      ]);
+    expect(violations).toEqual([]);
+    expect([...(fileAt(PLATFORM_OWNER_PATH)?.code ?? '').matchAll(PROTECTION_AVAILABLE_DEFINITION)]).toHaveLength(1);
+  });
+
   // 各規則が、現実的な書き方の違反で RED になること（検出の関数の自己確認）。
   it('detects realistic violations (detector self-check)', () => {
     // (r)
@@ -233,6 +265,10 @@ describe('Credential boundary (T26a)', () => {
     expect(findChildProcessReferences(scanSource("const cp = process.getBuiltinModule('node:child_process');"))).toHaveLength(1);
     expect(findChildProcessReferences(scanSource("const cp = require('child_process');"))).toHaveLength(1);
     expect(findChildProcessReferences(scanSource('// node:child_process is not used here'))).toHaveLength(0);
+    // PRE42-CC 組 G（新 Gate の 2。最も広い形）: 文字列の中の `node:child_process` も数える。似た名前は数えない。
+    expect(findChildProcessReferences(scanSource("const name = `node:child_process`;"))).toHaveLength(1);
+    expect(findChildProcessReferences(scanSource("const label = 'load node:child_process here';"))).toHaveLength(1);
+    expect(findChildProcessReferences(scanSource("const label = 'child_processes';"))).toHaveLength(0);
     // (s)
     expect(findWindowsToolNames(scanSource("spawn('PowerShell.exe', ['-Command', script]);"))).toEqual(['PowerShell']);
     expect(findWindowsToolNames(scanSource("execFile('icacls', [dir]);"))).toEqual(['icacls']);
@@ -269,6 +305,14 @@ describe('Credential boundary (T26a)', () => {
     expect([...scanSource("const CREDENTIAL_PLATFORM = 'x';").code.matchAll(PLATFORM_CONSTANT_DEFINITION)]).toHaveLength(1);
     expect([...scanSource("const DPAPI_PLATFORM = 'x';").code.matchAll(PLATFORM_CONSTANT_DEFINITION)]).toHaveLength(1);
     expect([...scanSource("export const CREDENTIAL_PLATFORM = 'x';").code.matchAll(PLATFORM_DEFINITION)]).toHaveLength(1);
+    // (y)
+    expect(findProtectionStateConstants(scanSource("const PROTECTION_AVAILABLE = 'AVAILABLE' satisfies CredentialProtectionState;"))).toHaveLength(1);
+    expect(findProtectionStateConstants(scanSource("const UNAVAILABLE: CredentialProtectionState = 'UNAVAILABLE';"))).toHaveLength(1);
+    expect(findProtectionStateConstants(scanSource("return plainText === TEXT ? 'AVAILABLE' : 'UNAVAILABLE';"))).toHaveLength(0);
+    expect(findProtectionStateConstants(scanSource("// 'AVAILABLE' satisfies CredentialProtectionState"))).toHaveLength(0);
+    expect(findProtectionStateConstants(scanSource('if (protection !== CREDENTIAL_PROTECTION_AVAILABLE) {}'))).toHaveLength(0);
+    expect([...scanSource("export const CREDENTIAL_PROTECTION_AVAILABLE = 'AVAILABLE' satisfies CredentialProtectionState;").code
+      .matchAll(PROTECTION_AVAILABLE_DEFINITION)]).toHaveLength(1);
   });
 
   // T26g-2（T26R の M3）: 画面のコードの書き方（Server Function のサーバのコードと TSX）でも、(r)(s)(t)(w) の違反を捕まえる。

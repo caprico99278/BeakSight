@@ -236,6 +236,18 @@ export const matchesSimplePattern = (pattern: SimplePattern, value: string): boo
   return reachable[length] === 1;
 };
 
+/**
+ * 数字だけの固定の桁数の pattern（FM2c の「番号・コード」。`^\d{7}$`、`[0-9]{4}` など）なら、その桁数（純粋）。部品がちょうど 1 つで、文字の集まりが
+ * 数字（`\d` か `[0-9]`）だけ、量が固定（`n` 回）のときだけ。ほかは null。
+ */
+export const fixedDigitCountOf = (pattern: SimplePattern): number | null => {
+  const [only] = pattern.tokens;
+  if (only === undefined || pattern.tokens.length !== 1 || only.min !== only.max) {
+    return null;
+  }
+  return only.ranges.every(([low, high]) => low === DIGIT_RANGE[0] && high === DIGIT_RANGE[1]) ? only.min : null;
+};
+
 /** 欄の pattern（なければ undefined、受けない形なら null）。 */
 export const simplePatternOf = (constraints: Pick<CandidateFieldConstraints, 'pattern'>): SimplePattern | null | undefined =>
   (constraints.pattern === null ? undefined : parseSimplePattern(constraints.pattern));

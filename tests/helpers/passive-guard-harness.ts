@@ -3,6 +3,7 @@ import {
   awaitPassiveRequestGuardReady,
   installPassiveRequestGuard,
   SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT,
+  WEBRTC_BLOCK_INIT_SCRIPT,
   WORKER_CONNECT_POLICY_INIT_SCRIPT,
 } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
@@ -94,10 +95,11 @@ export async function guardContextListenerEvents(): Promise<readonly string[]> {
     .map((call) => call.slice(CONTEXT_ON_CALL_PREFIX.length)));
 }
 
-/** 偽の harness の `calls` に残す、Guard の初期化のスクリプトの名前（DEF-040、DEF-049）。 */
+/** 偽の harness の `calls` に残す、Guard の初期化のスクリプトの名前（DEF-040、DEF-049、DEF-124）。 */
 function initScriptName(content: string | undefined): string {
   if (content === WORKER_CONNECT_POLICY_INIT_SCRIPT) return 'WORKER_CONNECT_POLICY';
   if (content === SERVICE_WORKER_REGISTRATION_BLOCK_INIT_SCRIPT) return 'SERVICE_WORKER_REGISTRATION_BLOCK';
+  if (content === WEBRTC_BLOCK_INIT_SCRIPT) return 'WEBRTC_BLOCK';
   return 'UNKNOWN';
 }
 
@@ -221,6 +223,10 @@ export function createGuardHarness(options: {
           }
           if (method === 'Page.getFrameTree') {
             return { frameTree: { frame: { id: GUARD_HARNESS_ROOT_FRAME_ID } } };
+          }
+          // EL-F2（N1）: Guard は page の準備の終わりに、今の項目の URL を読む（外部スキームのエラーの頁でない、ふつうの頁）。
+          if (method === 'Page.getNavigationHistory') {
+            return { currentIndex: 0, entries: [{ id: 1, url: 'about:blank', userTypedURL: 'about:blank', title: '', transitionType: 'typed' }] };
           }
           return undefined;
         },

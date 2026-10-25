@@ -1,0 +1,12 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-write-chain-start:1",
+  "description": "Local UI Server Function input: create a record with the ledger CREATE scenario and then update it with the UPDATE scenario after one confirmation dialog (Task 41 design 3.5.1; T41g-3, T41R5 M-1). scenarioId is the UPDATE scenario, expectedRevision is its revision the screen read, and expectedCreateRevision is the revision of the ledger CREATE scenario the screen read (passed to the grant issue of the create; a different revision starts nothing). No property holds a credential, a cookie, a token or an input value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["scenarioId", "expectedRevision", "expectedCreateRevision"],
+  "properties": {
+    "scenarioId": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/scenarioId" },
+    "expectedRevision": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/revision" },
+    "expectedCreateRevision": { "$ref": "urn:beaksight:schema:control:scenario:1#/properties/revision" }
+  }
+}

@@ -729,3 +729,60 @@ describe('T23c: retiredRevisionOf', () => {
     }
   });
 });
+
+// T34a（Task 34 の設計書 3.1）: 承認したサービスの Origin（`approvedServiceOrigins`。任意の項目）。認証のサービスと API の Origin。HTTPS の Origin の
+// 正規の直列化（loopback の host だけ http も受ける。テスト環境の Origin と同じ形の決まり）、上限 4、重なりなし、テスト環境の 2 つのモードだけ、設定の
+// `site.allowedOrigins` と重ならない（クロールの対象を広げない）。項目のないプロファイルは今までと同じに受け、写しに項目を足さない（今のプロファイルの
+// 文書と、それから求める値は変わらない）。
+describe('T34a: validateSiteProfile checks the approved service origins', () => {
+  const SERVICE_ORIGIN = 'https://auth.example.invalid';
+  const API_ORIGIN = 'https://api.example.invalid';
+  const LOOPBACK_SERVICE_ORIGIN = 'http://127.0.0.1:5173';
+
+  it('accepts up to the limit of service origins on the authenticated and the write modes, including an http origin on loopback', () => {
+    for (const mode of ['TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE'] as const) {
+      const accepted = expectAccepted({ ...testAuthProfile, mode, approvedServiceOrigins: [SERVICE_ORIGIN, API_ORIGIN, LOOPBACK_SERVICE_ORIGIN] });
+      expect(accepted.approvedServiceOrigins).toEqual([SERVICE_ORIGIN, API_ORIGIN, LOOPBACK_SERVICE_ORIGIN]);
+    }
+    expectAccepted({ ...testAuthProfile, approvedServiceOrigins: [] });
+    expectAccepted({ ...testAuthProfile, approvedServiceOrigins: ['https://a.example.invalid', 'https://b.example.invalid', 'https://c.example.invalid',
+      'https://d.example.invalid'] });
+  });
+
+  it('keeps a profile without the item as it is (no item added to the accepted copy)', () => {
+    const accepted = expectAccepted(testAuthProfile);
+    expect(Object.hasOwn(accepted, 'approvedServiceOrigins')).toBe(false);
+    expect(JSON.stringify(accepted)).toBe(JSON.stringify(testAuthProfile));
+  });
+
+  it.each([
+    ['a trailing slash', 'https://auth.example.invalid/'],
+    ['a path', 'https://auth.example.invalid/auth/v1'],
+    ['a query', 'https://auth.example.invalid/?x=1'],
+    ['credentials', 'https://user@auth.example.invalid'],
+    ['http on a host that is not loopback', 'http://auth.example.invalid'],
+    ['a non-HTTP scheme', 'wss://auth.example.invalid'],
+    ['an empty string', ''],
+  ])('rejects a service origin with %s', (_name, origin) => {
+    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [origin] }, ['PROFILE_SERVICE_ORIGIN_INVALID']);
+  });
+
+  it('rejects a service origin inside the target allowed origins (it is not a test origin), with a new reason', () => {
+    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [TEST_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INSIDE_TARGET']);
+    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [SERVICE_ORIGIN, LOOPBACK_TEST_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INSIDE_TARGET']);
+  });
+
+  it('rejects more service origins than the limit and duplicated service origins as the wrong shape', () => {
+    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: ['https://a.example.invalid', 'https://b.example.invalid',
+      'https://c.example.invalid', 'https://d.example.invalid', 'https://e.example.invalid'] }, ['PROFILE_SCHEMA_INVALID']);
+    expectRejectedWith({ ...testAuthProfile, approvedServiceOrigins: [SERVICE_ORIGIN, SERVICE_ORIGIN] }, ['PROFILE_SCHEMA_INVALID']);
+  });
+
+  it.each([
+    ['PUBLIC', publicProfile],
+    ['TEST', { ...publicProfile, environment: 'TEST' }],
+  ] as const)('rejects service origins on a %s public-passive profile', (_environment, profile) => {
+    expectRejectedWith({ ...profile, approvedServiceOrigins: [SERVICE_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INVALID']);
+    expectAccepted({ ...profile, approvedServiceOrigins: [] });
+  });
+});

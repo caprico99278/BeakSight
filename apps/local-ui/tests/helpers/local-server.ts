@@ -70,6 +70,18 @@ const copyFromRepository = (root: string, relativePath: string, filter?: (source
 /** 開発のサーバのために写さないもの（ビルドの出力、Vite の cache）。 */
 const isCopiedSource = (source: string): boolean => !/\/apps\/local-ui\/(?:dist|node_modules)(?:\/|$)/u.test(source.replaceAll('\\', '/'));
 
+/**
+ * FM-2（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 2.2）: 一時の root のワーカーの入口（写した `dist/worker/audit-worker.js`）を、ジョブのブラウザを
+ * 表示しないテストだけの口（`runAuditWorkerProcess` の `hideJobBrowser`）で始める入口に置き換える。画面のテストのジョブのブラウザは今どおり headless（プロファイルの
+ * 表示の設定の既定は表示）。リポジトリの `dist/` は変えない（写しだけ）。
+ */
+const hideJobBrowserOfWorker = (root: string): void => {
+  writeFileSync(
+    `${root}/dist/worker/audit-worker.js`,
+    "import { runAuditWorkerProcess } from './audit-worker-process.js';\nrunAuditWorkerProcess(process, { hideJobBrowser: true });\n",
+  );
+};
+
 /** 画面の起動に要るものを、OS の一時のフォルダに写す（`local-data/` は作らない。画面のサーバが作る）。 */
 export const createTemporaryUiRoot = (kind: TemporaryUiRootKind): TemporaryUiRoot => {
   if (kind !== 'source' && !existsSync(BUILT_SERVER_ENTRY)) {
@@ -96,6 +108,7 @@ export const createTemporaryUiRoot = (kind: TemporaryUiRootKind): TemporaryUiRoo
     if (kind === 'built') {
       // 監査のワーカー（T24f）: 監査の本体のビルドの出力（`dist/`。スキーマを含む）を写す。ワーカーは一時の root を cwd にして動く。
       copyFromRepository(root, 'dist');
+      hideJobBrowserOfWorker(root);
       copyFromRepository(root, 'apps/local-ui/dist');
       copyFromRepository(root, 'apps/local-ui/launcher');
       copyFromRepository(root, 'apps/local-ui/src/security');
@@ -103,6 +116,7 @@ export const createTemporaryUiRoot = (kind: TemporaryUiRootKind): TemporaryUiRoo
       if (kind === 'combined') {
         // 本番の起動の部品の分（起動の部品と src/security は、開発のサーバの分の写しに入る）。
         copyFromRepository(root, 'dist');
+        hideJobBrowserOfWorker(root);
         copyFromRepository(root, 'apps/local-ui/dist');
       }
       copyFromRepository(root, 'tsconfig.json');
@@ -202,14 +216,28 @@ const launcherEntryOf = (root: TemporaryUiRoot): string => `${root.root}/apps/lo
 
 /** ビルドした画面を、一時の root の起動の部品（`launcher/serve.ts`）で起動する。 */
 export const startLauncher = async (root: TemporaryUiRoot, port: number): Promise<StartedServer> =>
-  startProcess([launcherEntryOf(root), '--port', String(port)], port, root.root);
+  startProcess([launcherEntryOf(root), '--port', String(port), ...KEEP_RUNNING_PRESENCE_ARGUMENTS], port, root.root);
+
+/**
+ * UI-close: 画面のテストの起動では、ページを閉じても画面のサーバを止めない長さの猶予と途絶えの上限を注入する（テストは、ページを閉じてから次のページを
+ * 開くまでに時間がかかることがあるため）。止まることは、`ui-close.test.ts` が短い値を注入して確かめる。
+ */
+const KEEP_RUNNING_PRESENCE_MS = 3_600_000;
+const KEEP_RUNNING_PRESENCE_ARGUMENTS: readonly string[] = Object.freeze([
+  '--ui-close-grace-ms', String(KEEP_RUNNING_PRESENCE_MS),
+  '--ui-silence-limit-ms', String(KEEP_RUNNING_PRESENCE_MS),
+]);
+
+/** UI-close: 起動の部品に引数（猶予と途絶えの上限の注入など）を付けて起動する。 */
+export const startLauncherWithArguments = async (root: TemporaryUiRoot, port: number, args: readonly string[]): Promise<StartedServer> =>
+  startProcess([launcherEntryOf(root), '--port', String(port), ...args], port, root.root);
 
 /**
  * T26e: Node の起動の引数（`--import <テストだけの前処理>` など）を前に付けて、起動の部品を起動する（Windows でない環境を、プラットフォームの
  * 値を差し替えて確かめるため。製品の起動の部品は変えない）。
  */
 export const startLauncherWithNodeArguments = async (root: TemporaryUiRoot, port: number, nodeArguments: readonly string[]): Promise<StartedServer> =>
-  startProcess([...nodeArguments, launcherEntryOf(root), '--port', String(port)], port, root.root);
+  startProcess([...nodeArguments, launcherEntryOf(root), '--port', String(port), ...KEEP_RUNNING_PRESENCE_ARGUMENTS], port, root.root);
 
 /** 終わるまで待った子の process の結果。 */
 export interface ExitedProcess {

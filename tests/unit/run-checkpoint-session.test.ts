@@ -5,25 +5,29 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { PageId } from '../../src/core/contracts.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import {
-  checkRunCheckpointConsistency,
-  checkRunCheckpointPageConsistency,
   createRunLock,
   currentProcessRunLockHost,
   renewRunLock,
   RUN_LOCK_BOOT_TIME_TOLERANCE_MS,
   RUN_LOCK_HEARTBEAT_INTERVAL_MS,
   RUN_LOCK_STALE_AFTER_MS,
+  type RunLock,
+  type RunLockHost,
+} from '../../src/core/process-lock.js';
+import {
+  checkRunCheckpointConsistency,
+  checkRunCheckpointPageConsistency,
   type RunCheckpoint,
   type RunCheckpointLockAcquisition,
   type RunCheckpointPage,
   type RunCheckpointStore,
-  type RunLock,
-  type RunLockHost,
 } from '../../src/orchestration/run-checkpoint.js';
 import {
   RUN_CHECKPOINT_SESSION_RESUME_FAILURE_REASONS,
   RUN_CHECKPOINT_SESSION_START_MODES,
+  RUN_LOCK_REREAD_DELAY_MS,
   RunCheckpointSession,
+  RunLockLostError,
   type RunCheckpointHeartbeatTimer,
   type RunCheckpointSessionOptions,
   type RunCheckpointSessionStartOptions,
@@ -48,12 +52,14 @@ type StoreCall =
   | { readonly kind: 'acquireRunLock'; readonly runDirectory: string; readonly lock: RunLock }
   | { readonly kind: 'rewriteRunLock'; readonly runDirectory: string; readonly lock: RunLock }
   | { readonly kind: 'readRunLock'; readonly runDirectory: string }
+  | { readonly kind: 'takeOverRunLock'; readonly runDirectory: string; readonly judged: unknown; readonly lock: RunLock }
   | { readonly kind: 'releaseRunLock'; readonly runDirectory: string }
   | { readonly kind: 'cleanUpForResume'; readonly runDirectory: string; readonly completedPageIds: readonly PageId[] };
 
 /**
  * 偽の書き手。呼ばれた順に `calls` に記録する。振る舞いは、各操作の差し替え口で変える。差し替えていない `readRunLock` は、
- * 最後に書いたロック（`acquireRunLock` で作れたものか、`rewriteRunLock` で書き換えたもの。なければ `null`）を返す。
+ * 最後に書いたロック（`acquireRunLock` で作れたものか、`rewriteRunLock` で書き換えたもの、`takeOverRunLock` で取り直したもの。なければ `null`）を
+ * 返す。差し替えていない `takeOverRunLock` は、原子的な取り直しに成功する（`ACQUIRED`。LG-4: 書き手は必ず持つ）。
  */
 function fakeStore(overrides: Partial<RunCheckpointStore> = {}): { readonly store: RunCheckpointStore; readonly calls: StoreCall[] } {
   const calls: StoreCall[] = [];
@@ -83,6 +89,14 @@ function fakeStore(overrides: Partial<RunCheckpointStore> = {}): { readonly stor
     readRunLock: async (runDirectory) => {
       calls.push({ kind: 'readRunLock', runDirectory });
       return overrides.readRunLock === undefined ? lockOnDisk : overrides.readRunLock(runDirectory);
+    },
+    takeOverRunLock: async (runDirectory, judged, lock) => {
+      calls.push({ kind: 'takeOverRunLock', runDirectory, judged, lock });
+      const takeover = overrides.takeOverRunLock === undefined ? { outcome: 'ACQUIRED' as const } : await overrides.takeOverRunLock(runDirectory, judged, lock);
+      if (takeover.outcome === 'ACQUIRED') {
+        lockOnDisk = lock;
+      }
+      return takeover;
     },
     releaseRunLock: async (runDirectory) => {
       calls.push({ kind: 'releaseRunLock', runDirectory });
@@ -133,7 +147,7 @@ function fakeTimers(): { readonly timers: RunCheckpointSessionTimers; readonly c
  */
 function createSession(
   overrides: Partial<RunCheckpointStore> = {},
-  options: Pick<RunCheckpointSessionOptions, 'isProcessRunning'> = {},
+  options: Pick<RunCheckpointSessionOptions, 'isProcessRunning' | 'wait'> = {},
 ) {
   const { store, calls } = fakeStore(overrides);
   const clock = { nowMs: STARTED_AT_MS };
@@ -144,6 +158,8 @@ function createSession(
     createLockHost: lockHost,
     timers: timers.timers,
     isProcessRunning: options.isProcessRunning,
+    // DEF-172: 猶予と読み直しの待ちは、実際には待たない（差し替えがあれば、それを使う）。
+    wait: options.wait ?? (async () => undefined),
   });
   return { session, calls, clock, timers };
 }
@@ -317,10 +333,67 @@ describe('R4a: the heartbeat of the lock (design 4.3.1, 4.4)', () => {
     timers.tick();
     await flush();
 
+    // DEF-170: 書き換える前に読み直し、自分のロックのときだけ書き換える。
     expect(calls.slice(1)).toEqual([
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'rewriteRunLock', runDirectory: RUN_DIRECTORY, lock: renewRunLock(lock, STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS) },
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'rewriteRunLock', runDirectory: RUN_DIRECTORY, lock: renewRunLock(lock, STARTED_AT_MS + 2 * RUN_LOCK_HEARTBEAT_INTERVAL_MS) },
     ]);
+  });
+
+  it('does not rewrite and stops the heartbeat when the lock read again is not its own (DEF-170)', async () => {
+    const other = createRunLock({ ...lockHost(STARTED_AT_MS), processId: PROCESS_ID + 1 });
+    const { session, calls, timers } = createSession({ readRunLock: async () => other });
+    await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
+
+    timers.tick();
+    await flush();
+    timers.tick();
+    await flush();
+
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock']);
+    expect(session.lockLost).toBe(true);
+    expect(session.lockLostSignal.aborted).toBe(true);
+    expect(timers.created[0]?.cleared).toBe(true);
+    // ロックを失った後は、Run のディレクトリに書かない（保存も、終えるも、書き手に頼まずに拒む）。
+    await expect(session.saveState(sampleRunCheckpoint())).rejects.toBeInstanceOf(RunLockLostError);
+    await expect(session.finish(sampleRunCheckpoint({ state: 'FINISHED' }))).rejects.toBeInstanceOf(RunLockLostError);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock']);
+  });
+
+  it('reads the lock once more after RUN_LOCK_REREAD_DELAY_MS when it cannot be read, and loses it only when it is still not its own (DEF-170)', async () => {
+    const lock = createRunLock(lockHost(STARTED_AT_MS));
+    for (const [second, lost] of [[lock, false], [null, true]] as const) {
+      let reads = 0;
+      const waits: number[] = [];
+      const waiting = deferred();
+      const { session, calls, timers } = createSession({
+        readRunLock: async () => {
+          reads += 1;
+          return reads === 1 ? null : second;
+        },
+      }, {
+        wait: async (ms) => {
+          waits.push(ms);
+          await waiting.promise;
+        },
+      });
+      await session.start(RUN_DIRECTORY, { mode: 'NEW_RUN' });
+      timers.tick();
+      await flush();
+      // 1 回目が読めなければ、すぐには失ったとせず、間（`RUN_LOCK_REREAD_DELAY_MS`）を置いて読み直す。
+      expect(reads).toBe(1);
+      expect(waits).toEqual([RUN_LOCK_REREAD_DELAY_MS]);
+      expect(session.lockLost).toBe(false);
+      waiting.resolve();
+      await flush();
+      expect(reads).toBe(2);
+      expect(session.lockLost, String(lost)).toBe(lost);
+      expect(kindsOf(calls)).toEqual(lost
+        ? ['acquireRunLock', 'readRunLock', 'readRunLock']
+        : ['acquireRunLock', 'readRunLock', 'readRunLock', 'rewriteRunLock']);
+    }
   });
 
   it('does not throw or reject when a heartbeat write fails, and writes again at the next minute', async () => {
@@ -340,7 +413,7 @@ describe('R4a: the heartbeat of the lock (design 4.3.1, 4.4)', () => {
     timers.tick();
     await flush();
 
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'rewriteRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'rewriteRunLock']);
     await expect(session.saveState(sampleRunCheckpoint())).resolves.toBeUndefined();
   });
 
@@ -380,13 +453,13 @@ describe('R4a: the heartbeat of the lock (design 4.3.1, 4.4)', () => {
     timers.tick();
     timers.tick();
     await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock']);
 
     writing.resolve();
     await flush();
     timers.tick();
     await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'rewriteRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'rewriteRunLock']);
   });
 });
 
@@ -400,8 +473,11 @@ describe('R4a: saving pages and the run state (design 4.3)', () => {
     await expect(session.savePage(page)).resolves.toBeUndefined();
     await expect(session.saveState(state)).resolves.toBeUndefined();
 
+    // DEF-172: 書く前に、ロックが今も自分のものかを読んで確かめる。
     expect(calls.slice(1)).toEqual([
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'writeCheckpointPage', runDirectory: RUN_DIRECTORY, page },
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'writeCheckpointState', runDirectory: RUN_DIRECTORY, state },
     ]);
   });
@@ -437,6 +513,7 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
     await session.finish(finalState);
 
     expect(calls.slice(1)).toEqual([
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
       { kind: 'writeCheckpointState', runDirectory: RUN_DIRECTORY, state: finalState },
       { kind: 'releaseRunLock', runDirectory: RUN_DIRECTORY },
     ]);
@@ -444,7 +521,7 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
     // 終えた後は、ハートビートも保存もしない。
     timers.tick();
     await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'writeCheckpointState', 'releaseRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState', 'releaseRunLock']);
     await expect(session.saveState(finalState)).rejects.toThrow(/not active/u);
     await expect(session.finish(finalState)).rejects.toThrow(/not active/u);
   });
@@ -475,11 +552,11 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
 
     const finished = session.finish(sampleRunCheckpoint({ state: 'FINISHED' }));
     await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'writeCheckpointState']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'writeCheckpointState']);
 
     writing.resolve();
     await finished;
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'writeCheckpointState', 'releaseRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'rewriteRunLock', 'readRunLock', 'writeCheckpointState', 'releaseRunLock']);
   });
 
   it('keeps the lock and stops the heartbeat when the final state cannot be written', async () => {
@@ -489,7 +566,7 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
 
     await expect(session.finish(sampleRunCheckpoint({ state: 'FINISHED' }))).rejects.toBe(failure);
 
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'writeCheckpointState']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState']);
     expect(timers.created[0]?.cleared).toBe(true);
   });
 
@@ -512,7 +589,7 @@ describe('R4a: finishing and abandoning the session (design 4.3.1)', () => {
     expect(timers.created[0]?.cleared).toBe(true);
     timers.created[0]?.callback();
     await flush();
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'writeCheckpointState']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'readRunLock', 'writeCheckpointState']);
     await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
     // 2回目のやめる操作は、何もしない。
     await expect(session.abandon()).resolves.toBeUndefined();
@@ -587,9 +664,11 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
 
     await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({ ok: true, removedPaths: REMOVED_PATHS });
 
+    // DEF-170: 後始末の後に、ロックが自分のものかを読み直す。
     expect(calls).toEqual([
       { kind: 'acquireRunLock', runDirectory: RUN_DIRECTORY, lock },
       { kind: 'cleanUpForResume', runDirectory: RUN_DIRECTORY, completedPageIds: COMPLETED_PAGE_IDS },
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
     ]);
     expect(timersAtCleanUp).toBe(0);
     expect(timers.created).toHaveLength(1);
@@ -652,7 +731,7 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
     ['the process of the lock is not running', previousLock(), false],
     ['the heartbeat of the lock is older than the limit', previousLock({ heartbeatAtMs: STARTED_AT_MS - RUN_LOCK_STALE_AFTER_MS - 1 }), true],
     ['the lock could not be read as JSON', null, true],
-  ] as const)('takes over the stale lock when %s: rewrites it, reads it back, cleans up, and then starts the heartbeat', async (
+  ] as const)('takes over the stale lock atomically when %s: takes it over through the store, cleans up, and then starts the heartbeat', async (
     _case,
     existing,
     running,
@@ -669,16 +748,19 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
 
     await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({ ok: true, removedPaths: REMOVED_PATHS });
 
+    // DEF-172: 持ち主の process が動いているのに古く見えるロックは、猶予（注入した待ち）の後に読み直し、変わらなければ取り直す。
+    const graced = running && existing !== null;
     expect(calls).toEqual([
       { kind: 'acquireRunLock', runDirectory: RUN_DIRECTORY, lock },
-      { kind: 'rewriteRunLock', runDirectory: RUN_DIRECTORY, lock },
-      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
+      ...(graced ? [{ kind: 'readRunLock', runDirectory: RUN_DIRECTORY }] : []),
+      { kind: 'takeOverRunLock', runDirectory: RUN_DIRECTORY, judged: existing, lock },
       { kind: 'cleanUpForResume', runDirectory: RUN_DIRECTORY, completedPageIds: COMPLETED_PAGE_IDS },
+      { kind: 'readRunLock', runDirectory: RUN_DIRECTORY },
     ]);
     expect(timersAtCleanUp).toBe(0);
     expect(timers.created).toHaveLength(1);
     expect(timers.created[0]?.unref).toHaveBeenCalledOnce();
-    // ハートビートは、作り直した自分のロックを更新する。
+    // ハートビートは、取り直した自分のロックを更新する。
     clock.nowMs = STARTED_AT_MS + RUN_LOCK_HEARTBEAT_INTERVAL_MS;
     timers.tick();
     await flush();
@@ -689,39 +771,35 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
     });
   });
 
-  it.each([
-    ['another process rewrote it at the same time', { ...createRunLock(lockHost(STARTED_AT_MS)), processId: OTHER_PROCESS_ID }],
-    ['it was taken at another time', { ...createRunLock(lockHost(STARTED_AT_MS)), acquiredAtMs: STARTED_AT_MS + 1 }],
-    ['it is gone or cannot be read as JSON', null],
-  ] as const)('fails without touching the lock again, cleaning up or starting the heartbeat when the lock read back is not its own: %s', async (
-    _case,
-    readBack,
-  ) => {
+  // LG-4（テストの組の設計書 3.7.3）: 書き換えて読み直す前の方式は捨てた。ほかの起動が同時に取り直したら（原子的な取り直しの `wx` に負けた）、
+  // ロックに触れずに（相手のロックのまま）、読み直した今の中身で断る。
+  it('fails without touching the lock again, cleaning up or starting the heartbeat when another start took the stale lock over at the same time', async () => {
+    const theirs = { ...createRunLock(lockHost(STARTED_AT_MS)), processId: OTHER_PROCESS_ID };
     const { session, calls, timers } = createSession({
       ...lockExists(previousLock()),
-      readRunLock: async () => readBack,
+      takeOverRunLock: async () => ({ outcome: 'LOST' }),
+      readRunLock: async () => theirs,
     }, { isProcessRunning: () => false });
 
     await expect(session.start(RUN_DIRECTORY, resume())).resolves.toEqual({
       ok: false,
       reason: 'LOCK_TAKEN_OVER_CONCURRENTLY',
-      existingLock: readBack,
+      existingLock: theirs,
     });
 
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'readRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'takeOverRunLock', 'readRunLock']);
     expect(timers.created).toEqual([]);
     timers.tick();
     await flush();
     await expect(session.saveState(sampleRunCheckpoint())).rejects.toThrow(/not active/u);
     await expect(session.abandon()).resolves.toBeUndefined();
     // ロックは相手のもののまま（書き換えも、消すこともしない）。
-    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'rewriteRunLock', 'readRunLock']);
+    expect(kindsOf(calls)).toEqual(['acquireRunLock', 'takeOverRunLock', 'readRunLock']);
   });
 
   it.each([
-    ['rewriting the stale lock', 'rewriteRunLock', ['acquireRunLock', 'rewriteRunLock']],
-    ['reading the lock back', 'readRunLock', ['acquireRunLock', 'rewriteRunLock', 'readRunLock']],
-    ['cleaning up the run directory', 'cleanUpForResume', ['acquireRunLock', 'rewriteRunLock', 'readRunLock', 'cleanUpForResume']],
+    ['taking over the stale lock', 'takeOverRunLock', ['acquireRunLock', 'takeOverRunLock']],
+    ['cleaning up the run directory', 'cleanUpForResume', ['acquireRunLock', 'takeOverRunLock', 'cleanUpForResume']],
   ] as const)('passes on the failure of the store in %s, and starts no heartbeat', async (_case, operation, expectedKinds) => {
     const failure = new Error(`${operation} failed`);
     const { session, calls, timers } = createSession({
@@ -754,6 +832,8 @@ describe('R4a2a: starting the checkpoint session of a resumed Run (design 4.4, 4
       { ...valid, isProcessRunning: true },
       { ...valid, store: { ...store, readRunLock: undefined } },
       { ...valid, store: { ...store, cleanUpForResume: undefined } },
+      // LG-4: 原子的な取り直しの口は必須（前の方式の取り直しは捨てた）。
+      { ...valid, store: { ...store, takeOverRunLock: undefined } },
     ];
     for (const options of invalid) {
       expect(() => new RunCheckpointSession(options as RunCheckpointSessionOptions)).toThrow(TypeError);

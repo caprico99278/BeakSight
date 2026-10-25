@@ -12,10 +12,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   findTransitiveForbiddenReferences,
+  isPathUnderAny,
   loadSourceFiles,
-  moduleReferenceCandidatesOf,
+  modulePattern,
+  pathReferenceCandidatesOf,
   reachableFiles,
-  resolveRelativeSpecifier,
+  refersUnderAny,
   scanSource,
   type ScannedSource,
 } from './source-scan.js';
@@ -23,34 +25,28 @@ import {
 const CLI_DIRECTORY = 'src/cli/';
 /** (i): 監査の CLI から届いてはならないフォルダ。 */
 const FORBIDDEN_DIRECTORIES: readonly string[] = ['src/control/store/', 'src/control/environment/'];
-/** `node:sqlite`。 */
-const NODE_SQLITE_PATTERN = /^node:sqlite$/u;
+/** `node:sqlite`（`source-scan.ts` の `modulePattern`。`node:` のない形、下位のパス、文字列の中の `node:sqlite` も当てる。PRE42-CC 組 G）。 */
+const NODE_SQLITE_PATTERN = modulePattern(['sqlite']);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 指定子のすべて（型だけの import を含む）と、相対パスの文字列リテラル。 */
-const referencesOf = (source: ScannedSource): readonly string[] => moduleReferenceCandidatesOf(source, [NODE_SQLITE_PATTERN]);
+/** 指定子のすべて（型だけの import を含む）と、相対パス・`src/` のパス・`node:sqlite` の文字列リテラル。 */
+const referencesOf = (source: ScannedSource): readonly string[] => pathReferenceCandidatesOf(source, [NODE_SQLITE_PATTERN]);
 
-const isForbidden = (path: string): boolean => FORBIDDEN_DIRECTORIES.some((directory) => `${path}/`.startsWith(directory));
+const isForbidden = (path: string): boolean => isPathUnderAny(path, FORBIDDEN_DIRECTORIES);
 
-/** (i) 直接: 禁止のフォルダか `node:sqlite` を指す参照。 */
+/** (i) 直接: 禁止のフォルダ（相対でない参照は、文字列の中の `src/` からのパス）か `node:sqlite` を指す参照。 */
 const findDirectReferences = (path: string, source: ScannedSource): readonly string[] =>
-  referencesOf(source).filter((text) => {
-    if (NODE_SQLITE_PATTERN.test(text)) {
-      return true;
-    }
-    const resolved = resolveRelativeSpecifier(path, text);
-    return resolved !== null ? isForbidden(resolved) : /(?:^|\/)src\/control\/(?:store|environment)(?:\/|$)/u.test(text);
-  });
+  referencesOf(source).filter((text) => NODE_SQLITE_PATTERN.test(text) || refersUnderAny(path, text, FORBIDDEN_DIRECTORIES));
 
 /**
  * (i) 間接: 実行時の相対の import を、`source-scan.ts` の `findImportChains`（CCX-9）でたどり、禁止のフォルダ（`.js` などは `.ts` に
  * 読み替えたパス。たどった先のファイルが禁止のフォルダでも同じ）か `node:sqlite` に届いたら `<始まり> -> … -> <先>`。
  */
 const findTransitiveReferences = (files: ReadonlyMap<string, ScannedSource>, starts: readonly string[]): readonly string[] =>
-  // `node:sqlite`（`NODE_SQLITE_PATTERN` は全体の一致）は相対でないので、相対でない指定子の判定に渡す（CCX-27。前と同じ結果）。
+  // `node:sqlite` は相対でないので、相対でない指定子の判定に渡す（CCX-27）。
   findTransitiveForbiddenReferences(files, starts, isForbidden, (specifier) => NODE_SQLITE_PATTERN.test(specifier));
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -69,6 +65,9 @@ describe('CLI and control store boundary detectors', () => {
       "import { DatabaseSync } from 'node:sqlite';",
       "const sqlite = process.getBuiltinModule('node:sqlite');",
       "const directory = '../control/environment/';",
+      // PRE42-CC 組 G（新 Gate の 2）: 相対でない `src/` のパスと、`node:` のない `sqlite`、下位のパスも見る。
+      "const entry = 'beaksight/src/control/store/control-database.js';",
+      "const sqlite = require('sqlite');",
     ]) {
       expect(findDirectReferences(path, scanSource(line)), line).toHaveLength(1);
     }

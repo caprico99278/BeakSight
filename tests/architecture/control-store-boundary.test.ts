@@ -18,6 +18,8 @@
  *   `withWriteTransaction` の中だけ）。
  *   T29d: 入力の規則の保存の部品（`src/control/data-rules/rule-store.ts`。版 7 の表）も対象に足した（書いてよく、どの書き込みも
  *   `withWriteTransaction` の中だけ）。
+ *   LG-2: 基準の版 17 の文のファイル（`src/control/store/control-schema-v17.ts`。表と索引を作る凍結の文）も対象に足した（書いてよく、文は版の
+ *   一覧と同じくデータとして公開し、`migrations.ts` の版の管理が `withWriteTransaction` の中でだけ流す）。
  * - (k)（T28c。Task 28 の設計書 4.2、実装計画の Gate）: 承認と撤回の記録（`approval_receipts`）と、シナリオの版の写し（`scenario_revisions`）は追記だけ。
  *   `src/` と画面のコードの、どのファイルにも、この 2 つの表への `UPDATE`・`DELETE`・`REPLACE`・`INSERT OR REPLACE`・`DROP TABLE`・`ALTER TABLE`
  *   の文を書かない（移行のファイルを含む。表を作り直すときは、新しい版の設計を先に決める）。T29d: 入力の規則の集まりの版の写し
@@ -36,7 +38,8 @@
  *   作り直しの組だけを受ける。組は、`INSERT INTO write_results_v<N> (…) SELECT … FROM write_results`（今の行をすべて移す）と、
  *   `ALTER TABLE write_results_v<N> RENAME TO write_results` の 2 つの文が同じファイルにあること。そのときだけ、文の全体がちょうど
  *   `DROP TABLE write_results` のリテラルを、組の数まで受ける（行を消す `DELETE`、締めでない `UPDATE`、組のない `DROP`、条件つきの `DROP`、
- *   ほかのファイルの `DROP` は、今までどおり検出する）。
+ *   ほかのファイルの `DROP` は、今までどおり検出する）。LG-2: 版 9・版 14 の作り直しは、版 1〜16 の段と一緒に捨てた（今の移行のファイルに組は
+ *   ない）。版 18 から後の段でも表を作り直すことはありうるので、この例外の形は残す（例外は組の数までしか受けないので、組がなければ何も受けない）。
  * - (n)（T30e。T30d の発見事項 2 の判断）: 書き込みの結果を記録せずに予約を返す口（`settleWriteReservation`。`RELEASED` だけ）を参照するのは、
  *   `src/control/approval/scenario-store.ts` だけ。結果の記録を伴って予約を締める口と送る前の記録（`recordWriteAttempt`・`settleWriteResult`・
  *   `closeOrphanedWriteResults`・`closeWriteWithoutSending`）を参照するのは、保存の部品と、書き込みのジョブの管理（`audit-job-manager.ts`）だけ
@@ -60,20 +63,24 @@
  *     宣言の `export`、`export { a, b as c }` の一覧、`export default`（名前のある関数とクラス、識別子、名前のない式。名前のない式は
  *     `default` という名前で報告する）を数える（T23c round 4）。`export { … } from '…'` の再公開と、`export * from` は、ほかの
  *     モジュールの名前なので数えない。
- *     版の一覧（`CONTROL_MIGRATIONS`）は、データとして公開してよい代わりに、その中身（`.statements`・`.seed`）を
- *     `withWriteTransaction(…)` の引数の外で使わないことを確かめる。
+ *     版の一覧（`CONTROL_MIGRATIONS`。LG-2 で、基準の版 `CONTROL_SCHEMA_BASE`・`CONTROL_SCHEMA_V17` も）は、データとして
+ *     公開してよい代わりに、その中身（`.statements`・`.seed`）を `withWriteTransaction(…)` の引数の外で使わないことを確かめる。
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   REPOSITORY_ROOT,
   findCallSites,
   findModuleReferences,
+  loadLocalUiAppFiles,
   loadSourceFiles,
+  modulePattern,
   readTypeScriptFilesUnder,
   scanFile,
   scanSource,
+  sourceFileOf,
+  unusedExclusionsOf,
   type ScannedSource,
   type SourceFile,
   type UnscannedFile,
@@ -96,8 +103,13 @@ const LOCAL_DATA_IGNORE_LINE = '/local-data/';
 // 検出の関数（近似）
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 文字列リテラルの中の `node:sqlite`。 */
-const NODE_SQLITE_PATTERN = /(?<![\w-])node:sqlite(?![\w-])/u;
+/**
+ * `node:sqlite` の指定子（文字列の中の `node:sqlite` と、`node:` のない `sqlite`、下位のパス。`source-scan.ts` の `modulePattern`。
+ * PRE42-CC 組 G で最も広い形にそろえた）。
+ */
+const NODE_SQLITE_PATTERN = modulePattern(['sqlite']);
+/** (c) の絞り込みの文字列（`node:` のない指定子も当たるように、名前だけで絞る）。 */
+const SQLITE_NAME = 'sqlite';
 
 /** モジュールの識別子そのもの。 */
 const NODE_SQLITE_MODULE_ID = 'node:sqlite';
@@ -118,8 +130,8 @@ const findSqliteReferences = (source: ScannedSource): readonly string[] =>
  * `source-scan.ts` の `findModuleReferences` で取る（指定子を取り出す正規表現は、このファイルに書かない）。
  */
 const findRuntimeSqliteImports = (source: ScannedSource): readonly string[] =>
-  // DEF-107: 指定子は `code` の一部なので、`code` に `node:sqlite` がなければ当たる参照はない（取り出しの重い処理を省く。結果は同じ）。
-  (source.code.includes(NODE_SQLITE_MODULE_ID) ? findModuleReferences(source.code) : [])
+  // DEF-107: 指定子は `code` の一部なので、`code` に `sqlite` がなければ当たる参照はない（取り出しの重い処理を省く。結果は同じ）。
+  (source.code.includes(SQLITE_NAME) ? findModuleReferences(source.code) : [])
     .filter((reference) => !reference.typeOnly && reference.form !== 'builtin-module' && NODE_SQLITE_PATTERN.test(reference.specifier))
     .map((reference) => reference.specifier);
 
@@ -247,6 +259,8 @@ describe('Control store boundary detectors', () => {
       // CCX-9: 共通の取り出し（`findModuleReferences`）で、`require` と `createRequire(…)(…)` の読み込みも数える。
       "const sqlite = require('node:sqlite');",
       "const sqlite = createRequire(import.meta.url)('node:sqlite');",
+      // PRE42-CC 組 G（新 Gate の 2）: `node:` のない指定子も数える。
+      "const sqlite = await import('sqlite');",
     ]) {
       expect(findRuntimeSqliteImports(scanSource(line)), line).toHaveLength(1);
     }
@@ -377,30 +391,15 @@ describe('Control store boundary (Task 23 design 4.3, 4.5, 4.6)', () => {
 // T23c: 生の接続と、SQL の書き込みの文の置き場所
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 画面のコードの置き場所（T23e が作る。なければ空）。生成物と依存は読まない。 */
+/** 画面のコードの置き場所。生成物と依存は読まない。 */
 const UI_DIRECTORY = 'apps/local-ui';
-const UI_SKIPPED_SEGMENTS: readonly string[] = ['node_modules', 'dist'];
-const UI_SOURCE_EXTENSION = /\.(?:ts|tsx|mts|cts)$/u;
 
-/** `apps/local-ui/` の TypeScript のファイルを、1 回だけ読み込んで走査する。 */
-const loadUiSourceFiles = (): readonly SourceFile[] => {
-  const root = join(REPOSITORY_ROOT, UI_DIRECTORY);
-  if (!existsSync(root)) {
-    return [];
-  }
-  return readdirSync(root, { recursive: true, encoding: 'utf8' })
-    .map((relativePath) => relativePath.replaceAll('\\', '/'))
-    .filter((relativePath) => UI_SOURCE_EXTENSION.test(relativePath))
-    .filter((relativePath) => !relativePath.split('/').some((segment) => UI_SKIPPED_SEGMENTS.includes(segment)))
-    .sort()
-    .map((relativePath) => {
-      const content = readFileSync(join(root, relativePath), 'utf8');
-      return { path: `${UI_DIRECTORY}/${relativePath}`, content, ...scanSource(content) };
-    });
-};
-const UI_SOURCE_FILES = loadUiSourceFiles();
+/** `apps/local-ui/` の TypeScript のファイルを、1 回だけ読み込んで走査する（`source-scan.ts` の `loadLocalUiAppFiles`。PRE42-CC 組 G）。 */
+const UI_SOURCE_FILES = loadLocalUiAppFiles();
 
 const MIGRATIONS_FILE = 'src/control/store/migrations.ts';
+/** LG-2: 基準の版 17 の文（表と索引を作る凍結の文）。 */
+const BASE_SCHEMA_FILE = 'src/control/store/control-schema-v17.ts';
 const PROFILE_STORE_FILE = 'src/control/store/profile-store.ts';
 /** T25a round 1: 認証の設定の保存の部品（版 3 の `auth_setups`。書き込みは `withWriteTransaction` の中だけ）。 */
 const AUTH_SETUP_STORE_FILE = 'src/control/store/auth-setup-store.ts';
@@ -408,7 +407,9 @@ const AUTH_SETUP_STORE_FILE = 'src/control/store/auth-setup-store.ts';
 const SCENARIO_STORE_FILE = 'src/control/approval/scenario-store.ts';
 /** T29d: 入力の規則の保存の部品（版 7 の表。書き込みは `withWriteTransaction` の中だけ）。 */
 const RULE_STORE_FILE = 'src/control/data-rules/rule-store.ts';
-const SQL_WRITE_FILES: readonly string[] = [MIGRATIONS_FILE, PROFILE_STORE_FILE, AUTH_SETUP_STORE_FILE, SCENARIO_STORE_FILE, RULE_STORE_FILE];
+const SQL_WRITE_FILES: readonly string[] = [
+  MIGRATIONS_FILE, BASE_SCHEMA_FILE, PROFILE_STORE_FILE, AUTH_SETUP_STORE_FILE, SCENARIO_STORE_FILE, RULE_STORE_FILE,
+];
 /** T24e: 監査のジョブの管理のフォルダ（どのファイルも、書き込みは `withWriteTransaction` の中だけ）と、行の読み書きのファイル。 */
 const JOB_DIRECTORY = 'src/control/job/';
 const JOB_STORE_FILE = 'src/control/job/job-store.ts';
@@ -416,8 +417,31 @@ const JOB_FILES: readonly string[] = SOURCE_FILES.filter((file) => file.path.sta
 /** SQL の書き込みの文を書いてよいファイル（`SQL_WRITE_FILES` と、`src/control/job/` のファイル）。 */
 const SQL_WRITER_PATHS: readonly string[] = [...SQL_WRITE_FILES, ...JOB_FILES];
 
-/** 版の一覧（データとして公開してよい名前。中身の `.statements`・`.seed` は、トランザクションの中でだけ使う）。 */
-const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS'];
+/**
+ * 版の一覧（データとして公開してよい名前。中身の `.statements`・`.seed` は、トランザクションの中でだけ使う）。LG-2: 基準の版（`CONTROL_SCHEMA_BASE`と、
+ * 文のファイルの `CONTROL_SCHEMA_V17`）も、版の一覧と同じデータとして扱う。文の配列（`CONTROL_SCHEMA_V17_STATEMENTS`）は公開しないので、一覧に入れない
+ * （外で流す漏れを見る）。
+ */
+const MIGRATION_LIST_NAMES: readonly string[] = ['CONTROL_MIGRATIONS', 'CONTROL_SCHEMA_BASE', 'CONTROL_SCHEMA_V17'];
+
+/**
+ * T43d fix round 1（Task 43 の設計書 7 章。設計者の判断 2026-10-17）: (g) の閉じた例外（ファイル → 公開の名前と理由）。プロファイルと認証の設定を
+ * 1 つのトランザクションで書くため、認証の設定の行を書く部品だけを公開する。例外が広がらないよう、呼ぶファイルと呼ぶ位置も確かめる（下の (g) の例外の場面）。
+ */
+const OUTSIDE_TRANSACTION_EXCEPTIONS: ReadonlyMap<string, ReadonlyMap<string, string>> = new Map([
+  [AUTH_SETUP_STORE_FILE, new Map([[
+    'writeAuthSetupRow',
+    '`profile-store.ts` の `updateProfileWithFollowingWrite` のトランザクションの中からだけ呼ばれる。2026-10-17 Task 43 の設計書 7 章',
+  ]])],
+]);
+/** 例外の部品を import して呼んでよい、ただ 1 つのファイル（プロファイルと認証の設定のまとめて保存）。 */
+const FOLLOWING_WRITE_CALLER_FILE = 'src/control/store/profile-auth-setup-store.ts';
+/** 例外の部品を呼んでよい位置（この関数の呼び出しの引数の中。関数の中でトランザクションを開く）。 */
+const FOLLOWING_WRITE_RUNNER = 'updateProfileWithFollowingWrite';
+
+/** (g) の外で書けるものから、閉じた例外を除く。 */
+const withoutOutsideTransactionExceptions = (path: string, names: readonly string[]): readonly string[] =>
+  names.filter((name) => !(OUTSIDE_TRANSACTION_EXCEPTIONS.get(path)?.has(name) ?? false));
 
 /**
  * (f): 生の接続の参照（近似。限界はファイルの冒頭）。`bare`（文字列の中身を除いた本文）から:
@@ -560,7 +584,7 @@ const declarationHeadsOf = (code: string): readonly DeclarationHead[] => [
  * 一覧（`export { a, b as c, d as default }`）と `export default <識別子>;` で公開された、このファイルの名前（T23c round 4）。
  * `from` の付いた再公開と `export type { … }` は数えない。
  */
-const exportedNamesOf = (code: string): ReadonlySet<string> => {
+const listedExportNamesOf = (code: string): ReadonlySet<string> => {
   const names = new Set<string>();
   for (const match of code.matchAll(TOP_LEVEL_EXPORT_LIST)) {
     if (EXPORT_LIST_FROM.test(code.slice(match.index + match[0].length))) {
@@ -583,7 +607,7 @@ const exportedNamesOf = (code: string): ReadonlySet<string> => {
 const topLevelDeclarationsOf = (content: string): readonly TopLevelDeclaration[] => {
   const { code } = scanSource(content);
   const heads = declarationHeadsOf(code);
-  const exportedNames = exportedNamesOf(code);
+  const exportedNames = listedExportNamesOf(code);
   return heads.flatMap((head, index) => {
     if (head.name === NOT_A_DECLARATION) {
       return [];
@@ -822,35 +846,35 @@ describe('Control store boundary detectors (T23c round 3)', () => {
   });
 
   it('(g) finds writes that can run outside withWriteTransaction (top-level names, approximate)', () => {
-    const violationsOf = (content: string, migrationListNames: readonly string[] = []): readonly string[] =>
+    const outsideWritesOf = (content: string, migrationListNames: readonly string[] = []): readonly string[] =>
       findWritesOutsideTransactions(content, migrationListNames);
 
     // 違反: 書き込みを、トランザクションの外で行う公開の関数。
-    expect(violationsOf([
+    expect(outsideWritesOf([
       'export const remove = (database) => {',
       "  database.connection.prepare('DELETE FROM profiles').run();",
       '};',
     ].join('\n'))).toEqual(['remove']);
     // 違反: トランザクションの中の書き込みの後に、外で書く。
-    expect(violationsOf([
+    expect(outsideWritesOf([
       'export const both = (database) => {',
       "  withWriteTransaction(database, (connection) => connection.exec('DELETE FROM a'));",
       "  database.connection.exec('DELETE FROM b');",
       '};',
     ].join('\n'))).toEqual(['both']);
     // 違反: 書き込みの内部の関数を、トランザクションの外から呼ぶ。
-    expect(violationsOf([
+    expect(outsideWritesOf([
       "const INSERT_SQL = 'INSERT INTO t (x) VALUES (?)';",
       'const insertRow = (connection, value) => connection.prepare(INSERT_SQL).run(value);',
       'export const add = (database, value) => insertRow(database.connection, value);',
     ].join('\n'))).toEqual(['add']);
     // 違反: 書き込みの文の定数や、書き込みの内部の関数を公開する（ほかのファイルから、トランザクションの外で使える）。
-    expect(violationsOf("export const DELETE_SQL = 'DELETE FROM t';")).toEqual(['DELETE_SQL']);
-    expect(violationsOf([
+    expect(outsideWritesOf("export const DELETE_SQL = 'DELETE FROM t';")).toEqual(['DELETE_SQL']);
+    expect(outsideWritesOf([
       "export const clear = (connection) => connection.exec('DELETE FROM t');",
     ].join('\n'))).toEqual(['clear']);
     // 違反でない: 書き込みの文の定数と内部の関数を、トランザクションに渡す関数の中からだけ使う。
-    expect(violationsOf([
+    expect(outsideWritesOf([
       "const INSERT_SQL = 'INSERT INTO t (x) VALUES (?)';",
       "const UPDATE_SQL =\n  'UPDATE t SET x = ? WHERE id = ?';",
       'const insertRow = (connection, value) => connection.prepare(INSERT_SQL).run(value);',
@@ -865,7 +889,7 @@ describe('Control store boundary detectors (T23c round 3)', () => {
       '});',
     ].join('\n'))).toEqual([]);
     // 違反でない: 書き込みの文を、トランザクションに渡す関数の中に直接書く。
-    expect(violationsOf([
+    expect(outsideWritesOf([
       'export const add = (database) => withWriteTransaction(database, (connection) => {',
       "  connection.exec('INSERT INTO t (x) VALUES (1)');",
       '});',
@@ -886,29 +910,29 @@ describe('Control store boundary detectors (T23c round 3)', () => {
       '  }',
       '};',
     ];
-    expect(violationsOf(migrations.join('\n'), ['MIGRATIONS'])).toEqual([]);
+    expect(outsideWritesOf(migrations.join('\n'), ['MIGRATIONS'])).toEqual([]);
     // 違反: 版の一覧の書き込みを、トランザクションの外で使う。
-    expect(violationsOf([...migrations, 'export const leak = (connection) => connection.exec(MIGRATIONS[0].statements[0]);'].join('\n'), ['MIGRATIONS']))
+    expect(outsideWritesOf([...migrations, 'export const leak = (connection) => connection.exec(MIGRATIONS[0].statements[0]);'].join('\n'), ['MIGRATIONS']))
       .toEqual(['leak']);
     // T23c round 4（再レビュー T23R2 の N2）: `export { … }` の一覧と `export default` での公開も、公開の名前として数える。
     const remove = "const remove = (connection) => connection.exec('DELETE FROM t');";
     const add = "const add = (database) => withWriteTransaction(database, (connection) => connection.exec('INSERT INTO t (x) VALUES (1)'));";
-    expect(violationsOf([remove, 'export { remove };'].join('\n'))).toEqual(['remove']);
-    expect(violationsOf([remove, 'export { remove as clear };'].join('\n'))).toEqual(['remove']);
-    expect(violationsOf([remove, 'export { add, remove as default };', add].join('\n'))).toEqual(['remove']);
-    expect(violationsOf([remove, 'export default remove;'].join('\n'))).toEqual(['remove']);
-    expect(violationsOf("export default function remove(connection) { connection.exec('DELETE FROM t'); }")).toEqual(['remove']);
-    expect(violationsOf("export default async function (connection) { connection.exec('DELETE FROM t'); }")).toEqual(['default']);
-    expect(violationsOf("export default (connection) => connection.exec('DELETE FROM t');")).toEqual(['default']);
-    expect(violationsOf([remove, 'export default { remove };'].join('\n'))).toEqual(['default']);
+    expect(outsideWritesOf([remove, 'export { remove };'].join('\n'))).toEqual(['remove']);
+    expect(outsideWritesOf([remove, 'export { remove as clear };'].join('\n'))).toEqual(['remove']);
+    expect(outsideWritesOf([remove, 'export { add, remove as default };', add].join('\n'))).toEqual(['remove']);
+    expect(outsideWritesOf([remove, 'export default remove;'].join('\n'))).toEqual(['remove']);
+    expect(outsideWritesOf("export default function remove(connection) { connection.exec('DELETE FROM t'); }")).toEqual(['remove']);
+    expect(outsideWritesOf("export default async function (connection) { connection.exec('DELETE FROM t'); }")).toEqual(['default']);
+    expect(outsideWritesOf("export default (connection) => connection.exec('DELETE FROM t');")).toEqual(['default']);
+    expect(outsideWritesOf([remove, 'export default { remove };'].join('\n'))).toEqual(['default']);
     // 違反でない: トランザクションの中だけで書く関数を、一覧や default で公開する。
-    expect(violationsOf([add, 'export { add };', 'export { add as insertOne };', 'export default add;'].join('\n'))).toEqual([]);
+    expect(outsideWritesOf([add, 'export { add };', 'export { add as insertOne };', 'export default add;'].join('\n'))).toEqual([]);
     // 違反でない: 外で書く関数でも、公開しなければよい（`export { … }` の後ろに宣言が続いても、ほかの宣言に混ざらない）。
-    expect(violationsOf([remove, add, 'export { add };', 'export const other = 1;'].join('\n'))).toEqual([]);
+    expect(outsideWritesOf([remove, add, 'export { add };', 'export const other = 1;'].join('\n'))).toEqual([]);
     // 違反でない: ほかのモジュールからの再公開（`export { … } from '…'`）は、このファイルの名前ではない。
-    expect(violationsOf([remove, "export { remove } from './other.js';", "export type { Remove } from './other.js';"].join('\n'))).toEqual([]);
+    expect(outsideWritesOf([remove, "export { remove } from './other.js';", "export type { Remove } from './other.js';"].join('\n'))).toEqual([]);
     // 違反: 版の一覧として扱わないなら、公開した一覧も違反。
-    expect(violationsOf(migrations.join('\n'))).toContain('MIGRATIONS');
+    expect(outsideWritesOf(migrations.join('\n'))).toContain('MIGRATIONS');
   });
 });
 
@@ -918,8 +942,42 @@ describe('Control store boundary (T23c round 3)', () => {
     for (const path of SQL_WRITER_PATHS) {
       const file = SOURCE_FILES.find((candidate) => candidate.path === path);
       expect(file, path).toBeDefined();
-      expect(findWritesOutsideTransactions(file?.content ?? '', MIGRATION_LIST_NAMES), path).toEqual([]);
+      expect(withoutOutsideTransactionExceptions(path, findWritesOutsideTransactions(file?.content ?? '', MIGRATION_LIST_NAMES)), path).toEqual([]);
     }
+  });
+
+  // T43d fix round 1: (g) の閉じた例外は 1 件だけで、古くなっていない（検出の関数が実際に報告する名前）。例外の部品を import・参照するのは、認証の
+  // 設定の保存の部品と、まとめて保存のファイルだけ。まとめて保存のファイルの参照は、import のほかは `updateProfileWithFollowingWrite(…)` の引数の中だけ。
+  it('(g) has one closed exception, used only by the combined save inside updateProfileWithFollowingWrite', () => {
+    const exceptions = [...OUTSIDE_TRANSACTION_EXCEPTIONS].flatMap(([path, names]) => [...names.keys()].map((name) => `${path}: ${name}`));
+    expect(exceptions).toEqual([`${AUTH_SETUP_STORE_FILE}: writeAuthSetupRow`]);
+    const [[exceptionFile, exceptionNames] = ['', new Map<string, string>()]] = [...OUTSIDE_TRANSACTION_EXCEPTIONS];
+    const [name = ''] = [...exceptionNames.keys()];
+    expect(exceptionNames.get(name)).toContain('Task 43 の設計書 7 章');
+    const owner = SOURCE_FILES.find((file) => file.path === exceptionFile);
+    expect(findWritesOutsideTransactions(owner?.content ?? '', MIGRATION_LIST_NAMES)).toEqual([name]);
+    // 参照するファイル（製品のコードと画面のコード）。
+    const referencing = [...SOURCE_FILES, ...UI_SOURCE_FILES].filter((file) => referencesName(file.bare, name)).map((file) => file.path).sort();
+    expect(referencing).toEqual([exceptionFile, FOLLOWING_WRITE_CALLER_FILE].sort());
+    // まとめて保存のファイル: 認証の設定の保存の部品から import し、ほかの参照は `updateProfileWithFollowingWrite(…)` の引数の中だけ。
+    const caller = SOURCE_FILES.find((file) => file.path === FOLLOWING_WRITE_CALLER_FILE);
+    const bare = caller?.bare ?? '';
+    expect(findModuleReferences(caller?.content ?? '').map((reference) => reference.specifier)).toContain('./auth-setup-store.js');
+    const ranges = findCallSites(bare, FOLLOWING_WRITE_RUNNER).map((site): readonly [number, number] => {
+      const open = bare.indexOf('(', site.index);
+      return [open + 1, open + 1 + site.argumentText.length];
+    });
+    expect(ranges.length).toBeGreaterThan(0);
+    const occurrences = [...bare.matchAll(new RegExp(String.raw`(?<![\w$.])${name}(?![\w$])`, 'gu'))].map((match) => match.index);
+    const outside = occurrences.filter((index) => !ranges.some(([start, end]) => index >= start && index < end));
+    const inImport = (index: number): boolean => {
+      const head = bare.lastIndexOf('import', index);
+      const statementEnd = bare.indexOf(';', index);
+      return head >= 0 && !bare.slice(head, index).includes(';') && /\}\s*from\s/u.test(bare.slice(index, statementEnd));
+    };
+    expect(outside.length).toBe(1);
+    expect(outside.every(inImport)).toBe(true);
+    expect(occurrences.length).toBeGreaterThan(outside.length);
   });
 
   it('(g) the check sees the real files: a leak appended to each file is reported', () => {
@@ -933,8 +991,14 @@ describe('Control store boundary (T23c round 3)', () => {
       `${contentOf(PROFILE_STORE_FILE)}\nexport const leak = (database) => database.connection.prepare(INSERT_PROFILE_SQL).run();\n`,
       MIGRATION_LIST_NAMES,
     )).toEqual(['leak']);
+    // LG-2: 基準の版の文（`CONTROL_SCHEMA_V17_STATEMENTS`）と、基準の版の seed（`CONTROL_SCHEMA_BASE.seed`）を外で使う漏れも見える。
     expect(findWritesOutsideTransactions(
-      `${contentOf(MIGRATIONS_FILE)}\nexport const leak = (connection) => connection.exec(VERSION_1_STATEMENTS[0]);\n`,
+      `${contentOf(BASE_SCHEMA_FILE)}\nexport const leak = (connection) => connection.exec(CONTROL_SCHEMA_V17_STATEMENTS[0]);\n`,
+      MIGRATION_LIST_NAMES,
+    )).toEqual(['leak']);
+    expect(findWritesOutsideTransactions(`${contentOf(BASE_SCHEMA_FILE)}\n`, MIGRATION_LIST_NAMES)).toEqual([]);
+    expect(findWritesOutsideTransactions(
+      `${contentOf(MIGRATIONS_FILE)}\nexport const leak = (connection) => CONTROL_SCHEMA_BASE.seed(connection, context);\n`,
       MIGRATION_LIST_NAMES,
     )).toEqual(['leak']);
     expect(findWritesOutsideTransactions(
@@ -947,10 +1011,11 @@ describe('Control store boundary (T23c round 3)', () => {
       MIGRATION_LIST_NAMES,
     )).toEqual(['leak']);
     // T25a round 1: 認証の設定の保存の部品も、同じく見えている。
-    expect(findWritesOutsideTransactions(
+    // T43d fix round 1: 閉じた例外（`writeAuthSetupRow`）を除いても、足した漏れは見える。
+    expect(withoutOutsideTransactionExceptions(AUTH_SETUP_STORE_FILE, findWritesOutsideTransactions(
       `${contentOf(AUTH_SETUP_STORE_FILE)}\nexport const leak = (database) => database.connection.prepare(UPSERT_AUTH_SETUP_SQL).run();\n`,
       MIGRATION_LIST_NAMES,
-    )).toEqual(['leak']);
+    ))).toEqual(['leak']);
     // T28c: シナリオと承認の記録の保存の部品も、同じく見えている。
     expect(findWritesOutsideTransactions(
       `${contentOf(SCENARIO_STORE_FILE)}\nexport const leak = (connection) => connection.prepare(INSERT_RECEIPT_SQL).run();\n`,
@@ -1380,7 +1445,7 @@ const testSettlerViolationsOf = (files: readonly SourceFile[]): readonly string[
 
 describe('Control store boundary (T30g fix round 1)', () => {
   it('(o) reports a test file that refers to a settlement function outside the helpers and the closed exceptions (control)', () => {
-    const fileOf = (path: string, text: string): SourceFile => ({ path, content: text, ...scanSource(text) });
+    const fileOf = sourceFileOf;
     expect(testSettlerViolationsOf([
       fileOf(`${UI_DIRECTORY}/tests/example.test.ts`, "import { settleWriteResult } from '../../../src/control/approval/scenario-store.js';"),
       fileOf('tests/integration/example.test.ts', 'recordWriteAttempt(database, input);'),
@@ -1397,7 +1462,7 @@ describe('Control store boundary (T30g fix round 1)', () => {
     expect(helpers.every((file) => ALL_SETTLERS.some((name) => findSettlerReferences(file, name) > 0))).toBe(true);
     expect(TEST_FILE_PATHS.some((path) => path.startsWith(`${UI_DIRECTORY}/tests/`))).toBe(true);
     // 例外の一覧のファイルはすべてある（古くならない）。
-    expect(Object.keys(SETTLER_TEST_EXCEPTIONS).filter((path) => !TEST_FILE_PATHS.includes(path))).toEqual([]);
+    expect(unusedExclusionsOf(Object.keys(SETTLER_TEST_EXCEPTIONS), TEST_FILE_PATHS)).toEqual([]);
     expect(testSettlerViolationsOf(TEST_FILES)).toEqual([]);
   });
 });

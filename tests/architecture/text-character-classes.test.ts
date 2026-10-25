@@ -9,6 +9,7 @@
  *   - 向きを変える文字（U+061C、U+200E、U+200F、U+202A〜U+202E、U+2066〜U+2069）と、行・段落の区切り（U+2028、U+2029）の
  *     `\u` のエスケープ（`\u{…}` を含む）と、その文字そのもの。
  *   - サロゲートの範囲（`\ud800-\udfff` など）と、`.isWellFormed(` の呼び出し（`hasLoneSurrogate` を使う）。
+ *   - `.toWellFormed(` の呼び出し（PRE42-CC 組 4。CC-052・053 の残り。`replaceLoneSurrogates`、切るときは `truncateWellFormed` を使う）。
  *   意味の違う正規表現（`normalize-url.ts` の C0 と空白の `[\u0000- ]`、`isolated-auditor.ts` の ANSI のエスケープシーケンス、
  *   `profile-policy.ts` のゼロ幅の文字）には当たらない形にしてある。正当な使い方（ブラウザの中の関数など）は、`EXCLUSIONS` に理由を
  *   付けて置く（除外の一覧は、このファイルの中の 1 か所だけ。今は空）。
@@ -21,27 +22,23 @@
  *   `src/core/` を import できることは、`discovery-boundary.test.ts` などの層の Gate が確かめる）。
  * - `src/**` の読み込みは、このファイルの読み込み時に 1 回だけ行う。判定は、`fs`、正規表現、文字列の走査だけで行う（近似の検査）。
  */
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { findImportSpecifiers, loadSourceFiles, REPOSITORY_ROOT, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import {
+  LOCAL_UI_SOURCE_DIRECTORY,
+  findImportSpecifiers,
+  loadLocalUiSourceFiles,
+  loadSourceFiles,
+  scanSource,
+  sourceFileAt,
+  unusedExclusionsOf,
+  type ScannedSource,
+  type SourceFile,
+} from './source-scan.js';
 
 const SOURCE_FILES = loadSourceFiles();
 
-/** (d) 画面のコードのフォルダ（`apps/local-ui/src/`）と、走査する拡張子。 */
-const LOCAL_UI_SOURCE_DIRECTORY = 'apps/local-ui/src/';
-const LOCAL_UI_SOURCE_EXTENSION = /\.tsx?$/u;
-const LOCAL_UI_SOURCE_FILES: readonly SourceFile[] = readdirSync(join(REPOSITORY_ROOT, LOCAL_UI_SOURCE_DIRECTORY), {
-  recursive: true,
-  encoding: 'utf8',
-})
-  .map((relativePath) => `${LOCAL_UI_SOURCE_DIRECTORY}${relativePath.replaceAll('\\', '/')}`)
-  .filter((path) => LOCAL_UI_SOURCE_EXTENSION.test(path))
-  .sort()
-  .map((path) => {
-    const content = readFileSync(join(REPOSITORY_ROOT, path), 'utf8');
-    return { path, content, ...scanSource(content) };
-  });
+/** (d) 画面のコード（`apps/local-ui/src/` の `.ts`・`.tsx`。`source-scan.ts` の `loadLocalUiSourceFiles`。PRE42-CC 組 G）。 */
+const LOCAL_UI_SOURCE_FILES: readonly SourceFile[] = loadLocalUiSourceFiles();
 
 /** 文字の種類の判定の owner。 */
 const CHARACTER_CLASS_OWNER = 'src/core/text.ts';
@@ -56,6 +53,10 @@ const CHARACTER_CLASS_USERS: readonly string[] = [
   'src/interaction/isolated-auditor.ts',
   'src/control/credentials/dpapi-protector.ts',
   'src/control/credentials/credential-store.ts',
+  // PRE42-CC 組 4（CC-052・053 の残り）: `toWellFormed()` を `replaceLoneSurrogates`・`truncateWellFormed` に替えた場所。
+  'src/discovery/read-check-evaluation.ts',
+  'src/safety/job-safety-violation.ts',
+  'src/worker/audit-worker-session.ts',
 ];
 
 /** 禁止の形（名前 → 検出の正規表現）。 */
@@ -71,6 +72,7 @@ const FORBIDDEN_FORMS: ReadonlyMap<string, RegExp> = new Map([
   ['raw bidirectional control or line separator', /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/gu],
   ['surrogate range', /\\u[dD][89a-fA-F][0-9a-fA-F]{2}-\\u[dD][89a-fA-F][0-9a-fA-F]{2}/gu],
   ['isWellFormed call', /\.isWellFormed\s*\(/gu],
+  ['toWellFormed call', /\.toWellFormed\s*\(/gu],
 ]);
 
 /** `source.code`（コメントを除いた本文）の中の、禁止の形（`<形の名前>: <書いたままの形>`）。 */
@@ -85,11 +87,7 @@ const EXCLUSIONS: ReadonlyMap<string, string> = new Map();
 
 const detects = (text: string): readonly string[] => findCharacterClassForms(scanSource(text));
 
-const sourceFile = (path: string): SourceFile => {
-  const file = SOURCE_FILES.find((candidate) => candidate.path === path);
-  expect(file, path).toBeDefined();
-  return file ?? { path, content: '', ...scanSource('') };
-};
+const sourceFile = (path: string): SourceFile => sourceFileAt(SOURCE_FILES, path);
 
 describe('character class forms detector (CCX-3)', () => {
   it('detects the forms of the control, line separator, bidirectional control and surrogate checks', () => {
@@ -107,6 +105,8 @@ describe('character class forms detector (CCX-3)', () => {
     expect(detects('const A = "x\u202ey";')).toEqual(['raw bidirectional control or line separator: \u202e']);
     expect(detects('const A = /[\\ud800-\\udfff]/gu;')).toEqual(['surrogate range: \\ud800-\\udfff']);
     expect(detects('const ok = value.isWellFormed();')).toEqual(['isWellFormed call: .isWellFormed(']);
+    expect(detects('const A = text.toWellFormed();')).toEqual(['toWellFormed call: .toWellFormed(']);
+    expect(detects('const A = text.slice(0, 10)\n  .toWellFormed ();')).toEqual(['toWellFormed call: .toWellFormed (']);
   });
 
   it('ignores comments and the regular expressions with a different meaning', () => {
@@ -120,7 +120,7 @@ describe('character class forms detector (CCX-3)', () => {
     expect(detects('const A = /[\\s\\u200b-\\u200d\\u2060\\ufeff]/gu;')).toEqual([]);
     // サロゲートペアの文字（範囲ではない）と、ほかの Unicode の性質。
     expect(detects("const A = '\\ud83d\\ude00'; const B = /[^\\p{L}\\p{N}]+/gu;")).toEqual([]);
-    expect(detects('const A = text.toWellFormed();')).toEqual([]);
+    expect(detects('/** text.toWellFormed() */\nconst A = truncateWellFormed(text, 10);')).toEqual([]);
   });
 });
 
@@ -129,15 +129,15 @@ describe('character class Gate (CCX-3)', () => {
     const detections = SOURCE_FILES
       .filter((file) => file.path !== CHARACTER_CLASS_OWNER)
       .flatMap((file) => findCharacterClassForms(file).map((match) => `${file.path}: ${match}`));
-    for (const key of EXCLUSIONS.keys()) {
-      expect(detections, `除外が古くなっている: ${key}`).toContain(key);
-    }
+    expect(unusedExclusionsOf(EXCLUSIONS.keys(), detections), '除外が古くなっている').toEqual([]);
     expect(detections.filter((detection) => !EXCLUSIONS.has(detection))).toEqual([]);
   });
 
   it('(b) the owner holds the named checks', () => {
     const forms = findCharacterClassForms(sourceFile(CHARACTER_CLASS_OWNER)).map((form) => form.slice(0, form.indexOf(':')));
-    expect(new Set(forms)).toEqual(new Set(['unicode property escape', 'bidirectional control escape', 'surrogate range', 'isWellFormed call']));
+    expect(new Set(forms)).toEqual(
+      new Set(['unicode property escape', 'bidirectional control escape', 'surrogate range', 'isWellFormed call', 'toWellFormed call']),
+    );
   });
 
   it('(c) the original places import the checks from the owner', () => {
@@ -182,7 +182,7 @@ describe('NFKC case folding detector (CCX-15)', () => {
 
 describe('NFKC case folding Gate (CCX-15)', () => {
   it('reads src/** and apps/local-ui/src/** once', () => {
-    expect(LOCAL_UI_SOURCE_FILES.some((file) => file.path === `${LOCAL_UI_SOURCE_DIRECTORY}start.ts`)).toBe(true);
+    expect(LOCAL_UI_SOURCE_FILES.some((file) => file.path === `${LOCAL_UI_SOURCE_DIRECTORY}/start.ts`)).toBe(true);
     expect(LOCAL_UI_SOURCE_FILES.some((file) => file.path.endsWith('.tsx'))).toBe(true);
   });
 

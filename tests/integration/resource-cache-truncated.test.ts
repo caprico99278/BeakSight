@@ -9,16 +9,15 @@
 // - Chromium は、テストの既定（headless shell）と、CLI と同じ起動の設定（`chromiumLaunchOptions`。headless）の両方で確かめる
 //   （DEF-030。本文の切断の扱いが、Chromium の種類で違わないことを確かめるため）。
 import type { ServerResponse } from 'node:http';
-import { chromium, type Browser, type BrowserContext } from 'playwright';
+import type { Browser, BrowserContext } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { BrowserContextFactory } from '../../src/browser/context-factory.js';
 import { RESOURCE_CACHE_STORABLE_STATUS, ResourceCache } from '../../src/browser/resource-delivery.js';
 import { wait } from '../../src/core/deadline.js';
 import { createLoadMeter } from '../../src/crawl/load-meter.js';
 import type { NETWORK_LAYER_FAILURE_CODES } from '../../src/safety/network-layer-failure.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { useHeadlessChromium } from '../helpers/chromium.js';
+import { launchCliChromium, testContextsOf, useHeadlessChromium } from '../helpers/chromium.js';
 import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { closePassiveResources } from '../helpers/passive-cleanup.js';
 import { createTestConfig } from '../helpers/test-config.js';
@@ -153,7 +152,8 @@ useHeadlessChromium((launched) => {
 
 beforeAll(async () => {
   // CLI と同じ起動の設定（headless）。テストの既定の Chromium（headless shell）と、扱いが違う可能性があるため（DEF-030）。
-  cliBrowser = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+  // EL-12: 本番と同じ起動の部品（`launchCliChromium`）で起動する。
+  cliBrowser = await launchCliChromium();
 });
 
 afterAll(async () => {
@@ -252,7 +252,7 @@ describe('the Run cache stores only the responses whose requests finished (PCR-D
       } finally {
         await closePassiveResources({ factory, context: second, page: secondPage });
       }
-      expect(browser.contexts(), 'Contexts left in the browser after the test').toHaveLength(0);
+      expect(testContextsOf(browser), 'Contexts left in the browser after the test').toHaveLength(0);
     },
     TEST_TIMEOUT_MS,
   );

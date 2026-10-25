@@ -1,11 +1,20 @@
 {
   "$id": "urn:beaksight:schema:control:ui-scenario-form:1",
-  "description": "Local UI Server Function input: the values of the form that makes a write scenario from one candidate of the latest discovery (Task 28 design 4.6). The candidate is named by its identity digest.",
+  "description": "Local UI Server Function input: the values of the form that makes a write scenario from one candidate of the latest discovery (Task 28 design 4.6). The candidate is named by its identity digest. T38f (Task 38 design 3.7): an API candidate row is selected by the shape digest of its probe as well (shapeDigest; omitted for a FORM candidate).",
   "type": "object",
   "additionalProperties": false,
   "required": ["profileId", "candidateIdentityDigest"],
   "properties": {
     "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
-    "candidateIdentityDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" }
+    "candidateIdentityDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" },
+    "shapeDigest": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/fingerprint" },
+    "ledgerScenarioId": {
+      "description": "FM2b (the fewer manual steps design 3A.2): the ledger (a create scenario) chosen beforehand for an API UPDATE row from the guide of the automatic drafts. Only a suggestion: the server ignores it unless it is one of the ledger options (so the form of the id is checked by the options, not copied to the screen; FM2R Minor 13), and the store checks the saved draft as usual.",
+      "type": "string", "maxLength": 2048
+    },
+    "formPathTemplate": {
+      "description": "FM2b: the update page template chosen beforehand (a suggestion; ignored unless it is one of the template options).",
+      "type": "string", "maxLength": 2048
+    }
   }
 }

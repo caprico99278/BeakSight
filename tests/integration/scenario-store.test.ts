@@ -14,7 +14,6 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { computeApprovalDigest } from '../../src/control/approval/approval-digest.js';
-import { UNSPECIFIED_VERIFICATION } from '../../src/control/approval/scenario-contracts.js';
 import {
   SCENARIO_STORE_REJECTION_REASONS,
   approveScenario,
@@ -35,6 +34,7 @@ import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/cont
 import { createReadCheck } from '../../src/control/job/read-check-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
+import { ControlStoreError } from '../../src/control/store/store-errors.js';
 import { createProfile, retireProfile, updateProfile } from '../../src/control/store/profile-store.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import {
@@ -150,6 +150,16 @@ const approve = (overrides: Partial<Parameters<typeof approveScenario>[1]> = {})
 
 const reasonOf = (result: ScenarioStoreResult): string | null => (result.ok ? null : result.reason);
 
+/** 管理データの誤りの理由（`ControlStoreError` を投げなければ undefined）。LG-3: 前の形の行で止まることの確かめ。 */
+const storeErrorReasonOf = (action: () => unknown): string | undefined => {
+  try {
+    action();
+  } catch (error) {
+    return error instanceof ControlStoreError ? error.reason : `not a store error: ${String(error)}`;
+  }
+  return undefined;
+};
+
 describe('scenario store (T28c): create', () => {
   it('has the closed list of the rejection reasons', () => {
     expect(SCENARIO_STORE_REJECTION_REASONS).toEqual([
@@ -168,8 +178,7 @@ describe('scenario store (T28c): create', () => {
       'SCENARIO_FACTS_CHANGED',
       // T29d fix round 1: 付ける入力の規則の参照が、規則の集まりの最新の版と一致しない。
       'SCENARIO_INPUT_RULES_NOT_LATEST',
-      // T31b: UPDATE の指定の前に保存した UPDATE の版は、承認しない。
-      'SCENARIO_UPDATE_SPEC_MISSING',
+      // LG-3: T31b の `SCENARIO_UPDATE_SPEC_MISSING`（UPDATE の指定の前に保存した UPDATE の版）は捨てた（その版は読まずに止まる）。
     ]);
     expect(Object.isFrozen(SCENARIO_STORE_REJECTION_REASONS)).toBe(true);
   });
@@ -348,6 +357,19 @@ describe('scenario store (T28c): approval and revocation', () => {
       .toEqual({ approved: false, reasons: ['PROFILE_REVISION_CHANGED'] });
   });
 
+  // T34c（Task 34 の T34a の判断の (3)）: 承認したサービスの Origin だけを変えたプロファイルの改訂も、承認を縛り直す（再承認が要る）。
+  it('requires a new approval after a profile edit of the approved service origins only', () => {
+    create();
+    expect(approve().ok).toBe(true);
+    const edited = updateProfile(database, {
+      profile: { ...testWriteProfile(PROFILE_ID, MIN_PROFILE_REVISION + 1), approvedServiceOrigins: ['https://service.example.invalid'] },
+      expectedRevision: MIN_PROFILE_REVISION,
+    }, { resolveContext: resolveTestContext });
+    expect(edited.ok, JSON.stringify(edited)).toBe(true);
+    expect(readScenarioApprovalStatus(database, 'scenario-1', EXTERNAL, IN_TTL)?.validity)
+      .toEqual({ approved: false, reasons: ['PROFILE_REVISION_CHANGED'] });
+  });
+
   it('revokes the last approval by appending a revocation, and does not revoke twice', () => {
     create();
     approve();
@@ -440,7 +462,9 @@ describe('scenario store (T30a): verification spec', () => {
     expect(readScenario(database, 'scenario-1')).toBeNull();
   });
 
-  it('reads a revision stored before the verification spec as all unspecified', () => {
+  // LG-3（2026-10-24 の設計 3.7.2）: 検証の指定の前に保存した版（`verification` の項目がない）は読まない（管理データの誤りで止まる。黙って
+  // 未指定として読まない）。
+  it('stops at a revision stored before the verification spec with DATABASE_INTEGRITY_FAILED (LG-3)', () => {
     expect(create().ok).toBe(true);
     closeControlDatabase(database);
     const raw = new DatabaseSync(databasePath());
@@ -452,7 +476,7 @@ describe('scenario store (T30a): verification spec', () => {
       raw.close();
     }
     database = openControlDatabase(databasePath());
-    expect(readScenario(database, 'scenario-1')?.current.verification).toEqual(UNSPECIFIED_VERIFICATION);
+    expect(storeErrorReasonOf(() => readScenario(database, 'scenario-1'))).toBe('DATABASE_INTEGRITY_FAILED');
   });
 });
 
@@ -465,12 +489,14 @@ describe('scenario store (T31b): UPDATE scenarios', () => {
   });
 
   /** 保存した版から UPDATE の指定を除く（UPDATE の指定の前に保存した版の形）。 */
-  const dropUpdateSpec = (scenarioId: string): void => {
+  /** UPDATE の指定の前に保存した版の形に書き換える（`omit` なら項目をなくし、そうでなければ null にする）。 */
+  const dropUpdateSpec = (scenarioId: string, omit: boolean): void => {
     closeControlDatabase(database);
     const raw = new DatabaseSync(databasePath());
     try {
       const row = raw.prepare('SELECT document FROM scenario_revisions WHERE scenario_id = ?').get(scenarioId) as { readonly document: string };
-      const { update: _omitted, ...legacy } = JSON.parse(row.document) as Record<string, unknown>;
+      const { update: _omitted, ...withoutUpdate } = JSON.parse(row.document) as Record<string, unknown>;
+      const legacy = omit ? withoutUpdate : { ...withoutUpdate, update: null };
       raw.prepare('UPDATE scenario_revisions SET document = ? WHERE scenario_id = ?').run(JSON.stringify(legacy), scenarioId);
     } finally {
       raw.close();
@@ -553,18 +579,22 @@ describe('scenario store (T31b): UPDATE scenarios', () => {
     expect(approve({ scenarioId: 'scenario-update', expectedApprovalDigest: digestOf('scenario-update') }).ok).toBe(true);
   });
 
-  it('reads a stored UPDATE revision without the spec, and neither approves it nor issues a grant for it', () => {
+  // LG-3（2026-10-24 の設計 3.7.2）: UPDATE の指定の前に保存した UPDATE の版（`update` の項目がない・null）は読まない。読む・承認の状態・承認・
+  // 許可の発行のどれも、管理データの誤りで止まる（黙って通らない）。
+  it.each([
+    ['without the update spec', true],
+    ['with a null update spec', false],
+  ] as const)('stops at a stored UPDATE revision %s with DATABASE_INTEGRITY_FAILED (LG-3)', (_label, omit) => {
     expect(create().ok).toBe(true);
     expect(create(UPDATE_DRAFT, 'scenario-update').ok).toBe(true);
-    dropUpdateSpec('scenario-update');
-    expect(readScenario(database, 'scenario-update')?.current.update).toBeNull();
-    expect(readScenarioApprovalStatus(database, 'scenario-update', EXTERNAL, IN_TTL)?.validity)
-      .toEqual({ approved: false, reasons: ['UPDATE_SPEC_MISSING', 'NOT_APPROVED'] });
-    expect(reasonOf(approve({ scenarioId: 'scenario-update', expectedApprovalDigest: digestOf('scenario-update') }))).toBe('SCENARIO_UPDATE_SPEC_MISSING');
-    const issued = issueExecutionGrant(database, {
+    dropUpdateSpec('scenario-update', omit);
+    expect(storeErrorReasonOf(() => readScenario(database, 'scenario-update'))).toBe('DATABASE_INTEGRITY_FAILED');
+    expect(storeErrorReasonOf(() => readScenarioApprovalStatus(database, 'scenario-update', EXTERNAL, IN_TTL))).toBe('DATABASE_INTEGRITY_FAILED');
+    expect(storeErrorReasonOf(() => approve({ scenarioId: 'scenario-update', expectedApprovalDigest: `sha256:${'0'.repeat(64)}` })))
+      .toBe('DATABASE_INTEGRITY_FAILED');
+    expect(storeErrorReasonOf(() => issueExecutionGrant(database, {
       scenarioId: 'scenario-update', expectedRevision: 1, grantId: 'grant-1', jobId: 'job-w1', count: 1, external: EXTERNAL, at: APPROVED_AT,
-    });
-    expect(issued.ok ? null : issued.reason).toBe('SCENARIO_UPDATE_SPEC_MISSING');
+    }))).toBe('DATABASE_INTEGRITY_FAILED');
   });
 });
 

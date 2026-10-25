@@ -26,7 +26,7 @@ import { IdAllocator } from '../../src/orchestration/id-allocator.js';
 import { chromiumNetErrorCode, navigatePage } from '../../src/orchestration/page-navigation.js';
 import type { InteractionCandidate } from '../../src/safety/interaction-policy.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
-import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { isCliChromiumSelected, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { discoverInteractionCandidate, interactionAuditInput } from '../helpers/gate-harness.js';
 import { startLoopbackHttpServer, type LoopbackHttpServer } from '../helpers/loopback-server.js';
 import { NO_PACING_WAIT } from '../helpers/navigation-pacer.js';
@@ -134,12 +134,19 @@ interface Launcher {
   readonly interactionResetObservation: ObservationSummary;
 }
 
+/** CLI と同じ起動の設定で、サーバが接続を切ったときの Interaction の候補の読み込みの観測（上の説明の 2 つ目）。 */
+const CLI_INTERACTION_RESET_OBSERVATION = failed('FAILED', 'net::ERR_HTTP_RESPONSE_CODE_FAILURE', BAD_GATEWAY_STATUS);
+
+/**
+ * PRE42-CC 組 Z（DF-2b の発見）: テストの既定の Chromium（`launchHeadlessChromium`）は、CLI の回（`BEAKSIGHT_TEST_DEFAULT_CHROMIUM=cli`）では CLI の
+ * 起動の設定に替わる。そのときは、既定の Chromium の名前の組も、CLI の起動の設定の観測を期待する（`isCliChromiumSelected`）。
+ */
 const LAUNCHERS: readonly (readonly [string, Launcher])[] = [
-  ['the default test Chromium', { launch: () => launchHeadlessChromium(), interactionResetObservation: ok(BAD_GATEWAY_STATUS) }],
-  ['the CLI launch settings', {
-    launch: () => launchCliChromium(),
-    interactionResetObservation: failed('FAILED', 'net::ERR_HTTP_RESPONSE_CODE_FAILURE', BAD_GATEWAY_STATUS),
+  ['the default test Chromium', {
+    launch: () => launchHeadlessChromium(),
+    interactionResetObservation: isCliChromiumSelected() ? CLI_INTERACTION_RESET_OBSERVATION : ok(BAD_GATEWAY_STATUS),
   }],
+  ['the CLI launch settings', { launch: () => launchCliChromium(), interactionResetObservation: CLI_INTERACTION_RESET_OBSERVATION }],
 ];
 
 describe.each(LAUNCHERS)('the observations of the three callers of page.goto (CCX-7a, %s)', (_name, launcher) => {

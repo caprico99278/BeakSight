@@ -20,13 +20,13 @@ import {
   type DiscoverySite,
 } from '../helpers/discovery-site-fixture.js';
 import { runDiscoveryOnSite } from '../helpers/discovery-site-run.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
 
 const LAUNCHERS = [
   ['the default test Chromium', () => launchHeadlessChromium()],
   ['the CLI launch settings', () => launchCliChromium()],
 ] as const;
 const TEST_TIMEOUT_MS = 180_000;
-const READ_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 /** 読む画面の数より大きい上限。 */
 const ENOUGH_PAGES = 10;
 /** 読み込みの最小の間隔（ms。ループバックの fixture なので短くする）。 */

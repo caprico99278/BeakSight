@@ -1,0 +1,197 @@
+{
+  "$id": "urn:beaksight:schema:control:auth-setup:3",
+  "description": "Auth setup document version 3 (Task 34 design 3.2; T34a), the only version accepted (LG-3b: the documents of version 1 and 2 are not read): the fields of the Task 25 design 4.1 table, automatedLogin (Task 26 design 4.3) and loginTransport (FORM_NAVIGATION, the form navigation login, or SCRIPT_REQUEST, a login whose page script posts to a token endpoint on an approved service origin), scriptLogin (the token endpoint: an approved service origin, a path and the required query pairs; the method is fixed to POST and not stored), loginSideRequests (the POST requests a user registered to pass during the login stage, with a limit per login stage) and successStorageKey (the origin, prefix and suffix of the local storage key that marks a successful login; the value is never read). loginPostEndpoints may be empty for SCRIPT_REQUEST. Shape and limits only; the rules (which fields each transport needs, the approved origins, the duplicates) are in src/control/auth/auth-setup-policy.ts.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "profileId",
+    "profileRevision",
+    "loginStartUrl",
+    "loginPostEndpoints",
+    "successCondition",
+    "sessionLostCondition",
+    "excludedPaths",
+    "auditPathPrefixes",
+    "maxLoginAttempts",
+    "allowedIdpOrigins",
+    "automatedLogin",
+    "loginTransport",
+    "scriptLogin",
+    "loginSideRequests",
+    "successStorageKey"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "beaksight-auth-setup/3" },
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "profileRevision": { "type": "integer", "minimum": 1 },
+    "loginStartUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "loginPostEndpoints": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "path"],
+        "properties": {
+          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "path": { "type": "string", "maxLength": 2048 }
+        }
+      }
+    },
+    "successCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "maxLength": 2048 },
+        "selector": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "sessionLostCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pathPrefix"],
+      "properties": {
+        "pathPrefix": { "type": ["string", "null"], "maxLength": 2048 }
+      }
+    },
+    "excludedPaths": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "auditPathPrefixes": {
+      "type": "array",
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "maxLoginAttempts": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "allowedIdpOrigins": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 2048 }
+    },
+    "automatedLogin": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["usernameSelector", "passwordSelector", "submitSelector", "failureConditions"],
+      "properties": {
+        "usernameSelector": { "type": "string", "maxLength": 256 },
+        "passwordSelector": { "type": "string", "maxLength": 256 },
+        "submitSelector": { "type": "string", "maxLength": 256 },
+        "failureConditions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["invalidCredentials", "accountLocked", "mfaRequired", "credentialExpired"],
+          "properties": {
+            "invalidCredentials": { "$ref": "#/$defs/failureCondition" },
+            "accountLocked": { "$ref": "#/$defs/failureCondition" },
+            "mfaRequired": { "$ref": "#/$defs/failureCondition" },
+            "credentialExpired": { "$ref": "#/$defs/failureCondition" }
+          }
+        }
+      }
+    },
+    "loginTransport": { "enum": ["FORM_NAVIGATION", "SCRIPT_REQUEST"] },
+    "scriptLogin": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "path", "requiredQuery"],
+          "properties": {
+            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "path": { "type": "string", "maxLength": 2048 },
+            "requiredQuery": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "value"],
+                "properties": {
+                  "name": { "type": "string", "maxLength": 256 },
+                  "value": { "type": "string", "maxLength": 256 }
+                }
+              }
+            }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "loginSideRequests": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "path", "method", "maxPerLoginStage"],
+        "properties": {
+          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "path": { "type": "string", "maxLength": 2048 },
+          "method": { "enum": ["POST"] },
+          "maxPerLoginStage": { "type": "integer", "minimum": 1, "maximum": 3 }
+        }
+      }
+    },
+    "successStorageKey": {
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "prefix", "suffix"],
+          "properties": {
+            "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "prefix": { "type": "string", "maxLength": 256 },
+            "suffix": { "type": "string", "maxLength": 256 }
+          }
+        },
+        { "type": "null" }
+      ]
+    },
+    "auditReadRequests": {
+      "description": "Optional (T35a; Task 35 design 3.1): the POST requests for reading that a user registered to pass during the audit stage, with a limit per page load. SCRIPT_REQUEST only (the rule is in the policy).",
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["origin", "path", "method", "maxPerPageLoad"],
+        "properties": {
+          "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+          "path": { "type": "string", "maxLength": 2048 },
+          "method": { "enum": ["POST"] },
+          "maxPerPageLoad": { "type": "integer", "minimum": 1, "maximum": 10 }
+        }
+      }
+    },
+    "serviceRequestLimits": {
+      "description": "Optional (T35a; Task 35 design 3.1, 3.4): the limits of the requests to the approved service origins per minute and per Run. Absent means the maximum. SCRIPT_REQUEST only (the rule is in the policy). DEF-141: the maximums were raised from 120 and 600; the per minute limit makes the audit wait before the next load instead of refusing requests.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["perMinute", "perRun"],
+      "properties": {
+        "perMinute": { "type": "integer", "minimum": 1, "maximum": 600 },
+        "perRun": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    }
+  },
+  "$defs": {
+    "failureCondition": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["pathPrefix", "selector"],
+      "properties": {
+        "pathPrefix": { "type": "string", "maxLength": 2048 },
+        "selector": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    }
+  }
+}

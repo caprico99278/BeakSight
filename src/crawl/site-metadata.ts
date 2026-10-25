@@ -20,6 +20,7 @@ import type {
   SitemapXmlMetadataEvidence,
 } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../core/guards.js';
+import { SUCCESS_HTTP_STATUS_RANGE, isHttpStatusInRange } from '../core/http-status.js';
 import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH, MAX_SITE_METADATA_TEXT_LENGTH, MAX_SITEMAP_URLS } from '../core/limits.js';
 import { truncateText } from '../core/text.js';
@@ -156,8 +157,6 @@ const EXCLUDED_FETCH_OUTCOME: FetchOutcome = Object.freeze({ outcome: 'EXCLUDED'
 
 /** `NOT_FOUND` とする HTTP ステータス（ファイルがない）。 */
 const NOT_FOUND_HTTP_STATUSES: ReadonlySet<number> = new Set([404, 410]);
-const MIN_SUCCESS_HTTP_STATUS = 200;
-const MAX_SUCCESS_HTTP_STATUS = 299;
 
 /**
  * `page.goto` の終わり方（応答は `FULFILLED`、例外は `REJECTED`）。Playwright の期限だけで待つので、期限の競争の `DEADLINE_EXCEEDED` はない。
@@ -567,8 +566,9 @@ function rejectedNavigationOutcome(reason: unknown, observation: MainFrameLoadOb
   return { outcome: 'FAILED', httpStatus: null, body: null, failure: failureOf(reason) };
 }
 
+/** 応答の HTTP ステータスの取得の結果。成功（2xx）の範囲は core の `SUCCESS_HTTP_STATUS_RANGE`（PRE42-CC 組 5a。CC-042 (b)）。 */
 function outcomeOf(httpStatus: number): SiteMetadataOutcome {
-  if (httpStatus >= MIN_SUCCESS_HTTP_STATUS && httpStatus <= MAX_SUCCESS_HTTP_STATUS) {
+  if (isHttpStatusInRange(httpStatus, SUCCESS_HTTP_STATUS_RANGE)) {
     return 'OK';
   }
   return NOT_FOUND_HTTP_STATUSES.has(httpStatus) ? 'NOT_FOUND' : 'FAILED';

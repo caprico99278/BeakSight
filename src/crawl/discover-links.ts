@@ -127,24 +127,13 @@ function extractAnchorsReader(R: StandardReaders, { selector, maxLinks }: Anchor
   // DOM clobbering（DEF-073・DEF-074）: 名前つきの img・form など（`<img name="baseURI">`、`<img name="querySelectorAll">`）は、`document` の
   // 同じ名前のプロパティとメソッドを、form の中の名前つきの入力の欄は form のそれを隠すので、`document` と要素（form になりうる）は、
   // 標準の prototype の getter とメソッドで読む（getter は部品の `standardProperty`・`optionalStandardGetter`。`src/browser/in-page-readers.ts`。CC-068）。
-  // a 要素と shadow root は、名前つきの子でプロパティが隠れないので、そのまま読む。
+  // a 要素は、名前つきの子でプロパティが隠れないので、そのまま読む。
   const baseUrl = R.standardProperty<string>(Node.prototype, 'baseURI', document);
-  const shadowRootGetterOf = R.optionalStandardGetter<ShadowRoot | null>(Element.prototype, 'shadowRoot');
-  const shadowRootOf = (element: Element): ShadowRoot | null => shadowRootGetterOf(element) ?? null;
-  const queryAll = (root: Document | ShadowRoot, selectors: string): NodeListOf<Element> => (
-    root instanceof Document ? Document.prototype.querySelectorAll.call(root, selectors) : root.querySelectorAll(selectors)
-  );
-  const elements: Element[] = [];
-  const collect = (root: Document | ShadowRoot): void => {
-    elements.push(...queryAll(root, selector));
-    for (const element of queryAll(root, '*')) {
-      const shadowRoot = shadowRootOf(element);
-      if (shadowRoot !== null) {
-        collect(shadowRoot);
-      }
-    }
-  };
-  collect(document);
+  // 文書と open な shadow root（入れ子を含む。文書の順）を根にして、根ごとに CSS で集める（部品の `optionalOpenRoots`・`queryAllInRoots`。CC-099）。
+  // 根の順は、文書、要素の文書の順の shadow root（その中の入れ子の shadow root を先に）なので、今までの集め方（文書の一致の後に、要素ごとの
+  // shadow root を同じ集め方でたどる）と同じ順になる。ページの JS が `shadowRoot` の getter を消したときは、今までどおり shadow root を飛ばして
+  // 文書の link を集める（例外にしない。細工したページで発見を止めない）。
+  const elements = R.queryAllInRoots(R.optionalOpenRoots(), selector) as Element[];
   return {
     totalCount: elements.length,
     anchors: elements.slice(0, maxLinks).map((element) => {

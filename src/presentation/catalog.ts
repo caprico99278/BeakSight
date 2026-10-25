@@ -17,7 +17,9 @@ import type {
   ViewportProfile,
 } from '../core/contracts.js';
 import { FINDING_CATEGORIES, SEVERITIES } from '../core/contracts.js';
-import type { InteractionNotVerifiableKind, SafetyEventKind, ScreenshotCaptureType } from '../core/evidence-types.js';
+import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
+import type { BeakSightBlockRelation } from '../core/beaksight-block-relation.js';
+import type { BlockedEventPhase, InteractionNotVerifiableKind, SafetyEventKind, ScreenshotCaptureType } from '../core/evidence-types.js';
 import { deepFreeze } from '../core/immutable.js';
 
 /**
@@ -187,6 +189,13 @@ export const RUN_EXECUTION_END_REASON_CATALOG = deepFreeze({
     tone: 'caution',
     description: 'ログインの状態が切れた（ログインの画面に移った）ため、そのページを監査せず、残りのページも監査せずに止めました。',
   },
+  // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いて止まった。core の一覧の並び（最後）に合わせる。
+  STOPPED_BY_SERVICE_REQUEST_LIMIT: {
+    label: 'API の要求の上限で停止',
+    order: 8,
+    tone: 'caution',
+    description: '承認したサービスの Origin（API など）への要求の上限に届いたため、残りのページを監査せずに止めました。1 分あたりの上限なら、再開すると続きを監査します。Run の全体の上限に届いたときは、再開してもすぐに止まります。',
+  },
 } as const satisfies Record<RunExecutionEndReason, DisplaySpec>);
 
 export const PAGE_AUDIT_STATUS_CATALOG = deepFreeze({
@@ -324,7 +333,9 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     label: '遮断したリクエスト',
     order: 1,
     tone: 'shield',
-    description: '読み取り以外のメソッドのリクエストを、遮断しました。',
+    // T44R2 の M-7: 今の止め方に合わせた（理由ごとの説明は、事象の一覧の理由の欄。`BLOCKED_REQUEST_REASON_DESCRIPTIONS`）。
+    description:
+      'Guard が止めたリクエストです。読み取りでない送信のほか、1 画面あたりの読み込みの上限や、承認したサービスの Origin への要求の上限を超えたもの、閉じる前に画面を離れた後の上限を超えたもの（GET も止めます）を含みます。止めた理由は、理由の欄に示します。',
   },
   blockedNavigations: {
     label: '遮断したナビゲーション',
@@ -338,7 +349,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     tone: 'shield',
     // DEF-040（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
     description:
-      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。',
+      'WebSocket の接続を、遮断しました。理由が PASSIVE_WEBSOCKET の記録は、ページ（文書）が開いた接続を Guard が止めたものです。理由が WORKER_CONNECT_POLICY の記録は、Worker の中で開いた接続を、BeakSight が文書と Worker に加える通信の制限（CSP の connect-src）が止めたものです。この記録は観察によるもので、止めた接続のすべてが残るとは限りません。理由が AUDIT_SEND_OVER_LIMIT の記録は、ページが出す送信を通す扱いで、1 つの読み込みで通す接続の数の上限を超えたものです。',
   },
   blockedExternalActions: {
     label: '実行しなかった外部への作用',
@@ -359,7 +370,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     // DEF-039（NP4）: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。M3（NPR2）: 中継の記録に
     // Chromium 自身の通信が含まれうることも示す。
     description:
-      'Interaction の操作の間に、ページが起こしたリクエストを遮断しました。理由が INTERACTION_FROZEN の記録は、通信を止めた後に Guard が止めたものです。理由が INTERACTION_FROZEN_EGRESS の記録は、通信を止めた後に、Interaction の環境の通信を通す BeakSight の中継（127.0.0.1 の proxy）が拒んだものです。Guard を通らずに出た要求の証拠で、CONNECT の記録の URL は host:port の形です。理由が EGRESS_UPSTREAM_DENIED の記録は、中継の上流の方針で拒んだものです（通常は出ません）。理由が GUARD_BYPASS_EGRESS の記録は、Guard が許さない method や URL の要求が Guard を通らずに出ようとしたのを、BeakSight の中継が拒んだものです。この理由の記録と、通信を止めた後の中継の記録（INTERACTION_FROZEN_EGRESS）は、Interaction の操作に限らず、ページの読み込みと発見の段階の記録にも現れます。環境を閉じる途中に中継が拒んだ要求は、記録しません。中継の記録には、ページの通信のほかに、Chromium 自身の通信（例: Google への接続）も含まれることがあります。',
+      'Interaction の操作の間に、ページが起こしたリクエストを遮断しました。理由が INTERACTION_FROZEN の記録は、通信を止めた後に Guard が止めたものです。理由が INTERACTION_FROZEN_EGRESS の記録は、通信を止めた後に、Interaction の環境の通信を通す BeakSight の中継（127.0.0.1 の proxy）が拒んだものです。Guard を通らずに出た要求の証拠で、CONNECT の記録の URL は host:port の形です。理由が EGRESS_UPSTREAM_DENIED の記録は、中継の上流の方針で拒んだものです（通常は出ません）。理由が GUARD_BYPASS_EGRESS の記録は、Guard を通らずに出ようとした通信を、BeakSight の中継が拒んだものです。Guard が許さない method や URL の要求と、Guard が通していない宛先への接続（記録の method は CONNECT、URL は host:port の形）があります。接続の記録には、ページが Guard を通さずに始めた接続のほかに、Chromium が Guard の止めたナビゲーションの先へ先回りして始めた接続も含まれることがあります。この理由の記録と、通信を止めた後の中継の記録（INTERACTION_FROZEN_EGRESS）は、Interaction の操作に限らず、ページの読み込みと発見の段階の記録にも現れます。環境を閉じる途中に中継が拒んだ要求は、記録しません。中継の記録には、ページの通信のほかに、Chromium 自身の通信（例: Google への接続）も含まれることがあります。',
   },
   blockedInteractionNavigations: {
     label: '操作中に遮断したナビゲーション',
@@ -393,7 +404,7 @@ export const SAFETY_EVENT_KIND_CATALOG = deepFreeze({
     tone: 'shield',
     // C18g: 理由のコードごとの意味を示す（レポートは、事象の理由のコードをそのまま表示する）。
     description:
-      '外部スキーム（tel:、mailto: など）への移動の記録です。理由が EXTERNAL_SCHEME_NAVIGATION の記録は、ページが移動を試みたものです。ブラウザは移動していませんが、外部のアプリが起動した可能性があるので、安全の不変条件の違反として記録し、Run を止めます。理由が EXTERNAL_SCHEME_REDIRECT_BLOCKED の記録は、サーバのリダイレクトを、ブラウザがたどる前に止めたものです。',
+      '外部スキーム（tel:、mailto: など）への移動の記録です。理由が EXTERNAL_SCHEME_NAVIGATION の記録は、ページが移動を試みたものです。ブラウザの設定が移動を止め、外部のアプリへは渡していませんが、ページが外部のアプリを開こうとしたので、安全の不変条件の違反として記録し、Run を止めます。理由が EXTERNAL_SCHEME_REDIRECT_BLOCKED の記録は、サーバのリダイレクトを、ブラウザがたどる前に止めたものです。',
   },
 } as const satisfies Record<SafetyEventKind, DisplaySpec>);
 
@@ -631,7 +642,8 @@ export const AUDIT_JOB_AUTH_STATE_CATALOG = deepFreeze({
     label: 'ログイン待ち',
     order: 1,
     tone: 'notice',
-    description: 'BeakSight が開いたブラウザで、ログインしてください。ログインが済むと、そのブラウザを閉じて監査を始めます。',
+    // ML-b（手動のログインの設計書 2.2）: 手動のログインでは「ログインを終えた」で先へ進める。
+    description: 'BeakSight が開いたブラウザで、ログインしてください。ログインが済むと（手動のログインでは「ログインを終えた」を押すと）、そのブラウザを閉じて監査を始めます。',
   },
   AUTHENTICATED: {
     label: 'ログイン済み',
@@ -697,6 +709,71 @@ export const AUTH_SETUP_FRESHNESS_CATALOG = deepFreeze({
   },
 } as const satisfies Record<string, DisplaySpec>);
 
+/**
+ * ログインの送り方（`src/control/auth/auth-setup-contracts.ts` の `LOGIN_TRANSPORTS`。T34d。Task 34 の設計書 3.2、3.6）の表示。値の一覧と意味は
+ * `src/control/` が持ち、ここは表示だけを持つ。
+ */
+export const LOGIN_TRANSPORT_CATALOG = deepFreeze({
+  FORM_NAVIGATION: {
+    label: 'フォームの送信',
+    order: 1,
+    tone: 'neutral',
+    description: 'ログインのフォームを送ると、画面が移ります（送信先は「ログインの送信先」に書きます）。',
+  },
+  SCRIPT_REQUEST: {
+    label: 'スクリプトの送信',
+    order: 2,
+    tone: 'neutral',
+    description: 'ログインの画面のスクリプトが、承認したサービスの Origin へ token を取りに行きます（画面は移らずに、スクリプトが次の画面を開きます）。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// プロファイルの「次にすること」（T43a。Task 43 の設計書 4.1）。手順と状態の一覧は `apps/local-ui/src/display/next-steps.ts` の
+// `PROFILE_NEXT_STEPS`・`NEXT_STEP_STATES` が持ち、ここは表示だけを持つ。書き漏れと余分は、画面の側（`catalog-coverage.ts`）で型で確かめる。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** プロファイルの作成から監査の開始までの手順の表示。 */
+export const PROFILE_NEXT_STEP_CATALOG = deepFreeze({
+  AUTH_SETUP: {
+    label: '認証の設定',
+    order: 1,
+    tone: 'neutral',
+    description: 'ログインを使うモードで、ログインの画面や読む範囲を決めます。',
+  },
+  CREDENTIAL: {
+    label: '資格情報',
+    order: 2,
+    tone: 'neutral',
+    description: '自動ログインで使う、テスト用のアカウントのユーザー名とパスワードを保存します。',
+  },
+  LOGIN_CHECK: {
+    label: 'ログインの確かめ',
+    order: 3,
+    tone: 'neutral',
+    description: '保存した資格情報で、ログインだけを 1 回試します。',
+  },
+  AUDIT_START: {
+    label: '監査の開始',
+    order: 4,
+    tone: 'neutral',
+    description: '設定の要点を確かめてから、監査を始めます。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** 手順ごとの状態（済み・要る・古い（直す）・要らない）の表示。 */
+export const NEXT_STEP_STATE_CATALOG = deepFreeze({
+  DONE: { label: '済み', order: 1, tone: 'positive', description: null },
+  NEEDED: { label: '要る', order: 2, tone: 'notice', description: null },
+  STALE: {
+    label: '古い（直す）',
+    order: 3,
+    tone: 'caution',
+    description: '前に済ませた後に、プロファイルや設定が変わりました。開いて、今の内容で済ませ直してください。',
+  },
+  NOT_NEEDED: { label: '要らない', order: 4, tone: 'neutral', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
 // ---------------------------------------------------------------------------------------------------------------
 // 自動ログイン（ローカルの管理画面の資格情報、ログインの確かめ、ジョブの結果。Task 26 の設計書 4.2、4.6。T26e）
 // ---------------------------------------------------------------------------------------------------------------
@@ -739,6 +816,76 @@ export const AUDIT_JOB_KIND_CATALOG = deepFreeze({
     order: 6,
     tone: 'notice',
     description: '承認したシナリオに従って、BeakSight が登録して照合したテスト環境のレコードを 1 件だけ更新し、前後の値を確かめるジョブです。',
+  },
+  // T43c（Task 43 の設計書 4.3）: 入口の確かめのジョブ。
+  ENTRY_CHECK: {
+    label: '入口の確かめ',
+    order: 7,
+    tone: 'notice',
+    description: 'ログインしないで開始の URL を 1 回だけ読み、ログインの画面の欄と送り方の案を作るジョブです。欄の値は読まず、送信や書き込みはしません。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 入口の確かめ（ローカルの管理画面。Task 43 の設計書 4.3。T43c）
+// 値の一覧と意味は `src/control/entry-check.ts` が持ち、ここは表示だけを持つ。書き漏れと余分は、画面の側（`catalog-coverage.ts`）で型で確かめる。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 入口の確かめの終わり方（`ENTRY_CHECK_END_REASONS`）の表示。 */
+export const ENTRY_CHECK_END_REASON_CATALOG = deepFreeze({
+  READ: {
+    label: '読んだ',
+    order: 1,
+    tone: 'positive',
+    description: '開始の URL を読み、落ち着いた後に読み取りだけで調べました。',
+  },
+  LEFT_ALLOWED_ORIGINS: {
+    label: '許可 Origin の外へ移ろうとした',
+    order: 2,
+    tone: 'caution',
+    description: '開始の URL が、許可 Origin の外へ移ろうとしました。BeakSight は移らずに止め、移ろうとした Origin だけを記録しました（外部の認証のサービスへ移る形かもしれません）。案は作っていません。',
+  },
+  READ_FAILED: {
+    label: '読めなかった',
+    order: 3,
+    tone: 'caution',
+    description: '開始の URL は読み込めましたが、画面が落ち着かないか、読み取りができませんでした。案は作っていません。',
+  },
+  NAVIGATION_FAILED: {
+    label: '読み込めなかった',
+    order: 4,
+    tone: 'critical',
+    description: '開始の URL を読み込めませんでした（応答がない、時間切れなど）。もう一度読み込み直すことはしません。',
+  },
+  PREFLIGHT_FAILED: {
+    label: '始める前の確認で止まった',
+    order: 5,
+    tone: 'critical',
+    description: 'ブラウザや出力先の準備ができなかったため、開始の URL を読み込まずに止めました。',
+  },
+  STOPPED: {
+    label: '止めた',
+    order: 6,
+    tone: 'neutral',
+    description: '止める操作で、開始の URL を読み込む前に止めました。',
+  },
+  SAFETY_VIOLATION: {
+    label: '安全のために止めた',
+    order: 7,
+    tone: 'critical',
+    description: '安全の決まりに反する動きを記録したため、結果を使わずに止めました。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** 入口の確かめの、3 つの要素の form の中の置き方（`ENTRY_CHECK_FORM_PLACEMENTS`）の表示。 */
+export const ENTRY_CHECK_FORM_PLACEMENT_CATALOG = deepFreeze({
+  SAME: { label: '3 つが同じ form の中', order: 1, tone: 'neutral', description: null },
+  NONE: { label: '3 つとも form の外', order: 2, tone: 'neutral', description: null },
+  MIXED: {
+    label: '混ざっている',
+    order: 3,
+    tone: 'caution',
+    description: '一部だけが form の中にあるか、別々の form の中にあります。自動ログインはこの形を止めるので、送り方の案は作っていません。',
   },
 } as const satisfies Record<string, DisplaySpec>);
 
@@ -830,6 +977,72 @@ export const DISCOVERY_DRIFT_CATALOG = deepFreeze({
   },
 } as const satisfies Record<string, DisplaySpec>);
 
+/**
+ * T37c（Task 37 の設計書 3.4、3.6）: 送らずに観察する probe の結果（`src/discovery/submission-probe-contracts.ts` の `SUBMISSION_PROBE_RESULTS`）の表示。
+ * 結果は承認の材料で、この画面からの実行の可否は変えない。
+ */
+export const SUBMISSION_PROBE_RESULT_CATALOG = deepFreeze({
+  API_CREATE: {
+    label: 'API の登録',
+    order: 1,
+    tone: 'notice',
+    description: '押すと、承認した API の Origin へ、登録の形（POST、filter なし、object の本文）の要求を送る画面でした。BeakSight は送らずに止めました。',
+  },
+  API_UPDATE: {
+    label: 'API の更新',
+    order: 2,
+    tone: 'notice',
+    description: '押すと、承認した API の Origin へ、画面の ID の filter が 1 つの更新の形（PATCH、object の本文）の要求を送る画面でした。BeakSight は送らずに止めました。',
+  },
+  NOT_EXECUTABLE: {
+    label: '実行できない形',
+    order: 3,
+    tone: 'critical',
+    description: '押すと、削除・upsert・手続きの呼び出し・2 回以上の送信など、BeakSight が実行しない形の要求を送る画面でした。BeakSight は送らずに止めました。',
+  },
+  NO_REQUEST: {
+    label: '要求なし',
+    order: 4,
+    tone: 'neutral',
+    description: '押しても、読み取りでない要求が出ませんでした（画面の入力の確かめで止まった場合も含みます）。',
+  },
+  NOT_OBSERVED: {
+    label: '観察していない',
+    order: 5,
+    tone: 'caution',
+    description: '押さなかったか、押した後の要求を観察できませんでした。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** T37c: 送らずに観察する probe の理由（実行できない理由と、観察しなかった理由。`SUBMISSION_PROBE_REASONS`）の表示。 */
+export const SUBMISSION_PROBE_REASON_CATALOG = deepFreeze({
+  DELETE_METHOD: { label: 'DELETE の要求', order: 1, tone: 'critical', description: null },
+  PUT_METHOD: { label: 'PUT の要求', order: 2, tone: 'critical', description: null },
+  // T37R2-fix-A（M-2 (b)）: method を上書きするヘッダか、本文の `_method` がある。
+  METHOD_OVERRIDE: { label: 'method の上書き（ヘッダか本文の _method）', order: 3, tone: 'critical', description: null },
+  UNAPPROVED_ORIGIN: { label: '承認した API の Origin の外への要求', order: 4, tone: 'critical', description: null },
+  PROCEDURE_CALL_PATH: { label: '手続きの呼び出し（/rpc/）', order: 5, tone: 'critical', description: null },
+  UPSERT: { label: 'upsert（重なったら上書き）', order: 6, tone: 'critical', description: null },
+  ARRAY_BODY: { label: '本文が配列（複数件）', order: 7, tone: 'critical', description: null },
+  NON_JSON_BODY: { label: '本文が JSON でない', order: 8, tone: 'critical', description: null },
+  MULTIPLE_REQUESTS: { label: '1 回の押下で 2 つ以上の要求', order: 9, tone: 'critical', description: null },
+  SOFT_DELETE_KEY: { label: '論理削除にあたる鍵', order: 10, tone: 'critical', description: null },
+  // T37R-fix-A（I-3）・T37R2-fix-A（M-2 (a)）: 本文の鍵が上限で切り詰められた、伏せた鍵の名前がある、path が長すぎて伏せた、ヘッダの名前が多すぎる。
+  SHAPE_TRUNCATED: { label: '要求の形を全部は確かめられない（多すぎる・伏せた名前・長すぎる path）', order: 11, tone: 'critical', description: null },
+  FILTER_MISSING: { label: '更新の filter がない', order: 12, tone: 'critical', description: null },
+  FILTER_MULTIPLE: { label: '更新の filter が 2 つ以上', order: 13, tone: 'critical', description: null },
+  FILTER_NOT_PAGE_VALUE: { label: '更新の filter の値が画面の最後の ID でない', order: 14, tone: 'critical', description: null },
+  UNRECOGNIZED: { label: '登録と更新のどちらの形でもない', order: 15, tone: 'critical', description: null },
+  // DEF-144: 外部のアプリ（メール・電話など）へ移るボタン。押さない（押して移ろうとしたものも、この理由にする）。
+  EXTERNAL_SCHEME: { label: '外部のアプリへ移るボタン（mailto: や tel: など）なので押さなかった', order: 16, tone: 'caution', description: null },
+  PAGE_CHANGED: { label: '押した後に画面が移った', order: 17, tone: 'caution', description: null },
+  PRESS_LIMIT_REACHED: { label: '1 画面の押す回数の上限を超えた', order: 18, tone: 'neutral', description: null },
+  TARGET_NOT_FOUND: { label: '押す前に同じボタンが見つからなかった', order: 19, tone: 'caution', description: null },
+  PRESS_FAILED: { label: '入力か押す操作が失敗した', order: 20, tone: 'caution', description: null },
+  // DEF-144: 安全の違反の後に Guard が画面を閉じたので、押せなかった（画面が移ったのとは別）。
+  CONTEXT_CLOSED_BY_GUARD: { label: '安全のために画面を閉じたので押せなかった', order: 21, tone: 'caution', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
 /** 発見のジョブの終わり方（`DISCOVERY_END_REASONS`）の表示。 */
 export const DISCOVERY_END_REASON_CATALOG = deepFreeze({
   COMPLETED: { label: '読める画面をすべて読みました', order: 1, tone: 'positive', description: null },
@@ -852,15 +1065,29 @@ export const DISCOVERY_END_REASON_CATALOG = deepFreeze({
     tone: 'caution',
     description: '途中でログインの状態が切れたため、読んだ画面までを記録しました。もう一度「操作の候補を探す」を始めてください。',
   },
+  // T37a（Task 37 の設計書 3.1）: 承認したサービスの Origin への要求の上限に届いた。
+  SERVICE_REQUEST_LIMIT_REACHED: {
+    label: 'サービスへの要求の上限で止めました',
+    order: 6,
+    tone: 'caution',
+    description: 'サービスへの読み取りの要求の数が、認証の設定の上限に達したため、残りの画面は読んでいません。',
+  },
+  // DEF-136: サイトの不調（応答しない・接続できない・429・502・503・504）が、1 回の確かめ直しの後も続いた。
+  SITE_UNAVAILABLE: {
+    label: 'サイトが応答しないため止めました',
+    order: 7,
+    tone: 'caution',
+    description: 'サイトが応答しない状態が、待ってから確かめ直した後も続いたため、残りの画面は読んでいません。サイトが戻ってから、もう一度「操作の候補を探す」を始めてください。',
+  },
   SAFETY_VIOLATION: {
     label: '安全の決まりの違反で止めました',
-    order: 6,
+    order: 8,
     tone: 'critical',
     description: '安全の記録に、決まりの違反がありました。候補の一覧は変えていません。',
   },
   PREFLIGHT_FAILED: {
     label: '始める前の確認で止めました',
-    order: 7,
+    order: 9,
     tone: 'critical',
     description: '始める前の確認が失敗したため、画面を 1 つも読んでいません。',
   },
@@ -935,15 +1162,29 @@ export const READ_CHECK_END_REASON_CATALOG = deepFreeze({
     tone: 'caution',
     description: '途中でログインの状態が切れたため、残りの定義は確かめていません。もう一度「READ を確かめる」を始めてください。',
   },
+  // T37a（Task 37 の設計書 3.1）: 承認したサービスの Origin への要求の上限に届いた。
+  SERVICE_REQUEST_LIMIT_REACHED: {
+    label: 'サービスへの要求の上限で止めました',
+    order: 5,
+    tone: 'caution',
+    description: 'サービスへの読み取りの要求の数が、認証の設定の上限に達したため、残りの定義は確かめていません。',
+  },
+  // DEF-136: サイトの不調（応答しない・接続できない・429・502・503・504）が、1 回の確かめ直しの後も続いた。
+  SITE_UNAVAILABLE: {
+    label: 'サイトが応答しないため止めました',
+    order: 6,
+    tone: 'caution',
+    description: 'サイトが応答しない状態が、待ってから確かめ直した後も続いたため、その定義と残りの定義は確かめていません。サイトが戻ってから、もう一度「READ を確かめる」を始めてください。',
+  },
   SAFETY_VIOLATION: {
     label: '安全の決まりの違反で止めました',
-    order: 5,
+    order: 7,
     tone: 'critical',
     description: '安全の記録に、決まりの違反がありました。',
   },
   PREFLIGHT_FAILED: {
     label: '始める前の確認で止めました',
-    order: 6,
+    order: 8,
     tone: 'critical',
     description: '始める前の確認が失敗したため、どの定義も確かめていません。',
   },
@@ -1049,7 +1290,7 @@ export const SCENARIO_DISPLAY_STATE_CATALOG = deepFreeze({
   REVOKED: { label: '撤回済み', order: 5, tone: 'neutral', description: '承認を撤回しました。使うには、内容を確かめてから、もう一度承認します。' },
 } as const satisfies Record<string, DisplaySpec>);
 
-/** 再承認が要る理由（`APPROVAL_INVALIDITY_REASONS`。15 種。T31b で UPDATE の 2 種を足した）の表示。 */
+/** 再承認が要る理由（`APPROVAL_INVALIDITY_REASONS`。20 種。T31b で UPDATE の 2 種、T38c で API の 2 種、T38R-fix で API の 3 種を足した）の表示。 */
 export const APPROVAL_INVALIDITY_REASON_CATALOG = deepFreeze({
   SCENARIO_REVISION_CHANGED: {
     label: 'シナリオの版が変わった',
@@ -1087,33 +1328,58 @@ export const APPROVAL_INVALIDITY_REASON_CATALOG = deepFreeze({
     tone: 'caution',
     description: '最後の「操作の候補を探す」で、対象の候補が見つからないか、その画面を読み直していません。',
   },
-  // T31b: UPDATE のシナリオ（文言の確かめは T31h）。
-  UPDATE_SPEC_MISSING: {
-    label: 'UPDATE の指定がない',
-    order: 7,
-    tone: 'caution',
-    description: 'UPDATE のシナリオに、UPDATE の指定（台帳の参照、path の型、保つ欄）がありません。指定を足して保存し直すまで、承認できません。',
-  },
   CANDIDATE_TEMPLATES_UNAVAILABLE: {
     label: '型にした候補を確かめられない',
     order: 8,
     tone: 'caution',
     description: 'UPDATE のシナリオの候補を、レコードによらない形で確かめる記録が、まだありません。今は UPDATE を承認できません。',
   },
-  INPUT_RULES_CHANGED: { label: '入力の規則が変わった', order: 9, tone: 'caution', description: '入力の規則の参照（集まり・版・digest）が変わりました。' },
+  // T38c: API のシナリオ（候補の要求の型）。
+  CANDIDATE_SHAPE_CHANGED: {
+    label: '要求の型が変わった',
+    order: 9,
+    tone: 'caution',
+    description: '最後の「操作の候補を探す」で、対象のボタンを押したときにページが送る要求の型（送り先、本文の鍵など）が、承認した型と違いました。',
+  },
+  CANDIDATE_SHAPES_UNAVAILABLE: {
+    label: '要求の型を確かめられない',
+    order: 10,
+    tone: 'caution',
+    description: '対象の候補の要求の型の記録が、管理データにまだありません。「操作の候補を探す」をもう一度行ってください。',
+  },
+  // T38R-fix: 鍵と欄の対応（I-1）、Origin と最新の発見の改訂（C-2）。
+  CANDIDATE_FIELDS_CHANGED: {
+    label: '鍵と欄の対応が変わった',
+    order: 11,
+    tone: 'caution',
+    description: '最後の「操作の候補を探す」で、要求の型は同じでも、本文の鍵に値を入れる欄（名前か CSS）が、承認した対応と違いました。',
+  },
+  API_ORIGIN_NOT_APPROVED: {
+    label: '送り先が承認したサービスでない',
+    order: 12,
+    tone: 'critical',
+    description: 'シナリオの API の送り先の Origin が、今のプロファイルの承認したサービスの Origin の一覧の、同じ位置にありません。',
+  },
+  API_DISCOVERY_PROFILE_STALE: {
+    label: '発見がプロファイルの編集より前',
+    order: 13,
+    tone: 'caution',
+    description: '最後の「操作の候補を探す」は、プロファイルを編集する前の内容で行いました。もう一度「操作の候補を探す」を行ってください。',
+  },
+  INPUT_RULES_CHANGED: { label: '入力の規則が変わった', order: 14, tone: 'caution', description: '入力の規則の参照（集まり・版・digest）が変わりました。' },
   READ_CHECK_CHANGED: {
     label: '照らす READ の定義が変わった',
-    order: 10,
+    order: 15,
     tone: 'caution',
     description: '照らす READ の確かめの定義が、変わったか、削除されたか、見つかりません。',
   },
-  EXPIRED: { label: '期限切れ', order: 11, tone: 'caution', description: '承認の期限を過ぎました（ちょうど期限の時刻を含みます）。' },
-  REVOKED: { label: '撤回済み', order: 12, tone: 'neutral', description: '最後の承認を撤回しました。' },
-  NOT_APPROVED: { label: '未承認', order: 13, tone: 'neutral', description: 'まだ承認していません。' },
-  PROFILE_RETIRED: { label: 'プロファイルを取り消した', order: 14, tone: 'critical', description: '取り消したプロファイルのシナリオは、承認できません。' },
+  EXPIRED: { label: '期限切れ', order: 16, tone: 'caution', description: '承認の期限を過ぎました（ちょうど期限の時刻を含みます）。' },
+  REVOKED: { label: '撤回済み', order: 17, tone: 'neutral', description: '最後の承認を撤回しました。' },
+  NOT_APPROVED: { label: '未承認', order: 18, tone: 'neutral', description: 'まだ承認していません。' },
+  PROFILE_RETIRED: { label: 'プロファイルを取り消した', order: 19, tone: 'critical', description: '取り消したプロファイルのシナリオは、承認できません。' },
   MODE_NOT_WRITE: {
     label: '書き込みのモードでない',
-    order: 15,
+    order: 20,
     tone: 'critical',
     description: 'プロファイルの監査モードが、承認した書き込みのモード（TEST_APPROVED_WRITE）ではありません。',
   },
@@ -1230,6 +1496,63 @@ export const APPROVAL_DIGEST_ITEM_CATALOG = deepFreeze({
     order: 25,
     tone: 'neutral',
     description: 'レコードの ID の位置を {id} にした、候補の識別の digest です。UPDATE の指定がなければ null です。',
+  },
+  // T38c: 送り方と API の指定（FORM のシナリオは送り方が FORM で、ほかは null）。
+  transport: { label: '送り方', order: 26, tone: 'neutral', description: 'form の送信（FORM）か、ページのスクリプトが送る API の要求（API）かです。' },
+  apiShapeDigest: {
+    label: '要求の型の digest',
+    order: 27,
+    tone: 'neutral',
+    description: '発見で、対象のボタンを押したときにページが送ろうとした要求の型の digest です。API のシナリオでなければ null です。',
+  },
+  apiRequest: {
+    label: 'API の要求の型',
+    order: 28,
+    tone: 'neutral',
+    description: 'method、送り先の Origin、path の型、query の名前、Content-Type、Prefer です（値は持ちません）。API のシナリオでなければ null です。',
+  },
+  apiKeyFields: {
+    label: '本文の鍵と欄',
+    order: 29,
+    tone: 'neutral',
+    description: '送る本文の鍵ごとの、値の JSON の型と、値を入れる欄（名前か CSS）です。API のシナリオでなければ null です。',
+  },
+  apiPageKeys: {
+    label: 'ページが決める鍵',
+    order: 30,
+    tone: 'neutral',
+    description: '欄に対応せず、ページが値を決める本文の鍵の名前と JSON の型です（値は照らしません）。API のシナリオでなければ null です。',
+  },
+  apiHeaderNames: {
+    label: '許すヘッダの名前',
+    order: 31,
+    tone: 'neutral',
+    description: 'ページが付ける要求のヘッダの名前です（ブラウザが付ける名前は除きます）。API のシナリオでなければ null です。',
+  },
+  apiFilterName: {
+    label: '更新の filter の名前',
+    order: 32,
+    tone: 'neutral',
+    description: '更新する行を選ぶ query の名前です（列の名前は確かめていません）。CREATE と API のシナリオでないものは null です。',
+  },
+  apiRecordId: {
+    label: 'API の登録の ID の取り方',
+    order: 33,
+    tone: 'neutral',
+    description: '登録の ID を読む、応答の本文の鍵です。指定がなければ null です。',
+  },
+  apiLedger: {
+    label: 'API の台帳の参照',
+    order: 34,
+    tone: 'neutral',
+    description: '更新するレコードを登録した CREATE のシナリオと、更新の画面の path の型と、その型にした画面の識別の digest です。API の UPDATE のシナリオでなければ null です。',
+  },
+  // T41a: API の UPDATE の保つ鍵。
+  apiKeptKeys: {
+    label: '保つ鍵',
+    order: 35,
+    tone: 'neutral',
+    description: '更新で値を変えない本文の鍵ごとの、値の JSON の型と、値を読む欄（名前か CSS）です（値は持ちません）。API の UPDATE のシナリオでなければ null です。',
   },
 } as const satisfies Record<string, DisplaySpec>);
 
@@ -1421,6 +1744,103 @@ export const RECORD_ID_SOURCE_CATALOG = deepFreeze({
   ELEMENT: { label: '成功の画面の要素のセレクタ', order: 2, tone: 'neutral', description: 'ID を文字として表示する要素の CSS セレクタです。' },
 } as const satisfies Record<string, DisplaySpec>);
 
+/**
+ * T41g（Task 41 の設計書 3.5.1）: 「登録してから更新する」の状態（`apps/local-ui/src/server/write-chain-policy.ts` の `WRITE_CHAIN_STATES`）の表示。値の一覧と
+ * 意味は画面のサーバが持ち、ここは表示だけを持つ。書き漏れは画面の単体のテスト（`write-chain-policy.test.ts`）と `catalog-coverage.ts` が確かめる。
+ */
+export const WRITE_CHAIN_STATE_CATALOG = deepFreeze({
+  CREATING: { label: '登録中（終わったら続けて更新します）', order: 1, tone: 'notice', description: null },
+  // T41g-3: 自動ログインの最小の間隔を待っている（次に始められる時刻に、1 回だけ更新を始め直す）。
+  WAITING_LOGIN_INTERVAL: {
+    label: '自動ログインの間隔を待っています（待った後に続けて更新します）',
+    order: 2,
+    tone: 'notice',
+    description: '自動ログインどうしの最小の間隔があるため、登録のすぐ後には更新を始められません。次に始められる時刻まで待ってから、1 回だけ更新を始めます。',
+  },
+  UPDATE_STARTED: { label: '続けて更新を始めました', order: 3, tone: 'positive', description: null },
+  NOT_STARTED: { label: '更新は始めませんでした', order: 4, tone: 'caution', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** T41g: 「登録してから更新する」で更新を始めなかった理由（`WRITE_CHAIN_STOP_REASONS`）の表示。 */
+export const WRITE_CHAIN_STOP_REASON_CATALOG = deepFreeze({
+  CREATE_NOT_VERIFIED: {
+    label: '登録が照合済みになりませんでした',
+    order: 1,
+    tone: 'caution',
+    description: '登録のジョブの結果が照合済み（VERIFIED）でないので、そのレコードは更新しません。登録の結果を確かめてください。',
+  },
+  CREATE_RECORD_ID_MISSING: {
+    label: '登録の ID が記録にありません',
+    order: 2,
+    tone: 'caution',
+    description: '登録は照合済みですが、登録の ID が記録にないので、更新する対象を決められません。',
+  },
+  PLANNED_TARGET_MISMATCH: {
+    label: '更新の予定の対象が、登録したレコードと違います',
+    order: 3,
+    tone: 'caution',
+    description: '更新の予定の対象（台帳の照合済みの登録の最新の 1 件）が、今登録したレコードではありません。開始の画面で予定の対象を確かめてください。',
+  },
+  UPDATE_START_REJECTED: {
+    label: '更新を始められませんでした',
+    order: 4,
+    tone: 'caution',
+    description: '更新の実行の許可の発行か、ジョブの開始が拒みました。更新のシナリオの開始の画面で理由を確かめてください。',
+  },
+  CREATE_WAIT_TIMEOUT: {
+    label: '登録のジョブが待つ時間の中で終わりませんでした',
+    order: 5,
+    tone: 'caution',
+    description: '登録のジョブの終わりを待つ上限の時間を過ぎたので、更新は始めません。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/**
+ * FM2d・FM2R の Minor 3: まとめて実行の状態（`src/control/job/stage-chain-policy.ts` の `CHAIN_STATES`）の表示（書き込みの連鎖と同じ形）。書き漏れは
+ * `apps/local-ui/src/display/catalog-coverage.ts` が確かめる。
+ */
+export const STAGE_CHAIN_STATE_CATALOG = deepFreeze({
+  RUNNING: { label: '行っている', order: 1, tone: 'notice', description: null },
+  FINISHED: { label: '最後まで行った', order: 2, tone: 'positive', description: null },
+  STOPPED: { label: '途中で止めた', order: 3, tone: 'caution', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** FM2d・FM2R の Minor 3: まとめて実行の段の状態（`CHAIN_STAGE_STATES`）の表示。`STOPPED` は、連鎖がその段で止まった印（FM2R の I-5）。 */
+export const STAGE_CHAIN_STAGE_STATE_CATALOG = deepFreeze({
+  PENDING: { label: 'これから行う', order: 1, tone: 'neutral', description: null },
+  RUNNING: { label: '行っている', order: 2, tone: 'notice', description: null },
+  DONE: { label: '終えた', order: 3, tone: 'positive', description: null },
+  STOPPED: { label: 'この段で止まった', order: 4, tone: 'caution', description: null },
+  NOT_STARTED: { label: '始めなかった', order: 5, tone: 'caution', description: null },
+  NOT_NEEDED: { label: '行わなかった（READ の確かめの定義がない）', order: 6, tone: 'neutral', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** FM2d・FM2R の Minor 3: まとめて実行を止めた理由（`CHAIN_STOP_REASONS`）の表示。次にできることの文は `LOCAL_UI_STAGE_CHAIN_TEXT.stopReasons`。 */
+export const STAGE_CHAIN_STOP_REASON_CATALOG = deepFreeze({
+  USER_STOPPED: { label: '「やめる」で止めた', order: 1, tone: 'caution', description: null },
+  SAFETY_VIOLATION: { label: '安全の違反があった', order: 2, tone: 'critical', description: null },
+  SESSION_LOST: { label: 'ログインが切れた', order: 3, tone: 'caution', description: null },
+  SITE_UNAVAILABLE: { label: 'サイトが応答しなかった', order: 4, tone: 'caution', description: null },
+  SERVICE_REQUEST_LIMIT_REACHED: { label: 'サービスの Origin への要求の上限に届いた', order: 5, tone: 'caution', description: null },
+  STAGE_FAILED: { label: '段が失敗した', order: 6, tone: 'critical', description: null },
+  PROFILE_REVISION_CHANGED: { label: '途中でプロファイルが変わった', order: 7, tone: 'caution', description: null },
+  NEXT_STAGE_REJECTED: { label: '次の段を始められなかった', order: 8, tone: 'caution', description: null },
+} as const satisfies Record<string, DisplaySpec>);
+
+/**
+ * 書き込みの送り方（`src/control/approval/scenario-contracts.ts` の `SCENARIO_TRANSPORTS`。T40d。Task 40 の設計書 3.5）の表示。書き込みの報告・結果・
+ * 履歴・開始の画面が使う。書き漏れは `apps/local-ui/src/display/catalog-coverage.ts` と `tests/unit/action-report-changeability.test.ts` が確かめる。
+ */
+export const SCENARIO_TRANSPORT_CATALOG = deepFreeze({
+  FORM: { label: 'フォームの送信', order: 1, tone: 'neutral', description: '画面のフォームを送信して書き込みます。結果は検証の指定の条件で判定します。' },
+  API: {
+    label: 'API の要求',
+    order: 2,
+    tone: 'neutral',
+    description: 'ページのスクリプトが送る API の要求で書き込みます。結果は応答の状態と登録の ID で判定します。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
 // ---------------------------------------------------------------------------------------------------------------
 // 入力の規則（Task 29 の設計書 3 章の「補完の画面」、4.1、4.4。T29e）。値の一覧は `src/control/data-rules-view.ts` から公開し直したもの。書き漏れは
 // `apps/local-ui/src/display/catalog-coverage.ts` が型で確かめる（`src/presentation/` は `src/control/` を import しない）。
@@ -1451,6 +1871,34 @@ export const SEMANTIC_KIND_CATALOG = deepFreeze({
   PARTY_SIZE: { label: '人数（数）', order: 21, tone: 'neutral', description: null },
   FIXED_LIST: { label: '固定の一覧', order: 22, tone: 'neutral', description: '人が入れた値の一覧から選びます。' },
   OUT_OF_TEMPLATE: { label: 'テンプレートの外', order: 23, tone: 'neutral', description: '人が入れた値の一覧がなければ作りません。' },
+  // FM2c（手動の操作を減らす設計書 3A.3）: 番号・コード。
+  DIGIT_CODE: {
+    label: '番号・コード（数字の桁）',
+    order: 24,
+    tone: 'neutral',
+    description: '欄の pattern が数字だけの決まった桁数（例 ^\\d{7}$）のとき、その桁数の数字を作ります。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/** 保存した規則の出どころの印（`RULE_ORIGINS`。FM2c）の表示。 */
+export const RULE_ORIGIN_CATALOG = deepFreeze({
+  HUMAN: { label: '人が決めた', order: 1, tone: 'neutral', description: null },
+  INFERRED: {
+    label: '推した規則（人は確かめていない）',
+    order: 2,
+    tone: 'caution',
+    description: '業務テンプレートか汎用の規則で推した規則を、そのまま保存しました。内容を確かめてください。',
+  },
+} as const satisfies Record<string, DisplaySpec>);
+
+/**
+ * 自動で作る下書きの案の出どころ（`src/control/approval/draft-value-origin.ts` の `DRAFT_VALUE_ORIGINS`。FM2a・FM2b）の表示（名前・順・色の区分の
+ * 1 か所）。推測は注意の色。根拠の文は `messages.ts` の `DRAFT_VALUE_TEXT.grounds`。印は表示だけで、承認に結ばない。
+ */
+export const DRAFT_VALUE_ORIGIN_CATALOG = deepFreeze({
+  DETERMINED: { label: '発見の記録から決まる', order: 1, tone: 'neutral', description: null },
+  INFERRED: { label: '推測（確かめてください）', order: 2, tone: 'caution', description: '自動の下書きが推した値です。正しいかを確かめてください。' },
+  HUMAN: { label: '人が決める', order: 3, tone: 'neutral', description: null },
 } as const satisfies Record<string, DisplaySpec>);
 
 /** 値の作り方（`GENERATION_METHODS`）の表示。 */
@@ -1469,7 +1917,13 @@ export const FIELD_RELATION_KIND_CATALOG = deepFreeze({
 
 /** 欄の規則の出どころ（`RULE_SOURCES`）の表示。 */
 export const RULE_SOURCE_CATALOG = deepFreeze({
-  HUMAN: { label: '人の規則', order: 1, tone: 'notice', description: 'この画面で決めた規則です（最も強い）。' },
+  // FM2c fix round 1: 保存した推した規則も、判定の出どころは `HUMAN`。推したか人が決めたかは、出どころの印（`RULE_ORIGIN_CATALOG`）で出す。
+  HUMAN: {
+    label: '保存した規則',
+    order: 1,
+    tone: 'notice',
+    description: '規則の集まりに保存した規則です（最も強い）。推したか人が決めたかは、出どころの印で示します。',
+  },
   TEMPLATE: { label: '業務テンプレート', order: 2, tone: 'neutral', description: '欄の名前・型・autocomplete から推した規則です。' },
   GENERIC: { label: '汎用の規則', order: 3, tone: 'neutral', description: '欄の型と制約から作る規則です。' },
   OPT_OUT: { label: '送らない側に固定', order: 4, tone: 'shield', description: '通知・配信を求める欄なので、送らない側に固定しました。' },
@@ -1502,6 +1956,89 @@ export const EXTERNAL_DELIVERY_KIND_CATALOG = deepFreeze({
   NOTIFICATION: { label: '通知・配信の欄', order: 3, tone: 'shield', description: null },
   ADDRESS: { label: '住所の欄', order: 4, tone: 'shield', description: null },
 } as const satisfies Record<string, DisplaySpec>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// 監査の段の送信の扱い（AS-b。設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1・2.3）
+// ---------------------------------------------------------------------------------------------------------------
+
+/**
+ * 監査の段の送信の扱い（`AUDIT_SEND_POLICIES`）の表示。`prominent` は、報告（HTML・CLI・ChatGPT 用バンドル）とジョブの画面で、通したことの知らせを目立つ
+ * 形で出すか（`PASS_EXCEPT_DELETE` だけ）。出すかどうかを決めるのは、表示用モデル（`summary.auditSend.prominent`）と画面が、この値を読む 1 か所だけ。
+ */
+export const AUDIT_SEND_POLICY_CATALOG = deepFreeze({
+  READ_ONLY: {
+    label: '読み取りだけ',
+    order: 1,
+    tone: 'positive',
+    description: 'ページが出す書き込みの送信は、すべて止めました（GET と HEAD だけ）。',
+    prominent: false,
+  },
+  PASS_EXCEPT_DELETE: {
+    label: '削除のほかを通す',
+    order: 2,
+    tone: 'caution',
+    description: 'ページが出す書き込みの送信のうち、削除と危険な語の送信のほかを、サイトに届けました。',
+    prominent: true,
+  },
+} as const satisfies Record<AuditSendPolicyName, DisplaySpec & { readonly prominent: boolean }>);
+
+// ---------------------------------------------------------------------------------------------------------------
+// BeakSight の遮断と指摘の関係（BN-c・BN-d。設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.3・3.5）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** BeakSight の遮断と指摘の関係の区分の表示。 */
+export interface BeakSightBlockRelationSpec extends DisplaySpec {
+  /** HTML レポートの Finding の行に、区分の印を出すか（結び付かない指摘には出さない）。 */
+  readonly badgeInFindingRow: boolean;
+}
+
+/**
+ * BeakSight の遮断と指摘の関係の区分（`BEAKSIGHT_BLOCK_RELATIONS`）の表示（ラベル・色・順・説明）。HTML レポートの印と件数、CLI の要約の行、ChatGPT 用バンドルの
+ * 読み方の案内が、ここから取る。
+ */
+export const BEAKSIGHT_BLOCK_RELATION_CATALOG = deepFreeze({
+  CAUSED: {
+    label: '遮断が原因',
+    order: 1,
+    tone: 'shield',
+    description: 'BeakSight の遮断が、この指摘を決めました（指摘の対象の要求か、行き先の移動か、測った画面そのもの（止めた移動の後のエラーの画面）を、BeakSight が止めました）。サイトの欠陥ではありません。',
+    badgeInFindingRow: true,
+  },
+  POSSIBLE: {
+    label: '遮断の影響の可能性',
+    order: 2,
+    tone: 'caution',
+    description: '同じ読み込みで、この指摘の結果を変えうる種類の要求を BeakSight が止めたか、BeakSight が無効にした機能をページが呼びました。サイトの欠陥とは言い切れません。',
+    badgeInFindingRow: true,
+  },
+  NONE: {
+    label: '遮断と結び付かない',
+    order: 3,
+    tone: 'neutral',
+    description: 'BeakSight が止めた要求と結び付かない指摘です（サイトの欠陥の候補）。',
+    badgeInFindingRow: false,
+  },
+} as const satisfies Record<BeakSightBlockRelation, BeakSightBlockRelationSpec>);
+
+/**
+ * BN-R0 の M-3: Guard が止めた事象の時点（`BLOCKED_EVENT_PHASES`）の表示。HTML レポートの SAFETY の Finding の行に、閉じる途中の遮断の印を出す（`badgeInFindingRow`）。
+ */
+export const BLOCKED_EVENT_PHASE_CATALOG = deepFreeze({
+  LOAD: {
+    label: '読み込みの間に止めた',
+    order: 1,
+    tone: 'neutral',
+    description: '読み込みの間（閉じ始める前。測りの後も含む）に止めた要求です。',
+    badgeInFindingRow: false,
+  },
+  CLOSING: {
+    label: '閉じる途中に止めた',
+    order: 2,
+    tone: 'notice',
+    description: '閉じる途中とページを離れた後に止めた要求です（測りの後のもの）。',
+    badgeInFindingRow: true,
+  },
+} as const satisfies Record<BlockedEventPhase, DisplaySpec & { readonly badgeInFindingRow: boolean }>);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 並べ方

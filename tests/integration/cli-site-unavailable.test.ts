@@ -37,20 +37,17 @@ import { existsSync } from 'node:fs';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import {
   Agent,
-  createServer,
   request as httpRequest,
   type IncomingHttpHeaders,
   type IncomingMessage,
   type OutgoingHttpHeaders,
   type ServerResponse,
 } from 'node:http';
-import type { AddressInfo, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { chromium, type Browser } from 'playwright';
+import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startFixtureServer, type FixtureServer } from '../../fixtures/server.js';
-import { chromiumLaunchOptions } from '../../src/browser/chromium-launch.js';
 import { EXIT_CODES, exitCodeForRunStatus } from '../../src/cli/exit-codes.js';
 import { resumingRunLines } from '../../src/cli/output.js';
 import { runAuditCommand, type RunCommandDependencies } from '../../src/cli/run-command.js';
@@ -92,7 +89,9 @@ import { SITE_UNAVAILABLE_SKIP_REASON } from '../../src/orchestration/site-avail
 import { skippedPageResult } from '../../src/orchestration/skipped-page.js';
 import { formatDuration } from '../../src/presentation/format.js';
 import { CLI_TEXT, siteUnavailableRecheckText, siteUnavailableSlowdownText, siteUnavailableStopText } from '../../src/presentation/messages.js';
-import { BROWSER_DEFAULT_FAVICON_PATH } from '../helpers/chromium.js';
+import { BROWSER_DEFAULT_FAVICON_PATH, launchCliChromium as launchProductionCliChromium } from '../helpers/chromium.js';
+import { LOADED_BROWSER_CLOSE_TIMEOUT_MS, LOADED_RESOURCE_SETTLING_TIMEOUT_MS } from '../helpers/loaded-deadline.js';
+import { startLoopbackHttpServer } from '../helpers/loopback-server.js';
 import { captureCliOutput, fastRunConfig, readJson, readRunAudit, RUN_IDENTITY_AUDIT_OVERRIDES } from '../helpers/run-harness.js';
 
 const SUITE_TIMEOUT_MS = 300_000;
@@ -105,26 +104,16 @@ const PAGES_BEFORE_SWITCH = 2;
  * この期限の中で読み込める。
  */
 const UNRESPONSIVE_NAVIGATION_TIMEOUT_MS = 3_000;
-/**
- * 混雑の下で切れた本番の期限（DOM の準備と、Browser を閉じる処理）を、この結合テストの Run（比べる相手の中断しない Run と、各場面の Run）で
- * 延ばす倍率（DEF-063）。2026-10-10 の観測（CPU のループ 8 本と `tests/integration` の並行の実行 2 本の混雑）で、どちらの期限も既定の値で
- * 切れ、Run が PARTIAL になった。比べる相手と各場面の Run の片方だけが混雑で PARTIAL になると、比べる確かめが食い違うので、両方に同じ
- * 長めの期限を入れる。観測した止まり（下の各定数）に余裕を取って 6 倍にする。サイトの不調の判定に関わる値（読み込みの期限
- * `UNRESPONSIVE_NAVIGATION_TIMEOUT_MS`、確かめ直しの待ち）と、ページの期限（`overallPageTimeoutMs`）は変えない。
+/*
+ * 混雑の下で切れた本番の期限（DOM の準備と、Browser を閉じる処理）は、この結合テストの Run（比べる相手の中断しない Run と、各場面の Run）で、
+ * 名前つきの混雑の倍率（`tests/helpers/loaded-deadline.ts` の `LOADED_DEADLINE_FACTOR`。DEF-063）を掛けて延ばす。2026-10-10 の観測（CPU の
+ * ループ 8 本と `tests/integration` の並行の実行 2 本の混雑）で、どちらの期限も既定の値で切れ、Run が PARTIAL になった。比べる相手と各場面の
+ * Run の片方だけが混雑で PARTIAL になると、比べる確かめが食い違うので、両方に同じ長めの期限を入れる。サイトの不調の判定に関わる値（読み込みの
+ * 期限 `UNRESPONSIVE_NAVIGATION_TIMEOUT_MS`、確かめ直しの待ち）と、ページの期限（`overallPageTimeoutMs`）は変えない。
+ * DOM の準備の期限（`LOADED_RESOURCE_SETTLING_TIMEOUT_MS`。観測: その回は、前のページの読み込みから次の読み込みまで約 19 秒止まった）と、
+ * Browser を閉じる期限（`LOADED_BROWSER_CLOSE_TIMEOUT_MS`。観測: 強い混雑の下の SU6 の Run 4 回すべてと、比べる相手の Run 2 回のうち 1 回）は、
+ * DF-2b で、ほかの結合のテストと共有するために `tests/helpers/loaded-deadline.ts` へ移した。
  */
-const LOADED_DEADLINE_FACTOR = 6;
-/**
- * DOM の準備を待つ期限（ms。`crawl.resourceSettlingTimeoutMs`。既定は 5,000）。観測: 既定の 5 秒が切れ、ページが
- * `DOM_READINESS_FAILED: DEADLINE_EXCEEDED` の PARTIAL になった回がある（その回は、前のページの読み込みから次の読み込みまで約 19 秒
- * 止まった）。30,000。
- */
-const LOADED_RESOURCE_SETTLING_TIMEOUT_MS = DEFAULT_CONFIG.crawl.resourceSettlingTimeoutMs * LOADED_DEADLINE_FACTOR;
-/**
- * Browser を閉じる処理を待つ期限（ms。Run Coordinator の `browserCloseTimeoutMs`。既定は `BROWSER_CLOSE_TIMEOUT_MS` の 10,000）。
- * 観測: 強い混雑の下の SU6 の Run 4 回すべてと、比べる相手の Run 2 回のうち 1 回で、既定の 10 秒が切れ、Run の理由
- * `UNHANDLED_FAILURE: browser-close:...` で Run が PARTIAL になった（ふだんは 1 秒未満で終わる）。60,000。
- */
-const LOADED_BROWSER_CLOSE_TIMEOUT_MS = BROWSER_CLOSE_TIMEOUT_MS * LOADED_DEADLINE_FACTOR;
 /** `EMPTY_503` で返す status（503 Service Unavailable。`SITE_UNAVAILABLE_HTTP_STATUSES` の1つ）。 */
 const SERVICE_UNAVAILABLE_STATUS = 503;
 /** BeakSight が取得する robots.txt と sitemap.xml の、Origin からのパス（`src/crawl/site-metadata.ts` の取得の順）。 */
@@ -209,7 +198,6 @@ async function startRelayServer(upstream: FixtureServer): Promise<RelayServer> {
   // fixture のサーバへの接続は、要求ごとに作って閉じる（閉じた後に残る接続を作らない）。
   const agent = new Agent({ keepAlive: false });
   const requests: RelayedRequest[] = [];
-  const sockets = new Set<Socket>();
   const hungResponses = new Set<ServerResponse>();
   let mode: RelayMode = 'NORMAL';
 
@@ -245,7 +233,7 @@ async function startRelayServer(upstream: FixtureServer): Promise<RelayServer> {
     hungResponses.clear();
   };
 
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const pathname = (request.url ?? '/').split(/[?#]/u, 1)[0] ?? '/';
     requests.push(Object.freeze({ method: request.method ?? '', pathname, receivedAtMs: Date.now(), mode }));
     switch (mode) {
@@ -262,21 +250,9 @@ async function startRelayServer(upstream: FixtureServer): Promise<RelayServer> {
         relay(request, response);
     }
   });
-  server.on('connection', (socket) => {
-    sockets.add(socket);
-    socket.once('close', () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolveListen, reject) => {
-    server.once('error', reject);
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
-      server.off('error', reject);
-      resolveListen();
-    });
-  });
-  const { port } = server.address() as AddressInfo;
   let closing: Promise<void> | undefined;
   return {
-    origin: `http://127.0.0.1:${port}`,
+    origin: server.origin,
     requests,
     setMode: (next) => {
       mode = next;
@@ -287,15 +263,12 @@ async function startRelayServer(upstream: FixtureServer): Promise<RelayServer> {
       mode = next;
     },
     close: () => {
-      closing ??= new Promise<void>((resolveClose, reject) => {
+      if (closing === undefined) {
         cutHungConnections();
-        for (const socket of sockets) {
-          socket.destroy();
-        }
-        server.closeAllConnections();
-        server.close((error) => (error === undefined ? resolveClose() : reject(error)));
+        // 受けた接続を切ってから閉じる（`startLoopbackHttpServer` の `close`）。fixture のサーバへの接続も、閉じる処理を待たずに切る。
+        closing = server.close();
         agent.destroy();
-      });
+      }
       return closing;
     },
   };
@@ -326,7 +299,8 @@ const runBrowsers: Browser[] = [];
  * 同じく、要求された `headless` の値によらず、いつも headless で起動する。
  */
 const launchCliChromium: BrowserLauncher = async () => {
-  const launched = await chromium.launch(chromiumLaunchOptions({ headless: true }));
+  // EL-12: 本番と同じ起動の部品（`tests/helpers/chromium.ts` の `launchCliChromium`）で起動する。
+  const launched = await launchProductionCliChromium();
   runBrowsers.push(launched);
   return launched;
 };

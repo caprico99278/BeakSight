@@ -3,6 +3,10 @@
 //   含む）。推せなければ null（欄の判定が `SEMANTIC_KIND_UNDECIDED` にする）。テンプレートにサイト固有の値を書かない。
 // - 推しの順: 外部到達の欄（メール・電話。判定は `external-delivery-words.ts`）→ フリガナ → 氏名 → 合計 → 単価 → 数量 → 人数 → 商品名 → 備考 →
 //   開始 → 終了 → 日付 → 汎用（型から）。意味の種類ごとに、合う欄の型（`SEMANTIC_KIND_FIELD_TYPES`）だけで推す。
+// - FM2c（手動の操作を減らす設計書 3A.3）: text・search の欄の pattern が数字だけの固定の桁数（`simple-pattern.ts` の `fixedDigitCountOf`）なら、
+//   「番号・コード」（`DIGIT_CODE`）。名前の語に当たらない欄も推す。辞書の値から作る種類（氏名・フリガナ・備考・商品名）に当たった欄も、辞書の値は
+//   数字だけの pattern に合わないので、`DIGIT_CODE` にする。数の種類（単価など）は、そのまま（数の値を pattern で確かめる）。FM2R fix round 1（I-3）:
+//   この推しは、推した規則を作って保存するとき（`InferenceOptions` の `digitCode`）だけ。判定のたびの推しは、FM2c の前と同じ。
 // - 欄の名前の語の比べ方は、発見の分類の `fieldNameHasListedWord`（英語の語は語の単位の並び、日本語の語は部分一致）。区切りのない短い日本語の
 //   名前（`姓`・`名`・`セイ`・`メイ`）は、畳み込んだ名前の完全一致（`TEMPLATE_KIND_EXACT_NAMES`）だけで当てる（`名前`・`会社名` が `名` に
 //   当たらないように）。
@@ -16,6 +20,7 @@ import { CHOICE_FIELD_TYPES, VALUE_INPUT_FIELD_TYPES, type CandidateField, type 
 import { fieldNameHasListedWord } from '../../discovery/classify.js';
 import { externalDeliveryKindsOf } from './external-delivery-words.js';
 import type { FieldRelation, FieldRule, RuleRange, SemanticKind } from './rule-contracts.js';
+import { fixedDigitCountOf, parseSimplePattern } from './simple-pattern.js';
 
 /** 業務テンプレート（閉じた一覧）。 */
 export const BUSINESS_TEMPLATES = Object.freeze(['CUSTOMER', 'RESERVATION', 'PRODUCT'] as const);
@@ -64,6 +69,8 @@ export const SEMANTIC_KIND_FIELD_TYPES = Object.freeze({
   // 人の固定の一覧で値を入れられる型（値を入れて送れる型のすべて。password・file・hidden を除く。owner は候補の欄の形。CCX-20）。
   FIXED_LIST: VALUE_INPUT_FIELD_TYPES,
   OUT_OF_TEMPLATE: VALUE_INPUT_FIELD_TYPES,
+  // FM2c: 番号・コード（数字だけの固定の桁数の pattern を持つ文字の欄）。
+  DIGIT_CODE: Object.freeze(['text', 'search'] as const),
 } as const satisfies Readonly<Record<SemanticKind, readonly CandidateFieldType[]>>);
 
 /** 意味の種類が欄の型に合うか。 */
@@ -145,10 +152,20 @@ export const templateDefaultRangeOf = (kind: SemanticKind): RuleRange | null =>
 // 推し
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 推しに使う欄の項目。 */
+/** 推しに使う欄の項目（FM2c: pattern は「番号・コード」の推しに使う。なければ pattern なし）。 */
 export type InferenceField = Pick<CandidateField, 'name' | 'type'> & {
-  readonly constraints: Pick<CandidateField['constraints'], 'autocomplete'>;
+  readonly constraints: Pick<CandidateField['constraints'], 'autocomplete'> & Partial<Pick<CandidateField['constraints'], 'pattern'>>;
 };
+
+/** 欄の pattern が数字だけの固定の桁数なら、その桁数（FM2c。なければ・ほかの形なら null）。 */
+export const fieldDigitCodeLengthOf = (constraints: Partial<Pick<CandidateField['constraints'], 'pattern'>>): number | null => {
+  const pattern = constraints.pattern ?? null;
+  const parsed = pattern === null ? null : parseSimplePattern(pattern);
+  return parsed === null ? null : fixedDigitCountOf(parsed);
+};
+
+/** 数字だけの pattern に値が合わない、辞書の値から作る種類（FM2c。数字の pattern があれば `DIGIT_CODE` に替える）。 */
+const DIGIT_CODE_REPLACED_KINDS: readonly SemanticKind[] = Object.freeze([...PERSON_NAME_KINDS, 'NOTE', 'PRODUCT_NAME']);
 
 const nameHas = (name: string, kind: keyof typeof TEMPLATE_KIND_NAME_WORDS): boolean => fieldNameHasListedWord(name, TEMPLATE_KIND_NAME_WORDS[kind]);
 
@@ -214,7 +231,16 @@ const genericKindOf = (type: CandidateFieldType): SemanticKind | null =>
  * 合う型（`SEMANTIC_KIND_FIELD_TYPES`）のときだけ。メールと電話の両方に当たる欄は、型が email ならメール、tel なら電話、ほかは推さない
  * （T29R-fix-1 の I-1）。password・file・hidden は推さない。
  */
-export const inferSemanticKind = (field: InferenceField): SemanticKind | null => {
+/**
+ * 推しの選び（FM2R fix round 1。I-3）。`digitCode` が真のときだけ、FM2c の「番号・コード」を推す。推した規則を作って保存するとき
+ * （`rule-set-inference.ts` の `inferRuleSetContent`）だけが真にする。判定のたびの推し（保存した規則のない欄）は偽のまま（FM2c の前と同じ振る舞い。
+ * 前に承認したシナリオが、再承認なしに新しい作り方の値を送らないため）。
+ */
+export interface InferenceOptions {
+  readonly digitCode?: boolean;
+}
+
+export const inferSemanticKind = (field: InferenceField, options: InferenceOptions = {}): SemanticKind | null => {
   const external = externalDeliveryKindsOf(field);
   // T29R-fix-1（I-1）: メールと電話の両方に当たる欄（`携帯メール`、`tel_mail` など）は、欄の型で決める。型で決まらなければ推さない。
   if (external.includes('EMAIL') && external.includes('PHONE')) {
@@ -225,12 +251,16 @@ export const inferSemanticKind = (field: InferenceField): SemanticKind | null =>
       return kind;
     }
   }
-  const person = personNameKindOf(field);
-  if (person !== null) {
-    return person;
+  const worded = personNameKindOf(field)
+    ?? WORD_INFERENCE_ORDER.find((kind) => isSemanticKindCompatible(kind, field.type) && nameHas(field.name, kind))
+    ?? genericKindOf(field.type);
+  // FM2c: 数字だけの固定の桁数の pattern の文字の欄は、番号・コード（語に当たらない欄と、辞書の値の種類に当たった欄）。推した規則を作るときだけ
+  // （FM2R fix round 1）。
+  if (options.digitCode === true && (worded === null || DIGIT_CODE_REPLACED_KINDS.includes(worded)) && isSemanticKindCompatible('DIGIT_CODE', field.type)
+    && fieldDigitCodeLengthOf(field.constraints) !== null) {
+    return 'DIGIT_CODE';
   }
-  const worded = WORD_INFERENCE_ORDER.find((kind) => isSemanticKindCompatible(kind, field.type) && nameHas(field.name, kind));
-  return worded ?? genericKindOf(field.type);
+  return worded;
 };
 
 // ---------------------------------------------------------------------------------------------------------------

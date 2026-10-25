@@ -2,7 +2,7 @@
 // 時刻を注入し、許可 Origin とそれ以外の件数、数えない要求（Guard などが止めたもの、キャッシュから返したもの）、
 // 1分あたりの最大、状態の取り出しと作り直しを確かめる。L7（設計書 4.8）で、直近の1分の件数を加えた。
 import { describe, expect, it } from 'vitest';
-import { BLOCKED_BY_CLIENT_FAILURE_TEXTS } from '../../src/browser/playwright-errors.js';
+import { BLOCKED_BY_CLIENT_FAILURE_TEXTS } from '../../src/core/blocked-by-client-failures.js';
 import type { RunLoadRequests } from '../../src/core/contracts.js';
 import {
   createLoadMeter,

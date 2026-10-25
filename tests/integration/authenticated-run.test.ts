@@ -10,23 +10,21 @@
 //   みなすサーバで、`AUTH_SESSION_LOST` で止まり（Run は PARTIAL、実行の終わり方は `STOPPED_BY_AUTH_SESSION_LOST`）、ログインの画面を管理画面
 //   として監査しない。
 // - 除外の記録が 256 件を超えても、Ledger の記録の切り詰めにならない（PARTIAL にならない）。
-// - 秘密の目印（Cookie と localStorage の値）が、Run のディレクトリのどのファイル（保存、ZIP の中身を含む）にも現れない。
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+// - 秘密の目印（Cookie と localStorage の値）が、Run のディレクトリのどのファイル（保存、ZIP の中身を含む）にも現れないことは、TS-f で
+//   `authenticated-url-secrets.test.ts` の T25f にまとめた（同じ回転するサーバで、URL の query の目印も合わせて確かめる）。
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { unzipSync } from 'fflate';
 import type { Browser } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { writeAuditRunOutputs } from '../../src/cli/audit-run.js';
 import type { AuditConfig } from '../../src/config/types.js';
-import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/control/auth/auth-setup-contracts.js';
+import { DEFAULT_EXCLUDED_URL_WORDS } from '../../src/core/default-excluded-url-words.js';
 import { filterAuthenticatedState } from '../../src/control/auth/authenticated-state.js';
 import type { AuditRunResult, PageAuditResult } from '../../src/core/contracts.js';
+import type { RunStageCarried, RunStageCarry } from '../../src/orchestration/audit-stage-run.js';
 import type { RunAuthentication } from '../../src/orchestration/authenticated-run.js';
 import type { BrowserLauncher } from '../../src/orchestration/preflight.js';
-import { RunCheckpointSession } from '../../src/orchestration/run-checkpoint-session.js';
 import { RunCoordinator } from '../../src/orchestration/run-coordinator.js';
-import { ArtifactWriter } from '../../src/report/artifact-writer.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import {
   AUTH_SITE_MANY_EXCLUDED_IMAGES,
@@ -37,6 +35,8 @@ import {
   type AuthenticatedSiteOptions,
 } from '../helpers/authenticated-site-fixture.js';
 import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
+import { READ_METHODS } from '../helpers/leak-places.js';
+import { LOADED_BROWSER_CLOSE_TIMEOUT_MS, LOADED_RESOURCE_SETTLING_TIMEOUT_MS } from '../helpers/loaded-deadline.js';
 import { createTestConfig } from '../helpers/test-config.js';
 
 /** 幅の走査の幅（主の Desktop と Mobile の幅と重ならない 2 幅。Desktop の Context の中で、順に開け閉めする Context）。 */
@@ -55,6 +55,8 @@ const EXPIRING_STRESS_WIDTHS = Object.freeze([600]);
  * （`guard-response-received-failures.test.ts` などの `RUN_TEST_TIMEOUT_MS`）とそろえる。確かめる内容と Run の期限は変えない。
  */
 const FULL_RUN_TEST_TIMEOUT_MS = 120_000;
+/** BN-0: 除外に当たる iframe を 300 個読む画面の Run の期限（ms。iframe の文書は 1 つずつ止まるので、画像のときより長い）。 */
+const MANY_EXCLUDED_TEST_TIMEOUT_MS = 120_000;
 
 const LAUNCHERS = [
   ['the default test Chromium', () => launchHeadlessChromium()],
@@ -76,31 +78,10 @@ const SITEMAP_XML_PATH = '/sitemap.xml';
 
 const pathOf = (url: string | null): string | null => (url === null ? null : new URL(url).pathname);
 
-/** ディレクトリの下のすべてのファイルの中身（ZIP は展開した中身も）。 */
-async function readAllFiles(directory: string): Promise<{ readonly path: string; readonly bytes: Uint8Array }[]> {
-  const files: { readonly path: string; readonly bytes: Uint8Array }[] = [];
-  for (const entry of await readdir(directory, { withFileTypes: true, recursive: true })) {
-    if (!entry.isFile()) continue;
-    const path = join(entry.parentPath, entry.name);
-    const bytes = new Uint8Array(await readFile(path));
-    files.push({ path, bytes });
-    if (entry.name.endsWith('.zip')) {
-      for (const [name, content] of Object.entries(unzipSync(bytes))) {
-        files.push({ path: `${path}!${name}`, bytes: content });
-      }
-    }
-  }
-  return files;
-}
-
-/** `bytes` が、`needle`（UTF-8）を含むか。 */
-const containsBytes = (bytes: Uint8Array, needle: string): boolean => Buffer.from(bytes).includes(Buffer.from(needle, 'utf8'));
-
 describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => {
   let workDirectory: string;
   let site: AuthenticatedSite | undefined;
   const browsers: Browser[] = [];
-  const sessions: RunCheckpointSession[] = [];
   const launcher: BrowserLauncher = async () => {
     const browser = await launch();
     browsers.push(browser);
@@ -112,7 +93,6 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
   });
 
   afterEach(async () => {
-    await Promise.all(sessions.splice(0).map((session) => session.abandon().catch(() => undefined)));
     await Promise.all(browsers.splice(0).map((browser) => browser.close().catch(() => undefined)));
     await site?.close();
     site = undefined;
@@ -127,10 +107,12 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
     return site;
   }
 
+  // DF-2b（DEF-067 の続き。LG-3b の 2 件の PARTIAL）: Run が COMPLETE であることを確かめる場面が、混雑の下で DOM の準備の期限と Browser を
+  // 閉じる期限で PARTIAL にならないよう、どちらも名前つきの混雑の倍率を掛けた値にする（DEF-063 の形。判定に関わる読み込みの期限は変えない）。
   function configFor(started: AuthenticatedSite, startPath: string, overrides: Parameters<typeof createTestConfig>[2] = {}): AuditConfig {
     return createTestConfig(started.originA, startPath, {
       ...overrides,
-      crawl: { maxPages: MAX_PAGES, ...overrides.crawl },
+      crawl: { maxPages: MAX_PAGES, resourceSettlingTimeoutMs: LOADED_RESOURCE_SETTLING_TIMEOUT_MS, ...overrides.crawl },
       viewports: { stressWidths: [...STRESS_WIDTHS], ...overrides.viewports },
       audit: { screenshots: false, ...overrides.audit },
     });
@@ -154,9 +136,10 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
     readonly config: AuditConfig;
     readonly authentication?: RunAuthentication;
     readonly outputDirectory: string;
-    readonly checkpointSession?: RunCheckpointSession;
     /** 渡すと、Run で作ったすべての Safety Ledger を、作った順に入れる。 */
     readonly ledgers?: SafetyLedger[];
+    /** FM2d: まとめて実行の段の持ち越し。 */
+    readonly stageCarry?: RunStageCarry;
   }): Promise<{ readonly result: AuditRunResult; readonly coordinator: RunCoordinator }> {
     const coordinator = new RunCoordinator({
       config: input.config,
@@ -168,12 +151,42 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
       },
       clock: () => new Date(),
       now: () => Date.now(),
+      browserCloseTimeoutMs: LOADED_BROWSER_CLOSE_TIMEOUT_MS,
       outputDirectory: input.outputDirectory,
       ...(input.authentication === undefined ? {} : { authentication: input.authentication }),
-      ...(input.checkpointSession === undefined ? {} : { checkpointSession: input.checkpointSession }),
+      ...(input.stageCarry === undefined ? {} : { stageCarry: input.stageCarry }),
     });
     return { result: await coordinator.run(), coordinator };
   }
+
+  // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: Run の終わりに、factory の最新の状態を持ち越しの口へ 1 回渡す。回転するサーバ
+  // （古い値を無効にする）で、持ち越した状態から始めた次の Run も、ログインの画面に飛ばされずに通る。
+  it('records the latest state once at the end of the Run, and the next Run with the carried state passes on a rotating server', async () => {
+    const started = await startSite({ rotate: true });
+    const { state } = authenticatedStateFor(started);
+    const carried: RunStageCarried[] = [];
+    const first = await run({
+      config: configFor(started, AUTH_SITE_PATHS.admin),
+      authentication: authenticationFor(started, state),
+      outputDirectory: join(workDirectory, `carry-first-${browsers.length}-${Date.now()}`),
+      stageCarry: { serviceRequestWindowMs: [], record: (value) => carried.push(value) },
+    });
+    expect(first.result.run.runStatus).toBe('COMPLETE');
+    expect(carried).toHaveLength(1);
+    const latest = carried[0]?.latestState ?? null;
+    expect(latest).not.toBeNull();
+    // 監査の段の口がない Run の窓は空。
+    expect(carried[0]?.serviceRequestWindowMs).toEqual([]);
+
+    const second = await run({
+      config: configFor(started, AUTH_SITE_PATHS.admin),
+      authentication: authenticationFor(started, latest ?? state),
+      outputDirectory: join(workDirectory, `carry-second-${browsers.length}-${Date.now()}`),
+    });
+    expect(second.result.run.runStatus).toBe('COMPLETE');
+    expect(second.result.run.incompleteReasons.filter(({ code }) => code === 'AUTH_SESSION_LOST')).toEqual([]);
+    expect(started.requests.filter(({ path }) => path.startsWith(AUTH_SITE_PATHS.login))).toEqual([]);
+  }, FULL_RUN_TEST_TIMEOUT_MS * 2);
 
   const pageAt = (result: AuditRunResult, origin: string, path: string): PageAuditResult | undefined =>
     result.pages.find(({ pageUrl }) => pageUrl === `${origin}${path}`);
@@ -200,7 +213,7 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
     const adminRequests = started.requests.filter(({ site: origin, path }) => origin === 'A' && path.startsWith(AUTH_SITE_PATHS.admin));
     expect(adminRequests.length).toBeGreaterThanOrEqual(auditedPaths.length * (2 + STRESS_WIDTHS.length));
     expect(adminRequests.filter(({ authenticated }) => !authenticated)).toEqual([]);
-    expect(started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect(started.requests.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
     // ログアウト、危険な語、ログインの画面は、巡回の候補に入らず、サーバに届かない。
     for (const path of [AUTH_SITE_PATHS.adminLogout, AUTH_SITE_PATHS.adminDelete, AUTH_SITE_PATHS.login]) {
       expect(started.requests.filter(({ path: requested }) => requested.startsWith(path)), path).toEqual([]);
@@ -249,7 +262,7 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
     const finalPaths = result.pages.flatMap(({ viewports }) => [viewports.desktop.finalUrl, viewports.mobile.finalUrl]).map(pathOf);
     expect(finalPaths).not.toContain(AUTH_SITE_PATHS.login);
     expect(result.run.safety.invariantViolationCount).toBe(0);
-    expect(started.requests.filter(({ method }) => method !== 'GET' && method !== 'HEAD')).toEqual([]);
+    expect(started.requests.filter(({ method }) => !READ_METHODS.has(method))).toEqual([]);
   });
 
   it('stops with AUTH_SESSION_LOST when the server treats a reused rotated value as theft (the remaining risk of the generation inheritance)', async () => {
@@ -336,36 +349,10 @@ describe.each(LAUNCHERS)('T25c: the authenticated Run (%s)', (_name, launch) => 
     expect(result.run.runStatus).toBe('COMPLETE');
     expect(result.statusInput.safetyLedgerTruncated).toBe(false);
     expect(result.run.incompleteReasons.map(({ code }) => code)).not.toContain('SAFETY_LEDGER_TRUNCATED');
-  });
+  }, MANY_EXCLUDED_TEST_TIMEOUT_MS);
 
-  it('writes none of the secret markers to any file of the Run directory (outputs, checkpoint, ZIP contents)', async () => {
-    const started = await startSite({ rotate: true });
-    const { state, secrets } = authenticatedStateFor(started);
-    const outputDirectory = join(workDirectory, `secrets-${Date.now()}`);
-    const session = new RunCheckpointSession({ store: new ArtifactWriter(), now: () => Date.now() });
-    sessions.push(session);
-    const { result, coordinator } = await run({
-      config: configFor(started, AUTH_SITE_PATHS.admin, { audit: { screenshots: true } }),
-      authentication: authenticationFor(started, state),
-      outputDirectory,
-      checkpointSession: session,
-    });
-    const outputs = await writeAuditRunOutputs(result, outputDirectory);
-    const conclusion = coordinator.checkpointConclusion();
-    if (conclusion.action === 'FINISH') {
-      await session.finish(conclusion.checkpoint);
-      sessions.splice(sessions.indexOf(session), 1);
-    }
-
-    const files = await readAllFiles(outputs.runDirectory);
-    expect(files.length).toBeGreaterThan(0);
-    expect(files.some(({ path }) => path.includes('checkpoint'))).toBe(true);
-    // 回転で替えた値を含む、サーバが作ったすべてのセッションの値と、状態に入れたほかの値（別の Origin の Cookie、localStorage）。
-    const markers = [...new Set([...secrets, ...started.secretValues()])];
-    expect(markers.length).toBeGreaterThan(secrets.length);
-    const leaks = files.flatMap(({ path, bytes }) => markers.filter((marker) => containsBytes(bytes, marker)).map(() => path));
-    expect(leaks).toEqual([]);
-  }, FULL_RUN_TEST_TIMEOUT_MS);
+  // TS-f（B13）: 回転するサーバの認証つきの Run で、Run のディレクトリのどのファイル（出力、保存、ZIP の中身）にも秘密の目印が残らないことは、
+  // 同じ確かめ（と URL の query の目印）をしていた `authenticated-url-secrets.test.ts` の T25f に、1 か所にまとめた。
 
   it('keeps the Run without the authentication unchanged (Interaction stays enabled in the effective configuration)', async () => {
     const started = await startSite();

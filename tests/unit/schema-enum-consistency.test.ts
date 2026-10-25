@@ -14,23 +14,30 @@ import {
 import * as actionContracts from '../../src/control/actions/action-contracts.js';
 import { MAX_SAFE_RECORD_ID_LENGTH, SAFE_RECORD_ID_PATTERN } from '../../src/control/actions/action-outcome.js';
 import * as scenarioContracts from '../../src/control/approval/scenario-contracts.js';
+import * as authSetupContracts from '../../src/control/auth/auth-setup-contracts.js';
 import * as automatedLoginResults from '../../src/control/auth/automated-login-results.js';
 import * as controlContracts from '../../src/control/contracts.js';
 import * as credentialStore from '../../src/control/credentials/credential-store.js';
 import * as dataRuleContracts from '../../src/control/data-rules/rule-contracts.js';
+import * as entryCheck from '../../src/control/entry-check.js';
 import * as workerProtocol from '../../src/control/worker-protocol.js';
 import * as contracts from '../../src/core/contracts.js';
 import * as evidenceTypes from '../../src/core/evidence-types.js';
 import { createEvidenceId } from '../../src/core/ids.js';
 import { MAX_ERROR_MESSAGE_LENGTH, MAX_HTTP_METHOD_LENGTH, MAX_URL_LENGTH } from '../../src/core/limits.js';
+import * as apiRequestShape from '../../src/core/api-request-shape.js';
+import { AUDIT_SEND_POLICIES } from '../../src/core/audit-send-policy.js';
+import * as apiShapeClassification from '../../src/discovery/api-shape-classification.js';
 import * as discoveryCandidateContracts from '../../src/discovery/candidate-contracts.js';
+import * as submissionProbeContracts from '../../src/discovery/submission-probe-contracts.js';
 import * as discoveryClassificationWords from '../../src/discovery/classification-words.js';
+import * as loginObservation from '../../src/discovery/login-observation.js';
 import * as discoveryResult from '../../src/discovery/discovery-result.js';
 import * as readCheckContracts from '../../src/discovery/read-check-contracts.js';
 import * as readCheckEvaluation from '../../src/discovery/read-check-evaluation.js';
 import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
-import { WRITE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/write-payload-policy.js';
+import { WRITE_STAGE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/api-write-payload-policy.js';
 
 type SchemaName =
   | 'action-evidence'
@@ -40,6 +47,7 @@ type SchemaName =
   | 'checkpoint'
   | 'checkpoint-page'
   | 'discovery'
+  | 'entry-check'
   | 'finding'
   | 'page'
   | 'read-evidence'
@@ -74,12 +82,25 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('run', '/properties/retries/items/properties/navigationOutcome/enum', 'NAVIGATION_OUTCOME_KINDS'),
   // R4b2（中断した Run の再開の設計書 4.8）: run.json の実行の記録の終わり方（実行を終えた記録だけなので、null なし）。
   mapping('run', '/properties/executions/items/properties/endReason/enum', 'RUN_EXECUTION_END_REASONS'),
+  // DEF-138: セッションの切れの証拠（`authentication.sessionLoss`。発見・READ の確かめの成果物と IPC も同じ定義を参照する）。
+  mapping('run', '/$defs/sessionLossOriginKind/enum', 'SESSION_LOSS_ORIGIN_KINDS'),
+  mapping('run', '/$defs/sessionLoss/properties/landedBy/enum', 'SESSION_LOSS_LANDED_BY'),
+  mapping('run', '/$defs/sessionLoss/properties/blockedRequests/items/properties/reason/enum', 'SESSION_LOSS_BLOCKED_REQUEST_REASONS'),
+  mapping('run', '/$defs/sessionLoss/properties/storageKeyChange/anyOf/0/items/properties/storage/enum', 'SESSION_LOSS_STORAGE_KINDS'),
+  mapping('run', '/$defs/sessionLoss/properties/storageKeyChange/anyOf/0/items/properties/change/enum', 'SESSION_LOSS_KEY_CHANGES'),
+  // AS-b: 監査の段の送信の扱い（実効の設定の `audit.sendPolicy`。任意の項目）。
+  mapping('run', '/properties/effectiveConfig/properties/audit/properties/sendPolicy/enum', 'AUDIT_SEND_POLICIES'),
+  // DEF-144: 発見と READ の確かめのジョブの違反の中身の段（`discovery.json`・`read-evidence.json`・IPC も同じ定義を参照する）。
+  mapping('run', '/$defs/jobSafetyViolation/properties/stage/enum', 'JOB_SAFETY_VIOLATION_STAGES'),
   // checkpoint.schema.json（R2。中断した Run の再開の設計書 4.1、4.2）: 保存の状態、実行の終わり方（実行の途中は null）、
   // 巡回の記録の状態。checkpoint-page.schema.json は、page.schema.json の定義を参照するだけで、enum を持たない。
   mapping('checkpoint', '/properties/state/enum', 'RUN_CHECKPOINT_STATES'),
   mapping('checkpoint', '/$defs/execution/properties/endReason/enum', 'RUN_EXECUTION_END_REASONS', NULLABLE),
   mapping('checkpoint', '/$defs/frontierEntry/properties/state/enum', 'CRAWL_URL_STATES'),
   // page.schema.json: ページとビューポート
+  // BN-a（設計書 `2026-10-23-beaksight-bundle-beaksight-block-noise-design.md` 3.1 の 5）: 読める page.json の版と、止めた事象の時点。
+  mapping('page', '/properties/schemaVersion/enum', 'PAGE_READABLE_SCHEMA_VERSIONS'),
+  mapping('page', '/$defs/blockedEventPhase/enum', 'BLOCKED_EVENT_PHASES'),
   mapping('page', '/properties/status/enum', 'PAGE_AUDIT_STATUSES'),
   mapping('page', '/$defs/viewportAuditResult/properties/status/enum', 'PAGE_AUDIT_STATUSES'),
   // P14a（Task 14〜17 の設計書 4.3.0）: ナビゲーションの結果の種類。スキップしたビューポートでは null。
@@ -246,6 +267,11 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('discovery', '/properties/runStatus/enum', 'RUN_STATUSES'),
   mapping('discovery', '/properties/endReason/enum', 'DISCOVERY_END_REASONS'),
   mapping('discovery', '/$defs/page/oneOf/1/properties/reason/enum', 'DISCOVERY_UNREAD_REASONS'),
+  // T37a（Task 37 の設計書 3.1）: 終わり方の詳しい理由（READ の確かめの成果物は、この enum を `$ref` で使う）。
+  mapping('discovery', '/properties/endReasonDetail/enum', 'JOB_END_REASON_DETAILS'),
+  // T37a fix round 1: 読み手が受ける版（LG-4: 今の版だけ）。
+  mapping('discovery', '/properties/schemaVersion/enum', 'DISCOVERY_ARTIFACT_READABLE_SCHEMA_VERSIONS'),
+  mapping('read-evidence', '/properties/schemaVersion/enum', 'READ_EVIDENCE_ARTIFACT_READABLE_SCHEMA_VERSIONS'),
   // T27e（Task 27 の設計書 4.5）: READ の確かめの成果物 read-evidence.json。値の一覧は `src/discovery/read-check-evaluation.ts`（結果の一覧は
   // `src/discovery/read-check-contracts.ts`）。期待は `control/read-check-definition.schema.json` を参照する（enum を持たない）。
   mapping('read-evidence', '/properties/runStatus/enum', 'RUN_STATUSES'),
@@ -255,6 +281,8 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('read-evidence', '/$defs/executed/properties/result/enum', 'READ_CHECK_RESULTS'),
   mapping('read-evidence', '/$defs/executed/properties/detail/enum', 'READ_CHECK_DETAILS'),
   mapping('read-evidence', '/$defs/notExecuted/properties/reason/enum', 'READ_CHECK_NOT_EXECUTED_REASONS'),
+  // T37d（Task 37 の設計書 3.5）: 版 1.2 の定義の対象の種類。
+  mapping('read-evidence', '/$defs/targetKind/enum', 'READ_CHECK_TARGET_KINDS'),
   mapping('read-evidence', '/$defs/structure/properties/region/enum', 'READ_PAGE_REGIONS'),
   mapping('read-evidence', '/$defs/rowCountEvidence/properties/rowSource/anyOf/0/enum', 'READ_ROW_SOURCES'),
   // T30a（Task 30 の設計書 3 章の「記録」）: 書き込みのジョブの記録 action-run.json。値の一覧は `src/control/actions/action-contracts.ts`（照合の READ の
@@ -268,16 +296,29 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('action-run', '/$defs/readVerification/properties/result/enum', 'READ_CHECK_RESULTS'),
   // T31f: UPDATE の証拠の欄の役割（`update.updateEvidence`）。
   mapping('action-run', '/$defs/updateEvidenceField/properties/role/enum', 'UPDATE_EVIDENCE_FIELD_ROLES'),
+  // T40c（Task 40 の設計書 3.4）: 記録と報告の版 1.1。読み手が受ける版（1.0 と 1.1）と、送り方（シナリオの契約の一覧）。
+  mapping('action-run', '/properties/schemaVersion/enum', 'ACTION_RUN_READABLE_SCHEMA_VERSIONS'),
+  mapping('action-run', '/$defs/transport/enum', 'SCENARIO_TRANSPORTS'),
+  // T44e（Task 44 の設計書 P2-4）: 送らずに止めた具体的な理由（任意の項目）。
+  mapping('action-run', '/properties/precheckDetail/enum', 'PRECHECK_FAILURE_DETAILS'),
+  mapping('action-evidence', '/properties/schemaVersion/enum', 'ACTION_EVIDENCE_READABLE_SCHEMA_VERSIONS'),
   // T32c（Task 32 の設計書 4.1）: 書き込みの報告。ほかの値の一覧は `action-run`・`read-evidence`・`control/scenario` を `$ref` で使うので、ここに
   // 来るのは新しい enum だけ。Guard の要約の理由の鍵は、Guard の閉じた一覧（`src/safety/request-policy.ts`、`src/safety/write-payload-policy.ts`。
   // `src/control/` は読み込めないので契約に書き写さない）と一致する。人が決めたこと・自動で行うことは `src/control/actions/action-contracts.ts`。
   mapping('action-evidence', '/$defs/guardSummary/properties/blockedByReason/propertyNames/enum', 'SUBMISSION_STAGE_BLOCK_REASONS'),
-  mapping('action-evidence', '/$defs/guardSummary/properties/blockedByPayloadReason/propertyNames/enum', 'WRITE_PAYLOAD_BLOCK_REASONS'),
+  // T39a: 送る中身の照合の理由の鍵は、form の照合と API の照合の理由を重ねずに合わせた一覧（`src/safety/api-write-payload-policy.ts`）。
+  mapping('action-evidence', '/$defs/guardSummary/properties/blockedByPayloadReason/propertyNames/enum', 'WRITE_STAGE_PAYLOAD_BLOCK_REASONS'),
   // T32d: 事実の形は `$defs/facts` に 1 回だけ置き（IPC の `START` も `$ref` で使う）、種類ごとの一覧の決まりは `$defs/kindLists`。
   mapping('approval-summary', '/$defs/facts/properties/humanDecisions/items/enum', 'HUMAN_DECISIONS'),
   mapping('approval-summary', '/$defs/facts/properties/automatedActions/items/enum', 'AUTOMATED_ACTIONS'),
   mapping('approval-summary', '/$defs/kindLists/then/properties/humanDecisions/items/not/enum', 'UPDATE_ONLY_HUMAN_DECISIONS'),
   mapping('approval-summary', '/$defs/kindLists/then/properties/automatedActions/items/not/enum', 'UPDATE_ONLY_AUTOMATED_ACTIONS'),
+  // T43c（Task 43 の設計書 4.3）: 入口の確かめの成果物 entry-check.json。値の一覧は `src/control/entry-check.ts`（送り方は認証の設定の一覧そのもの）。
+  mapping('entry-check', '/properties/runStatus/enum', 'RUN_STATUSES'),
+  mapping('entry-check', '/properties/endReason/enum', 'ENTRY_CHECK_END_REASONS'),
+  mapping('entry-check', '/$defs/form/properties/placement/enum', 'ENTRY_CHECK_FORM_PLACEMENTS', NULLABLE),
+  mapping('entry-check', '/$defs/form/properties/method/enum', 'ENTRY_CHECK_FORM_METHODS', NULLABLE),
+  mapping('entry-check', '/$defs/proposal/properties/loginTransport/enum', 'ENTRY_CHECK_LOGIN_TRANSPORTS', NULLABLE),
 ]);
 
 const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
@@ -287,12 +328,18 @@ const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...readCheckContracts,
   ...readCheckEvaluation,
   ...actionContracts,
+  // T43c: 入口の確かめの成果物の値の一覧（owner は `src/control/entry-check.ts`）。
+  ...entryCheck,
   // T32c: Guard の要約の理由の鍵（owner は `src/safety/`。名前を指定して足し、ほかの名前を混ぜない）。
   SUBMISSION_STAGE_BLOCK_REASONS,
-  WRITE_PAYLOAD_BLOCK_REASONS,
+  WRITE_STAGE_PAYLOAD_BLOCK_REASONS,
+  // T40c: 記録の送り方（owner はシナリオの契約 `src/control/approval/scenario-contracts.ts`。名前を指定して足す）。
+  SCENARIO_TRANSPORTS: scenarioContracts.SCENARIO_TRANSPORTS,
+  // AS-b: 監査の段の送信の扱い（owner は `src/core/audit-send-policy.ts`。名前を指定して足す）。
+  AUDIT_SEND_POLICIES,
 });
 
-const mappingKey = (schema: string, pointer: string): string => `${schema}.schema.json#${pointer}`;
+const mappingKey =(schema: string, pointer: string): string => `${schema}.schema.json#${pointer}`;
 
 const escapePointerToken = (token: string): string => token.replaceAll('~', '~0').replaceAll('/', '~1');
 
@@ -343,7 +390,8 @@ beforeAll(() => {
 describe('F12: schema enums and the core value arrays', () => {
   it('reads every schema that the mapping table refers to', () => {
     expect([...schemas.keys()].sort()).toEqual([
-      'action-evidence', 'action-run', 'approval-summary', 'audit', 'checkpoint', 'checkpoint-page', 'discovery', 'finding', 'page', 'read-evidence', 'run',
+      'action-evidence', 'action-run', 'approval-summary', 'audit', 'checkpoint', 'checkpoint-page', 'discovery', 'entry-check', 'finding', 'page',
+      'read-evidence', 'run',
       'site-unavailable-diagnostic',
     ]);
   });
@@ -381,7 +429,19 @@ describe('F12: schema enums and the core value arrays', () => {
 // T22a（Task 22 の設計書 3.1、7）: Control のスキーマ（`schemas/control/*.schema.json`）の enum と、`src/control/contracts.ts` の
 // `as const` の凍結した配列の対応表。成果物のスキーマ（上の対応表）とは、置き場所も値の一覧の owner も別なので、別の表にする。
 // Control のスキーマに enum を増やしたら、この表に1行を加える。対応表にない enum があれば、このテストが失敗する。
-type ControlSchemaName = 'profile' | 'worker-message' | 'credential-file' | 'candidate' | 'scenario' | 'approval-receipt' | 'data-rule';
+type ControlSchemaName =
+  | 'profile'
+  | 'worker-message'
+  | 'credential-file'
+  | 'candidate'
+  | 'scenario'
+  | 'approval-receipt'
+  // FM2c: 入力の規則の集まりの版 2（LG-3: 版 1 の `data-rule` は捨てた）。
+  | 'data-rule-v2'
+  // T34a: 認証の設定の版 3。
+  | 'auth-setup-v3'
+  // AS-b: プロファイルの表示の設定の保存の入力（監査の段の送信の扱い）。
+  | 'ui-profile-display-settings';
 
 interface ControlEnumMapping {
   readonly schema: ControlSchemaName;
@@ -408,6 +468,9 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('worker-message', '/$defs/failed/properties/reason/enum', 'WORKER_FAILURE_REASONS'),
   // T25d: 認証の状態の知らせ（Task 25 の設計書 4.4）。
   controlMapping('worker-message', '/$defs/authState/properties/state/enum', 'WORKER_AUTH_STATES'),
+  // T34e: ログインの段で止めた読み取りでない要求の一覧の、要求の種類と理由（Task 34 の設計書 3.5）。
+  controlMapping('worker-message', '/$defs/loginStageBlockedRequests/properties/requests/items/properties/resourceType/enum', 'WORKER_REQUEST_RESOURCE_TYPES'),
+  controlMapping('worker-message', '/$defs/loginStageBlockedRequests/properties/requests/items/properties/reason/enum', 'WORKER_LOGIN_STAGE_BLOCK_REASONS'),
   // T26d-2: ジョブの種類と、自動ログインの結果（Task 26 の設計書 4.5）。結果と送信の一覧は `src/control/auth/automated-login-results.ts`。
   controlMapping('worker-message', '/$defs/start/properties/jobKind/enum', 'WORKER_JOB_KINDS'),
   controlMapping('worker-message', '/$defs/automatedLoginReport/properties/result/enum', 'AUTOMATED_LOGIN_RESULTS'),
@@ -417,6 +480,8 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('worker-message', '/$defs/writeRecheckResult/properties/reason/anyOf/0/enum', 'WORKER_WRITE_RECHECK_REJECTION_REASONS'),
   controlMapping('worker-message', '/$defs/writeSubmission/properties/submission/enum', 'WORKER_WRITE_SUBMISSION_STATES'),
   controlMapping('worker-message', '/$defs/writeSubmission/properties/blockReason/anyOf/0/enum', 'WORKER_WRITE_BLOCK_REASONS'),
+  // T43c: 入口の確かめのジョブの件数の要約の終わり方（`src/control/entry-check.ts` の一覧そのもの）。
+  controlMapping('worker-message', '/$defs/entryCheckSummary/properties/endReason/enum', 'WORKER_ENTRY_CHECK_END_REASONS'),
   // T26a: 資格情報のファイル（Task 26 の設計書 4.1、4.2）。値の一覧は `src/control/credentials/credential-store.ts`。
   controlMapping('credential-file', '/properties/lastChangeKind/enum', 'CREDENTIAL_CHANGE_KINDS'),
   // T27a: 発見の候補（Task 27 の設計書 4.1）。値の一覧は `src/discovery/candidate-contracts.ts`。form の外のボタンと form の項目の組み合わせは
@@ -433,27 +498,80 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('candidate', '/$defs/listenerKinds/items/enum', 'LISTENER_KINDS'),
   // T27R-fix-1（DEF-086）: 送信ボタンの語の閉じた一覧。値の一覧は `src/discovery/classification-words.ts`。
   controlMapping('candidate', '/properties/submitterWords/items/enum', 'DISCOVERY_SUBMITTER_WORDS'),
+  // T37c（Task 37 の設計書 3.4）: 送らずに観察する probe の結果（任意の項目 `submissionProbe`）。値の一覧は `src/discovery/submission-probe-contracts.ts`
+  // （実行できない理由は `src/discovery/api-shape-classification.ts`、型の一覧は `src/core/api-request-shape.ts` の一覧そのもの）。
+  controlMapping('candidate', '/$defs/submissionProbe/properties/result/enum', 'SUBMISSION_PROBE_RESULTS'),
+  controlMapping('candidate', '/$defs/submissionProbe/properties/reason/anyOf/0/enum', 'SUBMISSION_PROBE_REASONS'),
+  // DEF-144: 実行できない理由に、probe だけの理由（`EXTERNAL_SCHEME`）を足した一覧。
+  controlMapping('candidate', '/$defs/submissionProbe/allOf/0/then/properties/reason/enum', 'SUBMISSION_PROBE_NOT_EXECUTABLE_REASONS'),
+  controlMapping('candidate', '/$defs/submissionProbe/allOf/1/then/properties/reason/enum', 'SUBMISSION_PROBE_NOT_OBSERVED_REASONS'),
+  controlMapping('candidate', '/$defs/apiRequestShape/properties/filters/items/properties/operator/enum', 'SUBMISSION_PROBE_FILTER_OPERATORS'),
+  controlMapping('candidate', '/$defs/apiRequestShape/properties/prefer/items/enum', 'API_PREFER_SHAPES'),
+  controlMapping('candidate', '/$defs/apiRequestBody/properties/kind/enum', 'API_REQUEST_BODY_KINDS'),
+  controlMapping('candidate', '/$defs/apiRequestBody/properties/keys/items/properties/type/enum', 'API_JSON_VALUE_TYPES'),
   // T28a: シナリオと承認の記録（Task 28 の設計書 4.1）。値の一覧は `src/control/approval/scenario-contracts.ts`（enctype は候補の契約の一覧）。
   // 承認の記録の種類と承認者は分岐の const なので、`tests/unit/approval-schemas.test.ts` で確かめる。
   controlMapping('scenario', '/properties/kind/enum', 'SCENARIO_KINDS'),
   controlMapping('scenario', '/$defs/request/properties/methodOverride/anyOf/0/enum', 'SCENARIO_METHOD_OVERRIDES'),
   controlMapping('scenario', '/$defs/request/properties/enctype/enum', 'FORM_ENCTYPES'),
+  // T38b（Task 38 の設計書 3.2）: 送り方と API の指定（値の一覧は `scenario-contracts.ts` と probe の型の契約 `src/core/api-request-shape.ts`）。
+  controlMapping('scenario', '/properties/transport/enum', 'SCENARIO_TRANSPORTS'),
+  controlMapping('scenario', '/$defs/apiJsonType/enum', 'API_JSON_VALUE_TYPES'),
+  // T38R2-fix（M-2）: 送る鍵の欄の型（`SCENARIO_API_FIELD_JSON_TYPES` の欄の型）。
+  controlMapping('scenario', '/$defs/apiFieldType/enum', 'SCENARIO_API_FIELD_TYPES'),
+  controlMapping('scenario', '/$defs/apiRequest/properties/method/enum', 'SCENARIO_API_METHODS'),
+  controlMapping('scenario', '/$defs/apiRequest/properties/queryNames/items/enum', 'API_SELECTION_QUERY_NAMES'),
+  controlMapping('scenario', '/$defs/apiRequest/properties/prefer/items/enum', 'API_PREFER_SHAPES'),
+  controlMapping('scenario', '/$defs/api/properties/recordId/anyOf/0/properties/source/enum', 'SCENARIO_API_RECORD_ID_SOURCES'),
   controlMapping('approval-receipt', '/$defs/revocation/properties/reason/enum', 'REVOCATION_REASONS'),
   // T29a: 入力の規則の集まり（Task 29 の設計書 4.1）。値の一覧は `src/control/data-rules/rule-contracts.ts`。欄どうしの関係の種類は分岐の const
   // なので、`tests/unit/data-rule-contracts.test.ts` で確かめる。
-  controlMapping('data-rule', '/$defs/fieldRule/properties/semanticKind/enum', 'SEMANTIC_KINDS'),
-  controlMapping('data-rule', '/$defs/fieldRule/properties/method/enum', 'GENERATION_METHODS'),
+  // FM2c: 版 2 が今の値の一覧（LG-3: 版 1 のスキーマと、その写しの一覧は捨てた）。
+  controlMapping('data-rule-v2', '/$defs/fieldRule/properties/semanticKind/enum', 'SEMANTIC_KINDS'),
+  controlMapping('data-rule-v2', '/$defs/fieldRule/properties/method/enum', 'GENERATION_METHODS'),
+  controlMapping('data-rule-v2', '/$defs/origin/enum', 'RULE_ORIGINS'),
+  controlMapping('data-rule-v2', '/$defs/fieldRule/allOf/1/then/properties/method/enum', 'INFERRED_RULE_GENERATION_METHODS'),
+  // T34a: 認証の設定の版 3（Task 34 の設計書 3.2）。値の一覧は `src/control/auth/auth-setup-contracts.ts`。
+  controlMapping('auth-setup-v3', '/properties/loginTransport/enum', 'LOGIN_TRANSPORTS'),
+  controlMapping('auth-setup-v3', '/properties/loginSideRequests/items/properties/method/enum', 'LOGIN_SIDE_REQUEST_METHODS'),
+  // T35a: 監査の段の読み取りの手続きの呼び出しの method（`POST` だけ）。
+  controlMapping('auth-setup-v3', '/properties/auditReadRequests/items/properties/method/enum', 'AUDIT_READ_REQUEST_METHODS'),
+  // T43d（Task 43 の設計書 4.4）: ログインの段の止めた行の query の値を残す名前と、ログインの段の観察（成功の画面のセレクタの案の種類とログアウトの語）。
+  // 値の一覧は `src/discovery/login-observation.ts` と `src/discovery/classification-words.ts`。
+  controlMapping('worker-message', '/$defs/loginStageBlockedRequests/properties/requests/items/properties/query/properties/values/items/properties/name/enum',
+    'LOGIN_OBSERVED_QUERY_VALUE_NAMES'),
+  controlMapping('worker-message', '/$defs/loginObservation/properties/successSelector/properties/kind/enum', 'SUCCESS_SELECTOR_CANDIDATE_KINDS'),
+  // T43R-fix の C-1 (b): ログアウトの要素だけになったので、語は必ずある（`null` を持たない）。
+  controlMapping('worker-message', '/$defs/loginObservation/properties/successSelector/properties/logoutWord/enum', 'DISCOVERY_LOGOUT_WORDS'),
+  // DEF-139: ログインの段の状態の名前の記録の結果（値の一覧は `src/control/auth/authenticated-state.ts`。IPC の側の名前で写す）。
+  controlMapping('worker-message', '/$defs/loginStateNameOutcome/enum', 'WORKER_LOGIN_STATE_NAME_OUTCOMES'),
+  // AS-b: 監査の段の送信の扱い（`START` の項目と、プロファイルの設定の保存の入力）。値の一覧は `src/core/audit-send-policy.ts`。
+  controlMapping('worker-message', '/$defs/start/properties/auditSendPolicy/enum', 'AUDIT_SEND_POLICIES'),
+  controlMapping('ui-profile-display-settings', '/properties/auditSendPolicy/enum', 'AUDIT_SEND_POLICIES'),
+  // FM2d: まとめて実行の段の種類、次の段の種類、段の未完了の理由のコード（値の一覧は `src/control/worker-protocol.ts`。理由のコードは core の一覧の写し名）。
+  controlMapping('worker-message', '/$defs/chainStageKind/enum', 'WORKER_CHAIN_STAGE_KINDS'),
+  controlMapping('worker-message', '/$defs/nextStage/properties/jobKind/enum', 'WORKER_NEXT_STAGE_JOB_KINDS'),
+  controlMapping('worker-message', '/$defs/finished/properties/incompleteReasonCodes/items/enum', 'WORKER_INCOMPLETE_REASON_CODES'),
 ]);
 
 const controlExports: Readonly<Record<string, unknown>> = Object.freeze({
   ...controlContracts,
+  ...authSetupContracts,
   ...workerProtocol,
   ...credentialStore,
   ...automatedLoginResults,
   ...discoveryCandidateContracts,
   ...discoveryClassificationWords,
+  // T37c: 送らずに観察する probe の結果と型の値の一覧。
+  ...submissionProbeContracts,
+  ...apiShapeClassification,
+  ...apiRequestShape,
   ...scenarioContracts,
   ...dataRuleContracts,
+  // T43d: ログインの段の観察の値の一覧。
+  ...loginObservation,
+  // AS-b: 監査の段の送信の扱い（owner は `src/core/audit-send-policy.ts`。名前を指定して足す）。
+  AUDIT_SEND_POLICIES,
 });
 
 const controlMappingKey = (schema: string, pointer: string): string => mappingKey(`control/${schema}`, pointer);
@@ -477,16 +595,16 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
     expect([...controlSchemas.keys()].sort()).toEqual([
       // T28a: 承認の記録（Task 28 の設計書 4.1。enum は上の対応表。分岐の const と上限の一致は `approval-schemas.test.ts`）。
       'approval-receipt',
-      // T25a: 認証の設定（Task 25 の設計書 4.1。enum を持たない。上限と名前つきの定数の一致は `control-auth-setup.test.ts`）。
-      'auth-setup',
-      // T26b: 認証の設定の版 2（Task 26 の設計書 4.3。enum を持たない。上限と名前つきの定数の一致は `control-auth-setup-v2.test.ts`）。
-      'auth-setup-v2',
+      // T34a: 認証の設定の版 3（Task 34 の設計書 3.2。enum は上の対応表。上限と名前つきの定数の一致は `control-auth-setup.test.ts`。LG-3b: 版 1 の
+      // `auth-setup` と版 2 の `auth-setup-v2` は捨てた）。
+      'auth-setup-v3',
       // T27a: 発見の候補（Task 27 の設計書 4.1。enum は上の対応表。上限と名前つきの定数の一致は `discovery-candidate-schema.test.ts`）。
       'candidate',
       // T26a: 資格情報のファイル（Task 26 の設計書 4.1。enum は上の対応表の `lastChangeKind`）。
       'credential-file',
-      // T29a: 入力の規則の集まり（Task 29 の設計書 4.1。enum は上の対応表。上限と分岐の const の一致は `data-rule-contracts.test.ts`）。
-      'data-rule',
+      // T29a・FM2c: 入力の規則の集まりの版 2（手動の操作を減らす設計書 3A.3。enum は上の対応表。上限と分岐の const の一致は
+      // `data-rule-contracts.test.ts`。LG-3: 版 1 の `data-rule` は捨てた）。
+      'data-rule-v2',
       'profile',
       // T27c: READ の確かめの定義（Task 27 の設計書 4.5。期待の種類は分岐の const。種類と上限の一致は `read-check-contracts.test.ts`）。
       'read-check-definition',
@@ -496,8 +614,12 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-audit-job-key',
       'ui-audit-job-start',
       'ui-audit-job-stop',
+      // T43d: 画面の認証の設定とプロファイルのまとめて保存の Server Function の入力（Task 43 の設計書 4.4。enum を持たない）。
+      'ui-auth-setup-profile-save',
       // T25e: 画面の認証の設定の保存の Server Function の入力（Task 25 の設計書 4.5。enum を持たない）。
       'ui-auth-setup-save',
+      // FM2e: 画面の 1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4。enum を持たない）。
+      'ui-automated-login-setup',
       // T26e: 画面の資格情報の登録・変更・入れ直しと、ログインの検証の開始の Server Function の入力（Task 26 の設計書 4.2、4.6。enum を持たない）。
       'ui-credential-change',
       'ui-credential-register',
@@ -506,8 +628,15 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-data-rule-save',
       // T27f: 画面の操作の候補の発見と READ の確かめの Server Function の入力（Task 27 の設計書 4.7。enum を持たない）。
       'ui-discovery-start',
+      // T43c: 画面の入口の確かめの開始の Server Function の入力（Task 43 の設計書 4.3。enum を持たない）。
+      'ui-entry-check-start',
       'ui-login-check-start',
+      // FM-1: 画面のログインの段の表の 1 行の「登録する」の Server Function の入力（手動の操作を減らす設計書 2.1。enum を持たない）。
+      'ui-login-stage-row-key',
+      'ui-login-stage-row-register',
       'ui-profile-create',
+      // FM-1: 画面のプロファイルの表示の設定の保存の Server Function の入力（手動の操作を減らす設計書 2.2。enum を持たない）。
+      'ui-profile-display-settings',
       'ui-profile-key',
       'ui-profile-retire',
       'ui-profile-update',
@@ -517,12 +646,19 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-read-check-update',
       // T28e: 画面のシナリオの Server Function の入力（Task 28 の設計書 4.6。enum を持たない）。
       'ui-scenario-approve',
+      // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2。enum を持たない）。
+      'ui-scenario-auto-draft',
+      'ui-scenario-auto-rules',
       'ui-scenario-create',
       'ui-scenario-form',
       'ui-scenario-key',
       'ui-scenario-revoke',
       'ui-scenario-update',
       'ui-target-config',
+      // T44d: 画面のプロファイルの負荷の値（ページの上限・時間の上限・読み込みの間隔）の確かめと保存の Server Function の入力（enum を持たない）。
+      'ui-target-crawl-limits',
+      // T41g-3: 画面の「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1。enum を持たない）。
+      'ui-write-chain-start',
       // T30g fix round 1: 画面の書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章。enum を持たない）。
       'ui-write-start',
       // T31h-2: 画面の更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章。enum を持たない）。

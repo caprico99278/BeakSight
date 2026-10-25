@@ -27,7 +27,17 @@ import type {
   NormalizedHttpUrlEvidence,
   PageErrorEvidence,
 } from '../../src/core/evidence-types.js';
+import {
+  SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+  SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS,
+  serviceWorkerRegistrationBlockedMessageOf,
+  SHARED_WORKER_DISABLED_ERROR_NAME,
+  SHARED_WORKER_DISABLED_MESSAGE,
+  WEBRTC_BLOCKED_ERROR_NAME,
+  WEBRTC_BLOCKED_MESSAGE,
+} from '../../src/core/guard-page-exceptions.js';
 import { createEvidenceId, createPageId } from '../../src/core/ids.js';
+import { MAX_ERROR_MESSAGE_LENGTH, MAX_STACK_LENGTH } from '../../src/core/limits.js';
 
 const TARGET_ID = 'technical-rules-fixture-target';
 const PAGE_ID = createPageId(3);
@@ -88,6 +98,8 @@ const failure = (overrides: Partial<NetworkFailureEvidence> = {}): NetworkFailur
   method: 'GET',
   resourceType: 'script',
   errorText: 'net::ERR_CONNECTION_REFUSED',
+  blockedByBeakSight: false,
+  phase: 'LOAD',
   timing: TIMING,
   truncated: false,
   isNavigationRequest: false,
@@ -738,6 +750,106 @@ describe('PAGE_ERROR', () => {
       }),
     ]);
     expect(findingsOf(findings, 'PAGE_ERROR')).toHaveLength(2);
+  });
+
+  it('T44R2 の I-4: Guard の守りの例外（名前と文言の組）は作らず、名前か文言の違うページ自身の例外は今どおり作る', () => {
+    const blockedServiceWorker = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js`);
+    const findings = evaluate([
+      consoleRecord({
+        pageErrors: [
+          // 守りの例外: Service Worker の登録の拒否（切り詰めた文言は、上限の内の区切りまでで見分ける）と、WebRTC の構築子の例外。
+          pageError({ name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME, message: blockedServiceWorker, stack: '' }),
+          pageError({
+            name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+            message: serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`)
+              .slice(0, MAX_ERROR_MESSAGE_LENGTH),
+            stack: '',
+            truncated: true,
+          }),
+          pageError({ name: WEBRTC_BLOCKED_ERROR_NAME, message: WEBRTC_BLOCKED_MESSAGE, stack: '' }),
+          // ページ自身の例外: 名前が同じで文言が違う、文言が同じで名前が違う、形が途中まで同じ。
+          pageError({ name: 'NotSupportedError', message: 'page own unsupported failure', stack: '' }),
+          pageError({ name: 'SecurityError', message: blockedServiceWorker, stack: '' }),
+          pageError({ name: 'Error', message: WEBRTC_BLOCKED_MESSAGE, stack: '' }),
+          pageError({
+            name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+            message: `${SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS.beforeScope}${ORIGIN}/') with script: something else.`,
+            stack: '',
+          }),
+        ],
+      }),
+    ]);
+    const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
+    expect(messages).toHaveLength(4);
+    expect(messages.some((message) => message.includes('page own unsupported failure'))).toBe(true);
+    expect(messages.some((message) => message.startsWith('捕捉されない例外が発生しました（SecurityError:'))).toBe(true);
+    expect(messages.some((message) => message.startsWith('捕捉されない例外が発生しました（Error:'))).toBe(true);
+    expect(messages.some((message) => message.includes('something else'))).toBe(true);
+  });
+
+  it('T44R3 の M-4: 上限を超えた長い文言は、上限の内に scope と script の区切りがあるときだけ守りの例外とみなす（なければ Finding に残す）', () => {
+    const { beforeScope, beforeScript } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
+    const longScript = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/`, `${ORIGIN}/sw.js?pad=${'p'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`);
+    const longScope = serviceWorkerRegistrationBlockedMessageOf(`${ORIGIN}/?pad=${'q'.repeat(MAX_ERROR_MESSAGE_LENGTH)}`, `${ORIGIN}/sw.js`);
+    const mimic = `${beforeScope}${'PAGE-OWN-BUG '.repeat(MAX_ERROR_MESSAGE_LENGTH)}`;
+    const truncatedOf = (message: string): PageErrorEvidence => pageError({
+      name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+      message: message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      stack: '',
+      truncated: true,
+    });
+    // 前提: 区切りが上限の内にあるのは、script の長い文言だけ。
+    expect(longScript.slice(0, MAX_ERROR_MESSAGE_LENGTH).includes(beforeScript)).toBe(true);
+    expect(longScope.slice(0, MAX_ERROR_MESSAGE_LENGTH).includes(beforeScript)).toBe(false);
+
+    const findings = evaluate([
+      consoleRecord({ pageErrors: [truncatedOf(longScript), truncatedOf(longScope), truncatedOf(mimic)] }),
+    ]);
+    const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
+    // script の長い守りの例外は Finding にしない。区切りが上限の外の長い scope と、始まりだけを真似たページ自身の例外は、Finding に残す。
+    expect(messages).toHaveLength(2);
+    expect(messages.some((message) => message.includes('PAGE-OWN-BUG'))).toBe(true);
+    expect(messages.some((message) => message.includes('qqqq'))).toBe(true);
+    expect(messages.some((message) => message.includes('pppp'))).toBe(false);
+  });
+
+  it('T44R4 の M-1: stack だけが切り詰められた例外は、文言の終わりで比べる（終わりの違うページ自身の例外は Finding に残す）', () => {
+    const { beforeScope, beforeScript } = SERVICE_WORKER_REGISTRATION_BLOCKED_MESSAGE_PARTS;
+    // 再レビューの再現（guardex4.exp.ts）の形: 文言は切り詰めず、終わりだけが違う。stack が上限を超え、Evidence の truncated は真になる。
+    const message = `${beforeScope}a${beforeScript}b'): PAGE-OWN-REASON`;
+    const findings = evaluate([
+      consoleRecord({
+        pageErrors: [
+          pageError({
+            name: SERVICE_WORKER_REGISTRATION_BLOCKED_ERROR_NAME,
+            message,
+            stack: 'x'.repeat(MAX_STACK_LENGTH),
+            truncated: true,
+          }),
+        ],
+      }),
+    ]);
+    const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('PAGE-OWN-REASON');
+  });
+
+  it('BN-b: 起動の引数で SharedWorker がないときの例外（名前と文言の組）は作らず、名前か文言の違う例外は今どおり作る', () => {
+    const findings = evaluate([
+      consoleRecord({
+        pageErrors: [
+          // 守りの例外: `--disable-shared-workers` の下で、ページが `new SharedWorker(...)` を呼んだときに Chromium が出す形。
+          pageError({ name: SHARED_WORKER_DISABLED_ERROR_NAME, message: SHARED_WORKER_DISABLED_MESSAGE, stack: '' }),
+          // ページ自身の例外: 名前が同じで文言が違う（別の名前の未定義）、文言が同じで名前が違う。
+          pageError({ name: SHARED_WORKER_DISABLED_ERROR_NAME, message: 'notDefinedThing is not defined', stack: '' }),
+          pageError({ name: 'Error', message: SHARED_WORKER_DISABLED_MESSAGE, stack: '' }),
+        ],
+      }),
+    ]);
+    const messages = findingsOf(findings, 'PAGE_ERROR').map((finding) => finding.message);
+    expect(messages).toHaveLength(2);
+    expect(messages.some((message) => message.includes('notDefinedThing is not defined'))).toBe(true);
+    expect(messages.some((message) => message.startsWith('捕捉されない例外が発生しました（Error:'))).toBe(true);
   });
 
   it('pageerror がなければ、console.error があっても作らない', () => {

@@ -36,6 +36,17 @@ export const WORKER_ALLOWED_CONTROL_FILES: ReadonlySet<string> = new Set([
   'src/control/actions/action-contracts',
   'src/control/actions/action-outcome',
   'src/control/approval/scenario-contracts',
+  // T40b-1（Task 40 の設計書 3.3）: API の書き込みの流れ（`src/worker/write-create-run.ts`）が、記録と報告の API の要約の組み立て（`actionApiSummaryOf`）と、
+  // 応答の本文から登録の ID を取り出す口（`apiRecordIdOfResponseBody`。Guard の `recordIdOf` に渡す）を使う。どちらも純粋な関数だけのファイル（親も同じ
+  // 要約で照らす）。
+  'src/control/actions/action-api-summary',
+  'src/control/actions/api-record-id',
+  // T40b-2（Task 40 の設計書 7 章の「T40b-2 の設計」）: API の書き込みの照合の READ（`src/worker/read-check-run.ts`）が、`{id}` に ID を入れた画面の path に、
+  // 保存の時と同じ画面の path の確かめ（`readCheckPagePathRejectionsOf`）をかけ直す。純粋な関数だけのファイル（保存の確かめと同じ owner）。
+  'src/control/read-check-page-path',
+  // T43c（Task 43 の設計書 4.3）: 入口の確かめの流れ（`src/worker/entry-check-run.ts`・`entry-check-page.ts`）が、成果物 `entry-check.json` の契約と、
+  // 場所の作り方・案への写し・セレクタの受け入れ・Run Status の写しを使う。純粋な定義と関数だけのファイル（親も同じ要約で照らす）。
+  'src/control/entry-check',
 ]);
 
 /**

@@ -31,6 +31,16 @@
  *   通らない報告（ZIP の後に HTML を書き換えた）は、ファイルがあっても配らず、理由を出す。許可の外・パストラバーサル・別のジョブ・Host の違いは
  *   配らない。台帳の画面（プロファイルの画面からキーボードで開く）は管理データの台帳と同じ行を出し、注記を出す。CSRF・Host・入力の誤りを拒み、
  *   書き込みのモードでないプロファイルには台帳を出さない。
+ * - T38c（Task 38 の設計書 3.3）: API のシナリオ（管理データに、probe の型を持つ候補の発見とシナリオを直接入れる）の詳細と承認の確認のダイアログに、
+ *   要求の型の要約（method、Origin、path の型、本文の鍵と欄、ページが決める鍵、ヘッダの名前、filter の名前と、列の名前を確かめていない注意）を出す。
+ *   承認できる。目印の値は画面に出ない。T40a・T41b・LG-3b: 許可は、今の確かめ（承認の有効性、検証の指定など）に従う（送り方の理由
+ *   `API_WRITE_NOT_AVAILABLE` は捨てた）。
+ * - T40d（Task 40 の設計書 3.5）: API の登録のシナリオを、開始の画面（送り方のラベルと承認した API の要求の型）から確認のダイアログの後に始め、偽の
+ *   ワーカー（版 1.1 の API の `action-run.json` を書く）で終える。結果とジョブの画面に送り方と API の型の要約（管理データの書き込みの結果と同じ値）を、
+ *   書き込みの履歴に送り方のラベルを出す。probe の目印・ページの値・Authorization の値は、それらの画面と Server Function の応答に出ない。
+ * - T41e（Task 41 の設計書 3.5）: API の更新のシナリオのフォームで、目印を入れた欄の鍵ごとに変えるか保つかを選ぶ（既定は保つ。下書きは変える鍵を
+ *   `fieldNames`、保つ鍵を `keptKeys` で送る）。欄として識別できないページが決める鍵と、台帳の ID と filter が結び付かない台帳は、理由を出す。画面の型は
+ *   最後の ID の区切りだけ。詳細と承認のダイアログに保つ鍵と識別つきのページが決める鍵を、開始の画面に予定のレコードと変える鍵・保つ鍵を出す。
  * 管理データ、ターゲット設定、出力先は、一時の root の中だけ。Chromium は headless だけ。スクリーンショットは、環境変数
  * `T28E_SCREENSHOT_DIR` があれば、そこに保存する。
  */
@@ -40,13 +50,23 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import type { Browser, BrowserContext, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { EXIT_CODES, FAILURE_EXIT_CODE, INTERRUPTED_EXIT_CODE } from '../../../src/cli/exit-codes.js';
-import { WORKER_PROTOCOL_VERSION } from '../../../src/control/worker-protocol.js';
-import { APPROVAL_SUMMARY_SCHEMA_VERSION } from '../../../src/control/actions/action-contracts.js';
-import { readAuditedDataLedger } from '../../../src/control/actions/write-result-facts.js';
-import { readApprovalReceipts, readScenario, readWriteReservations } from '../../../src/control/approval/scenario-store.js';
+import { ACTION_RUN_SCHEMA_VERSION, APPROVAL_SUMMARY_SCHEMA_VERSION } from '../../../src/control/actions/action-contracts.js';
+import { actionApiSummaryOf } from '../../../src/control/actions/action-api-summary.js';
+import { readAuditedDataLedger, readWriteResult } from '../../../src/control/actions/write-result-facts.js';
+import type { ScenarioApiSpec } from '../../../src/control/approval/scenario-contracts.js';
+import {
+  createScenario,
+  issueExecutionGrant,
+  readApprovalReceipts,
+  readPlannedUpdateTarget,
+  readScenario,
+  readWriteReservations,
+} from '../../../src/control/approval/scenario-store.js';
 import { RECORD_ID_PLACEHOLDER } from '../../../src/control/approval-view.js';
-import { readJob } from '../../../src/control/job/job-store.js';
+import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../../src/control/job/discovery-index-store.js';
+import { createStartingJob, readJob, recordLoginCheckFinished } from '../../../src/control/job/job-store.js';
+import { apiRequestShapeOf } from '../../../src/core/api-request-shape.js';
+import { observedSubmissionProbeOf, type SubmissionProbeInputField } from '../../../src/discovery/submission-probe-contracts.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
 import {
@@ -60,10 +80,19 @@ import type { DiscoveredCandidate, DiscoveryCandidate } from '../../../src/disco
 import { classifyCandidate } from '../../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../../src/discovery/fingerprint.js';
-import { ACTION_OUTCOME_REASON_CATALOG, APPROVAL_DIGEST_ITEM_CATALOG, WRITE_REPORT_CHECK_CATALOG } from '../../../src/presentation/catalog.js';
+import {
+  ACTION_OUTCOME_REASON_CATALOG,
+  APPROVAL_DIGEST_ITEM_CATALOG,
+  SCENARIO_TRANSPORT_CATALOG,
+  WRITE_CHAIN_STOP_REASON_CATALOG,
+  WRITE_REPORT_CHECK_CATALOG,
+} from '../../../src/presentation/catalog.js';
+import { formatCount } from '../../../src/presentation/format.js';
 import {
   EXECUTION_GRANT_REJECTION_DESCRIPTIONS,
+  LOCAL_UI_CRAWL_LIMITS_TEXT,
   LOCAL_UI_LEDGER_TEXT,
+  LOCAL_UI_READ_CHECK_TEXT,
   LOCAL_UI_SCENARIO_TEXT,
   LOCAL_UI_WRITE_REPORT_TEXT,
   LOCAL_UI_WRITE_TEXT,
@@ -72,12 +101,14 @@ import {
   WRITE_START_LOCAL_REJECTION_DESCRIPTIONS,
   listText,
 } from '../../../src/presentation/messages.js';
+import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeFakeWorker, type FakeWorkerValues } from '../../../tests/helpers/fake-audit-worker.js';
+import { fakeWorkerValuesOf } from '../../../tests/helpers/job-test-support.js';
 import { verifiedUpdateDocuments } from '../../../tests/helpers/action-report-samples.js';
 import { seedWriteResultForTest } from '../../../tests/helpers/write-result-fixtures.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
-import { NO_CONSTRAINTS, sampleAction, sampleField, sampleForm } from '../../../tests/unit/discovery-candidate-samples.js';
+import { NO_CONSTRAINTS, NO_JS_BINDING, sampleAction, sampleButton, sampleField, sampleForm } from '../../../tests/unit/discovery-candidate-samples.js';
 import {
   createTemporaryUiRoot,
   findFreePort,
@@ -89,12 +120,15 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403, NOT_FOUND: 404, MISDIRECTED: 421 });
 /** ジョブの終わりを待つ上限と、読み直す間隔（ms）。 */
 const WAIT_LIMIT_MS = 60_000;
 const WAIT_POLL_MS = 200;
+/** T41g の続けて更新する状態を読み直す間隔（ms。前に使っていた Vitest の `expect.poll` の既定の間隔と同じ）。 */
+const EXPECT_POLL_DEFAULT_INTERVAL_MS = 50;
 /** process が消えるのを待つ上限（ms）。 */
 const PROCESS_EXIT_LIMIT_MS = 20_000;
 /** 画面の操作を待つ上限（ms）。 */
@@ -105,6 +139,8 @@ const MAX_TAB_PRESSES = 200;
 const FAKE_HEARTBEAT_INTERVAL_MS = 200;
 const FAKE_RUN_ID = 'RUN-20261013000000';
 const OTHER_RUN_ID = 'RUN-20261013000999';
+/** 偽のワーカーの Run の ID の組（`fakeWorkerValuesOf` に渡す。4 つの偽のワーカーで同じ）。 */
+const FAKE_RUN_IDS = Object.freeze({ runId: FAKE_RUN_ID, otherRunId: OTHER_RUN_ID });
 /** 許可 Origin（偽のワーカーは接続しない。値は匿名のループバック）。 */
 const ORIGIN = 'http://127.0.0.1:4173';
 const WRITE_PROFILE_ID = 't28e-write';
@@ -230,58 +266,50 @@ const discoveryDocument = (): DiscoveryDocument => ({
 });
 
 /** 一時の root の監査のワーカーの入口を、発見の偽のワーカーに替える（出力先はプロファイルの設定のもの）。 */
-const installFakeDiscovery = (outputDirectory: string): void => {
+const installFakeDiscovery = (outputDirectory: string, document: DiscoveryDocument = discoveryDocument()): void => {
   const directory = `${rootOf().root}/fake-workers/${outputDirectory}`;
   mkdirSync(directory, { recursive: true });
-  const document = discoveryDocument();
-  const worker = writeFakeWorker(directory, 'discovery', {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
+  const worker = writeFakeWorker(directory, 'discovery', fakeWorkerValuesOf(FAKE_RUN_IDS, {
     heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
     discovery: {
       outputDirectory: `${rootOf().root}/${outputDirectory}`,
       documentText: JSON.stringify(document),
       summary: { ...discoverySummaryOf(document) },
       runStatus: 'COMPLETE',
     },
-  });
+  }));
   writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
 };
 
-const waitForEnd = async (jobId: string): Promise<{ readonly state: string }> => {
-  const deadline = Date.now() + WAIT_LIMIT_MS;
-  for (;;) {
-    const job = await valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId });
-    if (job !== null && !job.active) {
-      return job;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`ジョブが終わらなかった: ${JSON.stringify(job)}`);
-    }
-    descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
-    await new Promise((resolveWait) => setTimeout(resolveWait, WAIT_POLL_MS));
-  }
-};
+/** ジョブが終わるまで待つ（その間の画面のサーバの子孫を記録する。待ち方は補助 `waitForJobViaServerFunctions`。PRE42-CC 組 UI-K2）。 */
+const waitForEnd = (jobId: string): Promise<{ readonly state: string }> => waitForJobViaServerFunctions(
+  (id) => valueOf<{ state: string; active: boolean } | null>('getAuditJobFn', 'GET', { jobId: id }),
+  jobId,
+  (job) => !job.active,
+  {
+    limitMs: WAIT_LIMIT_MS,
+    stepMs: WAIT_POLL_MS,
+    onPending: async () => {
+      descendants.push(...descendantsOf(started().child.pid ?? 0, await listProcesses()));
+    },
+  },
+);
 
 /** 発見を 1 回行う（偽のワーカー）。 */
-const discover = async (profileId: string, outputDirectory: string): Promise<void> => {
-  installFakeDiscovery(outputDirectory);
+const discover = async (profileId: string, outputDirectory: string, document?: DiscoveryDocument): Promise<void> => {
+  installFakeDiscovery(outputDirectory, document);
   const job = await valueOf<{ ok: boolean; jobId: string }>('startDiscoveryFn', 'POST', { profileId, expectedRevision: FIRST_REVISION });
   expect(job.ok).toBe(true);
   expect(await waitForEnd(job.jobId)).toMatchObject({ state: 'FINISHED' });
 };
 
-const writeTarget = (name: string, outputDirectory: string): string => {
-  const path = `config/targets/${name}.json`;
-  mkdirSync(`${rootOf().root}/config/targets`, { recursive: true });
+/**
+ * T44d: 書き込みのモードのプロファイルの設定のファイルは `local/targets/`（プロファイルの画面の「監査の負荷」を変えられる置き場所）に置き、承認が外れる旨を
+ * 確かめる。ほかは `config/targets/`。
+ */
+const writeTarget = (name: string, outputDirectory: string, directory: 'config/targets' | 'local/targets' = 'config/targets'): string => {
+  const path = `${directory}/${name}.json`;
+  mkdirSync(`${rootOf().root}/${directory}`, { recursive: true });
   writeFileSync(`${rootOf().root}/${path}`, `${JSON.stringify({
     target: { id: name },
     site: { startUrl: `${ORIGIN}/admin`, allowedOrigins: [ORIGIN] },
@@ -306,7 +334,7 @@ const profileDocument = (profileId: string, targetConfigPath: string, mode: stri
 });
 
 const authSetup = (profileId: string): Record<string, unknown> => ({
-  schemaVersion: 'beaksight-auth-setup/2',
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId,
   profileRevision: FIRST_REVISION,
   loginStartUrl: `${ORIGIN}/login`,
@@ -369,7 +397,7 @@ const focusedText = (page: Page): Promise<string> => page.evaluate(() => documen
 
 beforeAll(async () => {
   root = createTemporaryUiRoot('built');
-  state.writeTarget = writeTarget('t28e-write', 't28e-write-output');
+  state.writeTarget = writeTarget('t28e-write', 't28e-write-output', 'local/targets');
   const passiveTarget = writeTarget('t28e-passive', 't28e-passive-output');
   ids = readServerFunctionIds(`${root.root}/apps/local-ui/dist/server/server.js`);
   server = await startLauncher(root, await findFreePort());
@@ -418,9 +446,10 @@ describe('T28e: scenario Server Functions (registration, input validation, CSRF,
       // T32g: 監査済みデータの台帳の画面（読むだけ）。
       'auditedDataLedgerPageFn',
     ]));
-    // T30g: 書き込みの開始の画面の Server Function だけ（許可の消費・予約の締めの Server Function はない）。T31h-2: UPDATE の開始を足した。
+    // T30g: 書き込みの開始の画面の Server Function だけ（許可の消費・予約の締めの Server Function はない）。T31h-2: UPDATE の開始を足した。T41g: 登録してから
+    // 更新する（今の開始の口を順に呼ぶ）を足した。
     expect([...ids.keys()].filter((name) => /grant|reserv|consume|execut|settle|write/iu.test(name)).sort())
-      .toEqual(['startWriteCreateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
+      .toEqual(['startWriteCreateFn', 'startWriteCreateThenUpdateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
   });
 
   it('rejects inputs that do not match the schemas with 400, and creates nothing', async () => {
@@ -684,6 +713,33 @@ describe('T28e: the scenario screens', () => {
     expect(detail.differences).toEqual([]);
   });
 
+  // T44d（Task 44 の設計書 P2-1。設計の変更の履歴の T44d の行の (1)）: 書き込みのモードで承認したシナリオがあれば、「監査の負荷」の確認のダイアログに、
+  // 承認が外れて再承認が要ることを、件数とともに出す。取り消すので、設定のファイルも承認も変えない。
+  it('tells in the crawl limits dialog that the approval of the approved scenario comes off, and the cancel keeps the file and the approval', async () => {
+    const limitsText = LOCAL_UI_CRAWL_LIMITS_TEXT;
+    const before = readFileSync(`${rootOf().root}/${state.writeTarget}`, 'utf8');
+    const view = await valueOf<{ state: string; targetConfigDigest: string; limits: Record<string, number> }>('crawlLimitsPanelFn', 'GET', { profileId: WRITE_PROFILE_ID });
+    expect(view.state).toBe('EDITABLE');
+    expect(await valueOf('previewCrawlLimitsFn', 'GET', {
+      profileId: WRITE_PROFILE_ID, expectedTargetConfigDigest: view.targetConfigDigest, limits: { ...view.limits, maxPages: 11 },
+    })).toMatchObject({ ok: true, approvedScenarioCount: 1 });
+    const page = await openPage(`/profiles/${WRITE_PROFILE_ID}`);
+    const panel = page.getByTestId('profile-crawl-limits');
+    await panel.waitFor({ timeout: UI_TIMEOUT_MS });
+    await panel.getByLabel(limitsText.fields.maxPages, { exact: true }).fill('11');
+    await tabTo(page, panel.getByRole('button', { name: limitsText.review }));
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: limitsText.dialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.getByTestId('crawl-limits-approval').textContent()).toBe(limitsText.approvalNotice(formatCount(1)));
+    expect(await dialog.getByTestId('crawl-limits-resume').textContent()).toBe(limitsText.resumeNotice);
+    await screenshot(page, 'e08b-crawl-limits-approval-notice');
+    await page.keyboard.press('Enter');
+    await expect.poll(() => dialog.isVisible(), { timeout: UI_TIMEOUT_MS }).toBe(false);
+    expect(readFileSync(`${rootOf().root}/${state.writeTarget}`, 'utf8')).toBe(before);
+    expect((await detailOf(state.scenarioId)).status?.displayState).toBe('APPROVED');
+  });
+
   it('rejects an approval from an old screen (another revision, or the same revision with an old digest), and shows the differences', async () => {
     const before = await detailOf(state.scenarioId);
     const oldDigest = before.status?.approvalDigest;
@@ -867,20 +923,10 @@ const writePageOf = (scenarioId: string): Promise<WriteStartPage> => valueOf<Wri
 const installFakeWrite = (outputDirectory: string): void => {
   const directory = `${rootOf().root}/fake-workers/write-${outputDirectory}`;
   mkdirSync(directory, { recursive: true });
-  const worker = writeFakeWorker(directory, 'write', {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
+  const worker = writeFakeWorker(directory, 'write', fakeWorkerValuesOf(FAKE_RUN_IDS, {
     heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
     write: { outputDirectory: `${rootOf().root}/${outputDirectory}`, recheck: 1, onReject: 'report', submission: null, actionRunText: null, end: 'crash' },
-  });
+  }));
   writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
 };
 
@@ -960,6 +1006,38 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
         expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
     });
     await screenshot(page, 'g03-scenario-verification-saved');
+  });
+
+  // T37d fix round 1（T37d の発見事項 2）: 書き込みの照合の READ に、画面の path を読む定義は使わない。画面は照合の READ の選択肢に出さず、サーバは
+  // 専用の理由で拒む（シナリオは作らない）。
+  it('does not offer a page path READ check for the verification READ, and the server rejects it with its own reason', async () => {
+    const pageCheck = await valueOf<{ ok: boolean; readCheckId: string }>('createReadCheckFn', 'POST', {
+      profileId: WRITE_PROFILE_ID,
+      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
+    });
+    expect(pageCheck.ok).toBe(true);
+    const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}/edit`);
+    await page.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
+    const options = await page.locator('select[name="readVerification-check"] option').evaluateAll((items) =>
+      items.map((item) => (item as HTMLOptionElement).value));
+    expect(options).toContain(writeState.readCheckId);
+    expect(options).not.toContain(pageCheck.readCheckId);
+    const before = await valueOf<{ scenarios: readonly unknown[] }>('scenarioListPageFn', 'GET', { profileId: WRITE_PROFILE_ID });
+    const rejected = await valueOf<{ ok: boolean; errors: readonly { code: string }[] }>('createScenarioFn', 'POST', {
+      draft: draftOf({
+        fieldNames: ['email', 'name', 'plan'],
+        verification: {
+          successCondition: { pathPrefix: '/admin/members/', selector: '.registered' },
+          inputErrorCondition: { pathPrefix: '/admin/members/new', selector: '.error' },
+          recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' },
+          readVerification: { readCheckId: pageCheck.readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
+            expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
+        },
+      }),
+    });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.errors.map(({ code }) => code)).toEqual(['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']);
+    expect(await valueOf<{ scenarios: readonly unknown[] }>('scenarioListPageFn', 'GET', { profileId: WRITE_PROFILE_ID })).toEqual(before);
   });
 
   it('shows what to confirm before the start, and the server rejects the start of an unapproved scenario without issuing a grant', async () => {
@@ -1532,7 +1610,7 @@ const updateActionRunTextOf = (
   const at = formatCompactUtcTimestamp(new Date(Date.now() + ACTION_RUN_TIME_OFFSET_MS), 't31h2 fake action run');
   const verification = updateVerificationOf();
   return JSON.stringify({
-    schemaVersion: 'action-run-schema/1.0',
+    schemaVersion: ACTION_RUN_SCHEMA_VERSION,
     jobId: '__START_JOB_ID__',
     runId: FAKE_RUN_ID,
     profileId: WRITE_PROFILE_ID,
@@ -1558,6 +1636,9 @@ const updateActionRunTextOf = (
       targetRecordId: '__START_TARGET_RECORD_ID__',
       updateEvidence: { fields: [{ fieldName: 'name', role: 'CHANGED', previousValue: PREVIOUS_NAME, newValue: value, matched: changedMatched }, ...kept] },
     },
+    // LG-4: 版 1.1 の FORM の記録（送り方と、API の要約の null）。
+    transport: 'FORM',
+    api: null,
   });
 };
 
@@ -1571,23 +1652,13 @@ type FakeWriteReport = NonNullable<NonNullable<FakeWorkerValues['write']>['repor
 const installFakeUpdateWrite = (outputDirectory: string, actionRunText: string, report: FakeWriteReport | null = null): void => {
   const directory = `${rootOf().root}/fake-workers/update-${String(Date.now())}`;
   mkdirSync(directory, { recursive: true });
-  const worker = writeFakeWorker(directory, 'write', {
-    protocolVersion: WORKER_PROTOCOL_VERSION,
-    runId: FAKE_RUN_ID,
-    otherRunId: OTHER_RUN_ID,
+  const worker = writeFakeWorker(directory, 'write', fakeWorkerValuesOf(FAKE_RUN_IDS, {
     heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
-    exitCodes: {
-      complete: EXIT_CODES.COMPLETE,
-      partial: EXIT_CODES.PARTIAL,
-      interrupted: INTERRUPTED_EXIT_CODE,
-      configError: EXIT_CODES.CONFIG_ERROR,
-      failure: FAILURE_EXIT_CODE,
-    },
     write: {
       outputDirectory: `${rootOf().root}/${outputDirectory}`, recheck: 1, onReject: 'report', submission: { submission: 'SENT', blockReason: null },
       actionRunText, end: 'finish', ...(report === null ? {} : { report }),
     },
-  });
+  }));
   writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
 };
 
@@ -1859,6 +1930,8 @@ const ledgerText = LOCAL_UI_LEDGER_TEXT;
  */
 const fakeWriteReportOf = (scenarioId: string, scenarioRevision: number, actionRunText: string, tamper: 'disk' | null): FakeWriteReport => {
   const run = JSON.parse(actionRunText) as { result: string; reason: string; startedAt: string; finishedAt: string };
+  // LG-4: 偽のワーカーの `action-run.json`（`updateActionRunTextOf`）は版 1.1 の FORM の記録なので、証拠も同じ版 1.1 の見本にする（同じ Run の 2 つの
+  // 文書は同じ版）。
   const base = verifiedUpdateDocuments().evidence;
   return {
     approvalSummarySchemaVersion: APPROVAL_SUMMARY_SCHEMA_VERSION,
@@ -2127,5 +2200,1226 @@ describe('T32g: the write report on the screens, and the audited data ledger', (
     await page.getByTestId('ledger-not-eligible').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('ledger-entry').count()).toBe(0);
     await screenshot(page, 'g32-06-ledger-not-eligible');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T38c（Task 38 の設計書 3.3）: API のシナリオの承認の画面の型の要約
+// ---------------------------------------------------------------------------------------------------------------
+
+const API_PROFILE_ID = 't38c-api';
+const API_SERVICE_ORIGIN = 'https://api.example.invalid';
+/** probe の目印（値。シナリオと画面には出ない）。 */
+const API_MARKERS = ['bsprobe0000000000t38c', 'bsprobe0000000000t38d@example.invalid'];
+const API_JOB_ID = 'job-t38c-api-discovery';
+const API_NEW_PATH = '/admin/members/new';
+const API_EDIT_PATH = '/admin/members/1/edit';
+const API_INPUT_FIELDS = [
+  { name: 'name', selector: '#name', type: 'text', marker: 0 },
+  { name: 'email', selector: '#member-email', type: 'email', marker: 1 },
+] as const;
+
+/**
+ * form のない画面の保存のボタン（probe が API の要求の型を見た候補）。T41e: 更新の型は、欄として識別できないページが決める鍵（`tenant_id`）を持たない
+ * （持つ型は更新のシナリオにできない。Task 41 の設計書 3.3）。
+ */
+const apiButtonOf = (pagePath: string, method: 'POST' | 'PATCH', query: string): DiscoveryCandidate => {
+  const shape = apiRequestShapeOf({
+    method,
+    resourceType: 'fetch',
+    url: `${API_SERVICE_ORIGIN}/rest/v1/members?${query}`,
+    origin: { kind: 'APPROVED_API', index: 0 },
+    headers: { 'content-type': 'application/json', prefer: 'return=representation', authorization: 'Bearer x' },
+    body: { kind: 'TEXT', text: JSON.stringify({ name: API_MARKERS[0], email: API_MARKERS[1], ...(method === 'PATCH' ? {} : { tenant_id: 'tenant-t38c' }) }) },
+  }, { pagePath, markers: API_MARKERS });
+  const probe = observedSubmissionProbeOf({ shapes: [shape], nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 0 },
+    { filledFieldCount: 2, skippedFieldCount: 0 }, API_INPUT_FIELDS);
+  return {
+    ...candidateOf(sampleButton({ page: { origin: ORIGIN, path: pagePath }, submitterText: '保存', jsBinding: { ...NO_JS_BINDING, submitter: ['click'] } })),
+    submissionProbe: probe,
+  };
+};
+
+const API_CREATE = apiButtonOf(API_NEW_PATH, 'POST', 'select=*');
+const API_UPDATE = apiButtonOf(API_EDIT_PATH, 'PATCH', 'id=eq.1&select=*');
+
+/** API のシナリオの下書き（送る鍵は欄に対応する鍵。ページが決める鍵は `tenant_id`）。 */
+const apiDraftOf = (candidate: DiscoveryCandidate, api: Record<string, unknown>): Record<string, unknown> => ({
+  profileId: API_PROFILE_ID,
+  candidateIdentityDigest: candidate.identityDigest,
+  transport: 'API',
+  fieldNames: ['email', 'name'],
+  readChecks: [],
+  sideEffectConfirmations: confirmations(true),
+  limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
+  approvalTtlDays: 30,
+  api: { shapeDigest: candidate.submissionProbe?.shapeDigest, pageKeys: ['tenant_id'], filterName: null, recordId: null, ledger: null, ...api },
+});
+
+describe('T38c: the summary of the request shape on the approval screen of an API scenario', () => {
+  it('shows the shape (method, origin, path, keys and fields, page keys, headers, the filter with a caution) and approves without a grant', async () => {
+    const target = writeTarget(API_PROFILE_ID, `${API_PROFILE_ID}-output`);
+    expect(await valueOf('createProfileFn', 'POST', {
+      profile: { ...profileDocument(API_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN] },
+    })).toMatchObject({ ok: true });
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(API_PROFILE_ID) })).toMatchObject({ ok: true });
+    const at = formatCompactUtcTimestamp(new Date(), 'T38c test time');
+    const document: DiscoveryDocument = {
+      ...discoveryDocument(),
+      jobId: API_JOB_ID,
+      pages: [API_CREATE, API_UPDATE].map((candidate) => ({
+        url: `${candidate.page.origin}${candidate.page.path}`,
+        state: 'READ' as const,
+        record: { location: candidate.page, incompleteReasons: [], candidates: [candidate] },
+        blockedRequests: 0,
+      })),
+    };
+    withControlData((database) => {
+      expect(createStartingJob(database, {
+        jobId: API_JOB_ID, jobKind: 'DISCOVERY', profileId: API_PROFILE_ID, profileRevision: FIRST_REVISION, startNew: true, createdAt: at,
+      }, () => null)).toEqual({ ok: true });
+      expect(recordLoginCheckFinished(database, API_JOB_ID, 0, at)).toBe(true);
+      recordDiscoveryCandidates(database, {
+        profileId: API_PROFILE_ID, jobId: API_JOB_ID, at, entries: [API_CREATE, API_UPDATE].map(discoveryIndexEntryOf), readPagePaths: [API_EDIT_PATH, API_NEW_PATH],
+      });
+      expect(createScenario(database, { scenarioId: 'scenario-t38c-create', draft: apiDraftOf(API_CREATE, {}), discovery: document, at }))
+        .toMatchObject({ ok: true });
+      // T41e（Task 41 の設計書 3.1・3.3）: 更新は、変える鍵（`name`）と保つ鍵（`email`）に分ける。`tenant_id` は更新の画面の欄として識別できない
+      // ページが決める鍵なので、更新では許さない（`SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE`。登録のシナリオは今のまま許す）。
+      const updated = createScenario(database, {
+        scenarioId: 'scenario-t38c-update',
+        draft: {
+          ...apiDraftOf(API_UPDATE, {
+            pageKeys: [], keptKeys: ['email'], filterName: 'id',
+            ledger: { targetCreateScenarioId: 'scenario-t38c-create', formPathTemplate: '/admin/members/{id}/edit' },
+          }),
+          fieldNames: ['name'],
+        },
+        discovery: document,
+        at,
+      });
+      expect(updated, JSON.stringify(updated)).toMatchObject({ ok: true });
+    });
+
+    const page = await openPage(`/scenarios/${API_PROFILE_ID}/scenario-t38c-update`);
+    const shape = page.getByTestId('scenario-api-shape');
+    await shape.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await shape.getAttribute('data-shape-digest')).toBe(API_UPDATE.submissionProbe?.shapeDigest);
+    expect(await shape.locator('[data-item="method"]').textContent()).toBe('PATCH');
+    expect(await shape.locator('[data-item="origin"]').textContent()).toBe(API_SERVICE_ORIGIN);
+    expect(await shape.locator('[data-item="pathShape"]').textContent()).toBe('/rest/v1/members');
+    // T41e: 更新の型の要約は、変える鍵と保つ鍵を分けて出す（ページが決める鍵はない）。
+    expect(await shape.locator('[data-item="keyFields"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['name']);
+    expect(await shape.locator('[data-item="keyFields"]').textContent()).toContain(text.api.fieldName('name'));
+    expect(await shape.locator('[data-item="keptKeys"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['email']);
+    expect(await shape.locator('[data-item="keptKeys"]').textContent()).toContain(text.api.fieldName('email'));
+    expect(await shape.locator('[data-item="pageKeys"]').textContent()).toBe(text.api.none);
+    expect(await shape.locator('[data-item="headerNames"]').textContent()).toBe(listText(['authorization', 'content-type', 'prefer']));
+    expect(await shape.locator('[data-item="filterName"] strong').textContent()).toBe('id');
+    expect(await page.getByTestId('scenario-api-shape-filter-caution').textContent()).toBe(text.api.filterCaution);
+    await screenshot(page, 't38c-01-api-shape');
+
+    // 承認の前の状態は下書きで、再承認の理由はない（型が索引の候補の型と合う。未承認は下書きの状態で示す）。
+    expect((await detailOf('scenario-t38c-update')).status).toMatchObject({ displayState: 'DRAFT', reasons: [] });
+    // 承認の確認のダイアログにも、型の要約と filter の注意を出す。承認しても、書き込みの許可は出ない（開始の画面へのリンクもない）。
+    await tabTo(page, page.getByTestId('scenario-approve'));
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: text.approveDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.getByTestId('scenario-approve-api-shape').locator('[data-item="method"]').textContent()).toBe('PATCH');
+    expect(await dialog.getByTestId('scenario-approve-api-shape-filter-caution').isVisible()).toBe(true);
+    await screenshot(page, 't38c-02-api-approve-dialog');
+    await dialog.getByRole('button', { name: text.approveDialog.confirm, exact: true }).click();
+    await page.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
+    await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
+    expect(withControlData((database) => readApprovalReceipts(database, 'scenario-t38c-update').map(({ kind }) => kind))).toEqual(['APPROVAL']);
+    // T41e（Task 41 の設計書 3.2。T41b が許可を開いた）: 保つ鍵の契約を持つ API の更新は、承認の確かめで判定する（ここでは、管理データの外の事実が
+    // 承認と違うので、承認の理由で拒む）。LG-3b: 送り方の理由 `API_WRITE_NOT_AVAILABLE` と、その表示は捨てた。
+    const grant = withControlData((database) => issueExecutionGrant(database, {
+      scenarioId: 'scenario-t38c-update', expectedRevision: 1, grantId: 'grant-t38c-1', jobId: 'job-t38c-write', count: 1,
+      external: { authSetupDigest: null, targetConfigDigest: '0'.repeat(64) }, at: formatCompactUtcTimestamp(new Date(), 'T38c test time'),
+    }));
+    expect(grant).toMatchObject({ ok: false, reason: 'GRANT_APPROVAL_INVALID' });
+
+    // 登録のシナリオは filter を持たない（注意を出さない）。目印の値は画面に出ない。
+    const create = await openPage(`/scenarios/${API_PROFILE_ID}/scenario-t38c-create`);
+    await create.getByTestId('scenario-api-shape').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await create.getByTestId('scenario-api-shape-filter-caution').count()).toBe(0);
+    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="method"]').textContent()).toBe('POST');
+    // T41e: 登録のページが決める鍵は今のまま（欄の識別なし）。登録は保つ鍵を持たない（項目を出さない）。
+    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="pageKeys"]').textContent()).toBe(text.api.pageKey('tenant_id', 'string'));
+    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="keptKeys"]').count()).toBe(0);
+    for (const body of [await page.content(), await create.content()]) {
+      for (const marker of [...API_MARKERS, 'tenant-t38c']) {
+        expect(body.includes(marker), marker).toBe(false);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T38f（Task 38 の設計書 3.7、5 章の G38）: 発見の結果から API のシナリオを作り、変え、承認する画面
+// ---------------------------------------------------------------------------------------------------------------
+
+const API_FLOW_PROFILE_ID = 't38f-api';
+const API_FLOW_OUTPUT = 't38f-api-output';
+/** probe の目印の対応（名前・メールアドレスは名前の欄、備考は名前のない欄）。 */
+const API_FLOW_FIELDS = [
+  { name: 'name', selector: '#name', type: 'text', marker: 0 },
+  { name: 'email', selector: '#member-email', type: 'email', marker: 1 },
+] as const;
+
+/** probe が見た型を持つ、form のない画面の保存のボタン（`overrides` で型の本文・ヘッダ・method・query を変える。結果は分類の部品が決める）。 */
+const apiFlowButtonOf = (pagePath: string, overrides: {
+  readonly method?: 'POST' | 'PATCH';
+  readonly query?: string;
+  readonly body?: Readonly<Record<string, unknown>>;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly forgedResult?: 'API_CREATE';
+  /** T41e: probe の欄の識別（既定は名前とメールアドレスの 2 つの目印の欄。目印のない欄は、ページが決める鍵の欄の識別になる）。 */
+  readonly fields?: readonly SubmissionProbeInputField[];
+  /** T41e-3: 要求の送り先の path（既定は会員の表 `/rest/v1/members`）。 */
+  readonly resourcePath?: string;
+} = {}): DiscoveryCandidate => {
+  const shape = apiRequestShapeOf({
+    method: overrides.method ?? 'POST',
+    resourceType: 'fetch',
+    url: `${API_SERVICE_ORIGIN}${overrides.resourcePath ?? '/rest/v1/members'}?${overrides.query ?? 'select=*'}`,
+    origin: { kind: 'APPROVED_API', index: 0 },
+    headers: overrides.headers ?? { 'content-type': 'application/json', prefer: 'return=representation', authorization: 'Bearer x' },
+    body: { kind: 'TEXT', text: JSON.stringify(overrides.body ?? { name: API_MARKERS[0], email: API_MARKERS[1], tenant_id: 'tenant-t38f' }) },
+  }, { pagePath, markers: API_MARKERS });
+  const observed = observedSubmissionProbeOf({ shapes: [shape], nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 0 },
+    { filledFieldCount: 2, skippedFieldCount: 0 }, overrides.fields ?? API_FLOW_FIELDS);
+  // 偽った結果（分類を通らない型を `API_CREATE` にする。下書きの確かめが I21 を照らし直すことの確かめ）。
+  const probe = overrides.forgedResult === undefined ? observed : { ...observed, result: overrides.forgedResult, reason: null, shape };
+  return {
+    ...candidateOf(sampleButton({ page: { origin: ORIGIN, path: pagePath }, submitterText: '保存', jsBinding: { ...NO_JS_BINDING, submitter: ['click'] } })),
+    submissionProbe: probe,
+  };
+};
+
+const FLOW_NEW = '/admin/members/new';
+const FLOW_EDIT = '/admin/members/1/edit';
+/** 登録の画面の 2 つの型（同じボタン。2 つ目は、ページが決める鍵を 1 つ多く送る）。 */
+const FLOW_CREATE = apiFlowButtonOf(FLOW_NEW);
+const FLOW_CREATE_OTHER = apiFlowButtonOf(FLOW_NEW, { body: { name: API_MARKERS[0], email: API_MARKERS[1], tenant_id: 'tenant-t38f', source: 'web' } });
+/** T41e: 更新の型は、欄として識別できないページが決める鍵を持たない（`FLOW_UPDATE_TENANT` が持つ型）。 */
+const FLOW_UPDATE = apiFlowButtonOf(FLOW_EDIT, { method: 'PATCH', query: 'id=eq.1&select=*', body: { name: API_MARKERS[0], email: API_MARKERS[1] } });
+/** T41e: 欄として識別できないページが決める鍵 `tenant_id` を持つ更新の型（更新のシナリオにできない。理由を出す）。 */
+const FLOW_UPDATE_TENANT = apiFlowButtonOf('/admin/teams/1/edit', { method: 'PATCH', query: 'id=eq.1&select=*' });
+/** 論理削除の鍵を持つ型を `API_CREATE` と偽った候補（下書きで拒む）。 */
+const FLOW_STATE_KEY = apiFlowButtonOf('/admin/flags/new', {
+  body: { name: API_MARKERS[0], email: API_MARKERS[1], deleted: false }, forgedResult: 'API_CREATE',
+});
+/** 欄に対応しない、秘密に見える名前の鍵を持つ型（その鍵は、ページが決める鍵に選べない）。 */
+const FLOW_SECRET_KEY = apiFlowButtonOf('/admin/tokens/new', { body: { name: API_MARKERS[0], email: API_MARKERS[1], access_token: 'token-t38f' } });
+/** 画面の path の READ の定義（`{id}` の型と、型でない path）。 */
+const FLOW_TEMPLATE_READ = `/admin/members/${RECORD_ID_PLACEHOLDER}`;
+/**
+ * T41e: ID の区切りが 2 つある更新の画面（組織 `7` と会員 `1`。filter は最後の ID）。目印のない選択の欄 `plan` は、ページが決める鍵 `plan` の欄の識別になる
+ * （更新で前の値と照らせる鍵）。
+ */
+const FLOW_NESTED_EDIT = '/orgs/7/members/1/edit';
+const FLOW_UPDATE_NESTED = apiFlowButtonOf(FLOW_NESTED_EDIT, {
+  method: 'PATCH',
+  query: 'id=eq.1&select=*',
+  body: { name: API_MARKERS[0], email: API_MARKERS[1], plan: 'plan-t41e-page-value' },
+  fields: [...API_FLOW_FIELDS, { name: 'plan', selector: '#plan', type: 'select-one', marker: null }],
+});
+
+/** T41e-3: 別の表（`/rest/v1/teams`）の更新の画面（同じ表の API の登録のシナリオがないので、台帳に選べる登録がない）。 */
+const FLOW_UPDATE_TEAMS = apiFlowButtonOf('/admin/groups/2/edit', {
+  method: 'PATCH', query: 'id=eq.2&select=*', body: { name: API_MARKERS[0], email: API_MARKERS[1] }, resourcePath: '/rest/v1/teams',
+});
+
+const apiFlowDocument = (): DiscoveryDocument => ({
+  ...discoveryDocument(),
+  pages: [[FLOW_CREATE, FLOW_CREATE_OTHER], [FLOW_UPDATE], [FLOW_STATE_KEY], [FLOW_SECRET_KEY], [FLOW_UPDATE_NESTED], [FLOW_UPDATE_TENANT], [FLOW_UPDATE_TEAMS]]
+    .map((candidates) => {
+    const [first] = candidates;
+    const page = first?.page ?? { origin: ORIGIN, path: '/' };
+    return { url: `${page.origin}${page.path}`, state: 'READ' as const, record: { location: page, incompleteReasons: [], candidates }, blockedRequests: 0 };
+  }),
+});
+
+/** T38f の場面をまたぐ値（T40d: API の登録のシナリオと照合の READ を、T40d の場面でも使うので、describe の外に置いた）。 */
+const apiState = { createId: '', readCheckId: '' };
+
+describe('T38f: the API scenario screens from the discovery result (G38 on the screens)', () => {
+
+  it('offers a create link by probe row of an API candidate, and makes, saves and approves an API scenario by the form (no grant)', async () => {
+    const target = writeTarget(API_FLOW_PROFILE_ID, API_FLOW_OUTPUT);
+    expect(await valueOf('createProfileFn', 'POST', {
+      profile: { ...profileDocument(API_FLOW_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN] },
+    })).toMatchObject({ ok: true });
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(API_FLOW_PROFILE_ID) })).toMatchObject({ ok: true });
+    for (const path of [FLOW_TEMPLATE_READ, '/admin/members']) {
+      expect(await valueOf('createReadCheckFn', 'POST', {
+        profileId: API_FLOW_PROFILE_ID, definition: { targetPagePath: path, parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
+      }), path).toMatchObject({ ok: true });
+    }
+    await discover(API_FLOW_PROFILE_ID, API_FLOW_OUTPUT, apiFlowDocument());
+
+    // 発見の結果: API の候補の probe の行ごとに「シナリオを作る」を出す（型の digest で行を選ぶ）。偽った型の行にも出し、作成の画面が理由を出す。
+    const discoveryPage = await openPage(`/discovery/${API_FLOW_PROFILE_ID}`);
+    const createRow = discoveryPage.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_CREATE.identityDigest}"]`);
+    expect(await createRow.getByTestId('candidate-create-api-scenario').evaluateAll((links) => links.map((link) => link.getAttribute('data-shape-digest'))))
+      .toEqual([FLOW_CREATE.submissionProbe?.shapeDigest, FLOW_CREATE_OTHER.submissionProbe?.shapeDigest]);
+    expect(await createRow.getByTestId('candidate-create-scenario').count()).toBe(0);
+    await screenshot(discoveryPage, 't38f-01-discovery-api-rows');
+    await tabTo(discoveryPage, createRow.getByTestId('candidate-create-api-scenario').first());
+    await discoveryPage.keyboard.press('Enter');
+    const form = discoveryPage.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await form.getAttribute('data-shape-digest')).toBe(FLOW_CREATE.submissionProbe?.shapeDigest);
+    // 鍵と欄の対応は probe から埋める（確かめる）。ページが決める鍵は選ぶ。ヘッダの名前はブラウザが付ける名前を除いた案。
+    expect(await form.locator('[data-testid="scenario-api-key"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-key')))).toEqual(['email', 'name']);
+    expect(await form.locator('input[data-api-key]:checked').count()).toBe(2);
+    expect(await form.locator('[data-testid="scenario-api-page-key"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-key')))).toEqual(['tenant_id']);
+    // 型の要約の案は、承認の画面と同じ部品で出す。
+    expect(await form.getByTestId('scenario-form-api-shape').locator('[data-item="headerNames"]').textContent())
+      .toBe(listText(['authorization', 'content-type', 'prefer']));
+    // 照合の READ は、API のシナリオでは `{id}` の型の画面の READ の定義も選べる（型でない画面の READ は出さない）。
+    const readOptions = await discoveryPage.locator('select[name="readVerification-check"] option').evaluateAll((options) =>
+      options.map((option) => (option as HTMLOptionElement).value).filter((value) => value !== ''));
+    expect(readOptions).toHaveLength(1);
+    apiState.readCheckId = readOptions[0] ?? '';
+    // T40a-fix: API のシナリオの検証の指定の欄に、成否の条件と入力の誤りの条件は出さない（使わない）。使わないことの説明を出す。
+    expect(await discoveryPage.getByTestId('scenario-verification-successCondition').count()).toBe(0);
+    expect(await discoveryPage.getByTestId('scenario-verification-inputErrorCondition').count()).toBe(0);
+    expect(await discoveryPage.getByTestId('scenario-verification-api-note').textContent()).toBe(LOCAL_UI_WRITE_TEXT.apiVerificationNote);
+    // 保存の前に、ページが決める鍵を選ばずに保存すると、鍵ごとの理由が出る。
+    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
+      await discoveryPage.locator(`input[data-side-effect="${side}"]`).check();
+    }
+    await discoveryPage.getByTestId('scenario-save').click();
+    await discoveryPage.getByTestId('scenario-api-errors').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await discoveryPage.getByTestId('scenario-api-errors').textContent())
+      .toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_KEY_NOT_ALLOWED.description);
+    await tabTo(discoveryPage, form.locator('input[data-api-page-key="tenant_id"]'));
+    await discoveryPage.keyboard.press('Space');
+    await discoveryPage.locator('input[name="api-recordIdKey"]').fill('id');
+    await discoveryPage.locator('select[name="readVerification-check"]').selectOption(apiState.readCheckId);
+    await discoveryPage.getByTestId('scenario-verification-add-expectation').click();
+    // T40R-fix-B（I-2）: `{id}` の照合の READ の期待が行の数だけ（足した期待の既定）だと、保存で拒まれ、検証の指定の近くに理由がカタログの文言で出る。
+    // T40R2-fix（使える度合い）: 画面から ID を取る型に登録の画面（`/admin/members/new`）が当たっても拒まず、入力した時点で注意（応答の本文の鍵から取る形を
+    // 勧める）を出す。
+    expect(await discoveryPage.getByTestId('scenario-verification-record-id-caution').count()).toBe(0);
+    await discoveryPage.locator('select[name="recordId-source"]').selectOption('URL_PATH_PATTERN');
+    await discoveryPage.locator('input[name="recordId-value"]').fill('/admin/members/{id}');
+    expect(await discoveryPage.getByTestId('scenario-verification-record-id-caution').textContent()).toBe(LOCAL_UI_WRITE_TEXT.recordIdPatternCaution);
+    await discoveryPage.getByTestId('scenario-save').click();
+    await discoveryPage.getByTestId('scenario-verification-errors').waitFor({ timeout: UI_TIMEOUT_MS });
+    const verificationErrorsText = await discoveryPage.getByTestId('scenario-verification-errors').textContent();
+    expect(verificationErrorsText).toBe(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_READ_VERIFICATION_NOT_BOUND.description);
+    await screenshot(discoveryPage, 't40r-fix-b-01-api-verification-rejected');
+    await discoveryPage.locator('select[name="expectation-0-kind"]').selectOption('TEXT_CONTAINS');
+    await discoveryPage.locator('select[name="expectation-0-fieldName"]').selectOption('email');
+    await screenshot(discoveryPage, 't38f-02-api-form-filled');
+    await tabTo(discoveryPage, discoveryPage.getByTestId('scenario-save'));
+    await discoveryPage.keyboard.press('Enter');
+    await discoveryPage.waitForURL(new RegExp(`/scenarios/${API_FLOW_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
+    apiState.createId = new URL(discoveryPage.url()).pathname.split('/').at(-1) ?? '';
+
+    // 詳細: 送り方と型の要約（承認の画面と同じ部品）、ID の取り方（LG-3b: 送り方の理由の表示は捨てた）。
+    const detail = discoveryPage;
+    await detail.getByTestId('scenario-api-shape').waitFor({ timeout: UI_TIMEOUT_MS });
+    // CC-103（T40R-fix-B）: 送り方は表示のカタログのラベルで出す（生の値 `API` ではない）。
+    expect(await detail.getByTestId('scenario-api-shape').locator('[data-item="transport"]').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
+    expect(await detail.getByTestId('scenario-api-shape').locator('[data-item="recordId"]').textContent()).toBe('id');
+    // T40a-fix: 検証の指定は、API で求める項目（ID の取り方と照合の READ）だけを出す。ID は API の `recordId` で取るので、不足の理由は出さない。
+    expect(await detail.getByTestId('scenario-verification-values').locator('dd').evaluateAll((items) => items.map((item) => item.getAttribute('data-item'))))
+      .toEqual(['recordId', 'readVerification']);
+    expect(await detail.getByTestId('scenario-verification-missing').count()).toBe(0);
+    // T40R2-fix: 保存した ID の型は登録の画面に当たるので、詳細にも注意を出す（保存の画面と同じ文言）。
+    expect(await detail.getByTestId('scenario-record-id-caution').textContent()).toContain(LOCAL_UI_WRITE_TEXT.recordIdPatternCaution);
+    const saved = await detailOf(apiState.createId);
+    expect(saved.scenario).toMatchObject({ state: 'DRAFT', fieldNames: ['email', 'name'] });
+    expect(saved.status).toMatchObject({ displayState: 'DRAFT', reasons: [] });
+    await screenshot(detail, 't38f-03-api-detail');
+    await tabTo(detail, detail.getByTestId('scenario-approve'));
+    await detail.keyboard.press('Enter');
+    const dialog = detail.getByRole('dialog', { name: text.approveDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.getByTestId('scenario-approve-api-shape').count()).toBe(1);
+    await dialog.getByRole('button', { name: text.approveDialog.confirm, exact: true }).click();
+    await detail.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
+    await expect.poll(() => detail.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
+
+    // 書き込みの開始の画面: T40a: API の登録は始められる（許可が出る）。T40a-fix: 成否の条件と入力の誤りの条件がなくても、検証の
+    // 指定の不足にならず、始められる（開始のボタンを出す）。
+    const write = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${apiState.createId}/write`);
+    await write.getByTestId('write-start').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await write.getByTestId('write-start-verification-missing').count()).toBe(0);
+    expect(await write.getByTestId('write-start').getAttribute('data-startable')).toBe('true');
+    expect(await write.getByTestId('write-start-open').count()).toBe(1);
+    await screenshot(write, 't38f-04-api-write-startable');
+  });
+
+  it('makes an API UPDATE scenario with the ledger and the filter, and shows the ledger on the detail (no missing UPDATE spec)', async () => {
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE.submissionProbe?.shapeDigest ?? '')}`);
+    const form = page.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await form.getAttribute('data-kind')).toBe('UPDATE');
+    expect(await page.locator('input[name="api-filterName"]').inputValue()).toBe('id');
+    expect(await page.getByTestId('scenario-form-api-shape-filter-caution').textContent()).toBe(text.api.filterCaution);
+    await page.locator('select[name="api-ledger"]').selectOption(apiState.createId);
+    expect(await page.locator('select[name="api-formPathTemplate"]').inputValue()).toBe(`/admin/members/${RECORD_ID_PLACEHOLDER}/edit`);
+    // T41e（Task 41 の設計書 3.1、3.5）: 目印を入れた欄の鍵は、既定で保つ（メールアドレスも保つ。近くに知らせる）。変える鍵に `name` を選ぶ。
+    const roles = form.locator('[data-testid="scenario-api-key"]');
+    expect(await roles.evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-key'), row.getAttribute('data-role')])))
+      .toEqual([['email', 'KEEP'], ['name', 'KEEP']]);
+    expect(await form.locator('[data-testid="scenario-api-key"][data-key="email"] [data-testid="scenario-api-contact-hint"]').textContent())
+      .toBe(text.update.contactFieldHint);
+    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
+      await page.locator(`input[data-side-effect="${side}"]`).check();
+    }
+    // 変える鍵がないまま保存すると、理由を API の指定の近くに出す（既定はすべて保つ）。
+    await page.getByTestId('scenario-save').click();
+    await form.getByTestId('scenario-api-errors').locator('[data-code="SCENARIO_UPDATE_NO_CHANGED_FIELD"]').waitFor({ timeout: UI_TIMEOUT_MS });
+    // キーボードだけで選ぶ（Tab は選んでいる「保つ」に止まり、矢印で「変える」に移る）。
+    await tabTo(page, form.locator('input[data-api-role="name"][value="KEEP"]'));
+    await page.keyboard.press('ArrowUp');
+    expect(await form.locator('[data-testid="scenario-api-key"][data-key="name"]').getAttribute('data-role')).toBe('CHANGE');
+    await page.getByTestId('scenario-save').click();
+    await page.waitForURL(new RegExp(`/scenarios/${API_FLOW_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
+    // 下書きは、変える鍵を `fieldNames`、保つ鍵を `keptKeys` で送った（保存した API の指定で確かめる）。
+    const savedId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
+    const savedApi = withControlData((database) => readScenario(database, savedId)?.current ?? null);
+    expect(savedApi?.fieldNames).toEqual(['name']);
+    expect(savedApi?.api?.keyFields.map(({ key }) => key)).toEqual(['name']);
+    expect(savedApi?.api?.keptKeys?.map(({ key }) => key)).toEqual(['email']);
+    expect(savedApi?.api?.pageKeys).toEqual([]);
+    await page.getByTestId('scenario-update-section').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('scenario-update-spec-missing').count()).toBe(0);
+    expect(await page.getByTestId('scenario-update-ledger-value').getAttribute('data-scenario-id')).toBe(apiState.createId);
+    expect(await page.getByTestId('scenario-update-form-template').textContent()).toBe(`/admin/members/${RECORD_ID_PLACEHOLDER}/edit`);
+    expect(await page.getByTestId('scenario-api-shape').locator('[data-item="filterName"] strong').textContent()).toBe('id');
+    await screenshot(page, 't38f-05-api-update-detail');
+
+    // 変更の画面も、型で行を選んで同じ API の入力を出す（今の版の値を入れる）。
+    const scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
+    const edit = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/edit`);
+    await edit.getByTestId('scenario-api-fields').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await edit.locator('select[name="api-ledger"]').inputValue()).toBe(apiState.createId);
+    // T41e: 変更の画面は、保存した変える鍵と保つ鍵を選んだ状態で出す。
+    expect(await edit.locator('input[data-api-role="name"][value="CHANGE"]').isChecked()).toBe(true);
+    expect(await edit.locator('input[data-api-role="email"][value="KEEP"]').isChecked()).toBe(true);
+  });
+
+  it('shows the reasons of the shapes the draft rejects, and keeps a secret-like page key unselectable', async () => {
+    const stateKey = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_STATE_KEY.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_STATE_KEY.submissionProbe?.shapeDigest ?? '')}`);
+    const rejected = stateKey.getByTestId('scenario-candidate-rejected');
+    await rejected.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await rejected.getAttribute('data-reason')).toBe('SCENARIO_API_STATE_KEY');
+    expect(await rejected.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_STATE_KEY.description);
+
+    const secret = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_SECRET_KEY.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_SECRET_KEY.submissionProbe?.shapeDigest ?? '')}`);
+    const pageKey = secret.locator('[data-testid="scenario-api-page-key"][data-key="access_token"]');
+    await pageKey.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await pageKey.getAttribute('data-rejection')).toBe('SCENARIO_API_PAGE_KEY_SECRET_LIKE');
+    expect(await pageKey.locator('input').isDisabled()).toBe(true);
+    expect(await pageKey.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_SECRET_LIKE.description);
+    // 目印と値は、画面に出ない。
+    for (const body of [await stateKey.content(), await secret.content()]) {
+      for (const marker of [...API_MARKERS, 'tenant-t38f', 'token-t38f']) {
+        expect(body.includes(marker), marker).toBe(false);
+      }
+    }
+  });
+
+  it('tells on the READ check form that a page path may have {id} for the verification of an API scenario', async () => {
+    const page = await openPage(`/read-checks/${API_FLOW_PROFILE_ID}/new?target=PAGE`);
+    const hint = page.getByTestId('read-check-page-template-hint');
+    await hint.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await hint.textContent()).toBe(LOCAL_UI_READ_CHECK_TEXT.page.pageTemplateHint(RECORD_ID_PLACEHOLDER));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T40d（Task 40 の設計書 3.5）: API の登録の開始の画面、結果とジョブの画面、書き込みの履歴
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 偽のワーカーが書く API の登録の記録の値（匿名の合成の値）。 */
+const API_WRITE_VALUES = Object.freeze({ name: 't40d-name', email: 't40d@example.invalid', recordId: 'rec-t40d-1', pageKeyValue: 'tenant-t40d' });
+/** 偽のワーカーが書く API の応答の HTTP の状態。 */
+const API_WRITE_HTTP_STATUS = 201;
+/** probe が見た Authorization の値（discovery の型は値を持たない。画面と応答にも出ない）。 */
+const API_AUTHORIZATION_VALUE = 'Bearer x';
+
+/** 書き込みの結果の、送り方と API の型の要約（画面のサーバの値。確かめる項目）。 */
+interface ApiWriteSummaryOnServer {
+  readonly write: {
+    readonly transport: string;
+    readonly api: { readonly shapeDigest: string; readonly method: string; readonly origin: string; readonly pathShape: string } | null;
+  } | null;
+}
+
+/** 開始の画面の値の、送り方と API の指定（確かめる項目）。 */
+interface ApiWriteStartOnServer {
+  readonly startable: boolean;
+  /** T40R2-fix: 照合の READ の期待が、実行のたびに変わる値と比べない理由（比べるなら null）。 */
+  readonly readVerificationVaryingRejection: string | null;
+  readonly scenario: { readonly revision: number; readonly transport: string; readonly api: { readonly shapeDigest: string } | null };
+}
+
+/**
+ * 偽のワーカーが書く API の登録の `action-run.json`（版 1.1。ジョブの id・許可の id・seed の記録は、偽のワーカーが `START` の値に置き換える印）。API の要約は、
+ * 本番の組み立ての部品（`actionApiSummaryOf`）で、承認した API の指定から作る（親の照らし合わせ `actionRunMatchesWriteStart` が同じ指定と照らす）。
+ */
+const apiActionRunTextOf = (scenarioId: string, scenarioRevision: number, api: ScenarioApiSpec): string => {
+  const at = formatCompactUtcTimestamp(new Date(Date.now() + ACTION_RUN_TIME_OFFSET_MS), 't40d fake action run');
+  return JSON.stringify({
+    schemaVersion: ACTION_RUN_SCHEMA_VERSION,
+    jobId: '__START_JOB_ID__',
+    runId: FAKE_RUN_ID,
+    profileId: API_FLOW_PROFILE_ID,
+    scenarioId,
+    scenarioRevision,
+    grantId: '__START_GRANT_ID__',
+    seedRecord: '__START_SEED_RECORD__',
+    // T40R2-fix: 送った値は生成した値（email は実行のたびに変わる）なので、偽のワーカーが `START` の値を書き写す印。
+    submittedValues: '__START_VALUES__',
+    resultConditions: null,
+    submission: 'SENT',
+    blockReason: null,
+    httpStatus: API_WRITE_HTTP_STATUS,
+    responseJudgement: 'SUCCESS',
+    recordId: API_WRITE_VALUES.recordId,
+    readVerification: { readCheckId: apiState.readCheckId, readCheckRevision: 1, result: 'MATCHED' },
+    reservationState: 'COMMITTED',
+    result: 'VERIFIED',
+    reason: 'READ_VERIFICATION_MATCHED',
+    startedAt: at,
+    submittedAt: at,
+    finishedAt: at,
+    transport: 'API',
+    api: actionApiSummaryOf(api, { tenant_id: API_WRITE_VALUES.pageKeyValue }),
+  });
+};
+
+describe('T40d: the API create on the write start, result, job and history screens', () => {
+  it('starts the API create from the start screen with the transport and the shape, and shows the API summary on the job and the history', async () => {
+    const scenarioId = apiState.createId;
+    expect(scenarioId).not.toBe('');
+    // テストだけの準備: 送る鍵の入力の規則（固定の値）を画面のサーバの口で付け、承認し直す（規則を付けると版が上がる）。
+    const before = await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId });
+    expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
+      scenarioId,
+      expectedScenarioRevision: before.scenario.revision,
+      expectedRuleSetRevision: null,
+      fieldRules: [
+        { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.email] },
+        { fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.name] },
+      ],
+      relations: [],
+      uniqueKeyFieldNames: [],
+    })).toMatchObject({ ok: true });
+    await approveByFunction(scenarioId);
+    const scenario = withControlData((database) => readScenario(database, scenarioId));
+    const api = scenario?.current.api ?? null;
+    if (scenario === null || api === null) {
+      throw new Error('the approved API scenario is missing');
+    }
+    // T40R2-fix（M-1）: 照合の READ（送る値のない `{id}` の型）の期待の欄（email）が、1 つの値だけの固定の一覧（毎回同じ値）なので、開始の画面は始められず、
+    // 理由をカタログの文言で出す（許可の発行と同じ判定）。
+    const constantView = await valueOf<ApiWriteStartOnServer>('writeStartPageFn', 'GET', { scenarioId });
+    expect(constantView).toMatchObject({ startable: false, readVerificationVaryingRejection: 'READ_VERIFICATION_NOT_VARYING' });
+    const constantStart = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+    const varyingNotice = constantStart.getByTestId('write-start-read-verification-not-varying');
+    await varyingNotice.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await varyingNotice.getAttribute('data-reason')).toBe('READ_VERIFICATION_NOT_VARYING');
+    expect(await varyingNotice.textContent()).toContain(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.READ_VERIFICATION_NOT_VARYING.description);
+    expect(await constantStart.getByTestId('write-start-open').count()).toBe(0);
+    await screenshot(constantStart, 't40r2-fix-01-api-write-not-varying');
+    // email を生成した値（テンプレートの合成のメール）の規則に替えると、始められる。
+    const constantRevision = await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId });
+    expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
+      scenarioId,
+      expectedScenarioRevision: constantRevision.scenario.revision,
+      expectedRuleSetRevision: 1,
+      fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.name] }],
+      relations: [],
+      uniqueKeyFieldNames: [],
+    })).toMatchObject({ ok: true });
+    await approveByFunction(scenarioId);
+    const varyingScenario = withControlData((database) => readScenario(database, scenarioId));
+    if (varyingScenario === null) {
+      throw new Error('the approved API scenario is missing');
+    }
+    const view = await valueOf<ApiWriteStartOnServer>('writeStartPageFn', 'GET', { scenarioId });
+    expect(view).toMatchObject({
+      startable: true, readVerificationVaryingRejection: null,
+      scenario: { revision: varyingScenario.revision, transport: 'API', api: { shapeDigest: api.shapeDigest } },
+    });
+    installFakeUpdateWrite(API_FLOW_OUTPUT, apiActionRunTextOf(scenarioId, varyingScenario.revision, api));
+
+    // 開始の画面: 送り方のラベルと、承認した API の要求の型（form と同じ確かめの後に、開始のボタン）。
+    const start = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+    await start.getByTestId('write-start-open').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await start.getByTestId('write-start-transport').getAttribute('data-transport')).toBe('API');
+    expect(await start.getByTestId('write-start-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
+    const startShape = start.getByTestId('write-start-api-shape');
+    expect(await startShape.getAttribute('data-shape-digest')).toBe(api.shapeDigest);
+    expect(await startShape.locator('[data-item="method"]').textContent()).toBe('POST');
+    expect(await start.getByTestId('write-start-action').getAttribute('data-path')).toBe(api.request.pathShape);
+    const startHtml = await start.content();
+    await screenshot(start, 't40d-01-api-write-start');
+    await start.getByTestId('write-start-open').click();
+    const dialog = start.getByRole('dialog', { name: writeText.startDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await focusedText(start)).toBe(writeText.startDialog.cancel);
+    await dialog.getByRole('button', { name: writeText.startDialog.confirm, exact: true }).click();
+    await start.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
+    const jobId = new URL(start.url()).pathname.split('/').at(-1) ?? '';
+    expect(await waitForEnd(jobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
+
+    // 結果とジョブの画面: 送り方と API の型の要約（管理データの書き込みの結果と同じ値）。判定の説明を出す。
+    const stored = withControlData((database) => readWriteResult(database, jobId));
+    expect(stored).toMatchObject({
+      result: 'VERIFIED', transport: 'API', recordId: API_WRITE_VALUES.recordId, httpStatus: API_WRITE_HTTP_STATUS,
+      api: { shapeDigest: api.shapeDigest, method: api.request.method, origin: api.request.origin, pathShape: api.request.pathShape },
+    });
+    const job = await openPage(`/jobs/${jobId}`);
+    const result = job.locator('[data-testid="write-result"]:not([data-result=""])');
+    await result.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await result.getAttribute('data-transport')).toBe('API');
+    expect(await job.getByTestId('write-result-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
+    const summary = job.getByTestId('write-result-api');
+    expect(await summary.getAttribute('data-shape-digest')).toBe(stored?.api?.shapeDigest);
+    expect(await summary.locator('dd').evaluateAll((items) => items.map((item) => [item.getAttribute('data-item'), item.textContent])))
+      .toEqual([['method', stored?.api?.method], ['origin', stored?.api?.origin], ['pathShape', stored?.api?.pathShape], ['shapeDigest', stored?.api?.shapeDigest]]);
+    expect(await summary.getByTestId('write-result-api-note').textContent()).toBe(writeText.api.judgementNote);
+    expect(await job.getByTestId('write-result-record-id').textContent()).toBe(API_WRITE_VALUES.recordId);
+    const jobDetail = await valueOf<ApiWriteSummaryOnServer>('getAuditJobFn', 'GET', { jobId });
+    expect(jobDetail.write).toMatchObject({ transport: 'API', api: stored?.api });
+    await screenshot(job, 't40d-02-api-write-result');
+
+    // 書き込みの履歴: 送り方のラベル（API の登録のシナリオと、form の登録のシナリオ）。
+    const history = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
+    const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
+    await entry.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await entry.getAttribute('data-transport')).toBe('API');
+    expect(await entry.getByTestId('write-history-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
+    await screenshot(history, 't40d-03-api-write-history');
+    const formHistory = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}`);
+    await formHistory.getByTestId('write-history').waitFor({ timeout: UI_TIMEOUT_MS });
+    const formRows = formHistory.getByTestId('write-history-entry');
+    expect(new Set(await formRows.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-transport'))))).toEqual(new Set(['FORM']));
+    expect(await formRows.first().getByTestId('write-history-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.FORM.label);
+    expectNoReservedLeft(scenarioId);
+
+    // 目印: probe が欄に入れた値・ページの値・Authorization の値は、開始・結果・ジョブ・履歴の画面と、その Server Function の応答に出ない。
+    const bodies = [
+      startHtml, await job.content(), await history.content(),
+      JSON.stringify(jobDetail), JSON.stringify(view), JSON.stringify(await detailOf(scenarioId)),
+    ];
+    for (const body of bodies) {
+      for (const marker of [...API_MARKERS, 'tenant-t38f', API_AUTHORIZATION_VALUE]) {
+        expect(body.includes(marker), marker).toBe(false);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T41e（Task 41 の設計書 3.5）: API の更新のシナリオの画面（台帳の画面の型、識別つきのページが決める鍵、保つ鍵の表示、台帳の ID と filter の結び付きの
+// 理由、開始の画面の予定のレコード）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** T41e の場面をまたぐ値（ID の区切りが 2 つある更新の画面の、API の更新のシナリオ）。 */
+const apiUpdateState = { nestedId: '' };
+
+describe('T41e: the API update scenario screens', () => {
+  it('offers only the last record id segment as the page template, shows the kept keys and the identified page key on the detail and the dialog', async () => {
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE_NESTED.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE_NESTED.submissionProbe?.shapeDigest ?? '')}`);
+    const form = page.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    // 画面の型は、最後の ID の区切り（会員の `1`）だけ（組織の `7` を `{id}` にした型は、保存で拒まれるので出さない）。
+    expect(await page.locator('select[name="api-formPathTemplate"] option').evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)))
+      .toEqual([`/orgs/7/members/${RECORD_ID_PLACEHOLDER}/edit`]);
+    // 欄として識別できるページが決める鍵（選択の欄 `plan`）は選べる。
+    const plan = form.locator('[data-testid="scenario-api-page-key"][data-key="plan"]');
+    expect(await plan.getAttribute('data-rejection')).toBe('');
+    await plan.locator('input').check();
+    await form.locator('input[data-api-role="name"][value="CHANGE"]').check();
+    await page.locator('select[name="api-ledger"]').selectOption(apiState.createId);
+    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
+      await page.locator(`input[data-side-effect="${side}"]`).check();
+    }
+    await screenshot(page, 't41e-01-api-update-form');
+    await page.getByTestId('scenario-save').click();
+    await page.waitForURL(new RegExp(`/scenarios/${API_FLOW_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
+    apiUpdateState.nestedId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
+
+    // 詳細: 変える鍵、保つ鍵、欄の識別つきのページが決める鍵。承認の確認のダイアログも同じ部品で出す。
+    const shape = page.getByTestId('scenario-api-shape');
+    await shape.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await shape.locator('[data-item="keyFields"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['name']);
+    expect(await shape.locator('[data-item="keptKeys"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['email']);
+    expect(await shape.locator('[data-item="keptKeys"] li').textContent()).toBe(text.api.keptKey('email', 'string', text.api.fieldName('email')));
+    expect(await shape.locator('[data-item="pageKeys"] li').textContent()).toBe(text.api.pageKeyField('plan', 'string', text.api.fieldName('plan')));
+    await screenshot(page, 't41e-02-api-update-detail');
+    await tabTo(page, page.getByTestId('scenario-approve'));
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: text.approveDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.getByTestId('scenario-approve-api-shape').locator('[data-item="keptKeys"] li').count()).toBe(1);
+    await dialog.getByRole('button', { name: text.approveDialog.cancel, exact: true }).click();
+  });
+
+  it('shows the reason of a page key that is not identified as a field of the update page, and keeps it unselectable', async () => {
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE_TENANT.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE_TENANT.submissionProbe?.shapeDigest ?? '')}`);
+    const form = page.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    const tenant = form.locator('[data-testid="scenario-api-page-key"][data-key="tenant_id"]');
+    expect(await tenant.getAttribute('data-rejection')).toBe('SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE');
+    expect(await tenant.locator('input').isDisabled()).toBe(true);
+    expect(await tenant.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE.description);
+    await screenshot(page, 't41e-05-api-update-page-key-not-identifiable');
+  });
+
+  // T41e-3（T41R-fix-B の申し送り）: 台帳の ID が filter に結び付かない登録は、台帳の選択肢に出さない（保存で拒まれる選択肢を見せない。判定は下書きの
+  // 確かめと同じ部品）。
+  it('does not offer a ledger whose record id is not bound to the filter', async () => {
+    // 登録の ID を応答の鍵 `uid` で読む登録のシナリオ（filter の名前 `id` と違う）を作る。
+    const ledger = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: {
+        profileId: API_FLOW_PROFILE_ID, candidateIdentityDigest: FLOW_CREATE.identityDigest, transport: 'API', fieldNames: ['email', 'name'], readChecks: [],
+        sideEffectConfirmations: confirmations(true), limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
+        api: {
+          shapeDigest: FLOW_CREATE.submissionProbe?.shapeDigest, pageKeys: ['tenant_id'], filterName: null,
+          recordId: { source: 'RESPONSE_BODY_KEY', key: 'uid' }, ledger: null,
+        },
+      },
+    });
+    expect(ledger.ok).toBe(true);
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE.submissionProbe?.shapeDigest ?? '')}`);
+    const form = page.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    const options = await page.locator('select[name="api-ledger"] option').evaluateAll((items) =>
+      items.map((item) => (item as HTMLOptionElement).value).filter((value) => value !== ''));
+    expect(options).toContain(apiState.createId);
+    expect(options).not.toContain(ledger.scenarioId);
+    expect(await form.getByTestId('scenario-api-no-ledger').count()).toBe(0);
+    await screenshot(page, 't41e-03-api-update-ledger-options');
+  });
+
+  it('shows the planned record, the changed keys and the kept keys of an API update on the write start screen', async () => {
+    const scenarioId = apiUpdateState.nestedId;
+    expect(scenarioId).not.toBe('');
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+    await page.getByTestId('write-start').waitFor({ timeout: UI_TIMEOUT_MS });
+    // 予定のレコードは、更新の予定の唯一の読み出し（`readPlannedUpdateTarget`）の値（台帳に照合済みの登録がなければ、ないことを示す）。
+    const planned = withControlData((database) => readPlannedUpdateTarget(database, scenarioId));
+    expect(await page.getByTestId('write-start-target').getAttribute('data-target')).toBe(planned ?? '');
+    expect(await page.getByTestId('write-start-changed').textContent()).toBe(listText(['name']));
+    expect(await page.getByTestId('write-start-kept').textContent()).toBe(listText(['email']));
+    expect(await page.getByTestId('write-start-action').getAttribute('data-path')).toBe('/rest/v1/members');
+    expect(await page.getByTestId('write-start-api-shape').locator('[data-item="keptKeys"] li').count()).toBe(1);
+    const view = await valueOf<{ update: { plannedTarget: string | null; keptFieldNames: readonly string[] } | null }>('writeStartPageFn', 'GET', { scenarioId });
+    expect(view.update).toMatchObject({ plannedTarget: planned, keptFieldNames: ['email'] });
+    await screenshot(page, 't41e-04-api-update-write-start');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T41e-2（Task 41 の設計書 3.2、3.3、3.5）: 候補の一覧の作れない型の理由、API の更新の開始から結果まで（偽のワーカー）、検証の指定の項目、台帳の結び付きの
+// 理由
+// ---------------------------------------------------------------------------------------------------------------
+
+/** T41e-2: 偽のワーカーが書く、更新の前に読んだとする前の値（合成のテストデータ）と、変える鍵の固定の一覧（実行のたびに変わる 2 つの値）。 */
+const API_UPDATE_PREVIOUS_NAME = 't41e-before';
+const API_UPDATE_NAMES = Object.freeze(['t41e-name-a', 't41e-name-b']);
+/** T41e-2: ID の区切りが 2 つある更新の画面の、台帳の画面の型。 */
+const NESTED_TEMPLATE = `/orgs/7/members/${RECORD_ID_PLACEHOLDER}/edit`;
+
+/** T41e-2: ID の区切りが 2 つある更新の画面の API の更新の下書き（変える鍵 `name`、保つ鍵 `email`、ページが決める鍵 `plan`、照合の READ は `{id}` の型）。 */
+const apiUpdateDraftOf = (ledgerId: string): Record<string, unknown> => ({
+  profileId: API_FLOW_PROFILE_ID,
+  candidateIdentityDigest: FLOW_UPDATE_NESTED.identityDigest,
+  transport: 'API',
+  fieldNames: ['name'],
+  readChecks: [],
+  sideEffectConfirmations: confirmations(true),
+  limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
+  approvalTtlDays: 30,
+  verification: {
+    successCondition: null, inputErrorCondition: null, recordId: null,
+    readVerification: { readCheckId: apiState.readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }] },
+  },
+  api: {
+    shapeDigest: FLOW_UPDATE_NESTED.submissionProbe?.shapeDigest, pageKeys: ['plan'], keptKeys: ['email'], filterName: 'id', recordId: null,
+    ledger: { targetCreateScenarioId: ledgerId, formPathTemplate: NESTED_TEMPLATE },
+  },
+});
+
+/** T41e-2: API の更新のシナリオを作り、変える鍵の入力の規則を付け、承認する。シナリオの id を返す。 */
+const prepareApiUpdate = async (ledgerId: string): Promise<string> => {
+  const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', { draft: apiUpdateDraftOf(ledgerId) });
+  expect(created, JSON.stringify(created)).toMatchObject({ ok: true });
+  const detail = await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: created.scenarioId });
+  expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
+    scenarioId: created.scenarioId,
+    expectedScenarioRevision: detail.scenario.revision,
+    expectedRuleSetRevision: null,
+    fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [...API_UPDATE_NAMES] }],
+    relations: [],
+    uniqueKeyFieldNames: [],
+  })).toMatchObject({ ok: true });
+  await approveByFunction(created.scenarioId);
+  return created.scenarioId;
+};
+
+/**
+ * T41e-2: 偽のワーカーが書く API の更新の `action-run.json`（T41d の記録の形: 版 1.1 の `api` と `update`。ページが決める鍵の値は空。送った値と変えた欄の
+ * 新しい値は、`START` の生成した値の印 `__START_VALUE:name__`。対象の ID・ジョブ・許可・seed も `START` の値の印）。
+ */
+const apiUpdateActionRunTextOf = (scenarioId: string, scenarioRevision: number, api: ScenarioApiSpec): string => {
+  const at = formatCompactUtcTimestamp(new Date(Date.now() + ACTION_RUN_TIME_OFFSET_MS), 't41e-2 fake action run');
+  return JSON.stringify({
+    schemaVersion: ACTION_RUN_SCHEMA_VERSION,
+    jobId: '__START_JOB_ID__',
+    runId: FAKE_RUN_ID,
+    profileId: API_FLOW_PROFILE_ID,
+    scenarioId,
+    scenarioRevision,
+    grantId: '__START_GRANT_ID__',
+    seedRecord: '__START_SEED_RECORD__',
+    submittedValues: { name: '__START_VALUE:name__' },
+    resultConditions: null,
+    submission: 'SENT',
+    blockReason: null,
+    httpStatus: 200,
+    responseJudgement: 'SUCCESS',
+    recordId: '__START_TARGET_RECORD_ID__',
+    readVerification: { readCheckId: apiState.readCheckId, readCheckRevision: 1, result: 'MATCHED' },
+    reservationState: 'COMMITTED',
+    result: 'VERIFIED',
+    reason: 'READ_VERIFICATION_MATCHED',
+    startedAt: at,
+    submittedAt: at,
+    finishedAt: at,
+    update: {
+      targetRecordId: '__START_TARGET_RECORD_ID__',
+      updateEvidence: {
+        fields: [
+          { fieldName: 'name', role: 'CHANGED', previousValue: API_UPDATE_PREVIOUS_NAME, newValue: '__START_VALUE:name__', matched: true },
+          { fieldName: 'email', role: 'KEPT', previousValue: null, newValue: null, matched: true },
+          { fieldName: 'plan', role: 'KEPT', previousValue: null, newValue: null, matched: true },
+        ],
+      },
+    },
+    transport: 'API',
+    api: actionApiSummaryOf(api, {}),
+  });
+};
+
+describe('T41e-2: the API update from the candidate list to the result', () => {
+  it('shows the reason instead of the create link for a shape that cannot become an API update scenario, on the candidate list', async () => {
+    const page = await openPage(`/discovery/${API_FLOW_PROFILE_ID}`);
+    const tenantRow = page.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_UPDATE_TENANT.identityDigest}"]`);
+    const rejected = tenantRow.getByTestId('candidate-api-scenario-rejected');
+    await rejected.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await rejected.getAttribute('data-reason')).toBe('SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE');
+    expect(await rejected.getAttribute('data-shape-digest')).toBe(FLOW_UPDATE_TENANT.submissionProbe?.shapeDigest);
+    expect(await rejected.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE.description);
+    expect(await tenantRow.getByTestId('candidate-create-api-scenario').count()).toBe(0);
+    // 作れる更新の型（欄として識別できるページが決める鍵だけ）は、今どおり作成の画面へのリンクを出す。
+    const nestedRow = page.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_UPDATE_NESTED.identityDigest}"]`);
+    expect(await nestedRow.getByTestId('candidate-create-api-scenario').count()).toBe(1);
+    expect(await nestedRow.getByTestId('candidate-api-scenario-rejected').count()).toBe(0);
+    await screenshot(page, 't41e2-01-candidate-rejected');
+  });
+
+  it('starts an API update from the start screen with the planned record, and shows the API summary and the diff on the result', async () => {
+    const ledgerId = apiState.createId;
+    const scenarioId = await prepareApiUpdate(ledgerId);
+    // 検証の指定は、API の更新で求める項目（照合の READ）だけを出す（ID の取り方は対象の ID なので求めない）。
+    const detail = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
+    await detail.getByTestId('scenario-verification-values').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await detail.getByTestId('scenario-verification-values').locator('dd').evaluateAll((items) => items.map((item) => item.getAttribute('data-item'))))
+      .toEqual(['readVerification']);
+    expect(await detail.getByTestId('scenario-verification-missing').count()).toBe(0);
+
+    // 予定のレコードは、台帳（API の登録のシナリオ）の照合済みの登録（T40d の場面の登録）。
+    const planned = withControlData((database) => readPlannedUpdateTarget(database, scenarioId));
+    expect(planned).toBe(API_WRITE_VALUES.recordId);
+    const scenario = withControlData((database) => readScenario(database, scenarioId));
+    const api = scenario?.current.api ?? null;
+    if (scenario === null || api === null) {
+      throw new Error('the approved API update scenario is missing');
+    }
+    installFakeUpdateWrite(API_FLOW_OUTPUT, apiUpdateActionRunTextOf(scenarioId, scenario.revision, api));
+    const start = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+    await start.getByTestId('write-start-open').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await start.getByTestId('write-start-target').getAttribute('data-target')).toBe(planned);
+    expect(await start.getByTestId('write-start-form').getAttribute('data-path')).toBe(`/orgs/7/members/${API_WRITE_VALUES.recordId}/edit`);
+    expect(await start.getByTestId('write-start-ledger-unbound').count()).toBe(0);
+    const startHtml = await start.content();
+    await screenshot(start, 't41e2-02-api-update-start');
+    await start.getByTestId('write-start-open').click();
+    const dialog = start.getByRole('dialog', { name: writeText.startDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.textContent()).toContain(writeText.startDialogUpdateBody);
+    await dialog.getByRole('button', { name: writeText.startDialog.confirm, exact: true }).click();
+    await start.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
+    const jobId = new URL(start.url()).pathname.split('/').at(-1) ?? '';
+    expect(await waitForEnd(jobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
+
+    // 結果: 管理データの書き込みの結果（API の更新、対象の ID、前後の差分）と、画面の API の要約と前後の差分が同じ。
+    const stored = withControlData((database) => readWriteResult(database, jobId));
+    expect(stored).toMatchObject({ result: 'VERIFIED', writeKind: 'UPDATE', transport: 'API', targetRecordId: planned, recordId: planned });
+    const generated = stored?.submittedValues['name'] ?? '';
+    expect(API_UPDATE_NAMES).toContain(generated);
+    const job = await openPage(`/jobs/${jobId}`);
+    const result = job.locator('[data-testid="write-result"]:not([data-result=""])');
+    await result.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect([await result.getAttribute('data-transport'), await result.getAttribute('data-kind')]).toEqual(['API', 'UPDATE']);
+    expect(await job.getByTestId('write-result-api').getAttribute('data-shape-digest')).toBe(api.shapeDigest);
+    expect(await job.getByTestId('write-result-target').textContent()).toBe(planned);
+    expect(await job.getByTestId('write-result-diff-changed').evaluateAll((rows) => rows.map((row) => [
+      row.getAttribute('data-field-name'), row.getAttribute('data-matched'),
+      row.querySelector('[data-testid="write-result-diff-previous"]')?.textContent ?? null,
+      row.querySelector('[data-testid="write-result-diff-new"]')?.textContent ?? null,
+    ]))).toEqual([['name', 'true', API_UPDATE_PREVIOUS_NAME, generated]]);
+    expect(await job.getByTestId('write-result-diff-kept').evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-field-name'), row.getAttribute('data-matched')])))
+      .toEqual([['email', 'true'], ['plan', 'true']]);
+    await screenshot(job, 't41e2-03-api-update-result');
+    const history = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
+    const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
+    await entry.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect([await entry.getAttribute('data-transport'), await entry.getAttribute('data-target')]).toEqual(['API', planned]);
+    expectNoReservedLeft(scenarioId);
+
+    // 目印: probe が欄に入れた値・ページの値・Authorization の値は、開始・結果・履歴の画面に出ない。
+    for (const body of [startHtml, await job.content(), await history.content()]) {
+      for (const marker of [...API_MARKERS, 'plan-t41e-page-value', API_AUTHORIZATION_VALUE]) {
+        expect(body.includes(marker), marker).toBe(false);
+      }
+    }
+  });
+
+  it('shows the reason that the ledger is no longer bound to the filter on the start screen, and does not offer the start', async () => {
+    // 台帳（応答の鍵 `id`）に結び付けて保存・承認した後に、台帳の登録の ID を読む鍵を `uid` に変える。
+    const ledgerDraft = (key: string): Record<string, unknown> => ({
+      transport: 'API', fieldNames: ['email', 'name'], readChecks: [], sideEffectConfirmations: confirmations(true),
+      limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
+      api: { shapeDigest: FLOW_CREATE.submissionProbe?.shapeDigest, pageKeys: ['tenant_id'], filterName: null, recordId: { source: 'RESPONSE_BODY_KEY', key }, ledger: null },
+    });
+    const ledger = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: { profileId: API_FLOW_PROFILE_ID, candidateIdentityDigest: FLOW_CREATE.identityDigest, ...ledgerDraft('id') },
+    });
+    expect(ledger.ok).toBe(true);
+    const scenarioId = await prepareApiUpdate(ledger.scenarioId);
+    expect(await valueOf<{ ledgerBindingRejection: string | null }>('writeStartPageFn', 'GET', { scenarioId })).toMatchObject({ ledgerBindingRejection: null });
+    const revision = (await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: ledger.scenarioId })).scenario.revision;
+    expect(await valueOf('updateScenarioFn', 'POST', { scenarioId: ledger.scenarioId, expectedRevision: revision, draft: ledgerDraft('uid') }))
+      .toMatchObject({ ok: true });
+    const view = await valueOf<{ ledgerBindingRejection: string | null; startable: boolean }>('writeStartPageFn', 'GET', { scenarioId });
+    expect(view).toMatchObject({ ledgerBindingRejection: 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID', startable: false });
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+    const unbound = page.getByTestId('write-start-ledger-unbound');
+    await unbound.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await unbound.getAttribute('data-reason')).toBe('SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID');
+    expect(await unbound.textContent()).toContain(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID.description);
+    expect(await page.getByTestId('write-start-open').count()).toBe(0);
+    await screenshot(page, 't41e2-04-api-update-ledger-unbound');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T41e-3（T41R-fix-B の申し送り）: API の更新の台帳の選択肢は、保存を通る登録のシナリオ（同じ表の API の登録）だけ
+// ---------------------------------------------------------------------------------------------------------------
+
+describe('T41e-3: the ledger options of an API update scenario', () => {
+  it('offers only the API create scenarios of the same table, and tells what to do when there is none', async () => {
+    // 別の表（`/rest/v1/teams`）の更新: 同じ表の API の登録のシナリオがないので、選べる台帳がない。理由（同じ送り先の API の登録を先に作り、照合済みに
+    // する）を出す。
+    const teams = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE_TEAMS.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE_TEAMS.submissionProbe?.shapeDigest ?? '')}`);
+    const form = teams.getByTestId('scenario-api-fields');
+    await form.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await teams.locator('select[name="api-ledger"] option').evaluateAll((items) =>
+      items.map((item) => (item as HTMLOptionElement).value).filter((value) => value !== ''))).toEqual([]);
+    expect(await form.getByTestId('scenario-api-no-ledger').textContent()).toBe(text.api.noLedgerOptions);
+    await screenshot(teams, 't41e3-01-api-update-no-ledger');
+
+    // 会員の表の更新: 同じ表の API の登録（応答の鍵が filter の名前と同じもの）だけを選べる（判定は下書きの確かめと同じ部品）。
+    const members = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_UPDATE.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_UPDATE.submissionProbe?.shapeDigest ?? '')}`);
+    await members.getByTestId('scenario-api-fields').waitFor({ timeout: UI_TIMEOUT_MS });
+    const offered = await members.locator('select[name="api-ledger"] option').evaluateAll((items) =>
+      items.map((item) => (item as HTMLOptionElement).value).filter((value) => value !== ''));
+    expect(offered).toContain(apiState.createId);
+    expect(await members.getByTestId('scenario-api-no-ledger').count()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// T41g（Task 41 の設計書 3.5.1。ユーザーの判断「1で進めて。明日の検証に必要。」）: 登録してから更新する（1 回の操作で、台帳の登録 → 続けて更新）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** T41g: 偽のワーカーが書く登録の値（匿名の合成の値）。 */
+const CHAIN_VALUES = Object.freeze({ emails: ['t41g-a@example.invalid', 't41g-b@example.invalid'], name: 't41g-name', pageKeyValue: 'tenant-t41g' });
+
+/** T41g: 照合の READ を持つ、始められる API の登録のシナリオ（台帳）を作り、入力の規則を付けて承認する。シナリオの id を返す。 */
+const prepareApiCreateLedger = async (): Promise<string> => {
+  const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+    draft: {
+      profileId: API_FLOW_PROFILE_ID, candidateIdentityDigest: FLOW_CREATE.identityDigest, transport: 'API', fieldNames: ['email', 'name'], readChecks: [],
+      sideEffectConfirmations: confirmations(true), limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
+      verification: {
+        successCondition: null, inputErrorCondition: null, recordId: null,
+        readVerification: { readCheckId: apiState.readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
+      },
+      api: {
+        shapeDigest: FLOW_CREATE.submissionProbe?.shapeDigest, pageKeys: ['tenant_id'], filterName: null, recordId: { source: 'RESPONSE_BODY_KEY', key: 'id' },
+        ledger: null,
+      },
+    },
+  });
+  expect(created, JSON.stringify(created)).toMatchObject({ ok: true });
+  const detail = await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: created.scenarioId });
+  expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
+    scenarioId: created.scenarioId,
+    expectedScenarioRevision: detail.scenario.revision,
+    expectedRuleSetRevision: null,
+    fieldRules: [
+      // 照合の READ が比べるメールアドレスは、実行のたびに変わる値（2 つの値の固定の一覧）にする（許可の発行の `READ_VERIFICATION_NOT_VARYING` の決まり）。
+      { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [...CHAIN_VALUES.emails] },
+      { fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [CHAIN_VALUES.name] },
+    ],
+    relations: [],
+    uniqueKeyFieldNames: [],
+  })).toMatchObject({ ok: true });
+  await approveByFunction(created.scenarioId);
+  return created.scenarioId;
+};
+
+/** T41g: 偽のワーカーが書く API の登録の `action-run.json`（結果は `outcome`。照合済みなら登録の ID と照合の READ の一致を持つ）。 */
+const chainCreateActionRunTextOf = (scenarioId: string, scenarioRevision: number, api: ScenarioApiSpec, recordId: string | null): string => {
+  const at = formatCompactUtcTimestamp(new Date(Date.now() + ACTION_RUN_TIME_OFFSET_MS), 't41g fake create run');
+  const verified = recordId !== null;
+  return JSON.stringify({
+    schemaVersion: ACTION_RUN_SCHEMA_VERSION,
+    jobId: '__START_JOB_ID__',
+    runId: FAKE_RUN_ID,
+    profileId: API_FLOW_PROFILE_ID,
+    scenarioId,
+    scenarioRevision,
+    grantId: '__START_GRANT_ID__',
+    seedRecord: '__START_SEED_RECORD__',
+    submittedValues: { email: '__START_VALUE:email__', name: '__START_VALUE:name__' },
+    resultConditions: null,
+    submission: 'SENT',
+    blockReason: null,
+    httpStatus: 201,
+    responseJudgement: 'SUCCESS',
+    recordId,
+    readVerification: verified ? { readCheckId: apiState.readCheckId, readCheckRevision: 1, result: 'MATCHED' } : null,
+    reservationState: 'COMMITTED',
+    result: verified ? 'VERIFIED' : 'PARTIAL',
+    reason: verified ? 'READ_VERIFICATION_MATCHED' : 'RECORD_ID_NOT_FOUND',
+    startedAt: at,
+    submittedAt: at,
+    finishedAt: at,
+    transport: 'API',
+    api: actionApiSummaryOf(api, { tenant_id: CHAIN_VALUES.pageKeyValue }),
+  });
+};
+
+/** T41g: 1 つの偽のワーカーの入口で、登録のジョブと続けて始まる更新のジョブの両方に答える（更新の START には更新の記録を書く）。 */
+const installFakeChainWrite = (createText: string, updateText: string): void => {
+  const directory = `${rootOf().root}/fake-workers/chain-${String(Date.now())}`;
+  mkdirSync(directory, { recursive: true });
+  const worker = writeFakeWorker(directory, 'write', fakeWorkerValuesOf(FAKE_RUN_IDS, {
+    heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
+    write: {
+      outputDirectory: `${rootOf().root}/${API_FLOW_OUTPUT}`, recheck: 1, onReject: 'report', submission: { submission: 'SENT', blockReason: null },
+      actionRunText: createText, actionRunTextForUpdate: updateText, end: 'finish',
+    },
+  }));
+  writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
+};
+
+/** T41g: 開始の画面の値の、登録してから更新する、の項目（確かめる所）。 */
+interface ChainStartPage {
+  readonly chain: {
+    readonly offer: string | null;
+    readonly startable: boolean;
+    readonly last: { readonly state: string; readonly reason: string | null; readonly createJobId: string; readonly updateJobId: string | null } | null;
+  } | null;
+}
+/** T41g: ジョブの詳細の、続けて更新する予定と状態（確かめる所）。 */
+interface ChainJobDetail {
+  readonly writeChain: {
+    readonly state: string; readonly reason: string | null; readonly updateScenarioId: string; readonly updateJobId: string | null;
+  } | null;
+}
+
+/** T41g: 登録のジョブの、続けて更新する状態が「登録中」でなくなるまで待つ。 */
+const settledChainOf = async (createJobId: string): Promise<NonNullable<ChainJobDetail['writeChain']>> => {
+  // PRE42-CC 組 UI-K2（CC-112）: 読み直して待つのは補助（上限は前と同じ。間隔は前の `expect.poll` の既定の 50 ms）。
+  await waitForJobViaServerFunctions(
+    (jobId) => valueOf<ChainJobDetail>('getAuditJobFn', 'GET', { jobId }),
+    createJobId,
+    (job) => job.writeChain?.state !== 'CREATING',
+    { limitMs: WAIT_LIMIT_MS, stepMs: EXPECT_POLL_DEFAULT_INTERVAL_MS },
+  );
+  const chain = (await valueOf<ChainJobDetail>('getAuditJobFn', 'GET', { jobId: createJobId })).writeChain;
+  if (chain === null) {
+    throw new Error('the chain of the create job is missing');
+  }
+  return chain;
+};
+
+/** T41g: 開始の画面で「登録してから更新する」を確認のダイアログの後に始める。登録のジョブの id を返す。 */
+const startChainOnScreen = async (scenarioId: string, shot: string): Promise<string> => (await startChainPageOnScreen(scenarioId, shot)).jobId;
+
+/** T41g-2: 開始の画面で「登録してから更新する」を始め、移った登録のジョブの画面（読み込み直さない）と、そのジョブの id を返す。 */
+const startChainPageOnScreen = async (scenarioId: string, shot: string): Promise<{ readonly jobId: string; readonly page: Page }> => {
+  const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
+  await page.getByTestId('write-start-chain-open').waitFor({ timeout: UI_TIMEOUT_MS });
+  await page.getByTestId('write-start-chain-open').click();
+  const dialog = page.getByRole('dialog', { name: writeText.chain.dialogTitle });
+  await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+  expect(await dialog.getByTestId('write-start-chain-step').evaluateAll((steps) => steps.map((step) => step.getAttribute('data-step')))).toEqual(['CREATE', 'UPDATE']);
+  expect(await focusedText(page)).toBe(writeText.startDialog.cancel);
+  await screenshot(page, shot);
+  await dialog.getByRole('button', { name: writeText.chain.confirm, exact: true }).click();
+  await page.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
+  // T41g-2: 読み込み直していないことの印（文書を読み込み直すと消える）。
+  await page.evaluate(() => {
+    document.documentElement.dataset['t41gNoReload'] = 'kept';
+  });
+  return { jobId: new URL(page.url()).pathname.split('/').at(-1) ?? '', page };
+};
+
+describe('T41g: create then update in one operation', () => {
+  it('creates a record and then updates it from one confirmation, and both end verified', async () => {
+    const ledgerId = await prepareApiCreateLedger();
+    const updateId = await prepareApiUpdate(ledgerId);
+    expect(withControlData((database) => readPlannedUpdateTarget(database, updateId))).toBeNull();
+    // 台帳の登録のシナリオは、今の開始の画面の確かめで始められる。
+    const ledgerView = await valueOf<{ startable: boolean }>('writeStartPageFn', 'GET', { scenarioId: ledgerId });
+    expect(ledgerView.startable, JSON.stringify(ledgerView)).toBe(true);
+    const startView = await valueOf<ChainStartPage>('writeStartPageFn', 'GET', { scenarioId: updateId });
+    expect(startView.chain, JSON.stringify(startView)).toMatchObject({ offer: 'NO_TARGET', startable: true });
+    const ledger = withControlData((database) => readScenario(database, ledgerId));
+    const update = withControlData((database) => readScenario(database, updateId));
+    if (ledger?.current.api === undefined || update?.current.api === undefined) {
+      throw new Error('the API scenarios are missing');
+    }
+    installFakeChainWrite(
+      chainCreateActionRunTextOf(ledgerId, ledger.revision, ledger.current.api, 'rec-t41g-1'),
+      apiUpdateActionRunTextOf(updateId, update.revision, update.current.api),
+    );
+    const { jobId: createJobId, page: createPage } = await startChainPageOnScreen(updateId, 't41g-01-chain-dialog');
+    expect(await waitForEnd(createJobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
+    const chain = await settledChainOf(createJobId);
+    expect(chain).toMatchObject({ state: 'UPDATE_STARTED', reason: null, updateScenarioId: updateId });
+    const updateJobId = chain.updateJobId ?? '';
+    // T41g-2: 移った登録のジョブの画面は、登録のジョブが終わった後も、続けて更新する予定が「登録中」の間は読み直し、読み込み直さずに更新のジョブへの
+    // リンクを出す（読み直しの間隔はジョブの画面と同じ）。
+    const liveLink = createPage.getByTestId('job-write-chain-update');
+    await liveLink.waitFor({ timeout: WAIT_LIMIT_MS });
+    expect(await liveLink.getAttribute('href')).toBe(`/jobs/${updateJobId}`);
+    expect(await createPage.getByTestId('job-write-chain').getAttribute('data-state')).toBe('UPDATE_STARTED');
+    expect(await createPage.evaluate(() => document.documentElement.dataset['t41gNoReload'])).toBe('kept');
+    expect(await waitForEnd(updateJobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
+    expect(withControlData((database) => readWriteResult(database, createJobId))).toMatchObject({ result: 'VERIFIED', recordId: 'rec-t41g-1' });
+    expect(withControlData((database) => readWriteResult(database, updateJobId)))
+      .toMatchObject({ result: 'VERIFIED', writeKind: 'UPDATE', targetRecordId: 'rec-t41g-1' });
+
+    // 登録のジョブの画面: 続けて更新する状態と、更新のジョブへのリンク。
+    const job = await openPage(`/jobs/${createJobId}`);
+    const shown = job.getByTestId('job-write-chain');
+    await shown.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await shown.getAttribute('data-state')).toBe('UPDATE_STARTED');
+    expect(await shown.getByTestId('job-write-chain-update').getAttribute('href')).toBe(`/jobs/${updateJobId}`);
+    await screenshot(job, 't41g-02-chain-create-job');
+    // 更新のシナリオの開始の画面: 最後の続けて始めた状態。
+    const start = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${updateId}/write`);
+    expect(await start.getByTestId('write-start-chain-state').getAttribute('data-state')).toBe('UPDATE_STARTED');
+    expectNoReservedLeft(ledgerId);
+    expectNoReservedLeft(updateId);
+  });
+
+  it('does not start the update when the create does not end verified, and tells the reason', async () => {
+    const ledgerId = await prepareApiCreateLedger();
+    const updateId = await prepareApiUpdate(ledgerId);
+    const ledger = withControlData((database) => readScenario(database, ledgerId));
+    const update = withControlData((database) => readScenario(database, updateId));
+    if (ledger?.current.api === undefined || update?.current.api === undefined) {
+      throw new Error('the API scenarios are missing');
+    }
+    installFakeChainWrite(
+      chainCreateActionRunTextOf(ledgerId, ledger.revision, ledger.current.api, null),
+      apiUpdateActionRunTextOf(updateId, update.revision, update.current.api),
+    );
+    const createJobId = await startChainOnScreen(updateId, 't41g-03-chain-dialog-partial');
+    expect(await waitForEnd(createJobId)).toMatchObject({ state: 'FINISHED' });
+    expect(await settledChainOf(createJobId)).toMatchObject({ state: 'NOT_STARTED', reason: 'CREATE_NOT_VERIFIED', updateJobId: null });
+    expect(withControlData((database) => readWriteReservations(database, updateId))).toEqual([]);
+    const job = await openPage(`/jobs/${createJobId}`);
+    const shown = job.getByTestId('job-write-chain');
+    await shown.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect([await shown.getAttribute('data-state'), await shown.getAttribute('data-reason')]).toEqual(['NOT_STARTED', 'CREATE_NOT_VERIFIED']);
+    expect(await shown.textContent()).toContain(WRITE_CHAIN_STOP_REASON_CATALOG.CREATE_NOT_VERIFIED.label);
+    expect(await shown.getByTestId('job-write-chain-update').count()).toBe(0);
+    await screenshot(job, 't41g-04-chain-not-started');
+  });
+
+  it('starts nothing when the update scenario cannot start (no approval), and keeps the CSRF protection', async () => {
+    const ledgerId = await prepareApiCreateLedger();
+    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', { draft: apiUpdateDraftOf(ledgerId) });
+    expect(created.ok).toBe(true);
+    const revision = (await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: created.scenarioId })).scenario.revision;
+    expect((await valueOf<ChainStartPage>('writeStartPageFn', 'GET', { scenarioId: created.scenarioId })).chain).toMatchObject({ startable: false });
+    const page = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${created.scenarioId}/write`);
+    await page.getByTestId('write-start').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('write-start-chain-open').count()).toBe(0);
+    // T41g-3（T41R5 の M-1）: 要求は、画面が読んだ台帳の登録のシナリオの版も持つ。
+    const ledgerRevision = (await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: ledgerId })).scenario.revision;
+    const request = { scenarioId: created.scenarioId, expectedRevision: revision, expectedCreateRevision: ledgerRevision };
+    expect(await valueOf('startWriteCreateThenUpdateFn', 'POST', request)).toMatchObject({ ok: false, stage: 'CHAIN', reason: 'UPDATE_NOT_STARTABLE' });
+    // 登録のシナリオの版のない要求は、入力の形で拒む（400）。
+    expect((await call('startWriteCreateThenUpdateFn', 'POST', { scenarioId: created.scenarioId, expectedRevision: revision })).response.status)
+      .toBe(STATUS.BAD_REQUEST);
+    const response = await rawRequest(started().port, `/_serverFn/${ids.get('startWriteCreateThenUpdateFn') ?? ''}`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json', 'x-tsr-serverfn': 'true', 'sec-fetch-site': 'cross-site', origin: started().origin },
+      body: encodeServerFunctionPayload(request),
+    });
+    expect(response.status).toBe(STATUS.FORBIDDEN);
+    // 登録も始めていない（許可も予約もない）。
+    withControlData((database) => {
+      expect(readWriteReservations(database, ledgerId)).toEqual([]);
+      expect(readWriteReservations(database, created.scenarioId)).toEqual([]);
+    });
+  });
+
+  // T41g-3（T41R5 の M-1）: 画面が読んだ台帳の登録のシナリオの版を、登録の許可の発行に渡す。違えば何も始めない。
+  it('starts nothing when the ledger create scenario changed after the screen read it', async () => {
+    const ledgerId = await prepareApiCreateLedger();
+    const updateId = await prepareApiUpdate(ledgerId);
+    const view = await valueOf<ChainStartPage & { scenario: { revision: number } }>('writeStartPageFn', 'GET', { scenarioId: updateId });
+    expect(view.chain).toMatchObject({ startable: true });
+    const ledgerRevision = (await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: ledgerId })).scenario.revision;
+    expect(await valueOf('startWriteCreateThenUpdateFn', 'POST', {
+      scenarioId: updateId, expectedRevision: view.scenario.revision, expectedCreateRevision: ledgerRevision - 1,
+    })).toMatchObject({ ok: false, stage: 'GRANT', reason: 'GRANT_REVISION_CONFLICT' });
+    withControlData((database) => {
+      expect(readWriteReservations(database, ledgerId)).toEqual([]);
+      expect(readWriteReservations(database, updateId)).toEqual([]);
+    });
   });
 });

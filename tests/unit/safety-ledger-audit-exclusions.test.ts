@@ -26,6 +26,8 @@ const EVENT: BlockedAuditExclusionEvent = Object.freeze({
   url: 'https://example.com/admin/logout',
   mainFrameNavigation: true,
   reason: 'AUDIT_EXCLUDED_URL',
+  resourceType: 'document',
+  phase: 'LOAD',
 });
 
 const readSchema = (name: string): object =>
@@ -43,7 +45,16 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
   it('defines the reason only for this record, and does not add it to the existing reason lists', () => {
     expect(BLOCKED_AUDIT_EXCLUSION_REASONS).toEqual(['AUDIT_EXCLUDED_URL']);
     expect(Object.isFrozen(BLOCKED_AUDIT_EXCLUSION_REASONS)).toBe(true);
-    expect(BLOCKED_REQUEST_REASONS).toEqual(['NON_READ_METHOD']);
+    // T35a: 要求の理由の一覧には、サービスの Origin への要求の上限の理由を足した（除外の理由は足していない）。
+    // T35R-fix（T35R の C-1）: `SERVICE_ORIGIN_REVISIT` を足した（除外の理由は足さない）。
+    // DEF-129: ページが始めた main frame の読み込みの上限の理由を足した（除外の理由は足さない）。DEF-130-fix: 文書でない要求の数の上限の理由を足した。
+    // AS-a: 監査の段の送信の扱いで、1 つの読み込みで通す数の上限の理由を足した（除外の理由は足さない）。
+    expect(BLOCKED_REQUEST_REASONS).toEqual([
+      'NON_READ_METHOD', 'SERVICE_REQUEST_LIMIT_REACHED', 'SERVICE_ORIGIN_REVISIT', 'PAGE_NAVIGATION_LIMIT_REACHED', 'PAGE_SUBRESOURCE_LIMIT_REACHED',
+      'AUDIT_SEND_OVER_LIMIT',
+      // T44R の I-1。
+      'PAGE_LEAVE_REQUEST_LIMIT_REACHED',
+    ]);
     expect(BLOCKED_NAVIGATION_REASONS).toEqual(['EXTERNAL_MAIN_FRAME_NAVIGATION']);
     expect(SAFETY_EVENT_KINDS).not.toContain('blockedAuditExclusions');
     expectTypeOf<BlockedAuditExclusionEvent['reason']>().toEqualTypeOf<'AUDIT_EXCLUDED_URL'>();
@@ -52,24 +63,32 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
 
   it('does not put the record in the snapshot or the Evidence when nothing was excluded (the public audit output is unchanged)', () => {
     const ledger = new SafetyLedger();
-    ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.com/form', reason: 'NON_READ_METHOD' });
+    ledger.recordBlockedRequest({ method: 'POST', url: 'https://example.com/form', reason: 'NON_READ_METHOD', resourceType: 'document', phase: 'LOAD' });
     const snapshot = ledger.snapshot();
     expect(Object.hasOwn(snapshot, 'blockedAuditExclusions')).toBe(false);
-    expect(Object.hasOwn(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE'), 'blockedAuditExclusions')).toBe(false);
+    expect(Object.hasOwn(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE', { kind: 'PAGE_AUDIT' }), 'blockedAuditExclusions')).toBe(false);
     expect(Object.hasOwn(new SafetyLedger().snapshot(), 'blockedAuditExclusions')).toBe(false);
   });
 
   it('records the method (canonical), the URL, whether it was a main frame navigation and the reason, with the count', () => {
     const ledger = new SafetyLedger();
     ledger.recordBlockedAuditExclusion(EVENT);
-    ledger.recordBlockedAuditExclusion({ ...EVENT, method: 'HEAD', url: 'https://example.com/img/delete.png', mainFrameNavigation: false });
+    ledger.recordBlockedAuditExclusion({
+      ...EVENT, method: 'HEAD', url: 'https://example.com/img/delete.png', mainFrameNavigation: false, resourceType: 'image',
+    });
     const snapshot = ledger.snapshot();
 
     expect(snapshot.blockedAuditExclusions).toEqual({
       count: 2,
       events: [
-        { method: 'GET', url: 'https://example.com/admin/logout', mainFrameNavigation: true, reason: 'AUDIT_EXCLUDED_URL' },
-        { method: 'HEAD', url: 'https://example.com/img/delete.png', mainFrameNavigation: false, reason: 'AUDIT_EXCLUDED_URL' },
+        {
+          method: 'GET', url: 'https://example.com/admin/logout', mainFrameNavigation: true, reason: 'AUDIT_EXCLUDED_URL',
+          resourceType: 'document', phase: 'LOAD',
+        },
+        {
+          method: 'HEAD', url: 'https://example.com/img/delete.png', mainFrameNavigation: false, reason: 'AUDIT_EXCLUDED_URL',
+          resourceType: 'image', phase: 'LOAD',
+        },
       ],
     });
     expect(Object.isFrozen(snapshot.blockedAuditExclusions)).toBe(true);
@@ -80,7 +99,7 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
     expect(snapshot.blockedNavigations).toEqual([]);
     expect(snapshot.blockedRequestsByMethod).toEqual({});
     expect(snapshot.invariantViolations).toEqual([]);
-    expect(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE').blockedAuditExclusions).toEqual(snapshot.blockedAuditExclusions);
+    expect(safetyEventsEvidenceFromSnapshot(snapshot, 'PASSIVE', { kind: 'PAGE_AUDIT' }).blockedAuditExclusions).toEqual(snapshot.blockedAuditExclusions);
   });
 
   it('truncates the URL like the other request records', () => {
@@ -120,8 +139,8 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
     withLedger.recordBlockedAuditExclusion(EVENT);
     const withRecord = withLedger.snapshot();
 
-    expect(validateEvidence(JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(without, 'PASSIVE'))))).toBe(true);
-    expect(validateEvidence(JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(withRecord, 'PASSIVE'))))).toBe(true);
+    expect(validateEvidence(JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(without, 'PASSIVE', { kind: 'PAGE_AUDIT' }))))).toBe(true);
+    expect(validateEvidence(JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(withRecord, 'PASSIVE', { kind: 'PAGE_AUDIT' }))))).toBe(true);
     expect(validateSnapshot(JSON.parse(JSON.stringify(without)))).toBe(true);
     expect(validateSnapshot(JSON.parse(JSON.stringify(withRecord)))).toBe(true);
   });
@@ -130,8 +149,10 @@ describe('T25b round 1: the blockedAuditExclusions record of the Safety Ledger',
     const ajv = createAjv();
     const validateEvidence = ajv.getSchema('urn:beaksight:schema:page:1.0#/$defs/safetyEventsEvidence');
     if (validateEvidence === undefined) throw new Error('schema definition was not found');
-    const base = JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE'))) as object;
-    const event = { method: 'GET', url: 'https://example.com/admin/logout', mainFrameNavigation: true, reason: 'AUDIT_EXCLUDED_URL' };
+    const base = JSON.parse(JSON.stringify(safetyEventsEvidenceFromSnapshot(new SafetyLedger().snapshot(), 'PASSIVE', { kind: 'PAGE_AUDIT' }))) as object;
+    const event = {
+      method: 'GET', url: 'https://example.com/admin/logout', mainFrameNavigation: true, reason: 'AUDIT_EXCLUDED_URL', resourceType: 'document', phase: 'LOAD',
+    };
 
     expect(validateEvidence({ ...base, blockedAuditExclusions: { count: 1, events: [{ ...event, reason: 'NON_READ_METHOD' }] } })).toBe(false);
     expect(validateEvidence({ ...base, blockedAuditExclusions: { count: 1, events: [{ ...event, body: 'x' }] } })).toBe(false);

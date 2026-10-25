@@ -27,6 +27,7 @@ import {
   ICACLS_PATH,
   MAX_CREDENTIAL_FILE_BYTES,
   MAX_CREDENTIAL_VALUE_LENGTH,
+  MIN_CREDENTIAL_VALUE_LENGTH,
   createCredentialStore,
   createCredentialStoreWith,
   credentialEntropyFor,
@@ -266,6 +267,8 @@ describe('T26a: credential store constants, location and file shape', () => {
     expect(CREDENTIAL_CHANGE_KINDS).toEqual(['CREATED', 'USERNAME_CHANGED', 'PASSWORD_CHANGED', 'BOTH_CHANGED']);
     expect(CREDENTIAL_PROTECTION_STATES).toEqual(['AVAILABLE', 'UNAVAILABLE']);
     expect(MAX_CREDENTIAL_VALUE_LENGTH).toBe(256);
+    // T36c（Task 36。設計者の判断 2）: 登録の時点の値の最小の長さ（自動ログインの資格情報の守りの比べの閾値と同じ。一致は境界の一致のテスト）。
+    expect(MIN_CREDENTIAL_VALUE_LENGTH).toBe(4);
     expect(RENAME_RETRY_ERROR_CODES).toEqual(['EPERM', 'EBUSY', 'EACCES']);
     expect(RENAME_MAX_ATTEMPTS).toBeGreaterThan(1);
     expect(RENAME_RETRY_DELAY_MS).toBeGreaterThan(0);
@@ -275,6 +278,7 @@ describe('T26a: credential store constants, location and file shape', () => {
       'CREDENTIAL_ORIGIN_INVALID',
       'CREDENTIAL_VALUE_EMPTY',
       'CREDENTIAL_VALUE_TOO_LONG',
+      'CREDENTIAL_VALUE_TOO_SHORT',
       'CREDENTIAL_VALUE_MALFORMED',
       'CREDENTIAL_CHANGE_EMPTY',
       'CREDENTIAL_ALREADY_EXISTS',
@@ -483,6 +487,9 @@ describe('T26a: value rules', () => {
     ['password', 'an empty value', '', 'CREDENTIAL_VALUE_EMPTY'],
     ['username', 'a value over the limit', `${'a'.repeat(MAX_CREDENTIAL_VALUE_LENGTH)}b`, 'CREDENTIAL_VALUE_TOO_LONG'],
     ['password', 'a value over the limit', `${'a'.repeat(MAX_CREDENTIAL_VALUE_LENGTH)}b`, 'CREDENTIAL_VALUE_TOO_LONG'],
+    // T36c: 最小の長さより短い値（1 文字と、最小より 1 短い値）。
+    ['username', 'a one character value', '☃', 'CREDENTIAL_VALUE_TOO_SHORT'],
+    ['password', 'a value one shorter than the minimum', 'p'.repeat(MIN_CREDENTIAL_VALUE_LENGTH - 1), 'CREDENTIAL_VALUE_TOO_SHORT'],
     ['username', 'a lone high surrogate', 'ab\uD800', 'CREDENTIAL_VALUE_MALFORMED'],
     ['password', 'a lone low surrogate', '\uDC00ab', 'CREDENTIAL_VALUE_MALFORMED'],
     ['password', 'a value that is not a string', 42, 'CREDENTIAL_VALUE_MALFORMED'],
@@ -510,6 +517,17 @@ describe('T26a: value rules', () => {
     const h = harness();
     expect((await caughtStoreError(register(h, values))).code).toBe(code);
     expect(h.spawns).toHaveLength(0);
+  });
+
+  // T36c: 最小の長さちょうどの値は受ける。一部の変更でも、短い値は拒む（項目の名前だけを持つ）。
+  it('accepts values of the minimum length, and rejects a short value in a partial change too', async () => {
+    const h = harness();
+    const minimum = 'm'.repeat(MIN_CREDENTIAL_VALUE_LENGTH);
+    await register(h, { username: minimum, password: minimum });
+    expect((await h.store.decrypt(PROFILE_ID, ORIGIN)).username).toBe(minimum);
+    const error = await caughtStoreError(h.store.change({ profileId: PROFILE_ID, loginOrigin: ORIGIN, password: 'abc' }));
+    expect(error.code).toBe('CREDENTIAL_VALUE_TOO_SHORT');
+    expect(error.field).toBe('password');
   });
 
   it('rejects an invalid profile id for the reads and the removal too', async () => {

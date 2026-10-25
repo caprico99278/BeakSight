@@ -29,6 +29,7 @@ export type ExecutedReadVerification = Extract<ActionEvidenceDocument['readVerif
 export const sampleExecutedRead = (overrides: Partial<ExecutedReadVerification> = {}): ExecutedReadVerification => ({
   readCheckId: 'rc-verify',
   readCheckRevision: 1,
+  targetKind: 'CANDIDATE',
   targetIdentityDigest: DIGEST,
   state: 'EXECUTED',
   result: 'MATCHED',
@@ -75,6 +76,9 @@ export const verifiedCreateDocuments = (): ActionReportDocuments => {
     startedAt: '20261015010000',
     submittedAt: '20261015010010',
     finishedAt: '20261015010030',
+    // T40c: 版 1.1 の送り方と API の要約（FORM は null）。
+    transport: 'FORM',
+    api: null,
   };
   const evidence: ActionEvidenceDocument = {
     schemaVersion: ACTION_EVIDENCE_SCHEMA_VERSION,
@@ -103,6 +107,8 @@ export const verifiedCreateDocuments = (): ActionReportDocuments => {
     reason: 'READ_VERIFICATION_MATCHED',
     startedAt: '20261015010000',
     finishedAt: '20261015010030',
+    transport: 'FORM',
+    api: null,
   };
   const approvalSummary = sampleApprovalSummary(
     { kind: 'CREATE', profileId: 'example-write', scenarioId: 'scenario-w', scenarioRevision: 1, grantId: 'grant-w' },
@@ -198,6 +204,76 @@ export const partialDocuments = (): ActionReportDocuments => {
       readVerification: { readCheckId: 'rc-verify', readCheckRevision: 1, state: 'NOT_EXECUTED' },
       result: 'PARTIAL',
       reason: 'RECORD_ID_NOT_FOUND',
+    },
+    approvalSummary: base.approvalSummary,
+  };
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// T40c（Task 40 の設計書 3.4）: 版 1.1 の API の登録の見本と、前の版（1.0）の見本
+// ---------------------------------------------------------------------------------------------------------------
+
+/** API の見本の送り先の Origin と path の型（匿名の合成の値）。 */
+export const SAMPLE_API_ORIGIN = 'http://127.0.0.2:4174';
+export const SAMPLE_API_PATH = '/rest/v1/members';
+export const SAMPLE_API_SHAPE_DIGEST = `sha256:${'b'.repeat(64)}`;
+
+/** API の要約の見本（照合の型と同じ鍵。ページが決める鍵の値は、JSON の scalar を文字列にした形）。 */
+export const sampleApiSummary = (overrides: Partial<NonNullable<ActionRunDocument['api']>> = {}): NonNullable<ActionRunDocument['api']> => ({
+  method: 'POST',
+  origin: SAMPLE_API_ORIGIN,
+  pathShape: SAMPLE_API_PATH,
+  shapeDigest: SAMPLE_API_SHAPE_DIGEST,
+  keyNames: ['email', 'name'],
+  pageKeyNames: ['tenant_id'],
+  httpFieldNames: ['x-client-info'],
+  recordIdKey: 'id',
+  pageKeyValues: { tenant_id: '"tenant-1"' },
+  ...overrides,
+});
+
+/** 照合済みの API の登録（`VERIFIED`。成否の条件は持たない）。 */
+export const verifiedApiCreateDocuments = (): ActionReportDocuments => {
+  const base = verifiedCreateDocuments();
+  const api = sampleApiSummary();
+  return {
+    actionRun: { ...base.actionRun, resultConditions: null, httpStatus: 201, transport: 'API', api },
+    evidence: {
+      ...base.evidence,
+      submission: { ...base.evidence.submission, actionPath: SAMPLE_API_PATH },
+      response: { httpStatus: 201, judgement: 'SUCCESS', judgedAt: '20261015010012' },
+      transport: 'API',
+      api,
+    },
+    approvalSummary: base.approvalSummary,
+  };
+};
+
+/** 送らずに止めた API の登録（`BLOCKED`。ページが決める鍵の値は読めていない）。 */
+export const blockedApiDocuments = (): ActionReportDocuments => {
+  const base = blockedDocuments();
+  const api = sampleApiSummary({ pageKeyValues: null });
+  return {
+    actionRun: { ...base.actionRun, resultConditions: null, transport: 'API', api },
+    evidence: { ...base.evidence, transport: 'API', api },
+    approvalSummary: base.approvalSummary,
+  };
+};
+
+/**
+ * T41e（Task 41 の設計書 3.5）: 照合済みの API の更新（`VERIFIED`。API の要約と更新の前後の差分の両方を持つ）。変える鍵は `name`、保つ鍵は `email`
+ * （保つ欄は値を持たない）。ページが決める鍵の値は、更新では残さない（送る前の値と照らす。T41c）ので空。成否の条件は持たない。
+ */
+export const verifiedApiUpdateDocuments = (): ActionReportDocuments => {
+  const base = verifiedUpdateDocuments();
+  const api = sampleApiSummary({ method: 'PATCH', keyNames: ['name'], recordIdKey: null, pageKeyValues: {} });
+  return {
+    actionRun: { ...base.actionRun, resultConditions: null, transport: 'API', api },
+    evidence: {
+      ...base.evidence,
+      submission: { ...base.evidence.submission, actionPath: SAMPLE_API_PATH },
+      transport: 'API',
+      api,
     },
     approvalSummary: base.approvalSummary,
   };

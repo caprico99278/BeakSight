@@ -10,6 +10,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import { connect as netConnect, type AddressInfo, type Socket } from 'node:net';
 import type { Duplex } from 'node:stream';
 import { LOOPBACK_HOSTNAMES } from '../../src/crawl/normalize-url.js';
+import { startLoopbackHttpServer } from './loopback-server.js';
 
 /** 中継が待ち受ける loopback のアドレス。 */
 const RECORDER_HOST = '127.0.0.1';
@@ -224,8 +225,7 @@ export async function startContactFormFixtureServer(): Promise<ContactFormFixtur
     [CONTACT_FORM_FIXTURE_PATHS.plain, PLAIN_HTML],
     [CONTACT_FORM_FIXTURE_PATHS.googleSignIn, GOOGLE_SIGN_IN_HTML],
   ]);
-  const sockets = new Set<Socket>();
-  const server = createServer((request, response) => {
+  const server = await startLoopbackHttpServer((request, response) => {
     const path = (request.url ?? '').split('?')[0] ?? '';
     requests.push(`${request.method ?? ''} ${path}`);
     const body = request.method === 'GET' ? pages.get(path) : undefined;
@@ -237,20 +237,9 @@ export async function startContactFormFixtureServer(): Promise<ContactFormFixtur
     response.writeHead(STATUS_OK, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
     response.end(body);
   });
-  server.on('connection', (socket: Socket) => {
-    sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
-  });
-  await new Promise<void>((resolve) => server.listen({ host: RECORDER_HOST, port: 0 }, resolve));
-  const { port } = server.address() as AddressInfo;
   return {
-    origin: `http://${RECORDER_HOST}:${port}`,
+    origin: server.origin,
     requests: () => [...requests],
-    close: async () => {
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
+    close: () => server.close(),
   };
 }

@@ -49,6 +49,68 @@ export const sampleStartWrite = (origin: string, overrides: Record<string, unkno
   ...overrides,
 });
 
+/** T40a: API の Origin の例（承認したサービスの Origin。`START` の認証の指定の `approvedServiceOrigins` に入れる）。 */
+export const SAMPLE_API_ORIGIN = 'http://127.0.0.2:4174';
+
+/** T40a: 照合の READ の `{id}` の型の画面の path の例。 */
+export const SAMPLE_API_READ_TEMPLATE_PATH = '/admin/members/{id}/edit';
+
+/**
+ * T40a: 送り方 API の登録の書き込みの指定（受ける形。`origin` の form のない登録の画面と、`apiOrigin` の API）。API の指定はシナリオの API の指定の
+ * 形のまま（鍵と欄の対応、ページが決める鍵、許すヘッダの名前、ID の取り方）。値は欄に対応する鍵ごとの生成した値だけ（ページが決める鍵の値は
+ * 持たない）。照合の READ は `{id}` の型の画面の READ（送る値なし）。
+ */
+export const sampleStartApiWrite = (origin: string, overrides: Record<string, unknown> = {}, apiOrigin = SAMPLE_API_ORIGIN): Record<string, unknown> => ({
+  transport: 'API',
+  scenarioId: 'scenario-1',
+  scenarioRevision: 3,
+  grantId: 'grant-1',
+  profileId: 'profile-1',
+  seedRecord: {
+    seed: 'd'.repeat(64),
+    seedInput: { profileId: 'profile-1', scenarioId: 'scenario-1', scenarioRevision: 3, ruleSetDigest: RULE_DIGEST, executionGrantId: 'grant-1' },
+    baseDate: '2026-10-13',
+    attempt: 0,
+  },
+  formPage: { origin, path: '/admin/members/new' },
+  candidate: { identityDigest: DIGEST, ruleDigest: RULE_DIGEST },
+  submitterIdentityDigest: DIGEST,
+  api: {
+    shapeDigest: `sha256:${'f'.repeat(64)}`,
+    request: {
+      method: 'POST', origin: apiOrigin, pathShape: '/rest/v1/members', queryNames: ['select'], contentType: 'application/json',
+      prefer: ['return=representation'],
+    },
+    // T38R2-fix: 鍵と欄の対応は、目印を入れた欄の型（`fieldType`）も持つ。
+    keyFields: [
+      { key: 'email', type: 'string', field: { kind: 'NAME', name: 'email' }, fieldType: 'email' },
+      { key: 'name', type: 'string', field: { kind: 'NAME', name: 'name' }, fieldType: 'text' },
+      { key: 'score', type: 'number', field: { kind: 'SELECTOR', selector: '#score' }, fieldType: 'number' },
+    ],
+    pageKeys: [{ key: 'tenant_id', type: 'string' }],
+    headerNames: ['authorization', 'content-type', 'prefer'],
+    filterName: null,
+    recordId: { source: 'RESPONSE_BODY_KEY', key: 'id' },
+    ledger: null,
+  },
+  values: { email: 'sample0001@example.invalid', name: 'サンプル 太郎', score: '7' },
+  // T40a-fix: API の書き込みの指定は、成否の条件と入力の誤りの条件を持たない（null）。ID の取り方は検証の指定の `recordId`（API の `recordId` が
+  // あれば null でもよい）。
+  verification: {
+    successCondition: null,
+    inputErrorCondition: null,
+    recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' },
+  },
+  readVerification: {
+    readCheckId: 'rc-api-verify',
+    readCheckRevision: 1,
+    targetPage: { origin, path: SAMPLE_API_READ_TEMPLATE_PATH },
+    definition: { targetPagePath: SAMPLE_API_READ_TEMPLATE_PATH, parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'sample0001@example.invalid' }] },
+  },
+  approvalFacts: sampleApprovalFacts({ kind: 'CREATE', profileId: 'profile-1', scenarioId: 'scenario-1', scenarioRevision: 3, grantId: 'grant-1' }),
+  ...overrides,
+});
+
 /** T31f: 更新の対象のレコードの ID の例（親が実行の許可から写す）。 */
 export const SAMPLE_UPDATE_TARGET_RECORD_ID = '42';
 

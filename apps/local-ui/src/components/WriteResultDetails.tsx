@@ -8,6 +8,8 @@
  *   新しい値と一致、保つ欄の一致）を出す。保つ欄の値は記録にないので出さない。`UNKNOWN` は今の critical のお知らせのまま。
  * - T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: 書き込みの報告の欄（詳細）と列（履歴）。親の確かめに通った報告だけ、開く・ZIP を
  *   落とすリンクを出し、通らない・確かめていないときは配らない理由を出す。
+ * - T40d（Task 40 の設計書 3.5）: 送り方のラベル（詳細の欄と履歴の列）と、API の書き込みの型の要約（method、送り先の Origin、path の型、型の digest）と
+ *   判定のしかたの説明（成否の条件と入力の誤りの条件は使わない）。ラベルは `SCENARIO_TRANSPORT_CATALOG`、文言は `LOCAL_UI_WRITE_TEXT.api`。
  */
 import { Link } from '@tanstack/react-router';
 import { formatDateTime, formatInteger } from '../../../../src/presentation/format.js';
@@ -18,6 +20,7 @@ import {
   actionResultDisplay,
   readCheckResultDisplay,
   responseJudgementDisplay,
+  scenarioTransportDisplay,
   settledReservationStateDisplay,
   submissionStateDisplay,
   toneClass,
@@ -139,6 +142,26 @@ function WriteReport({ report }: Readonly<{ report: WriteReportView }>) {
   );
 }
 
+/** T40d: API の書き込みの型の要約（値を持たない）と、判定のしかたの説明。 */
+function ApiShape({ api }: Readonly<{ api: NonNullable<WriteResultSummaryView['api']> }>) {
+  return (
+    <div data-testid="write-result-api" data-shape-digest={api.shapeDigest}>
+      <h3>{text.api.heading}</h3>
+      <dl className="facts">
+        <dt>{text.api.method}</dt>
+        <dd data-item="method"><code>{api.method}</code></dd>
+        <dt>{text.api.origin}</dt>
+        <dd data-item="origin"><code>{api.origin}</code></dd>
+        <dt>{text.api.pathShape}</dt>
+        <dd data-item="pathShape"><code>{api.pathShape}</code></dd>
+        <dt>{text.api.shapeDigest}</dt>
+        <dd data-item="shapeDigest"><code>{api.shapeDigest}</code></dd>
+      </dl>
+      <p className="muted" data-testid="write-result-api-note">{text.api.judgementNote}</p>
+    </div>
+  );
+}
+
 /** 結果の見出しのお知らせ（`UNKNOWN`・`PARTIAL` だけ。ほかは出さない）。 */
 export function WriteResultWarning({ result }: Readonly<{ result: WriteResultSummaryView }>) {
   if (result.result === 'UNKNOWN') {
@@ -162,10 +185,12 @@ export function WriteResultWarning({ result }: Readonly<{ result: WriteResultSum
 export function WriteResultDetails({ result }: Readonly<{ result: WriteResultSummaryView }>) {
   const resultDisplay = result.result === null ? null : actionResultDisplay(result.result);
   return (
-    <div data-testid="write-result" data-job-id={result.jobId} data-result={result.result ?? ''} data-kind={result.writeKind}>
+    <div data-testid="write-result" data-job-id={result.jobId} data-result={result.result ?? ''} data-kind={result.writeKind} data-transport={result.transport}>
       <WriteResultWarning result={result} />
       {result.result === null ? <p data-testid="write-result-pending">{text.resultPending}</p> : null}
       <dl className="facts">
+        <dt>{text.api.transport}</dt>
+        <dd data-testid="write-result-transport"><Badge display={scenarioTransportDisplay(result.transport)} /></dd>
         <dt>{text.columns.result}</dt>
         <dd data-testid="write-result-label"><Badge display={resultDisplay} /></dd>
         <dt>{text.columns.reason}</dt>
@@ -200,6 +225,7 @@ export function WriteResultDetails({ result }: Readonly<{ result: WriteResultSum
         <dd>{result.settledAt === null ? text.notApplicable : formatDateTime(result.settledAt)}</dd>
       </dl>
       {resultDisplay === null || resultDisplay.description === null ? null : <p className="muted">{resultDisplay.description}</p>}
+      {result.api === null ? null : <ApiShape api={result.api} />}
       {result.update === null ? null : <UpdateDiff update={result.update} />}
       <WriteReport report={result.report} />
       <h3>{text.submittedValuesHeading}</h3>
@@ -226,6 +252,7 @@ export function WriteResultHistory({ results }: Readonly<{ results: readonly Wri
         <thead>
           <tr>
             <th scope="col">{text.columns.recordedAt}</th>
+            <th scope="col">{text.api.transport}</th>
             <th scope="col">{text.columns.result}</th>
             <th scope="col">{text.columns.reason}</th>
             <th scope="col">{text.columns.submission}</th>
@@ -239,8 +266,9 @@ export function WriteResultHistory({ results }: Readonly<{ results: readonly Wri
         <tbody>
           {results.map((result) => (
             <tr key={result.jobId} data-testid="write-history-entry" data-job-id={result.jobId} data-result={result.result ?? ''}
-              data-target={result.update?.targetRecordId ?? ''} data-report-check={result.report.check ?? ''}>
+              data-target={result.update?.targetRecordId ?? ''} data-report-check={result.report.check ?? ''} data-transport={result.transport}>
               <td>{formatDateTime(result.recordedAt)}</td>
+              <td data-testid="write-history-transport"><Badge display={scenarioTransportDisplay(result.transport)} /></td>
               <td><Badge display={result.result === null ? null : actionResultDisplay(result.result)} /></td>
               <td><Badge display={result.reason === null ? null : actionOutcomeReasonDisplay(result.reason)} /></td>
               <td><Badge display={result.submission === null ? null : submissionStateDisplay(result.submission)} /></td>

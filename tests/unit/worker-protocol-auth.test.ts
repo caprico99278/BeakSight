@@ -8,12 +8,13 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  AUTH_SETUP_SCHEMA_VERSION,
-  AUTH_SETUP_SCHEMA_VERSION_2,
+  AUTH_SETUP_SCHEMA_VERSION_3,
   AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
   type AuthSetup,
 } from '../../src/control/auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_SETUP_ITEMS, previousVersionSetupDocumentOf } from '../helpers/auth-setup-samples.js';
 import {
+  MAX_WORKER_APPROVED_SERVICE_ORIGINS,
   MAX_WORKER_APPROVED_TEST_ORIGINS,
   MAX_WORKER_NOTICE_URL_LENGTH,
   WORKER_AUTHENTICATION_SHA256_PATTERN,
@@ -27,6 +28,7 @@ import {
   validateWorkerToParentMessage,
   workerAuthenticationDigestOf,
 } from '../../src/control/worker-protocol.js';
+import { MAX_APPROVED_SERVICE_ORIGINS } from '../../src/control/contracts.js';
 
 const SCHEMA = JSON.parse(readFileSync(resolve(process.cwd(), 'schemas', 'control', 'worker-message.schema.json'), 'utf8')) as Record<string, unknown>;
 
@@ -39,7 +41,7 @@ const OTHER_ORIGIN = 'http://localhost:4173';
 const SHA256 = targetConfigDigestOf(new TextEncoder().encode('{}'));
 
 const SETUP: AuthSetup = Object.freeze({
-  schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2,
+  ...FORM_NAVIGATION_SETUP_ITEMS,
   profileId: 'example-auth',
   profileRevision: 1,
   loginStartUrl: `${ORIGIN}/login`,
@@ -53,7 +55,7 @@ const SETUP: AuthSetup = Object.freeze({
   automatedLogin: null,
 });
 
-/** 自動ログインの設定を持つ版 2 の設定（T26b。秘密を含まない）。 */
+/** 自動ログインの設定を持つ設定（T26b。秘密を含まない）。 */
 const AUTOMATED_SETUP: AuthSetup = Object.freeze({
   ...SETUP,
   maxLoginAttempts: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS,
@@ -70,11 +72,9 @@ const AUTOMATED_SETUP: AuthSetup = Object.freeze({
   },
 });
 
-/** 版 1 の文書（T26b からは `START` で受けない）。 */
-const V1_SETUP = (() => {
-  const { automatedLogin: _omitted, ...rest } = SETUP;
-  return { ...rest, schemaVersion: AUTH_SETUP_SCHEMA_VERSION };
-})();
+/** 版 1・版 2 の文書（`START` で受けない。LG-3b で版 2 も受けなくなった）。 */
+const V1_SETUP = previousVersionSetupDocumentOf(SETUP, 1);
+const V2_SETUP = previousVersionSetupDocumentOf(SETUP, 2);
 
 /** T26d-2: 手動のログインの監査の、SHA-256 に含める項目（ジョブの種類と、自動ログインの指定なし）。 */
 const MANUAL_BINDING = Object.freeze({ jobKind: 'AUDIT', automatedLogin: null } as const);
@@ -136,9 +136,10 @@ describe('worker protocol (T25d): the authenticated START', () => {
     ['authentication without the digest', { setup: SETUP, approvedTestOrigins: [ORIGIN] }],
     ['an extra property on authentication', { ...authenticationOf(), cookies: [] }],
     ['a setup with an extra property (a password)', authenticationOf({ ...SETUP, password: 'x' } as unknown as AuthSetup)],
-    ['a setup that is not an auth setup', { ...authenticationOf(), setup: { schemaVersion: AUTH_SETUP_SCHEMA_VERSION_2 } }],
-    // T26b: 版 1 の文書は `START` で受けない（親は版 2 に直した設定を渡す）。
+    ['a setup that is not an auth setup', { ...authenticationOf(), setup: { schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3 } }],
+    // T26b・LG-3b: 版 1・版 2 の文書は `START` で受けない（親は版 3 の設定だけを渡す）。
     ['a version 1 setup', authenticationOf(V1_SETUP as unknown as AuthSetup)],
+    ['a version 2 setup', authenticationOf(V2_SETUP as unknown as AuthSetup)],
     ['a setup without automatedLogin', authenticationOf((() => {
       const { automatedLogin: _omitted, ...rest } = SETUP;
       return rest as unknown as AuthSetup;
@@ -219,7 +220,91 @@ describe('worker protocol (T25d): value lists and the schema', () => {
     expect(pointerValue(SCHEMA, '/$defs/authState/properties/sessionLostUrl/anyOf/0/maxLength')).toBe(MAX_WORKER_NOTICE_URL_LENGTH);
     expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/authenticationSha256/pattern')).toBe(WORKER_AUTHENTICATION_SHA256_PATTERN.source);
     expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedTestOrigins/maxItems')).toBe(MAX_WORKER_APPROVED_TEST_ORIGINS);
-    // T26b: `START` の認証の設定は、版 2 だけ（親と子は同じビルドなので、版 1 との互換は要らない。Task 26 の設計書 4.3）。
-    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/setup/$ref')).toBe('urn:beaksight:schema:control:auth-setup:2');
+    // T26b・LG-3b: `START` の認証の設定は版 3 だけ（親と子は同じビルドなので、前の版との互換は要らない）。サービスの Origin の上限は、プロファイルの
+    // 上限と同じ。
+    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/setup')).toEqual({ $ref: 'urn:beaksight:schema:control:auth-setup:3' });
+    expect(pointerValue(SCHEMA, '/$defs/startAuthentication/properties/approvedServiceOrigins/maxItems')).toBe(MAX_WORKER_APPROVED_SERVICE_ORIGINS);
   });
 });
+
+// T34a（Task 34 の設計書 3.2）: 認証の設定の版 3 の `START`。認証の指定に、プロファイルの承認したサービスの Origin（`approvedServiceOrigins`。
+// 任意。ないときは空と同じ）を足した。契約は、スクリプトの送信先の Origin がサービスの Origin のどれか、ログインに伴う送信の Origin が承認したテストの
+// Origin かサービスの Origin、成功のローカル ストレージの鍵の Origin が承認したテストの Origin、であることを確かめる。版 2 の `START` の形と SHA-256 は
+// 変わらない（サービスの Origin は SHA-256 に入れない。ワーカーが求め直す値は今のまま）。
+describe('worker protocol (T34a): the authenticated START with an auth setup of version 3', () => {
+  const SERVICE_ORIGIN = 'http://127.0.0.1:5173';
+  const SCRIPT_SETUP: AuthSetup = Object.freeze({
+    ...SETUP,
+    schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+    loginPostEndpoints: [],
+    loginTransport: 'SCRIPT_REQUEST',
+    scriptLogin: { origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+    loginSideRequests: [
+      { origin: SERVICE_ORIGIN, path: '/rest/v1/rpc/resolve', method: 'POST', maxPerLoginStage: 1 },
+      { origin: ORIGIN, path: '/functions/v1/sync', method: 'POST', maxPerLoginStage: 2 },
+    ],
+    successStorageKey: { origin: ORIGIN, prefix: 'sb-', suffix: '-auth-token' },
+  } as const);
+  const scriptAuthentication = (setup: AuthSetup = SCRIPT_SETUP, services: readonly string[] = [SERVICE_ORIGIN]) => ({
+    ...authenticationOf(setup),
+    approvedServiceOrigins: services,
+  });
+
+  it('accepts a START with a script login setup and the service origins, and keeps the form navigation digest', () => {
+    const message = startWith(scriptAuthentication());
+    expect(validateParentToWorkerMessage(message)).toEqual({ ok: true, message });
+    // フォームの送信の版 3 は、サービスの Origin なしでも受ける。
+    const formSetup = { ...SCRIPT_SETUP, loginPostEndpoints: [{ origin: ORIGIN, path: '/login' }], loginTransport: 'FORM_NAVIGATION',
+      scriptLogin: null, loginSideRequests: [], successStorageKey: null } as AuthSetup;
+    expect(validateParentToWorkerMessage(startWith(authenticationOf(formSetup))).ok).toBe(true);
+    // フォームの送信の設定の SHA-256（LG-3b: 見本を版 2 から版 3 に替えた後の値。前の版 2 の見本の値は `e5ac4b39…` だった）。
+    expect(workerAuthenticationDigestOf(SETUP, [ORIGIN], MANUAL_BINDING)).toBe('807fe35d8ebbf8494ab8fc64d1de267a97581fbb74501ddf8796a35f26345678');
+    expect(MAX_WORKER_APPROVED_SERVICE_ORIGINS).toBe(MAX_APPROVED_SERVICE_ORIGINS);
+  });
+
+  it.each([
+    ['no service origins', scriptAuthentication(SCRIPT_SETUP, [])],
+    ['a script target outside the service origins', scriptAuthentication({ ...SCRIPT_SETUP,
+      scriptLogin: { origin: 'http://127.0.0.1:6173', path: '/auth/v1/token', requiredQuery: [] } } as AuthSetup)],
+    ['a script target on a test origin', scriptAuthentication({ ...SCRIPT_SETUP, scriptLogin: { origin: ORIGIN, path: '/auth/v1/token', requiredQuery: [] } } as AuthSetup)],
+    ['a side request outside the approved origins', scriptAuthentication({ ...SCRIPT_SETUP,
+      loginSideRequests: [{ origin: OTHER_ORIGIN, path: '/rpc', method: 'POST', maxPerLoginStage: 1 }] } as AuthSetup)],
+    ['a storage key on a service origin', scriptAuthentication({ ...SCRIPT_SETUP,
+      successStorageKey: { origin: SERVICE_ORIGIN, prefix: 'sb-', suffix: '-auth-token' } } as AuthSetup)],
+    ['a service origin that is not canonical', scriptAuthentication(SCRIPT_SETUP, [`${SERVICE_ORIGIN}/`])],
+    ['a service origin that is also a test origin', scriptAuthentication(SCRIPT_SETUP, [SERVICE_ORIGIN, ORIGIN])],
+    ['duplicated service origins', scriptAuthentication(SCRIPT_SETUP, [SERVICE_ORIGIN, SERVICE_ORIGIN])],
+    ['too many service origins', scriptAuthentication(SCRIPT_SETUP,
+      Array.from({ length: MAX_APPROVED_SERVICE_ORIGINS + 1 }, (_, index) => `http://127.0.0.1:${6000 + index}`))],
+    ['a script setup with a value in the storage key', scriptAuthentication({ ...SCRIPT_SETUP,
+      successStorageKey: { origin: ORIGIN, prefix: 'sb-', suffix: '-auth-token', value: 'x' } } as unknown as AuthSetup)],
+  ] as const)('rejects a version 3 START with %s', (_name, authentication) => {
+    expect(validateParentToWorkerMessage(startWith(authentication)).ok).toBe(false);
+  });
+
+  // T35a（Task 35 の設計書 3.1、3.2）: 版 3 の任意の項目（`auditReadRequests`・`serviceRequestLimits`）を START で渡す。監査の段の読み取りの手続きの
+  // 呼び出しの Origin は、承認したテストの Origin かサービスの Origin。項目のない版 3 の START の SHA-256 は変わらない。
+  const READ = { origin: SERVICE_ORIGIN, path: '/rest/v1/rpc/list_members', method: 'POST', maxPerPageLoad: 2 } as const;
+  const LIMITS = { perMinute: 60, perRun: 300 } as const;
+  it('keeps the digest of a version 3 START without the T35a items, and accepts the items on the approved origins', () => {
+    expect(workerAuthenticationDigestOf(SCRIPT_SETUP, [ORIGIN], { ...MANUAL_BINDING, approvedServiceOrigins: [SERVICE_ORIGIN] }))
+      .toBe(VERSION_3_START_DIGEST_BEFORE_T35A);
+    for (const reads of [[READ], [{ ...READ, origin: ORIGIN, maxPerPageLoad: 10 }]]) {
+      const message = startWith(scriptAuthentication({ ...SCRIPT_SETUP, auditReadRequests: reads, serviceRequestLimits: LIMITS } as AuthSetup));
+      expect(validateParentToWorkerMessage(message)).toEqual({ ok: true, message });
+    }
+  });
+
+  it.each([
+    ['a read request outside the approved origins', { auditReadRequests: [{ ...READ, origin: OTHER_ORIGIN }] }],
+    ['a read request with GET', { auditReadRequests: [{ ...READ, method: 'GET' }] }],
+    ['a read request over the limit per page load', { auditReadRequests: [{ ...READ, maxPerPageLoad: 11 }] }],
+    // DEF-141: 1 回の Run あたりの上限は 10,000 まで（前は 600 まで）。
+    ['a limit per Run over the maximum', { serviceRequestLimits: { ...LIMITS, perRun: 10_001 } }],
+  ] as const)('rejects a version 3 START with %s', (_name, change) => {
+    expect(validateParentToWorkerMessage(startWith(scriptAuthentication({ ...SCRIPT_SETUP, ...change } as AuthSetup))).ok).toBe(false);
+  });
+});
+
+/** T35a の項目を足す前の、T34a の版 3 の設定の START の SHA-256（サービスの Origin つき。T35a の前のコードで求めた固定の値）。 */
+const VERSION_3_START_DIGEST_BEFORE_T35A = '40e7e0c22977aa1318bde07596e64ad7808b629cbd88bdafd6ce22b802198d92';

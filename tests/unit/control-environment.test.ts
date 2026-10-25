@@ -19,13 +19,14 @@ const ENGINES_LOWER_BOUND_PATTERN = /(?:^|\s)>=\s*v?(\d+(?:\.\d+){0,2})(?=\s|$)/
 
 describe('Control environment: Node version comparison', () => {
   it('accepts the lower bound and newer versions, with or without the leading v', () => {
-    for (const version of ['24.15.0', 'v24.15.0', '24.15.1', '24.21.0', '24.100.0']) {
+    for (const version of ['24.22.1', 'v24.22.1', '24.22.2', '24.23.0', '24.100.0']) {
       expect(isNodeVersionAtLeast(version, MIN_CONTROL_NODE_VERSION), version).toBe(true);
     }
   });
 
   it('rejects older versions', () => {
-    for (const version of ['24.14.1', '24.0.0', 'v22.22.0', '20.19.5', '24.9.9']) {
+    // 24.15.0〜24.22.0 は、2026-10-21 のセキュリティリリースの修正の前の版なので通さない。
+    for (const version of ['24.22.0', '24.21.0', '24.15.0', '24.14.1', '24.0.0', 'v22.22.0', '20.19.5', '24.9.9']) {
       expect(isNodeVersionAtLeast(version, MIN_CONTROL_NODE_VERSION), version).toBe(false);
     }
   });
@@ -49,13 +50,13 @@ describe('Control environment: evaluation', () => {
   });
 
   it('passes when the version is supported and node:sqlite is available', () => {
-    expect(evaluateControlEnvironment({ nodeVersion: '24.15.0', sqliteAvailable: true })).toEqual({ ok: true, nodeVersion: '24.15.0' });
+    expect(evaluateControlEnvironment({ nodeVersion: '24.22.1', sqliteAvailable: true })).toEqual({ ok: true, nodeVersion: '24.22.1' });
   });
 
   it('stops with NODE_VERSION_UNSUPPORTED when Node is older than the lower bound', () => {
-    expect(evaluateControlEnvironment({ nodeVersion: '24.14.1', sqliteAvailable: true })).toEqual({
+    expect(evaluateControlEnvironment({ nodeVersion: '24.21.0', sqliteAvailable: true })).toEqual({
       ok: false,
-      nodeVersion: '24.14.1',
+      nodeVersion: '24.21.0',
       reason: 'NODE_VERSION_UNSUPPORTED',
     });
     // 版が足りないときは、SQLite の有無より先に版を伝える（Node を更新すれば両方が直る）。
@@ -67,14 +68,14 @@ describe('Control environment: evaluation', () => {
   });
 
   it('stops with NODE_SQLITE_UNAVAILABLE when node:sqlite cannot be loaded', () => {
-    expect(evaluateControlEnvironment({ nodeVersion: '24.15.0', sqliteAvailable: false })).toEqual({
+    expect(evaluateControlEnvironment({ nodeVersion: '24.22.1', sqliteAvailable: false })).toEqual({
       ok: false,
-      nodeVersion: '24.15.0',
+      nodeVersion: '24.22.1',
       reason: 'NODE_SQLITE_UNAVAILABLE',
     });
   });
 
-  it('passes in the current Node process (24.15.0 or later, with node:sqlite)', () => {
+  it('passes in the current Node process (24.22.1 or later, with node:sqlite)', () => {
     expect(checkControlEnvironment()).toEqual({ ok: true, nodeVersion: process.versions.node });
   });
 
@@ -85,7 +86,7 @@ describe('Control environment: evaluation', () => {
 });
 
 describe('Control environment: the lower bound is defined once', () => {
-  // T23b が `engines` を `>=24.15.0 <25` に変える。それより前は、この確かめが失敗する（二重定義の不一致の検出）。
+  // `engines` を `>=24.22.1 <25` に変えた。定数がそろっていなければ、この確かめが失敗する（二重定義の不一致の検出）。
   it('MIN_CONTROL_NODE_VERSION equals the lower bound of package.json engines.node', () => {
     const manifest = JSON.parse(readFileSync(PACKAGE_JSON_URL, 'utf8')) as { engines?: { node?: unknown } };
     const range = manifest.engines?.node;
