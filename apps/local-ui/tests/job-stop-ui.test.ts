@@ -182,14 +182,14 @@ describe('DEF-146: the result of the stop on the job screen of a discovery job',
     await page.getByRole('button', { name: text.job.stop(DISCOVERY_TARGET), exact: true }).click();
     const dialog = page.getByRole('dialog', { name: text.stopDialog.title(DISCOVERY_TARGET) });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(text.stopDialog.title(DISCOVERY_TARGET)).toBe('発見を止めますか');
+    expect(text.stopDialog.title(DISCOVERY_TARGET)).toBe('操作さがしを止めますか');
     // T44d: 本文は発見のもの（再開しない）。監査の本文（今のページの監査を終えてから止まり、続きから再開する）は出さない。
     const dialogText = await dialog.textContent();
     expect(dialogText).toContain(AUDIT_JOB_STOP_DIALOG_BODIES.DISCOVERY.stop);
     expect(dialogText).not.toContain(AUDIT_JOB_STOP_DIALOG_BODIES.AUDIT.stop);
     expect(dialogText).not.toContain('続きから再開');
     expect(await dialog.getByRole('button').allTextContents()).toEqual([text.stopDialog.cancel, text.stopDialog.confirm(DISCOVERY_TARGET)]);
-    expect(text.stopDialog.confirm(DISCOVERY_TARGET)).toBe('発見を止める');
+    expect(text.stopDialog.confirm(DISCOVERY_TARGET)).toBe('操作さがしを止める');
     expect(text.stopDialog.cancel).toBe('止めずに戻る');
     expect(await dialog.getByRole('button', { name: AMBIGUOUS_CANCEL_LABEL, exact: true }).count()).toBe(0);
     // 開いたときのフォーカスは取り消し（今の決まりのまま）。取り消すと、止める要求は送らない。

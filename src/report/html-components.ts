@@ -362,12 +362,18 @@ export interface ScreenshotRefInput {
   readonly captureType: ScreenshotCaptureType;
 }
 
+/** スクリーンショットの参照の出し方（OP-3。省略したときは、前と同じく Evidence の ID を添える）。 */
+export interface ScreenshotRefOptions {
+  /** 偽なら、Evidence の ID を添えない（報告の本文。ID は末尾の記録の段にだけ出す）。 */
+  readonly withEvidenceId?: boolean;
+}
+
 /**
  * スクリーンショットの参照。ビューポートと撮り方のラベルでリンクし、Evidence の ID を添える。
  * `relativePath` が安全な相対パス（`isPortableRelativeArtifactPath`）なら、区切りごとにパーセント符号化してリンクにする。そうでない場合は、
  * リンクにせず、パスを文字として示す（設計書 6.1.11）。
  */
-export const renderScreenshotRef = (input: ScreenshotRefInput): SafeHtml<'fragment'> => {
+export const renderScreenshotRef = (input: ScreenshotRefInput, options: ScreenshotRefOptions = {}): SafeHtml<'fragment'> => {
   const label = escapeHtml(
     screenshotLinkText(VIEWPORT_PROFILE_CATALOG[input.viewport].label, SCREENSHOT_CAPTURE_TYPE_CATALOG[input.captureType].label),
   );
@@ -377,7 +383,7 @@ export const renderScreenshotRef = (input: ScreenshotRefInput): SafeHtml<'fragme
     href === null
       ? `<span class="${REPORT_CLASS_NAMES.screenshotRef}">${label}</span> <span class="${REPORT_CLASS_NAMES.urlText}">${escapeHtml(input.relativePath)}</span>`
       : `<a class="${REPORT_CLASS_NAMES.screenshotRef}" href="${escapeHtml(href)}">${label}</a>`;
-  return trusted(`${target} ${evidence}`);
+  return trusted(options.withEvidenceId === false ? target : `${target} ${evidence}`);
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -409,10 +415,21 @@ export interface FindingRowInput {
   readonly blockRelation?: { readonly relation: BeakSightBlockRelation; readonly reason: BeakSightBlockRelationReason } | null;
   /** BN-R0 の M-3: SAFETY の Finding の止めた事象の、時点の別の件数（表示用モデルの `safetyBlockPhaseCounts`）。省略は `null`。 */
   readonly safetyBlockPhaseCounts?: Readonly<Record<BlockedEventPhase, number>> | null;
+  /**
+   * OP-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 14 章）: 偽なら、やさしい語の行にする（Rule の ID と版、Evidence の列を出さず、スクリーンショットに
+   * Evidence の ID を添えない。列は `PLAIN_FINDING_TABLE_COLUMNS`）。省略したときは、前と同じ（`FINDING_TABLE_COLUMNS`）。
+   */
+  readonly technical?: boolean;
+  /**
+   * OP-R2（PL 設計書 14 章）: 内容の欄に出す文（表示用モデルの `FindingView.plainMessage`。やさしい語の行が渡す）。省略したときは、Rule の文（`finding.message`）。
+   */
+  readonly plainMessage?: string;
 }
 
 /** Finding の表の列の見出し（`renderFindingRow` のセルの順）。 */
 export const FINDING_TABLE_COLUMNS: readonly string[] = REPORT_COMPONENT_TEXT.findingColumns;
+/** OP-3: やさしい語の Finding の表の列の見出し（`technical: false` の `renderFindingRow` のセルの順）。 */
+export const PLAIN_FINDING_TABLE_COLUMNS: readonly string[] = REPORT_COMPONENT_TEXT.plainFindingColumns;
 
 const referenceList = (items: readonly string[]): string =>
   items.length === 0
@@ -420,6 +437,10 @@ const referenceList = (items: readonly string[]): string =>
     : `<ul class="${REPORT_CLASS_NAMES.referenceList}">${items.map((item) => `<li>${item}</li>`).join('')}</ul>`;
 
 const categoryLabel = (category: FindingCategory): string => FINDING_CATEGORY_CATALOG[category].label;
+
+/** OP-G2: やさしい語の Finding の行の種類の名前（技術の語の種類だけ、`REPORT_COMPONENT_TEXT.plainCategoryLabels` の名前）。 */
+const PLAIN_CATEGORY_LABELS: Readonly<Partial<Record<FindingCategory, string>>> = REPORT_COMPONENT_TEXT.plainCategoryLabels;
+const plainCategoryLabel = (category: FindingCategory): string => PLAIN_CATEGORY_LABELS[category] ?? categoryLabel(category);
 
 /**
  * BN-c・BN-d: Finding の内容の欄の後ろに付ける、BeakSight の遮断の印（表示は `BEAKSIGHT_BLOCK_RELATION_CATALOG`・`BLOCKED_EVENT_PHASE_CATALOG` の 1 か所）。
@@ -459,17 +480,22 @@ export const renderFindingRow = (input: FindingRowInput): SafeHtml<'row'> => {
     finding.viewport === null
       ? mutedText(REPORT_COMPONENT_TEXT.viewportIndependent)
       : escapeHtml(VIEWPORT_PROFILE_CATALOG[finding.viewport].label);
+  const technical = input.technical !== false;
   const cells = [
     renderSeverityBadge(finding.severity).html,
-    escapeHtml(categoryLabel(finding.category)),
-    `<span class="${REPORT_CLASS_NAMES.findingMessage}">${escapeHtml(finding.message)}</span>${blockMarksHtml(input)}`,
+    escapeHtml(technical ? categoryLabel(finding.category) : plainCategoryLabel(finding.category)),
+    `<span class="${REPORT_CLASS_NAMES.findingMessage}">${escapeHtml(input.plainMessage ?? finding.message)}</span>${blockMarksHtml(input)}`,
     page,
     viewport,
-    `<code class="${REPORT_CLASS_NAMES.identifier}">${escapeHtml(finding.ruleId)}</code>${ruleVersion}`,
-    referenceList(
-      input.evidence.map((reference) => renderEvidenceRef(reference.evidenceId, reference.href, reference.pointer ?? null).html),
-    ),
-    referenceList(input.screenshots.map((screenshot) => renderScreenshotRef(screenshot).html)),
+    ...(technical
+      ? [
+        `<code class="${REPORT_CLASS_NAMES.identifier}">${escapeHtml(finding.ruleId)}</code>${ruleVersion}`,
+        referenceList(
+          input.evidence.map((reference) => renderEvidenceRef(reference.evidenceId, reference.href, reference.pointer ?? null).html),
+        ),
+      ]
+      : []),
+    referenceList(input.screenshots.map((screenshot) => renderScreenshotRef(screenshot, { withEvidenceId: technical }).html)),
   ];
   const idAttribute = input.anchored === false ? '' : `id="${escapeHtml(toAnchorId('finding', finding.findingId))}" `;
   return trustedRow(
@@ -477,11 +503,13 @@ export const renderFindingRow = (input: FindingRowInput): SafeHtml<'row'> => {
   );
 };
 
-/** Finding の表（列の見出しは `FINDING_TABLE_COLUMNS`）。 */
+/** Finding の表（列の見出しは `FINDING_TABLE_COLUMNS`。OP-3: `technical` が偽なら `PLAIN_FINDING_TABLE_COLUMNS`。行も同じ値で作る）。 */
 export const renderFindingTable = (input: {
   readonly caption: string | null;
   readonly rows: readonly SafeHtml<'row'>[];
-}): SafeHtml<'fragment'> => renderTable({ caption: input.caption, columns: FINDING_TABLE_COLUMNS, rows: input.rows });
+  readonly technical?: boolean;
+}): SafeHtml<'fragment'> =>
+  renderTable({ caption: input.caption, columns: input.technical === false ? PLAIN_FINDING_TABLE_COLUMNS : FINDING_TABLE_COLUMNS, rows: input.rows });
 
 // ---------------------------------------------------------------------------------------------------------------
 // 小さな部品（U16c で追加。HTML レポートの組み立てに使う）

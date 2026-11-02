@@ -121,7 +121,7 @@ describe('T40b-1: the documents of an API write run (writeRunDocumentsOf)', () =
     expect(documents.actionRun).toMatchObject({
       transport: 'API',
       api: summary,
-      resultConditions: null,
+      resultJudgement: null,
       submittedValues: API_WRITE.values,
       submission: 'SENT',
       httpStatus: 201,
@@ -161,7 +161,7 @@ describe('T40b-1: the documents of an API write run (writeRunDocumentsOf)', () =
     expect(documents.actionRun.api?.pageKeyValues).toBeNull();
     expect(documents.evidence.api?.pageKeyValues).toBeNull();
     expect(documents.evidence.submission).toEqual({ state: 'NOT_SENT', submittedValues: {}, actionPath: null, submittedAt: null });
-    expect(documents.actionRun).toMatchObject({ result: 'BLOCKED', reason: 'PAYLOAD_MISMATCH', reservationState: 'RELEASED', resultConditions: null });
+    expect(documents.actionRun).toMatchObject({ result: 'BLOCKED', reason: 'PAYLOAD_MISMATCH', reservationState: 'RELEASED', resultJudgement: null });
     expect(await validateArtifact('action-run', documents.actionRun)).toEqual({ ok: true });
     expect(await validateArtifact('action-evidence', documents.evidence)).toEqual({ ok: true });
     expect(actionRunRuleErrors(documents.actionRun)).toEqual([]);

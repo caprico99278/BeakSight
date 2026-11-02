@@ -104,6 +104,7 @@ import {
   openLoginStagePage,
   readAuthenticatedState,
   scriptLoginCountsOf,
+  waitForLoginFields,
   waitOrAbort,
 } from './login-stage-checks.js';
 import { observeLoginPageStart, observeLoginStageEnd } from './login-stage-observation.js';
@@ -490,6 +491,8 @@ async function runAutomatedLoginStageWith(
       // T36c: スクリプトで送るログインでは、form の method と action を確かめない（T36a）。
       submission: script ? SCRIPT_REQUEST_TRANSPORT : 'FORM_NAVIGATION',
     };
+    // OP-K（K3）: 欄が後から描かれる SPA のために、3 つの欄が見えるまで待ってから確かめる（数えるだけ。値はまだ受け取らない。上限は 1 段の上限）。
+    await waitForLoginFields([target.username, target.password, target.submit], formStepTimeoutMs);
     const inspected = await inspectLoginForm(target, formStepTimeoutMs);
     if (!inspected.ok) {
       return formInvalid(inspected.reason);

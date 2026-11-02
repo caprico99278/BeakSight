@@ -21,7 +21,7 @@ import { closeControlDatabase, openControlDatabase } from '../../../src/control/
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
 import { REDACTED_PATH_SEGMENT } from '../../../src/core/url-path-redaction.js';
 import { LOGIN_TRANSPORT_CATALOG } from '../../../src/presentation/catalog.js';
-import { formatCount } from '../../../src/presentation/format.js';
+import { formatCount, formatTimes } from '../../../src/presentation/format.js';
 import {
   AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS,
   LOCAL_UI_AUTH_TEXT,
@@ -30,6 +30,7 @@ import {
   LOCAL_UI_TEXT,
 } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
+import { openAuthSetupAdvancedSettings, openProfileAuthSetupAdvancedSettings } from './helpers/auth-setup-page.ts';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import {
   createTemporaryUiRoot,
@@ -43,6 +44,8 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -183,6 +186,9 @@ const writeJob = (jobId: string, profileId: string, summary: AuditJobLoginStageS
 /** ジョブの詳細を開き、ログインの段の欄を待つ。 */
 const openJob = async (jobId: string): Promise<Page> => {
   const page = await openPage(`/jobs/${jobId}`);
+  // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: ログインの段の記録と観察した案は、たたんだ詳しい内容の中（行の登録が要るときは
+  // 開いて出る）。開いてから確かめる。
+  await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
   await page.getByTestId('job-login-stage').waitFor({ timeout: UI_TIMEOUT_MS });
   return page;
 };
@@ -194,6 +200,7 @@ const openJob = async (jobId: string): Promise<Page> => {
 const openDraftFromRow = async (page: Page, rowIndex: number): Promise<void> => {
   await page.getByTestId('job-login-stage-blocked').locator('tbody tr').nth(rowIndex).getByTestId('job-login-stage-edit-draft').click();
   await page.getByTestId('auth-setup-observed-draft').waitFor({ timeout: UI_TIMEOUT_MS });
+  await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
   await page.getByTestId('auth-setup-form').waitFor({ timeout: UI_TIMEOUT_MS });
 };
 
@@ -217,7 +224,7 @@ beforeAll(async () => {
   cookie = parseSetCookie(exchange.headers['set-cookie'])?.pair ?? '';
   for (const profileId of [PROFILE_ID, CONFLICT_PROFILE_ID]) {
     expect(await valueOf('createProfileFn', 'POST', { profile: profileDocumentOf(profileId, 1) })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: formSetupOf(profileId) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: formSetupOf(profileId) })).toMatchObject({ ok: true });
   }
   writeJob(JOB_ID, PROFILE_ID);
   writeJob(CONFLICT_JOB_ID, CONFLICT_PROFILE_ID);
@@ -252,10 +259,12 @@ describe('T43R2-fix: no user name on the job detail and the draft URL', () => {
     await page.getByTestId('job-login-observation-apply').click();
     await page.getByTestId('auth-setup-observed-draft').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(markers.filter((marker) => page.url().includes(marker) || decodeURIComponent(page.url()).includes(marker))).toEqual([]);
-    // このプロファイルの保存した設定はフォームの送信なので、スクリプトの送信を選ぶと、鍵の欄に案が入っている。
-    await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).check();
-    expect(await field(page, scriptText.storageSuffix).inputValue()).toBe('.token');
-    expect(await field(page, scriptText.storagePrefix).inputValue()).toBe('');
+    // MI-F5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 6）: 認証の設定があるときは、ログインの送り方は読むだけ（このプロファイルの
+    // 保存した設定はフォームの送信のまま。送り方は入口の確かめと手動のログインの観察からだけ入る）。
+    await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
+    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).count()).toBe(0);
+    // PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 3。前は読むだけの値で出していた）: 変えられない送り方は出さない。
+    expect(await page.getByTestId('auth-setup-destination-transport').count()).toBe(0);
     const setupText = await page.locator('body').textContent() ?? '';
     expect(markers.filter((marker) => setupText.includes(marker))).toEqual([]);
   }, SCENARIO_TIMEOUT_MS);
@@ -299,11 +308,10 @@ describe('T43d: the draft of the auth setup and the save of both', () => {
     // 下書きは保存していない（保存してある設定はフォームの送信のまま）。
     expect((await authSetupPageOf(PROFILE_ID)).stored?.setup).toMatchObject({ loginTransport: 'FORM_NAVIGATION' });
     expect(await page.getByTestId('auth-setup-observed-service-origins').textContent()).toBe(SERVICE_ORIGIN);
-    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
-    expect(await field(page, scriptText.scriptOrigin).inputValue()).toBe(SERVICE_ORIGIN);
-    expect(await field(page, scriptText.scriptPath).inputValue()).toBe(TOKEN_PATH);
-    expect(await field(page, rowLabel(1, scriptText.queryName)).inputValue()).toBe('grant_type');
-    expect(await field(page, rowLabel(1, scriptText.queryValue)).inputValue()).toBe('password');
+    // MI-F5（設計書 4.7.1 の 6）・PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 3。前は読むだけの値で出していた）: 下書きの送り方と送信先は、
+    // 画面に出さずに行の観察のまま保存する（下の保存した設定で確かめる）。
+    expect(await page.locator('main [data-testid^="auth-setup-destination-"]:not([data-testid="auth-setup-destination-locked"])').count()).toBe(0);
+    expect(await page.getByRole('main').innerText()).not.toContain(TOKEN_PATH);
     // 成功の鍵の形は、利用者が入れる（ここでは観察の案の名前）。
     await field(page, scriptText.storageOrigin).selectOption(TEST_ORIGIN);
     await field(page, scriptText.storagePrefix).fill(KEY_NAME);
@@ -328,9 +336,8 @@ describe('T43d: the draft of the auth setup and the save of both', () => {
     await openDraftFromRow(page, 1);
     // サービスの Origin は前の保存で承認したので、プロファイルは変えない。
     expect(await page.getByTestId('auth-setup-observed-service-origins').count()).toBe(0);
-    expect(await field(page, rowLabel(1, scriptText.sideOrigin)).inputValue()).toBe(SERVICE_ORIGIN);
-    expect(await field(page, rowLabel(1, scriptText.sidePath)).inputValue()).toBe(TENANT_PATH);
-    expect(await field(page, rowLabel(1, scriptText.sideMaxPerLoginStage)).inputValue()).toBe('1');
+    // MI-F5・PL-4: 下書きのログインに伴う送信は、画面に出さずに保存する（回数は欄の既定の 1。下の保存した設定で確かめる）。
+    expect(await page.getByTestId('auth-setup-destination-side-requests').count()).toBe(0);
     await saveSetup(page);
     await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
     const saved = await authSetupPageOf(PROFILE_ID);
@@ -343,11 +350,14 @@ describe('T43d: the draft of the auth setup and the save of both', () => {
     expect(await field(job, scriptText.storagePrefix).inputValue()).toBe(KEY_SHAPE.prefix);
     expect(await field(job, scriptText.storageSuffix).inputValue()).toBe(KEY_SHAPE.suffix);
     expect(await field(job, authText.successSelector).inputValue()).toBe('#logout');
-    // 前に保存したログインに伴う送信は残る。
-    expect(await field(job, rowLabel(1, scriptText.sidePath)).inputValue()).toBe(TENANT_PATH);
+    // 前に保存したログインに伴う送信は残る（PL-4: 画面には出さないので、保存した設定で確かめる）。
+    expect(await job.getByTestId('auth-setup-destination-side-requests').count()).toBe(0);
     await saveSetup(job);
     await job.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect((await authSetupPageOf(PROFILE_ID)).stored?.setup).toMatchObject({ successCondition: { pathPrefix: '/admin', selector: '#logout' } });
+    expect((await authSetupPageOf(PROFILE_ID)).stored?.setup).toMatchObject({
+      successCondition: { pathPrefix: '/admin', selector: '#logout' },
+      loginSideRequests: [{ origin: SERVICE_ORIGIN, path: TENANT_PATH, method: 'POST', maxPerLoginStage: 1 }],
+    });
   }, SCENARIO_TIMEOUT_MS);
 
   it('rejects the save of both with the revision conflict when the profile changed after the draft was opened, and writes neither', async () => {
@@ -372,6 +382,11 @@ describe('T43d: the draft of the auth setup and the save of both', () => {
     const page = await openPage(`/auth-setup/${PROFILE_ID}?draft=${wrong}`);
     await page.getByTestId('auth-setup-observed-draft-invalid').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('auth-setup-observed-draft').count()).toBe(0);
-    expect(await field(page, scriptText.scriptPath).inputValue()).toBe(TOKEN_PATH);
+    await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
+    // PL-4（前は読むだけの値で、保存した送信先のままかを見ていた）: 送信先は出さないので、保存しても保存した送信先のままであることで確かめる。
+    expect(await page.getByTestId('auth-setup-destination-script-path').count()).toBe(0);
+    await saveSetup(page);
+    expect(await page.getByTestId('auth-setup-rejection').count()).toBe(0);
+    expect((await authSetupPageOf(PROFILE_ID)).stored?.setup).toMatchObject({ scriptLogin: { path: TOKEN_PATH } });
   }, SCENARIO_TIMEOUT_MS);
 });

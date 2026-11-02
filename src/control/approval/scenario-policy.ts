@@ -39,9 +39,10 @@
 //   場合は、保存で拒まず、画面に注意を出す（使える度合い。core の `recordIdPatternMatchesPagePath`）。
 // - LG-3（2026-10-24 のテストの組の設計 3.7.2）: 検証の指定の前に保存した版（`verification` の項目がない）を、すべて未指定として読む読み替えは
 //   捨てた。読むとき（`storedScenarioRevisionOf`）にスキーマの誤りになる（壊れた検証の指定と同じく、既定に直さない）。
-// - T30a fix round 1: 結果の条件の path の前方一致と、登録の ID の path の型（`{id}` の区切りを置き換えた形）の形は `isAcceptedPath`、セレクタの
-//   形は `isAcceptedSelector`、成功の条件と入力の誤りの条件が同時に当たりうるか（`SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS`）は
-//   `mayMatchTogether`（どれも Task 26 の判定の owner `src/control/auth/auth-setup-policy.ts`。書き写さない）。
+// - T30a fix round 1: 登録の ID の path の型（`{id}` の区切りを置き換えた形）の形は `isAcceptedPath`、セレクタの形は `isAcceptedSelector`（どれも Task 26
+//   の判定の owner `src/control/auth/auth-setup-policy.ts`。書き写さない）。PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成功の条件と入力の
+//   誤りの条件（と、2 つが同時に当たりうるかの確かめ）はなくした。検証の指定は、結果の判定のしかたの印（送り方から付ける）、登録の ID の取り方（form は ID の型の
+//   一覧 `URL_PATH_PATTERNS` だけ、API は今の 2 つの取り方だけ）、照合の READ（照合の専用の印を持てる）。
 // - T31b（Task 31 の設計書 2 章のユーザーの判断 1〜5、3 章の「UPDATE の指定」「削除にあたる変更の遮断」、4 章の「契約」、11 章の T31b の Blocker の
 //   判断）: UPDATE の指定（`update`。下書きでは省ける。省くか null なら指定なし）の確かめ。誤りの順は、送る欄の後、照らす READ の定義の前。
 //   - 形（台帳の参照の id の形、2 つの path の型（`{id}` をちょうど 1 つ、区切りの全体。query を持たない。上限の長さ）、保つ欄（件数・長さ・重複））
@@ -113,9 +114,10 @@ import {
   templatedIdentityDigestOf,
 } from '../../discovery/fingerprint.js';
 import { usableRecordIdOf } from '../actions/action-outcome.js';
-import { isAcceptedPath, isAcceptedSelector, mayMatchTogether } from '../auth/auth-setup-policy.js';
+import { isAcceptedPath, isAcceptedSelector } from '../auth/auth-setup-policy.js';
 import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import {
+  readListPagePathOf,
   MAX_READ_CHECK_DETAIL_FIELD_LENGTH,
   hasGeneratedValueExpectation,
   isSecretLikeStateField,
@@ -128,8 +130,12 @@ import {
   APPROVAL_TTL_DAYS,
   DEFAULT_MAX_CREATES_PER_RUN,
   DEFAULT_MAX_CUMULATIVE_CREATES,
+  FORM_RECORD_ID_SOURCE,
+  FORM_STRUCTURE_RESULT_JUDGEMENT,
+  MAX_FORM_RECORD_ID_PATTERNS,
   MAX_RECORD_ID_PATH_PATTERN_LENGTH,
-  MAX_RESULT_CONDITION_PATH_LENGTH,
+  RETIRED_SCENARIO_VERIFICATION_ITEMS,
+  recordIdPathPatternsOf,
   MAX_SCENARIO_FIELD_NAMES,
   MAX_SCENARIO_KEEP_FIELD_NAMES,
   MAX_UPDATE_PATH_TEMPLATE_LENGTH,
@@ -163,14 +169,14 @@ import {
   type ScenarioLimits,
   type ScenarioReadCheckDefinitionFact,
   type ScenarioReadVerification,
-  type ScenarioRecordIdSpec,
   type ScenarioRequestShape,
-  type ScenarioResultCondition,
   type ScenarioRevision,
   type ScenarioUpdateDraft,
   type ScenarioUpdateSpec,
   type ScenarioVerification,
+  type ScenarioVerificationDraft,
   type ScenarioVerificationItem,
+  type ScenarioVerificationRecordId,
   type SideEffectConfirmation,
   type SideEffectConfirmations,
   type VerificationExpectation,
@@ -199,6 +205,8 @@ import {
 } from '../../core/api-request-shape.js';
 import { apiShapeDigestOf, apiShapeHasSoftDeleteKey, classifyApiShapeObservation } from '../../discovery/api-shape-classification.js';
 import { submissionProbeKeyFieldsOf, submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
+import { isDiscoveryProfileRevisionCurrent, type DiscoveryProfileRevisions } from './discovery-profile-freshness.js';
+import { CREATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 
 /** ページが決める鍵に許す JSON の型（scalar だけ。T38R-fix の I-2）。 */
 const API_SCALAR_JSON_TYPES = Object.freeze(['string', 'number', 'boolean', 'null'] as const satisfies readonly ApiJsonValueType[]);
@@ -232,8 +240,6 @@ const API_SCALAR_JSON_TYPES = Object.freeze(['string', 'number', 'boolean', 'nul
  * - `SCENARIO_READ_CHECK_CANCELED`: 照らす READ の定義を取り消した。
  * - `SCENARIO_READ_CHECK_REVISION_MISMATCH`: 照らす READ の定義の版が、今の版と違う。
  *   （T30a: 上の 3 つは、検証の指定の照合の READ の定義にも使う。）
- * - `SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS`: 成功の条件と入力の誤りの条件が同時に当たりうる（path の前方一致が同じで、セレクタも同じか、
- *   どちらかにない。Task 26 の `mayMatchTogether`。T30a fix round 1）。
  * - `SCENARIO_VERIFICATION_PARAMETER_UNKNOWN`: 照合の READ で結び付ける送る値の名前が、READ の定義の今の版の送る値にない（T30a）。
  * - `SCENARIO_VERIFICATION_FIELD_NOT_SENT`: 照合の READ の結び付けか期待の欄が、シナリオの送る欄にない（生成した値がない。T30a）。
  * - `SCENARIO_LIMIT_ABOVE_DEFAULT`: 上限（1 回の Run、累積のそれぞれ）が既定を超える。
@@ -261,8 +267,8 @@ export interface ScenarioDraftInput {
   readonly sideEffectConfirmations: SideEffectConfirmations;
   readonly limits: ScenarioLimits;
   readonly approvalTtlDays: number;
-  /** 検証の指定（T30a。省けば、すべて未指定）。 */
-  readonly verification?: ScenarioVerification;
+  /** 検証の指定（T30a。省けば、すべて未指定）。PL-6a: 結果の判定のしかたの印は、下書きの確かめが送り方から付ける（省いてよい）。 */
+  readonly verification?: ScenarioVerificationDraft;
   /** UPDATE の指定（T31b。kind が UPDATE の候補では必須。省くか null なら指定なし）。 */
   readonly update?: ScenarioUpdateDraft | null;
   /** T38b: 送り方（省けば `FORM`）。`API` のときは `api` が必須で、`fieldNames` は送る本文の鍵。 */
@@ -287,7 +293,7 @@ export interface ScenarioDraftContext {
    * T38c（T38b の報告の (2)）: 候補を見つけた発見のジョブのプロファイルの改訂（ジョブの行の `profile_revision`。分からなければ null）と、今の改訂。型の
    * Origin は probe の時の承認したサービスの Origin の一覧の番号なので、API の下書きは 2 つが同じであることを求める（省けば拒む。fail-closed）。
    */
-  readonly profileRevisions?: { readonly discoveryJob: number | null; readonly current: number };
+  readonly profileRevisions?: DiscoveryProfileRevisions;
 }
 
 /** シナリオの事実のない文脈（既定。台帳の参照は見つからない）。 */
@@ -329,13 +335,18 @@ const UPDATE_DRAFT_KEYS: readonly (keyof ScenarioUpdateDraft)[] = Object.freeze(
 ]);
 const READ_CHECK_REFERENCE_KEYS: readonly (keyof ReadCheckReference)[] = Object.freeze(['readCheckId', 'revision']);
 const LIMIT_KEYS: readonly (keyof ScenarioLimits)[] = Object.freeze(['maxCreatesPerRun', 'maxCumulativeCreates']);
-const RESULT_CONDITION_KEYS: readonly (keyof ScenarioResultCondition)[] = Object.freeze(['pathPrefix', 'selector']);
 const READ_VERIFICATION_KEYS: readonly (keyof ScenarioReadVerification)[] = Object.freeze(['readCheckId', 'revision', 'bindings', 'expectations']);
+/** PL-6a: 照合の READ の省ける鍵（照合の専用の印）。 */
+const OPTIONAL_READ_VERIFICATION_KEYS: readonly (keyof ScenarioReadVerification)[] = Object.freeze(['verificationOnly']);
+/** PL-6a: 下書きの検証の指定の鍵（結果の判定のしかたの印は省ける）。 */
+const VERIFICATION_DRAFT_KEYS = Object.freeze(['recordId', 'readVerification'] as const);
+const OPTIONAL_VERIFICATION_DRAFT_KEYS = Object.freeze(['resultJudgement'] as const);
 const BINDING_KEYS = Object.freeze(['parameterName', 'fieldName'] as const);
 /** 登録の ID の取り方ごとの鍵。 */
-const RECORD_ID_KEYS: Readonly<Record<ScenarioRecordIdSpec['source'], readonly string[]>> = Object.freeze({
+const RECORD_ID_KEYS: Readonly<Record<ScenarioVerificationRecordId['source'], readonly string[]>> = Object.freeze({
   URL_PATH_PATTERN: Object.freeze(['source', 'pathPattern']),
   ELEMENT: Object.freeze(['source', 'selector']),
+  URL_PATH_PATTERNS: Object.freeze(['source', 'pathPatterns']),
 });
 /** 照合の READ の期待の種類ごとの鍵。 */
 const VERIFICATION_EXPECTATION_KEYS: Readonly<Record<VerificationExpectation['kind'], readonly string[]>> = Object.freeze({
@@ -460,28 +471,6 @@ const isBoundedText = (value: unknown, maxLength: number): value is string =>
 const isVerificationSelector = (value: unknown): value is string =>
   isBoundedText(value, MAX_VERIFICATION_SELECTOR_LENGTH) && isAcceptedSelector(value);
 
-/** 結果の条件の形の誤り（null は未指定）。 */
-const resultConditionShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
-  if (value === null) {
-    return [];
-  }
-  if (!isRecord(value)) {
-    return [invalid(`${path} must be null or an object`)];
-  }
-  const errors = [...keyErrorsOf(value, RESULT_CONDITION_KEYS, path)];
-  if (!isBoundedText(value.pathPrefix, MAX_RESULT_CONDITION_PATH_LENGTH) || !isAcceptedPath(value.pathPrefix)) {
-    errors.push(invalid(
-      `${path}/pathPrefix must be a path of at most ${MAX_RESULT_CONDITION_PATH_LENGTH} code units that starts with "/", without "//", ".." or an encoded dot`,
-    ));
-  }
-  if (value.selector !== null && !isVerificationSelector(value.selector)) {
-    errors.push(invalid(
-      `${path}/selector must be null or a non-blank selector of at most ${MAX_VERIFICATION_SELECTOR_LENGTH} code units, without control characters`,
-    ));
-  }
-  return errors;
-};
-
 /**
  * path の型か（`{id}` をちょうど 1 つ、path の 1 つの区切りの全体に持ち、`{id}` の区切りを置き換えた path が Task 26 の path の形
  * （`isAcceptedPath`。`/` で始まり、`//`・`..`・符号化した `.` を含まず、使える文字だけ）に当たる）。
@@ -496,11 +485,28 @@ const isRecordIdPathPattern = (value: unknown, maxLength: number = MAX_RECORD_ID
   return placeholders === 1 && isAcceptedPath(sample);
 };
 
-/** 登録の ID の取り方の形の誤り（null は未指定）。 */
-const recordIdShapeErrorsOf = (value: unknown): readonly ScenarioDraftError[] => {
+/**
+ * 登録の ID の取り方の形の誤り（null は未指定）。PL-6a（設計書 8.1）: form の下書きは ID の型の一覧（`URL_PATH_PATTERNS`。1〜`MAX_FORM_RECORD_ID_PATTERNS` 件、
+ * 重なりなし）だけ、API の下書きは今の 2 つの取り方（`URL_PATH_PATTERN`・`ELEMENT`）だけ。
+ */
+const recordIdShapeErrorsOf = (value: unknown, api: boolean): readonly ScenarioDraftError[] => {
   const path = '/verification/recordId';
   if (value === null) {
     return [];
+  }
+  if (!api) {
+    if (!isRecord(value) || value.source !== FORM_RECORD_ID_SOURCE) {
+      return [invalid(`${path} must be null or an object with a source of ${FORM_RECORD_ID_SOURCE}`)];
+    }
+    const formErrors = [...keyErrorsOf(value, RECORD_ID_KEYS[FORM_RECORD_ID_SOURCE], path)];
+    const patterns: unknown = value.pathPatterns;
+    if (!Array.isArray(patterns) || patterns.length === 0 || patterns.length > MAX_FORM_RECORD_ID_PATTERNS
+      || !patterns.every((pattern: unknown) => isRecordIdPathPattern(pattern)) || new Set(patterns).size !== patterns.length) {
+      formErrors.push(invalid(
+        `${path}/pathPatterns must be 1 to ${MAX_FORM_RECORD_ID_PATTERNS} distinct paths with ${RECORD_ID_PLACEHOLDER} once as a whole segment, without a query`,
+      ));
+    }
+    return formErrors;
   }
   if (!isRecord(value) || (value.source !== 'URL_PATH_PATTERN' && value.source !== 'ELEMENT')) {
     return [invalid(`${path} must be null or an object with a source of URL_PATH_PATTERN or ELEMENT`)];
@@ -591,7 +597,10 @@ const readVerificationShapeErrorsOf = (value: unknown, allowEmptyBindings: boole
   if (!isRecord(value)) {
     return [invalid(`${path} must be null or an object`)];
   }
-  const errors = [...keyErrorsOf(value, READ_VERIFICATION_KEYS, path)];
+  const errors = [...keyErrorsOf(value, READ_VERIFICATION_KEYS, path, OPTIONAL_READ_VERIFICATION_KEYS)];
+  if (Object.hasOwn(value, 'verificationOnly') && typeof value.verificationOnly !== 'boolean') {
+    errors.push(invalid(`${path}/verificationOnly must be a boolean`));
+  }
   if (typeof value.readCheckId !== 'string' || !SCENARIO_ID_PATTERN.test(value.readCheckId)) {
     errors.push(invalid(`${path}/readCheckId must match ${SCENARIO_ID_PATTERN.source}`));
   }
@@ -605,19 +614,27 @@ const readVerificationShapeErrorsOf = (value: unknown, allowEmptyBindings: boole
   return errors;
 };
 
-/** 検証の指定の形の誤り（T38c: 照合の READ の結び付けの 0 件は、API の下書きだけ形として受ける）。 */
-const verificationShapeErrorsOf = (value: unknown, allowEmptyBindings: boolean): readonly ScenarioDraftError[] => {
+/**
+ * 検証の指定の形の誤り（T38c: 照合の READ の結び付けの 0 件は、API の下書きだけ形として受ける）。PL-6a: 成否の条件の項目はもう受けない。結果の判定のしかたの
+ * 印は省けて、入れるなら送り方の印（form は `FORM_STRUCTURE`、API は null）と同じこと。
+ */
+const verificationShapeErrorsOf = (value: unknown, api: boolean): readonly ScenarioDraftError[] => {
   if (!isRecord(value)) {
     return [invalid('/verification must be an object')];
   }
+  const judgementErrors = Object.hasOwn(value, 'resultJudgement') && value.resultJudgement !== resultJudgementOf(api)
+    ? [invalid(`/verification/resultJudgement must be ${JSON.stringify(resultJudgementOf(api))} for this transport (BeakSight sets it)`)]
+    : [];
   return [
-    ...keyErrorsOf(value, SCENARIO_VERIFICATION_ITEMS, '/verification'),
-    ...resultConditionShapeErrorsOf(value.successCondition ?? null, '/verification/successCondition'),
-    ...resultConditionShapeErrorsOf(value.inputErrorCondition ?? null, '/verification/inputErrorCondition'),
-    ...recordIdShapeErrorsOf(value.recordId ?? null),
-    ...readVerificationShapeErrorsOf(value.readVerification ?? null, allowEmptyBindings),
+    ...keyErrorsOf(value, VERIFICATION_DRAFT_KEYS, '/verification', OPTIONAL_VERIFICATION_DRAFT_KEYS),
+    ...judgementErrors,
+    ...recordIdShapeErrorsOf(value.recordId ?? null, api),
+    ...readVerificationShapeErrorsOf(value.readVerification ?? null, api),
   ];
 };
+
+/** PL-6a: 送り方の、結果の判定のしかたの印（form は構造の判定、API は応答の状態で決めるので null）。 */
+const resultJudgementOf = (api: boolean): ScenarioVerification['resultJudgement'] => (api ? null : FORM_STRUCTURE_RESULT_JUDGEMENT);
 
 /** 保つ欄の形の誤り（T31b）。 */
 const keepFieldNamesShapeErrorsOf = (value: unknown, path: string): readonly ScenarioDraftError[] => {
@@ -916,11 +933,16 @@ type LedgerBinding = typeof FORM_ACTION_LEDGER_BINDING | typeof API_PAGE_LEDGER_
  */
 export const isUpdatePathBoundToLedger = (
   actionPathTemplate: string,
-  ledgerRecordId: ScenarioRecordIdSpec | null,
+  ledgerRecordId: ScenarioVerificationRecordId | null,
   binding: LedgerBinding = FORM_ACTION_LEDGER_BINDING,
 ): boolean => {
   if (ledgerRecordId === null) {
     return true;
+  }
+  // PL-6a: form の台帳の ID の型の一覧は、どれかの型が `URL_PATH_PATTERN` と同じ決まりで結び付けば足りる（どの型で取った ID も同じレコードの ID）。
+  if (ledgerRecordId.source === FORM_RECORD_ID_SOURCE) {
+    return recordIdPathPatternsOf(ledgerRecordId)
+      .some((pathPattern) => isUpdatePathBoundToLedger(actionPathTemplate, { source: 'URL_PATH_PATTERN', pathPattern }, binding));
   }
   const actionSegments = actionPathTemplate.split(PATH_SEPARATOR);
   if (ledgerRecordId.source === 'ELEMENT') {
@@ -1104,20 +1126,12 @@ const notSentErrorOf = (draft: ScenarioDraftInput, fieldName: string, readCheckI
       { fieldName, readCheckId },
     )];
 
-/** 成功の条件と入力の誤りの条件が同時に当たりうるときの誤り（どちらかが未指定なら確かめない。T30a fix round 1）。 */
-const conditionOverlapErrorsOf = (verification: ScenarioVerification | undefined): readonly ScenarioDraftError[] => {
-  const success = verification?.successCondition ?? null;
-  const inputError = verification?.inputErrorCondition ?? null;
-  return success !== null && inputError !== null && mayMatchTogether(success, inputError)
-    ? [errorOf(
-      'SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS',
-      '/verification/successCondition and /verification/inputErrorCondition may match the same page',
-    )]
-    : [];
-};
-
 /** 照合の READ の誤り。 */
-const readVerificationErrorsOf = (draft: ScenarioDraftInput, readChecks: readonly ScenarioReadCheckDefinitionFact[]): readonly ScenarioDraftError[] => {
+const readVerificationErrorsOf = (
+  draft: ScenarioDraftInput,
+  readChecks: readonly ScenarioReadCheckDefinitionFact[],
+  listPagePath: string | null,
+): readonly ScenarioDraftError[] => {
   const read = draft.verification?.readVerification ?? null;
   if (read === null) {
     return [];
@@ -1126,7 +1140,11 @@ const readVerificationErrorsOf = (draft: ScenarioDraftInput, readChecks: readonl
   const reference = readCheckReferenceCheckOf(draft.profileId, read, readChecks);
   // T38c（ユーザーの判断 (3)、T38c の Blocker の判断（案 A））: API のシナリオに限って、`{id}` つきの画面の path の定義を照合の READ に使える（送る値が
   // ないので、結び付けは 0 件。1 件でもあれば、送る値の名前の誤り）。
-  const apiPageTemplate = draft.transport === API_SCENARIO_TRANSPORT && reference.fact?.targetKind === 'PAGE' && reference.fact.pageTemplate === true;
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、登録の画面の 1 つ上の一覧の画面の定義
+  // （`listPagePath`。呼ぶ側が `readListPagePathOf` で求める。登録でなければ null）も、`{id}` の型と同じく使える（送る値がないので結び付けは 0 件。生成した値と
+  // 比べる期待が要る）。
+  const apiPageTemplate = draft.transport === API_SCENARIO_TRANSPORT && reference.fact?.targetKind === 'PAGE'
+    && (reference.fact.pageTemplate === true || (listPagePath !== null && reference.fact.pagePath === listPagePath));
   // T37d fix round 1: ほかの画面の path を読む定義は、照合の READ に使わない（送る値がないので、結び付けの名前の誤りとは言わずに、この理由だけを出す）。
   const pageTarget = reference.fact?.targetKind === 'PAGE' && !apiPageTemplate;
   const error = pageTarget
@@ -1163,13 +1181,14 @@ const readVerificationErrorsOf = (draft: ScenarioDraftInput, readChecks: readonl
 };
 
 /**
- * 検証の指定の誤り（T30a）: 2 つの結果の条件の重なり（fix round 1）、照合の READ の定義の参照（照らす READ の定義と同じ理由。1 件）、結び付けごと
- * に READ の送る値の名前（使える定義のときだけ）と送る欄、期待の欄（入力の順）。
+ * 検証の指定の誤り（T30a）: 照合の READ の定義の参照（照らす READ の定義と同じ理由。1 件）、結び付けごとに READ の送る値の名前（使える定義のときだけ）と
+ * 送る欄、期待の欄（入力の順）。PL-6a: 2 つの結果の条件の重なりの確かめは、条件がなくなったので外した。
  */
-const verificationErrorsOf = (draft: ScenarioDraftInput, readChecks: readonly ScenarioReadCheckDefinitionFact[]): readonly ScenarioDraftError[] => [
-  ...conditionOverlapErrorsOf(draft.verification),
-  ...readVerificationErrorsOf(draft, readChecks),
-];
+const verificationErrorsOf = (
+  draft: ScenarioDraftInput,
+  readChecks: readonly ScenarioReadCheckDefinitionFact[],
+  listPagePath: string | null = null,
+): readonly ScenarioDraftError[] => readVerificationErrorsOf(draft, readChecks, listPagePath);
 
 /** 上限と期限の誤り（1 回の Run、累積、上限どうし、期限の順）。 */
 const limitErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraftError[] => {
@@ -1190,14 +1209,13 @@ const limitErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraftError[]
   ];
 };
 
-/** 結果の条件の写し（鍵の順を決める）。 */
-const resultConditionContentOf = (condition: ScenarioResultCondition | null): ScenarioResultCondition | null =>
-  condition === null ? null : { pathPrefix: condition.pathPrefix, selector: condition.selector };
-
-/** 登録の ID の取り方の写し。 */
-const recordIdContentOf = (spec: ScenarioRecordIdSpec | null): ScenarioRecordIdSpec | null => {
+/** 登録の ID の取り方の写し（PL-6a: form の ID の型の一覧は、入力の順のまま。当てる順なので並べ替えない）。 */
+const recordIdContentOf = (spec: ScenarioVerificationRecordId | null): ScenarioVerificationRecordId | null => {
   if (spec === null) {
     return null;
+  }
+  if (spec.source === FORM_RECORD_ID_SOURCE) {
+    return { source: spec.source, pathPatterns: [...spec.pathPatterns] };
   }
   return spec.source === 'URL_PATH_PATTERN' ? { source: spec.source, pathPattern: spec.pathPattern } : { source: spec.source, selector: spec.selector };
 };
@@ -1214,12 +1232,14 @@ const expectationContentOf = (expectation: VerificationExpectation): Verificatio
   }
 };
 
-/** 検証の指定の写し（照合の READ の結び付けは READ の送る値の名前の UTF-16 のコード単位の順。期待は入力の順）。 */
-const verificationContentOf = (verification: ScenarioVerification): ScenarioVerification => {
+/**
+ * 検証の指定の写し（照合の READ の結び付けは READ の送る値の名前の UTF-16 のコード単位の順。期待は入力の順）。PL-6a: 結果の判定のしかたの印は、送り方から
+ * 付ける（form は `FORM_STRUCTURE`、API は null。人の入力から取らない）。照合の専用の印は、真のときだけ持つ。
+ */
+const verificationContentOf = (verification: ScenarioVerificationDraft, api: boolean): ScenarioVerification => {
   const read = verification.readVerification;
   return {
-    successCondition: resultConditionContentOf(verification.successCondition),
-    inputErrorCondition: resultConditionContentOf(verification.inputErrorCondition),
+    resultJudgement: resultJudgementOf(api),
     recordId: recordIdContentOf(verification.recordId),
     readVerification: read === null ? null : {
       readCheckId: read.readCheckId,
@@ -1228,6 +1248,7 @@ const verificationContentOf = (verification: ScenarioVerification): ScenarioVeri
         .map(({ parameterName, fieldName }) => ({ parameterName, fieldName }))
         .sort((left, right) => compareCodeUnits(left.parameterName, right.parameterName)),
       expectations: read.expectations.map(expectationContentOf),
+      ...(read.verificationOnly === true ? { verificationOnly: true } : {}),
     },
   };
 };
@@ -1573,14 +1594,14 @@ export const apiUpdateLedgerBindingRejectionOf = (
 
 /**
  * 発見のジョブのプロファイルの改訂の誤り（T38c。T38b の報告の (2)）: 型の Origin は probe の時の承認したサービスの Origin の一覧の番号なので、候補を
- * 見つけた発見のジョブの改訂が今の改訂と同じであること。文脈にない・分からない・違うなら拒む（fail-closed。発見のやり直しが要る）。
+ * 見つけた発見のジョブの改訂が今の改訂と同じであること（PL-U: または切り替えだけで進んだこと。切り替えは承認したサービスの Origin を変えない）。文脈にない・
+ * 分からない・違うなら拒む（fail-closed。発見のやり直しが要る）。
  */
-const apiProfileRevisionErrorsOf = (context: ScenarioDraftContext): readonly ScenarioDraftError[] => {
-  const revisions = context.profileRevisions;
-  return revisions !== undefined && revisions.discoveryJob !== null && revisions.discoveryJob === revisions.current
+const apiProfileRevisionErrorsOf = (context: ScenarioDraftContext): readonly ScenarioDraftError[] =>
+  // PL-U の修正の 1 回目（設計書 14.1 の U5）: 古さは判定の 1 か所（`isDiscoveryProfileRevisionCurrent`。切り替えだけで進んだ改訂は、記録で確かめて同じとみなす）。
+  isDiscoveryProfileRevisionCurrent(context.profileRevisions)
     ? []
     : [errorOf('SCENARIO_API_DISCOVERY_PROFILE_STALE', 'the discovery job that found the candidate was run with another revision of the profile')];
-};
 
 /** 送る鍵の名前の誤り（FORM の送る欄と同じ、秘密に見える名前と危険な語）。 */
 const apiFieldNameErrorsOf = (draft: ScenarioDraftInput): readonly ScenarioDraftError[] => draft.fieldNames.flatMap((fieldName) => {
@@ -1655,7 +1676,11 @@ const validateApiScenarioDraft = (
       ...apiLedgerErrorsOf(draft, api, candidateResult.accepted, candidate, context),
     );
   }
-  errors.push(...readCheckErrorsOf(draft, readChecks), ...verificationErrorsOf(draft, readChecks), ...limitErrorsOf(draft));
+  // OP-R（R1）: 一覧の画面の定義を照合の READ に使えるのは、API の登録だけ（登録の画面の 1 つ上の path）。
+  const listPagePath = candidateResult.ok && candidate !== null && candidateResult.accepted.kind === CREATE_SCENARIO_KIND
+    ? readListPagePathOf(candidate.page.path)
+    : null;
+  errors.push(...readCheckErrorsOf(draft, readChecks), ...verificationErrorsOf(draft, readChecks, listPagePath), ...limitErrorsOf(draft));
   if (errors.length > 0 || !candidateResult.ok || candidate === null) {
     return rejected(errors);
   }
@@ -1686,7 +1711,7 @@ const contentOf = (draft: ScenarioDraftInput, candidate: DiscoveryCandidate, kin
       unknown as SideEffectConfirmations,
     limits: { maxCreatesPerRun: draft.limits.maxCreatesPerRun, maxCumulativeCreates: draft.limits.maxCumulativeCreates },
     approvalTtlDays: draft.approvalTtlDays,
-    verification: verificationContentOf(draft.verification ?? UNSPECIFIED_VERIFICATION),
+    verification: verificationContentOf(draft.verification ?? UNSPECIFIED_VERIFICATION, draft.transport === API_SCENARIO_TRANSPORT),
     update: updateContentOf(draft, candidate, kind),
   });
 
@@ -1735,6 +1760,15 @@ export const unconfirmedSideEffectsOf = (confirmations: SideEffectConfirmations)
   Object.freeze(SIDE_EFFECT_CONFIRMATIONS.filter((item) => confirmations[item] !== true));
 
 /**
+ * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 4 項目をすべて確かめた副作用の確認（閉じた一覧の順）。承認の
+ * ダイアログの 1 回の「承認する」で、確認のない版に入れる値（`scenario-store.ts` の承認）。承認の前の画面が「承認のときに確認する」前提で例を作るときも、
+ * この値を使う（書き写さない）。
+ */
+export const CONFIRMED_SIDE_EFFECTS: SideEffectConfirmations = Object.freeze(
+  Object.fromEntries(SIDE_EFFECT_CONFIRMATIONS.map((item) => [item, true])) as Record<SideEffectConfirmation, boolean>,
+);
+
+/**
  * 送り方ごとの、検証の指定で求める項目（T40a-fix。閉じた一覧の順）: FORM（送り方の項目なしを含む）はすべて（`SCENARIO_VERIFICATION_ITEMS`）、API は
  * 照合の READ と ID の取り方だけ（`API_SCENARIO_VERIFICATION_ITEMS`）。画面の検証の指定の表示もこの一覧に従う。
  */
@@ -1760,9 +1794,14 @@ export const missingVerificationItemsOf = (
 ): readonly ScenarioVerificationItem[] => {
   const api = scenarioTransportOf(scenario) === API_SCENARIO_TRANSPORT;
   // T41e-2: API の更新は、求める一覧（`requiredVerificationItemsOf`）に ID の取り方が入らない。
-  return Object.freeze(requiredVerificationItemsOf(scenario).filter((item) => (api && item === 'recordId'
-    ? verification.recordId === null && (scenario.api?.recordId ?? null) === null
-    : verification[item] === null)));
+  // PL-5 の 9 の (4)（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「登録の ID の取り方」の行）: form の ID の取り方は、決められなければ
+  // null のまま実行の許可を出す（結果は ID なしの `PARTIAL`）。不足に数えない。結果の判定のしかたの印と答え合わせは今どおり求める。
+  return Object.freeze(requiredVerificationItemsOf(scenario).filter((item) => {
+    if (item !== 'recordId') {
+      return verification[item] === null;
+    }
+    return api && verification.recordId === null && (scenario.api?.recordId ?? null) === null;
+  }));
 };
 
 /** スキーマで形を確かめた凍結した写し。通らなければ `RangeError`（呼び出し側の誤り）。手順は `schema-checked-copy.ts`（CCX-17。CC-077）。 */
@@ -1770,15 +1809,34 @@ const storableCopyOf = <T>(schemaName: 'scenario' | 'approval-receipt', subject:
   requireSchemaCheckedCopy<T>(schemaName, subject, value);
 
 /** 保存の前の確かめ直し（シナリオの版 1 つ）。凍結した写しを返す。 */
-export const assertStorableScenarioRevision = (revision: ScenarioRevision): ScenarioRevision =>
-  storableCopyOf('scenario', 'scenario revision', revision);
+export const assertStorableScenarioRevision = (revision: ScenarioRevision): ScenarioRevision => {
+  const checked = storableCopyOf('scenario', 'scenario revision', revision);
+  // PL-6a（設計者の判断 (c)）: 新しく書く文書は新しい形だけ（結果の判定のしかたの印を持ち、人が入れた成否の条件の項目を持たない。スキーマは前の文書を
+  // 読むために受けるので、書く前にここで拒む）。
+  const verification = checked.verification as ScenarioVerification & Readonly<Record<string, unknown>>;
+  if (!Object.hasOwn(verification, 'resultJudgement') || RETIRED_SCENARIO_VERIFICATION_ITEMS.some((item) => Object.hasOwn(verification, item))) {
+    throw new RangeError('the scenario revision must have the result judgement and no retired result conditions');
+  }
+  return checked;
+};
 
 /**
  * 保存した版の文書を読む（T30a）。`assertStorableScenarioRevision` と同じく、スキーマで形を確かめた凍結した写しを返す（通らなければ `RangeError`）。
  * LG-3: 前の形（`verification`・`update` の項目がない、form の UPDATE で `update` が null、T41a の契約のない API の更新）を読み替えない。
  */
-export const storedScenarioRevisionOf = (document: unknown): ScenarioRevision =>
-  storableCopyOf('scenario', 'stored scenario revision', document as ScenarioRevision);
+export const storedScenarioRevisionOf = (document: unknown): ScenarioRevision => {
+  const checked = storableCopyOf('scenario', 'stored scenario revision', document as ScenarioRevision);
+  // PL-6a（設計者の判断 (c)）: 前に保存した文書の、人が入れた成否の条件の項目（`RETIRED_SCENARIO_VERIFICATION_ITEMS`。スキーマは受ける）は捨て、結果の
+  // 判定のしかたの印がなければ null として読む（未指定。form のシナリオは `VERIFICATION_SPEC_MISSING` で実行の許可を出さない。承認は digest の版で外れる）。
+  const stored = checked.verification as ScenarioVerification & Readonly<Record<string, unknown>>;
+  if (!RETIRED_SCENARIO_VERIFICATION_ITEMS.some((item) => Object.hasOwn(stored, item)) && Object.hasOwn(stored, 'resultJudgement')) {
+    return checked;
+  }
+  const verification: ScenarioVerification = {
+    resultJudgement: stored.resultJudgement ?? null, recordId: stored.recordId, readVerification: stored.readVerification,
+  };
+  return deepFreeze({ ...checked, verification });
+};
 
 /** 保存の前の確かめ直し（承認か撤回の記録 1 件）。凍結した写しを返す。 */
 export const assertStorableApprovalReceipt = <T extends ApprovalReceiptRecord>(receipt: T): T =>

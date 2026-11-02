@@ -76,6 +76,19 @@ const VALID_PARENT_MESSAGES: readonly (readonly [string, ParentToWorkerMessage])
   ['START (new)', { protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: 'job-0001', jobKind: 'AUDIT', targetConfigPath: 'config/targets/example.json', startNew: true, targetConfigSha256: SHA256 }],
   ['START (local target)', { protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: 'a', jobKind: 'AUDIT', targetConfigPath: 'local/targets/sub/example.json', startNew: false, targetConfigSha256: SHA256 }],
   ['START (longest job id)', { protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: `a${'0'.repeat(63)}`, jobKind: 'AUDIT', targetConfigPath: 'config/targets/x.json', startNew: false, targetConfigSha256: SHA256 }],
+  // DEF-180（版 5）: 前のワーカーの終わりの時刻（ただの数）。0 と安全な整数の最大も受ける。
+  ['START (previous navigation time)', {
+    protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: 'job-0002', jobKind: 'ENTRY_CHECK', targetConfigPath: 'config/targets/example.json', startNew: true,
+    targetConfigSha256: SHA256, previousNavigationAtMs: 1_793_000_000_000,
+  }],
+  ['START (previous navigation time 0)', {
+    protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: 'job-0003', jobKind: 'AUDIT', targetConfigPath: 'config/targets/example.json', startNew: true,
+    targetConfigSha256: SHA256, previousNavigationAtMs: 0,
+  }],
+  ['START (previous navigation time, the largest)', {
+    protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: 'job-0004', jobKind: 'AUDIT', targetConfigPath: 'config/targets/example.json', startNew: true,
+    targetConfigSha256: SHA256, previousNavigationAtMs: Number.MAX_SAFE_INTEGER,
+  }],
   ['STOP', { protocol: WORKER_PROTOCOL_VERSION, type: 'STOP', force: false }],
   ['STOP (force)', { protocol: WORKER_PROTOCOL_VERSION, type: 'STOP', force: true }],
 ];
@@ -228,6 +241,12 @@ describe('worker protocol: rejected messages (fail-closed)', () => {
     ['a config digest in upper case', { ...start, targetConfigSha256: SHA256.toUpperCase() }],
     ['a config digest that is too short', { ...start, targetConfigSha256: SHA256.slice(1) }],
     ['a config digest that is not hexadecimal', { ...start, targetConfigSha256: 'g'.repeat(SHA256.length) }],
+    // DEF-180（版 5）: 前の読み込みの時刻は、0 以上の安全な整数だけ。版 4 の START は受けない。
+    ['a negative previous navigation time', { ...start, previousNavigationAtMs: -1 }],
+    ['a fractional previous navigation time', { ...start, previousNavigationAtMs: 1.5 }],
+    ['a previous navigation time beyond the safe integers', { ...start, previousNavigationAtMs: Number.MAX_SAFE_INTEGER + 2 }],
+    ['a previous navigation time as a string', { ...start, previousNavigationAtMs: '1793000000000' }],
+    ['the protocol version 4', { ...start, protocol: 'beaksight-worker-message/4' }],
   ] as const)('rejects a parent message with %s', (_name, value) => {
     const result = validateParentToWorkerMessage(value);
     expect(result.ok).toBe(false);
@@ -343,7 +362,7 @@ describe('worker protocol: value lists, limits and the schema', () => {
     expect(pointerValue(SCHEMA, '/$id')).toBe('urn:beaksight:schema:control:worker-message:1');
     expect(definitionOf('protocol')).toEqual({ const: WORKER_PROTOCOL_VERSION });
     // T30e: 書き込みのジョブの指定と、確かめ直しの往復と、送信の報告を足したので、版を上げた。
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/2');
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/7'); // OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     expect(pointerValue(SCHEMA, '/$defs/start/properties/jobId/pattern')).toBe(WORKER_JOB_ID_PATTERN.source);
     expect(pointerValue(SCHEMA, '/$defs/start/properties/targetConfigSha256/pattern')).toBe(TARGET_CONFIG_SHA256_PATTERN.source);
     // 要約は、内容の SHA-256 の 16 進（Node の crypto と同じ値）。

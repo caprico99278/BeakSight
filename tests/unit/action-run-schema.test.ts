@@ -45,7 +45,9 @@ describe('action-run.json schema (T30a)', () => {
     expect(schema.$id).toBe('urn:beaksight:schema:action-run:1.0');
     // T40c: 書き手は 1.1 を書き、読み手は 1.0 と 1.1 を受ける（版の一覧とスキーマの enum の一致は `action-run-v11.test.ts`）。
     expect(prop(schema, 'schemaVersion').enum).toContain(ACTION_RUN_SCHEMA_VERSION);
-    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.1');
+    // PL-6a: 書き手は 1.2 を書き、読み手は 1.1 と 1.2 を受ける。
+    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.2');
+    expect(prop(schema, 'schemaVersion').enum).toEqual(['action-run-schema/1.1', 'action-run-schema/1.2']);
   });
 
   it('matches the limits and the shapes with the named constants', () => {
@@ -114,10 +116,11 @@ describe('action-run.json schema (T30a)', () => {
     ['a bad run id', verifiedRun({ runId: 'run-1' })],
     ['a bad timestamp', verifiedRun({ finishedAt: '2026-10-13T00:00:00Z' })],
     ['a RESERVED reservation (not settled)', verifiedRun({ reservationState: 'RESERVED' as never })],
-    ['a condition path prefix without "/"', verifiedRun({
-      // T40c: 成否の条件は API の記録で null を許す型になったので、FORM の見本の値を型どおりに写してから上書きする。
-      resultConditions: { inputErrorCondition: { pathPrefix: '/members/new', selector: null }, successCondition: { pathPrefix: 'members', selector: null } },
-    })],
+    // PL-6a: 版 1.2 の結果の判定のしかたの印は、閉じた一覧の値だけ（成否の条件の項目は持てない）。
+    ['an unknown result judgement', verifiedRun({ resultJudgement: 'SUCCESS_CONDITION' as never })],
+    ['a 1.2 run with the result conditions of 1.1', {
+      ...verifiedRun(), resultConditions: { successCondition: { pathPrefix: '/members/', selector: null }, inputErrorCondition: { pathPrefix: '/members', selector: null } },
+    }],
     ['a not sent run without a block reason', blockedRun({ blockReason: null })],
     ['a not sent run with a response', blockedRun({ httpStatus: 200 })],
     ['a not sent run with a response judgement', blockedRun({ responseJudgement: 'SUCCESS' })],

@@ -3,6 +3,8 @@
  * - 入力は、表示用モデル（`buildReportViewModel` の結果）だけ。判定や集計はしない。件数は、表示用モデルの値をそのまま使う（GATE-UI04）。
  * - 節と順は、設計書 6.1.4 のとおり（要約、重大な指摘、category ごとの節、Interaction、Safety、ページの一覧）。節の名前と順と
  *   アンカーは、表示カタログ（`REPORT_SECTION_CATALOG`、`REPORT_CATEGORY_SECTION_CATALOG`）から取る。
+ *   PL-R（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章）: 冒頭に「まとめ」の段（表示用モデルの `overview` を描くだけ）を置き、前の「要約」の
+ *   節（Run の ID・許可 Origin・環境・版・送った要求の数などの技術の記録）は、中身を変えずに末尾の「記録」の段へ移した。
  * - HTML のタグを書かない。`html-components.ts` の部品を組み合わせるだけにする（GATE-UI03）。値は、部品がエスケープする。
  * - 日本語の文言は、文言カタログ（`src/presentation/messages.ts`）と表示カタログから取る（GATE-UI06）。色の値と、状態や severity の
  *   値の文字列は書かない（GATE-UI02、GATE-UI01）。
@@ -26,6 +28,7 @@ import {
   type RunExecution,
   type RunLoad,
 } from '../core/contracts.js';
+import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import { BEAKSIGHT_BLOCK_RELATIONS } from '../core/beaksight-block-relation.js';
 import { INTERACTION_NOT_VERIFIABLE_KINDS } from '../core/evidence-types.js';
 import {
@@ -68,6 +71,7 @@ import {
   earlierAttemptRecordText,
   ordinalText,
   retryAttemptText,
+  ruleVersionText,
   severityGroupTotalText,
   userAgentLabelText,
 } from '../presentation/messages.js';
@@ -106,8 +110,10 @@ import type {
   FindingSectionView,
   FindingView,
   InteractionView,
+  OverviewProblemView,
   PageView,
   ReasonView,
+  ReportOverviewView,
   ReportViewModel,
   RetryAttemptView,
   RunSummaryView,
@@ -128,16 +134,29 @@ interface RenderContext {
 // アンカー
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 要約の小見出しのアンカー。 */
+/** 記録の段（PL-R の前の「要約」の節）の小見出しのアンカー。 */
 const SUMMARY_ANCHORS = Object.freeze({
-  run: toAnchorId('summary', 'run'),
-  coverage: toAnchorId('summary', 'coverage'),
-  counts: toAnchorId('summary', 'counts'),
-  limits: toAnchorId('summary', 'limits'),
-  load: toAnchorId('summary', 'load'),
-  executions: toAnchorId('summary', 'executions'),
-  reasons: toAnchorId('summary', 'reasons'),
-  environment: toAnchorId('summary', 'environment'),
+  run: toAnchorId('record', 'run'),
+  coverage: toAnchorId('record', 'coverage'),
+  counts: toAnchorId('record', 'counts'),
+  limits: toAnchorId('record', 'limits'),
+  load: toAnchorId('record', 'load'),
+  executions: toAnchorId('record', 'executions'),
+  reasons: toAnchorId('record', 'reasons'),
+  environment: toAnchorId('record', 'environment'),
+  // OP-3: 本文から移した技術の記録。
+  findings: toAnchorId('record', 'findings'),
+  interactions: toAnchorId('record', 'interactions'),
+  safety: toAnchorId('record', 'safety'),
+  pages: toAnchorId('record', 'pages'),
+});
+
+/** PL-R: まとめの段の小見出しのアンカー。 */
+const OVERVIEW_ANCHORS = Object.freeze({
+  scope: toAnchorId('overview', 'scope'),
+  counts: toAnchorId('overview', 'counts'),
+  top: toAnchorId('overview', 'top'),
+  notChecked: toAnchorId('overview', 'not-checked'),
 });
 
 /** Interaction と Safety の小見出しのアンカー。 */
@@ -215,6 +234,9 @@ const reasonParts = (reason: ReasonView<string>): readonly [Fragment, Fragment, 
 /** 1つの理由を、コード、説明、詳細の順に空白でつないだもの（詳細がなければ、コードと説明だけ）。 */
 const reasonText = (reason: ReasonView<string>): Fragment => joinWithSpace(reasonParts(reason));
 
+/** 理由の一覧（コード、説明、詳細。記録の段）。 */
+const reasonList = (reasons: readonly ReasonView[]): Fragment => renderReferenceList(reasons.map(reasonText));
+
 const reasonTable = (reasons: readonly ReasonView[]): Fragment =>
   tableOrNone(
     null,
@@ -225,8 +247,6 @@ const reasonTable = (reasons: readonly ReasonView[]): Fragment =>
     }),
   );
 
-const reasonList = (reasons: readonly ReasonView[]): Fragment => renderReferenceList(reasons.map(reasonText));
-
 // ---------------------------------------------------------------------------------------------------------------
 // Finding
 // ---------------------------------------------------------------------------------------------------------------
@@ -235,7 +255,7 @@ const reasonList = (reasons: readonly ReasonView[]): Fragment => renderReference
  * Finding の行（category の節だけが出す。アンカー `finding-<ID>` を付ける。すべての Finding は、どれか1つの category の節に入る）。T44f: 「重大な指摘」の
  * 節は行を出し直さず、この行へのリンクの一覧にした（`findingLinkList`）。
  */
-const findingRow = (context: RenderContext, view: FindingView): SafeHtml<'row'> =>
+const findingRow = (context: RenderContext, view: FindingView, technical: boolean): SafeHtml<'row'> =>
   renderFindingRow({
     finding: view.finding,
     allowedOrigins: context.allowedOrigins,
@@ -250,12 +270,29 @@ const findingRow = (context: RenderContext, view: FindingView): SafeHtml<'row'> 
     // BN-c・BN-d: BeakSight の遮断との関係の印（表示用モデルの判定のまま）と、BN-R0 の M-3: SAFETY の Finding の時点の印。
     blockRelation: view.beaksightBlockRelation,
     safetyBlockPhaseCounts: view.safetyBlockPhaseCounts,
+    // OP-3（PL 14 章）: 本文の行は、やさしい語の行（規則と証拠は、記録の段の `findingRecordRow`）。
+    technical,
+    // OP-R2: やさしい語の行の内容は、Rule のやさしい文（表示用モデルの値のまま）。Rule の文は、記録の段に出す。
+    ...(technical ? {} : { plainMessage: view.plainMessage }),
   });
 
 const findingTableOrNone = (context: RenderContext, findings: readonly FindingView[]): Fragment =>
   findings.length === 0
     ? renderParagraph(HTML_REPORT_TEXT.noFindings)
-    : renderFindingTable({ caption: null, rows: findings.map((view) => findingRow(context, view)) });
+    : renderFindingTable({ caption: null, rows: findings.map((view) => findingRow(context, view, false)), technical: false });
+
+/**
+ * OP-3: 記録の段の、Finding の技術の記録の行（番号は本文の行へのリンク、Rule の ID と版、Rule の文（OP-R2。本文はやさしい文なので、Rule の文はここに出す）、
+ * Evidence の参照、スクリーンショットの Evidence の ID）。
+ */
+const findingRecordRow = (view: FindingView): SafeHtml<'row'> =>
+  renderTableRow([
+    renderInternalLink(view.finding.findingId, toAnchorId('finding', view.finding.findingId)),
+    joinWithSpace([renderCode(view.finding.ruleId), renderMutedText(ruleVersionText(view.finding.ruleVersion))]),
+    htmlText(view.finding.message),
+    renderReferenceList(view.evidence.map((reference) => evidenceRef(reference.evidenceId, reference.location))),
+    renderReferenceList(view.screenshots.map((screenshot) => renderCode(screenshot.evidenceId))),
+  ]);
 
 /**
  * T44f（Task 44 の設計書 P3-1 の D）: Finding へのリンクの一覧（severity の印、分類ごとの節の行へのリンク（Finding の ID）、文言）。「重大な指摘」の節と、
@@ -263,11 +300,13 @@ const findingTableOrNone = (context: RenderContext, findings: readonly FindingVi
  */
 const findingLinkList = (findings: readonly FindingView[]): Fragment =>
   renderReferenceList(
-    findings.map(({ finding }) =>
+    findings.map(({ finding, plainMessage }) =>
       joinWithSpace([
         renderSeverityBadge(finding.severity),
-        renderInternalLink(finding.findingId, toAnchorId('finding', finding.findingId)),
-        htmlText(finding.message),
+        // OP-R2: 本文は、Rule のやさしい文（表示用モデルの値のまま）。
+        htmlText(plainMessage),
+        // OP-3（PL 14 章）: リンクの語は、問題の番号でなく「くわしく見る」（番号は記録の段）。
+        renderInternalLink(HTML_REPORT_TEXT.overview.problemLink, toAnchorId('finding', finding.findingId)),
       ]),
     ),
   );
@@ -328,6 +367,13 @@ const auditSendPolicyValue = (auditSend: RunSummaryView['auditSend']): Fragment 
   const spec = AUDIT_SEND_POLICY_CATALOG[auditSend.policy];
   return joinWithSpace([renderBadge(spec, auditSend.policy), spec.description === null ? null : htmlText(spec.description)]);
 };
+
+/** OP-3: 本文の送信の扱いの、やさしい説明（鍵は送信の扱いの一覧と同じ。書き漏れは型のエラー）。 */
+const PLAIN_AUDIT_SEND: Readonly<Record<AuditSendPolicyName, string>> = HTML_REPORT_TEXT.plainAuditSend;
+
+/** OP-3: 本文の送信の扱い（印と、送り方の名前を書かないやさしい説明。表示カタログの説明は記録の段）。 */
+const auditSendPlainValue = (auditSend: RunSummaryView['auditSend']): Fragment =>
+  joinWithSpace([renderBadge(AUDIT_SEND_POLICY_CATALOG[auditSend.policy], auditSend.policy), htmlText(PLAIN_AUDIT_SEND[auditSend.policy])]);
 
 /**
  * AS-b: 通したことの知らせ（目立つ形。表示用モデルの `prominent` が真のときだけ）。Run の小節の最初と、Safety の節に置く。件数は `formatCount`。
@@ -462,6 +508,86 @@ function renderSummary(summary: RunSummaryView, level: SectionHeadingLevel): rea
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// PL-R: 冒頭のまとめの段（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章）
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 大事な問題の 1 行（重さの印、Rule のやさしい文（OP-R2）、出た回数とページの数、種類ごとの問題の表の行へのリンク）。 */
+const overviewProblemItem = (problem: OverviewProblemView): Fragment =>
+  joinWithSpace([
+    renderSeverityBadge(problem.severity),
+    htmlText(problem.plainMessage),
+    renderMutedText(problem.pageCount === 0
+      ? HTML_REPORT_TEXT.overview.problemTimesWithoutPages(formatCount(problem.count))
+      : HTML_REPORT_TEXT.overview.problemTimes(formatCount(problem.count), formatInteger(problem.pageCount))),
+    renderInternalLink(HTML_REPORT_TEXT.overview.problemLink, toAnchorId('finding', problem.findingId)),
+  ]);
+
+/** 見なかった理由の 1 行（説明と、あれば次にできること。理由のコードと技術の詳細は、記録の段にだけ出す）。 */
+const overviewReasonText = (reason: ReasonView<string>): Fragment =>
+  reason.nextStep === null
+    ? htmlText(reason.description)
+    : joinWithSpace([htmlText(reason.description), htmlText(HTML_REPORT_TEXT.reasonNextStep(reason.nextStep))]);
+
+/** 「見られなかったところ」の中身（最後まで見られなかったページの数、点検の全体の理由、ページの理由ごとのページの数。何もなければ、ないことの文）。 */
+const overviewNotChecked = (overview: ReportOverviewView): readonly Fragment[] => {
+  const text = HTML_REPORT_TEXT.overview;
+  const parts: Fragment[] = [
+    ...(overview.notFullyCheckedPageCount > 0 ? [renderParagraph(text.notFullyCheckedPages(formatInteger(overview.notFullyCheckedPageCount)))] : []),
+    ...(overview.runReasons.length > 0
+      ? [renderKeyValueList([{ label: text.runReasonsCaption, value: renderReferenceList(overview.runReasons.map(overviewReasonText)) }])]
+      : []),
+    ...(overview.pageReasons.length > 0
+      ? [renderKeyValueList([{
+        label: text.pageReasonsCaption,
+        value: renderReferenceList(overview.pageReasons.map(({ reason, pages }) =>
+          reason.nextStep === null
+            ? htmlText(text.pageReason(reason.description, formatInteger(pages)))
+            : joinWithSpace([htmlText(text.pageReason(reason.description, formatInteger(pages))), htmlText(HTML_REPORT_TEXT.reasonNextStep(reason.nextStep))]))),
+      }])]
+      : []),
+  ];
+  return parts.length === 0 ? [renderParagraph(text.nothingLeft)] : parts;
+};
+
+/**
+ * まとめの段（何を見たか、見つかった問題の数、大事な問題、見られなかったところ）。値は表示用モデルの `overview` と `summary` のまま（数え直さない）。Run の ID・
+ * 許可 Origin・版などの技術の記録は出さない（末尾の記録の段にある）。
+ */
+function renderOverview(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): readonly Fragment[] {
+  const text = HTML_REPORT_TEXT.overview;
+  const { summary, overview } = viewModel;
+  return [
+    // 安全のために必ず見せるもの（設計書 7 章）: ページが出す送信を通した点検の知らせは、技術の記録を末尾へ移しても、冒頭に残す（目立つ形。表示用モデルの
+    // `summary.auditSend.prominent` が真のときだけ）。
+    ...auditSendNotice(summary.auditSend),
+    // OP-H: チェックした画面がある点検は、この後に登録・更新することを言う（表示用モデルの `overview.plannedWriteScreenCount` のまま。報告で判定しない）。
+    ...(overview.plannedWriteScreenCount > 0 ? [renderParagraph(text.plannedWrites)] : []),
+    subsection(level, text.scopeHeading, OVERVIEW_ANCHORS.scope, [
+      renderKeyValueList([
+        { label: text.site, value: renderUrl(summary.startUrl, context.allowedOrigins) },
+        { label: text.result, value: joinWithSpace([renderRunStatusBadge(summary.runStatus), htmlText(RUN_STATUS_CATALOG[summary.runStatus].description)]) },
+        { label: text.discoveredPages, value: formatCount(summary.coverage.discovered) },
+        { label: text.checkedPages, value: formatCount(overview.checkedPageCount) },
+      ]),
+    ]),
+    subsection(level, text.countsHeading, OVERVIEW_ANCHORS.counts, [
+      renderParagraph(overview.problemCount === 0 ? text.noProblems : text.problemsFound(formatCount(overview.problemCount))),
+      renderParagraph(renderMutedText(text.countsNote)),
+      renderKeyValueList(
+        sortByDisplayOrder(SEVERITIES, SEVERITY_CATALOG).map((severity) => ({
+          label: SEVERITY_CATALOG[severity].label,
+          value: formatCount(summary.findingCounts.bySeverity[severity]),
+        })),
+      ),
+    ]),
+    subsection(level, text.topHeading, OVERVIEW_ANCHORS.top, [
+      overview.topProblems.length === 0 ? renderParagraph(text.noProblems) : renderReferenceList(overview.topProblems.map(overviewProblemItem)),
+    ]),
+    subsection(level, text.notCheckedHeading, OVERVIEW_ANCHORS.notChecked, overviewNotChecked(overview)),
+  ];
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // 節2・3: 重大な指摘、category ごとの節
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -478,21 +604,43 @@ function renderCategorySection(context: RenderContext, view: FindingSectionView,
 // 節4: Interaction
 // ---------------------------------------------------------------------------------------------------------------
 
+/** 押したもの（要素の名前、役割、読み上げの名前。記録の段）。 */
+const interactionTargetCode = (item: InteractionView): Fragment =>
+  item.target === null
+    ? htmlText(formatNotObserved())
+    : joinWithSpace([
+        renderCode(item.target.tagName),
+        item.target.role === null ? null : renderCode(item.target.role),
+        item.target.accessibleName === '' ? null : htmlText(item.target.accessibleName),
+      ]);
+
+/** OP-3: 本文の押したもの（読み上げの名前だけ。名前がなければ、名前のない部品）。 */
+const interactionTargetPlain = (item: InteractionView): Fragment =>
+  item.target === null
+    ? htmlText(formatNotObserved())
+    : htmlText(item.target.accessibleName === '' ? HTML_REPORT_TEXT.interactions.unnamedTarget : item.target.accessibleName);
+
 function interactionRow(context: RenderContext, item: InteractionView): SafeHtml<'row'> {
-  const target =
-    item.target === null
-      ? htmlText(formatNotObserved())
-      : joinWithSpace([
-          renderCode(item.target.tagName),
-          item.target.role === null ? null : renderCode(item.target.role),
-          item.target.accessibleName === '' ? null : htmlText(item.target.accessibleName),
-        ]);
   return renderTableRow([
     joinWithSpace([renderUrl(item.pageUrl, context.allowedOrigins), pageLink(context, item.pageId)]),
     item.viewport === null ? renderMutedText(REPORT_COMPONENT_TEXT.viewportIndependent) : VIEWPORT_PROFILE_CATALOG[item.viewport].label,
-    target,
+    interactionTargetPlain(item),
     renderInteractionStatusBadge(item.status),
     item.notVerifiableKind === null ? none() : renderNotVerifiableKindBadge(item.notVerifiableKind),
+    // OP-3（PL 14 章）: 理由はやさしい説明だけ（コード・詳細・証拠は記録の段の `interactionRecordRow`）。
+    overviewReasonText(item.reason),
+  ]);
+}
+
+/**
+ * OP-3: 記録の段の、押して確かめた操作の技術の記録の行（ページ、押したもの、理由のコードと説明と詳細、Evidence の参照）。OP-G2（WCAG 2.2 の 2.5.8。axe の
+ * target-size）: ページの欄のアドレスは文字で示し、押す所はページへのリンクの 1 つにする（列の少ない表で、行が並ぶと、アドレスのリンクとページへのリンクと
+ * 隣の行のリンクが近づきすぎた。アドレスへのリンクは本文の表にある）。
+ */
+function interactionRecordRow(context: RenderContext, item: InteractionView): SafeHtml<'row'> {
+  return renderTableRow([
+    joinWithSpace([renderUrlAsText(item.pageUrl), pageLink(context, item.pageId)]),
+    interactionTargetCode(item),
     reasonText(item.reason),
     evidenceRef(item.evidenceId, item.location),
   ]);
@@ -521,7 +669,7 @@ function renderInteractions(context: RenderContext, viewModel: ReportViewModel, 
     subsection(level, text.listHeading, INTERACTION_ANCHORS.list, [
       interactions.items.length === 0
         ? renderParagraph(text.noInteractions)
-        : renderTable({ caption: null, columns: text.columns, rows: interactions.items.map((item) => interactionRow(context, item)) }),
+        : renderTable({ caption: null, columns: text.plainColumns, rows: interactions.items.map((item) => interactionRow(context, item)) }),
     ]),
   ];
 }
@@ -569,10 +717,10 @@ function renderSafety(context: RenderContext, viewModel: ReportViewModel, level:
   const blocked = safety.blockedActions;
   const { auditSend } = viewModel.summary;
   return [
-    // AS-b: 通したことの知らせ（目立つ形）と、扱い・通した数（method ごと）。値は表示用モデルの `summary.auditSend` のまま。
+    // AS-b: 通したことの知らせ（目立つ形）と、扱い・通した数。値は表示用モデルの `summary.auditSend` のまま。OP-3: method ごとの数は記録の段。
     ...auditSendNotice(auditSend),
     renderKeyValueList([
-      { label: AUDIT_SEND_TEXT.label, value: auditSendPolicyValue(auditSend) },
+      { label: AUDIT_SEND_TEXT.label, value: auditSendPlainValue(auditSend) },
       ...(auditSend.prominent
         ? [
           { label: AUDIT_SEND_TEXT.passedCount, value: formatCount(auditSend.passedRequests) },
@@ -585,13 +733,6 @@ function renderSafety(context: RenderContext, viewModel: ReportViewModel, level:
         ]
         : []),
     ]),
-    ...(auditSend.prominent
-      ? [tableOrNone(
-        AUDIT_SEND_TEXT.methodsCaption,
-        AUDIT_SEND_TEXT.methodColumns,
-        Object.entries(auditSend.passedRequestsByMethod).map(([method, count]) => renderTableRow([renderCode(method), formatCount(count)])),
-      )]
-      : []),
     renderKeyValueList([
       { label: text.guard, value: safety.guardEnabled ? text.guardEnabled : text.guardDisabled },
       { label: text.excludedInteractionCandidates, value: formatCount(safety.excludedInteractionCandidateCount) },
@@ -608,18 +749,38 @@ function renderSafety(context: RenderContext, viewModel: ReportViewModel, level:
         { label: text.blockedActions.downloads, value: formatCount(blocked.downloads) },
         { label: text.blockedActions.webSockets, value: formatCount(blocked.webSockets) },
       ]),
-      tableOrNone(
-        text.methodsCaption,
-        text.methodColumns,
-        Object.entries(safety.blockedRequestsByMethod).map(([method, count]) => renderTableRow([renderCode(method), formatCount(count)])),
-      ),
     ]),
+  ];
+}
+
+/**
+ * OP-3（PL 14 章）: 記録の段の、安全の技術の記録（通した送信と止めた要求の送り方ごとの数、安全の決まりに反したことの記号、安全のために止めたことの一覧）。
+ * 本文の安全の節から移した（中身は変えない）。
+ */
+function renderSafetyRecord(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): Fragment {
+  const text = HTML_REPORT_TEXT.safety;
+  const { safety } = viewModel;
+  const { auditSend } = viewModel.summary;
+  const subLevel = (level + 1) as SectionHeadingLevel;
+  return subsection(level, HTML_REPORT_TEXT.record.safetyHeading, SUMMARY_ANCHORS.safety, [
+    ...(auditSend.prominent
+      ? [tableOrNone(
+        AUDIT_SEND_TEXT.methodsCaption,
+        AUDIT_SEND_TEXT.methodColumns,
+        Object.entries(auditSend.passedRequestsByMethod).map(([method, count]) => renderTableRow([renderCode(method), formatCount(count)])),
+      )]
+      : []),
+    tableOrNone(
+      text.methodsCaption,
+      text.methodColumns,
+      Object.entries(safety.blockedRequestsByMethod).map(([method, count]) => renderTableRow([renderCode(method), formatCount(count)])),
+    ),
     tableOrNone(
       text.violationsCaption,
       text.violationColumns,
       safety.invariantViolations.map((violation) => renderTableRow([renderCode(violation.code), renderCode(violation.message)])),
     ),
-    subsection(level, text.eventsHeading, SAFETY_ANCHORS.events, [
+    subsection(subLevel, text.eventsHeading, SAFETY_ANCHORS.events, [
       renderParagraph(text.eventsNote),
       ...(safety.recordTruncated ? [renderParagraph(text.eventsTruncatedNote)] : []),
       tableOrNone(
@@ -628,19 +789,32 @@ function renderSafety(context: RenderContext, viewModel: ReportViewModel, level:
         safety.events.map((event) => safetyEventRow(context, event)),
       ),
     ]),
-  ];
+  ]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // 節6: ページの一覧
 // ---------------------------------------------------------------------------------------------------------------
 
+/** OP-3: やさしい語の理由の一覧（説明と次にできることだけ。コードと詳細は記録の段）。 */
+const plainReasonList = (reasons: readonly ReasonView[]): Fragment => renderReferenceList(reasons.map(overviewReasonText));
+
+/** 本文の、画面の幅ごとの状態の行（OP-3: 返事の番号と開いた結果のコードは、記録の段の `viewportRecordRow`）。 */
 function viewportRow(context: RenderContext, view: ViewportView): SafeHtml<'row'> {
   return renderTableRow([
     VIEWPORT_PROFILE_CATALOG[view.viewport].label,
     renderPageAuditStatusBadge(view.status),
     renderUrl(view.requestedUrl, context.allowedOrigins),
     view.finalUrl === null ? formatNotObserved() : renderUrl(view.finalUrl, context.allowedOrigins),
+    view.incompleteReasons.length === 0 ? none() : plainReasonList(view.incompleteReasons),
+  ]);
+}
+
+/** OP-3: 記録の段の、画面の幅ごとの技術の記録の行（ページの番号、画面の幅、返事の番号、開いた結果のコード）。 */
+function viewportRecordRow(page: PageView, view: ViewportView): SafeHtml<'row'> {
+  return renderTableRow([
+    renderCode(page.pageId),
+    VIEWPORT_PROFILE_CATALOG[view.viewport].label,
     formatInteger(view.httpStatus),
     observedCode(view.navigationOutcome),
     view.incompleteReasons.length === 0 ? none() : reasonList(view.incompleteReasons),
@@ -665,34 +839,70 @@ function retryRow(attempt: RetryAttemptView): SafeHtml<'row'> {
   ]);
 }
 
-function renderPage(context: RenderContext, view: PageView, level: SectionHeadingLevel): Fragment {
+/**
+ * 本文のページの節（OP-3: 見出しは何番目のページか。ページの番号、ファイル、返事の番号、開いた結果のコード、やり直す前の記録は、記録の段の
+ * `renderPagesRecord`）。アンカーは今どおりページの番号から作る（本文と記録の段のリンクの先）。
+ */
+function renderPage(context: RenderContext, view: PageView, index: number, level: SectionHeadingLevel): Fragment {
   const text = HTML_REPORT_TEXT.pages;
   const subLevel = (level + 1) as SectionHeadingLevel;
-  return subsection(level, view.pageId, pageAnchorOf(view.pageId), [
+  return subsection(level, text.heading(formatInteger(index + 1)), pageAnchorOf(view.pageId), [
     renderKeyValueList([
       { label: text.url, value: renderUrl(view.pageUrl, context.allowedOrigins) },
       { label: text.status, value: renderPageAuditStatusBadge(view.status) },
-      { label: text.pageJson, value: renderFileLink(view.pageJsonPath) },
-      { label: text.visibleText, value: view.visibleTextPath === null ? none() : renderFileLink(view.visibleTextPath) },
       { label: HTML_REPORT_TEXT.findingCount, value: formatCount(view.findingCounts.total) },
-      { label: text.reasons, value: view.incompleteReasons.length === 0 ? none() : reasonList(view.incompleteReasons) },
+      { label: text.reasons, value: view.incompleteReasons.length === 0 ? none() : plainReasonList(view.incompleteReasons) },
     ]),
     subsection(subLevel, text.viewportsHeading, toAnchorId('page-viewports', view.pageId), [
-      renderTable({ caption: null, columns: text.viewportColumns, rows: view.viewports.map((viewport) => viewportRow(context, viewport)) }),
+      renderTable({ caption: null, columns: text.plainViewportColumns, rows: view.viewports.map((viewport) => viewportRow(context, viewport)) }),
     ]),
     subsection(subLevel, text.screenshotsHeading, toAnchorId('page-screenshots', view.pageId), [
-      renderReferenceList(view.screenshots.map((screenshot) => renderScreenshotRef(screenshot))),
+      renderReferenceList(view.screenshots.map((screenshot) => renderScreenshotRef(screenshot, { withEvidenceId: false }))),
     ]),
     subsection(subLevel, text.findingsHeading, toAnchorId('page-findings', view.pageId), [findingLinkList(view.findings)]),
-    ...(view.retryAttempts.length === 0
+  ]);
+}
+
+/**
+ * OP-3: 記録の段の、ページの技術の記録（ページごとの番号とファイル、画面の幅ごとの返事の番号と開いた結果、やり直す前の記録）。本文のページの節から移した
+ * （値は表示用モデルのまま）。
+ */
+function renderPagesRecord(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): Fragment {
+  const text = HTML_REPORT_TEXT.record;
+  const subLevel = (level + 1) as SectionHeadingLevel;
+  return subsection(level, text.pagesHeading, SUMMARY_ANCHORS.pages, [
+    tableOrNone(null, text.pageColumns, viewModel.pages.map((view) => renderTableRow([
+      joinWithSpace([renderUrl(view.pageUrl, context.allowedOrigins), pageLink(context, view.pageId)]),
+      renderCode(view.pageId),
+      renderFileLink(view.pageJsonPath),
+      view.visibleTextPath === null ? none() : renderFileLink(view.visibleTextPath),
+      view.incompleteReasons.length === 0 ? none() : reasonList(view.incompleteReasons),
+    ]))),
+    tableOrNone(null, text.viewportColumns, viewModel.pages.flatMap((view) => view.viewports.map((viewport) => viewportRecordRow(view, viewport)))),
+    ...viewModel.pages.flatMap((view) => (view.retryAttempts.length === 0
       ? []
       : [
-          subsection(subLevel, text.retriesHeading, toAnchorId('page-retries', view.pageId), [
-            renderParagraph(text.retriesNote),
-            renderTable({ caption: null, columns: text.retryColumns, rows: view.retryAttempts.map(retryRow) }),
+          subsection(subLevel, text.retriesCaption(view.pageId), toAnchorId('page-retries', view.pageId), [
+            renderParagraph(HTML_REPORT_TEXT.pages.retriesNote),
+            renderTable({ caption: null, columns: HTML_REPORT_TEXT.pages.retryColumns, rows: view.retryAttempts.map(retryRow) }),
           ]),
-        ]),
+        ])),
   ]);
+}
+
+/** OP-3: 記録の段の、Finding と押して確かめた操作の技術の記録（本文の表から移した、規則と証拠、理由のコードと証拠）。 */
+function renderFindingsRecord(context: RenderContext, viewModel: ReportViewModel, level: SectionHeadingLevel): readonly Fragment[] {
+  const text = HTML_REPORT_TEXT.record;
+  const findings = viewModel.categorySections.flatMap((section) => section.findings);
+  return [
+    subsection(level, text.findingsHeading, SUMMARY_ANCHORS.findings, [
+      renderParagraph(text.findingsNote),
+      tableOrNone(null, text.findingColumns, findings.map(findingRecordRow)),
+    ]),
+    subsection(level, text.interactionsHeading, SUMMARY_ANCHORS.interactions, [
+      tableOrNone(null, text.interactionColumns, viewModel.interactions.items.map((item) => interactionRecordRow(context, item))),
+    ]),
+  ];
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -706,7 +916,15 @@ const SUBSECTION_LEVEL: SectionHeadingLevel = 3;
 /** 節ごとの中身（`Record` なので、節を1つ加えると、ここの書き漏れが型のエラーになる）。 */
 const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext, viewModel: ReportViewModel) => readonly Fragment[]>> =
   Object.freeze({
-    SUMMARY: (_context, viewModel) => renderSummary(viewModel.summary, SUBSECTION_LEVEL),
+    // PL-R: 冒頭のまとめの段と、末尾の記録の段（前の要約の節。中身は変えずに移した）。
+    OVERVIEW: (context, viewModel) => renderOverview(context, viewModel, SUBSECTION_LEVEL),
+    // OP-3（PL 14 章）: 本文から移した技術の記録（問題、押して確かめた操作、安全、ページ）も、記録の段の終わりに置く。
+    RECORD: (context, viewModel) => [
+      ...renderSummary(viewModel.summary, SUBSECTION_LEVEL),
+      ...renderFindingsRecord(context, viewModel, SUBSECTION_LEVEL),
+      renderSafetyRecord(context, viewModel, SUBSECTION_LEVEL),
+      renderPagesRecord(context, viewModel, SUBSECTION_LEVEL),
+    ],
     // T44f（Task 44 の設計書 P3-1 の D）: 行を出し直さず、分類ごとの節の行へのリンクの一覧にする。
     CRITICAL_FINDINGS: (_context, viewModel) => [findingLinksOrNone(viewModel.criticalFindings)],
     CATEGORY_FINDINGS: (context, viewModel) =>
@@ -716,7 +934,7 @@ const SECTION_RENDERERS: Readonly<Record<ReportSection, (context: RenderContext,
     PAGES: (context, viewModel) =>
       viewModel.pages.length === 0
         ? [renderParagraph(HTML_REPORT_TEXT.pages.noPages)]
-        : viewModel.pages.map((view) => renderPage(context, view, SUBSECTION_LEVEL)),
+        : viewModel.pages.map((view, index) => renderPage(context, view, index, SUBSECTION_LEVEL)),
   });
 
 function createContext(viewModel: ReportViewModel): RenderContext {

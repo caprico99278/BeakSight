@@ -27,8 +27,13 @@ import {
   type AuthSetupValidationError,
 } from '../auth/auth-setup-contracts.js';
 import { validateAuthSetup } from '../auth/auth-setup-policy.js';
+import {
+  CREDENTIAL_DESTINATION_LOCKED_REASON,
+  CREDENTIAL_DESTINATION_OBSERVED_ONLY_REASON,
+  authSetupCredentialDestinationChangesOf,
+} from '../auth/credential-destination.js';
 import { validateControlDocument } from '../control-schema-validator.js';
-import type { ValidatedSiteProfile } from '../contracts.js';
+import type { AuthStrategy, SiteProfile, ValidatedSiteProfile } from '../contracts.js';
 import { isAcceptedTargetConfigPath, validateSiteProfile, type ProfileValidationContext } from '../profile-policy.js';
 import type { ControlDatabase } from './control-database.js';
 import { ACTIVE_PROFILE_STATUS, RETIRED_PROFILE_STATUS } from './profile-records.js';
@@ -51,6 +56,19 @@ export const AUTH_SETUP_STORE_REJECTION_REASONS = Object.freeze([
   'PROFILE_INVALID',
   /** 検証の後、書き込みの前に、プロファイルが変わった（別の変更が先に保存された）。 */
   'PROFILE_REVISION_CONFLICT',
+  /**
+   * MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 3）: 保存の前も後も自動ログインのプロファイルで、資格情報の送信先の項目（判定は
+   * `authSetupCredentialDestinationChangesOf`）が、今保存してある設定から変わる。書かない。
+   */
+  CREDENTIAL_DESTINATION_LOCKED_REASON,
+  /** MI-F1（設計書 4.3）: 「設定がないときだけ保存する」（`onlyWhenAbsent`）の保存で、書き込みのトランザクションの中で見ると、設定がすでにある。書かない。 */
+  'AUTH_SETUP_ALREADY_EXISTS',
+  /**
+   * MI-F5（設計書 4.7.1 の 6）: 画面の保存の口の選択肢（`observedDestinationsOnly`）のある保存で、資格情報の送信先の項目が、今保存してある設定（と口が渡す観察の案）
+   * から変わる。設定がないときは、口が渡す案（入口の確かめの案）とも、送信先のない形とも違う。判定は `authSetupCredentialDestinationChangesOf`。書かない
+   * （保存の前も後も自動ログインのプロファイルは、今どおり `CREDENTIAL_DESTINATION_LOCKED`）。
+   */
+  CREDENTIAL_DESTINATION_OBSERVED_ONLY_REASON,
 ] as const);
 export type AuthSetupStoreRejectionReason = (typeof AUTH_SETUP_STORE_REJECTION_REASONS)[number];
 
@@ -85,6 +103,20 @@ export interface AuthSetupWriteOptions {
   readonly resolveContext: ProfileContextResolver;
   /** 今の時刻（既定は `new Date()`）。 */
   readonly now?: () => Date;
+  /**
+   * MI-F1（設計書 4.3。MI-R の Minor 4）: 真なら、設定がないときだけ保存する（確かめは書き込みのトランザクションの中。あれば `AUTH_SETUP_ALREADY_EXISTS`）。
+   * 入口の確かめの後の案の保存（ジョブの管理）が使う。省けば偽（あれば置き換える）。
+   */
+  readonly onlyWhenAbsent?: boolean;
+  /**
+   * MI-F5（設計書 4.7.1 の 6・7）: 画面の保存の口（認証の設定の画面の保存、監査の開始の画面の読まないパスの保存、行から開いた下書きの保存）が渡す。あれば、
+   * 方式によらず、書き込みのトランザクションの中で今保存してある設定と、`baselinesOf`（トランザクションの中で読んだプロファイルと今保存してある設定で呼ぶ。
+   * 設定がないときは、そのプロファイルの最後の入口の確かめの案。下書きの保存は、行の観察を足した設定）と比べ、どれとも違う送信先の保存を拒む。設定がないときは、
+   * 送信先のない形も受ける。観察の口（入口の確かめの後の案の保存、自動の登録）とテストの準備は渡さない。
+   */
+  readonly observedDestinationsOnly?: {
+    readonly baselinesOf: (profile: SiteProfile, stored: AuthSetup | null) => readonly AuthSetup[];
+  };
 }
 
 type Rejection = Extract<AuthSetupStoreResult, { ok: false }>;
@@ -125,8 +157,8 @@ const freshnessOf = (setup: AuthSetup, profile: StoredProfile): AuthSetupFreshne
 const storedSetupOf = (parsed: unknown): AuthSetup | undefined =>
   (validateControlDocument(AUTH_SETUP_SCHEMA_NAME, parsed).ok ? parsed as AuthSetup : undefined);
 
-/** 読み出し: 壊れた行は、データベースの誤りとして止める。 */
-const storedOf = (row: AuthSetupRow, profile: StoredProfile | null): StoredAuthSetup => {
+/** 行の文書を、設定として読む（壊れた行は、データベースの誤りとして止める。読み出しと、MI-F1 の書き込みの中の比べが共有する）。 */
+const rowSetupOf = (row: AuthSetupRow): AuthSetup => {
   const fail = (detail: string): never => {
     throw new ControlStoreError('DATABASE_INTEGRITY_FAILED', `stored auth setup ${row.profile_id}: ${detail}`);
   };
@@ -136,10 +168,15 @@ const storedOf = (row: AuthSetupRow, profile: StoredProfile | null): StoredAuthS
   } catch {
     return fail('the stored document is not JSON');
   }
-  const setup = storedSetupOf(parsed);
-  if (setup === undefined) {
-    return fail('the stored document is not an auth setup of version 3');
-  }
+  return storedSetupOf(parsed) ?? fail('the stored document is not an auth setup of version 3');
+};
+
+/** 読み出し: 壊れた行は、データベースの誤りとして止める。 */
+const storedOf = (row: AuthSetupRow, profile: StoredProfile | null): StoredAuthSetup => {
+  const fail = (detail: string): never => {
+    throw new ControlStoreError('DATABASE_INTEGRITY_FAILED', `stored auth setup ${row.profile_id}: ${detail}`);
+  };
+  const setup = rowSetupOf(row);
   if (setup.profileId !== row.profile_id || setup.profileRevision !== row.profile_revision) {
     return fail('the stored document does not match its row (profileId or profileRevision)');
   }
@@ -204,8 +241,61 @@ export const saveAuthSetup = (database: ControlDatabase, input: unknown, options
     if (latest === null || latest.status !== ACTIVE_PROFILE_STATUS || latest.profile.revision !== profile.profile.revision) {
       return rejected('PROFILE_REVISION_CONFLICT', 'the profile changed after the auth setup was validated');
     }
-    return writeAuthSetupRow(connection, setup, options.now);
+    if (options.onlyWhenAbsent === true && storedSetupDocumentIn(connection, profileId) !== null) {
+      return rejected('AUTH_SETUP_ALREADY_EXISTS', 'an auth setup already exists for the profile');
+    }
+    // MI-F1（設計書 4.7.1 の 3・4）: プロファイルは変わらないので、保存の前も後も同じ方式で比べる。MI-F5（6）: 画面の保存の口なら、方式によらず比べる。
+    const observed = options.observedDestinationsOnly;
+    const locked = credentialDestinationRejectionIn(connection, latest.profile.auth, latest.profile.auth, setup, observed === undefined
+      ? undefined
+      : { baselinesOf: (stored) => observed.baselinesOf(latest.profile, stored) });
+    return locked ?? writeAuthSetupRow(connection, setup, options.now);
   });
+};
+
+/** 書き込みのトランザクションの中で、今保存してある設定の文書を読む（なければ `null`。壊れていれば `ControlStoreError` の `DATABASE_INTEGRITY_FAILED`）。 */
+const storedSetupDocumentIn = (connection: SqliteConnection, profileId: string): AuthSetup | null => {
+  const row = connection.prepare(SELECT_AUTH_SETUP_SQL).get(profileId) as AuthSetupRow | undefined;
+  return row === undefined ? null : rowSetupOf(row);
+};
+
+/**
+ * MI-F5（設計書 4.7.1 の 6・7）: 画面の保存の口の選択肢。`baselinesOf` は、書き込みのトランザクションの中で読んだ今保存してある設定（なければ `null`）から、
+ * 今の設定のほかに受ける送信先の案を返す（最初の保存の入口の確かめの案、行の観察を足した設定）。
+ */
+export interface ObservedDestinationsCheck {
+  readonly baselinesOf: (stored: AuthSetup | null) => readonly AuthSetup[];
+}
+
+/**
+ * MI-F1（設計書 4.7.1 の 3・4）: 書き込みのトランザクションの中で、今保存してある設定と、保存の後の設定を比べ、自動ログインのプロファイル（保存の前の方式
+ * `beforeAuth` と後の方式 `afterAuth` が、どちらも自動ログイン）で資格情報の送信先が変わるなら、その拒否（変わらなければ `null`）。判定は
+ * `authSetupCredentialDestinationChangesOf`。認証の設定の保存（`saveAuthSetup`）と、プロファイルと認証の設定のまとめて保存（`profile-auth-setup-store.ts`）が使う。
+ * MI-F5（6）: 画面の保存の口の選択肢（`observed`）があれば、方式によらず、今保存してある設定と口の案と比べる（3 が当たるときの理由は今どおり
+ * `CREDENTIAL_DESTINATION_LOCKED`、ほかは `CREDENTIAL_DESTINATION_OBSERVED_ONLY`）。
+ */
+export const credentialDestinationRejectionIn = (
+  connection: SqliteConnection,
+  beforeAuth: AuthStrategy,
+  afterAuth: AuthStrategy,
+  setup: AuthSetup,
+  observed?: ObservedDestinationsCheck,
+): Rejection | null => {
+  const before = storedSetupDocumentIn(connection, setup.profileId);
+  const locked = authSetupCredentialDestinationChangesOf({ beforeAuth, afterAuth, before, after: setup });
+  if (locked.length > 0) {
+    return rejected(CREDENTIAL_DESTINATION_LOCKED_REASON, `the credential destination of an AUTOMATED_LOGIN profile cannot change: ${locked.join(', ')}`);
+  }
+  if (observed === undefined) {
+    return null;
+  }
+  const changed = authSetupCredentialDestinationChangesOf({
+    beforeAuth, afterAuth, before, after: setup, observedOnly: { baselines: observed.baselinesOf(before) },
+  });
+  // 3 が当たる（保存の前も後も自動ログインで、設定がある）ときは、上で今の設定と比べてあり、今の設定は比べる相手に入るので、ここへは来ない。
+  return changed.length === 0
+    ? null
+    : rejected(CREDENTIAL_DESTINATION_OBSERVED_ONLY_REASON, `the credential destination comes from the observation only: ${changed.join(', ')}`);
 };
 
 /**

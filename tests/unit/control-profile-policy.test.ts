@@ -417,6 +417,23 @@ describe('T22b: validateSiteProfile checks the environment evidence reference', 
   it('rejects an evidence reference on a PUBLIC profile (the PUBLIC environment has no evidence)', () => {
     expectRejectedWith({ ...publicProfile, environmentEvidenceRef: 'evidence/ref' }, ['PROFILE_MODE_ENVIRONMENT_MISMATCH']);
   });
+
+  // PL-F 修正の 1 回目（PL-REV の Minor 2）: 秘密に見える参照は、詳しい内容の編集でも拒む（判定は `isSecretLikeText`）。
+  it.each([
+    ['a secret-like name and its value', 'password=hunter2'],
+    ['a Bearer scheme and its value', 'Bearer abcdefghijklmnopqrstuvwxyz0123456789'],
+    ['a URL with userinfo', 'https://user:pass@example.invalid/x'],
+  ])('rejects a secret-like evidence reference (%s)', (_name, environmentEvidenceRef) => {
+    expectRejectedWith({ ...testAuthProfile, environmentEvidenceRef }, ['ISOLATION_REFERENCE_SECRET_LIKE']);
+    expectRejectedWith({ ...testAuthProfile, mode: 'TEST_APPROVED_WRITE', environmentEvidenceRef }, ['ISOLATION_REFERENCE_SECRET_LIKE']);
+  });
+
+  it.each([
+    ['a URL with an ordinary query', 'https://wiki.example.invalid/page?id=3'],
+    ['a reference that contains auth in a word', 'auth-server-isolation'],
+  ])('accepts an evidence reference that is not secret-like (%s)', (_name, environmentEvidenceRef) => {
+    expectAccepted({ ...testAuthProfile, environmentEvidenceRef });
+  });
 });
 
 describe('T22b: validateSiteProfile reports every rule that fails', () => {
@@ -784,5 +801,21 @@ describe('T34a: validateSiteProfile checks the approved service origins', () => 
   ] as const)('rejects service origins on a %s public-passive profile', (_environment, profile) => {
     expectRejectedWith({ ...profile, approvedServiceOrigins: [SERVICE_ORIGIN] }, ['PROFILE_SERVICE_ORIGIN_INVALID']);
     expectAccepted({ ...profile, approvedServiceOrigins: [] });
+  });
+});
+
+// OP-1 の修正の 1 回目（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: プロファイルの任意の項目 `loginPreference`（毎回手でログインするか）。
+// 省いた今のプロファイルは、そのまま読め、`AUTOMATIC` とみなす。
+describe('OP-1: the login preference of a profile', () => {
+  it('accepts the two values and the profile without the item (AUTOMATIC)', async () => {
+    const { LOGIN_PREFERENCES, loginPreferenceOf } = await import('../../src/control/contracts.js');
+    expect(LOGIN_PREFERENCES).toEqual(['AUTOMATIC', 'MANUAL_EVERY_TIME']);
+    expect(loginPreferenceOf(expectAccepted(testAuthProfile))).toBe('AUTOMATIC');
+    expect(loginPreferenceOf(expectAccepted({ ...testAuthProfile, loginPreference: 'MANUAL_EVERY_TIME' }))).toBe('MANUAL_EVERY_TIME');
+    expect(loginPreferenceOf(expectAccepted({ ...testAuthProfile, loginPreference: 'AUTOMATIC' }))).toBe('AUTOMATIC');
+  });
+
+  it('rejects another value', () => {
+    expectRejectedWith({ ...testAuthProfile, loginPreference: 'NEVER' }, ['PROFILE_SCHEMA_INVALID']);
   });
 });

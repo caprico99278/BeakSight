@@ -151,8 +151,7 @@ export const createApiUpdateScenario = (database: ControlDatabase, options: ApiU
       approvalTtlDays: 30,
       ...(options.readCheckId === undefined ? {} : {
         verification: {
-          successCondition: null,
-          inputErrorCondition: null,
+          resultJudgement: null,
           recordId: null,
           readVerification: { readCheckId: options.readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }] },
         },
@@ -191,6 +190,13 @@ export interface ApiCreateScenarioOptions {
   readonly document: DiscoveryDocument;
   readonly limits: ScenarioLimits;
   readonly at: () => string;
+  /**
+   * OP-R（設計書 4.1.9 の R1）: 照合の READ の画面の path（省略は `{id}` の型 `API_WRITE_READ_TEMPLATE_PATH`）。一覧の画面の path を渡せば、照合の専用の印を付ける
+   * （自動の下書きと同じ形）。
+   */
+  readonly readTargetPagePath?: string;
+  /** OP-REV6 の I-1: 照合の READ の期待（本文が含む）で比べる欄（省略はメールアドレス `email`）。 */
+  readonly expectationFieldName?: string;
 }
 
 /**
@@ -211,7 +217,8 @@ export const createApiCreateScenario = (database: ControlDatabase, options: ApiC
     entries: mergeDiscoveryCandidates(discoveryCandidatesOf(document)).map(discoveryIndexEntryOf), readPagePaths: discoveryReadPagePaths(document),
   });
   // 照合の READ: `{id}` の型の画面の READ（画面の文脈で確かめる）。
-  const checked = validateReadCheckDefinition({ targetPagePath: API_WRITE_READ_TEMPLATE_PATH, parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] }, null, {
+  const readTargetPagePath = options.readTargetPagePath ?? API_WRITE_READ_TEMPLATE_PATH;
+  const checked = validateReadCheckDefinition({ targetPagePath: readTargetPagePath, parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] }, null, {
     startUrl: `${site.appOrigin}${SPA_APP_PATHS.admin}`,
     allowedOrigins: [site.appOrigin],
     approvedTestOrigins: [site.appOrigin],
@@ -237,10 +244,12 @@ export const createApiCreateScenario = (database: ControlDatabase, options: ApiC
       limits: options.limits,
       approvalTtlDays: 30,
       verification: {
-        successCondition: null,
-        inputErrorCondition: null,
+        resultJudgement: null,
         recordId: null,
-        readVerification: { readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
+        readVerification: {
+          readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: options.expectationFieldName ?? 'email' }],
+          ...(readTargetPagePath === API_WRITE_READ_TEMPLATE_PATH ? {} : { verificationOnly: true }),
+        },
       },
       api: {
         shapeDigest: probe.shapeDigest,

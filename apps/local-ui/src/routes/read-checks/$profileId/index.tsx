@@ -9,6 +9,7 @@ import {
   LOCAL_UI_JOB_NEXT_STEPS,
   LOCAL_UI_READ_CHECK_TEXT,
   LOCAL_UI_TEXT,
+  LOCAL_UI_WRITE_STAGE_TEXT,
   READ_CHECK_DETAIL_DESCRIPTIONS,
   READ_CHECK_TARGET_KIND_LABELS,
   READ_EXPECTATION_UNDETERMINED_REASON_DESCRIPTIONS,
@@ -16,8 +17,8 @@ import {
   listText,
 } from '../../../../../../src/presentation/messages.js';
 import { Notice } from '../../../components/Notice';
-import { PageFrame } from '../../../components/PageFrame';
-import { ProfileSummary } from '../../../components/ProfileSummary';
+import { PageFrame, siteTrail } from '../../../components/PageFrame';
+import { AdvancedSettings } from '../../../components/AdvancedSettings';
 import { StartReasonDetails } from '../../../components/StartReasonDetails';
 import {
   readCheckEndReasonDisplay,
@@ -25,6 +26,7 @@ import {
   toneClass,
 } from '../../../display/labels';
 import { expectationText, parametersText } from '../../../display/read-checks';
+import { closedSearchValueOf, isClosedSearchValue } from '../../../display/search-values';
 import type { AuditJobStartView } from '../../../server/audit-job-functions';
 import {
   readCheckPageFn,
@@ -38,7 +40,7 @@ import {
 /** 保存と削除の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。 */
 const NOTICES = Object.freeze(['saved', 'removed'] as const);
 type ReadCheckNotice = (typeof NOTICES)[number];
-const isReadCheckNotice = (value: unknown): value is ReadCheckNotice => NOTICES.some((notice) => notice === value);
+const isReadCheckNotice = (value: unknown): value is ReadCheckNotice => isClosedSearchValue(NOTICES, value);
 
 export const Route = createFileRoute('/read-checks/$profileId/')({
   validateSearch: (search: Record<string, unknown>): { notice?: ReadCheckNotice } =>
@@ -98,8 +100,8 @@ const expectationResultText = (view: ReadExpectationResultView): string => {
 function Results({ page }: Readonly<{ page: ReadCheckPageView }>) {
   const columns = text.resultColumns;
   return (
-    <section className="panel" data-testid="read-check-results">
-      <h2 className="panel-heading">{text.resultsHeading}</h2>
+    <section data-testid="read-check-results">
+      <h3>{text.resultsHeading}</h3>
       {page.results.length === 0 ? <p data-testid="read-check-no-results">{text.noResults}</p> : page.results.map((job) => (
         <section key={job.jobId} data-testid="read-check-job" data-job-id={job.jobId}>
           <h3>
@@ -209,7 +211,9 @@ function Results({ page }: Readonly<{ page: ReadCheckPageView }>) {
  */
 function ReadChecksPage() {
   const page = Route.useLoaderData();
-  const { notice } = Route.useSearch();
+  const { notice: rawNotice } = Route.useSearch();
+  // MI-C2 項目 19: ルータは根の生の search も子へ渡すので、知らせの値は描く前に閉じた一覧でもう一度確かめる（`display/search-values.ts`）。
+  const notice = closedSearchValueOf(NOTICES, rawNotice);
   const start = useServerFn(startReadCheckFn);
   const navigate = useNavigate();
   const router = useRouter();
@@ -219,13 +223,19 @@ function ReadChecksPage() {
   const columns = text.columns;
 
   return (
-    <PageFrame title={text.pages.readChecks}>
+    <PageFrame title={text.pages.readChecks} trail={siteTrail(profile.profileId)}>
+      {/* PL-5（設計書 3 章の 1、8 章）: 要点のパネル（見るだけの確かめの数、ふだんの流れの外の画面であること、主のボタン「見るだけの確かめを始める」）。 */}
+      <section className="panel" data-testid="read-check-summary">
+      <h2 className="panel-heading">{LOCAL_UI_WRITE_STAGE_TEXT.summaryHeading}</h2>
       {notice === undefined ? null : (
         <Notice kind="positive">
           <p data-testid="read-check-notice" data-notice={notice}>{NOTICE_TEXT[notice]}</p>
         </Notice>
       )}
-      <ProfileSummary profile={profile} testId="read-check-profile" />
+      <p data-testid="read-check-count">
+        {page.definitions.length === 0 ? LOCAL_UI_WRITE_STAGE_TEXT.readChecks.none : LOCAL_UI_WRITE_STAGE_TEXT.readChecks.count(formatCount(page.definitions.length))}
+      </p>
+      <p data-testid="read-check-optional">{LOCAL_UI_WRITE_STAGE_TEXT.readChecks.optional}</p>
 
       {page.eligible ? null : (
         <Notice kind="caution">
@@ -238,8 +248,7 @@ function ReadChecksPage() {
         </Notice>
       ) : null}
 
-      <section className="panel">
-        <h2 className="panel-heading">{text.heading}</h2>
+      <div>
         <p data-testid="read-check-guidance">{text.guidance}</p>
         {page.start.blocker === null ? (
           <>
@@ -298,10 +307,14 @@ function ReadChecksPage() {
             />
           </Notice>
         )}
+      </div>
       </section>
 
-      <section className="panel" data-testid="read-check-definitions">
-        <h2 className="panel-heading">{text.definitionsHeading}</h2>
+      {/* 3 章の 1: 詳しい内容 1 つ（定義の一覧、作れる候補、結果）。 */}
+      <section className="panel">
+      <AdvancedSettings testId="read-check-advanced">
+      <section data-testid="read-check-definitions">
+        <h3>{text.definitionsHeading}</h3>
         <p className="muted">{text.definitionCount(formatCount(page.definitions.length), formatCount(page.form.maxDefinitions))}</p>
         <p className="muted">{text.valuesNote}</p>
         {page.editable ? (
@@ -326,7 +339,6 @@ function ReadChecksPage() {
                   <th scope="col">{text.page.targetHeading}</th>
                   <th scope="col">{columns.parameters}</th>
                   <th scope="col">{columns.expectations}</th>
-                  <th scope="col">{columns.revision}</th>
                   <th scope="col">{columns.updatedAt}</th>
                   <th scope="col">{columns.operations}</th>
                 </tr>
@@ -349,7 +361,6 @@ function ReadChecksPage() {
                         {definition.definition.expectations.map((expectation, index) => <li key={String(index)}>{expectationText(expectation)}</li>)}
                       </ul>
                     </td>
-                    <td className="nowrap">{LOCAL_UI_TEXT.profileForm.revisionText(definition.revision)}</td>
                     <td className="nowrap">{formatDateTime(definition.updatedAt)}</td>
                     <td className="nowrap">
                       <Link
@@ -368,8 +379,8 @@ function ReadChecksPage() {
         )}
       </section>
 
-      <section className="panel" data-testid="read-check-candidates">
-        <h2 className="panel-heading">{text.candidatesHeading}</h2>
+      <section data-testid="read-check-candidates">
+        <h3>{text.candidatesHeading}</h3>
         <p className="muted">{text.candidatesNote}</p>
         {page.candidates.length === 0 ? <p data-testid="read-check-no-candidates">{text.noCandidates}</p> : (
           <div className="table-wrap">
@@ -409,11 +420,8 @@ function ReadChecksPage() {
       </section>
 
       <Results page={page} />
-
-      <div className="button-row">
-        <Link to="/discovery/$profileId" params={{ profileId: profile.profileId }} className="button">{text.openDiscovery}</Link>
-        <Link to="/profiles/$profileId" params={{ profileId: profile.profileId }} className="button">{LOCAL_UI_DISCOVERY_TEXT.backToProfile}</Link>
-      </div>
+      </AdvancedSettings>
+      </section>
     </PageFrame>
   );
 }

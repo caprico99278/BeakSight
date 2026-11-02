@@ -24,6 +24,7 @@ import {
   readScenario,
   readScenarioApprovalStatus,
   readScenarioRevisions,
+  readVerificationOnlyReadCheckIds,
   revokeScenarioApproval,
   updateScenario,
   type ApprovalExternalFacts,
@@ -427,13 +428,79 @@ describe('scenario store (T28c): approval and revocation', () => {
   });
 });
 
+// MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 副作用の確認は、承認のダイアログの 1 回にまとめた。承認の
+// 確認（`confirmSideEffects`）を付けた承認は、確認のない版なら、同じトランザクションで、確認を入れた次の版を足して、その版を承認する。承認が縛る
+// digest は、確認を入れた版のもの。確かめ（版・digest・事実）に外れたら、版も記録も書かない。確認済みの版は、版を作らずに今どおり承認する。
+describe('scenario store (MI-6): the approval confirms the side effects in one press', () => {
+  const UNCONFIRMED = { TEST_RECORDS_ONLY: false, NO_EXTERNAL_NOTIFICATION: false, NO_PAYMENT_OR_EXTERNAL_SERVICE: false, NOT_DESTRUCTIVE: false };
+
+  it('adds the next revision with every confirmation and approves it in one transaction, binding the digest of that revision', () => {
+    expect(create({ sideEffectConfirmations: UNCONFIRMED }).ok).toBe(true);
+    const shown = digestOf();
+    const approved = approve({ expectedApprovalDigest: shown, confirmSideEffects: true });
+    expect(approved.ok && approved.scenario).toMatchObject({ revision: 2, state: 'APPROVED', lastApprovalReceiptId: 'receipt-1', updatedAt: APPROVED_AT });
+    const revisions = readScenarioRevisions(database, 'scenario-1');
+    expect(revisions.map(({ revision, scenario }) => [revision, scenario.sideEffectConfirmations])).toEqual([[1, UNCONFIRMED], [2, ALL_CONFIRMED]]);
+    // 確認のほかは、前の版のまま（送る欄・上限・期限・候補・入力の規則の参照）。
+    const [first, second] = revisions;
+    expect(second?.scenario).toEqual({ ...first?.scenario, revision: 2, sideEffectConfirmations: ALL_CONFIRMED, updatedAt: APPROVED_AT });
+    expect(second?.evidence).toEqual(first?.evidence);
+    const [receipt] = readApprovalReceipts(database, 'scenario-1');
+    const current = readScenario(database, 'scenario-1');
+    expect(receipt).toMatchObject({ kind: 'APPROVAL', scenarioRevision: 2 });
+    expect(receipt?.kind === 'APPROVAL' ? receipt.approvalDigest : null).toBe(current === null ? '' : computeApprovalDigest(current.current, {
+      profileRevision: MIN_PROFILE_REVISION, authSetupDigest: EXTERNAL.authSetupDigest, targetConfigDigest: EXTERNAL.targetConfigDigest,
+    }));
+    expect(receipt?.kind === 'APPROVAL' ? receipt.approvalDigest : null).not.toBe(shown);
+    expect(readScenarioApprovalStatus(database, 'scenario-1', EXTERNAL, IN_TTL)?.validity)
+      .toEqual({ approved: true, receiptId: 'receipt-1', expiresAt: EXPIRES_AT });
+  });
+
+  it('approves a revision whose side effects are all confirmed without a new revision', () => {
+    create();
+    const approved = approve({ confirmSideEffects: true });
+    expect(approved.ok && approved.scenario).toMatchObject({ revision: 1, state: 'APPROVED' });
+    expect(readScenarioRevisions(database, 'scenario-1').map(({ revision }) => revision)).toEqual([1]);
+    expect(readApprovalReceipts(database, 'scenario-1').map((receipt) => (receipt.kind === 'APPROVAL' ? receipt.scenarioRevision : null))).toEqual([1]);
+  });
+
+  it('writes neither a revision nor a receipt when the screen is old or the facts do not allow the approval', () => {
+    expect(create({ sideEffectConfirmations: UNCONFIRMED }).ok).toBe(true);
+    const shown = digestOf();
+    expect(reasonOf(approve({ expectedRevision: 2, expectedApprovalDigest: shown, confirmSideEffects: true }))).toBe('SCENARIO_REVISION_CONFLICT');
+    const otherDigest = digestOf('scenario-1', { ...EXTERNAL, targetConfigDigest: '4'.repeat(64) });
+    expect(reasonOf(approve({ expectedApprovalDigest: otherDigest, confirmSideEffects: true }))).toBe('SCENARIO_APPROVAL_DIGEST_MISMATCH');
+    latest = discover('job-d2', [UPDATE_CANDIDATE], '20261012000500');
+    const missing = approve({ expectedApprovalDigest: digestOf(), confirmSideEffects: true });
+    expect(missing.ok ? null : [missing.reason, missing.invalidityReasons]).toEqual(['SCENARIO_NOT_APPROVABLE', ['CANDIDATE_MISSING']]);
+    expect(readScenarioRevisions(database, 'scenario-1').map(({ revision }) => revision)).toEqual([1]);
+    expect(readApprovalReceipts(database, 'scenario-1')).toEqual([]);
+    expect(readScenario(database, 'scenario-1')).toMatchObject({ revision: 1, state: 'DRAFT' });
+  });
+
+  it('keeps rejecting an approval without the confirmation of the dialog while a side effect is unconfirmed', () => {
+    expect(create({ sideEffectConfirmations: UNCONFIRMED }).ok).toBe(true);
+    expect(reasonOf(approve())).toBe('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
+    expect(reasonOf(approve({ confirmSideEffects: false }))).toBe('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
+    expect(readScenarioRevisions(database, 'scenario-1').map(({ revision }) => revision)).toEqual([1]);
+    expect(readApprovalReceipts(database, 'scenario-1')).toEqual([]);
+  });
+
+  it('does not let a write start from a revision without the confirmations (the grant is not issued before the approval)', () => {
+    expect(create({ sideEffectConfirmations: UNCONFIRMED }).ok).toBe(true);
+    const issued = issueExecutionGrant(database, {
+      scenarioId: 'scenario-1', expectedRevision: 1, grantId: 'grant-1', jobId: 'job-w1', count: 1, external: EXTERNAL, at: APPROVED_AT,
+    });
+    expect(issued.ok).toBe(false);
+  });
+});
+
 // T30a（Task 30 の設計書 3 章の「検証の指定」）: 検証の指定を保存の形に通し、照合の READ の結び付けを READ の定義の今の版の送る値で確かめる。
 // 検証の指定の前に保存した版は、すべて未指定として読む。
 describe('scenario store (T30a): verification spec', () => {
   const VERIFICATION = Object.freeze({
-    successCondition: { pathPrefix: '/members/', selector: '.registered' },
-    inputErrorCondition: { pathPrefix: '/members/new', selector: '.error' },
-    recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' },
+    resultJudgement: 'FORM_STRUCTURE',
+    recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}'] },
     readVerification: {
       readCheckId: 'rc-1',
       revision: 1,
@@ -477,6 +544,40 @@ describe('scenario store (T30a): verification spec', () => {
     }
     database = openControlDatabase(databasePath());
     expect(storeErrorReasonOf(() => readScenario(database, 'scenario-1'))).toBe('DATABASE_INTEGRITY_FAILED');
+  });
+
+  // PL-6a（設計者の判断 (c)）: 前に保存した版の、人が入れた成否の条件の項目は、読むときに捨てる（結果の判定のしかたの印がなければ null。未指定）。
+  it('reads a revision stored with the retired result conditions, dropping them (PL-6a)', () => {
+    expect(create({ verification: VERIFICATION }).ok).toBe(true);
+    closeControlDatabase(database);
+    const raw = new DatabaseSync(databasePath());
+    try {
+      const row = raw.prepare('SELECT document FROM scenario_revisions WHERE scenario_id = ?').get('scenario-1') as { readonly document: string };
+      const stored = JSON.parse(row.document) as Record<string, Record<string, unknown>>;
+      const { resultJudgement: _omitted, ...rest } = stored['verification'] ?? {};
+      const legacy = {
+        ...stored,
+        verification: {
+          ...rest, successCondition: { pathPrefix: '/members/', selector: '.registered' }, inputErrorCondition: { pathPrefix: '/members/new', selector: '.error' },
+        },
+      };
+      raw.prepare('UPDATE scenario_revisions SET document = ? WHERE scenario_id = ?').run(JSON.stringify(legacy), 'scenario-1');
+    } finally {
+      raw.close();
+    }
+    database = openControlDatabase(databasePath());
+    expect(readScenario(database, 'scenario-1')?.current.verification).toEqual({ ...VERIFICATION, resultJudgement: null });
+  });
+
+  // PL-6a（設計者の判断 (f)）: 照合の専用の印を持つ照合の READ の定義は、単独の READ の確かめのジョブで読まない（ジョブの管理は、この一覧で外す）。
+  it('lists the READ checks that a scenario marks as verification only (PL-6a)', () => {
+    expect(create({ verification: VERIFICATION }).ok).toBe(true);
+    expect(readVerificationOnlyReadCheckIds(database, PROFILE_ID)).toEqual([]);
+    expect(create({ verification: { ...VERIFICATION, readVerification: { ...VERIFICATION.readVerification, verificationOnly: true } } }, 'scenario-2').ok)
+      .toBe(true);
+    expect(readScenario(database, 'scenario-2')?.current.verification.readVerification?.verificationOnly).toBe(true);
+    expect(readVerificationOnlyReadCheckIds(database, PROFILE_ID)).toEqual(['rc-1']);
+    expect(readVerificationOnlyReadCheckIds(database, 'other-profile')).toEqual([]);
   });
 });
 

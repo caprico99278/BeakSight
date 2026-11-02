@@ -74,6 +74,7 @@ import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation
 import type { CandidateLocation } from '../discovery/candidate-contracts.js';
 import { pageLoadIncompleteReasonsOf, readInFullAfterIncompleteReasons, readInFullAfterServiceRefusal } from '../discovery/discovery-result.js';
 import {
+  isReadCheckPageTemplatePath,
   readCheckPagePathOfTemplate,
   readCheckPageTemplateUrlOf,
   readCheckPageUrlOf,
@@ -417,7 +418,8 @@ export type RecordPageReadTarget =
 const URL_NOT_BUILT_TARGET: RecordPageReadTarget = Object.freeze({ ok: false, detail: 'URL_NOT_BUILT', url: null });
 
 /**
- * T40b-2: API の登録の書き込みの照合の READ の、`{id}` の画面の読む URL を決める（純粋。ファイルの先頭の T40b-2）。定義が `{id}` の型の画面の path でない、
+ * T40b-2: API の登録の書き込みの照合の READ の、`{id}` の画面の読む URL を決める（純粋。ファイルの先頭の T40b-2）。OP-R（設計書 4.1.9 の R1）: 定義が `{id}` の
+ * ない画面の path（IPC が、登録の画面の 1 つ上の一覧の画面だけを受ける）なら、ID を入れずにその path を読む（確かめ直しは同じ）。定義が `{id}` の型の画面の path でない、
  * ID が使える形でない、開始の URL が分からない、親が入れた対象の画面（Origin と型の path）と開始の URL の Origin・型が合わないなら `URL_NOT_BUILT`。組み立てた
  * 具体的な path が、画面の path の確かめ（`readCheckPagePathRejectionsOf`。保存の時と同じ owner）か事前の判定（`isReadUrlAllowed`）に当たれば
  * `REQUEST_POLICY`（URL つき）。
@@ -436,8 +438,11 @@ export const recordPageReadTargetOf = (
   if (template === undefined || startOrigin === null || targetPage === null || pageUrlOf(targetPage) !== pageUrlOf({ origin: startOrigin, path: template })) {
     return URL_NOT_BUILT_TARGET;
   }
-  const url = readCheckPageTemplateUrlOf(startOrigin, template, recordId, isUsableRecordId);
-  const path = url === null ? null : readCheckPagePathOfTemplate(template, recordId);
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: `{id}` のない画面の path（API の登録の一覧の画面。IPC が登録の画面の 1 つ上だけを
+  // 受ける）は、ID を入れずに、その画面を読む（確かめ直しは同じ）。
+  const listPage = !isReadCheckPageTemplatePath(template);
+  const url = listPage ? readCheckPageUrlOf(startOrigin, template) : readCheckPageTemplateUrlOf(startOrigin, template, recordId, isUsableRecordId);
+  const path = url === null ? null : listPage ? template : readCheckPagePathOfTemplate(template, recordId);
   if (url === null || path === null) {
     return URL_NOT_BUILT_TARGET;
   }

@@ -545,7 +545,7 @@ describe.each(LAUNCHERS)('T38b: API scenarios from the discovery of the formless
       definition: { targetPagePath: '/admin/members/{id}', parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] },
     }).ok).toBe(true);
     const verificationOf = (expectations: readonly Record<string, unknown>[], recordId: Record<string, unknown> | null) => ({
-      successCondition: null, inputErrorCondition: null, recordId,
+      resultJudgement: null, recordId,
       readVerification: { readCheckId: 'rc-api-member', revision: 1, bindings: [], expectations },
     });
     const saveWith = (scenarioId: string, verification: Record<string, unknown>) => createScenario(opened, {

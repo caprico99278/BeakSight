@@ -21,6 +21,7 @@
 //   欄の名前の語の判定 `fieldNameHasListedWord`、秘密に見える名前の方針の owner の判定 `isSecretUrlQueryParameterName` と一覧
 //   `PAGE_ISSUED_TOKEN_FIELD_WORDS` だけ。DEF-094。候補の欄の形は型だけ）。Playwright、ブラウザ、`node:fs`、`src/control/`、
 //   監査エンジンを import しない（`src/control/` とワーカーから import できるようにするため。`tests/architecture/discovery-boundary.test.ts`）。
+import { isRecordIdLikePathSegment } from '../core/api-request-shape.js';
 import { isSecretUrlQueryParameterName, PAGE_ISSUED_TOKEN_FIELD_WORDS } from '../core/secret-query-names.js';
 // PRE42-CC 組 UI-K2（CC-113）: 期待の種類の一覧の定義（画面のブラウザ側も読む、import を持たない純粋な core のファイル）。ここは公開し直す。
 import {
@@ -240,6 +241,30 @@ export const readCheckPageTemplateUrlOf = (
   }
   const path = readCheckPagePathOfTemplate(template, recordId);
   return path === null ? null : readCheckPageUrlOf(origin, path);
+};
+
+/** path の末尾の区切りを外した形（根は `/`。OP-R: 一覧の画面の判定と、自動の下書きの `{id}` の型の推しが使う）。 */
+export const withoutTrailingPathSeparator = (path: string): string => {
+  const trimmed = path.replace(/\/+$/u, '');
+  return trimmed.length === 0 ? PAGE_PATH_SEPARATOR : trimmed;
+};
+
+/**
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1・R2）: API の登録の照合の READ と、まとめて実行の操作さがしの段が読む、一覧の画面の path
+ * の唯一の判定（純粋）。一覧の画面は、登録の画面の path の 1 つ上の path（`/admin/members/new` → `/admin/members`）。1 つ上の path がない（根）、登録の画面の
+ * 最後の区切りが空か ID に見える（`isRecordIdLikePathSegment`）、1 つ上の path が画面の path の定義の形でない（`{`・`}` を持つ）ときは null。点検の段のリンクに
+ * あるかは、呼ぶ側が見る（自動の下書きの選び方、操作さがしの段）。使う所: 自動の下書き（よくある詳細の画面の型 `commonReadPageTemplateOf` も、これに `{id}` を
+ * 足す）、下書きの確かめ、書き込みの指定の組み立て、IPC の契約、操作さがしの段。同じ判定を写さない。
+ */
+export const readListPagePathOf = (createPagePath: string): string | null => {
+  const own = withoutTrailingPathSeparator(createPagePath);
+  const last = own.slice(own.lastIndexOf(PAGE_PATH_SEPARATOR) + PAGE_PATH_SEPARATOR.length);
+  const parent = own.slice(0, own.lastIndexOf(PAGE_PATH_SEPARATOR));
+  if (!own.startsWith(PAGE_PATH_SEPARATOR) || parent.length === 0 || parent === PAGE_PATH_SEPARATOR || last.length === 0
+    || isRecordIdLikePathSegment(last) || parent.includes('{') || parent.includes('}')) {
+    return null;
+  }
+  return parent;
 };
 
 /**

@@ -6,10 +6,16 @@
 //   `validateAuthSetup`）と書き込み（`writeAuthSetupRow`。プロファイルを書いた直後に、同じトランザクションの中で呼ばれる）。
 // - どちらかが通らなければ、どちらも書かない。画面が読んだ改訂と保存されている改訂が違えば `PROFILE_REVISION_CONFLICT`（今の改訂の照合を保つ）。
 // - 拒否は、どちらの部品の理由か（`part`）と、その部品の閉じた一覧の理由の値で返す（日本語の説明は今の表示のカタログ）。
+// - MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 3・4）: 保存の前も後も自動ログインのプロファイルなら、資格情報の送信先が変わる
+//   保存を拒む（プロファイルの項目は `PROFILE` の、認証の設定の項目は `AUTH_SETUP` の `CREDENTIAL_DESTINATION_LOCKED`。どちらも書かない）。
+// - MI-F5（設計書 4.7.1 の 6・7）: 画面の口（認証の設定の画面の、行から開いた下書きの保存）は、選択肢 `observedDestinationsOnly` を渡す。書き込みのトランザクション
+//   の中で、保存してあった改訂と今保存してある設定から、口が受ける送信先の案（行の観察を足した設定）を求め、今の設定か案と同じ送信先だけを受ける（方式によらない。
+//   違えば `AUTH_SETUP` の `CREDENTIAL_DESTINATION_OBSERVED_ONLY`）。観察の口（表の行の「登録する」）と切り替えは渡さない。
 import { deepFreeze } from '../../core/immutable.js';
 import type { AuthSetup, AuthSetupValidationError } from '../auth/auth-setup-contracts.js';
-import type { ProfileValidationError } from '../contracts.js';
+import type { ProfileValidationError, SiteProfile } from '../contracts.js';
 import {
+  credentialDestinationRejectionIn,
   validateAuthSetupForProfile,
   writeAuthSetupRow,
   type AuthSetupStoreRejectionReason,
@@ -51,6 +57,13 @@ export type ProfileAndAuthSetupSaveResult =
 
 type AuthSetupRejection = Extract<AuthSetupStoreResult, { ok: false }>;
 
+/** まとめて保存の選択肢（MI-F5: 画面の口の、送信先の案。`baselinesOf` は、トランザクションの中で読んだ、保存してあった改訂と今保存してある設定で呼ぶ）。 */
+export interface ProfileAndAuthSetupWriteOptions extends ProfileWriteOptions {
+  readonly observedDestinationsOnly?: {
+    readonly baselinesOf: (previous: SiteProfile, stored: AuthSetup | null) => readonly AuthSetup[];
+  };
+}
+
 /**
  * プロファイルの次の改訂と、その改訂に結びつく認証の設定を、1 つのトランザクションで書く（ファイルの先頭）。データベースそのものの誤りは
  * `ControlStoreError` で投げる。
@@ -58,8 +71,9 @@ type AuthSetupRejection = Extract<AuthSetupStoreResult, { ok: false }>;
 export const saveProfileAndAuthSetup = (
   database: ControlDatabase,
   request: ProfileAndAuthSetupSaveRequest,
-  options: ProfileWriteOptions,
+  options: ProfileAndAuthSetupWriteOptions,
 ): ProfileAndAuthSetupSaveResult => {
+  const observed = options.observedDestinationsOnly;
   const result = updateProfileWithFollowingWrite<AuthSetup, AuthSetupRejection, StoredAuthSetup>(
     database,
     { profile: request.profile, expectedRevision: request.expectedRevision },
@@ -74,6 +88,12 @@ export const saveProfileAndAuthSetup = (
         const validation = validateAuthSetupForProfile(request.setup, candidate, context);
         return validation.ok ? { ok: true, value: validation.setup } : { ok: false, rejection: validation };
       },
+      // MI-F1（設計書 4.7.1 の 3・4）: 書き込みのトランザクションの中で、保存してあった改訂の方式と次の改訂の方式で、今保存してある設定と比べる（プロファイルの
+      // 項目の送信先は、プロファイルの更新の部品が同じトランザクションで確かめる）。手動から自動への切り替え（`setUpAutomatedLogin`）は当たらない。
+      // MI-F5（6・7）: 画面の口の選択肢があれば、同じトランザクションの中で、口の案（保存してあった改訂と今の設定から求める）とも比べる。
+      check: (connection, previous, next, setup) => credentialDestinationRejectionIn(connection, previous.auth, next.auth, setup, observed === undefined
+        ? undefined
+        : { baselinesOf: (stored) => observed.baselinesOf(previous, stored) }),
       write: (connection, setup) => {
         const written = writeAuthSetupRow(connection, setup, options.now);
         if (!written.ok) {

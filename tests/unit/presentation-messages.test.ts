@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { formatCount } from '../../src/presentation/format.js';
 import { INCOMPLETE_REASON_CODES } from '../../src/core/contracts.js';
 import { INTERACTION_REASON_CODES } from '../../src/core/evidence-types.js';
 import {
@@ -8,8 +9,11 @@ import {
   INCOMPLETE_REASON_DESCRIPTIONS,
   INCOMPLETE_REASON_NEXT_STEPS,
   INTERACTION_REASON_DESCRIPTIONS,
+  LOCAL_UI_AUTO_DRAFT_TEXT,
+  LOCAL_UI_SAFETY_VIOLATION_TEXT,
   NOT_OBSERVED_TEXT,
   PAGE_COVERAGE_ITEMS,
+  PRECHECK_FAILURE_DETAIL_DESCRIPTIONS,
   RUN_SUMMARY_TEXT,
   activeRunInOutputDirectoryText,
   checkpointStoreFailedText,
@@ -37,6 +41,8 @@ import {
   unreadableCheckpointText,
   versionDifferenceText,
 } from '../../src/presentation/messages.js';
+import * as messagesModule from '../../src/presentation/messages.js';
+import * as catalogModule from '../../src/presentation/catalog.js';
 
 const JAPANESE_CHARACTER = /[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u;
 
@@ -61,7 +67,7 @@ describe('incomplete reason descriptions', () => {
 
   // T44c（Task 44 の設計書 P1-4）: 内側のスクロールの領域を走査しきれなかった理由と、次にできること。
   it('explains INNER_SCROLL_CONTAINER_NOT_TRAVERSED with its next step (T44c)', () => {
-    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('読み込みの後に動く内側のスクロールの領域');
+    expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('読み込みの後に動く別のスクロールの枠');
     expect(describeIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('全部は確かめていません');
     expect(nextStepOfIncompleteReason('INNER_SCROLL_CONTAINER_NOT_TRAVERSED')).toContain('手で確かめてください');
     expect(Object.isFrozen(INCOMPLETE_REASON_NEXT_STEPS)).toBe(true);
@@ -99,7 +105,7 @@ describe('incomplete reason descriptions', () => {
 
   // SU1（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で、その後の監査を始めなかった理由の説明。
   it('describes SITE_UNAVAILABLE as not starting the later audits because the site does not respond (SU1)', () => {
-    expect(describeIncompleteReason('SITE_UNAVAILABLE')).toBe('サイトが応答しないため、それより後の監査を始めませんでした。');
+    expect(describeIncompleteReason('SITE_UNAVAILABLE')).toBe('サイトが応答しないため、それより後の点検を始めませんでした。');
   });
 });
 
@@ -185,18 +191,19 @@ describe('Run summary text', () => {
 // L6（サイトへの負荷の制御の設計書 3.1 の7、4.5）: サイトへの負荷の記録の文言。HTML レポートだけで使う項目の名前は
 // `HTML_REPORT_TEXT.summary`、CLI だけで使う短い名前は `CLI_TEXT.run`、両方で使うものは `RUN_SUMMARY_TEXT` に置く。
 describe('site load text', () => {
+  // PL-R（plain UI の設計書 14 章、5 章）: 報告だけの文言を、画面と同じやさしい言葉にした（項目と並びは変えない）。
   it('names every item of the site load subsection of the HTML report in Japanese', () => {
     expect(HTML_REPORT_TEXT.summary.loadNote).toBe(
-      'BeakSight が監査対象のサイトに送った要求の実績です。ページの読み込みは、最小の間隔以上空けて行いました。',
+      'BeakSight が点検したサイトに送った要求の記録です。ページの読み込みは、いちばん短い間隔より長く空けて行いました。',
     );
     expect(HTML_REPORT_TEXT.summary.load).toEqual({
-      minNavigationInterval: 'ページの読み込みの最小の間隔',
-      maxInteractionsPerPage: '1ページで監査する Interaction の候補の上限',
+      minNavigationInterval: 'ページの読み込みの、いちばん短い間隔',
+      maxInteractionsPerPage: '1 ページで押して確かめる操作の上限',
       navigationCount: 'ページの読み込みの回数（始められなかったものを含む）',
-      pacingWait: '間隔のために待った時間の合計',
-      otherOriginRequests: '許可 Origin の外への要求',
-      servedFromCache: 'Run 全体のキャッシュから返した要求',
-      withheldOtherOrigins: '送らなかった、許可 Origin の外への要求',
+      pacingWait: '間隔を空けるために待った時間の合計',
+      otherOriginRequests: '点検してよいサイトの外への要求',
+      servedFromCache: '点検の回の全体で、取っておいた写しから返した要求',
+      withheldOtherOrigins: '送らなかった、点検してよいサイトの外への要求',
     });
     expect(Object.isFrozen(HTML_REPORT_TEXT.summary.load)).toBe(true);
   });
@@ -223,13 +230,14 @@ describe('site load text', () => {
 describe('run execution text', () => {
   it('names the executions subsection of the HTML report, its counts and its table columns in Japanese', () => {
     const { summary } = HTML_REPORT_TEXT;
-    expect(summary.executionsHeading).toBe('実行の記録');
+    // PL-R（plain UI の設計書 14 章、5 章）: 報告だけの文言を、画面と同じやさしい言葉にした（項目と並びは変えない）。
+    expect(summary.executionsHeading).toBe('起動の記録');
     expect(summary.executionsNote).toBe(
-      'BeakSight を起動した回ごとの、開始と終了の日時と、終わり方です。中断した Run を、同じコマンドで続きから監査した起動を、再開として数えます。',
+      'BeakSight を起動した回ごとの、始めと終わりの日時と、終わり方です。途中で止まった点検の回を、続きから点検した起動を、再開として数えます。',
     );
-    expect(summary.executions).toEqual({ count: '実行の回数', resumeCount: '再開の回数' });
+    expect(summary.executions).toEqual({ count: '起動の回数', resumeCount: '再開の回数' });
     expect(Object.isFrozen(summary.executions)).toBe(true);
-    expect(summary.executionColumns).toEqual(['何回目の実行', '開始の日時', '終了の日時', '終わり方']);
+    expect(summary.executionColumns).toEqual(['何回目の起動', '開始の日時', '終了の日時', '終わり方']);
     // 開始と終了の日時の列は、Run の開始と終了の日時の項目と、同じ名前で示す。
     expect(summary.executionColumns[1]).toBe(summary.startedAt);
     expect(summary.executionColumns[2]).toBe(summary.finishedAt);
@@ -261,8 +269,9 @@ describe('run progress text', () => {
     expect(Object.isFrozen(CLI_TEXT.progress)).toBe(true);
   });
 
-  it('has the units of times, hours, minutes and seconds for the formats', () => {
-    expect(FORMAT_UNIT_TEXT).toEqual({ seconds: '秒', count: '件', times: '回', hours: '時間', minutes: '分' });
+  // PL-4 で経過時間の日の単位（「1日 10回まで」）を足した（PL-TD の 4b で期待を追いつかせた）。OP-3 で、ふだんの画面の日時の月と日を足した。
+  it('has the units of times, days, hours, minutes and seconds for the formats', () => {
+    expect(FORMAT_UNIT_TEXT).toEqual({ seconds: '秒', count: '件', times: '回', days: '日', hours: '時間', minutes: '分', monthOfYear: '月', dayOfMonth: '日' });
     expect(Object.isFrozen(FORMAT_UNIT_TEXT)).toBe(true);
   });
 
@@ -425,5 +434,70 @@ describe('list text', () => {
     const urls = ['u1', 'u2', 'u3'];
     truncatedListText(urls, 1);
     expect(urls).toEqual(['u1', 'u2', 'u3']);
+  });
+});
+
+// MI-F3（MI-F4 の報告の片付け）: 件数の書式（`formatCount`。単位「件」を含む）を受ける文言の後ろに、もう一度「件」を書かない（「3件 件」と出さない）。
+// 期待は固定の文字で書く（同じ関数で期待を作ると、書式の誤りを捕まえないため）。
+describe('MI-F3: texts that take a count formatted with formatCount do not add the unit again', () => {
+  it('shows the number of the safety violations not listed once with its unit', () => {
+    expect(LOCAL_UI_SAFETY_VIOLATION_TEXT.omittedText(formatCount(3))).toBe('一覧に載せなかった違反が 3件あります。');
+  });
+});
+
+// PL-F（安全のレビュー PL-REV の Minor 3 と、PL-D2 の文言の持ち越し）。期待は固定の文字で書く。
+describe('PL-F: the plain texts after the safety review', () => {
+  it('tells that nothing was written because the list of the site could not be read, and to start again after a while', () => {
+    const { description, action } = PRECHECK_FAILURE_DETAIL_DESCRIPTIONS.VERIFICATION_READ_UNAVAILABLE;
+    expect(`${description}${action}`).toBe('サイトの一覧を読めなかったので、書き込みませんでした。少し待ってから、もう一度始めてください。');
+  });
+
+  // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6・D7'）: 「書き込みにも使う」の確認のダイアログは、なくしたので、文言も消した。
+  it('has no texts for the dialog of the write mode switch any more', () => {
+    expect(Object.keys(messagesModule)).not.toContain('LOCAL_UI_WRITE_MODE_SWITCH_TEXT');
+  });
+
+  it('has only one line for the automatic drafts when nothing was made', () => {
+    expect(Object.keys(LOCAL_UI_AUTO_DRAFT_TEXT)).toContain('noneCreated');
+    expect(Object.keys(LOCAL_UI_AUTO_DRAFT_TEXT)).not.toContain('noCreates');
+  });
+});
+
+// OP-3（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D11・D12）: 画面・報告・CLI が使う文言のカタログに、「書き換え」と「SMS」の語を
+// 置かない（「更新」と「メールや電話への知らせ」にそろえる）。関数の文言は、仮の値を入れて作った文で確かめる。
+describe('OP-3: the words of the catalogs', () => {
+  const SAMPLE_ARGUMENT = '〇';
+  /** 値の中の、すべての文（関数は、引数の数だけ仮の値を入れて呼ぶ）。 */
+  const textsOf = (value: unknown, path: string): readonly (readonly [string, string])[] => {
+    if (typeof value === 'string') {
+      return [[path, value]];
+    }
+    if (typeof value === 'function') {
+      // 文字でない引数を取る部品（一覧の書式など）は、文言のカタログではないので読まない。
+      try {
+        const made: unknown = value(...Array.from({ length: value.length }, () => SAMPLE_ARGUMENT));
+        return textsOf(made, `${path}()`);
+      } catch {
+        return [];
+      }
+    }
+    if (value !== null && typeof value === 'object') {
+      return Object.entries(value).flatMap(([key, child]) => textsOf(child, `${path}.${key}`));
+    }
+    return [];
+  };
+  const texts = [...Object.entries(messagesModule), ...Object.entries(catalogModule)].flatMap(([name, value]) => textsOf(value, name));
+
+  it('reads the texts of every catalog (the check itself)', () => {
+    expect(texts.length).toBeGreaterThan(1000);
+    expect(texts.some(([, text]) => text.includes('更新'))).toBe(true);
+  });
+
+  it('says 更新 for an update write and never 書き換え', () => {
+    expect(texts.filter(([, text]) => text.includes('書き換')).map(([path]) => path)).toEqual([]);
+  });
+
+  it('says メールや電話への知らせ and never SMS', () => {
+    expect(texts.filter(([, text]) => text.includes('SMS')).map(([path]) => path)).toEqual([]);
   });
 });

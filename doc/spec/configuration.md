@@ -54,7 +54,7 @@
 - 期限の値には、組み合わせの条件があります。たとえば、Interaction を行う場合は、`crawl.overallPageTimeoutMs` を `crawl.navigationTimeoutMs + 2 × crawl.interactionTimeoutMs` 以上にする必要があります。
 - 条件に合わない値は、`validate-config` が英語の技術的な詳細で示します。
 - `audit.sendPolicy` の実効の値は、`run.json` の `effectiveConfig.audit.sendPolicy` と `safety.auditSend` に残ります。中断した Run の再開では、この値も比べます（違えば再開しません）。この項目を持たない古い Run の保存は `"READ_ONLY"` と読むので、今の既定のままなら再開できます。
-- 画面から始めるジョブは、設定のファイルの値ではなく、プロファイルの設定（「[ローカルの管理画面](local-ui.md)」の表示の設定の欄）を使います。書き込みのジョブ・ログインの確かめ・入口の確かめは、いつも `"READ_ONLY"` で読みます。
+- 画面から始めるジョブは、設定のファイルの値ではなく、プロファイルの設定（「[ローカルの管理画面](local-ui.md)」の表示の設定の欄）を使います。画面のサイトの既定は `"PASS_EXCEPT_DELETE"` です（2026-10-29 から。この表の既定 `"READ_ONLY"` は、CLI の設定のファイルのものです）。書き込みのジョブは、値を入れる前などの一部にだけ当てます（「[監査の段の送信の扱い](safety.md#監査の段の送信の扱い)」の「当てない段」の後）。ログインの確かめ・入口の確かめは、いつも `"READ_ONLY"` で読みます。
 
 ## `config/targets/` と `local/` の使い分け
 

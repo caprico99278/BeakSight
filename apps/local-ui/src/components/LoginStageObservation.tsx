@@ -6,6 +6,8 @@
  * - 観察の欄: 新しく出たローカル ストレージの鍵の名前の接頭辞と接尾辞（成功の鍵の名前の案。間の部分は持たない）と、成功の画面のセレクタの案（ログアウトの
  *   属性の CSS と語の説明。画面の文字は持たない）と、資格情報を含んだので捨てた案の数（T43R-fix の C-1）。「案を認証の設定に入れる」で、同じ下書きの仕組みで
  *   認証の設定の画面を開く。まとめが大きすぎて観察を省いたときは、その旨（M-5）。
+ * - PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 4 章の 2）: 自動の登録が済んだ（`registrationDone`。サーバの要点の
+ *   `loginStageRegistration` が `DONE`）ときは、済んだ操作（行の「登録する」「認証の設定の画面で直す」、「案を認証の設定に入れる」）を出さない。
  */
 import { Link } from '@tanstack/react-router';
 import {
@@ -46,13 +48,20 @@ export function LoginStageQueryCell({ request }: Readonly<{ request: WorkerLogin
 /**
  * 行の登録の欄（「登録する」か、手で入れる案内）。FM-1（手動の操作を減らす設計書 2.1）: 「登録する」は、確認のダイアログの後にその場で保存する
  * （`LoginStageRegisterButton`。画面は移らない）。今までの下書きのリンク（認証の設定の画面を下書きつきで開く。保存は利用者）は「認証の設定の画面で直す」
- * として残す。
+ * として残す。MI-C 項目 12（安全）: 自動ログインの文脈の行（`automatedLoginContext`。サーバが MI-G の `isAutomatedLoginSource` で決めた値）には、下書きの
+ * リンクを出さない（「登録する」の拒否と同じ文脈。下書きから token の送信先と承認したサービスの Origin を足す道を作らない）。
  */
-export function LoginStageRegisterCell({ profileId, request, target }: Readonly<{
+export function LoginStageRegisterCell({ profileId, request, target, automatedLoginContext, registrationDone = false }: Readonly<{
   profileId: string;
   request: WorkerLoginStageBlockedRequest;
   target: LoginStageRowTarget;
+  automatedLoginContext: boolean;
+  /** PL-2: 自動の登録が済んだか（真なら、済んだ操作を出さない）。 */
+  registrationDone?: boolean;
 }>) {
+  if (registrationDone) {
+    return null;
+  }
   const registration = loginStageRegistrationOf(request);
   const draft = observedDraftOfRegistration(registration);
   if (registration.kind === 'MANUAL' || draft === null) {
@@ -63,19 +72,24 @@ export function LoginStageRegisterCell({ profileId, request, target }: Readonly<
     <>
       <LoginStageRegisterButton target={target} registration={registration.kind} />
       <span className="field-hint">{registration.kind === 'TOKEN_TARGET' ? text.registerTokenTarget : text.registerSideRequest}</span>
-      <Link to="/auth-setup/$profileId" params={{ profileId }} search={{ draft }} data-testid="job-login-stage-edit-draft">
-        {LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT.editDraft}
-      </Link>
+      {automatedLoginContext ? null : (
+        // MI-F1（設計書 4.7.1 の 1）: 下書きに、作ったジョブの記録の行を付ける（Origin を足す保存は、サーバがこの行から組み立て直す）。
+        <Link to="/auth-setup/$profileId" params={{ profileId }} search={{ draft, row: target }} data-testid="job-login-stage-edit-draft">
+          {LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT.editDraft}
+        </Link>
+      )}
     </>
   );
 }
 
 /** ログインの段で観察した案の欄（観察がなければ出さない）。 */
-export function LoginStageObservationPanel({ profileId, observation, omitted = false }: Readonly<{
+export function LoginStageObservationPanel({ profileId, observation, omitted = false, registrationDone = false }: Readonly<{
   profileId: string;
   observation: WorkerLoginObservation | undefined;
   /** T43R-fix の M-5: まとめが大きすぎたので、観察と query の名前を省いたか。 */
   omitted?: boolean;
+  /** PL-2: 自動の登録が済んだか（真なら、「案を認証の設定に入れる」を出さない。案は自動の登録に入った）。 */
+  registrationDone?: boolean;
 }>) {
   if (observation === undefined) {
     return omitted ? <p className="muted" data-testid="job-login-observation-omitted">{text.observationOmitted}</p> : null;
@@ -116,7 +130,7 @@ export function LoginStageObservationPanel({ profileId, observation, omitted = f
       {credentialDiscarded === undefined ? null : (
         <p className="muted" data-testid="job-login-observation-discarded">{text.credentialDiscarded(formatCount(credentialDiscarded))}</p>
       )}
-      {draft === null ? null : (
+      {draft === null || registrationDone ? null : (
         <p>
           <Link to="/auth-setup/$profileId" params={{ profileId }} search={{ draft }} className="button" data-testid="job-login-observation-apply">
             {text.applyObservation}

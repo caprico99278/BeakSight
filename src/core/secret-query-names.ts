@@ -260,9 +260,11 @@ export const API_WRITE_SECRET_LIKE_KEY_SEGMENTS = Object.freeze([
  * T44g（Task 44 の設計書 P4-2。設計者の判断）: 方針 6 の部分一致の誤検知として除く、鍵の名前（名前つきの閉じた一覧。比べる形で書く）。鍵の名前の比べる形
  * （NFKC と大文字小文字を畳み、文字と数字以外を除いた形。結合文字を除いた形も）が、この語にちょうど当たる鍵だけを除く（`author_token` などは今どおり当たる）。
  * `author` は `auth`、`footprint` は `otp` の部分一致に当たっていた。`session_count`・`hmac_ok` は、`session`・`hmac` の語そのものを含むので除かない。
+ * OP-K（K2。設計者の判断 4）: `authorid`（`author_id`・`authorId` などの比べる形）は、画面が自動で入れる作成者の番号で、認証の秘密ではない（`author_id_token` は今どおり当たる）。
  */
 export const API_WRITE_SECRET_LIKE_KEY_EXCLUDED_NAMES = Object.freeze([
   'author',
+  'authorid',
   'footprint',
 ] as const);
 

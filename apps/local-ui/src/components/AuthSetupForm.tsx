@@ -22,6 +22,15 @@
  * - T35d（Task 35 の設計書 3.1、3.4）: スクリプトの送信のときだけ、監査の段の読み取りの手続きの呼び出しの一覧（Origin、パス、1 回の読み込みの回数。
  *   method は POST だけ。上限 8）と、サービスの Origin への要求の上限（1 分あたり、1 回の Run あたり。空なら上限の値）の欄を出す。どちらも、値がある
  *   ときだけ項目として送る（項目のない設定の文書と digest を変えない）。フォームの送信では出さず、送らない。
+ * - MI-F5（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 6）: 認証の設定がすでにあるとき（`destinationsLocked`）は、ログインの
+ *   送信先の項目（ログインの画面の URL、送り方、フォームの送信先、token の送信先、必須の query、ログインに伴う送信、自動ログインの 3 つのセレクタ）を、入力の欄に
+ *   せず、読むだけの値で出す（保存で拒まれる欄を見せない。欄は増やさない）。送信先は、入口の確かめと手動のログインの観察からだけ入る（行から開いた下書きの値も、
+ *   読むだけで出し、そのまま保存する）。送信先でない欄は今どおり入力できる。
+ * - PL-S（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8。MI 4.7.1 の 6）: そのうち token の送信先（Origin・path）・必須の query・
+ *   ログインに伴う送信は、設定がまだないときも読むだけで出す（入るのは手動のログインの観察からだけで、最初の保存も、それらが空の形だけを受けるため）。
+ * - PL-4（同 2 章・3 章の 3。作業記録 UX-1 の画面 C の 5.3）: 読むだけだった送信先の項目は、もう出さない（直せない欄を見せない。Origin・path・query・セレクタは
+ *   2 章の「出さないもの」）。値はフォームの値に持ったまま、そのまま保存する（変えない）。出さない項目の保存の誤りは、フォームの上に項目の名前つきで出す。
+ *   出さない項目は `hiddenDestinationFieldsOf`。送信の method の固定の表示も出さない。見せ方だけを変え、保存の判定は変えない。
  */
 import { useState, type ReactNode } from 'react';
 import {
@@ -43,13 +52,8 @@ import {
   LOGIN_SIDE_REQUEST_METHODS,
   LOGIN_TRANSPORTS,
   MAX_LOGIN_ATTEMPTS,
-  MAX_LOGIN_SIDE_REQUESTS,
-  MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
-  MAX_SCRIPT_LOGIN_REQUIRED_QUERY,
   MIN_LOGIN_ATTEMPTS,
-  MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE,
   SCRIPT_REQUEST_TRANSPORT,
-  loginTransportOf,
   type AuthSetup,
   type AutomatedLoginFailureConditionKind,
   type LoginPostEndpoint,
@@ -67,14 +71,8 @@ import {
 } from '../../../../src/presentation/messages.js';
 import { loginTransportDisplay } from '../display/labels';
 import { linesOf, textOfLines } from '../display/form-lines';
-import { authSetupDraftOf } from '../display/start-url-draft';
-import {
-  entryCheckDraftOf,
-  entryProposalSelectorsOf,
-  keepsStartUrlSuccessPath,
-  observedDraftFieldsOf,
-  type EntryCheckDraft,
-} from '../display/entry-check-draft';
+import { proposedAuthSetupBodyOf, type AuthSetupBody } from '../../../../src/control/auth/auth-setup-proposal.js';
+import { entryProposalSelectorsOf, observedDraftFieldsOf } from '../display/entry-check-draft';
 import type { EntryCheckProposal } from '../../../../src/control/entry-check.js';
 import type { ObservedAuthSetupDraft } from '../../../../src/control/login-observation-draft.js';
 import {
@@ -158,18 +156,8 @@ type TextValueKey = Exclude<
   'maxLoginAttempts' | 'failureConditions' | 'loginTransport' | 'requiredQuery' | 'sideRequests' | 'auditReads'
 >;
 
-/** ログインに伴う送信の、1 回のログインの回数の選択肢（下限から上限まで）。 */
-const SIDE_REQUEST_COUNT_OPTIONS: readonly number[] = Array.from(
-  { length: MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE - MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE + 1 },
-  (_unused, index) => MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE + index,
-);
-
 /** ログインに伴う送信の method（`POST` だけ）。 */
 const [SIDE_REQUEST_METHOD] = LOGIN_SIDE_REQUEST_METHODS;
-
-/** 新しい行の、必須の query の組とログインに伴う送信の初めの値。 */
-const EMPTY_QUERY: QueryFormValues = Object.freeze({ name: '', value: '' });
-const EMPTY_SIDE_REQUEST: SideRequestFormValues = Object.freeze({ origin: '', path: '', maxPerLoginStage: MIN_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE });
 
 /** T35d: 監査の段の読み取りの手続きの呼び出しの、1 回の読み込みの回数の選択肢と、新しい行の初めの値と、method（`POST` だけ）。 */
 const AUDIT_READ_COUNT_OPTIONS: readonly number[] = Array.from(
@@ -217,10 +205,9 @@ const failureConditionOf = (values: FailureConditionFormValues): LoginResultCond
 
 /**
  * 保存してある設定（なければ空）を、フォームの値にする。自動ログインのプロファイル（`automated`）では、回数は固定の値。
- * T43b（Task 43 の設計書 4.2）: 保存した設定がない（新しい認証の設定）ときだけ、対象の設定の開始の URL の path（`startUrlPath`）で、成功の画面の
- * path と監査の path の案を埋める（`authSetupDraftOf`）。保存した設定があれば、その値を出す。除外の path は今の既定（空）のまま。
- * T43c（Task 43 の設計書 4.3）: 保存した設定がないときだけ、最後の成功した入口の確かめの案（`entryProposal`）も埋める（`entryCheckDraftOf`。開始の
- * URL の path の案より優先する。ログインの画面の path に当たる成功の画面の path の案は残さない）。案のない欄は埋めない。保存は利用者が押す。
+ * T43b・T43c（Task 43 の設計書 4.2、4.3）・MI-3: 保存した設定がない（新しい認証の設定）ときだけ、案の設定を欄に写す。案の設定は、対象の設定の開始の
+ * URL の path（`startUrlPath`）と、最後の成功した入口の確かめの案（`entryProposal`）から、ジョブの管理が入口の確かめの後に保存する案と同じ 1 か所
+ * （`src/control/auth/auth-setup-proposal.ts` の `proposedAuthSetupBodyOf`）で作る。保存した設定があれば、その値を出す。
  * T43d（Task 43 の設計書 4.4）: ジョブの詳細からの観察した要求の下書き（`observedDraft`）を、優先の順の最後に重ねる（保存した設定があっても入れる。
  * 優先の順は `display/entry-check-draft.ts` の 1 か所）。
  */
@@ -238,38 +225,30 @@ export const authSetupFormValuesOf = (
     : { ...base, ...observedDraftFieldsOf(observedDraft, base.sideRequests, entryProposalSelectorsOf(entryProposal)) };
 };
 
-/** 優先の順の 1 と 2（保存した設定の値と、保存した設定がないときの開始の URL の path と入口の確かめの案）。 */
+/** 優先の順の 1（保存した設定の値。保存した設定がなければ、案の設定の値）。 */
 const savedAndEntryValuesOf = (
-  setup: AuthSetup | null,
+  saved: AuthSetup | null,
   automated: boolean,
   startUrlPath: string | null,
   entryProposal: EntryCheckProposal | null,
 ): AuthSetupFormValues => {
-  const draft = authSetupDraftOf(setup === null ? startUrlPath : null);
-  const entry: EntryCheckDraft = setup === null && entryProposal !== null ? entryCheckDraftOf(entryProposal) : {};
-  const rest = restValuesOf(setup, automated);
+  // MI-3: 新しい設定は、ジョブの管理が保存する案と同じ部品で作った案の設定を、保存した設定と同じ写し方で欄にする。
+  const setup: AuthSetupBody = saved ?? proposedAuthSetupBodyOf({ automated, startUrlPath, entryProposal });
   return {
-    loginStartUrl: setup?.loginStartUrl ?? entry.loginStartUrl ?? '',
-    loginPostEndpoints: setup === null
-      ? entry.loginPostEndpoints ?? ''
-      : textOfLines(setup.loginPostEndpoints.map((endpoint) => `${endpoint.origin}${endpoint.path}`)),
-    successPathPrefix: setup?.successCondition.pathPrefix
-      ?? (keepsStartUrlSuccessPath(draft.successPathPrefix, entry) ? draft.successPathPrefix : ''),
-    successSelector: setup?.successCondition.selector ?? '',
-    sessionLostPathPrefix: setup?.sessionLostCondition.pathPrefix ?? entry.sessionLostPathPrefix ?? '',
-    excludedPaths: textOfLines(setup?.excludedPaths ?? []),
-    auditPathPrefixes: textOfLines(setup?.auditPathPrefixes ?? draft.auditPathPrefixes),
-    ...rest,
-    loginTransport: entry.loginTransport ?? rest.loginTransport,
-    usernameSelector: entry.usernameSelector ?? rest.usernameSelector,
-    passwordSelector: entry.passwordSelector ?? rest.passwordSelector,
-    submitSelector: entry.submitSelector ?? rest.submitSelector,
+    loginStartUrl: setup.loginStartUrl,
+    loginPostEndpoints: textOfLines(setup.loginPostEndpoints.map((endpoint) => `${endpoint.origin}${endpoint.path}`)),
+    successPathPrefix: setup.successCondition.pathPrefix,
+    successSelector: setup.successCondition.selector ?? '',
+    sessionLostPathPrefix: setup.sessionLostCondition.pathPrefix ?? '',
+    excludedPaths: textOfLines(setup.excludedPaths),
+    auditPathPrefixes: textOfLines(setup.auditPathPrefixes),
+    ...restValuesOf(setup, automated),
   };
 };
 
 /** 保存してある設定の、残りの欄の値（自動ログインと、版 3 の項目）。 */
 const restValuesOf = (
-  setup: AuthSetup | null,
+  setup: AuthSetupBody | null,
   automated: boolean,
 ): Omit<AuthSetupFormValues, 'loginStartUrl' | 'loginPostEndpoints' | 'successPathPrefix' | 'successSelector' | 'sessionLostPathPrefix'
   | 'excludedPaths' | 'auditPathPrefixes'> => ({
@@ -284,14 +263,14 @@ const restValuesOf = (
 
 /** T34d: 版 3 の項目の欄の値（新しい設定は、フォームの送信と空の欄）。 */
 function scriptLoginValuesOf(
-  setup: AuthSetup | null,
+  setup: AuthSetupBody | null,
 ): Pick<AuthSetupFormValues, 'loginTransport' | 'scriptOrigin' | 'scriptPath' | 'requiredQuery' | 'sideRequests'
   | 'storageOrigin' | 'storagePrefix' | 'storageSuffix' | 'auditReads' | 'servicePerMinute' | 'servicePerRun'> {
   const version3 = setup;
   const limits = version3?.serviceRequestLimits;
   return {
     // T36a: 自動ログインのプロファイルでも、保存してある送り方のまま（新しい設定はフォームの送信）。
-    loginTransport: setup === null ? FORM_NAVIGATION_TRANSPORT : loginTransportOf(setup),
+    loginTransport: setup === null ? FORM_NAVIGATION_TRANSPORT : setup.loginTransport,
     scriptOrigin: version3?.scriptLogin?.origin ?? '',
     scriptPath: version3?.scriptLogin?.path ?? '',
     requiredQuery: (version3?.scriptLogin?.requiredQuery ?? []).map(({ name, value }) => ({ name, value })),
@@ -443,6 +422,17 @@ const FIELD_LABELS = Object.freeze({
 export const authSetupErrorSummaryText = (error: AuthSetupErrorView): string =>
   error.field === null ? errorTextOf(error) : `${FIELD_LABELS[error.field]}: ${errorTextOf(error)}`;
 
+/** PL-4: いつも出さない送信先の項目（token の送信先・必須の query・ログインに伴う送信。入るのは手動のログインの観察からだけ）。 */
+const ALWAYS_HIDDEN_DESTINATION_FIELDS: readonly AuthSetupFormField[] = Object.freeze(['scriptOrigin', 'scriptPath', 'requiredQuery', 'loginSideRequests']);
+/** PL-4: 認証の設定がすでにあるときに出さない送信先の項目（MI 4.7.1 の 6 で変えられない）。 */
+const LOCKED_DESTINATION_FIELDS: readonly AuthSetupFormField[] = Object.freeze([
+  'loginStartUrl', 'loginTransport', 'loginPostEndpoints', 'usernameSelector', 'passwordSelector', 'submitSelector',
+]);
+
+/** PL-4: 画面に出さない送信先の項目（`destinationsLocked` は認証の設定がすでにあるか）。 */
+const hiddenDestinationFieldsOf = (destinationsLocked: boolean): ReadonlySet<AuthSetupFormField> =>
+  new Set(destinationsLocked ? [...ALWAYS_HIDDEN_DESTINATION_FIELDS, ...LOCKED_DESTINATION_FIELDS] : ALWAYS_HIDDEN_DESTINATION_FIELDS);
+
 /** 拒否の表示（項目ごとの誤りと、フォームの上の誤り）。 */
 interface RejectionDisplay {
   readonly view: Extract<AuthSetupSaveView, { ok: false }>;
@@ -450,13 +440,16 @@ interface RejectionDisplay {
   readonly formErrors: readonly string[];
 }
 
-const rejectionDisplayOf = (view: Extract<AuthSetupSaveView, { ok: false }>): RejectionDisplay => {
+const rejectionDisplayOf = (view: Extract<AuthSetupSaveView, { ok: false }>, hiddenFields: ReadonlySet<AuthSetupFormField>): RejectionDisplay => {
   const fieldErrors: Partial<Record<AuthSetupFormField, string[]>> = {};
   const formErrors: string[] = [];
   for (const error of view.errors) {
     const text = errorTextOf(error);
     if (error.field === null) {
       formErrors.push(text);
+    } else if (hiddenFields.has(error.field)) {
+      // PL-4: 出さない項目の誤りは、フォームの上に項目の名前つきで出す（欄がないので、誤りを隠さない）。
+      formErrors.push(authSetupErrorSummaryText(error));
     } else {
       fieldErrors[error.field] = [...(fieldErrors[error.field] ?? []), text];
     }
@@ -479,6 +472,10 @@ export interface AuthSetupFormProps {
   readonly onSaved: () => void;
   /** 改訂の衝突のときに、今の内容を読み直す。 */
   readonly onReload: () => void;
+  /** MI-F5: ログインの送信先の項目が変えられないか（認証の設定がすでにあるとき）。PL-4: 変えられない項目は出さない。 */
+  readonly destinationsLocked: boolean;
+  /** PL-4: 「保存する」を主のボタンの見た目にするか（画面にほかの主のボタンがあるときは偽。既定は真）。 */
+  readonly submitPrimary?: boolean;
 }
 
 /** 選択肢（承認した Origin と、今の値が一覧にないときは今の値も。今の値を黙って変えない）。 */
@@ -503,7 +500,10 @@ function GroupFrame({ label, hint, errors, testId, children }: Readonly<{
   );
 }
 
-export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOrigins, onSave, onSaved, onReload }: AuthSetupFormProps) {
+export function AuthSetupForm({
+  initialValues, automated, testOrigins, serviceOrigins, onSave, onSaved, onReload, destinationsLocked, submitPrimary = true,
+}: AuthSetupFormProps) {
+  const hiddenFields = hiddenDestinationFieldsOf(destinationsLocked);
   const text = LOCAL_UI_AUTH_TEXT.setup;
   const scriptText = LOCAL_UI_SCRIPT_LOGIN_TEXT.setup;
   // T44h の判断 (2): スクリプトで送るログインの案内（入口の確かめの案の文は、ページの側が出す）。
@@ -557,6 +557,10 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
   );
   const textInput = (field: AuthSetupFormField, key: TextValueKey, hint: string): ReactNode =>
     plainInput(field, key, values[key], hint, (value) => change(key, value));
+  // 送信先の項目: 入力の欄か、出さないか（PL-4。`destinationsLocked` のときは変えられないので出さない。値はそのまま保存する）。
+  const destinationText = (field: AuthSetupFormField, key: 'loginStartUrl' | 'usernameSelector' | 'passwordSelector' | 'submitSelector',
+    hint: string): ReactNode =>
+    (hiddenFields.has(field) ? null : textInput(field, key, hint));
   const linesInput = (field: AuthSetupFormField, key: 'loginPostEndpoints' | 'excludedPaths' | 'auditPathPrefixes', hint: string): ReactNode => (
     <FieldFrame label={FIELD_LABELS[field]} hint={hint} errors={errorsOf(field)}>
       {({ id, describedBy, invalid }) => (
@@ -576,7 +580,7 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
   // T34d: 版 3 の欄。
   // T36a: 自動ログインのプロファイルでも、スクリプトで送るログインの欄を出す。
   const script = values.loginTransport === SCRIPT_REQUEST_TRANSPORT;
-  const originSelect = (field: AuthSetupFormField, key: 'scriptOrigin' | 'storageOrigin', origins: readonly string[], hint: string): ReactNode => (
+  const originSelect = (field: AuthSetupFormField, key: 'storageOrigin', origins: readonly string[], hint: string): ReactNode => (
     <FieldFrame label={FIELD_LABELS[field]} hint={hint} errors={errorsOf(field)}>
       {({ id, describedBy, invalid }) => (
         <select
@@ -594,13 +598,9 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
       )}
     </FieldFrame>
   );
-  const changeQuery = (index: number, key: keyof QueryFormValues, value: string): void =>
-    change('requiredQuery', values.requiredQuery.map((row, rowIndex) => (rowIndex === index ? { ...row, [key]: value } : row)));
   const changeAuditRead = <TKey extends keyof AuditReadFormValues>(index: number, key: TKey, value: AuditReadFormValues[TKey]): void =>
     change('auditReads', values.auditReads.map((row, rowIndex) => (rowIndex === index ? { ...row, [key]: value } : row)));
   const auditText = LOCAL_UI_SPA_AUDIT_TEXT.setup;
-  const changeSideRequest = <TKey extends keyof SideRequestFormValues>(index: number, key: TKey, value: SideRequestFormValues[TKey]): void =>
-    change('sideRequests', values.sideRequests.map((row, rowIndex) => (rowIndex === index ? { ...row, [key]: value } : row)));
   const lineLabel = (index: number, label: string): string => `${text.lineText(formatInteger(index + 1))} ${label}`;
 
   return (
@@ -617,7 +617,7 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
             if (result.ok) {
               onSaved();
             } else {
-              setRejection(rejectionDisplayOf(result));
+              setRejection(rejectionDisplayOf(result, hiddenFields));
             }
           })
           .finally(() => setSaving(false));
@@ -636,7 +636,9 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
         </Notice>
       ) : null}
 
-      {textInput('loginStartUrl', 'loginStartUrl', text.loginStartUrlHint)}
+      {destinationsLocked ? <p className="field-hint" data-testid="auth-setup-destination-locked">{text.destinationLockedNote}</p> : null}
+      {destinationText('loginStartUrl', 'loginStartUrl', text.loginStartUrlHint)}
+      {hiddenFields.has('loginTransport') ? null : (
       <GroupFrame label={FIELD_LABELS.loginTransport} hint={scriptText.loginTransportHint} errors={errorsOf('loginTransport')} testId="auth-setup-transport">
         {LOGIN_TRANSPORTS.map((transport) => {
           const display = loginTransportDisplay(transport);
@@ -655,7 +657,8 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
           );
         })}
       </GroupFrame>
-      {script ? null : linesInput('loginPostEndpoints', 'loginPostEndpoints', text.loginPostEndpointsHint)}
+      )}
+      {script || hiddenFields.has('loginPostEndpoints') ? null : linesInput('loginPostEndpoints', 'loginPostEndpoints', text.loginPostEndpointsHint)}
       {textInput('successPathPrefix', 'successPathPrefix', text.successPathPrefixHint)}
       {textInput('successSelector', 'successSelector', text.successSelectorHint)}
       {textInput('sessionLostPathPrefix', 'sessionLostPathPrefix', text.sessionLostPathPrefixHint)}
@@ -696,100 +699,14 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
           <legend className="field-group-heading">{scriptText.scriptHeading}</legend>
           <p className="field-hint">{scriptText.scriptBody}</p>
           {/* T44e（Task 44 の設計書 P2-8）: 手動のログインのプロファイルでは、送信先と鍵を空のまま保存でき、手動のログインの後に自動で登録される。T44h の判断 (2):
-              承認したサービスの Origin も自動の登録が足すので、赤い文（先にプロファイルで足す）は自動ログインのプロファイルだけに出す（`scriptLoginNoticesOf`）。 */}
+              承認したサービスの Origin も自動の登録が足すので、承認したサービスの Origin がない文は自動ログインのプロファイルだけに出す（`scriptLoginNoticesOf`）。
+              MI-3: その文は誤りの見た目（`field-error`）でなく知らせ（ヒント）にする。 */}
           {scriptNotices.autoRegistration === null ? null : <p data-testid="auth-setup-script-login-note">{scriptNotices.autoRegistration}</p>}
-          {scriptNotices.serviceOriginsRequired === null ? null : (
-            <p className="field-error" data-testid="auth-setup-no-service-origins">{scriptNotices.serviceOriginsRequired}</p>
+          {scriptNotices.serviceOriginsPending === null ? null : (
+            <p className="field-hint" data-testid="auth-setup-no-service-origins">{scriptNotices.serviceOriginsPending}</p>
           )}
-          {originSelect('scriptOrigin', 'scriptOrigin', serviceOrigins, scriptText.scriptOriginHint)}
-          {textInput('scriptPath', 'scriptPath', scriptText.scriptPathHint)}
-          <p className="field-hint" data-testid="auth-setup-script-method">{`${scriptText.methodFixed}: ${scriptText.methodFixedValue}`}</p>
-          <GroupFrame
-            label={FIELD_LABELS.requiredQuery}
-            hint={scriptText.requiredQueryHint(formatCount(MAX_SCRIPT_LOGIN_REQUIRED_QUERY))}
-            errors={errorsOf('requiredQuery')}
-            testId="auth-setup-required-query"
-          >
-            {values.requiredQuery.map((row, index) => (
-              // 行の位置で並ぶ一覧（足すと末尾、消すと詰める）。
-              <div key={index} className="field-pair" data-testid="auth-setup-required-query-row">
-                {plainInput('requiredQuery', `requiredQueryName${String(index)}`, row.name, '', (value) => changeQuery(index, 'name', value),
-                  lineLabel(index, scriptText.queryName))}
-                {plainInput('requiredQuery', `requiredQueryValue${String(index)}`, row.value, '', (value) => changeQuery(index, 'value', value),
-                  lineLabel(index, scriptText.queryValue))}
-                <button type="button" className="button" onClick={() => change('requiredQuery', values.requiredQuery.filter((_row, rowIndex) => rowIndex !== index))}>
-                  {lineLabel(index, scriptText.removeQuery)}
-                </button>
-              </div>
-            ))}
-            <div className="button-row">
-              <button
-                type="button"
-                className="button"
-                disabled={values.requiredQuery.length >= MAX_SCRIPT_LOGIN_REQUIRED_QUERY}
-                onClick={() => change('requiredQuery', [...values.requiredQuery, EMPTY_QUERY])}
-              >
-                {scriptText.addQuery}
-              </button>
-            </div>
-          </GroupFrame>
-          <GroupFrame
-            label={FIELD_LABELS.loginSideRequests}
-            hint={scriptText.sideRequestsHint(formatCount(MAX_LOGIN_SIDE_REQUESTS), formatTimes(MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE))}
-            errors={errorsOf('loginSideRequests')}
-            testId="auth-setup-side-requests"
-          >
-            {values.sideRequests.length === 0 ? <p>{scriptText.noSideRequests}</p> : null}
-            {values.sideRequests.map((row, index) => (
-              <div key={index} className="field-pair" data-testid="auth-setup-side-request-row">
-                <FieldFrame label={lineLabel(index, scriptText.sideOrigin)} errors={[]}>
-                  {({ id, describedBy }) => (
-                    <select
-                      id={id}
-                      className="input"
-                      name={`sideRequestOrigin${String(index)}`}
-                      value={row.origin}
-                      aria-describedby={describedBy}
-                      onChange={(event) => changeSideRequest(index, 'origin', event.target.value)}
-                    >
-                      <option value="">{scriptText.selectPlaceholder}</option>
-                      {originOptionsOf([...testOrigins, ...serviceOrigins], row.origin).map((origin) => <option key={origin} value={origin}>{origin}</option>)}
-                    </select>
-                  )}
-                </FieldFrame>
-                {plainInput('loginSideRequests', `sideRequestPath${String(index)}`, row.path, '', (value) => changeSideRequest(index, 'path', value),
-                  lineLabel(index, scriptText.sidePath))}
-                <FieldFrame label={lineLabel(index, scriptText.sideMaxPerLoginStage)} errors={[]}>
-                  {({ id, describedBy }) => (
-                    <select
-                      id={id}
-                      className="input"
-                      name={`sideRequestMax${String(index)}`}
-                      value={String(row.maxPerLoginStage)}
-                      aria-describedby={describedBy}
-                      onChange={(event) => changeSideRequest(index, 'maxPerLoginStage', Number(event.target.value))}
-                    >
-                      {SIDE_REQUEST_COUNT_OPTIONS.map((count) => <option key={count} value={String(count)}>{formatTimes(count)}</option>)}
-                    </select>
-                  )}
-                </FieldFrame>
-                <span className="field-hint">{`${scriptText.methodFixed}: ${scriptText.methodFixedValue}`}</span>
-                <button type="button" className="button" onClick={() => change('sideRequests', values.sideRequests.filter((_row, rowIndex) => rowIndex !== index))}>
-                  {lineLabel(index, scriptText.removeSideRequest)}
-                </button>
-              </div>
-            ))}
-            <div className="button-row">
-              <button
-                type="button"
-                className="button"
-                disabled={values.sideRequests.length >= MAX_LOGIN_SIDE_REQUESTS}
-                onClick={() => change('sideRequests', [...values.sideRequests, EMPTY_SIDE_REQUEST])}
-              >
-                {scriptText.addSideRequest}
-              </button>
-            </div>
-          </GroupFrame>
+          {/* PL-S・PL-4（MI 4.7.1 の 6）: token の送信先・必須の query・ログインに伴う送信は、設定があるかないかによらず出さない（入るのは手動のログインの観察から
+              だけ。値はフォームの値に持ったまま保存する）。送信の method の固定の表示も出さない。 */}
           <p className="field-group-subheading">{scriptText.storageKeyHeading}</p>
           <p className="field-hint">{scriptText.storageKeyBody}</p>
           {originSelect('storageOrigin', 'storageOrigin', testOrigins, scriptText.storageOriginHint)}
@@ -870,9 +787,9 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
         <fieldset className="field-group" data-testid="auth-setup-automated">
           <legend className="field-group-heading">{text.automatedHeading}</legend>
           <p className="field-hint">{text.automatedBody}</p>
-          {textInput('usernameSelector', 'usernameSelector', text.usernameSelectorHint)}
-          {textInput('passwordSelector', 'passwordSelector', text.passwordSelectorHint)}
-          {textInput('submitSelector', 'submitSelector', text.submitSelectorHint)}
+          {destinationText('usernameSelector', 'usernameSelector', text.usernameSelectorHint)}
+          {destinationText('passwordSelector', 'passwordSelector', text.passwordSelectorHint)}
+          {destinationText('submitSelector', 'submitSelector', text.submitSelectorHint)}
           <p className="field-group-subheading">{text.failureConditionsHeading}</p>
           <p className="field-hint">{text.failureConditionsBody}</p>
           {AUTOMATED_LOGIN_FAILURE_CONDITION_KINDS.map((kind) => (
@@ -897,7 +814,7 @@ export function AuthSetupForm({ initialValues, automated, testOrigins, serviceOr
       ) : null}
 
       <div className="button-row">
-        <button type="submit" className="button button--primary" disabled={saving}>
+        <button type="submit" className={submitPrimary ? 'button button--primary' : 'button'} disabled={saving}>
           {saving ? text.saving : text.save}
         </button>
       </div>

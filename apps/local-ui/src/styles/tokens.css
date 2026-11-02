@@ -1,7 +1,8 @@
 /*
  * ローカルの管理画面の色と余白の唯一の定義（Task 23 設計書 4.7）。ほかの CSS は、この変数だけを使う。
  * 暗い背景（炭と紺）、少し明るいパネル、琥珀色の差し色。状態の色は、成功が緑、注意が琥珀、誤りが赤。
- * 本文の文字と背景の対比は、WCAG の AA（4.5:1）を十分に超える組み合わせにする。
+ * 本文の文字と背景の対比は、WCAG の AA（4.5:1）を十分に超える組み合わせにする。部品の縁（欄・二次のボタン・ダイアログ・checkbox）は 3:1 以上
+ * （WCAG 1.4.11）にする（PL-V。設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章。配色は暗いままで、明るい配色は持たない）。
  */
 :root {
   color-scheme: dark;
@@ -12,11 +13,14 @@
   --color-panel: #18202b;
   --color-panel-raised: #1f2937;
   --color-border: #2c3848;
+  /* 欄・二次のボタン・ダイアログ・checkbox の縁（パネルに 4.66:1、背景に 5.2:1）。`--color-border` は区切りの線とパネルの枠だけに使う */
+  --color-border-strong: #7a8aa0;
   --color-overlay: rgb(5 8 12 / 0.72);
+  --shadow-dialog: 0 0.75rem 2.5rem rgb(0 0 0 / 0.55);
 
   /* 文字 */
   --color-text: #e8edf3;
-  --color-text-muted: #aab6c4;
+  --color-text-muted: #b4bfcc;
   --color-text-on-accent: #1a1204;
 
   /* 差し色と状態 */
@@ -28,15 +32,26 @@
   --color-notice: #74b6ff;
   --color-neutral: #aab6c4;
   --color-focus: #ffd27a;
+  /* 知らせの面（色の帯に加えて、種類を面の色でも示す。本文の文字と 13:1 以上） */
+  --color-positive-surface: #0f2a1c;
+  --color-caution-surface: #2a2110;
+  --color-critical-surface: #2a1416;
 
   /* 文字の大きさ */
   --font-family: system-ui, -apple-system, 'Segoe UI', 'Yu Gothic UI', 'Meiryo', sans-serif;
-  --font-size-small: 0.875rem;
+  /* `<code>` の等幅（l と I を見分けやすい字体を先に。UA の既定の等幅は使わない） */
+  --font-family-mono: ui-monospace, Consolas, 'BIZ UDGothic', 'Yu Gothic UI', monospace;
+  --font-size-small: 0.9375rem;
   --font-size-body: 1rem;
-  --font-size-title: 1.5rem;
-  --font-size-heading: 1.125rem;
+  /* 要点の 1 行目 */
+  --font-size-lead: 1.125rem;
+  /* 見出しの段: h1 26px、h2 20px、h3 17px（h4 は本文と同じ大きさ） */
+  --font-size-title: 1.625rem;
+  --font-size-heading: 1.25rem;
+  --font-size-subheading: 1.0625rem;
   --font-size-brand: 1.375rem;
-  --line-height: 1.6;
+  --line-height: 1.75;
+  --line-height-heading: 1.4;
 
   /* 余白と形 */
   --space-1: 0.25rem;
@@ -48,17 +63,28 @@
   --radius: 0.75rem;
   --radius-small: 0.375rem;
   --sidebar-width: 15rem;
-  --content-max-width: 72rem;
+  /* 本文の最大幅（パネルの中の 1 行が約 41 字） */
+  --content-max-width: 48rem;
+  /* 押せる部品（ボタン・欄）の最小の高さ（44px） */
+  --control-min-height: 2.75rem;
+  /* checkbox と radio の大きさ */
+  --choice-size: 1.25rem;
   --focus-ring-width: 3px;
   --focus-ring-offset: 2px;
   --nav-bar-width: 3px;
-  --notice-bar-width: 4px;
+  --notice-bar-width: 6px;
   --letter-spacing-brand: 0.02em;
-  --opacity-disabled: 0.6;
+  /* 押せない部品の不透明度（app.css で灰色にも寄せる） */
+  --opacity-disabled: 0.45;
   --textarea-min-height: 5rem;
-  --dialog-max-width: 32rem;
+  --dialog-max-width: 40rem;
   --dialog-details-max-height: 50vh;
   --facts-label-min-width: 10rem;
   --table-wrap-column-min-width: 8rem;
   --progress-height: 0.75rem;
+  /*
+   * これより狭い画面では、左のメニューを上に積む（WCAG 1.4.10）。`@media` の条件は変数を使えないので、app.css の `@media (max-width: 48rem)` に
+   * 同じ値を書いている。変えるときは両方を変える。
+   */
+  --layout-stack-width: 48rem;
 }

@@ -16,7 +16,14 @@
  * - 返す値は、表示に要るものだけ（選択肢の値は返さない。人が入れた固定の値は、その画面を使う人が入れた値なので返す）。日時は ISO 8601。
  */
 import { createServerFn } from '@tanstack/react-start';
-import { readScenario, type InputRuleReference, type ScenarioKind, type ScenarioState, type ScenarioView } from '../../../../src/control/approval-view.js';
+import {
+  CONFIRMED_SIDE_EFFECTS,
+  readScenario,
+  type InputRuleReference,
+  type ScenarioKind,
+  type ScenarioState,
+  type ScenarioView,
+} from '../../../../src/control/approval-view.js';
 import {
   FIELD_RELATION_KINDS,
   FIELD_RELATION_ROLES,
@@ -89,6 +96,11 @@ export interface DataRuleFieldView {
    * `defaultRangeFieldNamesOf` の 1 か所。画面は、この値だけを使う）。
    */
   readonly defaultRange: boolean;
+  /**
+   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 「承認のときに外部への通知がないことを確認する」前提で作れる欄にした、メール・
+   * 電話の欄か（判定の owner `field-evaluation.ts` の印。画面は、この値だけを使う）。
+   */
+  readonly confirmationAtApproval: boolean;
 }
 
 /** 例の値 1 つ（null は送らない。合成の形は、メール・電話のとき）。 */
@@ -165,14 +177,18 @@ const EXAMPLE_SEED_PREFIX = 'screen-example-';
 /** 例の基準日（サーバの今日。Asia/Tokyo の `YYYY-MM-DD`。計算は基準日の owner の `baseDateOf`。CCX-20）。 */
 const exampleBaseDate = (): string => baseDateOf(new Date());
 
-/** データの例（決まった値の seed で作る。送らない）。 */
+/**
+ * データの例（決まった値の seed で作る。送らない）。MI-6: 例は、画面の判定と同じく「承認のときに確認する」前提で作る（副作用の確認は、承認のダイアログが
+ * 入れる値 `CONFIRMED_SIDE_EFFECTS`。版は変えない。生成の判定は、生成の部品のまま）。
+ */
 const examplesOf = (stored: StoredProfile, scenario: ScenarioView, ruleSet: RuleSetRevision): readonly DataRuleExampleView[] => {
   const baseDate = exampleBaseDate();
+  const atApproval = { ...scenario.current, sideEffectConfirmations: CONFIRMED_SIDE_EFFECTS };
   const digest = computeRuleSetDigest(ruleSet);
   return Array.from({ length: EXAMPLE_COUNT }, (_unused, offset) => offset + 1).flatMap((index) => {
     const result = generateScenarioData({
       ruleSet,
-      scenario: scenario.current,
+      scenario: atApproval,
       candidate: scenario.evidence,
       seedInput: {
         profileId: stored.profile.profileId,
@@ -255,6 +271,7 @@ const pageOf = (stored: StoredProfile, scenario: ScenarioView): DataRulePageView
         allowedKinds: candidateField === undefined ? [] : SEMANTIC_KINDS.filter((kind) => isSemanticKindCompatible(kind, candidateField.type)),
         secretLike: isSecretUrlQueryParameterName(field.fieldName),
         defaultRange: defaultRanges.has(field.fieldName),
+        confirmationAtApproval: field.confirmationAtApproval === true,
       };
     }),
     relations: evaluation.relations.map((relation) => ({ ...relation })),

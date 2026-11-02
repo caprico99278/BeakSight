@@ -72,6 +72,9 @@ export const EXECUTION_GRANT_REJECTION_REASONS = Object.freeze([
   // T41b（Task 41 の設計書 3.2）: 下書きの保存の後に台帳の登録の ID の取り方（応答の本文の鍵）が変わり、API の更新の filter の名前に結び付かなくなった
   // （下書きの理由と同じ名前。判定は `scenario-policy.ts` の `apiUpdateLedgerBindingRejectionOf`）。
   'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+  // MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 5。MI-R の Minor 7）: 発行・消費・確かめ直しで、シナリオの今の版の副作用の確認に、
+  // まだ確かめていない項目がある（承認の不変条件に頼らない多重の守り。判定は `scenario-policy.ts` の `unconfirmedSideEffectsOf`。承認の理由と同じ名前）。
+  'SCENARIO_SIDE_EFFECTS_UNCONFIRMED',
 ] as const);
 export type ExecutionGrantRejectionReason = (typeof EXECUTION_GRANT_REJECTION_REASONS)[number];
 

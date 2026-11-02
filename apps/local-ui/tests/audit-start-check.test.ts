@@ -93,7 +93,10 @@ describe('T25e: the start screen check (the same order as the job manager)', () 
 
   it.each([
     ['PROFILE_RETIRED', { status: 'RETIRED', storedSetup: null, context: undefined }],
-    ['MODE_NOT_EXECUTABLE', { profile: { ...authProfile, mode: 'TEST_APPROVED_WRITE' }, storedSetup: null }],
+    // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 監査は、どのモードでも始められる（書き込みのモードも）。表にない値だけが
+    // モードの理由になる（fail-closed）。書き込みのモードは、認証の設定がなければ `AUTH_SETUP_MISSING`。
+    ['MODE_NOT_EXECUTABLE', { profile: { ...authProfile, mode: 'TEST_UNKNOWN_MODE' }, storedSetup: null }],
+    ['AUTH_SETUP_MISSING', { profile: { ...authProfile, mode: 'TEST_APPROVED_WRITE' }, storedSetup: null }],
     // T26d-2 round 1: 自動ログインは方式として実行できる（どの OS でも。Windows だけであることは、ジョブの管理の開始の確かめで強制する）。今実行
     // できない方式は、公開の監査の手動のログインなど。
     ['AUTH_STRATEGY_NOT_EXECUTABLE', { profile: { ...publicProfile, auth: 'MANUAL_SESSION' }, storedSetup: null }],
@@ -228,6 +231,16 @@ describe('T26e: the automated login check of the start screen and the login chec
     expect(automated({ ...ready, limit })).toMatchObject({ blocker: 'AUTO_LOGIN_RATE_LIMITED', nextAllowedAt: '2026-10-11T09:03:00Z' });
   });
 
+  // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: 「毎回手でログインする」の自動ログインのプロファイルは、手でログインするので、自動ログインの
+  // 開始の前の確かめと上限を当てない（ジョブの管理と同じ判定 `manualLoginEveryTimeApplies`）。ログインの確かめのジョブには、今どおり当てる。
+  it('does not apply the automated login checks when the profile logs in by hand every time (OP-1)', () => {
+    const limit = decideAutoLoginStart({ attempts: [{ startedAt: '20261011085800', retryAfterUntil: null }], hold: null, now: NOW });
+    const manualEveryTime = { ...automatedProfile, loginPreference: 'MANUAL_EVERY_TIME' } satisfies SiteProfile;
+    expect(automated({ ...ready, limit }, { profile: manualEveryTime }).blocker).toBeNull();
+    expect(automated({ ...ready, credential: null }, { profile: manualEveryTime }).blocker).toBeNull();
+    expect(automated({ ...ready, limit }, { profile: manualEveryTime, jobKind: 'LOGIN_CHECK' }).blocker).toBe('AUTO_LOGIN_RATE_LIMITED');
+  });
+
   it('puts the auth setup and the profile checks before the automated login check', () => {
     expect(automated({ ...ready, credential: null }, { storedSetup: null }).blocker).toBe('AUTH_SETUP_MISSING');
     expect(automated({ ...ready, credential: null }, { context: undefined }).blocker).toBe('TARGET_CONFIG_UNAVAILABLE');
@@ -248,8 +261,9 @@ describe('T26e: the automated login check of the start screen and the login chec
 });
 
 // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、ジョブの管理と同じく、発見・
-// READ の確かめ・（自動ログインなら）ログインの確かめを始められる（認証の設定が要る）。認証つきの監査（`AUDIT`）は、今までどおり
-// `MODE_NOT_EXECUTABLE` で、認証の設定を要るとは言わない（始められないため）。
+// READ の確かめ・（自動ログインなら）ログインの確かめを始められる（認証の設定が要る）。MI-5（設計書
+// `2026-10-26-beaksight-minimal-input-ux-design.md` 3 章の判断 1、4.5）: 認証つきの監査（`AUDIT`）も、認証つきの読み取りの監査と同じ確かめで始められる
+// （前は `MODE_NOT_EXECUTABLE`）。
 describe('T28b: the start check of a write mode profile', () => {
   const writeProfile = { ...authProfile, mode: 'TEST_APPROVED_WRITE' } satisfies SiteProfile;
   const writeAutomatedProfile = { ...writeProfile, auth: 'AUTOMATED_LOGIN' } satisfies SiteProfile;
@@ -287,11 +301,18 @@ describe('T28b: the start check of a write mode profile', () => {
     expect(check({ profile: writeProfile, jobKind: 'READ_CHECK' }).blocker).toBe('READ_CHECK_DEFINITIONS_MISSING');
   });
 
-  it('rejects the AUDIT of a write mode profile with MODE_NOT_EXECUTABLE, without asking for the auth setup', () => {
+  it('has no blocker for the AUDIT of a write mode profile with a CURRENT valid setup, and needs the setup (MI-5)', () => {
     expect(check({ profile: writeProfile })).toEqual({
-      blocker: 'MODE_NOT_EXECUTABLE', errorCodes: [], authRequired: false, authSetupErrors: [], nextAllowedAt: null,
+      blocker: null, errorCodes: [], authRequired: true, authSetupErrors: [], nextAllowedAt: null,
     });
-    expect(check({ profile: writeProfile, jobKind: 'AUDIT', storedSetup: null }).blocker).toBe('MODE_NOT_EXECUTABLE');
+    expect(check({ profile: writeProfile, jobKind: 'AUDIT', storedSetup: null }).blocker).toBe('AUTH_SETUP_MISSING');
+    expect(check({ profile: writeProfile, jobKind: 'AUDIT', storedSetup: stored({ freshness: 'STALE' }) }).blocker).toBe('AUTH_SETUP_STALE');
+    // 自動ログインの書き込みのモードも、監査の前に自動ログインの開始の確かめを行う（認証つきの読み取りの監査と同じ）。
+    expect(check({ profile: writeAutomatedProfile, jobKind: 'AUDIT', storedSetup: stored({ setup: writeAutomatedSetup }), autoLogin: ready }))
+      .toEqual({ blocker: null, errorCodes: [], authRequired: true, authSetupErrors: [], nextAllowedAt: null });
+    expect(check({
+      profile: writeAutomatedProfile, jobKind: 'AUDIT', storedSetup: stored({ setup: writeAutomatedSetup }), autoLogin: { ...ready, credential: null },
+    }).blocker).toBe('CREDENTIAL_MISSING');
   });
 
   it('allows the login check of an automated login write mode profile only', () => {

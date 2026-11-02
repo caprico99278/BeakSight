@@ -19,7 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CONTROL_DATA_DIRECTORY_NAME, resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
 import { RUN_ARTIFACT_FILE_NAMES } from '../../../src/core/artifact-layout.js';
 import { REDACTED } from '../../../src/core/redaction.js';
-import { LOCAL_UI_AUDIT_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_NEXT_STEP_TEXT } from '../../../src/presentation/messages.js';
 import {
   AUTH_SITE_LOGIN_FIELDS,
   AUTH_SITE_PATHS,
@@ -52,6 +52,9 @@ import {
 import { databaseRowsPlace, filesUnder, leakedPlaces, textPlace, type SearchedPlace } from './helpers/secret-markers.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { waitForJobViaServerFunctions, waitForNoActiveJobViaServerFunctions, type ServerFunctionJobRow } from './helpers/server-function-job-wait.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 /** 画面の操作を待つ上限（ミリ秒）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -153,6 +156,9 @@ const authProfileDocument = (profileId: string, targetConfigPath: string, origin
   auth: 'MANUAL_SESSION',
   approvedTestOrigins: [origin],
   environmentEvidenceRef: 't25f-evidence',
+  // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: この確かめは手でのログインを繰り返す（セッションの切れと再開）ので、毎回手でログインする
+  // （1 回目の手でのログインの後に、自動ログインへ切り替えない。受け取りと切り替えの値の漏れは `login-registration-fork.test.ts`・`automated-login-setup-ui.test.ts`）。
+  loginPreference: 'MANUAL_EVERY_TIME',
 });
 
 /** 認証の設定の文書（ログアウトを読まないパスに、管理画面を読む範囲に）。 */
@@ -175,7 +181,7 @@ const authSetupDocument = (profileId: string, origin: string): Record<string, un
 const prepareProfile = async (profileId: string, site: AuthenticatedSite): Promise<void> => {
   const config = configs.get(profileId) ?? '';
   expect(await valueOf('createProfileFn', 'POST', { profile: authProfileDocument(profileId, config, site.originA) })).toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetupDocument(profileId, site.originA) })).toMatchObject({ ok: true });
+  expect(await saveAuthSetupRequestInStore(root, { setup: authSetupDocument(profileId, site.originA) })).toMatchObject({ ok: true });
 };
 
 /** fixture の正しい資格情報（値はテストの process の中だけ。目印として覚える。出力しない）。 */
@@ -193,24 +199,41 @@ const waitForLoginPage = async (count: number): Promise<void> => {
   await expect.poll(() => relay?.requested() ?? 0, { timeout: AUDIT_TIMEOUT_MS, interval: RELAY_POLL_MS }).toBeGreaterThanOrEqual(count);
 };
 
-/** 一覧の行の「監査を始める」から開始の画面を開き、`startNew` に合わせて選び、開始してジョブの画面に移る（キーボードだけ）。ジョブの ID を返す。 */
+/**
+ * 一覧の行の「続ける」からサイトの画面へ進み、要点の「点検を始める」から開始の画面を開き、`startNew` に合わせて選び、開始してジョブの画面に移る（キーボード
+ * だけ）。ジョブの ID を返す。PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章、4 章の 1）: 一覧の行のボタンは「続ける」1 つ（前は行に「監査を始める」）。
+ */
 const startFromList = async (profileId: string, startNew: boolean): Promise<{ readonly page: Page; readonly jobId: string }> => {
   const page = await openPage('/');
   const row = page.locator(`tr[data-profile-id="${profileId}"]`);
-  await tabTo(page, row.getByRole('link', { name: auditText.profileList.startAudit }));
+  await tabTo(page, row.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.continue }));
+  await page.keyboard.press('Enter');
+  await page.waitForURL(new RegExp(`/profiles/${profileId}$`, 'u'), { timeout: UI_TIMEOUT_MS });
+  await tabTo(page, page.getByTestId('profile-summary').getByRole('link', { name: auditText.profileList.startAudit }));
   await page.keyboard.press('Enter');
   await page.waitForURL(new RegExp(`/start/${profileId}$`, 'u'), { timeout: UI_TIMEOUT_MS });
   await page.getByTestId('start-login').waitFor({ timeout: UI_TIMEOUT_MS });
-  await tabTo(page, page.getByRole('radio', { name: auditText.start.resume }));
-  if (startNew) {
-    await page.keyboard.press('ArrowDown');
+  // PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 4）: 始め方の選択は、前回の点検が最後まで終わらなかったときだけ、たたんだ詳しい内容に出る
+  // （既定は続きから）。まだ点検していないサイトは、選ばずに新しく始まる。
+  if (await page.locator('input[name="start-mode"]').count() > 0) {
+    await tabTo(page, page.getByTestId('start-advanced-settings').locator('summary'));
+    await page.keyboard.press('Enter');
+    await tabTo(page, page.getByRole('radio', { name: auditText.start.resume }));
+    if (startNew) {
+      await page.keyboard.press('ArrowDown');
+    }
+    expect(await page.getByRole('radio', { name: startNew ? auditText.start.startNew : auditText.start.resume }).isChecked()).toBe(true);
+  } else {
+    expect(startNew).toBe(true);
   }
-  expect(await page.getByRole('radio', { name: startNew ? auditText.start.startNew : auditText.start.resume }).isChecked()).toBe(true);
   await tabTo(page, page.getByRole('button', { name: auditText.start.submit }));
   await page.keyboard.press('Enter');
   await page.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
   return { page, jobId: new URL(page.url()).pathname.split('/').at(-1) ?? '' };
 };
+
+/** 作業の終わりを、サーバの値で待つときの読み直しの間隔（ms）。 */
+const JOB_END_POLL_MS = 250;
 
 const jobState = (page: Page, state: string): Locator => page.locator(`[data-testid="job-state"][data-state="${state}"]`);
 const authState = (page: Page, state: string): Locator => page.locator(`[data-testid="job-auth-state"][data-auth-state="${state}"]`);
@@ -227,7 +250,24 @@ const runAudit = async (
   const job = await startFromList(profileId, startNew);
   await waitForLoginPage(requestedBefore + 1);
   await recordDescendants();
+  // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 5）: 見ていた点検が成功で終わると、サイトの詳細へ自動で移る。終わりはサーバの値で待ち、
+  // 終わった作業の画面を開き直してから確かめる（開き直した画面は移らない）。認証の状態は、たたんだ詳しい内容の中。
+  await waitForJobViaServerFunctions(
+    (id) => valueOf('getAuditJobFn', 'GET', { jobId: id }) as Promise<{ readonly active: boolean }>,
+    job.jobId,
+    (current) => !current.active,
+    { limitMs: AUDIT_TIMEOUT_MS, stepMs: JOB_END_POLL_MS },
+  );
+  // PL-3（設計書 2 章の判断 3）: 「点検を始める」は、まとめて実行（点検 → 操作さがし → 見るだけの確かめ）を始める。残りのステップも終わるまで待つ（ログインは
+  // 最初の段の 1 回だけ）。
+  await waitForNoActiveJobViaServerFunctions(
+    () => valueOf('listAuditJobsFn', 'GET') as Promise<readonly ServerFunctionJobRow[]>,
+    profileId,
+    { limitMs: AUDIT_TIMEOUT_MS, stepMs: JOB_END_POLL_MS },
+  );
+  await job.page.goto(new URL(`/jobs/${job.jobId}`, job.page.url()).href);
   await jobState(job.page, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+  await openAdvancedSettings(job.page, 'job-details', UI_TIMEOUT_MS);
   await authState(job.page, expectedAuthState).waitFor({ timeout: UI_TIMEOUT_MS });
   return job;
 };

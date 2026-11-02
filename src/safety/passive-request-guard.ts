@@ -119,6 +119,13 @@ import {
   type WriteStagePayloadBlockReason,
 } from './api-write-payload-policy.js';
 import {
+  WRITE_STAGE_AUDIT_SEND_PASSED,
+  WriteStageUnexpectedRequestList,
+  type WriteStageRequestDestination,
+  type WriteStageRequestTiming,
+  type WriteStageUnexpectedRequests,
+} from './write-stage-unexpected-requests.js';
+import {
   PREFLIGHT_METHOD,
   sendWriteSubmissionOnce,
   type WriteSubmissionOptions,
@@ -448,6 +455,12 @@ export interface GuardAuditSend {
   readonly maxPassedPerContext?: number | undefined;
   /** AS-c: この Context で通す WebSocket の接続の数の上限（1 以上 `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT` 以下の整数。省略は `AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT`）。 */
   readonly maxWebSocketsPerContext?: number | undefined;
+  /**
+   * OP-Q（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.8 の Q1）: 書き込みの作業の中の Passive の Context（送る前の確かめと照合の READ）の印（その作業の
+   * 承認した送信の送信先）。ある場合は、判定の口に写し（要求の判定の owner が、書き込みの段の値を入れる前と同じ決まりを加える）、WebSocket を通さず、ほかの Origin
+   * への事前確認の送り手（`auditSendPreflight`）も受けない（`TypeError`）。省略は監査の段の決まりのまま。
+   */
+  readonly writeJobEndpoint?: { readonly origin: string; readonly path: string } | undefined;
 }
 
 /** AS-a: Guard の取り付けの指定の、監査の段の送信の扱いの形か（factory の指定の確かめも、これを使う）。 */
@@ -458,10 +471,15 @@ export function isGuardAuditSend(value: unknown): value is GuardAuditSend {
   const isStrings = (items: unknown): boolean => Array.isArray(items) && items.every((item) => typeof item === 'string');
   const isLimit = (limit: unknown, max: number): boolean =>
     limit === undefined || (Number.isSafeInteger(limit) && (limit as number) >= 1 && (limit as number) <= max);
+  // OP-Q（Q1）: 書き込みの作業の印は、省略か、Origin と path の文字列の組だけ。
+  const { writeJobEndpoint } = value;
+  const isEndpoint = writeJobEndpoint === undefined
+    || (isRecord(writeJobEndpoint) && isStrings([writeJobEndpoint['origin'], writeJobEndpoint['path']]));
   return isStrings(value.approvedServiceOrigins)
     && isStrings(value.dangerousTerms)
     && isLimit(value.maxPassedPerContext, AUDIT_SEND_MAX_PASSED_PER_CONTEXT)
-    && isLimit(value.maxWebSocketsPerContext, AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT);
+    && isLimit(value.maxWebSocketsPerContext, AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT)
+    && isEndpoint;
 }
 
 /**
@@ -768,6 +786,8 @@ abstract class SubmissionStageMonitor {
     SUBMISSION_WINDOW_BROWSER_FAVICON: 0,
   };
   #blockedByOtherRulesInWindow = 0;
+  /** OP-N（N1）: 送信の窓の中で止めた、予期しない要求の数（`SUBMISSION_WINDOW` と窓の中のほかの判定のうち、`tolerated` でないもの）。 */
+  #unexpectedInWindow = 0;
 
   /** 送信の窓を開く（閉じた後は何もしない）。開いたら真。 */
   protected openWindow(): boolean {
@@ -788,21 +808,40 @@ abstract class SubmissionStageMonitor {
     return this.#submissionWindowOpen;
   }
 
-  /** 送信の段だけの理由で止めた要求を数える。 */
-  recordStageBlock(reason: SubmissionStageBlockReason): void {
+  /**
+   * 送信の段だけの理由で止めた要求を数える。OP-N（N1）: `tolerated`（書き込みの段の、値を入れた後の目印のない読み取り）は、予期しない要求の数に数えない。
+   */
+  recordStageBlock(reason: SubmissionStageBlockReason, tolerated = false): void {
     this.#blockedByReason[reason] = saturatingIncrement(this.#blockedByReason[reason]);
-  }
-
-  /** 今の判定で止めた要求を、判定の時点で窓が開いていたなら数える。 */
-  recordOtherBlock(submissionWindowOpenAtDecision: boolean): void {
-    if (submissionWindowOpenAtDecision) {
-      this.#blockedByOtherRulesInWindow = saturatingIncrement(this.#blockedByOtherRulesInWindow);
+    if (reason === 'SUBMISSION_WINDOW' && !tolerated) {
+      this.#unexpectedInWindow = saturatingIncrement(this.#unexpectedInWindow);
     }
   }
 
-  /** 送信の窓の中で止めた、予期しない要求の数（ブラウザ自身の favicon を除く）。 */
+  /**
+   * 今の判定で止めた要求を、判定の時点で窓が開いていたなら数える。OP-N（N1）: `tolerated`（書き込みの段の、値を入れた後の目印のない読み取りと WebSocket）は、
+   * 予期しない要求の数に数えない。
+   */
+  recordOtherBlock(submissionWindowOpenAtDecision: boolean, tolerated = false): void {
+    if (submissionWindowOpenAtDecision) {
+      this.#blockedByOtherRulesInWindow = saturatingIncrement(this.#blockedByOtherRulesInWindow);
+      if (!tolerated) {
+        this.#unexpectedInWindow = saturatingIncrement(this.#unexpectedInWindow);
+      }
+    }
+  }
+
+  /**
+   * 送信の窓の中で止めた、予期しない要求の数（ブラウザ自身の favicon を除く）。OP-N（N1）: 書き込みの段の、値を入れた後に止めた、目印のない読み取りと WebSocket
+   * （`tolerated` を付けて数えたもの）は数えない（止めたまま。種類ごとの数には今どおり数える）。
+   */
   unexpectedRequestCount(): number {
-    return this.#blockedByReason.SUBMISSION_WINDOW + this.#blockedByOtherRulesInWindow;
+    return this.#unexpectedInWindow;
+  }
+
+  /** OP-N（N1）: 送信の窓を一度でも開いたか（開いている、または承認の送信を通して閉じた）。 */
+  hasSubmissionWindowOpened(): boolean {
+    return this.#submissionWindowOpen || this.#submissionWindowClosed;
   }
 
   protected stageSnapshot(): SubmissionStageMonitorSnapshot {
@@ -954,6 +993,20 @@ export interface WriteStageMonitorSnapshot extends SubmissionStageMonitorSnapsho
    * ブラウザに返せなかった（`Fetch.fulfillRequest` の失敗を違反にせず、ここに記録する）。
    */
   readonly responseDeliveryCanceled: boolean;
+  /**
+   * OP-M: 書き込みの段で止めた、承認した送信のほかの要求の一覧（送り方・送り先の区分・path の形・種類・時点・理由・目印の真偽。値・Origin を持たない。
+   * `src/safety/write-stage-unexpected-requests.ts`）。止める判定には使わない。
+   */
+  readonly unexpectedRequests: WriteStageUnexpectedRequests['requests'];
+  /** OP-M: 一覧に入れなかった、止めた要求の数（上限を超えた新しい形と、型を作れなかった要求）。 */
+  readonly unexpectedRequestsUnlisted: number;
+  /**
+   * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` で通した、サイトが自動で送る通信の一覧
+   * （止めた一覧と同じ形と上限。理由は `WRITE_STAGE_AUDIT_SEND_PASSED`。値・Origin を持たない）。書き込みには数えない。
+   */
+  readonly passedRequests: WriteStageUnexpectedRequests['requests'];
+  /** OP-N: 通した一覧に入れなかった要求の数。 */
+  readonly passedRequestsUnlisted: number;
 }
 
 /** 書き込みの段の、Guard だけが書く状態（`WriteStageMonitor` ごと。モジュールの外から書けない）。 */
@@ -977,6 +1030,12 @@ interface WriteStageState {
   documentCharsetRead: boolean;
   /** 付けた Guard の、文書の文字コードを読む口（取り付けの時点で付ける。1 つの部品に 1 回だけ）。 */
   measureDocument: ((page: Page) => Promise<void>) | undefined;
+  /** OP-M: 止めた、承認した送信のほかの要求の一覧（取り付けの時点で、入れる値を目印にして作り直す）。 */
+  unexpectedRequests: WriteStageUnexpectedRequestList;
+  /** OP-M: 送り先の区分の決め方（取り付けの時点で付ける。付いていなければ一覧に入れない）。 */
+  destinationOf: ((url: string) => WriteStageRequestDestination) | undefined;
+  /** OP-N（N2）: 送信の扱いの口で通した要求の一覧（取り付けの時点で、止めた一覧と同じ目印で作り直す）。 */
+  passedRequests: WriteStageUnexpectedRequestList;
 }
 
 const writeStageStates = new WeakMap<WriteStageMonitor, WriteStageState>();
@@ -1019,6 +1078,9 @@ export class WriteStageMonitor extends SubmissionStageMonitor {
       responseDeliveryCanceled: false,
       documentCharsetRead: false,
       measureDocument: undefined,
+      unexpectedRequests: new WriteStageUnexpectedRequestList([]),
+      destinationOf: undefined,
+      passedRequests: new WriteStageUnexpectedRequestList([]),
     });
   }
 
@@ -1085,8 +1147,59 @@ export class WriteStageMonitor extends SubmissionStageMonitor {
       blockedByPayloadReason: Object.freeze({ ...state.blockedByPayloadReason }),
       documentCharsetRead: state.documentCharsetRead,
       responseDeliveryCanceled: state.responseDeliveryCanceled,
+      ...unexpectedRequestsSnapshotOf(state.unexpectedRequests),
+      ...passedRequestsSnapshotOf(state.passedRequests),
     });
   }
+}
+
+/** OP-N: 通した一覧の写しを、1 つの配列（`passedRequests`）と、一覧に入れなかった数（`passedRequestsUnlisted`）に分ける。 */
+const passedRequestsSnapshotOf = (
+  list: WriteStageUnexpectedRequestList,
+): Pick<WriteStageMonitorSnapshot, 'passedRequests' | 'passedRequestsUnlisted'> => {
+  const { requests, unlisted } = list.snapshot();
+  return { passedRequests: requests, passedRequestsUnlisted: unlisted };
+};
+
+/** OP-M: 一覧の写しを、1 つの配列（`unexpectedRequests`）と、一覧に入れなかった数（`unexpectedRequestsUnlisted`）に分ける。 */
+const unexpectedRequestsSnapshotOf = (
+  list: WriteStageUnexpectedRequestList,
+): Pick<WriteStageMonitorSnapshot, 'unexpectedRequests' | 'unexpectedRequestsUnlisted'> => {
+  const { requests, unlisted } = list.snapshot();
+  return { unexpectedRequests: requests, unexpectedRequestsUnlisted: unlisted };
+};
+
+/**
+ * OP-M: 書き込みの段で止めた要求の時点。判定の時点で送信の窓が開いていなければ、値を入れる前（窓を閉じた後は、送信の段を開いた後なので押した後）。
+ * 開いていれば、送信の段を開く前は値を入れた後、開いた後は押した後。
+ */
+const writeStageTimingOf = (state: WriteStageState, submissionWindowOpenAtDecision: boolean): WriteStageRequestTiming => {
+  if (state.submissionPhaseOpen) {
+    return 'AFTER_PRESS';
+  }
+  return submissionWindowOpenAtDecision ? 'AFTER_FILL' : 'BEFORE_FILL';
+};
+
+/**
+ * OP-M: 書き込みの段で止めた、承認した送信のほかの要求を一覧に記録する（Guard に付いた部品だけ。止め方と、ほかの記録は変えない）。本文は、行を作るとき
+ * だけ読む。
+ */
+function recordWriteStageUnexpectedRequest(
+  monitor: WriteStageMonitor,
+  request: { readonly method: string; readonly url: string; readonly resourceType: RequestResourceType; readonly body: () => RequestBodyText },
+  reason: string,
+  submissionWindowOpenAtDecision: boolean,
+): void {
+  const state = writeStageStateOf(monitor);
+  if (state.destinationOf === undefined) {
+    return;
+  }
+  state.unexpectedRequests.record({
+    ...request,
+    destination: state.destinationOf(request.url),
+    timing: writeStageTimingOf(state, submissionWindowOpenAtDecision),
+    reason,
+  });
 }
 
 /** 送信の段の種類（判定の口の名前と、止めた理由の種類 `LOGIN_STAGE`・`WRITE_STAGE`）。 */
@@ -1212,9 +1325,11 @@ class SubmissionPostAdmission {
     // 止まり、窓の中の止めた要求として数える（`unexpectedRequestCount`）。
     const admittable = this.monitor instanceof WriteStageMonitor && writeStageStateOf(this.monitor).submissionPhaseOpen ? remainingPosts : 0;
     const apiOrigin = this.#apiOrigin === undefined ? {} : { apiOrigin: this.#apiOrigin };
+    // OP-N（N2）: 送信の窓を一度でも開いたか（値を入れ始めた後）。開いた後は、監査の段の送信の扱いの口を使わない（OP-REV3 の C-2）。
+    const valuesEntered = this.monitor.hasSubmissionWindowOpened();
     return writeEndpoint === undefined
-      ? { writeStage: { writeEndpoint: { origin: '', path: '' }, remainingPosts: 0, submissionWindowOpen, ...apiOrigin } }
-      : { writeStage: { writeEndpoint, remainingPosts: admittable, submissionWindowOpen, ...apiOrigin } };
+      ? { writeStage: { writeEndpoint: { origin: '', path: '' }, remainingPosts: 0, submissionWindowOpen, valuesEntered, ...apiOrigin } }
+      : { writeStage: { writeEndpoint, remainingPosts: admittable, submissionWindowOpen, valuesEntered, ...apiOrigin } };
   }
 
   /** CDP の層の判定の口（残りの回数そのもの）。 */
@@ -1397,10 +1512,15 @@ class AuditSendAdmission {
   /** AS-c: 許可 Origin と承認したサービスの Origin（正規の形。通した要求がほかの Origin へのものかを見分けるため）。 */
   readonly #knownOrigins: ReadonlySet<string>;
   readonly #routeTickets = new RouteTicketBook();
+  /** OP-Q（Q1）: 書き込みの作業の中の Passive の Context の印の写し（承認した送信の送信先。なければ `undefined`）。 */
+  readonly #writeJobEndpoint: { readonly origin: string; readonly path: string } | undefined;
 
   constructor(send: GuardAuditSend, allowedOrigins: ReadonlySet<string>) {
     this.#approvedServiceOrigins = Object.freeze(send.approvedServiceOrigins.map((origin) => String(origin)));
     this.#dangerousTerms = Object.freeze(send.dangerousTerms.map((term) => String(term)));
+    this.#writeJobEndpoint = send.writeJobEndpoint === undefined
+      ? undefined
+      : Object.freeze({ origin: String(send.writeJobEndpoint.origin), path: String(send.writeJobEndpoint.path) });
     this.#remainingPasses = send.maxPassedPerContext ?? AUDIT_SEND_MAX_PASSED_PER_CONTEXT;
     this.#remainingWebSockets = send.maxWebSocketsPerContext ?? AUDIT_SEND_MAX_WEBSOCKETS_PER_CONTEXT;
     this.#knownOrigins = canonicalPassiveAllowedOrigins(new Set([...allowedOrigins, ...this.#approvedServiceOrigins]));
@@ -1421,8 +1541,18 @@ class AuditSendAdmission {
     return !hasAllowedOrigin(url, this.#knownOrigins);
   }
 
+  /** OP-Q（Q1）: 書き込みの作業の中の Passive の Context の口か（WebSocket と、ほかの Origin への事前確認の送り手を使わない）。 */
+  get forWriteJob(): boolean {
+    return this.#writeJobEndpoint !== undefined;
+  }
+
   #policyWith(remainingPasses: number): AuditSendPolicy {
-    return Object.freeze({ approvedServiceOrigins: this.#approvedServiceOrigins, dangerousTerms: this.#dangerousTerms, remainingPasses });
+    return Object.freeze({
+      approvedServiceOrigins: this.#approvedServiceOrigins,
+      dangerousTerms: this.#dangerousTerms,
+      remainingPasses,
+      ...(this.#writeJobEndpoint === undefined ? {} : { writeJobEndpoint: this.#writeJobEndpoint }),
+    });
   }
 
   /** CDP の層の判定の口（残りの数そのもの）。 */
@@ -4168,6 +4298,8 @@ interface BlockedRequestFacts {
   readonly speculative: boolean;
   /** T36R-fix（T36R の I-1）: 要求のヘッダ（自動ログインの資格情報の守りの比べだけに使う。記録しない）。 */
   readonly headers?: Readonly<Record<string, string>> | undefined;
+  /** OP-M: 要求の本文の読み方（書き込みの段の止めた要求の一覧の、目印の真偽だけに使う。本文は記録しない。省略は本文なし）。 */
+  readonly body?: (() => RequestBodyText) | undefined;
 }
 
 /**
@@ -4201,6 +4333,81 @@ function stageRecordingOf(
 
 /** T37R-fix-B（M-5）: 許可 Origin への、データを取る読み取りでない要求として数える要求の種類（計測の送信 `ping`・`beacon` などは数えない）。 */
 const AUDIT_STAGE_DATA_REQUEST_RESOURCE_TYPES: ReadonlySet<RequestResourceType> = new Set<RequestResourceType>(['fetch', 'xhr']);
+
+/**
+ * OP-M: 書き込みの段の Guard が止めた要求を、承認した送信のほかの要求の一覧に記録する（書き込みの段の記録でなければ何もしない）。理由は、送信の段の理由、
+ * 送る中身の照合の理由、ほかの判定の理由のどれか。
+ */
+function recordWriteStageBlockedFacts(stage: StageRecording, request: BlockedRequestFacts, reason: string): void {
+  if (!(stage.monitor instanceof WriteStageMonitor)) {
+    return;
+  }
+  recordWriteStageUnexpectedRequest(stage.monitor, {
+    method: request.method,
+    url: request.url,
+    resourceType: requestResourceTypeOf(request.resourceType),
+    body: request.body ?? ((): RequestBodyText => NO_BODY_TEXT),
+  }, reason, stage.submissionWindowOpenAtDecision);
+}
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1）: 書き込みの段の、値を入れた後（送信の窓の観察の段）に止めた要求のうち、取りやめに
+ * 数えないものか。読み取り（GET・HEAD）で、URL と本文に入れた値（目印）がないもの（照らしは `WriteStageUnexpectedRequestList.carriesMarker`。読めない本文は
+ * あるとみなす）。止めることは変えない。書き込みの段でない、窓の外、送信の段を開いた後、読み取りでない要求は偽。
+ */
+function toleratedInWriteWindow(
+  monitor: SubmissionStageMonitor,
+  submissionWindowOpenAtDecision: boolean,
+  request: { readonly method: string; readonly url: string; readonly body?: (() => RequestBodyText) | undefined },
+): boolean {
+  if (!(monitor instanceof WriteStageMonitor) || !submissionWindowOpenAtDecision || !isReadMethod(request.method)) {
+    return false;
+  }
+  const state = writeStageStateOf(monitor);
+  return !state.submissionPhaseOpen && !state.unexpectedRequests.carriesMarker({ url: request.url, body: request.body ?? ((): RequestBodyText => NO_BODY_TEXT) });
+}
+
+/** OP-N（N1）: 書き込みの段の、値を入れた後に止めた WebSocket（張り直し）のうち、URL に入れた値（目印）がなく、取りやめに数えないものか。 */
+function toleratedWebSocketInWriteWindow(monitor: SubmissionStageMonitor, url: string): boolean {
+  return toleratedInWriteWindow(monitor, monitor.isSubmissionWindowOpen(), { method: WEBSOCKET_HANDSHAKE_METHOD, url });
+}
+
+/**
+ * OP-N（N2）: 書き込みの段の Guard が、送信の扱いの口で通した要求を、通した一覧に記録する（書き込みの段でなければ何もしない）。時点は、値を入れる前だけ（窓を
+ * 開いた後は通さない。OP-REV3 の C-2）。本文は、行を作るときだけ読む。
+ */
+function recordWriteStagePassedRequest(
+  monitor: WriteStageMonitor,
+  request: { readonly method: string; readonly url: string; readonly resourceType: RequestResourceType; readonly body: () => RequestBodyText },
+): void {
+  const state = writeStageStateOf(monitor);
+  if (state.destinationOf === undefined) {
+    return;
+  }
+  state.passedRequests.record({
+    ...request,
+    destination: state.destinationOf(request.url),
+    timing: writeStageTimingOf(state, false),
+    reason: WRITE_STAGE_AUDIT_SEND_PASSED,
+  });
+}
+
+/** OP-M: WebSocket の始まりの要求の method と、要求の種類（一覧の行に書く）。 */
+const WEBSOCKET_HANDSHAKE_METHOD = 'GET';
+const WEBSOCKET_RESOURCE_TYPE: RequestResourceType = 'websocket';
+
+/** OP-M: 書き込みの段の Guard が止めた WebSocket を、承認した送信のほかの要求の一覧に記録する（書き込みの段の記録でなければ何もしない）。 */
+function recordWriteStageBlockedWebSocket(monitor: SubmissionStageMonitor | undefined, url: string, reason: string): void {
+  if (!(monitor instanceof WriteStageMonitor)) {
+    return;
+  }
+  recordWriteStageUnexpectedRequest(monitor, {
+    method: WEBSOCKET_HANDSHAKE_METHOD,
+    url,
+    resourceType: WEBSOCKET_RESOURCE_TYPE,
+    body: (): RequestBodyText => NO_BODY_TEXT,
+  }, reason, monitor.isSubmissionWindowOpen());
+}
 
 function recordBlockedDecision(
   ledger: SafetyLedger,
@@ -4269,14 +4476,17 @@ function recordBlockedDecision(
       ledger.recordInvariantViolation({ code: 'UNEXPECTED_HTTP_DECISION', message: `HTTP policy returned ${decision.category}` });
       return;
     }
-    stage.monitor.recordStageBlock(decision.reason);
+    stage.monitor.recordStageBlock(decision.reason, toleratedInWriteWindow(stage.monitor, stage.submissionWindowOpenAtDecision, request));
+    recordWriteStageBlockedFacts(stage, request, decision.reason);
     return;
   }
   if (stage?.payloadBlockReason !== undefined && stage.monitor instanceof WriteStageMonitor) {
     const state = writeStageStateOf(stage.monitor);
     state.blockedByPayloadReason[stage.payloadBlockReason] = saturatingIncrement(state.blockedByPayloadReason[stage.payloadBlockReason]);
+    recordWriteStageBlockedFacts(stage, request, stage.payloadBlockReason);
   } else {
-    stage?.monitor.recordOtherBlock(stage.submissionWindowOpenAtDecision);
+    stage?.monitor.recordOtherBlock(stage.submissionWindowOpenAtDecision, toleratedInWriteWindow(stage.monitor, stage.submissionWindowOpenAtDecision, request));
+    if (stage !== undefined) recordWriteStageBlockedFacts(stage, request, decision.reason);
   }
   if (decision.category === 'REQUEST' && decision.scriptLoginBlock !== undefined && stage?.monitor instanceof LoginStageMonitor) {
     // T34b: スクリプトで送るログインの段で止めた、読み取りでない要求を、詳しい理由ごとに数える（Safety Ledger には、今どおり `NON_READ_METHOD`）。
@@ -4628,12 +4838,23 @@ export async function installPassiveRequestGuard(
     || (options.writeStage !== undefined && (options.writeStage as Partial<GuardApiWriteStage>).transport !== API_SCENARIO_TRANSPORT))) {
     throw new TypeError('Passive request guard cannot combine the audit stage with the login stage or the form write stage');
   }
-  // AS-a: 監査の段の送信の扱いの指定は、形を確かめ、ログインの段と書き込みの段の指定と一緒には受けない（今の決まりのまま。factory は Passive の Context だけに渡す）。
+  // AS-a: 監査の段の送信の扱いの指定は、形を確かめ、ログインの段の指定と一緒には受けない（今の決まりのまま）。
+  // OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 書き込みの段の指定とは一緒に受ける（判定は要求の判定の owner の
+  // `writeStageAuditSendApplies`。WebSocket には使わない）。書き込みの段では、ほかの Origin への事前確認の送り手（`auditSendPreflight`）は受けない（書き込みの段は
+  // 許可 Origin と承認したサービスの Origin のほかへ送らないので、使わない）。
   if (options.auditSend !== undefined && !isGuardAuditSend(options.auditSend)) {
     throw new TypeError('Passive request guard audit send policy is malformed');
   }
-  if (options.auditSend !== undefined && (options.loginStage !== undefined || options.writeStage !== undefined)) {
-    throw new TypeError('Passive request guard cannot combine the audit send policy with the login stage or the write stage');
+  if (options.auditSend !== undefined && options.loginStage !== undefined) {
+    throw new TypeError('Passive request guard cannot combine the audit send policy with the login stage');
+  }
+  if (options.auditSendPreflight !== undefined && options.writeStage !== undefined) {
+    throw new TypeError('Passive request guard cannot combine the audit send preflight with the write stage');
+  }
+  // OP-Q（Q1）: 書き込みの作業の中の Passive の Context（印 `writeJobEndpoint`）も、ほかの Origin への事前確認の送り手を受けない（許可 Origin と承認したサービスの
+  // Origin のほかへ送らない）。
+  if (options.auditSendPreflight !== undefined && options.auditSend?.writeJobEndpoint !== undefined) {
+    throw new TypeError('Passive request guard cannot combine the audit send preflight with the write job audit send policy');
   }
   // T37b: 送らずに観察する probe の口は、ログインの段と書き込みの段の指定と一緒には受けない（factory は PRIMARY の Passive の Context だけに渡す）。
   if (options.submissionObservation !== undefined && (options.loginStage !== undefined || options.writeStage !== undefined)) {
@@ -4816,11 +5037,34 @@ export async function installPassiveRequestGuard(
   // route の層・CDP の層・`requestfailed` の判定のすべてに渡す。ない場合は、口を渡さない（今と同じ）。
   // AS-c の WebSocket の Blocker の判断 W1: 監査の段の送信の扱いの口がある Context（`PASS_EXCEPT_DELETE` の Passive の Context。Interaction・ログインの段・
   // 書き込みの段には口が渡らない）だけ、文書と http(s) の script の Worker の CSP に `ws:`・`wss:` を足す。ほかは今のまま（`WORKER_CONNECT_POLICY`）。
-  const connectPolicy = options.auditSend === undefined ? WORKER_CONNECT_POLICY : AUDIT_SEND_CONNECT_POLICY;
+  // OP-N: 書き込みの段は、送信の扱いの口があっても WebSocket を通さないので、今のまま（`WORKER_CONNECT_POLICY`）。
+  // OP-Q（Q1）: 書き込みの作業の中の Passive の Context（印 `writeJobEndpoint`）も、WebSocket を通さないので、今のまま。
+  const connectPolicy = options.auditSend === undefined || writeStage !== undefined || options.auditSend.writeJobEndpoint !== undefined
+    ? WORKER_CONNECT_POLICY
+    : AUDIT_SEND_CONNECT_POLICY;
   // AS-c: ほかの Origin の見分けには、許可 Origin と、口の承認したサービスの Origin と、監査の段の承認したサービスの Origin を使う。
   const auditSendAdmission = options.auditSend === undefined
     ? undefined
     : new AuditSendAdmission(options.auditSend, new Set([...authoritySnapshot, ...(options.auditStage?.approvedServiceOrigins ?? [])]));
+  /**
+   * OP-N（N2）: WebSocket に使う、送信の扱いの数え方（書き込みの段では持たない。値を入れる前に開いた接続は、値を入れた後も開いたままになり、Guard が送受信を
+   * 見ないため。WebSocket の判定・観察・記録は、今の書き込みの段のまま）。
+   */
+  // OP-Q（Q1）: 書き込みの作業の中の Passive の Context も持たない（WebSocket を通さない）。
+  const webSocketAuditSendAdmission = writeStage === undefined && auditSendAdmission?.forWriteJob !== true ? auditSendAdmission : undefined;
+
+  /** OP-N（N2）: CDP の層で、送信の扱いの口が通した要求を、書き込みの段の通した一覧に記録する（書き込みの段でなければ何もしない）。 */
+  const recordWriteStagePassedOf = (request: GuardRequestIdentity, event: PausedDocumentEvent): void => {
+    if (writeStage === undefined) {
+      return;
+    }
+    recordWriteStagePassedRequest(writeStage.monitor, {
+      method: request.method,
+      url: request.url,
+      resourceType: requestResourceTypeOf(event.resourceType),
+      body: () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
+    });
+  };
   /** CDP の層の判定の口。 */
   const cdpRequestPolicy = (): PassiveRequestPolicyOptions | undefined =>
     requestPolicyOf(submissionAdmission?.cdpStagePolicy(), auditExclusions, auditReadAdmission?.cdpPolicy(), auditSendAdmission?.cdpPolicy());
@@ -4897,7 +5141,7 @@ export async function installPassiveRequestGuard(
   };
   /** 観察した接続を、Safety Ledger の通した接続の記録に残す（止めない。Context も無効にしない）。 */
   const recordObservedWebSocket = ({ url }: ObservedWebSocket): void => {
-    if (auditSendAdmission === undefined) {
+    if (webSocketAuditSendAdmission === undefined) {
       return;
     }
     // AS-c fix round 2（I-C）: 締め切りの内の route の通過（同じ URL）があれば、いちばん古いものと照らす。
@@ -4910,7 +5154,7 @@ export async function installPassiveRequestGuard(
     } else {
       routeAdmittedWebSockets.delete(key);
     }
-    const policy = requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), auditSendAdmission.webSocketPolicy()) ?? {};
+    const policy = requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), webSocketAuditSendAdmission.webSocketPolicy()) ?? {};
     ledger.recordPassedAuditSendWebSocket({ url, outsideGuard: !matched, dangerous: isAuditSendDangerousWebSocket(url, policy) });
   };
   /**
@@ -5793,6 +6037,8 @@ export async function installPassiveRequestGuard(
                       phase: blockedEventPhaseOf(guardState.phase, page),
                       speculative: isSpeculativeRequestHeaders(event.request.headers),
                       headers: event.request.headers,
+                      // OP-M: 書き込みの段の止めた要求の一覧の、目印の真偽だけに使う（記録しない）。
+                      body: () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
                     },
                     stageRecordingOf(submissionAdmission, subresourcePolicy, apiPayloadBlockReason),
                     auditMonitor,
@@ -5825,7 +6071,9 @@ export async function installPassiveRequestGuard(
                 // Network の要求の ID（リダイレクトの間は同じ ID）も、リダイレクトの先の手がかりにする。
                 auditSendAdmission.admitWithoutRoute();
                 recordPassedAuditSendRequest(request.method, request.url);
+                recordWriteStagePassedOf(request, event);
               } else if (auditSendAdmission !== undefined && verdict.decision.auditSendAdmission === true) {
+                recordWriteStagePassedOf(request, event);
                 if (auditSendNetworkId !== null) {
                   rememberAuditSendNetworkId(auditSendNetworkId);
                 }
@@ -5855,7 +6103,13 @@ export async function installPassiveRequestGuard(
                 if (!isReadMethod(request.method)) {
                   submissionAdmission.recordManualPass(request.url, requestResourceTypeOf(event.resourceType), manualPass.reason);
                 }
-              } else if (submissionAdmission !== undefined && !isReadMethod(request.method) && auditStageAdmission === undefined) {
+              } else if (
+                submissionAdmission !== undefined
+                && !isReadMethod(request.method)
+                && auditStageAdmission === undefined
+                // OP-N（N2）: 書き込みの段で、送信の扱いの口が通した要求は、承認した送信の回数に数えず、送信の窓も閉じない（承認した 1 件だけを数える）。
+                && verdict.decision.auditSendAdmission !== true
+              ) {
                 submissionAdmission.admitAtCdp(request.method, request.url, !apiWrite, loginStageAdmission);
               } else if (loginStageAdmission?.kind === 'SERVICE_ORIGIN_READ' && submissionAdmission?.monitor instanceof LoginStageMonitor) {
                 const state = loginStageStateOf(submissionAdmission.monitor);
@@ -6138,6 +6392,8 @@ export async function installPassiveRequestGuard(
                     phase: blockedEventPhaseOf(guardState.phase, page),
                     speculative: isSpeculativeRequestHeaders(event.request.headers),
                     headers: event.request.headers,
+                    // OP-M: 書き込みの段の止めた要求の一覧の、目印の真偽だけに使う（記録しない）。
+                    body: () => requestBodyTextOf(event.request.hasPostData, event.request.postDataEntries),
                   }, stageRecordingOf(submissionAdmission, documentPolicy, payloadBlockReason), auditMonitor, countedServiceOrigins, authoritySnapshot);
                 } catch (error) {
                   if (expectedFailure !== undefined) {
@@ -6474,7 +6730,13 @@ export async function installPassiveRequestGuard(
           } else if (phase === 'PASSIVE_ACTIVE') {
             // BN-a: 止めた時点（ページを離れた後なら `CLOSING`）。
             ledger.recordBlockedWebSocket({ url, reason: WORKER_CONNECT_POLICY_REASON, phase: blockedEventPhaseOf(phase, page) });
-            submissionAdmission?.monitor.recordOtherBlock(submissionAdmission.monitor.isSubmissionWindowOpen());
+            // OP-N（N1）: 書き込みの段の、値を入れた後の目印のない WebSocket は、止めたまま、予期しない要求の数に数えない。
+            submissionAdmission?.monitor.recordOtherBlock(
+              submissionAdmission.monitor.isSubmissionWindowOpen(),
+              toleratedWebSocketInWriteWindow(submissionAdmission.monitor, url),
+            );
+            // OP-M: 書き込みの段なら、止めた要求の一覧にも記録する（本文はない）。
+            recordWriteStageBlockedWebSocket(submissionAdmission?.monitor, url, WORKER_CONNECT_POLICY_REASON);
           }
         };
         session.on('Log.entryAdded', onLogEntryAdded);
@@ -6502,7 +6764,7 @@ export async function installPassiveRequestGuard(
         await recordSettledExternalNavigations(session);
         // AS-c fix round 1（C-1・C-2）: 監査の段の送信の扱いの口がある Context だけ、ブラウザが開く WebSocket の接続を観察する（page の準備の前に付け、最初の
         // 読み込みの接続から観察する。付けられなくても、page の準備は失敗にしない）。
-        if (auditSendAdmission !== undefined) {
+        if (webSocketAuditSendAdmission !== undefined) {
           await observeAuditSendWebSockets(page, listenerGroup);
         }
         const guard = { session, rootFrameId, awaitMainFrameCancellation: pageInterception.awaitMainFrameCancellation };
@@ -6592,6 +6854,23 @@ export async function installPassiveRequestGuard(
       } catch {
         // 読めなかった（値を持たない。承認の POST は止まる）。
       }
+    };
+    // OP-M: 止めた、承認した送信のほかの要求の一覧。目印は、この段で入れる生成した値（API は鍵ごとの値、form は送る欄の値）。送り先の区分は、許可 Origin
+    // （テスト環境）→ 承認したサービスの Origin（監査の段の承認したサービスの Origin と、承認した API の Origin）→ 許可の外、の順に決める。
+    const writeStageState = writeStageStateOf(writeStage.monitor);
+    const writeStageMarkers = writeStage.transport === API_SCENARIO_TRANSPORT
+      ? Object.values(writeStage.expectation.values).filter((value): value is string => value !== null)
+      : writeStage.expectation.submittedFields.map(({ value }) => value);
+    writeStageState.unexpectedRequests = new WriteStageUnexpectedRequestList(writeStageMarkers);
+    // OP-N（N2）: 送信の扱いの口で通した要求の一覧（同じ目印。通すのは値を入れる前だけ）。
+    writeStageState.passedRequests = new WriteStageUnexpectedRequestList(writeStageMarkers);
+    const writeStageServiceOrigins: ReadonlySet<string> = new Set([
+      ...countedServiceOrigins,
+      ...(writeStage.transport === API_SCENARIO_TRANSPORT ? [writeStage.expectation.spec.request.origin] : []),
+    ]);
+    writeStageState.destinationOf = (url: string): WriteStageRequestDestination => {
+      if (hasAllowedOrigin(url, authoritySnapshot)) return 'TEST_ORIGIN';
+      return hasAllowedOrigin(url, writeStageServiceOrigins) ? 'APPROVED_SERVICE_ORIGIN' : 'OUTSIDE_ALLOWED_ORIGINS';
     };
   }
 
@@ -7016,14 +7295,15 @@ export async function installPassiveRequestGuard(
         }
         // AS-c: 監査の段の送信の扱いの口があれば、WebSocket の残りの数つきの口で判定する（監査の段の口と除外の口も渡す。送信の段の口は渡さない。
         // 送信の段と一緒の口は、Guard の取り付けで拒んである）。口がなければ、今の判定（`PASSIVE_WEBSOCKET`）。
-        const webSocketPolicy = auditSendAdmission === undefined
+        // OP-N: 書き込みの段では、送信の扱いの口を WebSocket に使わない（`webSocketAuditSendAdmission`）。
+        const webSocketPolicy = webSocketAuditSendAdmission === undefined
           ? undefined
-          : requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), auditSendAdmission.webSocketPolicy());
+          : requestPolicyOf(undefined, auditExclusions, auditReadAdmission?.cdpPolicy(), webSocketAuditSendAdmission.webSocketPolicy());
         const decision = classifyPassiveRequest({ kind: 'WEBSOCKET', url: webSocketRoute.url() }, authoritySnapshot, webSocketPolicy);
-        if (decision.action === 'ALLOW' && decision.auditSendWebSocketAdmission === true && auditSendAdmission !== undefined) {
+        if (decision.action === 'ALLOW' && decision.auditSendWebSocketAdmission === true && webSocketAuditSendAdmission !== undefined) {
           // 数えてから、ページの接続をサーバへつなぐ（以後の送受信は、ページとサーバの間でそのまま渡す。記録しない）。接続は出口の中継を通る。
           // AS-c fix round 1（C-1・C-2）: 記録は、ブラウザが実際に開いた接続の観察（`recordObservedWebSocket`）で残す。ここでは、route が通したことだけを残す。
-          auditSendAdmission.admitWebSocket();
+          webSocketAuditSendAdmission.admitWebSocket();
           // DEF-125: 出口の中継に、この接続の宛先を知らせる（Chromium は ws(s) を中継の CONNECT で通す。知らせのない宛先は中継が拒む）。
           if (egressDestinationHook !== undefined) {
             try {
@@ -7061,8 +7341,14 @@ export async function installPassiveRequestGuard(
         }
         // BN-a: 止めた時点。WebSocket の route は page を持たないので、Guard の段階だけで決める（ここは `PASSIVE_ACTIVE` なので `LOAD`）。
         ledger.recordBlockedWebSocket({ url: webSocketRoute.url(), reason: decision.reason, phase: blockedEventPhaseOf(phase, null) });
-        // T26g-1: 送信の窓の中の WebSocket も、予期しない要求として数える。
-        submissionAdmission?.monitor.recordOtherBlock(submissionAdmission.monitor.isSubmissionWindowOpen());
+        // T26g-1: 送信の窓の中の WebSocket も、予期しない要求として数える。OP-N（N1）: 書き込みの段の、値を入れた後の目印のない WebSocket（張り直し）は、止めた
+        // まま、予期しない要求の数に数えない。
+        submissionAdmission?.monitor.recordOtherBlock(
+          submissionAdmission.monitor.isSubmissionWindowOpen(),
+          toleratedWebSocketInWriteWindow(submissionAdmission.monitor, webSocketRoute.url()),
+        );
+        // OP-M: 書き込みの段なら、止めた要求の一覧にも記録する（本文はない）。
+        recordWriteStageBlockedWebSocket(submissionAdmission?.monitor, webSocketRoute.url(), decision.reason);
         try {
           await webSocketRoute.close({ code: 1008, reason: decision.reason });
         } catch (error) {
@@ -7162,6 +7448,8 @@ export async function installPassiveRequestGuard(
             phase: blockedEventPhaseOf(guardState.phase, requestPageForPhase(request)),
             speculative: isSpeculativeRequestHeaders(requestSentContentOf(request).headers),
             headers: routeHeaders,
+            // OP-M: 書き込みの段の止めた要求の一覧の、目印の真偽だけに使う（記録しない）。
+            body: () => requestBodyTextOfBuffer(request.postDataBuffer()),
           }, stageRecordingOf(submissionAdmission, routePolicy), auditMonitor, countedServiceOrigins, authoritySnapshot);
           return;
         }

@@ -34,11 +34,12 @@ const RULE_VERSION = 1;
  * 観測できなかった指標（`NOT_OBSERVED`・`UNSUPPORTED`）と、Web Vitals を収集できなかった Evidence からは、Finding を作らない。
  * 収集が `PARTIAL` でも、観測できた値は判定に使う。
  */
-const poorWebVitalRule = (ruleId: string, metric: WebVitalName): AuditRule => ({
+const poorWebVitalRule = (ruleId: string, metric: WebVitalName, plainMessage: string): AuditRule => ({
   ruleId,
   version: RULE_VERSION,
   category: 'PERFORMANCE',
   severity: 'WARN',
+  plainMessage,
   evaluate(input: PageRuleInput): readonly FindingDraft[] {
     const threshold = POOR_WEB_VITAL_THRESHOLDS[metric];
     const format = WEB_VITAL_FORMATS[metric];
@@ -65,9 +66,9 @@ const poorWebVitalRule = (ruleId: string, metric: WebVitalName): AuditRule => ({
 
 /** 性能の page rule（T12c）の一覧。登録は `RULE_CATALOG`（`./rule-catalog.ts`）がまとめて行う。 */
 export const PERFORMANCE_RULES: readonly AuditRule[] = Object.freeze([
-  poorWebVitalRule('POOR_LCP', 'LCP'),
-  poorWebVitalRule('POOR_FCP', 'FCP'),
-  poorWebVitalRule('POOR_CLS', 'CLS'),
-  poorWebVitalRule('POOR_TTFB', 'TTFB'),
-  poorWebVitalRule('POOR_INP', 'INP'),
+  poorWebVitalRule('POOR_LCP', 'LCP', 'ページのいちばん大きな中身が出るまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_FCP', 'FCP', 'ページを開いてから、最初に何かが表示されるまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_CLS', 'CLS', '表示の途中で、ページの部品が大きく動きます。読みにくかったり、押しまちがえたりすることがあります。'),
+  poorWebVitalRule('POOR_TTFB', 'TTFB', 'ページを開いてから、サイトが返事をするまでに、時間がかかりすぎています。見る人が、待たされます。'),
+  poorWebVitalRule('POOR_INP', 'INP', 'ボタンなどを押してから、画面が変わるまでに、時間がかかりすぎています。見る人が、うまく動かないと感じることがあります。'),
 ]);

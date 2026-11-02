@@ -393,7 +393,7 @@ describe('T40a・T40b-1: an API CREATE scenario from the formless member screen 
       candidate: { identityDigest: scenario?.candidate.identityDigest },
       submitterIdentityDigest: scenario?.candidate.identityDigest,
       api: scenario?.api,
-      verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+      verification: { resultJudgement: null, recordId: null },
       readVerification: {
         readCheckId: READ_CHECK_ID,
         targetPage: { origin: site.appOrigin, path: API_WRITE_READ_TEMPLATE_PATH },
@@ -442,7 +442,7 @@ describe('T40a・T40b-1: an API CREATE scenario from the formless member screen 
     expect(await validateArtifact('action-run', actionRun)).toEqual({ ok: true });
     if (scenario?.api === undefined) throw new Error('the scenario has no API specification');
     expect(actionRun).toMatchObject({
-      schemaVersion: 'action-run-schema/1.1', transport: 'API', resultConditions: null, api: actionApiSummaryOf(scenario.api, {}),
+      schemaVersion: 'action-run-schema/1.2', transport: 'API', resultJudgement: null, api: actionApiSummaryOf(scenario.api, {}),
       submittedValues: write['values'], recordId: result?.recordId,
       readVerification: { readCheckId: READ_CHECK_ID, result: 'MATCHED' }, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED',
     });

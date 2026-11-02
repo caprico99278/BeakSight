@@ -12,6 +12,7 @@ import {
   type ReadCheckPageContext,
 } from '../../src/control/read-check-policy.js';
 import {
+  readListPagePathOf,
   READ_CHECK_PAGE_TEMPLATE_SAMPLE_ID,
   isReadCheckPageTemplatePath,
   readCheckPageTemplateUrlOf,
@@ -92,5 +93,20 @@ describe('T38c: the verification READ of a page path template at the write start
     expect(readVerificationTargetRejectionOf(page('/admin/members/1'), 'FORM')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
     expect(readVerificationTargetRejectionOf(candidate, 'FORM')).toBeNull();
     expect(readVerificationTargetRejectionOf(candidate, 'API')).toBeNull();
+  });
+});
+
+// OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1・R2）: 一覧の画面は、登録の画面の path の 1 つ上（唯一の判定 `readListPagePathOf`）。
+describe('OP-R: the list page path one above the create page', () => {
+  it.each([
+    ['/admin/members/new', '/admin/members'],
+    ['/admin/members/new/', '/admin/members'],
+    ['/admin/x/create', '/admin/x'],
+  ])('takes the list page of %s', (createPath, listPath) => {
+    expect(readListPagePathOf(createPath)).toBe(listPath);
+  });
+
+  it.each(['/new', '/', '', 'admin/members/new', '/admin/members/12', '/admin/{id}/new'])('has no list page for %j', (createPath) => {
+    expect(readListPagePathOf(createPath)).toBeNull();
   });
 });

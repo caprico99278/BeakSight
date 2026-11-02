@@ -10,6 +10,8 @@
 //   NO_CONDITION_MATCHED。ID がない・安全でない 2xx は `actionOutcomeOf` が成功と偽らない。閉じた一覧は増やさない。
 // - 親の照らし合わせ（`actionRunMatchesWriteStart`）: 記録の送り方と API の要約が、`START` の API の指定（承認したもの）と同じか。
 // - 手書きの確かめの誤りの文に、値と名前を入れない。報告の確かめは、記録と証拠の送り方と要約が同じことも照らす。表示は 1.1 でも壊れない。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (d)）: 書き手は版 1.2（成否の条件 `resultConditions` の代わりに結果の判定のしかたの
+//   印 `resultJudgement`。FORM は `FORM_STRUCTURE`、API は null）を書き、読み手は 1.1（前の成果物）と 1.2 の両方を受ける。
 // 値は匿名の合成のテストデータだけ。
 import { describe, expect, it } from 'vitest';
 import {
@@ -86,13 +88,22 @@ const formRun = (overrides: Partial<ActionRunDocument> = {}): ActionRunDocument 
 const apiEvidence = (overrides: Partial<ActionEvidenceDocument> = {}): ActionEvidenceDocument =>
   ({ ...verifiedApiCreateDocuments().evidence, ...overrides });
 const without = (value: object, key: string): unknown => Object.fromEntries(Object.entries(value).filter(([name]) => name !== key));
+/** PL-6a: 前の版 1.1 の書き手の形（結果の判定のしかたの印の代わりに成否の条件。FORM は見本の条件、API は null）。今の読み手が受けることを確かめる。 */
+const LEGACY_CONDITIONS = Object.freeze({
+  successCondition: { pathPrefix: '/members/', selector: '.registered' }, inputErrorCondition: { pathPrefix: '/members/new', selector: null },
+});
+const version11Of = (document: ActionRunDocument): unknown => ({
+  ...Object.fromEntries(Object.entries(document).filter(([name]) => name !== 'resultJudgement')),
+  schemaVersion: 'action-run-schema/1.1',
+  resultConditions: document.transport === 'API' ? null : LEGACY_CONDITIONS,
+});
 /** LG-4: 前の版 1.0 の書き手の形（送り方と API の要約の項目を除き、版の印を 1.0 にする）。今の読み手が受けないことを確かめるためだけに使う。 */
 const version10Of = (document: object, schemaVersion: string): unknown =>
   ({ ...Object.fromEntries(Object.entries(document).filter(([name]) => name !== 'transport' && name !== 'api')), schemaVersion });
 
 describe('T40c: the version 1.1 of the write record and report (contracts and schemas)', () => {
-  it('writes 1.1 and keeps the artifact ids', () => {
-    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.1');
+  it('writes 1.2 (PL-6a) and keeps the artifact ids', () => {
+    expect(ACTION_RUN_SCHEMA_VERSION).toBe('action-run-schema/1.2');
     expect(ACTION_EVIDENCE_SCHEMA_VERSION).toBe('action-evidence-schema/1.1');
     // 成果物の id は変えない（版は `schemaVersion` で分ける。`read-evidence` と同じ作り）。
     expect(runSchema.$id).toBe('urn:beaksight:schema:action-run:1.0');
@@ -111,7 +122,11 @@ describe('T40c: the version 1.1 of the write record and report (contracts and sc
   });
 
   it.each<readonly [string, unknown]>([
-    ['a FORM run of 1.1', formRun()],
+    ['a FORM run of 1.2', formRun()],
+    // PL-6a: 前の成果物（版 1.1。成否の条件を持つ）も受ける。
+    ['a FORM run of 1.1 written before', version11Of(formRun())],
+    ['a blocked FORM run of 1.1 written before', version11Of(blockedDocuments().actionRun)],
+    ['an API run of 1.1 written before', version11Of(apiRun())],
     ['a blocked FORM run of 1.1', blockedDocuments().actionRun],
     ['an UPDATE run of 1.1', verifiedUpdateDocuments().actionRun],
     ['a verified API run', apiRun()],
@@ -127,13 +142,20 @@ describe('T40c: the version 1.1 of the write record and report (contracts and sc
   });
 
   it.each<readonly [string, unknown]>([
-    ['an unknown version', formRun({ schemaVersion: 'action-run-schema/1.2' as never })],
+    ['an unknown version', formRun({ schemaVersion: 'action-run-schema/1.3' as never })],
+    // PL-6a: 版 1.1 は成否の条件を持ち、印を持たない。版 1.2 は印を持ち、成否の条件を持たない。
+    ['a 1.1 run with the result judgement', { ...(version11Of(formRun()) as object), resultJudgement: 'FORM_STRUCTURE' }],
+    ['a 1.1 run without the result conditions', without(version11Of(formRun()) as object, 'resultConditions')],
+    ['a 1.2 run with the result conditions', { ...formRun(), resultConditions: LEGACY_CONDITIONS }],
+    ['a 1.2 run without the result judgement', without(formRun(), 'resultJudgement')],
     ['a 1.1 run without the transport', without(formRun(), 'transport')],
     ['a 1.1 run without the API summary', without(formRun(), 'api')],
     ['an unknown transport', formRun({ transport: 'GRAPHQL' as never })],
     ['a FORM run with an API summary', formRun({ api: sampleApiSummary() })],
-    ['a FORM run without the result conditions', formRun({ resultConditions: null })],
-    ['an API run with the result conditions', apiRun({ resultConditions: formRun().resultConditions })],
+    ['a FORM run without the result judgement of a form', formRun({ resultJudgement: null })],
+    ['an API run with the result judgement of a form', apiRun({ resultJudgement: 'FORM_STRUCTURE' })],
+    ['a FORM run of 1.1 without the result conditions', { ...(version11Of(formRun()) as object), resultConditions: null }],
+    ['an API run of 1.1 with the result conditions', { ...(version11Of(apiRun()) as object), resultConditions: LEGACY_CONDITIONS }],
     ['an API run without the API summary', apiRun({ api: null })],
     // LG-4: 前の版 1.0 は読まない（1.0 の書き手の形も、今の形に 1.0 の印を付けたものも）。
     ['a FORM run of the previous version 1.0', version10Of(formRun(), 'action-run-schema/1.0')],
@@ -268,13 +290,18 @@ describe('T40c: the hand-written checks (actionRunRuleErrors)', () => {
   it('has no error for the samples', () => {
     for (const documents of [verifiedCreateDocuments(), blockedDocuments(), verifiedUpdateDocuments(), verifiedApiCreateDocuments(), blockedApiDocuments()]) {
       expect(actionRunRuleErrors(documents.actionRun)).toEqual([]);
+      // PL-6a: 前の成果物（版 1.1）も、手書きの確かめを通る。
+      expect(actionRunRuleErrors(version11Of(documents.actionRun) as ActionRunDocument)).toEqual([]);
     }
   });
 
   it.each<readonly [string, unknown]>([
     ['a FORM run with an API summary', formRun({ api: sampleApiSummary() })],
-    ['a FORM run without the result conditions', formRun({ resultConditions: null })],
-    ['an API run with the result conditions', apiRun({ resultConditions: formRun().resultConditions })],
+    ['a FORM run without the result judgement of a form', formRun({ resultJudgement: null })],
+    ['an API run with the result judgement of a form', apiRun({ resultJudgement: 'FORM_STRUCTURE' })],
+    ['a 1.2 run with the result conditions', { ...formRun(), resultConditions: LEGACY_CONDITIONS }],
+    ['a FORM run of 1.1 without the result conditions', { ...(version11Of(formRun()) as object), resultConditions: null }],
+    ['an API run of 1.1 with the result conditions', { ...(version11Of(apiRun()) as object), resultConditions: LEGACY_CONDITIONS }],
     ['an API run without the summary', apiRun({ api: null })],
     ['a 1.1 run without the transport', without(formRun(), 'transport')],
     ['a blocked API run with page key values', { ...blockedApiDocuments().actionRun, api: sampleApiSummary() }],

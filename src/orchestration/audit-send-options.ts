@@ -1,7 +1,8 @@
 // 監査の段の送信の扱いの、factory の口（`BrowserContextFactoryOptions.auditSend`）の組み立ての唯一の場所（AS-b。設計書
 // `doc/design/2026-10-19-beaksight-audit-send-policy-design.md` 2.1・2.2、5 章の AS-b の Blocker の行の (1)）。
 // - Run Coordinator（CLI の監査とワーカーの監査。公開と認証つき）、発見のジョブ、READ の確かめのジョブが、Passive Context を作る factory に渡す指定を
-//   ここで作る。書き込みの段とログインの段の流れは使わない（口を渡さない）。
+//   ここで作る。OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）・OP-REV3（C-1）: 書き込みのジョブも、同じ組み立てで作った口を、書き込みの段の
+//   Context だけに渡す（factory の `writeStageAuditSend`。送る前の確かめの Passive の Context には渡さない）。ログインの段の流れは使わない（口を渡さない）。
 // - 実効の設定の扱いが `PASS_EXCEPT_DELETE` のときだけ口を作る。`READ_ONLY` と、項目のない設定（`READ_ONLY` と読む）は口を作らない（今のまま読み取りだけ）。
 // - 承認したサービスの Origin は呼び出し側が渡す（認証つきならプロファイルの承認したサービスの Origin（`approvedTestOrigins`）、公開の監査なら空）。
 // - 危険な語は既定の危険な語（`DEFAULT_EXCLUDED_URL_WORDS`。監査の段の除外と同じ一覧）に、送信の扱いだけの語（`AUDIT_SEND_EXTRA_DANGEROUS_TERMS`）を

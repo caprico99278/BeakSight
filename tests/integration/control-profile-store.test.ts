@@ -183,6 +183,8 @@ describe('Control store version 1 tables (design 4.3)', () => {
       'PROFILE_REVISION_CONFLICT',
       'PROFILE_REVISION_NOT_ADVANCED',
       'STORED_PROFILE_INVALID',
+      // MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 3）: 自動ログインのプロファイルの送信先の変更（`credential-destination-lock.test.ts`）。
+      'CREDENTIAL_DESTINATION_LOCKED',
     ] satisfies readonly ProfileStoreRejectionReason[]);
     for (const list of [PROFILE_STATUSES, PROFILE_CHANGE_KINDS, PROFILE_STORE_REJECTION_REASONS]) {
       expect(Object.isFrozen(list)).toBe(true);

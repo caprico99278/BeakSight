@@ -1,13 +1,12 @@
 /**
  * AS-b（設計書 `doc/design/2026-10-19-beaksight-audit-send-policy-design.md` 2.1・2.3、受け入れ条件 5）: プロファイルの画面の、監査の段の送信の扱いの設定と、
  * ジョブの画面の、通したことの知らせを、ビルドした画面のサーバ（一時の root）と headless の Chromium で確かめる。
- * - 設定は表示の設定と同じ欄（`DisplaySettingsPanel`。承認に結ばれるプロファイルの改訂の外）。既定は読み取りだけ。通す側へ切り替えるときは確認のダイアログ
+ * - 設定は表示の設定と同じ欄（`DisplaySettingsPanel`。承認に結ばれるプロファイルの改訂の外）。既定は削除のほかを通す（OP-I の I1）。通す側へ切り替えるときは確認のダイアログ
  *   （やめると切り替わらない）。保存してもプロファイルの改訂は変わらない。読み取りだけへ戻すときはダイアログを出さない。
  *   FM-3: 専用の保存のボタンはない。通す側へは、確認のダイアログで「通す」を選んだ時点で保存する（「やめる」なら保存の要求を送らない）。読み取りだけへは、
  *   切り替えた時点で保存する。保存できなければ、チェックを元の値に戻し、誤りを出す。
- * - ジョブの画面: 終わった監査のジョブの `run.json` の `safety.auditSend` が `PASS_EXCEPT_DELETE` なら、「この監査では、ページが出す送信のうち削除のほかを通した
- *   （N 件）」を目立つ形で出す。読み取りだけの Run と、項目のない古い Run には出さない。文言と出すかどうかは表示カタログ（同じ部品を報告と共用する）。
- * - 通した要求の path（値に見える区切りは伏せたもの）と、目印の値は、画面に出さない（数だけ）。
+ * - ジョブの画面: OP-U から、通したことの知らせを出さない（`PASS_EXCEPT_DELETE`・読み取りだけ・項目のない古い Run のどれも）。通した数は `run.json` と報告に残す。
+ * - 通した要求の path（値に見える区切りは伏せたもの）と、目印の値は、画面に出さない。
  * ジョブの行と成果物は、テストだけの操作で書く（ワーカーは起動しない。サイトへは接続しない）。値は匿名（ループバック）。
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -36,6 +35,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, isServerFunctionUrlOf, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -165,17 +165,34 @@ afterAll(async () => {
 });
 
 describe('AS-b: the audit send policy of a profile', () => {
-  it('is READ_ONLY by default, asks before switching to PASS_EXCEPT_DELETE and saves on the confirm only, keeps the revision, and goes back (saved on the switch) without a dialog', async () => {
+  // OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: サイトの既定は「削除のほかを通す」。読み取りだけは、人が詳しい内容で選んだときだけ。
+  // 既定になったので、要点の「守りを緩めています」の印は、どちらの扱いでも出さない（作業の画面の知らせは下の describe で残す）。
+  it('is PASS_EXCEPT_DELETE by default without the relaxed mark, goes to READ_ONLY (saved on the switch) without a dialog, asks before switching back and saves on the confirm only, and keeps the revision', async () => {
     const before = await profileRevision();
-    expect(await storedPolicy()).toBe('READ_ONLY');
+    expect(await storedPolicy()).toBe('PASS_EXCEPT_DELETE');
     const page = await openPage(`/profiles/${PROFILE_ID}`);
     const saveRequests = recordSaveRequests(page);
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 表示の設定の欄は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
     const panel = page.getByTestId('profile-display-settings');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     // FM-3: 欄に専用の保存のボタンはない。
     expect(await panel.getByRole('button').count()).toBe(0);
     const toggle = panel.getByRole('checkbox', { name: text.auditSendPassExceptDelete });
+    expect(await toggle.isChecked()).toBe(true);
+    expect(await page.getByTestId('profile-summary').count()).toBe(1);
+    expect(await page.getByTestId('profile-audit-send-relaxed').count()).toBe(0);
+
+    // 読み取りだけへは、ダイアログを出さず、切り替えた時点で保存される（人が選んだ読み取りだけ）。
+    await toggle.click();
+    expect(await page.getByRole('dialog', { name: text.auditSendDialogTitle }).isVisible()).toBe(false);
+    await panel.getByTestId('profile-display-settings-saved').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await toggle.isChecked()).toBe(false);
+    expect(saveRequests).toEqual(['POST']);
+    saveRequests.length = 0;
+    expect(await storedPolicy()).toBe('READ_ONLY');
+    expect(await profileRevision()).toBe(before);
+    expect(await page.getByTestId('profile-audit-send-relaxed').count()).toBe(0);
 
     // やめると、切り替わらず、保存の要求を送らない。
     await toggle.click();
@@ -203,10 +220,14 @@ describe('AS-b: the audit send policy of a profile', () => {
 
     const again = await openPage(`/profiles/${PROFILE_ID}`);
     const againSaveRequests = recordSaveRequests(again);
+    await openProfileAdvancedSettings(again, UI_TIMEOUT_MS);
     const reloaded = again.getByTestId('profile-display-settings');
     await reloaded.waitFor({ timeout: UI_TIMEOUT_MS });
     const reloadedToggle = reloaded.getByRole('checkbox', { name: text.auditSendPassExceptDelete });
     expect(await reloadedToggle.isChecked()).toBe(true);
+    // OP-I（I1）: 通す側は既定なので、開き直しても、要点に守りを緩めている印は出さない。
+    expect(await again.getByTestId('profile-summary').count()).toBe(1);
+    expect(await again.getByTestId('profile-audit-send-relaxed').count()).toBe(0);
     await screenshot(again, 'asb-11-pass-except-delete');
 
     // 読み取りだけへ戻すときは、ダイアログを出さず、切り替えた時点で保存される。
@@ -217,11 +238,14 @@ describe('AS-b: the audit send policy of a profile', () => {
     expect(againSaveRequests).toEqual(['POST']);
     expect(await storedPolicy()).toBe('READ_ONLY');
     expect(await profileRevision()).toBe(before);
+    expect(await again.getByTestId('profile-audit-send-relaxed').count()).toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 
   it('puts the switch back to READ_ONLY and shows the error when the save after the confirm fails', async () => {
     expect(await storedPolicy()).toBe('READ_ONLY');
     const page = await openPage(`/profiles/${PROFILE_ID}`);
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: この欄は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
     const panel = page.getByTestId('profile-display-settings');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     const toggle = panel.getByRole('checkbox', { name: text.auditSendPassExceptDelete });
@@ -259,28 +283,25 @@ describe('AS-b: the audit send policy of a profile', () => {
   });
 });
 
-describe('AS-b: the notice of the passed sends on the job screen', () => {
-  it('shows the notice with the number for a PASS_EXCEPT_DELETE audit, and nothing for READ_ONLY and an old Run', async () => {
-    const passed = await openPage('/jobs/job-asb-passed');
-    const notice = passed.getByTestId('job-audit-send-notice');
-    await notice.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await notice.textContent()).toContain(AUDIT_SEND_TEXT.passedNotice(formatCount(PASSED_REQUESTS)));
-    expect(await notice.getAttribute('data-policy')).toBe('PASS_EXCEPT_DELETE');
-    // AS-c: 内訳（ほかの Origin への送信と、WebSocket の接続）。
-    expect(await passed.getByTestId('job-audit-send-detail').textContent())
-      .toBe(AUDIT_SEND_TEXT.passedDetail(formatCount(PASSED_OTHER_ORIGIN_REQUESTS), formatCount(PASSED_WEB_SOCKETS)));
-    // AS-c fix round 1: Guard の判定を通らずに開いた接続と、危険な語の接続の知らせ。
-    expect(await passed.getByTestId('job-audit-send-websocket-caution').textContent())
-      .toBe(AUDIT_SEND_TEXT.webSocketCaution(formatCount(PASSED_WEB_SOCKETS_OUTSIDE_GUARD), formatCount(PASSED_DANGEROUS_WEB_SOCKETS)));
-    expect(await passed.content()).not.toContain(MARKER);
-    await screenshot(passed, 'asb-20-job-notice');
-    for (const jobId of ['job-asb-read-only', 'job-asb-old']) {
+// OP-U（設計者の判断の 2）: 作業の画面には、通したことの知らせを出さない（どの扱いでも）。通した数と送り先は成果物（`run.json` の `safety.auditSend`）と報告に残す。
+describe('AS-b: the job screen does not show the passed sends', () => {
+  it('shows no notice, no number and no marker for a PASS_EXCEPT_DELETE audit, a READ_ONLY audit and an old Run', async () => {
+    for (const jobId of ['job-asb-passed', 'job-asb-read-only', 'job-asb-old']) {
       const page = await openPage(`/jobs/${jobId}`);
-      await page.getByTestId('job-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+      // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 要点は結果の 1 行（前の表は、たたんだ詳しい内容の中）。
+      await page.getByTestId('job-result').waitFor({ timeout: UI_TIMEOUT_MS });
       await page.getByTestId('job-run-status').waitFor({ timeout: UI_TIMEOUT_MS });
-      expect(await page.getByTestId('job-audit-send-notice').count(), jobId).toBe(0);
-      expect(await page.getByTestId('job-audit-send-websocket-caution').count(), jobId).toBe(0);
-      expect(await page.content(), jobId).not.toContain(NOTICE_PREFIX);
+      for (const testId of ['job-audit-send-notice', 'job-audit-send-detail', 'job-audit-send-websocket-caution']) {
+        expect(await page.getByTestId(testId).count(), `${jobId} ${testId}`).toBe(0);
+      }
+      const content = await page.content();
+      expect(content, jobId).not.toContain(NOTICE_PREFIX);
+      expect(content, jobId).not.toContain(AUDIT_SEND_TEXT.passedNotice(formatCount(PASSED_REQUESTS)));
+      expect(content, jobId).not.toContain(AUDIT_SEND_TEXT.jobNotice);
+      expect(content, jobId).not.toContain(MARKER);
+      if (jobId === 'job-asb-passed') {
+        await screenshot(page, 'asb-20-job-without-notice');
+      }
     }
   }, SCENARIO_TIMEOUT_MS);
 });

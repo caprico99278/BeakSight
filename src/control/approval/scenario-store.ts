@@ -71,6 +71,7 @@ import type { ControlDatabase } from '../store/control-database.js';
 import { RETIRED_PROFILE_STATUS } from '../store/profile-records.js';
 import { getProfile } from '../store/profile-store.js';
 import type { SqliteConnection } from '../store/sqlite-module.js';
+import { discoveryProfileRevisionsIn } from './discovery-profile-freshness.js';
 import { withReadTransaction, withWriteTransaction } from '../store/transaction.js';
 import { approvalBoundFactsOf, computeApprovalDigest } from './approval-digest.js';
 import {
@@ -117,6 +118,7 @@ import {
   revisionViewOf,
   scenarioRowOf,
   scenarioViewOf,
+  verificationOnlyReadCheckIdsIn,
   writeFamilyScenarioIdsIn,
   type ApprovalExternalFacts,
   type DiscoverySnapshot,
@@ -148,7 +150,7 @@ import {
   type ScenarioContent,
   type ScenarioKind,
   type ScenarioKindFact,
-  type ScenarioRecordIdSpec,
+  type ScenarioVerificationRecordId,
   type ScenarioRevision,
   type ScenarioState,
   type ScenarioTransport,
@@ -158,6 +160,7 @@ import {
   assertStorableApprovalReceipt,
   assertStorableScenarioRevision,
   apiUpdateLedgerBindingRejectionOf,
+  CONFIRMED_SIDE_EFFECTS,
   isUpdatePathBoundToLedger,
   missingVerificationItemsOf,
   unconfirmedSideEffectsOf,
@@ -396,7 +399,8 @@ const draftContextIn = (
   scenarioId,
   scenarios: scenarioKindFactsIn(connection, profile.profileId),
   approvedServiceOrigins: profile.approvedServiceOrigins ?? [],
-  profileRevisions: { discoveryJob: discoveryJobProfileRevisionIn(connection, profile.profileId, discoveryJobId), current: profile.revision },
+  // PL-U の修正の 1 回目（設計書 14.1 の U5）: 値は判定の 1 か所の読み出し（切り替えだけで進んだかを、保存した改訂の記録で確かめる）。
+  profileRevisions: discoveryProfileRevisionsIn(connection, profile.profileId, discoveryJobProfileRevisionIn(connection, profile.profileId, discoveryJobId), profile.revision),
 });
 
 /**
@@ -636,6 +640,13 @@ export const listScenarios = (database: ControlDatabase, profileId: string): rea
     (connection.prepare(SELECT_PROFILE_SCENARIOS_SQL).all(profileId) as unknown as ScenarioRow[]).map((row) => scenarioViewOf(connection, row)),
   ));
 
+/**
+ * PL-6a（設計者の判断 (f)）: プロファイルのシナリオの今の版が、照合の専用の印（`verificationOnly`）で参照する READ の定義の id（id の順）。READ の確かめのジョブの
+ * 開始は、この定義を外す（`audit-job-manager.ts`）。
+ */
+export const readVerificationOnlyReadCheckIds = (database: ControlDatabase, profileId: string): readonly string[] =>
+  withReadTransaction(database, (connection) => verificationOnlyReadCheckIdsIn(connection, profileId));
+
 /** シナリオの版の写しの履歴（版の順。なければ空）。 */
 export const readScenarioRevisions = (database: ControlDatabase, scenarioId: string): readonly ScenarioRevisionView[] =>
   withReadTransaction(database, (connection) => Object.freeze(
@@ -647,6 +658,9 @@ export const readScenarioRevisions = (database: ControlDatabase, scenarioId: str
 // - 承認（`approveScenario`）: 画面から来た版と承認の digest が、サーバで今の事実から求め直した値と一致し、副作用の確認がすべて済み、再承認の判定
 //   （`evaluateApprovalValidity`）の理由が承認がないこと（`NOT_APPROVED`）だけのときだけ、承認者 `LOCAL_OPERATOR` の承認の記録を追記し、状態を
 //   `APPROVED` にする。期限は `approvalExpiresAtOf`。有効な承認の上の承認し直し（期限が延びる）は許す（T28c の判断）。
+//   MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 承認のダイアログで副作用の確認を確かめた承認
+//   （`confirmSideEffects`）は、確認のない版なら、画面が出した版と digest を照らした後、同じトランザクションで 4 項目を確かめた次の版を足して、その版を
+//   承認する（版の写しの形・digest の項目・承認が縛るものは変えない。確かめに外れたら、版も記録も書かない）。
 // - 撤回（`revokeScenarioApproval`）: `APPROVED` のシナリオの最後の承認に対する撤回の記録を追記し、状態を `REVOKED` にする。同じトランザクションで、
 //   そのシナリオの消費していない許可を無効にし、その `RESERVED` の予約を `RELEASED` にする（T28d。節 3 の `releaseOpenGrantsIn`）。消費済みの許可の
 //   予約は今のまま（送ったかどうかの扱いは Task 30）。
@@ -664,6 +678,12 @@ export interface ScenarioApproval {
   readonly receiptId: string;
   readonly external: ApprovalExternalFacts;
   readonly at: string;
+  /**
+   * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 承認のダイアログで、副作用の確認の 4 項目を示して確かめたか
+   * （省けば偽）。真で、今の版に確かめていない項目があれば、同じトランザクションで、4 項目をすべて確かめた次の版（ほかは今の版のまま）を足し、その版を
+   * 承認する（承認が縛る digest は、その版のもの）。偽なら、確かめていない項目がある版は `SCENARIO_SIDE_EFFECTS_UNCONFIRMED` で拒む（今どおり）。
+   */
+  readonly confirmSideEffects?: boolean;
 }
 
 /** 撤回の入力。 */
@@ -738,22 +758,36 @@ const approveIn = (database: ControlDatabase, connection: SqliteConnection, inpu
     return rejected('SCENARIO_FACTS_CHANGED');
   }
   // LG-3: UPDATE の指定の前に保存した UPDATE の版は、読むとき（`revisionViewOf`）に止まる（T31b の承認の前の確かめは捨てた）。
-  const scenario = revisionViewOf(revisionRowOf(connection, row.scenario_id, row.revision)).scenario;
-  const facts = currentFactsIn(connection, database, scenario, input.snapshot, input.external);
-  const digestFacts = digestFactsOf(facts);
-  const approvalDigest = computeApprovalDigest(scenario, digestFacts);
-  if (approvalDigest !== input.expectedApprovalDigest) {
+  const shown = revisionViewOf(revisionRowOf(connection, row.scenario_id, row.revision));
+  const shownFacts = currentFactsIn(connection, database, shown.scenario, input.snapshot, input.external);
+  // 画面が出した版と事実の digest（MI-6: 確認を入れる版を作るときも、画面が見せた今の版で照らす。古い画面のまま確認を入れない）。
+  if (computeApprovalDigest(shown.scenario, digestFactsOf(shownFacts)) !== input.expectedApprovalDigest) {
     return rejected('SCENARIO_APPROVAL_DIGEST_MISMATCH');
   }
-  if (unconfirmedSideEffectsOf(scenario.sideEffectConfirmations).length > 0) {
+  const unconfirmed = unconfirmedSideEffectsOf(shown.scenario.sideEffectConfirmations).length > 0;
+  if (unconfirmed && input.confirmSideEffects !== true) {
     return rejected('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
   }
+  // MI-6: 承認のダイアログで確かめた版（確認のない版なら、4 項目を確かめた次の版。ほかは今の版のまま。根拠の写しと発見のジョブも今の版のまま）。
+  const scenario = unconfirmed
+    ? assertStorableScenarioRevision({ ...shown.scenario, revision: row.revision + 1, sideEffectConfirmations: CONFIRMED_SIDE_EFFECTS, updatedAt: input.at })
+    : shown.scenario;
+  // 今の事実は、画面が出した版のもの（確認を入れた版は、候補・根拠の写し・入力の規則の参照などを今の版から写すので、事実は同じ。版の根拠の写しを
+  // 管理データから読む事実（API の型の Origin）は、まだ書いていない次の版では読めないので、求め直さない）。
+  const facts = shownFacts;
+  const digestFacts = digestFactsOf(facts);
+  const approvalDigest = computeApprovalDigest(scenario, digestFacts);
   const validity = evaluateApprovalValidity({ scenario, facts, lastApproval: null, lastRevocation: null, now: dateOfCompactUtcTimestamp(input.at) });
   const blocking = validity.approved ? [] : validity.reasons.filter((reason) => reason !== NOT_APPROVED_REASON);
   if (blocking.length > 0) {
     return rejected('SCENARIO_NOT_APPROVABLE', { invalidityReasons: blocking });
   }
   assertUnusedReceiptId(connection, input.receiptId);
+  // MI-6: 確認を入れた版は、確かめがすべて通った後に書く（拒むときは、版も記録も書かない）。承認は、書いた版の行に記録する。
+  if (unconfirmed) {
+    advanceRevisionIn(connection, row, scenario, shown.evidence, shown.discoveryJobId, input.at);
+  }
+  const approvedRow = unconfirmed ? scenarioRowOrThrow(connection, row.scenario_id) : row;
   const receipt = assertStorableApprovalReceipt<ApprovalReceipt>({
     schemaVersion: APPROVAL_RECEIPT_SCHEMA_VERSION,
     kind: 'APPROVAL',
@@ -768,7 +802,7 @@ const approveIn = (database: ControlDatabase, connection: SqliteConnection, inpu
     approver: APPROVER_LOCAL_OPERATOR,
   });
   insertReceiptIn(connection, receipt);
-  updateStateIn(connection, row, APPROVED_STATE, receipt.receiptId, input.at);
+  updateStateIn(connection, approvedRow, APPROVED_STATE, receipt.receiptId, input.at);
   return Object.freeze({ ok: true, scenario: scenarioViewOf(connection, scenarioRowOrThrow(connection, row.scenario_id)) });
 };
 
@@ -811,6 +845,8 @@ export const approveScenario = (database: ControlDatabase, input: ScenarioApprov
     receiptId: requireId(input.receiptId, 'receipt id'),
     external: requireExternal(input.external),
     at: requireTimestamp(input.at),
+    // MI-6: 承認のダイアログで副作用の確認を確かめたか（真のときだけ真。ほかの値は偽として扱う）。
+    confirmSideEffects: input.confirmSideEffects === true,
   };
   if (!isSha256Fingerprint(values.expectedApprovalDigest)) {
     throw new RangeError('the expected approval digest must be a digest of computeApprovalDigest');
@@ -1114,7 +1150,7 @@ const UPDATE_KIND = UPDATE_SCENARIO_KIND;
  * 台帳（参照した CREATE のシナリオ）の今の版の登録の ID の取り方（T31R-fix-1 の I-2。下書きの確かめと同じ事実 `scenarioKindFactsIn` から読む。
  * 台帳がない・未指定なら null）。
  */
-const ledgerRecordIdIn = (connection: SqliteConnection, profileId: string, ledgerScenarioId: string): ScenarioRecordIdSpec | null =>
+const ledgerRecordIdIn = (connection: SqliteConnection, profileId: string, ledgerScenarioId: string): ScenarioVerificationRecordId | null =>
   ledgerFactIn(connection, profileId, ledgerScenarioId)?.recordId ?? null;
 
 /** 台帳の今の版の事実（T41b。下書きの確かめと同じ `scenarioKindFactsIn`。API の登録の応答の鍵の取り方を含む。なければ undefined）。 */
@@ -1172,6 +1208,13 @@ const expiringGrantOf = (grant: GrantRow): ExpiringGrant => ({
   invalidatedAt: grant.invalidated_at,
 });
 
+/**
+ * MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 5。MI-R の Minor 7）: シナリオの今の版の副作用の確認に、まだ確かめていない項目が
+ * あるか（判定は `unconfirmedSideEffectsOf`。実行の許可の発行・消費・確かめ直しが、承認の判定と別に見る）。
+ */
+const sideEffectsUnconfirmed = (state: ScenarioApprovalState): boolean =>
+  unconfirmedSideEffectsOf(state.scenario.current.sideEffectConfirmations).length > 0;
+
 /** 許可を出したときの承認の記録と版が、今の承認の状態と同じか。 */
 const grantMatchesApproval = (grant: GrantRow, row: ScenarioRow, state: ScenarioApprovalState): boolean =>
   state.validity.approved && state.validity.receiptId === grant.approval_receipt_id && row.revision === grant.scenario_revision;
@@ -1209,6 +1252,10 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
     return grantRejected('GRANT_CLOCK_BEFORE_APPROVAL');
   }
   const scenario = state.scenario.current;
+  // MI-F1（設計書 4.7.1 の 5）: 副作用の確認を直接見る（承認の判定と別の多重の守り）。
+  if (sideEffectsUnconfirmed(state)) {
+    return grantRejected('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
+  }
   if (scenario.inputRuleReference === null) {
     return grantRejected('NEEDS_RULE_INPUT');
   }
@@ -1229,7 +1276,10 @@ const issueIn = (database: ControlDatabase, connection: SqliteConnection, input:
   }
   // T40R2-fix（Task 40 の設計書 7 章の「T40R2」の行の M-1）: API のシナリオの送る値を持たない照合の READ は、実行のたびに変わる値と比べる期待が要る。
   // 入力の規則（毎回同じ値になる欄か）は、シナリオの保存の時にはまだないので、規則を確かめるここで判定する（開始の画面も同じ判定を出す）。
-  const varyingRejection = readVerificationVaryingRejectionOf(latestRules.ruleSet, scenario, state.scenario.evidence);
+  // OP-REV6 の I-1: 一覧の画面の照合の READ は、実行のたびに違う値になる欄と比べる期待が要る（判定は同じ部品。定義の画面の path を渡す）。
+  const readCheckId = scenario.verification.readVerification?.readCheckId;
+  const readTargetPagePath = readCheckFactsIn(connection, row.profile_id).find((fact) => fact.readCheckId === readCheckId)?.pagePath ?? null;
+  const varyingRejection = readVerificationVaryingRejectionOf(latestRules.ruleSet, scenario, state.scenario.evidence, readTargetPagePath);
   if (varyingRejection !== null) {
     return grantRejected(varyingRejection);
   }
@@ -1344,6 +1394,10 @@ const consumeIn = (database: ControlDatabase, connection: SqliteConnection, inpu
   const state = approvalStateIn(connection, database, row, input.snapshot, input.external, now);
   if (!state.validity.approved) {
     return grantRejected('GRANT_APPROVAL_INVALID', state.validity.reasons);
+  }
+  // MI-F1（設計書 4.7.1 の 5）: 書き込みの開始でも、副作用の確認を直接見る。
+  if (sideEffectsUnconfirmed(state)) {
+    return grantRejected('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
   }
   if (!grantMatchesApproval(grant, row, state)) {
     return grantRejected('GRANT_MISMATCH');
@@ -1464,6 +1518,10 @@ export const assertGrantStillValid = (database: ControlDatabase, input: GrantRec
     const state = approvalStateIn(connection, database, row, snapshot, values.external, input.now);
     if (!state.validity.approved) {
       return grantRejected('GRANT_APPROVAL_INVALID', state.validity.reasons);
+    }
+    // MI-F1（設計書 4.7.1 の 5）: 書き込みの要求の前の確かめ直しでも、副作用の確認を直接見る。
+    if (sideEffectsUnconfirmed(state)) {
+      return grantRejected('SCENARIO_SIDE_EFFECTS_UNCONFIRMED');
     }
     return grantMatchesApproval(grant, row, state) ? Object.freeze({ ok: true, grant: view }) : grantRejected('GRANT_MISMATCH');
   });

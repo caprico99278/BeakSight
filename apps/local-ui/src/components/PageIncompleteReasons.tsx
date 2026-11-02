@@ -36,7 +36,7 @@ export function PageIncompleteReasons({ counts }: Readonly<{ counts: readonly Pa
             {counts.map(({ code, pages }) => (
               <tr key={code} data-code={code}>
                 <td className="cell-break">
-                  {INCOMPLETE_REASON_DESCRIPTIONS[code]} <code>{code}</code>
+                  {INCOMPLETE_REASON_DESCRIPTIONS[code]}
                 </td>
                 <td>{formatCount(pages)}</td>
                 {/* T44h の判断 (1): どの理由にも、次にできること（レポートと同じ文）がある。 */}

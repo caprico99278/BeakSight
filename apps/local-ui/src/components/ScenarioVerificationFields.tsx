@@ -6,10 +6,13 @@
  * - 画面の確かめは補助だけ。形と結び付けの確かめは、サーバの下書きの確かめ（`validateScenarioDraft`）が決め、誤りは項目の近くに出す。
  * - 文言は `src/presentation/` のカタログだけ。
  * - T40a-fix: API のシナリオでは、成否の条件と入力の誤りの条件の欄を出さない（使わない。下書きにも null で送る）。
+ * - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成否の条件と入力の誤りの条件の欄をなくした（BeakSight が構造で判定する。下書きにも送らない）。
+ *   form の登録の ID の取り方は、送った後のアドレスの形（`URL_PATH_PATTERNS`。2 つまで、空白で区切る）だけ。API は今の 2 つの取り方。画面の作り直しは PL-5。
+ * - MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 照合の READ の欄の上に、呼び出し側の知らせ（台帳から埋めたかなど）を出せる。
  */
+import type { ReactNode } from 'react';
 import type {
   RecordIdSource,
-  ScenarioResultCondition,
   ScenarioVerification,
   VerificationExpectation,
   VerificationExpectationKind,
@@ -31,20 +34,17 @@ import { FieldFrame } from './FieldFrame';
 
 const text = LOCAL_UI_WRITE_TEXT;
 
-/** 登録の ID の取り方の選択肢（閉じた一覧の順）。 */
-const RECORD_ID_SOURCE_OPTIONS: readonly RecordIdSource[] = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT']);
+/** 登録の ID の取り方の選択肢（閉じた一覧の順）。PL-6a: form は送った後のアドレスの形の一覧だけ、API は今の 2 つ。 */
+const FORM_RECORD_ID_SOURCE_OPTIONS: readonly RecordIdSource[] = Object.freeze(['URL_PATH_PATTERNS']);
+const API_RECORD_ID_SOURCE_OPTIONS: readonly RecordIdSource[] = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT']);
+/** PL-6a: アドレスの形の一覧の区切り（空白）。 */
+const PATH_PATTERN_SEPARATOR = /\s+/u;
 /** 照合の READ の期待の種類の選択肢（閉じた一覧の順）。 */
 const EXPECTATION_KIND_OPTIONS: readonly VerificationExpectationKind[] = VERIFICATION_EXPECTATION_KINDS;
 /** 行の数の期待の既定。 */
 const DEFAULT_ROW_COUNT = '1';
 /** 未指定の選択肢の値。 */
 const UNSET = '';
-
-/** 結果の条件の入力の値。 */
-interface ConditionState {
-  readonly pathPrefix: string;
-  readonly selector: string;
-}
 
 /** 期待 1 件の入力の値（数は文字のまま。サーバの形の確かめが拒む）。 */
 export interface ExpectationState {
@@ -56,8 +56,6 @@ export interface ExpectationState {
 
 /** 検証の指定の入力の値。 */
 export interface VerificationState {
-  readonly success: ConditionState;
-  readonly inputError: ConditionState;
   readonly recordSource: RecordIdSource | typeof UNSET;
   readonly recordValue: string;
   readonly readCheckId: string;
@@ -65,9 +63,6 @@ export interface VerificationState {
   readonly bindings: Readonly<Record<string, string>>;
   readonly expectations: readonly ExpectationState[];
 }
-
-const conditionStateOf = (condition: ScenarioResultCondition | null): ConditionState =>
-  ({ pathPrefix: condition?.pathPrefix ?? '', selector: condition?.selector ?? '' });
 
 const expectationStateOf = (expectation: VerificationExpectation): ExpectationState => {
   switch (expectation.kind) {
@@ -83,11 +78,18 @@ const expectationStateOf = (expectation: VerificationExpectation): ExpectationSt
 /** 保存した検証の指定から、入力の値を作る（作成の画面は、すべて未指定）。 */
 export const verificationStateOf = (verification: ScenarioVerification): VerificationState => {
   const { recordId, readVerification } = verification;
+  const recordValueOf = (): string => {
+    if (recordId === null) {
+      return '';
+    }
+    if (recordId.source === 'URL_PATH_PATTERNS') {
+      return recordId.pathPatterns.join(' ');
+    }
+    return recordId.source === 'URL_PATH_PATTERN' ? recordId.pathPattern : recordId.selector;
+  };
   return {
-    success: conditionStateOf(verification.successCondition),
-    inputError: conditionStateOf(verification.inputErrorCondition),
     recordSource: recordId?.source ?? UNSET,
-    recordValue: recordId === null ? '' : recordId.source === 'URL_PATH_PATTERN' ? recordId.pathPattern : recordId.selector,
+    recordValue: recordValueOf(),
     readCheckId: readVerification?.readCheckId ?? UNSET,
     bindings: Object.fromEntries((readVerification?.bindings ?? []).map(({ parameterName, fieldName }) => [parameterName, fieldName])),
     expectations: (readVerification?.expectations ?? []).map(expectationStateOf),
@@ -96,9 +98,6 @@ export const verificationStateOf = (verification: ScenarioVerification): Verific
 
 /** 0 以上の整数の文字だけを数にする（ほかは文字のまま送り、サーバの形の確かめが拒む）。 */
 const NON_NEGATIVE_INTEGER = /^[0-9]+$/u;
-
-const conditionInputOf = (condition: ConditionState): ScenarioResultCondition | null =>
-  (condition.pathPrefix.trim() === '' ? null : { pathPrefix: condition.pathPrefix, selector: condition.selector === '' ? null : condition.selector });
 
 const expectationInputOf = (expectation: ExpectationState): Record<string, unknown> => {
   switch (expectation.kind) {
@@ -112,8 +111,8 @@ const expectationInputOf = (expectation: ExpectationState): Record<string, unkno
 };
 
 /**
- * 入力の値を、下書きの検証の指定にする（形の確かめはサーバ）。T40a-fix: API のシナリオ（`api`）は、成否の条件と入力の誤りの条件を null にする
- * （使わない。欄も出さない）。
+ * 入力の値を、下書きの検証の指定にする（形の確かめはサーバ）。PL-6a: 成否の条件は送らない（結果の判定のしかたの印はサーバが付ける）。form の ID の取り方は、
+ * 空白で区切ったアドレスの形の一覧。
  */
 export const verificationInputOf = (
   state: VerificationState,
@@ -121,14 +120,20 @@ export const verificationInputOf = (
   api = false,
 ): Record<string, unknown> => {
   const readCheck = readChecks.find(({ readCheckId }) => readCheckId === state.readCheckId);
+  const recordIdOf = (): Record<string, unknown> | null => {
+    switch (state.recordSource) {
+      case UNSET:
+        return null;
+      case 'URL_PATH_PATTERNS':
+        return { source: state.recordSource, pathPatterns: state.recordValue.split(PATH_PATTERN_SEPARATOR).filter((pattern) => pattern !== '') };
+      case 'URL_PATH_PATTERN':
+        return { source: state.recordSource, pathPattern: state.recordValue };
+      case 'ELEMENT':
+        return { source: state.recordSource, selector: state.recordValue };
+    }
+  };
   return {
-    successCondition: api ? null : conditionInputOf(state.success),
-    inputErrorCondition: api ? null : conditionInputOf(state.inputError),
-    recordId: state.recordSource === UNSET
-      ? null
-      : state.recordSource === 'URL_PATH_PATTERN'
-        ? { source: state.recordSource, pathPattern: state.recordValue }
-        : { source: state.recordSource, selector: state.recordValue },
+    recordId: recordIdOf(),
     readVerification: readCheck === undefined
       ? null
       : {
@@ -145,36 +150,9 @@ export const verificationInputOf = (
 /** 説明があるときだけ、枠の説明にする。 */
 const hintOf = (description: string | null): { readonly hint?: string } => (description === null ? {} : { hint: description });
 
-/** 結果の条件の 2 つの欄。 */
-function ConditionFields({ name, value, onChange }: Readonly<{
-  name: 'successCondition' | 'inputErrorCondition';
-  value: ConditionState;
-  onChange: (next: ConditionState) => void;
-}>) {
-  const display = scenarioVerificationItemDisplay(name);
-  return (
-    <fieldset className="field-group" data-testid={`scenario-verification-${name}`}>
-      <legend className="field-group-heading">{display.label}</legend>
-      <p className="field-hint">{text.conditionHint}</p>
-      <FieldFrame label={text.conditionPathPrefix} errors={[]}>
-        {({ id, describedBy }) => (
-          <input id={id} name={`${name}-pathPrefix`} className="input" type="text" value={value.pathPrefix} aria-describedby={describedBy}
-            onChange={(event) => onChange({ ...value, pathPrefix: event.target.value })} />
-        )}
-      </FieldFrame>
-      <FieldFrame label={text.conditionSelector} errors={[]}>
-        {({ id, describedBy }) => (
-          <input id={id} name={`${name}-selector`} className="input" type="text" value={value.selector} aria-describedby={describedBy}
-            onChange={(event) => onChange({ ...value, selector: event.target.value })} />
-        )}
-      </FieldFrame>
-    </fieldset>
-  );
-}
-
-/** 検証の指定の入力（成功の条件、入力の誤りの条件、登録の ID の取り方、照合の READ）。 */
+/** 検証の指定の入力（登録の ID の取り方、照合の READ。PL-6a: 成否の条件の欄はない）。 */
 export function ScenarioVerificationFields({
-  state, onChange, readChecks, fieldNames, errors, allowPageTemplate = false, api = false, writePagePath = null,
+  state, onChange, readChecks, fieldNames, errors, allowPageTemplate = false, api = false, writePagePath = null, readNote = null,
 }: Readonly<{
   state: VerificationState;
   onChange: (next: VerificationState) => void;
@@ -192,6 +170,8 @@ export function ScenarioVerificationFields({
    * `recordIdPatternMatchesPagePath`）。
    */
   writePagePath?: string | null;
+  /** MI-7: 照合の READ の欄の上に出す知らせ（更新の照合の READ を台帳から埋めたか・埋める前か・埋められない理由。文言はカタログ）。 */
+  readNote?: ReactNode;
 }>) {
   const readCheck = readChecks.find(({ readCheckId }) => readCheckId === state.readCheckId);
   const recordDisplay = scenarioVerificationItemDisplay('recordId');
@@ -211,12 +191,7 @@ export function ScenarioVerificationFields({
       <p className="field-hint">{text.verificationNote}</p>
       {errors.length === 0 ? null : <p className="field-error" data-testid="scenario-verification-errors">{errors.join(' ')}</p>}
 
-      {api ? <p className="field-hint" data-testid="scenario-verification-api-note">{text.apiVerificationNote}</p> : (
-        <>
-          <ConditionFields name="successCondition" value={state.success} onChange={(success) => onChange({ ...state, success })} />
-          <ConditionFields name="inputErrorCondition" value={state.inputError} onChange={(inputError) => onChange({ ...state, inputError })} />
-        </>
-      )}
+      {api ? <p className="field-hint" data-testid="scenario-verification-api-note">{text.apiVerificationNote}</p> : null}
 
       <fieldset className="field-group" data-testid="scenario-verification-recordId">
         <legend className="field-group-heading">{recordDisplay.label}</legend>
@@ -226,7 +201,8 @@ export function ScenarioVerificationFields({
             <select id={id} name="recordId-source" className="input" value={state.recordSource} aria-describedby={describedBy}
               onChange={(event) => onChange({ ...state, recordSource: event.target.value as VerificationState['recordSource'] })}>
               <option value={UNSET}>{text.recordIdUnset}</option>
-              {RECORD_ID_SOURCE_OPTIONS.map((source) => <option key={source} value={source}>{recordIdSourceDisplay(source).label}</option>)}
+              {(api ? API_RECORD_ID_SOURCE_OPTIONS : FORM_RECORD_ID_SOURCE_OPTIONS)
+                .map((source) => <option key={source} value={source}>{recordIdSourceDisplay(source).label}</option>)}
             </select>
           )}
         </FieldFrame>
@@ -248,6 +224,7 @@ export function ScenarioVerificationFields({
       <fieldset className="field-group" data-testid="scenario-verification-readVerification">
         <legend className="field-group-heading">{readDisplay.label}</legend>
         {readDisplay.description === null ? null : <p className="field-hint">{readDisplay.description}</p>}
+        {readNote}
         {readChecks.length === 0 ? <p>{text.noReadChecks}</p> : (
           <FieldFrame label={text.readVerificationCheck} errors={[]}>
             {({ id, describedBy }) => (

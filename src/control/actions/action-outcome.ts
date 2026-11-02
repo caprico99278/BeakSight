@@ -10,21 +10,32 @@
 //   `PARTIAL`（`READ_VERIFICATION_UNDETERMINED`）。`VERIFIED` は、欄がすべて一致し、ID が対象と同じで、照合の READ が一致したときだけ。
 // - T40c（Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」）: API の書き込みの応答の状態から結果の判定を決める唯一の口
 //   （`apiResponseJudgementOf`）。今の閉じた一覧の値だけを返し、ID の判定は `actionOutcomeOf` に任せる。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。調査 FV-0 の案 (b2)）: form の書き込みの結果の判定を、人が入れる条件（path の前方一致と
+//   CSS セレクタ）から、構造の判定に変えた唯一の口（`formResultJudgementOf`）。4xx・5xx の扱いは API の判定と同じ部品（`errorResponseJudgementOf`）。
+//   2xx・3xx は、照合（登録は答え合わせの READ、更新は更新の後の照合）で決め、一致しないときは、送った値を保った同じ「フォームの形」がもう一度出た
+//   ときだけ入力の誤り（誤った失敗を出さないことを、判定できないが少し増えることより優先する）。送った後の URL から登録の ID を取る判定
+//   （`recordIdOfResultUrl`）と、送る前の答え合わせの READ で送らずに止める判定（`preSubmitReadStopOf`）も、ここに置く。
 // - 入出力を持たない。管理データ・画面・ブラウザ・ワーカーに触れない。
+import { isRecordIdLikePathSegment } from '../../core/api-request-shape.js';
 import {
   CLIENT_ERROR_HTTP_STATUS_RANGE,
+  REDIRECTION_HTTP_STATUS_RANGE,
   SERVER_ERROR_HTTP_STATUS_RANGE,
   SUCCESS_HTTP_STATUS_RANGE,
   TOO_MANY_REQUESTS_HTTP_STATUS,
   isHttpStatusInRange,
 } from '../../core/http-status.js';
+import { recordIdOfPathPattern } from '../../core/record-id-path-pattern.js';
 import { hasControlOrLineSeparator, hasLoneSurrogate } from '../../core/text.js';
+import type { ReadCheckResult } from '../../discovery/read-check-contracts.js';
 import { MAX_RECORD_ID_LENGTH } from '../approval/scenario-contracts.js';
 import type {
   ActionOutcome,
   ActionOutcomeInput,
   ActionOutcomeReason,
   ActionResult,
+  FormUpdatePostcheck,
+  PrecheckFailureDetail,
   ResponseJudgement,
   SettledReservationState,
   SubmissionState,
@@ -111,13 +122,135 @@ export const apiResponseJudgementOf = (status: number): ResponseJudgement => {
   if (isHttpStatusInRange(status, SUCCESS_HTTP_STATUS_RANGE)) {
     return 'SUCCESS';
   }
+  return errorResponseJudgementOf(status) ?? 'NO_CONDITION_MATCHED';
+};
+
+/**
+ * 誤りの応答の状態の判定（純粋。PL-6a で API の判定から取り出し、form の判定 `formResultJudgementOf` と共有する唯一の部品）: 429 → `RATE_LIMITED`、
+ * ほかの 4xx → `INPUT_ERROR`、5xx → `SERVER_ERROR`（登録を済ませていることがあるので `UNKNOWN`）。ほか（2xx・3xx、1xx、600 以上、整数でない値）は null。
+ */
+export const errorResponseJudgementOf = (status: number): ResponseJudgement | null => {
+  if (!Number.isSafeInteger(status)) {
+    return null;
+  }
   if (status === TOO_MANY_REQUESTS_HTTP_STATUS) {
     return 'RATE_LIMITED';
   }
   if (isHttpStatusInRange(status, CLIENT_ERROR_HTTP_STATUS_RANGE)) {
     return 'INPUT_ERROR';
   }
-  return isHttpStatusInRange(status, SERVER_ERROR_HTTP_STATUS_RANGE) ? 'SERVER_ERROR' : 'NO_CONDITION_MATCHED';
+  return isHttpStatusInRange(status, SERVER_ERROR_HTTP_STATUS_RANGE) ? 'SERVER_ERROR' : null;
+};
+
+/**
+ * PL-6a: form の書き込みの、送信の後の文書の状態が、構造（照合とフォームの形）で判定する状態か（2xx・3xx。整数でない値は偽）。ワーカーは、この状態の
+ * ときだけ、送った後の照合（登録の答え合わせの READ、更新の後の照合）を行う。
+ */
+export const isFormStructureStatus = (status: number): boolean => Number.isSafeInteger(status)
+  && (isHttpStatusInRange(status, SUCCESS_HTTP_STATUS_RANGE) || isHttpStatusInRange(status, REDIRECTION_HTTP_STATUS_RANGE));
+
+/**
+ * PL-6a（設計書 8.1 の「判定の順」の 2）: 送った後の URL から、登録の ID を取る（純粋。取れなければ null）。ID の型（`{id}` の区切りを持つ path の型。
+ * 契約は `MAX_FORM_RECORD_ID_PATTERNS` まで）を順に当て、最初に当たって、次をすべて満たす値: 区切りが ID の形（core の `isRecordIdLikePathSegment`。
+ * 数字・UUID の形）、押す前の URL を同じ型に当てた値と違う、URL が押す前から変わった。当てるのは path だけ（query は見ない）。URL を読めなければ null。
+ */
+export const recordIdOfResultUrl = (pathPatterns: readonly string[], beforeUrl: string, afterUrl: string): string | null => {
+  if (beforeUrl === afterUrl) {
+    return null;
+  }
+  let beforePath: string;
+  let afterPath: string;
+  try {
+    beforePath = new URL(beforeUrl).pathname;
+    afterPath = new URL(afterUrl).pathname;
+  } catch {
+    return null;
+  }
+  for (const pattern of pathPatterns) {
+    const recordId = recordIdOfPathPattern(afterPath, pattern);
+    if (recordId !== null && isRecordIdLikePathSegment(recordId) && recordId !== recordIdOfPathPattern(beforePath, pattern)) {
+      return recordId;
+    }
+  }
+  return null;
+};
+
+/**
+ * PL-6a（設計書 8.1 の「事前の確かめ」。設計者の判断）: form の登録を送る前に、同じ値で読んだ答え合わせの READ の結果から、送らずに止める理由を決める
+ * （純粋）。値がもう見えていれば `VALUE_ALREADY_PRESENT`（照合に使えない。実験では、これがないと、登録していないのに `VERIFIED` になった）。判定できな
+ * ければ `VERIFICATION_READ_UNAVAILABLE`（送った後の照合にも使えないので、件数を使って結果の分からない書き込みをしない）。見えていなければ null（送る）。
+ */
+export const preSubmitReadStopOf = (result: ReadCheckResult): PrecheckFailureDetail | null => {
+  if (result === 'NOT_MATCHED') {
+    return null;
+  }
+  return result === 'MATCHED' ? 'VALUE_ALREADY_PRESENT' : 'VERIFICATION_READ_UNAVAILABLE';
+};
+
+/**
+ * PL-6a: form の書き込みの結果の判定の入力（送った後の観察。値は持たない）。
+ * - `httpStatus`: 送信の後の main frame の最後の文書の状態（redirect の後。応答がなければ null）。
+ * - `sameForm`: 送った後の画面に、送ったフォームと同じ「フォームの形」（`fingerprint.ts` の `formShapeKeyOf`）の候補があったか。
+ * - `sameFormKeptValues`: その同じフォームが、送った値を保っていたか（読めなければ偽）。
+ * - `recordId`: 送った後の URL から取った ID（`recordIdOfResultUrl`。なければ null）。
+ * - `readVerification`: 登録の答え合わせの READ の結果（読まなかった・実行できなかったら null）。更新は見ない（更新の後の照合 `update.postcheck` で決める）。
+ * - `update`: 更新だけ。対象の ID と、更新の後の照合の分け方。
+ */
+export interface FormResultFacts {
+  readonly httpStatus: number | null;
+  readonly sameForm: boolean;
+  readonly sameFormKeptValues: boolean;
+  readonly recordId: string | null;
+  readonly readVerification: ReadCheckResult | null;
+  readonly update?: { readonly targetRecordId: string; readonly postcheck: FormUpdatePostcheck } | undefined;
+}
+
+/** PL-6a: form の書き込みの判定（`action-run.json` の `responseJudgement` と `recordId`。応答がなければ判定は null）。 */
+export interface FormResultJudgement {
+  readonly responseJudgement: ResponseJudgement | null;
+  readonly recordId: string | null;
+}
+
+const formJudgementOf = (responseJudgement: ResponseJudgement | null, recordId: string | null = null): FormResultJudgement =>
+  Object.freeze({ responseJudgement, recordId });
+
+/**
+ * PL-6a（設計書 8.1 の「判定の順」。案 (b2)）: form の書き込みの結果の判定（純粋。登録・更新とも）。結果（`ActionResult`）は、この判定と照合の結果を
+ * `actionOutcomeOf` に渡して決める（ワーカーと親の締めが同じ入力で同じ結果になる）。
+ * 1. 応答がなければ判定なし（`NO_RESPONSE`）。4xx は入力の誤り（429 は回数の制限）、5xx は結果が分からない（`errorResponseJudgementOf`。API と共有）。
+ *    2xx・3xx でない残り（1xx、600 以上）は `NO_CONDITION_MATCHED`。
+ * 2. 2xx・3xx: 照合が一致すれば成功（登録は答え合わせの READ が `MATCHED`。ID は送った後の URL の ID。なければ null で `PARTIAL`。更新は更新の後の照合が
+ *    `UPDATED`。ID は URL の ID があればそれ（対象と違えば `RECORD_ID_MISMATCH`）、なければ対象の ID）。
+ * 3. 照合が一致しない（登録は READ が `NOT_MATCHED`、更新は `UNCHANGED`）ときは、送った値を保った同じフォームがもう一度出たときだけ入力の誤り。ほかは
+ *    判定できない（`NO_CONDITION_MATCHED`）。登録で URL に新しい ID が出ていれば、成功の判定に ID を付けて返し、`actionOutcomeOf` が READ の不一致で
+ *    `UNKNOWN`（`READ_VERIFICATION_NOT_MATCHED`）にする（失敗と言わない）。
+ * 4. 照合を判定できない: 登録は、新しい ID があり同じフォームが出ていなければ、照合できない成功（`PARTIAL`・`READ_VERIFICATION_UNDETERMINED`）、ほかは
+ *    判定できない。更新は、更新の後の照合を判定できなければ判定できない。更新の後の照合で、ほかの欄の変化（`CHANGED_OTHERWISE`）は、成功の判定に対象の
+ *    ID を付けて返し、`actionOutcomeOf` が `UNEXPECTED_FIELD_CHANGE`（`UNKNOWN`）にする。
+ */
+export const formResultJudgementOf = (facts: FormResultFacts): FormResultJudgement => {
+  const { httpStatus, sameForm, sameFormKeptValues, recordId, update } = facts;
+  if (httpStatus === null) {
+    return formJudgementOf(null);
+  }
+  if (!isFormStructureStatus(httpStatus)) {
+    return formJudgementOf(errorResponseJudgementOf(httpStatus) ?? 'NO_CONDITION_MATCHED');
+  }
+  const inputErrorOrUndetermined = (): FormResultJudgement => formJudgementOf(sameForm && sameFormKeptValues ? 'INPUT_ERROR' : 'NO_CONDITION_MATCHED');
+  if (update !== undefined) {
+    if (update.postcheck === 'UPDATED' || update.postcheck === 'CHANGED_OTHERWISE') {
+      return formJudgementOf('SUCCESS', recordId ?? update.targetRecordId);
+    }
+    return update.postcheck === 'UNCHANGED' ? inputErrorOrUndetermined() : formJudgementOf('NO_CONDITION_MATCHED');
+  }
+  if (facts.readVerification === 'MATCHED') {
+    return formJudgementOf('SUCCESS', recordId);
+  }
+  if (facts.readVerification === 'NOT_MATCHED') {
+    return recordId === null ? inputErrorOrUndetermined() : formJudgementOf('SUCCESS', recordId);
+  }
+  // 照合を判定できない（`UNDETERMINED`）・行わなかった（null）。
+  return recordId !== null && !sameForm ? formJudgementOf('SUCCESS', recordId) : formJudgementOf('NO_CONDITION_MATCHED');
 };
 
 /** `ActionResult` とそれを決めた理由（純粋。凍結）。 */

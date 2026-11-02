@@ -36,6 +36,7 @@ import { LOGIN_BROWSER_HEADLESS, runLoginStage, type LoginStageDependencies } fr
 import { runAutomatedLoginStage, type AutomatedLoginStageDependencies, type AutomatedLoginStageResult } from './automated-login.js';
 import { startAuditWorker, type WorkerAutomatedLoginStageRequest, type WorkerChannel } from './audit-worker-session.js';
 import { executeDiscoveryRun } from './discovery-run.js';
+import { withCapturedLoginCredential } from './login-credential-capture.js';
 import { executeEntryCheckRun } from './entry-check-run.js';
 import { executeReadCheckRun } from './read-check-run.js';
 import { executeWriteCreateRun } from './write-create-run.js';
@@ -171,6 +172,13 @@ export function runAuditWorkerProcess(target: NodeJS.Process, options: AuditWork
       : { ...PRODUCTION_RUN_DEPENDENCIES, launchBrowser: options.launchRunBrowser },
     runLoginStage: (request) => runLoginStage(request, loginStage),
     runAutomatedLoginStage: (request) => runAutomatedLoginWithCredentials(request, automatedLoginStage, openCredentialStore),
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 親が許したときだけ、受け取った資格情報を資格情報のファイルの部品の `register`
+    // で書く（ファイルがすでにあれば部品が拒む）。値は、部品に渡すまでの関数の中だけ。
+    saveCapturedCredential: async ({ credentialRoot, profileId, loginOrigin, credential }) => {
+      const metadata = await withCapturedLoginCredential(credential, (values) =>
+        openCredentialStore(credentialRoot).register({ profileId, loginOrigin, username: values.username, password: values.password }));
+      return metadata.credentialRevision;
+    },
     // T27d: 発見のジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium。`runDependencies.launchBrowser`）。
     executeDiscovery: executeDiscoveryRun,
     // T27e: READ の確かめのジョブの流れ（監査の Browser と同じ、CLI の起動の設定の Chromium）。

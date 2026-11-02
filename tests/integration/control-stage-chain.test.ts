@@ -1,9 +1,11 @@
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1、5 章の 2026-10-22 の FM2d の Blocker の行）: まとめて実行の、ジョブの管理の側の決まり
 // （`startStageChain` と段の進め方）を、偽のワーカー（`tests/helpers/fake-audit-worker.ts` の `chain`）を本物の `fork` で起動して確かめる（本物のワーカーと Chromium
 // での端から端は `stage-chain-fork-default.test.ts`・`stage-chain-fork-cli.test.ts`。中身は `stage-chain-fork-cases.ts`）。
-// - 段の並びはモードで決まる（`TEST_AUTH_PASSIVE`: 監査 → 発見 → READ、`TEST_APPROVED_WRITE`: 発見 → READ、公開の監査: 拒む）。段ごとにジョブの行を作る。
+// - 段の並びはモードで決まる（`TEST_AUTH_PASSIVE` と、MI-5 から `TEST_APPROVED_WRITE`: 監査 → 発見 → READ、公開の監査: 拒む）。段ごとにジョブの行を作る。
 // - READ の段の対象の画面は、発見の段の索引を記録した後に決めて、`NEXT_STAGE` で渡す。定義が 0 件なら READ を行わない（失敗にしない）。
 // - 手動のログインの自動の登録（改訂を進める）は、連鎖の最後に 1 回だけ（記録は最初の段のジョブ）。途中の段のジョブの行は、始めた時の改訂のまま。
+//   OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D4、4.1.3 の 1）で置き換えた: 登録は、ログインの直後（点検と操作さがしの前）に 1 回だけ。
+//   連鎖は、親が自分で進めた改訂を基準に進み、後の段のジョブの行は登録の後の改訂。
 // - 止める理由: 止める要求（連鎖の全体を止める）、段の未完了の理由（サービスの要求の上限など）、改訂の変化。止めたら次の段を始めない（`CHAIN_END`）。
 // - 段の間に、ほかのジョブを始められない。
 // 管理データと出力先は一時のフォルダだけを使う。起動したワーカーは、すべて止まったことを確かめる。
@@ -17,6 +19,9 @@ import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
 import type { AuditJobManager, AuditWorkerForker } from '../../src/control/job/audit-job-manager.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
+import { UNCONFIRMED_SIDE_EFFECTS } from '../../src/control/approval/api-scenario-draft.js';
+import { createScenario } from '../../src/control/approval/scenario-store.js';
+import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
 import { createReadCheck, readRecentReadCheckResults } from '../../src/control/job/read-check-store.js';
 import type { StageChainView } from '../../src/control/job/stage-chain-policy.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
@@ -25,7 +30,13 @@ import { resolveControlDatabasePath } from '../../src/control/store/database-pat
 import { createProfile, getProfile, updateProfile } from '../../src/control/store/profile-store.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
-import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
+import {
+  DISCOVERY_ARTIFACT_SCHEMA_VERSION,
+  discoveryReadPagePaths,
+  discoverySummaryOf,
+  mergeDiscoveryCandidates,
+  type DiscoveryDocument,
+} from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
 import { createCountingFork } from '../helpers/worker-fork.js';
@@ -208,8 +219,18 @@ const createDefinition = (): void => {
   }).ok).toBe(true);
 };
 
+/** PL-6b: 登録の form（照合の専用の印を持つシナリオを作るため）。 */
+const CREATE: DiscoveryCandidate = ((discovered: DiscoveredCandidate) => ({
+  ...discovered,
+  ...classifyCandidate(discovered, { allowedOrigins: ALLOWED }),
+  ...computeCandidateDigests(discovered),
+}))(sampleForm({
+  page: { origin: TEST_ORIGIN, path: '/admin/items/new' }, action: sampleAction('/admin/items', [], TEST_ORIGIN), submitterText: '登録',
+  fields: [sampleField('name', 'text', { required: true })],
+}));
+
 describe('FM2d: the chained run in the job management', () => {
-  it('runs the audit, the discovery and the READ check as three job rows, gives the READ target from the discovery stage, and registers the login once at the end', async () => {
+  it('runs the audit, the discovery and the READ check as three job rows, gives the READ target from the discovery stage, and registers the login once right after it', async () => {
     createAuthProfile();
     createDefinition();
     const worker = fakeWorker({ runIds: RUN_IDS }, { loginStage: { passedRequests: PASSED_REQUESTS, loginObservation: LOGIN_OBSERVATION } });
@@ -217,11 +238,12 @@ describe('FM2d: the chained run in the job management', () => {
     const chainId = await startChain(jobManager);
     const chain = await waitForChainEnd(jobManager, chainId);
 
-    expect(chain).toMatchObject({ chainId, profileId: PROFILE_ID, profileRevision: MIN_PROFILE_REVISION, state: 'FINISHED', stopReason: null });
+    // OP-1: 登録はログインの直後。連鎖の基準の改訂は、登録で親が進めた改訂（後の段のジョブの行も）。
+    expect(chain).toMatchObject({ chainId, profileId: PROFILE_ID, profileRevision: MIN_PROFILE_REVISION + 1, state: 'FINISHED', stopReason: null });
     expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'DONE']]);
     const jobs = jobsOf(jobManager, chain);
     expect(jobs.map(({ jobKind, state, profileRevision, runId }) => [jobKind, state, profileRevision, runId]))
-      .toEqual([['AUDIT', 'FINISHED', 1, RUN_IDS[0]], ['DISCOVERY', 'FINISHED', 1, RUN_IDS[1]], ['READ_CHECK', 'FINISHED', 1, RUN_IDS[2]]]);
+      .toEqual([['AUDIT', 'FINISHED', 1, RUN_IDS[0]], ['DISCOVERY', 'FINISHED', 2, RUN_IDS[1]], ['READ_CHECK', 'FINISHED', 2, RUN_IDS[2]]]);
     // どの段のジョブからも、同じ連鎖が見える。
     for (const job of jobs) {
       expect(jobManager.getStageChainOfJob(job.jobId)?.chainId).toBe(chainId);
@@ -235,7 +257,8 @@ describe('FM2d: the chained run in the job management', () => {
     expect((nextStages[1]?.['readChecks'] as readonly { readonly targetPage: unknown }[] | undefined)?.map(({ targetPage }) => targetPage))
       .toEqual([{ origin: TEST_ORIGIN, path: '/admin/items' }]);
     expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ jobId }) => jobId)).toEqual([jobs[2]?.jobId]);
-    // 自動の登録は、連鎖の最後に 1 回だけ（最初の段のジョブの記録。ほかの段にはログインの段がない）。
+    // 自動の登録は、ログインの直後に 1 回だけ（最初の段のジョブの記録。ほかの段にはログインの段がない）。新しい設定は LOGIN_REGISTERED で渡した。
+    expect(received.filter((message) => message['type'] === 'LOGIN_REGISTERED')).toHaveLength(1);
     const registered = await waitFor(() => jobManager.getAuditJob(chainId)?.loginStage?.autoRegistration);
     expect(registered).toMatchObject({ result: 'SAVED', profileRevision: MIN_PROFILE_REVISION + 1 });
     expect(jobs.slice(1).map(({ jobId }) => jobManager.getAuditJob(jobId)?.loginStage ?? null)).toEqual([null, null]);
@@ -254,11 +277,59 @@ describe('FM2d: the chained run in the job management', () => {
     expect(worker.received().filter((message) => message['type'] === 'CHAIN_END')).toHaveLength(1);
   }, TEST_TIMEOUT_MS);
 
-  it('chains only the discovery and the READ check in TEST_APPROVED_WRITE, and rejects the public profile', async () => {
+  // PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。PL-6a の持ち越し）: 連鎖の READ の段も、シナリオが照合の専用の印で参照する定義を読まない。
+  // 照合の専用の定義だけなら、READ の段を行わない（失敗にしない）。
+  it('leaves out the definitions referred to as verification only from the READ stage of the chain', async () => {
+    createAuthProfile('WRITE');
+    const document: DiscoveryDocument = { ...DISCOVERY_DOCUMENT, jobId: 'job-pl6b-before', pages: [
+      ...DISCOVERY_DOCUMENT.pages,
+      { url: `${TEST_ORIGIN}/admin/items/new`, state: 'READ', record: { location: { origin: TEST_ORIGIN, path: '/admin/items/new' }, incompleteReasons: [], candidates: [CREATE] }, blockedRequests: 0 },
+    ] };
+    recordDiscoveryCandidates(database, {
+      profileId: PROFILE_ID, jobId: document.jobId, at: '20261021000000',
+      entries: mergeDiscoveryCandidates([SEARCH, CREATE]).map(discoveryIndexEntryOf), readPagePaths: discoveryReadPagePaths(document),
+    });
+    expect(createReadCheck(database, {
+      readCheckId: 'read-answer', profileId: PROFILE_ID, definition: { targetIdentityDigest: SEARCH.identityDigest, parameters: { q: '' }, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] }, at: '20261021000000',
+    }).ok).toBe(true);
+    expect(createScenario(database, {
+      scenarioId: 'scenario-answer',
+      draft: {
+        profileId: PROFILE_ID, candidateIdentityDigest: CREATE.identityDigest, fieldNames: ['name'], readChecks: [], sideEffectConfirmations: UNCONFIRMED_SIDE_EFFECTS,
+        limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
+        verification: {
+          recordId: null,
+          readVerification: {
+            readCheckId: 'read-answer', revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }],
+            verificationOnly: true,
+          },
+        },
+      },
+      discovery: document,
+      at: '20261021000100',
+    })).toMatchObject({ ok: true });
+    const only = managerWith(fakeWorker({ runIds: RUN_IDS }));
+    const skipped = await waitForChainEnd(only, await startChain(only));
+    expect(skipped.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'NOT_NEEDED']]);
+    await manager?.close();
+    // 照合の専用でない定義を足すと、READ の段はその定義だけを読む。
+    createDefinition();
+    const worker = fakeWorker({ runIds: RUN_IDS.map((runId) => runId.replace('RUN-20261022', 'RUN-20261023')) });
+    const jobManager = managerWith(worker);
+    const chain = await waitForChainEnd(jobManager, await startChain(jobManager));
+    expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'DONE']]);
+    const nextStages = worker.received().filter((message) => message['type'] === 'NEXT_STAGE');
+    expect((nextStages[1]?.['readChecks'] as readonly { readonly readCheckId: string }[] | undefined)?.map(({ readCheckId }) => readCheckId)).toEqual(['read-items']);
+  }, TEST_TIMEOUT_MS);
+
+  // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードでも監査を始められるので、認証つきの読み取りの監査と同じ
+  // 監査 → 発見 → READ の確かめを並べる（前は発見 → READ の確かめ）。
+  it('chains the audit, the discovery and the READ check in TEST_APPROVED_WRITE (MI-5), and rejects the public profile', async () => {
     createAuthProfile('WRITE');
     const jobManager = managerWith(fakeWorker({ runIds: RUN_IDS }));
     const chain = await waitForChainEnd(jobManager, await startChain(jobManager));
-    expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['DISCOVERY', 'DONE'], ['READ_CHECK', 'NOT_NEEDED']]);
+    expect(chain.stages.map(({ kind, state }) => [kind, state])).toEqual([['AUDIT', 'DONE'], ['DISCOVERY', 'DONE'], ['READ_CHECK', 'NOT_NEEDED']]);
+    expect(jobsOf(jobManager, chain).map(({ jobKind, state }) => [jobKind, state])).toEqual([['AUDIT', 'FINISHED'], ['DISCOVERY', 'FINISHED']]);
     expect(createProfile(database, publicProfile('example-public-chain', MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(await jobManager.startStageChain({ profileId: 'example-public-chain', expectedRevision: MIN_PROFILE_REVISION, startNew: false }))
       .toMatchObject({ ok: false, reason: 'MODE_NOT_EXECUTABLE' });

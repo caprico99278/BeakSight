@@ -215,6 +215,7 @@ export function CrawlLimitsPanel({ view }: Readonly<{ view: CrawlLimitsPanelView
         body={text.dialog.body}
         confirmLabel={text.dialog.confirm}
         cancelLabel={text.dialog.cancel}
+        confirmTone="primary"
         busy={busy}
         onCancel={() => setPending(null)}
         onConfirm={() => {

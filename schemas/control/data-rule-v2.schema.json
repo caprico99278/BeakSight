@@ -73,7 +73,8 @@
             "PARTY_SIZE",
             "FIXED_LIST",
             "OUT_OF_TEMPLATE",
-            "DIGIT_CODE"
+            "DIGIT_CODE",
+            "GENERIC_TEXT"
           ]
         },
         "method": { "enum": ["FROM_TYPE", "FROM_TEMPLATE", "FROM_FIXED_LIST"] },

@@ -25,6 +25,9 @@ import {
   readRecentReadCheckResults,
   updateReadCheck,
 } from '../../src/control/job/read-check-store.js';
+import { UNCONFIRMED_SIDE_EFFECTS } from '../../src/control/approval/api-scenario-draft.js';
+import { createScenario } from '../../src/control/approval/scenario-store.js';
+import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
@@ -32,7 +35,13 @@ import { createProfile } from '../../src/control/store/profile-store.js';
 import { MAX_WORKER_READ_CHECKS, workerAuthenticationDigestOf } from '../../src/control/worker-protocol.js';
 import type { DiscoveredCandidate, DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { classifyCandidate } from '../../src/discovery/classify.js';
-import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../src/discovery/discovery-result.js';
+import {
+  DISCOVERY_ARTIFACT_SCHEMA_VERSION,
+  discoveryReadPagePaths,
+  discoverySummaryOf,
+  mergeDiscoveryCandidates,
+  type DiscoveryDocument,
+} from '../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../src/discovery/fingerprint.js';
 import type { ReadCheckDefinition } from '../../src/discovery/read-check-contracts.js';
 import { writeFakeWorker, type FakeWorker, type FakeWorkerMode, type FakeWorkerValues } from '../helpers/fake-audit-worker.js';
@@ -100,6 +109,11 @@ const LOOKUP = candidateOf(sampleForm({
   fields: [sampleField('id')],
 }));
 const UNKNOWN_DIGEST = `sha256:${'f'.repeat(64)}`;
+/** PL-6b: 登録の form（照合の専用の印を持つシナリオを作るため）。 */
+const CREATE = candidateOf(sampleForm({
+  page: location('/admin/items/new'), action: sampleAction('/admin/items', [], TEST_ORIGIN), submitterText: '登録',
+  fields: [sampleField('name', 'text', { required: true })],
+}));
 
 const definitionFor = (targetIdentityDigest: string, q = 'x'): ReadCheckDefinition => ({
   targetIdentityDigest,
@@ -266,9 +280,10 @@ describe('READ check jobs (T27e): the start', () => {
   }, TEST_TIMEOUT_MS);
 
   // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、認証の設定・発見・READ の
-  // 確かめの定義の保存・READ の確かめのジョブができる（確かめは認証つきの読み取りの監査と同じ）。認証つきの監査（`AUDIT`）は、今までどおり
-  // `MODE_NOT_EXECUTABLE` で、ワーカーを起動しない。
-  it('runs the READ check of a write mode profile after its discovery, and still rejects its AUDIT (T28b)', async () => {
+  // 確かめの定義の保存・READ の確かめのジョブができる（確かめは認証つきの読み取りの監査と同じ）。MI-5（設計書
+  // `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 認証つきの監査（`AUDIT`）は、書き込みのモードでも始められるようになったので、ここで拒むことは
+  // 確かめない（書き込みのモードの監査の開始の確かめは `control-audit-jobs.test.ts`、読み取りだけであることは `write-mode-audit-read-only.test.ts`）。
+  it('runs the READ check of a write mode profile after its discovery (T28b)', async () => {
     expect(createProfile(database, testWriteProfile(WRITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(saveAuthSetup(database, { ...SETUP, profileId: WRITE_PROFILE_ID }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
     await discover(WRITE_PROFILE_ID);
@@ -282,10 +297,6 @@ describe('READ check jobs (T27e): the start', () => {
     });
     expect(readRecentReadCheckResults(database, WRITE_PROFILE_ID).map(({ jobId, readCheckId, result }) => [jobId, readCheckId, result]))
       .toEqual([[ended.jobId, 'write-read-1', 'MATCHED']]);
-    const forked = forks.count();
-    expect(await manager?.startAuditJob({ profileId: WRITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true }))
-      .toEqual({ ok: false, reason: 'MODE_NOT_EXECUTABLE', errors: [] });
-    expect(forks.count()).toBe(forked);
   }, TEST_TIMEOUT_MS);
 
   it('gives a null target page when the last discovery.json cannot be read', async () => {
@@ -313,6 +324,53 @@ describe('READ check jobs (T27e): the start', () => {
     ]);
     expect(readRecentReadCheckResults(database, PROFILE_ID).map(({ readCheckId, result }) => [readCheckId, result]).sort())
       .toEqual([['read-1', 'MATCHED'], ['read-2', 'UNDETERMINED']]);
+  }, TEST_TIMEOUT_MS);
+});
+
+// PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「契約の変更」。PL-6a の持ち越し）: 照合の専用の印（`readVerification.verificationOnly`）で
+// シナリオが参照する READ の定義は、ジョブの管理を通した単独の READ の確かめのジョブで読まない（`START` の定義の一覧に入らず、結果も記録しない）。印のない
+// 参照は今どおり読む。
+describe('READ check jobs (PL-6b): a definition referred to as verification only is not read', () => {
+  it('leaves out the verification only definition from START and from the results, and keeps the other definitions', async () => {
+    expect(createProfile(database, testWriteProfile(WRITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(saveAuthSetup(database, { ...SETUP, profileId: WRITE_PROFILE_ID }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
+    // 登録の候補を持つ発見の記録（索引だけ。ジョブの行と `discovery.json` は作らない）の後に、シナリオを作る。
+    const document: DiscoveryDocument = { ...discoveryDocument('job-pl6b-create'), pages: [
+      ...discoveryDocument('job-pl6b-create').pages,
+      { url: `${TEST_ORIGIN}/admin/items/new`, state: 'READ', record: { location: location('/admin/items/new'), incompleteReasons: [], candidates: [CREATE] }, blockedRequests: 0 },
+    ] };
+    recordDiscoveryCandidates(database, {
+      profileId: WRITE_PROFILE_ID, jobId: document.jobId, at: DEFINITION_AT,
+      entries: mergeDiscoveryCandidates([SEARCH, LOOKUP, CREATE]).map(discoveryIndexEntryOf), readPagePaths: discoveryReadPagePaths(document),
+    });
+    createDefinition('read-standalone', definitionFor(SEARCH.identityDigest), WRITE_PROFILE_ID);
+    createDefinition('read-answer', definitionFor(SEARCH.identityDigest, ''), WRITE_PROFILE_ID);
+    createDefinition('read-shared', definitionFor(LOOKUP.identityDigest), WRITE_PROFILE_ID);
+    const scenarioOf = (scenarioId: string, readCheckId: string, verificationOnly: boolean) => createScenario(database, {
+      scenarioId,
+      draft: {
+        profileId: WRITE_PROFILE_ID, candidateIdentityDigest: CREATE.identityDigest, fieldNames: ['name'], readChecks: [],
+        sideEffectConfirmations: UNCONFIRMED_SIDE_EFFECTS,
+        limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
+        verification: {
+          recordId: null,
+          readVerification: {
+            readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
+            expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }], ...(verificationOnly ? { verificationOnly: true } : {}),
+          },
+        },
+      },
+      discovery: document,
+      at: CHANGED_AT,
+    });
+    expect(scenarioOf('scenario-answer', 'read-answer', true)).toMatchObject({ ok: true });
+    // 印のない参照（人が作った定義を照合にも使う形）は、単独の READ の確かめでも読む。
+    expect(scenarioOf('scenario-shared', 'read-shared', false)).toMatchObject({ ok: true });
+    const ended = await runReadCheckJob('verification-only', { results: ['MATCHED', 'MATCHED'] }, undefined, countingFork, WRITE_PROFILE_ID);
+    expect(ended).toMatchObject({ jobKind: 'READ_CHECK', state: 'FINISHED', failureReason: null });
+    const start = ended.received.find((message) => message['type'] === 'START');
+    expect((start?.['readChecks'] as readonly { readonly readCheckId: string }[]).map(({ readCheckId }) => readCheckId).sort()).toEqual(['read-shared', 'read-standalone']);
+    expect(readRecentReadCheckResults(database, WRITE_PROFILE_ID).map(({ readCheckId }) => readCheckId).sort()).toEqual(['read-shared', 'read-standalone']);
   }, TEST_TIMEOUT_MS);
 });
 

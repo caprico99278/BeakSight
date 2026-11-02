@@ -636,6 +636,7 @@ describe('PageAuditor rule evaluation and cleanup failures', () => {
       version: 1,
       category: 'DOM',
       severity: 'WARN',
+      plainMessage: 'テストの指摘です。',
       evaluate: () => {
         throw new Error('injected rule failure');
       },

@@ -228,9 +228,8 @@ describe.each(LAUNCHERS)('T37a: the audit stage of the discovery, READ check and
       candidateFields: [{ name: 'name', type: 'text', readonly: false, hidden: false, disabled: false }],
       values: { name: 'テスト' },
       verification: {
-        successCondition: { pathPrefix: SPA_APP_PATHS.admin, selector: '#members' },
-        inputErrorCondition: { pathPrefix: SPA_APP_PATHS.memberNew, selector: '.error' },
-        recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${SPA_APP_PATHS.admin}/members/{id}/edit` },
+        resultJudgement: 'FORM_STRUCTURE',
+        recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${SPA_APP_PATHS.admin}/members/{id}/edit`] },
       },
       readVerification: {
         readCheckId: 'rc-t37a',

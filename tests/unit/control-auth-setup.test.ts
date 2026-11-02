@@ -490,3 +490,25 @@ describe('T25a: validateAuthSetup rejects each rule violation with its own code 
     expect(codesOf(validate(throwing))).toEqual(['AUTH_SETUP_SCHEMA_INVALID']);
   });
 });
+
+// OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D3。DEF-181）: 手動のログインのプロファイルだけ、成功の条件を空（path もセレクタもない）にして
+// 保存できる（開始の URL がログインの画面や `/` のときの案。手でのログインの後に、観察した成功の画面の path が埋める。空の条件は実行時に成功にしない）。
+// 自動ログインのプロファイルは、今どおり拒む。
+describe('OP-1: an empty success condition', () => {
+  it('accepts an empty success condition for a manual login profile only', () => {
+    const empty = withSetup({ successCondition: { pathPrefix: '', selector: null } });
+    expect(codesOf(validate(empty))).toEqual([]);
+    const automatedProfile = validatedProfileOf({ ...testAuthProfileInput, auth: 'AUTOMATED_LOGIN' });
+    const automated = {
+      ...empty,
+      maxLoginAttempts: 1,
+      automatedLogin: {
+        usernameSelector: '#user', passwordSelector: '#pass', submitSelector: '#go',
+        failureConditions: { invalidCredentials: null, accountLocked: null, mfaRequired: null, credentialExpired: null },
+      },
+    };
+    expect(validate(automated, automatedProfile).ok).toBe(false);
+    // 空の path にセレクタがあるもの（どの画面の path にも当たる）は、今どおり拒む。
+    expect(validate(withSetup({ successCondition: { pathPrefix: '', selector: '#account-menu' } })).ok).toBe(false);
+  });
+});

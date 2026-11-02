@@ -5,22 +5,20 @@ import { formatCount, formatDateTime, formatInteger } from '../../../../../../..
 import {
   AUDIT_JOB_START_REJECTION_DESCRIPTIONS,
   EXECUTION_GRANT_REJECTION_DESCRIPTIONS,
-  LOCAL_UI_DISCOVERY_TEXT,
   LOCAL_UI_SCENARIO_TEXT,
+  LOCAL_UI_WRITE_STAGE_TEXT,
   LOCAL_UI_WRITE_TEXT,
   WRITE_START_LOCAL_REJECTION_DESCRIPTIONS,
   listText,
 } from '../../../../../../../src/presentation/messages.js';
+import { AdvancedSettings } from '../../../../components/AdvancedSettings';
 import { ConfirmDialog } from '../../../../components/ConfirmDialog';
 import { Notice } from '../../../../components/Notice';
-import { PageFrame } from '../../../../components/PageFrame';
-import { ScenarioApiShape } from '../../../../components/ScenarioApiShape';
+import { PageFrame, scenarioTrail } from '../../../../components/PageFrame';
 import { ScenarioProfilePanel } from '../../../../components/ScenarioProfilePanel';
 import {
   approvalInvalidityReasonDisplay,
   scenarioDisplayStateDisplay,
-  scenarioTransportDisplay,
-  scenarioVerificationItemDisplay,
   toneClass,
   writeChainStateDisplay,
 } from '../../../../display/labels';
@@ -46,6 +44,7 @@ export const Route = createFileRoute('/scenarios/$profileId/$scenarioId/write')(
 
 const text = LOCAL_UI_WRITE_TEXT;
 const scenarioText = LOCAL_UI_SCENARIO_TEXT;
+const stageText = LOCAL_UI_WRITE_STAGE_TEXT.write;
 
 /** 拒んだ結果の説明と手順（どの段で拒んだかで、文言のカタログを選ぶ）。 */
 const rejectionTextOf = (result: Extract<WriteStartView, { ok: false }>): { readonly description: string; readonly action: string } => {
@@ -105,21 +104,17 @@ function WriteChainOffer({ chain, onOpen }: Readonly<{ chain: NonNullable<WriteS
 /** T41g: 「登録してから更新する」の確認のダイアログの本文（2 回の書き込みの、それぞれの送り先と累積の残り）。 */
 function WriteChainSteps({ chain, page }: Readonly<{ chain: NonNullable<WriteStartPageView['chain']>; page: WriteStartPageView }>) {
   const create = chain.create;
-  const update = page.update;
-  const updateAction = page.scenario.api === null ? update?.actionPath ?? '' : `${page.scenario.api.request.origin}${page.scenario.api.request.pathShape}`;
   return (
     <div>
       {create === null ? null : (
         <dl className="facts" data-testid="write-start-chain-step" data-step="CREATE" data-scenario-id={create.scenarioId} data-remaining={String(create.remaining)}>
-          <dt>{text.chain.stepCreate(create.scenarioId)}</dt>
-          <dd>{text.chain.stepAction}: <code>{create.action}</code></dd>
+          <dt>{text.chain.stepCreate}</dt>
           <dd>{text.chain.stepRemaining}: {text.chain.remainingValue(formatCount(create.remaining), formatCount(create.limit))}</dd>
         </dl>
       )}
       <dl className="facts" data-testid="write-start-chain-step" data-step="UPDATE" data-scenario-id={page.scenario.scenarioId}
         data-remaining={String(page.remaining)}>
-        <dt>{text.chain.stepUpdate(page.scenario.scenarioId)}</dt>
-        <dd>{text.chain.stepAction}: <code>{updateAction}</code></dd>
+        <dt>{text.chain.stepUpdate}</dt>
         <dd>{text.chain.stepRemaining}: {text.chain.remainingValue(formatCount(page.remaining), formatCount(page.scenario.limits.maxCumulativeCreates))}</dd>
         <dd>{text.chain.stepTarget}: {text.chain.stepTargetValue}</dd>
       </dl>
@@ -134,8 +129,10 @@ function WriteChainSteps({ chain, page }: Readonly<{ chain: NonNullable<WriteSta
  * 詳細へ移る。拒まれたら、理由をカタログの文言で出す。
  * T31h-2（Task 31 の設計書 3 章の「対象の選び方」、10 章）: 更新（UPDATE）のシナリオでは、送る欄の代わりに、更新するレコード（予定のレコード）、変える欄、
  * 保つ欄、型に予定の ID を入れた更新の画面の path と送り先を出し、開始の要求に画面が見せた予定の ID を載せる（予定がなければ始められない）。
- * T40d（Task 40 の設計書 3.5）: 送り方のラベルを出す。API のシナリオは、送り先に承認した API の path の型を、その下に承認した API の要求の型の要約
- * （シナリオの詳細と同じ部品 `ScenarioApiShape`）を出す。始め方と確かめは form と同じ。
+ * T40d（Task 40 の設計書 3.5）: API のシナリオも、始め方と確かめは form と同じ。
+ * PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2、7 章）: 要点のパネル（何を・どこへ・何件、隔離の注意、始められない理由、主のボタン
+ * 「書き込みを始める」）と詳しい内容 1 つ（確かめる値）の形にした。書き込みの手順の ID・版・送り方・送り先のアドレス・API の要求の型は出さない。
+ * 「書き込みの手順の詳細に戻る」は出さない（今どこにいるかの 1 行）。
  */
 function WriteStartPage() {
   const page = Route.useLoaderData();
@@ -150,18 +147,12 @@ function WriteStartPage() {
   const [busy, setBusy] = useState(false);
   const [rejection, setRejection] = useState<Extract<WriteStartView, { ok: false }> | null>(null);
   const { profile, scenario, update } = page;
-  // T38b: API のシナリオは form の要求の形を持たない（null）。T40d: 送り先は、承認した API の要求の型（`scenario.api`）の path の型で示す。
-  const { request, api } = scenario;
-  const origin = page.showOrigins && request !== null ? request.origin : '';
-  const transport = scenarioTransportDisplay(scenario.transport);
   const updateText = scenarioText.update;
-  const params = { profileId: profile.profileId, scenarioId: scenario.scenarioId };
   const rejectionText = rejection === null ? null : rejectionTextOf(rejection);
 
   return (
-    <PageFrame title={text.pages.writeStart}>
-      <ScenarioProfilePanel profile={profile} eligible={page.eligible} editable={page.eligible} />
-
+    <PageFrame title={text.pages.writeStart} trail={scenarioTrail(profile.profileId, scenario.scenarioId)}>
+      {/* PL-5（設計書 3 章の 1）: 要点のパネル（何を・どこへ・何件、隔離の注意、始められない理由、主のボタン 1 つ）。 */}
       <section
         className="panel"
         data-testid="write-start"
@@ -169,123 +160,50 @@ function WriteStartPage() {
         data-kind={scenario.kind}
         data-startable={String(page.startable)}
       >
-        <h2 className="panel-heading">{text.confirmHeading}</h2>
-        <p>{update === null ? text.confirmNote : text.confirmNoteUpdate}</p>
-        <dl className="facts">
-          <dt>{text.scenario}</dt>
-          <dd><code>{scenario.scenarioId}</code></dd>
-          <dt>{text.revision}</dt>
-          <dd data-testid="write-start-revision">{scenarioText.revisionValue(formatInteger(scenario.revision))}</dd>
-          <dt>{text.api.transport}</dt>
-          <dd data-testid="write-start-transport" data-transport={scenario.transport}><span className={toneClass(transport.tone)}>{transport.label}</span></dd>
-          {update === null ? [
-            <dt key="fields:name">{text.fields}</dt>,
-            <dd key="fields:value" data-testid="write-start-fields">{scenario.fieldNames.length === 0 ? text.notApplicable : listText(scenario.fieldNames)}</dd>,
-          ] : [
-            <dt key="target:name">{text.targetRecord}</dt>,
-            <dd key="target:value">
-              <span data-testid="write-start-target" data-target={update.plannedTarget ?? ''}>
-                {update.plannedTarget === null ? updateText.noPlannedTarget : <code>{update.plannedTarget}</code>}
-              </span>
-              <span className="field-hint">{text.targetRecordNote}</span>
-            </dd>,
-            <dt key="changed:name">{text.changedFields}</dt>,
-            <dd key="changed:value" data-testid="write-start-changed">
-              {update.changedFieldNames.length === 0 ? text.notApplicable : listText(update.changedFieldNames)}
-            </dd>,
-            <dt key="kept:name">{text.keptFields}</dt>,
-            <dd key="kept:value" data-testid="write-start-kept">{update.keptFieldNames.length === 0 ? text.notApplicable : listText(update.keptFieldNames)}</dd>,
-            <dt key="form:name">{text.formPage}</dt>,
-            <dd key="form:value" data-testid="write-start-form" data-path={update.formPath ?? ''}>
-              {update.formPath === null ? text.notApplicable : <code>{`${origin}${update.formPath}`}</code>}
-            </dd>,
-          ]}
-          <dt>{text.action}</dt>
-          <dd data-testid="write-start-action" data-path={update === null ? request?.path ?? api?.request.pathShape ?? '' : update.actionPath ?? ''}>
-            {update === null
-              ? (request === null
-                ? (api === null ? text.notApplicable : <code>{`${api.request.origin}${api.request.pathShape}`}</code>)
-                : <code>{`${origin}${request.path}`}</code>)
-              // T41e: API の更新の送り先は、承認した API の Origin と path の型。
-              : update.actionPath === null ? text.notApplicable : <code>{`${api === null ? origin : api.request.origin}${update.actionPath}`}</code>}
-            {request === null || request.methodOverride === null
-              ? null
-              : <span>{` ${LOCAL_UI_DISCOVERY_TEXT.methodOverride(request.formMethod, request.methodOverride)}`}</span>}
-          </dd>
-          <dt>{scenarioText.perRunLimit}</dt>
-          <dd>{text.perRun}</dd>
-          <dt>{text.cumulative}</dt>
-          <dd data-testid="write-start-cumulative" data-remaining={String(page.remaining)}>
-            {text.cumulativeValue(formatCount(page.used), formatCount(scenario.limits.maxCumulativeCreates), formatCount(page.remaining))}
-          </dd>
-          <dt>{text.schedule}</dt>
-          <dd data-testid="write-start-schedule" data-remaining={String(page.remainingInWindow)}>
-            {text.scheduleValue(formatInteger(page.intervalMinutes), formatCount(page.writesPerDay), formatCount(page.remainingInWindow))}
-          </dd>
-          <dt>{text.nextAllowedAt}</dt>
-          <dd data-testid="write-start-next" data-next={page.nextWriteAllowedAt ?? ''}>
-            {page.nextWriteAllowedAt === null ? text.nextAllowedNow : formatDateTime(page.nextWriteAllowedAt)}
-          </dd>
-          <dt>{text.notification}</dt>
-          <dd data-testid="write-start-notification" data-confirmed={String(page.notificationConfirmed)}>
-            <span className={toneClass(page.notificationConfirmed ? 'positive' : 'caution')}>
-              {page.notificationConfirmed ? text.notificationConfirmed : text.notificationUnconfirmed}
-            </span>
-          </dd>
-          <dt>{text.evidence}</dt>
-          <dd data-testid="write-start-evidence" data-present={String(page.evidencePresent)}>
-            <span className={toneClass(page.evidencePresent ? 'positive' : 'caution')}>{page.evidencePresent ? text.evidencePresent : text.evidenceMissing}</span>
-          </dd>
-          <dt>{text.approval}</dt>
-          <dd data-testid="write-start-approval" data-approved={page.approved === null ? '' : String(page.approved)}>
-            {page.approved === null
-              ? scenarioText.factsUnavailable
-              : page.approved
-                ? <span className={toneClass(scenarioDisplayStateDisplay('APPROVED').tone)}>{scenarioDisplayStateDisplay('APPROVED').label}</span>
-                : listText(page.invalidityReasons.map((reason) => approvalInvalidityReasonDisplay(reason).label))}
-          </dd>
-        </dl>
-        {/* T40d: API のシナリオは、承認した API の要求の型の要約（値を持たない型と名前）を出す。 */}
-        {api === null ? null : <ScenarioApiShape api={api} transport={scenario.transport} testId="write-start-api-shape" />}
-        {page.missingVerification.length === 0 ? null : (
-          <Notice kind="caution" heading={text.verificationMissingHeading}>
-            <div data-testid="write-start-verification-missing">
-              <p>{text.verificationMissing}</p>
-              <ul>
-                {page.missingVerification.map((item) => <li key={item} data-item={item}>{scenarioVerificationItemDisplay(item).label}</li>)}
-              </ul>
-            </div>
-          </Notice>
+        <h2 className="panel-heading">{LOCAL_UI_WRITE_STAGE_TEXT.summaryHeading}</h2>
+        <ScenarioProfilePanel eligible={page.eligible} editable={page.eligible} />
+        {/* PL-S（設計書 7 章）: 何を・どこへ・何件（書き込みの OK のダイアログと同じ文）。 */}
+        <p data-testid="write-start-target-text">
+          {(update === null ? scenarioText.approveDialog.targetCreate : scenarioText.approveDialog.targetUpdate)(
+            scenario.pagePath, formatInteger(scenario.limits.maxCreatesPerRun),
+          )}
+        </p>
+        {/* OP-2 の修正の 1 回目（判断 5。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6）: 隔離の注意は出さない。 */}
+        <p data-testid="write-start-state">{page.startable ? stageText.ready : stageText.notReady}</p>
+        {page.nextWriteAllowedAt === null ? null : (
+          <p data-testid="write-start-wait" data-next={page.nextWriteAllowedAt}>{stageText.waitUntil(formatDateTime(page.nextWriteAllowedAt))}</p>
         )}
+        {page.missingVerification.length === 0 ? null : (
+          <p data-testid="write-start-verification-missing">{LOCAL_UI_WRITE_STAGE_TEXT.scenario.verificationMissing}</p>
+        )}
+        {page.approved === false ? (
+          <ul data-testid="write-start-not-approved">
+            {page.invalidityReasons.map((reason) => <li key={reason} data-reason={reason}>{approvalInvalidityReasonDisplay(reason).label}</li>)}
+          </ul>
+        ) : null}
+        {update !== null && update.plannedTarget === null ? <p data-testid="write-start-no-target">{LOCAL_UI_WRITE_STAGE_TEXT.scenario.noPlannedTarget}</p> : null}
         {page.startBlocker === null ? null : (
-          <Notice kind="caution">
-            <div data-testid="write-start-blocker" data-reason={page.startBlocker}>
-              <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[page.startBlocker].description}</p>
-              <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[page.startBlocker].action}</p>
-            </div>
-          </Notice>
+          <div data-testid="write-start-blocker" data-reason={page.startBlocker}>
+            <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[page.startBlocker].description}</p>
+            <p>{AUDIT_JOB_START_REJECTION_DESCRIPTIONS[page.startBlocker].action}</p>
+          </div>
         )}
         {/* T40R2-fix（M-1）: 照合の READ の期待が、実行のたびに変わる値と比べない（許可の発行と同じ判定の理由）。 */}
         {page.readVerificationVaryingRejection === null ? null : (
-          <Notice kind="caution" heading={text.readVerificationNotVaryingHeading}>
-            <div data-testid="write-start-read-verification-not-varying" data-reason={page.readVerificationVaryingRejection}>
-              <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.readVerificationVaryingRejection].description}</p>
-              <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.readVerificationVaryingRejection].action}</p>
-            </div>
-          </Notice>
+          <div data-testid="write-start-read-verification-not-varying" data-reason={page.readVerificationVaryingRejection}>
+            <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.readVerificationVaryingRejection].description}</p>
+            <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.readVerificationVaryingRejection].action}</p>
+          </div>
         )}
         {/* T41e-2: API の更新の台帳の結び付きが外れた（許可の発行の確かめ直しと同じ部品の理由）。 */}
         {page.ledgerBindingRejection === null ? null : (
-          <Notice kind="caution">
-            <div data-testid="write-start-ledger-unbound" data-reason={page.ledgerBindingRejection}>
-              <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.ledgerBindingRejection].description}</p>
-              <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.ledgerBindingRejection].action}</p>
-            </div>
-          </Notice>
+          <div data-testid="write-start-ledger-unbound" data-reason={page.ledgerBindingRejection}>
+            <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.ledgerBindingRejection].description}</p>
+            <p>{EXECUTION_GRANT_REJECTION_DESCRIPTIONS[page.ledgerBindingRejection].action}</p>
+          </div>
         )}
-        {page.startable ? null : <p data-testid="write-start-not-startable">{text.notStartable}</p>}
-        {/* T41g: 登録してから更新する（台帳の参照を持つ更新のシナリオだけ）。 */}
-        {page.chain === null ? null : <WriteChainOffer chain={page.chain} onOpen={() => setChainDialog(true)} />}
+        {page.notificationConfirmed ? null : <p data-testid="write-start-notification-unconfirmed">{text.notificationUnconfirmed}</p>}
+        {page.evidencePresent ? null : <p data-testid="write-start-evidence-missing">{text.evidenceMissing}</p>}
         {rejection === null || rejectionText === null ? null : (
           <Notice kind="critical" heading={text.startRejectedHeading}>
             <div data-testid="write-start-rejection" data-stage={rejection.stage} data-reason={rejection.reason}>
@@ -302,12 +220,68 @@ function WriteStartPage() {
             </div>
           </Notice>
         )}
-        <div className="button-row">
-          {page.startable ? (
+        {/* T41g: 登録してから更新する（台帳の参照を持つ更新のシナリオだけ。二次のボタン）。 */}
+        {page.chain === null ? null : <WriteChainOffer chain={page.chain} onOpen={() => setChainDialog(true)} />}
+        {/* PL-V（判断 5）・PL-5 の 7: 「書き込みの手順の詳細に戻る」は、今どこにいるかの 1 行で足りるので出さない。 */}
+        {page.startable ? (
+          <div className="button-row">
             <button type="button" className="button button--primary" data-testid="write-start-open" onClick={() => setDialog(true)}>{text.start}</button>
-          ) : null}
-          <Link to="/scenarios/$profileId/$scenarioId" params={params} className="button">{text.backToScenario}</Link>
-        </div>
+          </div>
+        ) : null}
+      </section>
+
+      {/* 3 章の 1: 詳しい内容 1 つ（確かめる値。送り先のアドレス・送り方・ID・版は出さない）。 */}
+      <section className="panel">
+        <AdvancedSettings testId="write-start-advanced">
+          <dl className="facts">
+            {update === null ? [
+              <dt key="fields:name">{text.fields}</dt>,
+              <dd key="fields:value" data-testid="write-start-fields">{scenario.fieldNames.length === 0 ? text.notApplicable : listText(scenario.fieldNames)}</dd>,
+            ] : [
+              <dt key="target:name">{text.targetRecord}</dt>,
+              <dd key="target:value">
+                <span data-testid="write-start-target" data-target={update.plannedTarget ?? ''}>
+                  {update.plannedTarget === null ? updateText.noPlannedTarget : update.plannedTarget}
+                </span>
+                <span className="field-hint">{text.targetRecordNote}</span>
+              </dd>,
+              <dt key="changed:name">{text.changedFields}</dt>,
+              <dd key="changed:value" data-testid="write-start-changed">
+                {update.changedFieldNames.length === 0 ? text.notApplicable : listText(update.changedFieldNames)}
+              </dd>,
+              <dt key="kept:name">{text.keptFields}</dt>,
+              <dd key="kept:value" data-testid="write-start-kept">{update.keptFieldNames.length === 0 ? text.notApplicable : listText(update.keptFieldNames)}</dd>,
+            ]}
+            <dt>{scenarioText.perRunLimit}</dt>
+            <dd>{text.perRun}</dd>
+            <dt>{text.cumulative}</dt>
+            <dd data-testid="write-start-cumulative" data-remaining={String(page.remaining)}>
+              {text.cumulativeValue(formatCount(page.used), formatCount(scenario.limits.maxCumulativeCreates), formatCount(page.remaining))}
+            </dd>
+            <dt>{text.schedule}</dt>
+            <dd data-testid="write-start-schedule" data-remaining={String(page.remainingInWindow)}>
+              {text.scheduleValue(formatInteger(page.intervalMinutes), formatCount(page.writesPerDay), formatCount(page.remainingInWindow))}
+            </dd>
+            <dt>{text.nextAllowedAt}</dt>
+            <dd data-testid="write-start-next" data-next={page.nextWriteAllowedAt ?? ''}>
+              {page.nextWriteAllowedAt === null ? text.nextAllowedNow : formatDateTime(page.nextWriteAllowedAt)}
+            </dd>
+            <dt>{text.notification}</dt>
+            <dd data-testid="write-start-notification" data-confirmed={String(page.notificationConfirmed)}>
+              <span className={toneClass(page.notificationConfirmed ? 'positive' : 'caution')}>
+                {page.notificationConfirmed ? text.notificationConfirmed : text.notificationUnconfirmed}
+              </span>
+            </dd>
+            <dt>{text.approval}</dt>
+            <dd data-testid="write-start-approval" data-approved={page.approved === null ? '' : String(page.approved)}>
+              {page.approved === null
+                ? scenarioText.factsUnavailable
+                : page.approved
+                  ? <span className={toneClass(scenarioDisplayStateDisplay('APPROVED').tone)}>{scenarioDisplayStateDisplay('APPROVED').label}</span>
+                  : listText(page.invalidityReasons.map((reason) => approvalInvalidityReasonDisplay(reason).label))}
+            </dd>
+          </dl>
+        </AdvancedSettings>
       </section>
 
       <ConfirmDialog
@@ -316,6 +290,7 @@ function WriteStartPage() {
         body={update === null ? text.startDialog.body : text.startDialogUpdateBody}
         confirmLabel={busy ? text.starting : text.startDialog.confirm}
         cancelLabel={text.startDialog.cancel}
+        confirmTone="danger"
         busy={busy}
         onCancel={() => setDialog(false)}
         onConfirm={() => {
@@ -346,6 +321,7 @@ function WriteStartPage() {
           body={text.chain.dialogBody}
           confirmLabel={busy ? text.starting : text.chain.confirm}
           cancelLabel={text.startDialog.cancel}
+          confirmTone="danger"
           busy={busy}
           onCancel={() => setChainDialog(false)}
           onConfirm={() => {

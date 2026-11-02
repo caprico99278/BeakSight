@@ -249,6 +249,23 @@ describe.each(LAUNCHERS)('T26d-1: the automated login stage (%s)', (_name, launc
     expectNoSecretLeak(run);
   }, TEST_TIMEOUT_MS);
 
+  // OP-1（DEF-181。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 5）: 成功の条件が空（path も selector もない）なら、それだけでは成功にしない
+  // （空の条件はどの画面にも当たる）。失敗の条件にも当たらないので、結果は分からないで終わる。
+  it('DEF-181: does not treat an empty success condition alone as a success', async () => {
+    const base = setupFor('standard', 'success');
+    const setup: AuthSetup = {
+      ...base,
+      successCondition: { pathPrefix: '', selector: null },
+      automatedLogin: base.automatedLogin === null ? null : {
+        ...base.automatedLogin,
+        failureConditions: { invalidCredentials: null, accountLocked: null, mfaRequired: null, credentialExpired: null },
+      },
+    };
+    const run = await runStage({ request: { setup } });
+    expect(run.result.kind).not.toBe('AUTHENTICATED');
+    expectNoSecretLeak(run);
+  }, TEST_TIMEOUT_MS);
+
   // T34c（T34d の申し送り）: 画面が新しく保存する、認証の設定の版 3 のフォームの送信（`FORM_NAVIGATION`）でも、自動ログインの段が今どおり動く。
   it('logs in with a version 3 form navigation setup as before (only one POST reaches the server)', async () => {
     const { schemaVersion: _version2, ...fields } = setupFor('standard', 'success');

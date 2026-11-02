@@ -6,6 +6,9 @@
  *   認証の設定が要らない）。
  * - 結果は成果物 `entry-check.json` が正（管理データには結果を残さない）。最後の成功した入口の確かめ（終わったジョブで、Run の状態が `COMPLETE`）の
  *   成果物を、スキーマとジョブの ID を確かめる読み出し（`readJobResultDocument`）で読み、項目を選んで写す。欄の値は成果物にもない。
+ * - MI-3（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 入口の確かめの後の認証の設定の状態（`entryCheckAuthSetupStateOf`）。ジョブの画面の
+ *   「入口の確かめの結果」とプロファイルの詳細の「次にすること」が、この 1 か所を使う。判定と案の組み立ては、ジョブの管理が案で保存するときと同じ部品
+ *   （`src/control/auth/auth-setup-proposal.ts`）、案の検証は保存と同じ部品（`validateAuthSetupForProfile`）。管理データには記録しない（設計者の判断）。
  */
 import { createServerFn, createServerOnlyFn } from '@tanstack/react-start';
 import type { ConfigErrorKind } from '../../../../src/config/config-error.js';
@@ -13,8 +16,20 @@ import type { EntryCheckDocument } from '../../../../src/control/entry-check.js'
 import { FINISHED_AUDIT_JOB_STATE } from '../../../../src/control/job/job-records.js';
 // T44g（Task 44 の設計書 P4-8 の CC-105）: ジョブの種類の値は、IPC の契約の名前つきの定数から読む（画面のサーバに同じ定数を置かない）。
 import { WORKER_ENTRY_CHECK_JOB_KIND } from '../../../../src/control/worker-protocol.js';
-import type { AuditJobView } from '../../../../src/control/job/job-store.js';
+import { lastFinishedEntryCheckJobOf, type AuditJobView } from '../../../../src/control/job/job-store.js';
 import type { RunStatus } from '../../../../src/core/contracts.js';
+import { startUrlPathOf } from '../../../../src/config/target-config-draft.js';
+import {
+  authSetupProposalProfileOf,
+  entryCheckAuthSetupDecisionOf,
+  proposedAuthSetupOf,
+  type EntryCheckAuthSetupState,
+} from '../../../../src/control/auth/auth-setup-proposal.js';
+import { validateSiteProfile } from '../../../../src/control/profile-policy.js';
+import { getAuthSetup, validateAuthSetupForProfile } from '../../../../src/control/store/auth-setup-store.js';
+import { getProfile } from '../../../../src/control/store/profile-store.js';
+import { localUiStore } from './control-store';
+import { loadTargetContext } from './target-config';
 import type { AuditJobStartView, AuditStartCheckView } from './audit-job-functions';
 import { auditStartCheckOf, startRejectionViewOf } from './audit-start-check';
 import { localUiAuditJobs } from './audit-jobs';
@@ -68,6 +83,51 @@ export const entryCheckResultOfJob = createServerOnlyFn(async (job: AuditJobView
   return document === null ? null : entryCheckResultViewOf(document);
 });
 
+/**
+ * MI-3: 入口の確かめの後の、プロファイルの認証の設定の状態（プロファイルがなければ `null`）。`entryCheck` は入口の確かめの結果（なければ `null`）。案で保存する
+ * 判定が `PROPOSE` のとき（認証の設定がなく、読んでいてログインの画面）だけ、今のプロファイルと対象の設定で案を作り、保存の検証にかける: 通らなければ
+ * `PROPOSAL_INVALID`、通るのに設定がなければ `NOT_SAVED`（保存が改訂の衝突などで済まなかった）。サーバだけで使う。
+ */
+export const entryCheckAuthSetupStateOf = createServerOnlyFn(async (
+  profileId: string,
+  entryCheck: Pick<EntryCheckResultView, 'endReason' | 'facts' | 'proposal'> | null,
+): Promise<EntryCheckAuthSetupState | null> => {
+  const database = localUiStore();
+  const stored = getProfile(database, profileId);
+  if (stored === null) {
+    return null;
+  }
+  const { profile } = stored;
+  const { usesAuthSetup, automated } = authSetupProposalProfileOf(profile.mode, profile.auth);
+  const decision = entryCheckAuthSetupDecisionOf({ usesAuthSetup, hasAuthSetup: getAuthSetup(database, profileId) !== null, entryCheck });
+  if (decision !== 'PROPOSE' || entryCheck === null) {
+    return decision === 'PROPOSE' ? 'NOT_CHECKED' : decision;
+  }
+  const { context } = await loadTargetContext(profile.targetConfigPath);
+  const site = context === undefined ? null : validateSiteProfile(profile, context);
+  if (context === undefined || site === null || !site.ok) {
+    return 'PROPOSAL_INVALID';
+  }
+  const setup = proposedAuthSetupOf({
+    profileId,
+    profileRevision: profile.revision,
+    automated,
+    startUrlPath: startUrlPathOf(context.targetConfig.site.startUrl) ?? null,
+    entryProposal: entryCheck.proposal,
+  });
+  return validateAuthSetupForProfile(setup, site.profile, context).ok ? 'NOT_SAVED' : 'PROPOSAL_INVALID';
+});
+
+/**
+ * MI-3: プロファイルの最後の、終わった（`FINISHED`）入口の確かめの結果（Run の状態を問わない。「読んでいない」も理由として示すため）。なければ `null`。
+ * サーバだけで使う。
+ */
+export const lastFinishedEntryCheckOf = createServerOnlyFn(async (profileId: string): Promise<EntryCheckResultView | null> => {
+  // OP-K（共通化）: 選び方は、ジョブの管理と同じ 1 か所（`lastFinishedEntryCheckJobOf`）。
+  const job = lastFinishedEntryCheckJobOf(localUiAuditJobs().listAuditJobs(), profileId);
+  return job === null ? null : entryCheckResultOfJob(job);
+});
+
 /** 最後の成功した入口の確かめ（なければ `null`）。ジョブの一覧は新しい順。 */
 const latestEntryCheckOf = async (profileId: string): Promise<EntryCheckLatestView | null> => {
   const job = localUiAuditJobs().listAuditJobs().find((candidate) =>
@@ -78,12 +138,22 @@ const latestEntryCheckOf = async (profileId: string): Promise<EntryCheckLatestVi
     : { jobId: job.jobId, finishedAt: isoTimestampOrNull(job.finishedAt), result: await entryCheckResultOfJob(job) };
 };
 
+/**
+ * MI-F5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 6）: プロファイルの最後の成功した入口の確かめの案（なければ `null`）。認証の設定の画面が
+ * 新しい設定の欄に埋める案（`latestEntryCheckOf`。画面の `entryCheck.latest`）と同じもの。認証の設定がまだないときの最初の保存は、送信先の項目がこの案と同じとき
+ * だけ受ける。サーバだけで使う。
+ */
+export const latestEntryCheckProposalOf = createServerOnlyFn(async (profileId: string): Promise<EntryCheckResultView['proposal']> =>
+  (await latestEntryCheckOf(profileId))?.result?.proposal ?? null);
+
 interface ProfileKeyRequest {
   readonly profileId: string;
 }
 interface EntryCheckStartRequest {
   readonly profileId: string;
   readonly expectedRevision: number;
+  /** OP-1: 下調べの後に、続けて点検を始める（作成の画面の「点検を始める」）。 */
+  readonly thenStartAudit?: boolean;
 }
 
 /** プロファイルの入口の確かめの要点（読むだけ）。プロファイルがなければ `null`。 */
@@ -108,7 +178,10 @@ export const entryCheckSummaryFn = createServerFn({ method: 'GET' })
 export const startEntryCheckFn = createServerFn({ method: 'POST' })
   .validator(requestOf<EntryCheckStartRequest>('ui-entry-check-start'))
   .handler(async ({ data }): Promise<AuditJobStartView> => {
-    const result = await localUiAuditJobs().startEntryCheck({ profileId: data.profileId, expectedRevision: data.expectedRevision });
+    // OP-1（4.1.3 の 3）: 作成の画面の「点検を始める」は、下調べの後に続けて点検を始める印を渡す（始めるかはジョブの管理が決める）。
+    const result = await localUiAuditJobs().startEntryCheck({
+      profileId: data.profileId, expectedRevision: data.expectedRevision, ...(data.thenStartAudit === true ? { thenStartAudit: true } : {}),
+    });
     return result.ok
       ? { ok: true, jobId: result.job.jobId }
       : { ok: false, ...startRejectionViewOf(result) };

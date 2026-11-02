@@ -39,7 +39,11 @@ describe('T25e: the display catalogs and texts of the authenticated audit', () =
     for (const text of Object.values(AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS)) {
       expect(text).toMatch(SENTENCE_END);
     }
-    expect(Object.keys(AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS).sort()).toEqual([...AUTH_SETUP_STORE_REJECTION_REASONS].sort());
+    // MI-C 項目 12: 保存の部品の理由に、画面のサーバの保存が拒む `NEW_TARGET_FROM_AUTOMATED_LOGIN`（`auth-setup-functions.ts` の `AuthSetupSaveRejectionReason`）を足す。
+    // MI-F1（設計書 4.7.1 の 1）: 下書きからの保存で、ジョブの行の観察にない Origin を足す `SERVICE_ORIGIN_ADD_NOT_OBSERVED` も足す。
+    // MI-F3（設計書 4.3）: 監査の開始の画面の読まないパスの保存で、替える元の認証の設定がない `AUTH_SETUP_NOT_FOUND` も足す。
+    expect(Object.keys(AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS).sort())
+      .toEqual([...AUTH_SETUP_STORE_REJECTION_REASONS, 'NEW_TARGET_FROM_AUTOMATED_LOGIN', 'SERVICE_ORIGIN_ADD_NOT_OBSERVED', 'AUTH_SETUP_NOT_FOUND'].sort());
     for (const { description, action } of Object.values(AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS)) {
       expect(description).toMatch(SENTENCE_END);
       expect(action).toMatch(SENTENCE_END);
@@ -47,19 +51,24 @@ describe('T25e: the display catalogs and texts of the authenticated audit', () =
     expect(Object.keys(AUDIT_JOB_START_REJECTION_DESCRIPTIONS).sort()).toEqual([...AUDIT_JOB_START_REJECTION_REASONS].sort());
   });
 
-  it('says that only the approved write audit is not executable yet (the authenticated read audit is executable now)', () => {
+  it('says that the audit is executable in every mode, including the write mode (MI-5)', () => {
     const { description, action } = AUDIT_JOB_START_REJECTION_DESCRIPTIONS.MODE_NOT_EXECUTABLE;
-    expect(description).toContain('承認した書き込みの監査');
+    // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードでも監査を始められるので、「書き込みのモードでは監査を
+    // 始められない」とは言わない（前は「承認した書き込みの監査」は始められない、と言っていた）。
+    expect(description).not.toContain('承認した書き込みの監査');
     expect(description).not.toContain('ログイン');
-    // T25e round 1: 手順は、今実行できる 2 つのモード（公開の監査、認証つきの読み取りの監査）を案内する。
-    expect(action).toContain('公開の監査');
-    expect(action).toContain('認証つきの読み取りの監査');
-    // T25e round 1: プロファイルのフォームの「今は実行できない」案内は、承認した書き込みの監査だけを言う（ログインは今使える）。
-    expect(LOCAL_UI_TEXT.profileForm.testModeNotice).toContain('承認した書き込みの監査');
-    expect(LOCAL_UI_TEXT.profileForm.testModeNotice).not.toContain('ログイン');
+    // T25e round 1: 手順は、今実行できるモード（公開の監査、認証つきの読み取りの監査、MI-5 から承認した書き込みのモード）を案内する。
+    // PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 5 章）: 画面の言葉（点検のしかたの名前）で案内する。どのしかたでも点検は見るだけ。
+    expect(action).toContain('「公開の画面の点検」');
+    expect(action).toContain('「ログインして見るだけの点検」');
+    expect(action).toContain('「書き込みも試す点検」');
+    expect(action).toContain('点検そのものは、どれも見るだけです');
+    // MI-1 の D（MI-5 の報告による設計者の判断）: プロファイルのフォームの「今は実行できない」案内（testModeNotice）は、どのモードでも出なくなったので
+    // カタログから消した（前は、承認した書き込みの監査だけを言うことを確かめていた）。
+    expect(Object.hasOwn(LOCAL_UI_TEXT.profileForm, 'testModeNotice')).toBe(false);
   });
 
   it('guides the login on the start screen with the agreed sentence', () => {
-    expect(LOCAL_UI_AUTH_TEXT.start.guidance).toBe('BeakSight が開くブラウザでログインしてください。ログインが済むと自動で監査が始まります。');
+    expect(LOCAL_UI_AUTH_TEXT.start.guidance).toBe('BeakSight が開くブラウザでログインしてください。ログインが済むと、自動で作業が進みます。');
   });
 });

@@ -165,7 +165,17 @@
           ]
         },
         "incompleteReasons": { "$ref": "urn:beaksight:schema:control:candidate:1#/properties/incompleteReasons" },
-        "candidates": { "type": "array", "items": { "$ref": "urn:beaksight:schema:control:candidate:1" } }
+        "candidates": { "type": "array", "items": { "$ref": "urn:beaksight:schema:control:candidate:1" } },
+        "screenName": {
+          "description": "Optional (OP-2 fix round 1): the name of the screen, the text of the first h1 and the title, white space folded and cut at MAX_DISCOVERY_SCREEN_NAME_LENGTH of src/discovery/discovery-result.ts; null when empty, absent or looking like a secret. Used only for the name of the row of the screen list; not for a decision. Absent in the documents of the earlier writers (the version stays 1.1).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["heading", "title"],
+          "properties": {
+            "heading": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 60 }, { "type": "null" }] },
+            "title": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 60 }, { "type": "null" }] }
+          }
+        }
       }
     }
   }

@@ -2,6 +2,8 @@
 // T25d（Task 25 の設計書 4.4、4.5）: 認証つきの読み取りの監査（`TEST_AUTH_PASSIVE`）を、手動のログイン（`MANUAL_SESSION`）のときだけ足した。
 // 書き込みの監査（`TEST_APPROVED_WRITE`）は、引き続き実行できない。T26d-2: 自動ログイン（`AUTOMATED_LOGIN`）を、方式として実行できるものに足した
 // （プラットフォームを問わない。Windows だけであることは、ジョブの管理の開始の確かめで強制する。`execution-policy-automated-login.test.ts`）。
+// MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 3 章の判断 1、4.5）: 書き込みのモードのプロファイルでも、読み取りの監査（`AUDIT`）を
+// 始められるようにした（プロファイルを 1 つにする。監査のジョブは、モードにかかわらず読み取りだけ）。
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -25,24 +27,32 @@ import { WORKER_JOB_KINDS } from '../../src/control/worker-protocol.js';
 import { scanSource } from '../architecture/source-scan.js';
 
 describe('executable audit modes', () => {
-  it('lists the public passive audit and the authenticated passive audit, as a frozen subset of the audit modes', () => {
-    expect(EXECUTABLE_AUDIT_MODES).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE']);
+  it('lists every audit mode (MI-5: the write mode too), as a frozen subset of the audit modes', () => {
+    expect(EXECUTABLE_AUDIT_MODES).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
     expect(Object.isFrozen(EXECUTABLE_AUDIT_MODES)).toBe(true);
     expect(EXECUTABLE_AUDIT_MODES.every((mode) => AUDIT_MODES.includes(mode))).toBe(true);
   });
 
-  it('accepts only the listed modes, and rejects the write mode and values that are not modes', () => {
-    expect(AUDIT_MODES.filter(isExecutableAuditMode)).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE']);
-    for (const value of ['TEST_APPROVED_WRITE', 'public_passive', '', null, undefined, 1, ['PUBLIC_PASSIVE']]) {
+  it('accepts only the listed modes (MI-5: the write mode too), and rejects values that are not modes', () => {
+    expect(AUDIT_MODES.filter(isExecutableAuditMode)).toEqual(['PUBLIC_PASSIVE', 'TEST_AUTH_PASSIVE', 'TEST_APPROVED_WRITE']);
+    for (const value of ['test_approved_write', 'public_passive', '', null, undefined, 1, ['PUBLIC_PASSIVE']]) {
       expect(isExecutableAuditMode(value), String(value)).toBe(false);
     }
   });
 
-  it('accepts only NONE for the public audit and MANUAL_SESSION and AUTOMATED_LOGIN (T26d-2) for the authenticated audit (T25d)', () => {
+  it('accepts only NONE for the public audit and MANUAL_SESSION and AUTOMATED_LOGIN for the authenticated audit (T25d, T26d-2) and the write mode (MI-5)', () => {
     const accepted = AUDIT_MODES.flatMap((mode) =>
       AUTH_STRATEGIES.filter((auth) => isExecutableAuthStrategy(mode, auth)).map((auth) => `${mode}/${auth}`));
-    expect(accepted).toEqual(['PUBLIC_PASSIVE/NONE', 'TEST_AUTH_PASSIVE/MANUAL_SESSION', 'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN']);
-    for (const [mode, auth] of [['TEST_AUTH_PASSIVE', 'manual_session'], ['TEST_AUTH_PASSIVE', null], [null, 'NONE'], ['constructor', 'NONE']]) {
+    expect(accepted).toEqual([
+      'PUBLIC_PASSIVE/NONE',
+      'TEST_AUTH_PASSIVE/MANUAL_SESSION',
+      'TEST_AUTH_PASSIVE/AUTOMATED_LOGIN',
+      'TEST_APPROVED_WRITE/MANUAL_SESSION',
+      'TEST_APPROVED_WRITE/AUTOMATED_LOGIN',
+    ]);
+    for (const [mode, auth] of [
+      ['TEST_AUTH_PASSIVE', 'manual_session'], ['TEST_AUTH_PASSIVE', null], [null, 'NONE'], ['constructor', 'NONE'], ['TEST_APPROVED_WRITE', 'NONE'],
+    ]) {
       expect(isExecutableAuthStrategy(mode, auth), `${String(mode)}/${String(auth)}`).toBe(false);
     }
   });
@@ -75,8 +85,8 @@ describe('profile operations by mode (T28b)', () => {
   const AUTH = 'AUTH_STRATEGY_NOT_EXECUTABLE';
   /** 操作ごとの、`PROFILE_KINDS` の順の判定（`null` は許す）。今までの公開監査と認証つきの読み取りの監査の理由は変えない。 */
   const EXPECTED: Readonly<Record<ProfileOperation, readonly (ProfileOperationRejection | null)[]>> = {
-    // 認証つきの監査は、書き込みのモードでは今までどおり始められない（ユーザーの判断の範囲の外）。
-    AUDIT: [ALLOWED, ALLOWED, ALLOWED, MODE, MODE],
+    // MI-5（設計書 3 章の判断 1、4.5）: 認証つきの監査は、書き込みのモードでも始められる（ログインを使う方式。監査のジョブは読み取りだけ）。
+    AUDIT: [ALLOWED, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
     // ログインの確かめは、自動ログインのプロファイルだけ（公開の監査と手動のログインは、今までどおり方式の理由）。
     LOGIN_CHECK: [AUTH, AUTH, ALLOWED, AUTH, ALLOWED],
     DISCOVERY: [MODE, ALLOWED, ALLOWED, ALLOWED, ALLOWED],
@@ -114,9 +124,9 @@ describe('profile operations by mode (T28b)', () => {
     expect(WORKER_JOB_KINDS.filter((kind) => !(PROFILE_OPERATIONS as readonly string[]).includes(kind))).toEqual([]);
     // 書き込みのモードで許すのは、認証の設定・資格情報・ログインの確かめ・発見・READ の確かめ（10 章の 5）と、書き込みのシナリオ（T28e fix round 1。
     // シナリオは書き込みのモードの機能そのもので、書き込みは実行しない）と、承認された CREATE の書き込み（T30e）と、承認された UPDATE の書き込み
-    // （T31e fix round 1）だけ。
+    // （T31e fix round 1）と、読み取りの監査（MI-5）。
     expect(PROFILE_OPERATIONS.filter((operation) => Object.hasOwn(PROFILE_OPERATION_POLICY[operation], 'TEST_APPROVED_WRITE')))
-      .toEqual(['LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
+      .toEqual(['AUDIT', 'LOGIN_CHECK', 'DISCOVERY', 'READ_CHECK', 'AUTH_SETUP', 'CREDENTIAL', 'SCENARIO', 'WRITE_CREATE', 'WRITE_UPDATE', 'ENTRY_CHECK']);
     // T43c: 入口の確かめの行は、公開のモード × `NONE`、テストの 2 つのモード × ログインを使う方式（`NONE` は方式の理由で拒む）。
     expect(PROFILE_OPERATION_POLICY.ENTRY_CHECK).toEqual({
       PUBLIC_PASSIVE: ['NONE'],
@@ -162,8 +172,8 @@ describe('profile operations by mode (T28b)', () => {
     }
   });
 
-  it('needs the auth setup only for an operation the mode accepts (the write mode audit does not need it, as it cannot start)', () => {
-    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('AUDIT', mode))).toEqual([false, true, false]);
+  it('needs the auth setup only for an operation the mode accepts (MI-5: the write mode audit needs it too)', () => {
+    expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('AUDIT', mode))).toEqual([false, true, true]);
     expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('DISCOVERY', mode))).toEqual([false, true, true]);
     expect(AUDIT_MODES.map((mode) => operationRequiresAuthSetup('LOGIN_CHECK', mode))).toEqual([false, true, true]);
     expect(operationRequiresAuthSetup('DISCOVERY', 'constructor')).toBe(false);

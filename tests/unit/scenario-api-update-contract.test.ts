@@ -382,7 +382,8 @@ const updateScenario = (api: Partial<ScenarioApiSpec> = {}, spec: ScenarioApiSpe
   request: null,
   api: { ...spec, ...api },
   fieldNames: ['name'],
-  verification: { ...FULL_VERIFICATION, readVerification: null },
+  // PL-6a: API のシナリオは、結果の判定のしかたの印を持たず（null）、form の ID の型の一覧を持たない（ID は台帳の対象の ID）。
+  verification: { ...FULL_VERIFICATION, resultJudgement: null, recordId: null, readVerification: null },
   update: null,
 });
 

@@ -93,6 +93,8 @@ describe('T22a: the closed lists of src/control/contracts.ts', () => {
         // T34a（Task 34 の設計書 3.1）: 承認したサービスの Origin の形とモード、設定の許可 Origin との重なり。
         'PROFILE_SERVICE_ORIGIN_INVALID',
         'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
+        // PL-F 修正の 1 回目（PL-REV の Minor 2）: 環境の証跡の参照が秘密に見える。
+        'ISOLATION_REFERENCE_SECRET_LIKE',
       ],
     ],
   ] as const)('defines %s as a frozen list of the designed values without duplicates', (_name, values, expected) => {
@@ -139,7 +141,8 @@ describe('T22a: schemas/control/profile.schema.json and the contracts', () => {
     expect(schema.additionalProperties).toBe(false);
     expect(schema.required).toEqual(PROFILE_KEYS);
     // T34a（Task 34 の設計書 3.1）: 任意の項目 `approvedServiceOrigins` を、版を上げずに足した（必須の項目は変えない）。
-    expect(Object.keys(schema.properties as object)).toEqual([...PROFILE_KEYS, 'approvedServiceOrigins']);
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: 任意の項目 `loginPreference` を、版を上げずに足した（必須の項目は変えない）。
+    expect(Object.keys(schema.properties as object)).toEqual([...PROFILE_KEYS, 'approvedServiceOrigins', 'loginPreference']);
     expect(propertyOf(schema, 'approvedServiceOrigins').maxItems).toBe(MAX_APPROVED_SERVICE_ORIGINS);
     expect(propertyOf(schema, 'approvedServiceOrigins').uniqueItems).toBe(true);
   });
@@ -185,6 +188,8 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-auth-setup-save',
       // T43d: 画面の認証の設定とプロファイルのまとめて保存の Server Function の入力（Task 43 の設計書 4.4）。
       'ui-auth-setup-profile-save',
+      // MI-F3: 画面の監査の開始の画面から、認証の設定の読まないパスだけを替えて保存する Server Function の入力（入力を極限まで減らす設計書 4.3）。
+      'ui-auth-setup-excluded-paths-save',
       // T26a: 資格情報のファイル（Task 26 の設計書 4.1）。
       'credential-file',
       // T26e: 画面の資格情報の登録・変更・入れ直しと、ログインの検証の開始の Server Function の入力（Task 26 の設計書 4.2、4.6）。
@@ -214,7 +219,6 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-scenario-revoke',
       // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2）。
       'ui-scenario-auto-draft',
-      'ui-scenario-auto-rules',
       // T29a・FM2c: 入力の規則の集まりの版 2（手動の操作を減らす設計書 3A.3。LG-3: 版 1 の `data-rule` は捨てた）。
       'data-rule-v2',
       // T29e: 画面の入力の規則の保存の Server Function の入力（Task 29 の設計書 4.4）。
@@ -236,6 +240,8 @@ describe('T22a: validateControlDocument with the profile schema', () => {
       'ui-target-crawl-limits',
       // FM2e: 画面の 1 回の操作で自動ログインの設定を終える Server Function の入力（手を減らす段 2 の設計書 3A.4）。
       'ui-automated-login-setup',
+      // OP-2: 画面の「登録・更新を試せる画面」の一覧のチェックの保存の Server Function の入力。
+      'ui-write-screen-check',
     ]);
     expect(Object.isFrozen(CONTROL_SCHEMA_NAMES)).toBe(true);
   });

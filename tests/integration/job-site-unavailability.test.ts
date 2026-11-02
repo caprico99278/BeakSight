@@ -159,19 +159,22 @@ describe.each([
     return page === undefined ? undefined : page.state === 'READ' ? 'READ' : `NOT_READ/${page.reason}`;
   };
 
-  // 受け入れ条件 1・2: 2 つ目の画面（一覧）が不調のままなら、確かめ直しを 1 回だけ行って止め、3 つ目の画面は読み込まない。
+  // 受け入れ条件 1・2: 2 つ目の画面が不調のままなら、確かめ直しを 1 回だけ行って止め、3 つ目の画面は読み込まない。
+  // OP-I（I2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 操作さがしの段は、登録の画面らしいリンクを先に読むので、入口の次に読む
+  // 2 つ目の画面は登録の画面（その次の 3 つ目が一覧）。不調にするのは、2 つ目に読む登録の画面。
   it.each<[string, DiscoverySitePageFault]>([
     ['503', STATUS_503],
     ...(everyCase ? [['a refused connection', { kind: 'REFUSE' }], ['no response', { kind: 'HANG' }]] as [string, DiscoverySitePageFault][] : []),
   ])('stops the discovery when the second page stays unavailable (%s), after one recheck, and reads no third page', async (_name, fault) => {
-    site.setPageFault(P.list, fault);
+    site.setPageFault(P.create, fault);
     const { document, notices } = await discover();
     expect(document).toMatchObject({ endReason: 'SITE_UNAVAILABLE', runStatus: 'PARTIAL' });
     expect(stateOf(document, P.admin)).toBe('READ');
+    expect(stateOf(document, P.create)).toBe('NOT_READ/SITE_UNAVAILABLE');
     expect(stateOf(document, P.list)).toBe('NOT_READ/SITE_UNAVAILABLE');
     expect(stateOf(document, P.search)).toBe('NOT_READ/SITE_UNAVAILABLE');
-    expectLoadsAndArrivals([P.admin, P.list, P.list], fault.kind === 'REFUSE' ? P.list : undefined);
-    expect(notices).toEqual([{ kind: 'SITE_UNAVAILABLE_RECHECK', url: `${site.origin}${P.list}`, delayMs: RECHECK_DELAY_MS, attempt: 1, maxAttempts: 1 }]);
+    expectLoadsAndArrivals([P.admin, P.create, P.create], fault.kind === 'REFUSE' ? P.create : undefined);
+    expect(notices).toEqual([{ kind: 'SITE_UNAVAILABLE_RECHECK', url: `${site.origin}${P.create}`, delayMs: RECHECK_DELAY_MS, attempt: 1, maxAttempts: 1 }]);
   }, TEST_TIMEOUT_MS);
 
   if (!everyCase) {

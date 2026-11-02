@@ -90,10 +90,12 @@ describe('write bundle (T32f)', () => {
   // いない）。
   // LG-4: 照合の READ の見本に対象の種類（`targetKind`。read-evidence の前の版を捨てて必ず持つ）を足したので、版 1.1 の値を求め直した（組み立ての部品は
   // 変えていない）。
+  // PL-6a: 書き込みの記録が版 1.2（成否の条件の代わりに結果の判定のしかたの印）になり、判定の表示の文言（カタログ）を直したので、値を求め直した（組み立ての
+  // 部品は変えていない）。見本の名前の 1.1 は、報告の証拠の版（1.1 のまま）。
   it.each<readonly [string, () => ActionReportDocuments, string]>([
-    ['a verified create of 1.1', verifiedCreateDocuments, 'sha256:6c6efe3bc817e05fede06b02e0852b55aee5ff82537bae78fc332210e91a2b57'],
+    ['a verified create of 1.1', verifiedCreateDocuments, 'sha256:6b1ed5be08094a6198c38a968a114f78fe406dd5990fc559162e8ddcc47c5ba2'],
     ['a verified update of 1.1 (with the notice)', verifiedUpdateDocuments,
-      'sha256:0f3c4767154761d3fc35f93912fad30304cdebb86f3363ed6dcdaffd9e2298c3'],
+      'sha256:91f6644d9e065ff6424a769a024b2c83a9b75ca374a217909d2dd495814bceff'],
   ])('keeps the SHA-256 of the bundle of %s (T32R2 M-2)', (_label, documents, expected) => {
     expect(sha256Of(createActionBundle({ ...inputOf(documents()), reportHtml: PINNED_HTML }))).toBe(expected);
   });

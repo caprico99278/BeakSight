@@ -21,7 +21,6 @@ import {
   CONTROL_STORE_FAILURE_DESCRIPTIONS,
   SETUP_LOCAL_TEXT,
   cliFieldText,
-  labelWithCodeText,
 } from '../../../../src/presentation/messages.js';
 import { repositoryRootOf } from './repository-root';
 
@@ -53,12 +52,16 @@ const databasePath = (): string => resolveControlDatabasePath(localUiRepositoryR
 /** 管理データの場所を、リポジトリの root からの相対の形で（画面に出す。区切りは `/`）。 */
 export const relativeDatabaseLocation = (): string => relative(localUiRepositoryRoot(), databasePath()).replaceAll('\\', '/');
 
-/** 準備の失敗を、コンソールに出す行にする（`npm run setup:local` と同じ説明と手順）。 */
+/**
+ * 準備の失敗を、コンソールに出す行にする（`npm run setup:local` と同じ説明と手順）。PL-2（PL-W の持ち越し。設計書
+ * `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 理由の行は日本語の説明だけにし、英大文字の理由のコードを入れない（詳しいことは
+ * 「詳細」の行にある）。
+ */
 const failureLines = (failure: LocalUiStoreFailure): readonly string[] => {
   const text = CONTROL_STORE_FAILURE_DESCRIPTIONS[failure.reason];
   return Object.freeze([
     SETUP_LOCAL_TEXT.failedHeading,
-    cliFieldText(SETUP_LOCAL_TEXT.reasonLabel, labelWithCodeText(text.description, failure.reason)),
+    cliFieldText(SETUP_LOCAL_TEXT.reasonLabel, text.description),
     ...(ENVIRONMENT_REASONS.has(failure.reason) ? [SETUP_LOCAL_TEXT.nodeVersionText(process.versions.node, MIN_CONTROL_NODE_VERSION)] : []),
     cliFieldText(SETUP_LOCAL_TEXT.locationLabel, relativeDatabaseLocation()),
     cliFieldText(SETUP_LOCAL_TEXT.actionLabel, text.action),

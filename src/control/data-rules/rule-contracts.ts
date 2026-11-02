@@ -51,6 +51,8 @@ export type RuleSetSchemaVersion = typeof RULE_SET_SCHEMA_VERSION;
  * - `FIXED_LIST`（人の固定の一覧の値だけ）、`OUT_OF_TEMPLATE`（テンプレートの外。人の固定の一覧がなければ作らない）。
  * - `DIGIT_CODE`（番号・コード。FM2c）: 欄の pattern が数字だけの固定の桁数（`^\d{7}$`、`[0-9]{4}` など）のとき、その桁数の数字を作る。ほかの
  *   pattern からは作らない（`PATTERN_UNSUPPORTED`）。規則の集まりの版 2 から。
+ * - `GENERIC_TEXT`（作り物の文字。OP-2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D10）: テンプレートの外のふつうの文字の欄（名前が業務の語に
+ *   当たらない text・search・textarea）に、`SYNTHETIC_TEXT_PREFIX` と数字の作り物の文字を作る。推した規則を作るときだけ推す（前に承認した規則の値は変えない）。
  */
 export const SEMANTIC_KINDS = Object.freeze([
   'GENERIC_NUMBER',
@@ -77,6 +79,7 @@ export const SEMANTIC_KINDS = Object.freeze([
   'FIXED_LIST',
   'OUT_OF_TEMPLATE',
   'DIGIT_CODE',
+  'GENERIC_TEXT',
 ] as const);
 export type SemanticKind = (typeof SEMANTIC_KINDS)[number];
 
@@ -329,6 +332,15 @@ export const SYNTHETIC_EMAIL_LOCAL_DIGITS = 10;
 /** 10 進の桁の数から、作る数の上限（`10^digits - 1`）。 */
 const DECIMAL_RADIX = 10;
 export const maxNumberOfDigits = (digits: number): number => DECIMAL_RADIX ** digits - 1;
+
+/** OP-2: 作り物の文字（`GENERIC_TEXT`）の頭（人や物を指さない語。合成のメールアドレスの局所部の頭と同じ語）。 */
+export const SYNTHETIC_TEXT_PREFIX = SYNTHETIC_EMAIL_LOCAL_PREFIX;
+
+/** OP-2: 作り物の文字の、決定的に作る数字の桁の数（値の候補を多くし、送らずに止まった回の値が履歴に入っても尽きないため。設計書 4.1.2 の R4）。 */
+export const SYNTHETIC_TEXT_DIGITS = 8;
+
+/** OP-2: 作り物の文字（`sample` と `SYNTHETIC_TEXT_DIGITS` 桁の数字）。 */
+export const syntheticTextOf = (number: number): string => `${SYNTHETIC_TEXT_PREFIX}${String(number).padStart(SYNTHETIC_TEXT_DIGITS, '0')}`;
 
 /** 合成のメールアドレス（`sample` と `SYNTHETIC_EMAIL_LOCAL_DIGITS` 桁の数字の局所部と、`example.invalid`。T29c）。 */
 export const syntheticEmailAddressOf = (number: number): string =>

@@ -183,11 +183,15 @@ describe('FM2e: the page values of the one screen of the automated login', () =>
     expect(page?.automatedLoginSetup).toEqual({
       authSetupCurrent: true,
       currentAuth: 'MANUAL_SESSION',
-      currentSelectors: { username: null, password: null, submit: null },
+      // PL-T: 今の認証の設定のセレクタ（currentSelectors）は、使う画面がないので返さない（PL-4 でセレクタの欄を消した）。
       proposals: { username: inferred(FIELDS.username), password: inferred(FIELDS.password), submit: null },
       proposalJobId: 'job-new',
+      // MI-4: 案のもと（最後の手動のログインの観察）。
+      proposalSource: 'MANUAL_LOGIN_OBSERVATION',
       maxLoginAttempts: { before: 2, after: AUTOMATED_LOGIN_MAX_LOGIN_ATTEMPTS },
       approvedScenarioCount: APPROVED_SCENARIOS,
+      // PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 9 章の 2）: 確認のダイアログに出す、パスワードを入れる先（ログインの画面のホストだけ）。
+      loginHost: new URL(TEST_ORIGIN).host,
     });
   });
 
@@ -385,4 +389,96 @@ describe('FM2e: the order of the saves of the automated login', () => {
     expect(leaks(JSON.stringify(worker.received()))).toBe(false);
     expect(leaks(databaseBytes())).toBe(false);
   }, TEST_TIMEOUT_MS);
+});
+
+/**
+ * MI-4（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.4）: 切り替え（`setUpAutomatedLogin`）の前の確かめ。3 つのセレクタは切り替えの
+ * 画面で入れる。OP-3: 前の「次から自動でログインする」の判定（`automatedLoginReadinessOf`）は、使い先がなくなったので消した（OP-1 の D5。1 回目の点検の
+ * 手でのログインの後に、BeakSight が自動ログインへ切り替える）。ここでは、その判定と共用していた切り替えの確かめを、そのまま確かめる。
+ */
+describe('MI-4: the checks before the switch to the automated login', () => {
+  const SCRIPT_PROFILE = 'mi4-script';
+  const SERVICE_ORIGIN = 'https://auth.example.invalid';
+  const TOKEN_TARGET = Object.freeze({ origin: SERVICE_ORIGIN, path: '/auth/v1/token', requiredQuery: [{ name: 'grant_type', value: 'password' }] });
+  const SUCCESS_KEY = Object.freeze({ origin: TEST_ORIGIN, prefix: 'sb-', suffix: '-auth-token' });
+
+  /** スクリプトで送るログインの、手動のログインの認証の設定（`targets` が偽なら、手動のログインの自動の登録の前。token の送信先と成功の鍵がない）。 */
+  const scriptSetupOf = (targets: boolean, profileRevision: number = MIN_PROFILE_REVISION): AuthSetup => ({
+    ...MANUAL_SETUP,
+    profileId: SCRIPT_PROFILE,
+    profileRevision,
+    loginPostEndpoints: [],
+    loginTransport: 'SCRIPT_REQUEST',
+    scriptLogin: targets ? TOKEN_TARGET : null,
+    loginSideRequests: [],
+    successStorageKey: targets ? SUCCESS_KEY : null,
+  } as AuthSetup);
+
+  const createScriptProfile = (targets: boolean): void => {
+    expect(createProfile(database, { ...testAuthProfile(SCRIPT_PROFILE, MIN_PROFILE_REVISION), approvedServiceOrigins: [SERVICE_ORIGIN] },
+      { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(saveAuthSetup(database, scriptSetupOf(targets), { resolveContext: resolveTestContext }).ok).toBe(true);
+  };
+
+  it('switches a form navigation setup (the selectors are entered on the switch screen)', async () => {
+    expect(await setUp(requestOf())).toMatchObject({ ok: true });
+  });
+
+  it('asks for one manual login while the token target and the success key are missing, and offers the switch after they are registered', async () => {
+    createScriptProfile(false);
+    // 切り替えの確かめは、送信先と成功の鍵がないことで拒む。
+    const rejected = await setUp(requestOf({ profileId: SCRIPT_PROFILE }));
+    expect(rejected).toMatchObject({ ok: false, kind: 'SETUP', reason: 'AUTH_SETUP_INVALID', rollback: 'NOT_NEEDED' });
+    expect(rejected.ok ? [] : 'errors' in rejected ? rejected.errors.map(({ code }) => code) : []).toContain('AUTH_SETUP_SCRIPT_LOGIN_REQUIRED');
+    // 手動のログインの自動の登録が済んだ形（token の送信先と成功の鍵がそろった）。
+    expect(saveAuthSetup(database, scriptSetupOf(true), { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(await setUp(requestOf({ profileId: SCRIPT_PROFILE }))).toMatchObject({ ok: true });
+  });
+
+  it('rejects the switch with a stale setup, switches after the setup is saved again, and rejects a profile already switched', async () => {
+    // 認証の設定が古い（プロファイルを直した後）間は、切り替えの確かめが拒む。
+    const current = getProfile(database, PROFILE_ID);
+    if (current === null) throw new Error('no profile');
+    expect(updateProfile(database, { profile: { ...current.profile, revision: MIN_PROFILE_REVISION + 1 }, expectedRevision: MIN_PROFILE_REVISION },
+      { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(await setUp(requestOf({ expectedRevision: MIN_PROFILE_REVISION + 1 })))
+      .toMatchObject({ ok: false, kind: 'SETUP', reason: 'AUTH_SETUP_NOT_CURRENT', rollback: 'NOT_NEEDED' });
+    expect(saveAuthSetup(database, { ...MANUAL_SETUP, profileRevision: MIN_PROFILE_REVISION + 1 }, { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(await setUp(requestOf({ expectedRevision: MIN_PROFILE_REVISION + 1 }))).toMatchObject({ ok: true });
+    // 自動ログインに切り替えた後は、対象でない。
+    expect(await setUp(requestOf({ expectedRevision: MIN_PROFILE_REVISION + 2 }))).toMatchObject({ ok: false, kind: 'SETUP', reason: 'NOT_OFFERED' });
+  });
+});
+
+/**
+ * MI-4（設計書 4.4）: 切り替えの画面の 3 つのセレクタの案は、最後の手動のログインの観察の案（今どおり）。それがないときは、最後の入口の確かめの案を使う
+ * （同じ検出の部品で、各欄の候補がちょうど 1 つのときの CSS。推測の印）。どちらもなければ案なし。
+ */
+describe('MI-4: the selector proposals from the entry check when there is no manual login observation', () => {
+  const ENTRY_FIELDS = Object.freeze({ username: '#entry-user', password: '#entry-pass', submit: '#entry-go' });
+  const withEntryCheck = (fields: Readonly<Record<'username' | 'password' | 'submit', string | null>> | null) =>
+    deps(credentials.store, { entryCheckLoginFields: async (profileId) => (profileId === PROFILE_ID ? fields : null) });
+  const inferred = (value: string) => ({ value, origin: 'INFERRED', ground: 'LOGIN_FIELD_SINGLE_CANDIDATE' });
+
+  it('uses the entry check proposals without a manual login observation, and the manual login ones when there is one', async () => {
+    const fromEntry = await credentialPageOf(withEntryCheck(ENTRY_FIELDS), PROFILE_ID);
+    expect(fromEntry?.automatedLoginSetup).toMatchObject({
+      proposals: { username: inferred(ENTRY_FIELDS.username), password: inferred(ENTRY_FIELDS.password), submit: inferred(ENTRY_FIELDS.submit) },
+      proposalJobId: null,
+      proposalSource: 'ENTRY_CHECK_PROPOSAL',
+    });
+    // 形の受けない CSS は案にしない。案が 1 つもなければ、案なし。
+    const partial = await credentialPageOf(withEntryCheck({ username: ENTRY_FIELDS.username, password: null, submit: null }), PROFILE_ID);
+    expect(partial?.automatedLoginSetup?.proposals).toEqual({ username: inferred(ENTRY_FIELDS.username), password: null, submit: null });
+    const none = await credentialPageOf(withEntryCheck({ username: null, password: null, submit: null }), PROFILE_ID);
+    expect(none?.automatedLoginSetup).toMatchObject({ proposals: { username: null, password: null, submit: null }, proposalSource: null });
+    // 手動のログインの観察の案があれば、そちらを使う。
+    recordManualLoginJob('job-manual', FIELDS, 5);
+    const fromManual = await credentialPageOf(withEntryCheck(ENTRY_FIELDS), PROFILE_ID);
+    expect(fromManual?.automatedLoginSetup).toMatchObject({
+      proposals: { username: inferred(FIELDS.username), password: inferred(FIELDS.password), submit: inferred(FIELDS.submit) },
+      proposalJobId: 'job-manual',
+      proposalSource: 'MANUAL_LOGIN_OBSERVATION',
+    });
+  });
 });

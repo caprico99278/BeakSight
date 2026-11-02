@@ -2,8 +2,14 @@
 // - 優先順位（汎用 → テンプレート → 人の上書き）、送る欄すべてに規則、required の未選択、状態の欄、外部到達の欄（メール・電話・住所・通知）、
 //   password・file・url、既定の値、範囲・固定の値・pattern、欄どうしの関係。
 // 例の値は匿名の値だけ。
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { evaluateRuleSet, type FieldEvaluation } from '../../src/control/data-rules/field-evaluation.js';
+import {
+  EXTERNAL_NOTIFICATION_AT_APPROVAL,
+  PRE_APPROVAL_EVALUATION_PREMISE,
+  evaluateRuleSet,
+  type FieldEvaluation,
+} from '../../src/control/data-rules/field-evaluation.js';
 import type { RuleProblem } from '../../src/control/data-rules/rule-contracts.js';
 import type { CandidateField } from '../../src/discovery/candidate-contracts.js';
 import { ALL_CONFIRMED } from './approval-samples.js';
@@ -276,5 +282,63 @@ describe('evaluateRuleSet: relations, executability and the shape (T29c)', () =>
     expect(evaluate({ fields: [sampleField('email', 'email')], selected: ['email'], confirmed: true }).executable).toBe(true);
     expect(evaluate({ fields: [sampleField('email', 'email')], selected: ['email'], confirmed: false }).executable).toBe(false);
     expect(ALL_CONFIRMED.NO_EXTERNAL_NOTIFICATION).toBe(true);
+  });
+});
+
+// MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 副作用の確認は承認のダイアログの 1 回にまとめた。承認の前の
+// 画面は「承認のときに確認する」前提（`EXTERNAL_NOTIFICATION_AT_APPROVAL`）で判定し、メール・電話の欄を作れる欄として、印を付けて返す。前提を渡さない
+// 判定（承認と書き込みの開始の確かめ）は、今どおり版の確認の値だけを見る。
+describe('evaluateRuleSet: the premise that the approval confirms the notification (MI-6)', () => {
+  const unconfirmed = (premise: Parameters<typeof evaluateRuleSet>[3]) => {
+    const candidate = candidateWith([sampleField('email', 'email'), sampleField('tel', 'tel'), sampleField('name')]);
+    const scenario = scenarioFor(candidate, ['email', 'tel', 'name'], { sideEffectConfirmations: NOTIFICATION_UNCONFIRMED });
+    return evaluateRuleSet(ruleSetFor(scenario), scenario, candidate, premise);
+  };
+
+  it('decides the email and phone fields with a mark under the premise, and keeps the other fields the same', () => {
+    const result = unconfirmed({ notificationConfirmation: EXTERNAL_NOTIFICATION_AT_APPROVAL });
+    expect(result.executable).toBe(true);
+    expect(result.fields.map(({ fieldName, status, problem, confirmationAtApproval }) => [fieldName, status, problem, confirmationAtApproval ?? false]))
+      .toEqual([
+        ['email', 'DECIDED', null, true],
+        ['name', 'DECIDED', null, false],
+        ['tel', 'DECIDED', null, true],
+      ]);
+  });
+
+  it('keeps the judgement by the confirmation of the scenario revision without the premise', () => {
+    const result = unconfirmed(undefined);
+    expect(result.executable).toBe(false);
+    expect(fieldOf(result, 'email').problem).toEqual({ code: 'EXTERNAL_DELIVERY_BLOCKED', detail: 'EXTERNAL_NOTIFICATION_UNCONFIRMED' });
+    expect(fieldOf(result, 'email').confirmationAtApproval).toBeUndefined();
+  });
+
+  it('adds no mark when the scenario revision has the confirmation', () => {
+    const candidate = candidateWith([sampleField('email', 'email')]);
+    const scenario = scenarioFor(candidate, ['email']);
+    const result = evaluateRuleSet(ruleSetFor(scenario), scenario, candidate, { notificationConfirmation: EXTERNAL_NOTIFICATION_AT_APPROVAL });
+    expect(fieldOf(result, 'email')).toMatchObject({ status: 'DECIDED' });
+    expect(fieldOf(result, 'email').confirmationAtApproval).toBeUndefined();
+  });
+});
+
+// MI-C2 項目 18: 承認の前の画面の判定の前提は、1 つの定数（`PRE_APPROVAL_EVALUATION_PREMISE`）だけで組む。画面のサーバの 3 か所（入力の規則の事実、シナリオの
+// 詳細の推測の項目の求め直し、自動の下書きの推し）は、それを使う（同じ形のオブジェクトを書き写さない）。
+describe('the premise of the screens before the approval (MI-C2)', () => {
+  it('is one frozen constant with the premise that the approval confirms the notification', () => {
+    expect(PRE_APPROVAL_EVALUATION_PREMISE).toEqual({ notificationConfirmation: EXTERNAL_NOTIFICATION_AT_APPROVAL });
+    expect(Object.isFrozen(PRE_APPROVAL_EVALUATION_PREMISE)).toBe(true);
+  });
+
+  it('is used by the three server parts, and no one builds the same object again', () => {
+    for (const path of [
+      'apps/local-ui/src/server/data-rule-facts.ts',
+      'apps/local-ui/src/server/scenario-functions.ts',
+      'apps/local-ui/src/server/scenario-autodraft-functions.ts',
+    ]) {
+      const source = readFileSync(path, 'utf8');
+      expect(source, path).toContain('PRE_APPROVAL_EVALUATION_PREMISE');
+      expect(source, path).not.toMatch(/notificationConfirmation\s*:/u);
+    }
   });
 });

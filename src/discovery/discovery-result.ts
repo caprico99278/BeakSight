@@ -19,7 +19,8 @@ import type { AuditSendPolicyName } from '../core/audit-send-policy.js';
 import { SESSION_KEY_LOST_DETAIL, type JobSafetyViolation, type RunAuthenticationSummary, type RunStatus } from '../core/contracts.js';
 import type { SessionLossEvidence } from '../core/evidence-types.js';
 import { deriveRunStatus } from '../core/status.js';
-import { compareCodeUnits } from '../core/text.js';
+import { isSecretLikeText } from '../core/secret-like-text.js';
+import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import {
   CANDIDATE_REASON_CLASSIFICATIONS,
   INCOMPLETE_REASONS,
@@ -170,7 +171,43 @@ export interface DiscoveryReadPageRecord {
   readonly incompleteReasons: readonly IncompleteReason[];
   /** 候補（probe の順: form（送信ボタンごと）、form の外のボタン）。 */
   readonly candidates: readonly DiscoveryCandidate[];
+  /**
+   * OP-2 の修正の 1 回目（判断 2）: 画面の名前（見出し h1 と題 title。`discoveryScreenNameOf` の形）。サイトの画面の一覧の行の名前に使う（判定には使わない）。
+   * 読めた画面だけが持つ。前の書き手の成果物にはない（任意の項目。版は変えない）。
+   */
+  readonly screenName?: DiscoveryScreenName;
 }
+
+/** OP-2 の修正の 1 回目（判断 2）: 画面の名前の長さの上限（文字の数）。 */
+export const MAX_DISCOVERY_SCREEN_NAME_LENGTH = 60;
+
+/** 画面の名前（見出しと題。取れない・空・秘密に見えるときは null）。 */
+export interface DiscoveryScreenName {
+  readonly heading: string | null;
+  readonly title: string | null;
+}
+
+/** 名前 1 つの形: 文字だけ。空白をまとめ、上限で切る（コードポイントの数）。空か、秘密に見える文（`isSecretLikeText`）なら null。 */
+const screenNameTextOf = (value: unknown): string | null => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const text = [...normalizeWhitespace(value)].slice(0, MAX_DISCOVERY_SCREEN_NAME_LENGTH).join('').trim();
+  return text.length === 0 || isSecretLikeText(value) || isSecretLikeText(text) ? null : text;
+};
+
+/** 読んだ見出しと題から、記録する画面の名前を作る（凍結）。 */
+export const discoveryScreenNameOf = (heading: unknown, title: unknown): DiscoveryScreenName =>
+  Object.freeze({ heading: screenNameTextOf(heading), title: screenNameTextOf(title) });
+
+/** 一覧の行の名前: 発見の文書で、その path を読んだ画面の見出し → 題（どちらもなければ・読んだ画面がなければ null）。 */
+export const discoveryPageScreenNameOf = (document: DiscoveryDocument | null, pagePath: string): string | null => {
+  const page = document?.pages.find((entry) => entry.state === 'READ' && entry.record.location?.path === pagePath);
+  if (page === undefined || page.state !== 'READ') {
+    return null;
+  }
+  return page.record.screenName?.heading ?? page.record.screenName?.title ?? null;
+};
 
 /** 成果物の画面 1 件（巡回の URL は、ArtifactWriter が書くときに伏せ字を通す）。 */
 export type DiscoveryPageEntry =
@@ -356,6 +393,8 @@ export const withIncompleteReason = (record: DiscoveryReadPageRecord, reason: In
     ...candidate,
     incompleteReasons: orderedIncompleteReasons([...candidate.incompleteReasons, reason]),
   }))),
+  // OP-K（K1）: 画面の名前は写す（前は落としていた）。
+  ...(record.screenName === undefined ? {} : { screenName: record.screenName }),
 });
 
 /**

@@ -29,6 +29,11 @@
  *   `chromiumLaunchOptions`、`launchPersistentContext`、手動のログインの段のファイル）。ログイン用の Browser は、呼ぶ側が渡す。
  * - (z) 入力の部品の中で、値を受ける引数（`LOGIN_SECRET_PARAMETER`）が現れるのは、その宣言（`loginSecret:`）と `.fill(` の引数の中だけ
  *   （`evaluate` などに渡さない。別の名前に移さない）。
+ * - (aa) OP-1（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D2）: 「欄の値は読まない」の、ログインの段だけの名前つきの例外。
+ *   人が入れた ID とパスワードを隔離した世界で読む部品（`LOGIN_CREDENTIAL_CAPTURE_PATH`）だけが、ページの中の関数を binding で Node の側へつなぐ CDP の
+ *   命令（`CAPTURE_ONLY_CDP_COMMANDS`）を書く。その部品を参照する（import・文字列）のは、手動のログインの段（`authenticated-login.ts`）だけ（自動ログインの段・
+ *   ほかのジョブの流れは参照しない。OP-1 の修正の 1 回目で、保存の口の process の組み立てを足した）。受け取った値を取り出す口（`CAPTURED_VALUE_ACCESSORS`）は、
+ *   部品の外では閉じた一覧（`CAPTURED_VALUE_USERS`。保存の口だけ）のファイルだけが書く。部品は (q) の入力の操作を行わない（(q) の例外の一覧に入れない）。
  * - ファイル全体を 1 秒以内に終える。
  */
 import { describe, expect, it } from 'vitest';
@@ -88,6 +93,22 @@ const LOGIN_SECRET_PARAMETER = 'loginSecret';
 /** (z) 引数の宣言（`loginSecret: <型>`）。 */
 const LOGIN_SECRET_DECLARATION = new RegExp(`(?<![\\w$.])${LOGIN_SECRET_PARAMETER}\\s*:`, 'gu');
 
+/** (aa) 値の受け取りの部品（ログインの段だけの例外）。 */
+const LOGIN_CREDENTIAL_CAPTURE_PATH = 'src/worker/login-credential-capture.ts';
+/** (aa) 値の受け取りの部品のモジュールの名前。 */
+const LOGIN_CREDENTIAL_CAPTURE_MODULE = /login-credential-capture/u;
+/** (aa) 受け取りの部品だけが書く CDP の命令（ページの中の関数を Node の側へつなぐ）。 */
+const CAPTURE_ONLY_CDP_COMMANDS: readonly string[] = ['Runtime.addBinding', 'Page.addScriptToEvaluateOnNewDocument', 'Runtime.bindingCalled'];
+/** (aa) 受け取った値を取り出す口の名前。 */
+const CAPTURED_VALUE_ACCESSORS = /\b(?:withCapturedLoginCredential|capturedLoginValuesOf)\b/gu;
+/**
+ * (aa) 部品の外で、受け取った値を取り出してよいファイル（閉じた一覧）。OP-1 の修正の 1 回目（設計書 4.1.3 の 1）: 保存の口（process の組み立て。親の許しの後に、
+ * 資格情報のファイルの部品の `register` に渡すだけ）。
+ */
+const CAPTURED_VALUE_USERS: ReadonlySet<string> = new Set<string>(['src/worker/audit-worker-process.ts']);
+/** (aa) 受け取りの部品を参照してよいファイル（閉じた一覧。手動のログインの段と、保存の口）。 */
+const CAPTURE_REFERRERS: readonly string[] = ['src/worker/audit-worker-process.ts', 'src/worker/authenticated-login.ts'];
+
 const SOURCE_FILES = loadSourceFiles();
 const WORKER_FILES = SOURCE_FILES.filter((file) => file.path.startsWith(WORKER_DIRECTORY));
 
@@ -114,6 +135,23 @@ const countLoginSecretLeaks = (source: ScannedSource): number => {
   const total = countIdentifier(source.bare, LOGIN_SECRET_PARAMETER);
   return declarations === 0 ? 1 : total - declarations - insideFill;
 };
+
+type PathSource = ScannedSource & { readonly path: string };
+
+/** (aa) 受け取りの部品の外で、binding の CDP の命令を書くところ（`<path>: <命令>`）。 */
+const findCaptureCommandUses = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH)
+  .flatMap(({ path, code }) => CAPTURE_ONLY_CDP_COMMANDS.filter((command) => code.includes(command)).map((command) => `${path}: ${command}`));
+
+/** (aa) 受け取りの部品を参照するファイル（部品そのものを除く。コメントを除いた本文の指定子と文字列）。 */
+const findCaptureReferrers = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path, code }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH && LOGIN_CREDENTIAL_CAPTURE_MODULE.test(code))
+  .map(({ path }) => path);
+
+/** (aa) 部品と閉じた一覧の外で、受け取った値を取り出す口を書くところ。 */
+const findCapturedValueAccess = (files: readonly PathSource[]): readonly string[] => files
+  .filter(({ path }) => path !== LOGIN_CREDENTIAL_CAPTURE_PATH && !CAPTURED_VALUE_USERS.has(path))
+  .flatMap(({ path, bare }) => [...bare.matchAll(CAPTURED_VALUE_ACCESSORS)].map((match) => `${path}: ${match[0]}`));
 
 describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', () => {
   it('reads the worker files, the login stages, and the form input owner', () => {
@@ -193,7 +231,30 @@ describe('Worker login hooks (T25d) and the single form input owner (T26d-1)', (
     expect(countIdentifier(owner?.bare ?? '', LOGIN_SECRET_PARAMETER)).toBeGreaterThan(0);
   });
 
+  it('(aa) only the credential capture part writes the binding CDP commands, only the manual login stage refers to it, and only it reveals the values (OP-1)', () => {
+    expect(SOURCE_FILES.map(({ path }) => path)).toContain(LOGIN_CREDENTIAL_CAPTURE_PATH);
+    expect(findCaptureCommandUses(SOURCE_FILES)).toEqual([]);
+    const capture = SOURCE_FILES.find(({ path }) => path === LOGIN_CREDENTIAL_CAPTURE_PATH);
+    // 例外の一覧が古くなっていない（部品が実際にその命令を書く）。
+    expect(CAPTURE_ONLY_CDP_COMMANDS.filter((command) => !(capture?.code.includes(command) ?? false))).toEqual([]);
+    expect([...findCaptureReferrers(SOURCE_FILES)].sort()).toEqual(CAPTURE_REFERRERS);
+    expect(findCaptureReferrers(SOURCE_FILES)).not.toContain(AUTOMATED_LOGIN_PATH);
+    expect(findCapturedValueAccess(SOURCE_FILES)).toEqual([]);
+    // 部品は入力の操作をしない（(q) の例外の一覧の外）。
+    expect(findInputOperations(capture ?? scanSource(''))).toEqual([]);
+  });
+
   it('detects the patterns (detector self-check)', () => {
+    // (aa)
+    expect(findCaptureCommandUses([{ path: 'src/worker/other.ts', ...scanSource("await session.send('Runtime.addBinding', {});") }]))
+      .toEqual(['src/worker/other.ts: Runtime.addBinding']);
+    expect(findCaptureReferrers([
+      { path: AUTOMATED_LOGIN_PATH, ...scanSource("import { startLoginCredentialCapture } from './login-credential-capture.js';") },
+      { path: MANUAL_LOGIN_PATH, ...scanSource("import { startLoginCredentialCapture } from './login-credential-capture.js';") },
+      { path: 'src/worker/other.ts', ...scanSource('// login-credential-capture is the owner') },
+    ])).toEqual([AUTOMATED_LOGIN_PATH, MANUAL_LOGIN_PATH]);
+    expect(findCapturedValueAccess([{ path: 'src/worker/audit-worker-session.ts', ...scanSource('await withCapturedLoginCredential(c, save);') }]))
+      .toEqual(['src/worker/audit-worker-session.ts: withCapturedLoginCredential']);
     expect('process.env.X'.match(ENVIRONMENT_READS)).toHaveLength(1);
     expect([...'runAuditWorkerProcess(process, { loginStage })'.matchAll(ENTRY_CALL)].map((match) => match[1])).toEqual(['process, { loginStage }']);
     // (q) 違反の例（RED になる）と、違反でない例。

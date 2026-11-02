@@ -275,6 +275,9 @@ describe.each(LOGIN_LAUNCHES)('T34c: the script login audit in a child worker (l
         successSelector: { selector: '#logout', kind: 'LOGOUT_CONTROL', logoutWord: expect.any(String) },
         // DEF-161（FM2e の 3A.4 に合わせて直した期待）: 手動のログインの段の始めに検出したログインの 3 つの欄の CSS の案（欄の値は持たない）。
         loginFields: { username: SPA_LOGIN_FIELDS.email, password: SPA_LOGIN_FIELDS.password, submit: SPA_LOGIN_FIELDS.submit },
+        // OP-1 の D3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md`。意図して直した期待）: 成功の画面の path を観察から決める。
+        // ログインの画面（`/auth`）にもセッションの切れの path にも当たらない、いちばん短い前方（アプリの管理の画面）。
+        successPathPrefix: SPA_APP_PATHS.admin,
       });
       expect(readJob(database, jobId)?.loginStage).toMatchObject({
         scriptLogin: authStates[1]?.scriptLogin, blockedRequests: null, passedRequests: tenantPassed, observation: authStates[1]?.loginObservation,

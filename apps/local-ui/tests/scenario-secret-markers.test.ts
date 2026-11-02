@@ -43,6 +43,7 @@ import { leakedPlaces, textPlace, type SearchedPlace } from './helpers/secret-ma
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 /** ジョブの終わりを待つ上限と、読み直す間隔（ms）。 */
 const JOB_TIMEOUT_MS = 240_000;
@@ -150,7 +151,7 @@ beforeAll(async () => {
       environmentEvidenceRef: 't28e-evidence',
     },
   })).toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', {
+  expect(await saveAuthSetupRequestInStore(root, {
     setup: {
       ...FORM_NAVIGATION_SETUP_ITEMS,
       profileId: PROFILE_ID,
@@ -203,22 +204,25 @@ describe('T28e: no secret marker on the scenario screens', () => {
     ]);
     const confirmed = { TEST_RECORDS_ONLY: true, NO_EXTERNAL_NOTIFICATION: true, NO_PAYMENT_OR_EXTERNAL_SERVICE: true, NOT_DESTRUCTIVE: true };
     const draft = { fieldNames: ['name'], readChecks: [], sideEffectConfirmations: confirmed, limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30 };
-    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+    const created = await valueOf<{ ok: boolean; scenarioId: string; revision: number }>('createScenarioFn', 'POST', {
       draft: { profileId: PROFILE_ID, candidateIdentityDigest: digest, ...draft },
     });
     expect(created.ok).toBe(true);
     const { scenarioId } = created;
-    expect(await valueOf('updateScenarioFn', 'POST', { scenarioId, expectedRevision: 1, draft: { ...draft, approvalTtlDays: 7 } }))
-      .toMatchObject({ ok: true, revision: 2 });
+    // PL-5 の 9 の (1): 作成の保存で推した入れる値の決まりを付けると、書き込みの手順の版が 1 つ進む（版 2）。後の版は、作成の応答の版から数える。
+    expect(created.revision).toBe(2);
+    const first = created.revision;
+    expect(await valueOf('updateScenarioFn', 'POST', { scenarioId, expectedRevision: first, draft: { ...draft, approvalTtlDays: 7 } }))
+      .toMatchObject({ ok: true, revision: first + 1 });
     const detail = await valueOf<{ status: { approvalDigest: string } | null }>('scenarioDetailPageFn', 'GET', { scenarioId });
-    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId, expectedRevision: 2, expectedApprovalDigest: detail.status?.approvalDigest }))
+    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId, expectedRevision: first + 1, expectedApprovalDigest: detail.status?.approvalDigest }))
       .toMatchObject({ ok: true });
-    expect(await valueOf('updateScenarioFn', 'POST', { scenarioId, expectedRevision: 2, draft }))
-      .toMatchObject({ ok: true, revision: 3 });
+    expect(await valueOf('updateScenarioFn', 'POST', { scenarioId, expectedRevision: first + 1, draft }))
+      .toMatchObject({ ok: true, revision: first + 2 });
     const again = await valueOf<{ status: { approvalDigest: string } | null }>('scenarioDetailPageFn', 'GET', { scenarioId });
-    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId, expectedRevision: 3, expectedApprovalDigest: again.status?.approvalDigest }))
+    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId, expectedRevision: first + 2, expectedApprovalDigest: again.status?.approvalDigest }))
       .toMatchObject({ ok: true });
-    expect(await valueOf('revokeScenarioFn', 'POST', { scenarioId, expectedRevision: 3 })).toMatchObject({ ok: true });
+    expect(await valueOf('revokeScenarioFn', 'POST', { scenarioId, expectedRevision: first + 2 })).toMatchObject({ ok: true });
 
     const places: SearchedPlace[] = [];
     const paths = [

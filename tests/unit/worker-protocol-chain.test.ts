@@ -1,6 +1,7 @@
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行の IPC の契約（`src/control/worker-protocol.ts`、
 // `schemas/control/worker-message.schema.json`）。
-// - `START` は 1 回のまま。`chain` に段の並び（閉じた一覧の並びだけ: 監査 → 発見 → READ、発見 → READ）を持てる。最初の段の種類は `jobKind`。認証つきだけ。
+// - `START` は 1 回のまま。`chain` に段の並び（閉じた一覧の並びだけ: 監査 → 発見 → READ。MI-C: どのモードも使わなくなった発見 → READ を外した）を
+//   持てる。最初の段の種類は `jobKind`。認証つきだけ。
 // - 親 → 子の `NEXT_STAGE`（次の段のジョブの ID と種類。READ の確かめなら定義の一覧を必ず持つ）と `CHAIN_END`（次の段を始めない）。
 // - `FINISHED` は、未完了の理由のコード（`incompleteReasonCodes`。コードだけ。重なりなし）を持てる。
 // 例の値は、匿名の値（`127.0.0.1`、`example`）だけを使う。
@@ -67,9 +68,12 @@ const errorsOf = (result: ReturnType<typeof validateParentToWorkerMessage>): rea
 
 describe('FM2d: the IPC contract of the chained run', () => {
   it('accepts the START with the closed list of the stage sequences only', () => {
-    expect(WORKER_CHAIN_STAGE_SEQUENCES).toEqual([['AUDIT', 'DISCOVERY', 'READ_CHECK'], ['DISCOVERY', 'READ_CHECK']]);
+    expect(WORKER_CHAIN_STAGE_SEQUENCES).toEqual([['AUDIT', 'DISCOVERY', 'READ_CHECK']]);
     expect(validateParentToWorkerMessage(start('AUDIT', { stages: ['AUDIT', 'DISCOVERY', 'READ_CHECK'] })).ok).toBe(true);
-    expect(validateParentToWorkerMessage(start('DISCOVERY', { stages: ['DISCOVERY', 'READ_CHECK'] })).ok).toBe(true);
+    // MI-C（MI-5 の発見事項）: 発見 → READ の確かめの並びは、MI-5 で書き込みのモードも監査から始まるようになり、どのモードも使わない。契約から外したので、
+    // その並びの START は拒む。
+    expect(errorsOf(validateParentToWorkerMessage(start('DISCOVERY', { stages: ['DISCOVERY', 'READ_CHECK'] }))))
+      .toEqual(['/chain/stages must be one of the stage sequences of the chained run']);
     // 並びの一覧にない並び。
     expect(errorsOf(validateParentToWorkerMessage(start('AUDIT', { stages: ['AUDIT', 'READ_CHECK'] }))))
       .toEqual(['/chain/stages must be one of the stage sequences of the chained run']);

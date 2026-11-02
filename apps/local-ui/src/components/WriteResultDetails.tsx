@@ -10,6 +10,10 @@
  *   落とすリンクを出し、通らない・確かめていないときは配らない理由を出す。
  * - T40d（Task 40 の設計書 3.5）: 送り方のラベル（詳細の欄と履歴の列）と、API の書き込みの型の要約（method、送り先の Origin、path の型、型の digest）と
  *   判定のしかたの説明（成否の条件と入力の誤りの条件は使わない）。ラベルは `SCENARIO_TRANSPORT_CATALOG`、文言は `LOCAL_UI_WRITE_TEXT.api`。
+ * - PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 2、7 章、13 章の 13）: ジョブの詳細は 2 つに分ける。`WriteResultDetails` は、
+ *   ふだんの画面に出すもの（`UNKNOWN`・`PARTIAL` の知らせ、結果、送ったか、止めた理由、レコードの番号、変えた所、報告を配らない理由、送った値）。
+ *   `WriteResultFacts` は、たたんだ詳しい内容に入れるもの（送り方、理由、応答の状態と判定、照合、予約の締め、日時、API の型、報告の ZIP）。報告を開く
+ *   リンクは、作業の画面の要点の主のボタン（結果を見る）だけが出す（報告の HTML と ZIP を 2 回出さない）。
  */
 import { Link } from '@tanstack/react-router';
 import { formatDateTime, formatInteger } from '../../../../src/presentation/format.js';
@@ -18,6 +22,7 @@ import {
   actionBlockReasonDisplay,
   actionOutcomeReasonDisplay,
   actionResultDisplay,
+  httpMethodLabel,
   readCheckResultDisplay,
   responseJudgementDisplay,
   scenarioTransportDisplay,
@@ -113,31 +118,22 @@ function UpdateDiff({ update }: Readonly<{ update: WriteUpdateResultView }>) {
  * サーバが返す URL があるかで決める（確かめの結果の値で分岐しない）。
  */
 function WriteReport({ report }: Readonly<{ report: WriteReportView }>) {
+  if (report.reportHref !== null) {
+    // PL-2: 配る報告は、作業の画面の要点の主のボタン（結果を見る）と、詳しい内容の ZIP（`WriteResultFacts`）が出す。
+    return null;
+  }
   const check = report.check === null ? null : writeReportCheckDisplay(report.check);
   return (
     <div data-testid="write-report" data-check={report.check ?? ''}>
       <h3>{reportText.heading}</h3>
-      {report.reportHref === null ? (
-        <>
-          <p>{reportText.notDistributed}</p>
-          {check === null ? <p data-testid="write-report-not-checked">{reportText.notChecked}</p> : (
-            <dl className="facts">
-              <dt>{reportText.checkLabel}</dt>
-              <dd data-testid="write-report-reason"><span className={toneClass(check.tone)}>{check.label}</span></dd>
-            </dl>
-          )}
-          {check === null || check.description === null ? null : <p className="muted">{check.description}</p>}
-        </>
-      ) : (
-        <ul className="link-list">
-          <li>
-            <a href={report.reportHref} target="_blank" rel="noopener noreferrer" data-testid="write-report-open">{reportText.openReport}</a>
-          </li>
-          {report.bundleHref === null ? null : (
-            <li><a href={report.bundleHref} download data-testid="write-report-download">{reportText.downloadBundle}</a></li>
-          )}
-        </ul>
+      <p>{reportText.notDistributed}</p>
+      {check === null ? <p data-testid="write-report-not-checked">{reportText.notChecked}</p> : (
+        <dl className="facts">
+          <dt>{reportText.checkLabel}</dt>
+          <dd data-testid="write-report-reason"><span className={toneClass(check.tone)}>{check.label}</span></dd>
+        </dl>
       )}
+      {check === null || check.description === null ? null : <p className="muted">{check.description}</p>}
     </div>
   );
 }
@@ -149,7 +145,7 @@ function ApiShape({ api }: Readonly<{ api: NonNullable<WriteResultSummaryView['a
       <h3>{text.api.heading}</h3>
       <dl className="facts">
         <dt>{text.api.method}</dt>
-        <dd data-item="method"><code>{api.method}</code></dd>
+        <dd data-item="method" data-method={api.method}>{httpMethodLabel(api.method)}</dd>
         <dt>{text.api.origin}</dt>
         <dd data-item="origin"><code>{api.origin}</code></dd>
         <dt>{text.api.pathShape}</dt>
@@ -181,36 +177,64 @@ export function WriteResultWarning({ result }: Readonly<{ result: WriteResultSum
   return null;
 }
 
-/** 書き込みの結果 1 件の詳細（結果・理由・送信・応答・登録の ID・照合の READ・予約の締め・日時・送った値）。 */
+/**
+ * 書き込みの結果 1 件の要点（ふだんの画面に出す: 結果、送ったか、止めた理由、レコードの番号、変えた所、報告を配らない理由、送った値）。PL-2: 詳しい
+ * 記録は `WriteResultFacts`。
+ */
 export function WriteResultDetails({ result }: Readonly<{ result: WriteResultSummaryView }>) {
   const resultDisplay = result.result === null ? null : actionResultDisplay(result.result);
   return (
     <div data-testid="write-result" data-job-id={result.jobId} data-result={result.result ?? ''} data-kind={result.writeKind} data-transport={result.transport}>
-      <WriteResultWarning result={result} />
+      {/* PL-2: `UNKNOWN`・`PARTIAL` の知らせ（`WriteResultWarning`）は、作業の画面の要点の中に出す（ここで重ねて出さない）。 */}
       {result.result === null ? <p data-testid="write-result-pending">{text.resultPending}</p> : null}
       <dl className="facts">
-        <dt>{text.api.transport}</dt>
-        <dd data-testid="write-result-transport"><Badge display={scenarioTransportDisplay(result.transport)} /></dd>
         <dt>{text.columns.result}</dt>
         <dd data-testid="write-result-label"><Badge display={resultDisplay} /></dd>
-        <dt>{text.columns.reason}</dt>
-        <dd data-testid="write-result-reason" data-reason={result.reason ?? ''}>
-          <Badge display={result.reason === null ? null : actionOutcomeReasonDisplay(result.reason)} />
-        </dd>
         {result.update === null ? null : [
           <dt key="target:name">{text.columns.target}</dt>,
           <dd key="target:value" data-testid="write-result-target"><code>{result.update.targetRecordId}</code></dd>,
         ]}
         <dt>{text.columns.submission}</dt>
         <dd data-testid="write-result-submission"><Badge display={result.submission === null ? null : submissionStateDisplay(result.submission)} /></dd>
-        <dt>{text.columns.blockReason}</dt>
-        <dd><Badge display={result.blockReason === null ? null : actionBlockReasonDisplay(result.blockReason)} /></dd>
+        {result.blockReason === null ? null : [
+          <dt key="block:name">{text.columns.blockReason}</dt>,
+          <dd key="block:value"><Badge display={actionBlockReasonDisplay(result.blockReason)} /></dd>,
+        ]}
+        <dt>{result.update === null ? text.columns.recordId : text.columns.obtainedId}</dt>
+        <dd data-testid="write-result-record-id">{result.recordId === null ? text.notApplicable : <code>{result.recordId}</code>}</dd>
+      </dl>
+      {result.update === null ? null : <UpdateDiff update={result.update} />}
+      <WriteReport report={result.report} />
+      <h3>{text.submittedValuesHeading}</h3>
+      {result.submittedValues.length === 0 ? <p>{text.noSubmittedValues}</p> : (
+        <dl className="facts" data-testid="write-result-values">
+          {result.submittedValues.map(({ name, value }) => [
+            <dt key={`${name}:name`}><code>{name}</code></dt>,
+            <dd key={`${name}:value`}><code>{value}</code></dd>,
+          ])}
+        </dl>
+      )}
+    </div>
+  );
+}
+
+/** 書き込みの結果 1 件の詳しい記録（PL-2: たたんだ詳しい内容に入れる。送り方・理由・応答・照合・予約の締め・日時・API の型・報告の ZIP）。 */
+export function WriteResultFacts({ result }: Readonly<{ result: WriteResultSummaryView }>) {
+  const resultDisplay = result.result === null ? null : actionResultDisplay(result.result);
+  return (
+    <section className="panel" data-testid="write-result-facts">
+      <h2 className="panel-heading">{text.resultHeading}</h2>
+      <dl className="facts">
+        <dt>{text.api.transport}</dt>
+        <dd data-testid="write-result-transport"><Badge display={scenarioTransportDisplay(result.transport)} /></dd>
+        <dt>{text.columns.reason}</dt>
+        <dd data-testid="write-result-reason" data-reason={result.reason ?? ''}>
+          <Badge display={result.reason === null ? null : actionOutcomeReasonDisplay(result.reason)} />
+        </dd>
         <dt>{text.columns.httpStatus}</dt>
         <dd>{result.httpStatus === null ? text.notApplicable : formatInteger(result.httpStatus)}</dd>
         <dt>{text.columns.responseJudgement}</dt>
         <dd><Badge display={result.responseJudgement === null ? null : responseJudgementDisplay(result.responseJudgement)} /></dd>
-        <dt>{result.update === null ? text.columns.recordId : text.columns.obtainedId}</dt>
-        <dd data-testid="write-result-record-id">{result.recordId === null ? text.notApplicable : <code>{result.recordId}</code>}</dd>
         <dt>{text.columns.readVerification}</dt>
         <dd><Badge display={result.readVerification === null ? null : readCheckResultDisplay(result.readVerification)} /></dd>
         <dt>{text.columns.reservation}</dt>
@@ -226,18 +250,10 @@ export function WriteResultDetails({ result }: Readonly<{ result: WriteResultSum
       </dl>
       {resultDisplay === null || resultDisplay.description === null ? null : <p className="muted">{resultDisplay.description}</p>}
       {result.api === null ? null : <ApiShape api={result.api} />}
-      {result.update === null ? null : <UpdateDiff update={result.update} />}
-      <WriteReport report={result.report} />
-      <h3>{text.submittedValuesHeading}</h3>
-      {result.submittedValues.length === 0 ? <p>{text.noSubmittedValues}</p> : (
-        <dl className="facts" data-testid="write-result-values">
-          {result.submittedValues.map(({ name, value }) => [
-            <dt key={`${name}:name`}><code>{name}</code></dt>,
-            <dd key={`${name}:value`}><code>{value}</code></dd>,
-          ])}
-        </dl>
+      {result.report.bundleHref === null ? null : (
+        <p><a href={result.report.bundleHref} download data-testid="write-report-download">{reportText.downloadBundle}</a></p>
       )}
-    </div>
+    </section>
   );
 }
 

@@ -41,6 +41,7 @@ import {
   placeNameOf,
 } from './helpers/scenario-marker-flow.ts';
 import { databaseRowsPlace, leakedPlaces } from './helpers/secret-markers.ts';
+import { DATA_RULE_ADVANCED_SETTINGS, SCENARIO_DETAIL_ADVANCED_SETTINGS, openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 const text = LOCAL_UI_DATA_RULE_TEXT;
 
@@ -54,10 +55,16 @@ const EXAMPLE_COUNT = 3;
 /** 1 つの場面のジョブの数（発見だけ。規則の保存と承認はジョブを始めない）。 */
 const JOBS_PER_SCENE = 1;
 /** 保存と承認の数: 規則の保存が 2 回（版 1 と版 2）、承認が 2 回（保存の後と、再承認）。 */
-const RULE_SET_REVISIONS = 2;
+// PL-5 の 9 の (1): 作成の保存で、BeakSight が推した規則の集まりを付ける（版 1）。その後に画面で 2 回保存する（版 2・3）。
+const RULE_SET_REVISIONS = 3;
 const APPROVALS = 2;
-/** シナリオの版: 作成で 1、規則の保存ごとに 1 つ上がる。 */
-const REVISION_AFTER_RULES = FIRST_REVISION + RULE_SET_REVISIONS;
+/**
+ * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 最初の承認は、画面で作ったシナリオ（副作用の確認がまだ）に、
+ * 4 項目を確かめた次の版を足してから承認する（版が 1 つ上がる）。再承認の版は確かめ済みなので、版を足さない。
+ */
+const CONFIRMATION_REVISIONS = 1;
+/** シナリオの版: 作成で 1、規則の保存ごとに 1 つ上がる（作成の保存で付けた推した規則を含む）。MI-6: 最初の承認で、確認を入れた版が 1 つ足される。 */
+const REVISION_AFTER_RULES = FIRST_REVISION + RULE_SET_REVISIONS + CONFIRMATION_REVISIONS;
 
 let site: DiscoverySite | undefined;
 /** 場面で作ったもの。 */
@@ -115,6 +122,8 @@ const flow = createScenarioMarkerFlow({
 /** シナリオの詳細の画面から、入力の規則の画面を開く（リンクをたどる）。 */
 const openRulesFromDetail = async (scenarioId: string): Promise<Page> => {
   const page = await flow.openPage(`/scenarios/${PROFILE}/${scenarioId}`);
+  // PL-5（設計書 8 章）: 入れる値の決まりの画面への入口は、書き込みの手順の詳細の詳しい内容の中。
+  await openAdvancedSettings(page, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
   await page.getByTestId('scenario-open-rules').click();
   await page.waitForURL(new RegExp(`${rulesPathOf(scenarioId)}$`, 'u'), { timeout: UI_TIMEOUT_MS });
   await page.getByTestId('data-rule-form').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -171,6 +180,8 @@ const runScene = async (): Promise<void> => {
 
   // 人の固定の値を入れて保存する（承認していたので、再承認になる）。
   const second = await openRulesFromDetail(scenarioId);
+  // MI-6: 推せた欄は、たたんだ詳しい設定の中にある。
+  await openAdvancedSettings(second, DATA_RULE_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
   await second.locator(`select[data-kind-for="${SCENARIO_FIELD_NAME}"]`).selectOption('FIXED_LIST');
   await second.locator(`select[data-method-for="${SCENARIO_FIELD_NAME}"]`).selectOption('FROM_FIXED_LIST');
   await second.locator(`textarea[data-fixed-for="${SCENARIO_FIELD_NAME}"]`).fill(FIXED_VALUES.join('\n'));

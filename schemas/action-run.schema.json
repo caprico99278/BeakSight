@@ -1,6 +1,6 @@
 {
   "$id": "urn:beaksight:schema:action-run:1.0",
-  "description": "The record of one write job (action-run.json in the Run directory; Task 30 design 3 'record'; T30a): the scenario and its revision, the consumed execution grant, the seed record of the generated data, the submitted values (synthetic test data, kept in plain text like the values of a READ check definition), the submission state, the response, the result conditions, the record id, the READ verification, the settled reservation, the ActionResult and its reason. The value lists and limits are owned by src/control/actions/action-contracts.ts; the decisions by src/control/actions/action-outcome.ts. No property holds a credential, a cookie, a CSRF token, a hidden value or an authenticated state. The public audit run.json schema is not changed (only its runId is referenced). T40c (Task 40 design 3.4): the version 1.1 adds the transport (FORM or API) and the API summary (null for FORM; for API the request shape summary, the key names, the names of the header fields supplied by the page, the record id key and the values of the keys decided by the page as JSON texts, cut to null above the limit); an API record has no result conditions (null). The readers accept 1.1 only (LG-4: the previous version 1.0, a FORM record without these items, is no longer read); the writer writes 1.1. No property holds a header value or the response body.",
+  "description": "The record of one write job (action-run.json in the Run directory; Task 30 design 3 'record'; T30a): the scenario and its revision, the consumed execution grant, the seed record of the generated data, the submitted values (synthetic test data, kept in plain text like the values of a READ check definition), the submission state, the response, the result conditions, the record id, the READ verification, the settled reservation, the ActionResult and its reason. The value lists and limits are owned by src/control/actions/action-contracts.ts; the decisions by src/control/actions/action-outcome.ts. No property holds a credential, a cookie, a CSRF token, a hidden value or an authenticated state. The public audit run.json schema is not changed (only its runId is referenced). T40c (Task 40 design 3.4): the version 1.1 adds the transport (FORM or API) and the API summary (null for FORM; for API the request shape summary, the key names, the names of the header fields supplied by the page, the record id key and the values of the keys decided by the page as JSON texts, cut to null above the limit); an API record has no result conditions (null). The readers accept 1.1 only (LG-4: the previous version 1.0, a FORM record without these items, is no longer read); the writer writes 1.1. No property holds a header value or the response body. PL-6a (plain UI design 8.1, the designer's decision (d)): the version 1.2 replaces the result conditions with the way to judge the result (resultJudgement: FORM_STRUCTURE for FORM, null for API); the writer writes 1.2 and the readers accept 1.1 (the records written before) and 1.2.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,7 +13,6 @@
     "grantId",
     "seedRecord",
     "submittedValues",
-    "resultConditions",
     "submission",
     "blockReason",
     "httpStatus",
@@ -30,7 +29,7 @@
     "api"
   ],
   "properties": {
-    "schemaVersion": { "enum": ["action-run-schema/1.1"] },
+    "schemaVersion": { "enum": ["action-run-schema/1.1", "action-run-schema/1.2"] },
     "jobId": { "$ref": "#/$defs/id" },
     "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
     "profileId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
@@ -78,6 +77,10 @@
         },
         { "type": "null" }
       ]
+    },
+    "resultJudgement": {
+      "description": "PL-6a: the way to judge the result (version 1.2 only).",
+      "anyOf": [{ "enum": ["FORM_STRUCTURE"] }, { "type": "null" }]
     },
     "submission": { "enum": ["NOT_SENT", "SENT", "UNKNOWN"] },
     "blockReason": { "enum": ["PAYLOAD_MISMATCH", "PRECHECK_FAILED", null] },
@@ -159,7 +162,9 @@
         "UNEXPECTED_REQUEST",
         "RECHECK_REFUSED",
         "AUDIT_STAGE_STOPPED",
-        "PREFLIGHT_FAILED"
+        "PREFLIGHT_FAILED",
+        "VALUE_ALREADY_PRESENT",
+        "VERIFICATION_READ_UNAVAILABLE"
       ]
     }
   },
@@ -170,10 +175,16 @@
       "then": { "properties": { "blockReason": { "const": "PRECHECK_FAILED" } } }
     },
     {
-      "description": "T40c: an API record has the API summary and no result conditions; a FORM record has no API summary and has the result conditions.",
+      "description": "T40c: an API record has the API summary and no result conditions; a FORM record has no API summary and has the result conditions. PL-6a: in the version 1.2, the way to judge the result in place of the result conditions (null for API, FORM_STRUCTURE for FORM).",
       "if": { "properties": { "transport": { "const": "API" } } },
-      "then": { "properties": { "api": { "type": "object" }, "resultConditions": { "type": "null" } } },
-      "else": { "properties": { "api": { "type": "null" }, "resultConditions": { "type": "object" } } }
+      "then": { "properties": { "api": { "type": "object" }, "resultConditions": { "type": "null" }, "resultJudgement": { "type": "null" } } },
+      "else": { "properties": { "api": { "type": "null" }, "resultConditions": { "type": "object" }, "resultJudgement": { "const": "FORM_STRUCTURE" } } }
+    },
+    {
+      "description": "PL-6a: a record of the version 1.1 has the result conditions and no way to judge the result; a record of the version 1.2 has the way to judge the result and no result conditions.",
+      "if": { "properties": { "schemaVersion": { "const": "action-run-schema/1.1" } }, "required": ["schemaVersion"] },
+      "then": { "required": ["resultConditions"], "properties": { "resultJudgement": false } },
+      "else": { "required": ["resultJudgement"], "properties": { "resultConditions": false } }
     }
   ],
   "if": { "properties": { "submission": { "const": "NOT_SENT" } } },

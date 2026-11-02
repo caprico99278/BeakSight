@@ -15,18 +15,38 @@
 //   後に、実行のたびに値が変わる欄から推す（`inferredReadExpectationOf`。推測の印）。
 // - 既にあるもの: 同じ型の行（候補の識別の digest と型の digest）のシナリオがあれば、状態（下書き・承認済み・撤回済み）によらず作らない（書き換えない）。
 // - 推測の印は承認に結ばない。表示のときに、同じ部品で求め直す（`autoDraftInferredItemsOf`）。
+import { isDiscoveryProfileRevisionCurrent } from './discovery-profile-freshness.js';
 import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
-import { isReadCheckPageTemplatePath, type ReadCheckExpectation } from '../../discovery/read-check-contracts.js';
+// OP-R: 一覧の画面の判定と、path の末尾の区切りを外す形は、画面の path の定義の owner の部品（写さない）。
+import {
+  isReadCheckPageTemplatePath,
+  readListPagePathOf,
+  withoutTrailingPathSeparator as withoutTrailingSeparator,
+  type ReadCheckExpectation,
+} from '../../discovery/read-check-contracts.js';
 import { submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
 import {
   DRAFT_PROBE_PATH_TEMPLATE,
   apiScenarioDraftInputOf,
   apiScenarioFormOf,
-  isUsableRecordIdSegment,
   type ApiScenarioFormProposal,
 } from './api-scenario-draft.js';
+import {
+  autoDraftDefinitionChoiceOf,
+  formAutoDraftRowsOf,
+  isAutoDraftRecordIdSegment,
+  type AutoDraftDefinitionFact,
+} from './autodraft-shared.js';
 import { draftValueOf, type DraftValue, type DraftValueGround, type DraftValueOrigin } from './draft-value-origin.js';
+import { externalDeliveryKindsOf } from '../data-rules/external-delivery-words.js';
+import {
+  apiKeyFieldOf,
+  chooseUpdateChangedField,
+  updateChangedValueVaries,
+  type UpdateChangedFieldGround,
+  type UpdateChangedFieldUnavailableReason,
+} from './update-changed-field.js';
 import {
   CREATE_SCENARIO_KIND,
   RECORD_ID_PLACEHOLDER,
@@ -80,13 +100,35 @@ export type AutoDraftCreatePlan =
     readonly values: readonly DraftValue<unknown>[];
   }
   | { readonly status: 'EXISTING'; readonly row: AutoDraftRow; readonly scenarioId: string }
-  | { readonly status: 'REJECTED'; readonly row: AutoDraftRow; readonly reason: ScenarioDraftRejectionReason };
+  | {
+    readonly status: 'REJECTED';
+    readonly row: AutoDraftRow;
+    readonly reason: ScenarioDraftRejectionReason;
+    /**
+     * OP-L（L3）: 理由が当たった鍵の名前（下書きの確かめの誤りの `fieldName`。鍵の名前で、値ではない。鍵に結び付かない理由・下書きの前の理由では持たない）。
+     * 次の点検で、どの鍵の形が扱えなかったかを分かるようにする。
+     */
+    readonly reasonKey?: string;
+  };
 
-/** 更新の行の計画（変える欄を人が選ぶ・既にある・作れない）。更新は保存しない。 */
+/**
+ * 更新の行の計画（変える鍵を規則 F で決めた・決められない・既にある・作れない）。計画は保存しない。OP-2（設計書
+ * `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D10）: 前は変える鍵を人が選んだ（`NEEDS_CHANGED_FIELDS`）。
+ */
 export type AutoDraftUpdatePlan =
-  | { readonly status: 'NEEDS_CHANGED_FIELDS'; readonly row: AutoDraftRow }
+  | {
+    readonly status: 'NEW';
+    readonly row: AutoDraftRow;
+    readonly changedFieldNames: readonly string[];
+    readonly keepFieldNames: readonly string[];
+    readonly ground: UpdateChangedFieldGround;
+  }
+  | { readonly status: 'NO_CHANGED_FIELD'; readonly row: AutoDraftRow; readonly reason: UpdateChangedFieldUnavailableReason }
   | { readonly status: 'EXISTING'; readonly row: AutoDraftRow; readonly scenarioId: string }
   | { readonly status: 'REJECTED'; readonly row: AutoDraftRow; readonly reason: ScenarioDraftRejectionReason };
+
+/** OP-2: 更新の行の、作った結果の状態（計画の状態に、保存した `CREATED` と、台帳・型を決められない・保存で拒まれた `NOT_SAVED` を足す）。 */
+export type AutoDraftUpdateResultStatus = AutoDraftUpdatePlan['status'] | 'CREATED' | 'NOT_SAVED';
 
 /** 計画（作る順: 登録が先、更新が後）。 */
 export interface AutoDraftPlan {
@@ -144,10 +186,10 @@ const [RESPONSE_BODY_KEY_SOURCE] = SCENARIO_API_RECORD_ID_SOURCES;
 const STALE_REASON = 'SCENARIO_API_DISCOVERY_PROFILE_STALE' satisfies ScenarioDraftRejectionReason;
 /** 登録の ID を読む応答の鍵が秘密に見える理由（推した鍵が当たれば、鍵を空にする）。 */
 const RECORD_ID_KEY_SECRET_REASON = 'SCENARIO_API_RECORD_ID_KEY_SECRET_LIKE' satisfies ScenarioDraftRejectionReason;
+/** OP-K（K2）: 欄に対応しない鍵が、ページが決める鍵にない理由（外した鍵があれば、その理由に置き換える）。 */
+const API_KEY_NOT_ALLOWED_REASON = 'SCENARIO_API_KEY_NOT_ALLOWED' satisfies ScenarioDraftRejectionReason;
 /** path の区切り。 */
 const PATH_SEPARATOR = '/';
-/** ID の区切りに見える値（数字を 1 つ以上含む。`new`・`import` のような語を ID にしない）。 */
-const HAS_DIGIT = /[0-9]/u;
 /** 照合の READ の期待の種類（本文が含む）。 */
 const TEXT_CONTAINS_KIND = 'TEXT_CONTAINS' satisfies VerificationExpectation['kind'];
 /** 本文が含む期待。 */
@@ -178,11 +220,11 @@ export const apiAutoDraftRowsOf = (candidates: readonly DiscoveryCandidate[]): r
   return Object.freeze([...rows.filter(({ kind }) => kind === CREATE_SCENARIO_KIND), ...rows.filter(({ kind }) => kind === UPDATE_SCENARIO_KIND)]);
 };
 
-/** 発見のジョブのプロファイルの改訂が、今の改訂と違う（分からないときも。下書きの確かめと同じ fail-closed）か。 */
-export const isAutoDraftDiscoveryStale = (context: ScenarioDraftContext): boolean => {
-  const revisions = context.profileRevisions;
-  return revisions === undefined || revisions.discoveryJob === null || revisions.discoveryJob !== revisions.current;
-};
+/**
+ * 発見の結果が、今の改訂のものとみなせないか（分からないときも。下書きの確かめと同じ fail-closed）。PL-U の修正の 1 回目（設計書 14.1 の U5）: 判定は 1 か所
+ * （`discovery-profile-freshness.ts` の `isDiscoveryProfileRevisionCurrent`。「書き込みも試す」の切り替えだけで進んだ改訂は、記録で確かめて同じとみなす）。
+ */
+export const isAutoDraftDiscoveryStale = (context: ScenarioDraftContext): boolean => !isDiscoveryProfileRevisionCurrent(context.profileRevisions);
 
 /** 型の更新の filter の名前（ない・登録なら null）。 */
 const updateFilterNameOf = (probe: SubmissionProbeRecord): string | null => probe.shape?.filters[0]?.name ?? null;
@@ -211,6 +253,37 @@ export const inferredRecordIdKeyOf = (
   }));
   const [only] = names;
   return names.size === 1 && only !== undefined ? draftValueOf(only, 'RECORD_ID_KEY_FROM_UPDATE_FILTER') : null;
+};
+
+/**
+ * OP-G（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.4 の E2）: データのないサイトで推す、よくある番号の鍵の名前（短い一覧の 1 か所。先頭から、
+ * 登録で送る鍵でない最初の名前を使う）。
+ */
+export const COMMON_API_RECORD_ID_KEYS = Object.freeze(['id', 'uuid'] as const);
+
+/**
+ * OP-G（E2）: 同じ表（承認したサービスの Origin と path の型が同じ）の更新の型が 1 つもないとき（データのないサイト）の、登録の ID を読む応答の鍵の推し（推測。根拠
+ * `API_RECORD_ID_KEY_COMMON_NAME`）。更新の型があるとき（推せなかったのは filter の名前が決まらないため）・送り先が分からないときは null（今どおり推さない）。
+ * 推しが外れたら、送った後に番号が取れず `PARTIAL`（`RECORD_ID_NOT_FOUND`）になり、更新はしない。
+ */
+export const commonRecordIdKeyOf = (
+  create: DiscoveryCandidate,
+  rows: readonly AutoDraftRow[],
+  approvedServiceOrigins: readonly string[],
+  sentKeys: readonly string[],
+): DraftValue<string> | null => {
+  const probe = create.submissionProbe;
+  const target = probe === undefined ? null : apiRequestTargetOfProbe(probe, approvedServiceOrigins);
+  if (target === null) {
+    return null;
+  }
+  const sameTableUpdate = rows.some(({ kind, candidate }) => {
+    const updateProbe = candidate.submissionProbe;
+    const updateTarget = kind === UPDATE_SCENARIO_KIND && updateProbe !== undefined ? apiRequestTargetOfProbe(updateProbe, approvedServiceOrigins) : null;
+    return updateTarget !== null && updateTarget.pathShape === target.pathShape && isOriginInAllowedOrigins([target.origin], updateTarget.origin);
+  });
+  const key = sameTableUpdate ? undefined : COMMON_API_RECORD_ID_KEYS.find((name) => !sentKeys.includes(name));
+  return key === undefined ? null : draftValueOf<string>(key, 'API_RECORD_ID_KEY_COMMON_NAME');
 };
 
 /** 同じ型の行の、既にあるシナリオ（状態によらない。なければ null）。 */
@@ -243,7 +316,9 @@ const createPlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow, rows: readon
     ...base,
     api: { ...(base['api'] as Record<string, unknown>), recordId: key === null ? null : { source: RESPONSE_BODY_KEY_SOURCE, key } },
   });
-  const inferred = inferredRecordIdKeyOf(candidate, rows, context.approvedServiceOrigins ?? []);
+  // OP-G（E2）: 同じ表の更新の型がない（データのないサイト）ときは、よくある番号の鍵を推す。
+  const inferred = inferredRecordIdKeyOf(candidate, rows, context.approvedServiceOrigins ?? [])
+    ?? commonRecordIdKeyOf(candidate, rows, context.approvedServiceOrigins ?? [], fieldNames);
   const withKey = inferred === null ? null : firstDraftErrorOf(draftWith(inferred.value), candidate, context);
   // 推した鍵が秘密に見える名前なら、鍵を空にする（人が入れる）。ほかの誤りは、鍵を空にしても同じなので、下で理由にする。
   const recordIdKey = inferred !== null && !(withKey ?? []).some(({ code }) => code === RECORD_ID_KEY_SECRET_REASON) ? inferred : null;
@@ -251,7 +326,12 @@ const createPlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow, rows: readon
   const errors = firstDraftErrorOf(draft, candidate, context);
   const [first] = errors ?? [];
   if (first !== undefined) {
-    return { status: 'REJECTED', row, reason: first.code };
+    // OP-K（K2）: 欄に対応しない鍵が、ページが決める鍵から外れた（秘密に見える名前など、その鍵だけの理由がある）ために拒まれたときは、外した鍵の理由を返す
+    // （行の 1 行を、本当の理由に合わせる。拒むことは変えない）。
+    const blockedPageKey = first.code === API_KEY_NOT_ALLOWED_REASON ? form.pageKeys.find(({ rejection: blocked }) => blocked !== null) : undefined;
+    // OP-L（L3）: 理由が当たった鍵の名前（外した鍵の理由なら、その鍵）も添える（値は添えない）。
+    const reasonKey = blockedPageKey?.key ?? first.fieldName;
+    return { status: 'REJECTED', row, reason: blockedPageKey?.rejection ?? first.code, ...(reasonKey === null ? {} : { reasonKey }) };
   }
   return {
     status: 'NEW',
@@ -268,13 +348,49 @@ const createPlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow, rows: readon
   };
 };
 
-/** 更新の行の計画（保存しない。作れない理由は、型の入口の判定と案の部品の判定）。 */
-const updatePlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow): AutoDraftUpdatePlan => {
+/** 文字の値の JSON の型（変える鍵に選べる型）。 */
+const STRING_KEY_TYPE = 'string';
+/** 変える鍵に選べる、ふつうの文字の欄の型（入れる値の決まりの文字の種類と同じ。メール・電話・選択は選ばない）。 */
+const TEXT_KEY_FIELD_TYPES: ReadonlySet<string> = new Set(['text', 'search', 'textarea']);
+
+/**
+ * OP-2（D10、規則 F）: API の形の更新の変える鍵を 1 つ決める（決まりは `update-changed-field.ts`）。選べる鍵は、送れる（案の誤りがない）、文字の値の、ふつうの
+ * 文字の欄に対応する鍵で、外部へ届く語でなく、推した規則で値が決まり毎回変わる鍵（判定は、鍵の欄を候補の欄にした写しで、フォームの形と同じ部品）。登録で送った
+ * 鍵は、同じ計画の API の登録の行の送る鍵（登録は欄に対応する鍵をすべて送る）。ほかの送れる鍵は保つ鍵にする。
+ */
+const apiUpdateChangedFieldOf = (
+  row: AutoDraftRow,
+  form: ApiScenarioFormProposal,
+  createKeys: ReadonlySet<string>,
+): Extract<AutoDraftUpdatePlan, { readonly status: 'NEW' | 'NO_CHANGED_FIELD' }> => {
+  const sendable = form.keyFields.filter(({ rejection }) => rejection === null);
+  const keys = sendable.map(({ key }) => key);
+  const facts = sendable.map((keyField) => {
+    const field = apiKeyFieldOf(keyField.key, keyField.fieldType);
+    const usable = keyField.type === STRING_KEY_TYPE && TEXT_KEY_FIELD_TYPES.has(keyField.fieldType)
+      && externalDeliveryKindsOf(field).length === 0
+      && updateChangedValueVaries({ ...row.candidate, fields: [field] }, keyField.key, []);
+    return { name: keyField.key, usable, sentInLedger: createKeys.has(keyField.key), onCreateScreen: createKeys.has(keyField.key) };
+  });
+  const choice = chooseUpdateChangedField(facts);
+  return choice.kind === 'CHOSEN'
+    ? {
+      status: 'NEW', row, changedFieldNames: Object.freeze([choice.fieldName]),
+      keepFieldNames: Object.freeze(keys.filter((key) => key !== choice.fieldName)), ground: choice.ground,
+    }
+    : { status: 'NO_CHANGED_FIELD', row, reason: choice.reason };
+};
+
+/** 更新の行の計画（保存しない。作れない理由は、型の入口の判定と案の部品の判定）。OP-2: 変える鍵は規則 F で決める。 */
+const updatePlanOf = (input: AutoDraftPlanInput, row: AutoDraftRow, createKeys: ReadonlySet<string>): AutoDraftUpdatePlan => {
   const probe = row.candidate.submissionProbe;
   const shapeRejection = probe === undefined ? 'SCENARIO_API_CANDIDATE_NOT_API' : apiScenarioShapeRejectionOf(probe);
-  const { rejection } = apiScenarioFormOf({ profileId: input.profileId, candidate: row.candidate, context: input.context, scenarios: [] });
+  const { form, rejection } = apiScenarioFormOf({ profileId: input.profileId, candidate: row.candidate, context: input.context, scenarios: [] });
   const reason = shapeRejection ?? rejection;
-  return reason === null ? { status: 'NEEDS_CHANGED_FIELDS', row } : { status: 'REJECTED', row, reason };
+  if (reason !== null) {
+    return { status: 'REJECTED', row, reason };
+  }
+  return form === null ? { status: 'NO_CHANGED_FIELD', row, reason: 'UPDATE_CHANGED_FIELD_NOT_FOUND' } : apiUpdateChangedFieldOf(row, form, createKeys);
 };
 
 /**
@@ -290,12 +406,14 @@ export const apiAutoDraftPlanOf = (input: AutoDraftPlanInput): AutoDraftPlan => 
     }
     return stale ? { status: 'REJECTED', row, reason: STALE_REASON } : createPlanOf(input, row, rows);
   });
+  // OP-2: 登録で送る鍵（同じ計画の API の登録の行。登録は欄に対応する鍵をすべて送る）。
+  const createKeys = new Set(creates.flatMap((plan) => (plan.status === 'NEW' ? (plan.draft['fieldNames'] as readonly string[] | undefined) ?? [] : [])));
   const updates = rows.filter(({ kind }) => kind === UPDATE_SCENARIO_KIND).map((row): AutoDraftUpdatePlan => {
     const existing = existingScenarioIdOf(row, input.scenarios);
     if (existing !== null) {
       return { status: 'EXISTING', row, scenarioId: existing };
     }
-    return stale ? { status: 'REJECTED', row, reason: STALE_REASON } : updatePlanOf(input, row);
+    return stale ? { status: 'REJECTED', row, reason: STALE_REASON } : updatePlanOf(input, row, createKeys);
   });
   return Object.freeze({ creates: Object.freeze(creates), updates: Object.freeze(updates) });
 };
@@ -316,15 +434,9 @@ export const apiUpdateDraftPresetOf = (form: Pick<ApiScenarioFormProposal, 'ledg
   });
 };
 
-/** path の末尾の区切りを外した形（根は `/`）。 */
-const withoutTrailingSeparator = (path: string): string => {
-  const trimmed = path.replace(/\/+$/u, '');
-  return trimmed.length === 0 ? PATH_SEPARATOR : trimmed;
-};
-
 /**
  * 照合の READ の `{id}` の画面の型の推し（推測。根拠 `READ_PAGE_TEMPLATE_FROM_READ_PATH`）: 登録の画面の path（と、その 1 つ上の path）の直下に、ID に見える
- * 区切り（レコードの ID の形で、数字を含む）を 1 つだけ足した、読めた画面の path があれば、その区切りを `{id}` にした型（登録の画面の path の直下を先に
+ * 区切り（PL-6b: 自動の下書きの共通の判定 `isAutoDraftRecordIdSegment`。core の `isRecordIdLikePathSegment`）を 1 つだけ足した、読めた画面の path があれば、その区切りを `{id}` にした型（登録の画面の path の直下を先に
  * 見る）。型の決まり（`isReadCheckPageTemplatePath`。前に固定の区切りが要る）に合わなければ null。
  */
 export const inferredReadPageTemplateOf = (createPagePath: string, readPagePaths: readonly string[]): DraftValue<string> | null => {
@@ -339,7 +451,7 @@ export const inferredReadPageTemplateOf = (createPagePath: string, readPagePaths
         return false;
       }
       const segment = path.slice(prefix.length + PATH_SEPARATOR.length);
-      return !segment.includes(PATH_SEPARATOR) && isUsableRecordIdSegment(segment) && HAS_DIGIT.test(segment);
+      return !segment.includes(PATH_SEPARATOR) && isAutoDraftRecordIdSegment(segment);
     });
     const template = `${prefix}${PATH_SEPARATOR}${RECORD_ID_PLACEHOLDER}`;
     if (found && isReadCheckPageTemplatePath(template)) {
@@ -348,6 +460,35 @@ export const inferredReadPageTemplateOf = (createPagePath: string, readPagePaths
   }
   return null;
 };
+
+/**
+ * OP-G（E2）: データのないサイトの、照合の READ の `{id}` の画面の型の推し（推測。根拠 `READ_PAGE_TEMPLATE_COMMON_SHAPE`）。登録の画面の path の 1 つ上の path の
+ * 後ろに `{id}` を足した、よくある詳細の画面の形（`/admin/members/new` → `/admin/members/{id}`）。登録の画面の最後の区切りが番号に見える・上の path が根・
+ * 型が READ の画面の型として通らないときは null。外れたら、答え合わせが合わず `PARTIAL` になり、更新はしない。
+ */
+export const commonReadPageTemplateOf = (createPagePath: string): DraftValue<string> | null => {
+  // OP-R（R1）: 1 つ上の path は、一覧の画面の唯一の判定（`readListPagePathOf`）と同じ。
+  const parent = readListPagePathOf(createPagePath);
+  if (parent === null) {
+    return null;
+  }
+  const template = `${parent}${PATH_SEPARATOR}${RECORD_ID_PLACEHOLDER}`;
+  return isReadCheckPageTemplatePath(template) ? draftValueOf(template, 'READ_PAGE_TEMPLATE_COMMON_SHAPE') : null;
+};
+
+/**
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: 照合の READ の一覧の画面の推し（推測。根拠 `READ_PAGE_LIST_OF_CREATE_PAGE`）。登録の
+ * 画面の 1 つ上の path（`readListPagePathOf`）が、点検の段のリンクの path（`auditLinkPaths`）にあるときだけ、その path。期待は「作った値を含む」のまま（シナリオの
+ * 期待。下書きの確かめと IPC が、生成した値と比べる期待を求める）。
+ */
+export const listReadPageOf = (createPagePath: string, auditLinkPaths: readonly string[]): DraftValue<string> | null => {
+  const list = readListPagePathOf(createPagePath);
+  return list !== null && auditLinkPaths.includes(list) ? draftValueOf(list, 'READ_PAGE_LIST_OF_CREATE_PAGE') : null;
+};
+
+/** OP-R（R1）: 選んだ照合の READ の画面が、一覧の画面か（照合の READ に照合の専用の印を付ける。単独の READ の確かめのジョブは読まない）。 */
+export const isAutoDraftListPageChoice = (choice: AutoDraftReadCheckChoice): boolean =>
+  choice.kind !== 'NOT_INFERRED' && choice.template.ground === 'READ_PAGE_LIST_OF_CREATE_PAGE';
 
 /**
  * 照合の READ の期待の推し（推測。根拠 `READ_EXPECTATION_FROM_VARYING_FIELD`）: 送る欄（鍵の順）のうち、入力の規則で実行のたびに値が変わる欄の最初の
@@ -367,10 +508,10 @@ export const inferredReadExpectationOf = (
  * - `PROFILE_NOT_EDITABLE`: シナリオを使わないプロファイルか、取り消したプロファイル。
  * - `DISCOVERY_MISSING`: 最後の発見の結果（`discovery.json`）を読めない、または発見の記録がない。
  * - `DISCOVERY_STALE`: 最後の発見の時のプロファイルの改訂が、今の改訂と違う（発見をやり直す）。
- * - `NO_API_ROWS`: 最後の発見の結果に、API の登録・更新の型の行がない。
+ * - `NO_WRITE_ROWS`（PL-6b で `NO_API_ROWS` から広げた）: 最後の発見の結果に、API の登録・更新の型の行も、フォームの形の登録・書き換えの行もない。
  * - `PREVIEW_OUTDATED`: 確認のダイアログに出した後に、プロファイルの改訂か最後の発見が変わった（読み直す）。画面のサーバが作る時に判定する。
  */
-export const AUTO_DRAFT_BLOCKERS = Object.freeze(['PROFILE_NOT_EDITABLE', 'DISCOVERY_MISSING', 'DISCOVERY_STALE', 'NO_API_ROWS', 'PREVIEW_OUTDATED'] as const);
+export const AUTO_DRAFT_BLOCKERS = Object.freeze(['PROFILE_NOT_EDITABLE', 'DISCOVERY_MISSING', 'DISCOVERY_STALE', 'NO_WRITE_ROWS', 'PREVIEW_OUTDATED'] as const);
 export type AutoDraftBlocker = (typeof AUTO_DRAFT_BLOCKERS)[number];
 
 /** ボタンを押せない理由（押せるなら null。`PREVIEW_OUTDATED` は作る時だけの判定なので、ここでは返さない）。 */
@@ -391,7 +532,7 @@ export const autoDraftBlockerOf = (input: {
   if (isAutoDraftDiscoveryStale(input.context)) {
     return 'DISCOVERY_STALE';
   }
-  return apiAutoDraftRowsOf(input.candidates).length === 0 ? 'NO_API_ROWS' : null;
+  return apiAutoDraftRowsOf(input.candidates).length === 0 && formAutoDraftRowsOf(input.candidates).length === 0 ? 'NO_WRITE_ROWS' : null;
 };
 
 /**
@@ -407,11 +548,8 @@ export const AUTO_DRAFT_READ_CHECK_OUTCOMES = Object.freeze(
 );
 export type AutoDraftReadCheckOutcome = (typeof AUTO_DRAFT_READ_CHECK_OUTCOMES)[number];
 
-/** 取り消していない READ の確かめの定義 1 件（照合の READ の選び方に要るものだけ）。 */
-export interface AutoDraftReadCheckFact extends ReadCheckReference {
-  /** 画面の path の定義の path（候補の定義は null）。 */
-  readonly targetPagePath: string | null;
-}
+/** 取り消していない READ の確かめの定義 1 件（照合の READ の選び方に要るものだけ。PL-6b: 形はフォームの形と共通 `AutoDraftDefinitionFact`）。 */
+export type AutoDraftReadCheckFact = AutoDraftDefinitionFact;
 
 /** 照合の READ の定義の選び方（既にある定義を使う・作る・作らない）。 */
 export type AutoDraftReadCheckChoice =
@@ -429,18 +567,40 @@ export const autoDraftReadCheckChoiceOf = (input: {
   readonly readPagePaths: readonly string[];
   readonly definitions: readonly AutoDraftReadCheckFact[];
   readonly maxDefinitions: number;
+  /**
+   * OP-G（E2）: データのないサイトの登録（番号の鍵をよくある名前から推した行）か。真なら、読めた画面から型を推せないとき、よくある形
+   * （`commonReadPageTemplateOf`）を推す。省けば偽。
+   */
+  readonly withoutData?: boolean;
+  /**
+   * OP-R（設計書 4.1.9 の R1）: 直前の点検の段の成果物のリンクの path（開始の URL と同じ Origin のもの）。登録の画面の 1 つ上の一覧の画面がここにあれば、よくある
+   * 形より先に、その画面を選ぶ（`listReadPageOf`）。省けば空。
+   */
+  readonly auditLinkPaths?: readonly string[];
+  /**
+   * OP-REV6 の I-1: 送る欄（鍵の順）と、そのうち実行のたびに違う値になる欄（値の生成の持ち主の判定 `uniqueEachRunFieldNamesOf`）。一覧の画面には前の登録が並ぶので、
+   * 送る欄にそのような欄があるときだけ、一覧の画面を推す（なければ次の候補へ）。どちらかを省いたとき（入力の規則がまだない確認の一覧）は、送る欄で絞らない。
+   */
+  readonly fieldNames?: readonly string[];
+  readonly uniqueEachRunFieldNames?: readonly string[];
 }): AutoDraftReadCheckChoice => {
-  const template = inferredReadPageTemplateOf(input.createPagePath, input.readPagePaths);
+  const unique = input.uniqueEachRunFieldNames;
+  const listUsable = unique === undefined || input.fieldNames === undefined || input.fieldNames.some((name) => unique.includes(name));
+  // OP-R（R1）: 選ぶ順は、読めた画面から推した `{id}` の型 → 点検の段のリンクにある一覧の画面 → よくある詳細の画面の形（データのないときだけ）。
+  const template = inferredReadPageTemplateOf(input.createPagePath, input.readPagePaths)
+    ?? (listUsable ? listReadPageOf(input.createPagePath, input.auditLinkPaths ?? []) : null)
+    ?? (input.withoutData === true ? commonReadPageTemplateOf(input.createPagePath) : null);
   if (template === null) {
     return { kind: 'NOT_INFERRED' };
   }
-  const existing = input.definitions.find(({ targetPagePath }) => targetPagePath === template.value);
-  if (existing !== undefined) {
-    return { kind: 'EXISTING', template, reference: { readCheckId: existing.readCheckId, revision: existing.revision } };
-  }
-  return input.definitions.length >= input.maxDefinitions
-    ? { kind: 'LIMIT_REACHED', template }
-    : { kind: 'CREATE', template, definition: autoDraftReadCheckDefinitionOf(template.value) };
+  // PL-6b: 既にある・上限・作るの選び方は、フォームの形と共通の部品（`autoDraftDefinitionChoiceOf`）。
+  const choice = autoDraftDefinitionChoiceOf({
+    definitions: input.definitions,
+    isSame: ({ targetPagePath }) => targetPagePath === template.value,
+    maxDefinitions: input.maxDefinitions,
+    definition: autoDraftReadCheckDefinitionOf(template.value),
+  });
+  return choice.kind === 'LIMIT_REACHED' ? { kind: 'LIMIT_REACHED', template } : { ...choice, template };
 };
 
 /** 照合の READ の `{id}` の型の定義（送る値なし。期待は仮の 1 件）。 */
@@ -450,12 +610,20 @@ export const autoDraftReadCheckDefinitionOf = (template: string): {
   readonly expectations: readonly ReadCheckExpectation[];
 } => ({ targetPagePath: template, parameters: {}, expectations: AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS });
 
-/** シナリオの照合の READ（`{id}` の型の定義。結び付けは 0 件。期待は推した 1 件）。 */
-export const autoDraftReadVerificationOf = (readCheck: ReadCheckReference, expectation: VerificationExpectation): ScenarioReadVerification => ({
+/**
+ * シナリオの照合の READ（`{id}` の型か、OP-R: 一覧の画面の定義。結び付けは 0 件。期待は推した 1 件）。OP-R（R1）: 一覧の画面のときは、照合の専用の印を付ける
+ * （`verificationOnly`。単独の READ の確かめのジョブは、その定義を読まない）。
+ */
+export const autoDraftReadVerificationOf = (
+  readCheck: ReadCheckReference,
+  expectation: VerificationExpectation,
+  verificationOnly = false,
+): ScenarioReadVerification => ({
   readCheckId: readCheck.readCheckId,
   revision: readCheck.revision,
   bindings: [],
   expectations: [expectation],
+  ...(verificationOnly ? { verificationOnly: true } : {}),
 });
 
 /** 表示のときに求め直す入力。 */
@@ -481,6 +649,8 @@ export const autoDraftExpectationStepOf = (input: {
   readonly readCheck: AutoDraftReadCheckChoice;
   readonly fieldNames: readonly string[];
   readonly varyingFieldNames: readonly string[];
+  /** OP-REV6 の I-1: 実行のたびに違う値になる欄。一覧の画面の期待は、この欄から推す（省けば空。一覧の画面の期待は推さない）。 */
+  readonly uniqueEachRunFieldNames?: readonly string[];
 }): { readonly kind: 'LINK'; readonly expectation: DraftValue<TextContainsExpectation> } | {
   readonly kind: 'SKIP';
   readonly outcome: Exclude<AutoDraftExpectationOutcome, 'LINKED' | 'LINK_FAILED'>;
@@ -491,7 +661,9 @@ export const autoDraftExpectationStepOf = (input: {
   if (input.readCheck.kind !== 'EXISTING' && input.readCheck.kind !== 'CREATE') {
     return { kind: 'SKIP', outcome: 'NO_READ_CHECK' };
   }
-  const expectation = inferredReadExpectationOf(input.fieldNames, input.varyingFieldNames);
+  // OP-REV6 の I-1: 一覧の画面は、実行のたびに違う値になる欄と比べる（前の登録の値で一致しないように）。
+  const compared = isAutoDraftListPageChoice(input.readCheck) ? input.uniqueEachRunFieldNames ?? [] : input.varyingFieldNames;
+  const expectation = inferredReadExpectationOf(input.fieldNames, compared);
   return expectation === null ? { kind: 'SKIP', outcome: 'NO_VARYING_FIELD' } : { kind: 'LINK', expectation };
 };
 

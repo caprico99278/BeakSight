@@ -1,0 +1,35 @@
+{
+  "$id": "urn:beaksight:schema:report-summary:1.0",
+  "description": "The small summary of the audit report (report-summary.json in the Run directory; plain UI design 14 and 13.13; PL-R). Written by ArtifactWriter.writePresentation from the same view model as report.html, so that the job screen of the local UI reads the number of problems without reading audit.json. Only counts, the Run ID and the Run Status: never a URL, a message or a value of the site.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "runId", "runStatus", "problemCount", "findingCounts", "notFullyCheckedPageCount"],
+  "properties": {
+    "schemaVersion": { "const": "report-summary-schema/1.0" },
+    "runId": { "$ref": "urn:beaksight:schema:run:1.0#/properties/runId" },
+    "runStatus": { "enum": ["COMPLETE", "PARTIAL", "FAILED", "ABORTED_BY_SAFETY"] },
+    "problemCount": {
+      "description": "The number of the site quality findings (ERROR, WARN and INFO). The Safety findings are counted apart.",
+      "$ref": "#/$defs/count"
+    },
+    "findingCounts": {
+      "description": "The number of the findings of each severity.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ERROR", "WARN", "INFO", "SAFETY"],
+      "properties": {
+        "ERROR": { "$ref": "#/$defs/count" },
+        "WARN": { "$ref": "#/$defs/count" },
+        "INFO": { "$ref": "#/$defs/count" },
+        "SAFETY": { "$ref": "#/$defs/count" }
+      }
+    },
+    "notFullyCheckedPageCount": {
+      "description": "The number of the pages that were not checked to the end (PARTIAL, FAILED and SKIPPED).",
+      "$ref": "#/$defs/count"
+    }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+  }
+}

@@ -10,11 +10,15 @@
 // 4. probe（isolated world の 1 回の読み取り。`isolated-read.ts` の `readInIsolatedWorld`。DEF-087）→ JS の結び付き（CDP。main world の
 //    objectId で読む。`listeners.ts`）→ T27a の分類（`classifyCandidate`）と指紋（`computeCandidateDigests`）。
 //    読み取りが失敗したら、候補を出さずに `INCOMPLETE_READ_FAILED`。
+// 5. OP-2 の修正の 1 回目（判断 2）: 候補を読めた画面は、画面の名前（最初の h1 の文字と title）を isolated world の 1 回の読み取りで読み、記録に足す
+//    （`discoveryScreenNameOf` の形。標準の prototype の getter で読む。読めなければ足さない。候補・理由・判定は変えない）。
+//    OP-K（K1）: 1 の前に、SPA の見出しが後から描かれるのを、上限（`DISCOVERY_SCREEN_HEADING_WAIT_MS`）まで待つ（isolated world で読むだけ。読み込みは足さない）。
 // 画面の記録は、成果物 `discovery.json`（T27d）の 1 画面分の形（純粋な部品 `discovery-result.ts` の `DiscoveryReadPageRecord`。型は 1 つ。
 // PRE42-CC 組 5b。CC-070 (a)）: 画面の Origin と path（http(s) でなければ null）、読み切れなかった理由（重複なし、閉じた一覧の順）、候補（どの
 // 候補にも、画面の理由を同じく付ける）。候補 0 件の不完全な画面も表せる。
 import type { Page } from 'playwright';
-import { awaitBeforeDeadline } from '../core/deadline.js';
+import { composeInPage, type StandardReaders } from '../browser/in-page-readers.js';
+import { awaitBeforeDeadline, wait } from '../core/deadline.js';
 import {
   activateInteractionFreeze,
   assertPassiveRequestGuardActive,
@@ -29,7 +33,8 @@ import {
   type IncompleteReason,
 } from './candidate-contracts.js';
 import { classifyCandidate, type CandidateClassificationPolicy } from './classify.js';
-import type { DiscoveryReadPageRecord } from './discovery-result.js';
+import { discoveryScreenNameOf, type DiscoveryReadPageRecord, type DiscoveryScreenName } from './discovery-result.js';
+import { readInIsolatedWorld } from './isolated-read.js';
 import { computeCandidateDigests } from './fingerprint.js';
 import { readCandidateListeners } from './listeners.js';
 import { locationOfUrl, probePageCandidates, type ProbedCandidate } from './probe.js';
@@ -52,6 +57,58 @@ export interface DiscoverPageOptions {
   /** 落ち着きの待ちの指定（試験のための差し替え。本番は省略して `DISCOVERY_SETTLE_POLICY`）。 */
   readonly settlePolicy?: DiscoverySettlePolicy | undefined;
 }
+
+/** 画面の名前の、ページの中で読む文字の長さの上限（記録の上限より長めに読み、Node の側で形を整える）。 */
+const SCREEN_NAME_READ_LENGTH = 1_000;
+
+/**
+ * OP-2 の修正の 1 回目（判断 2）: ページの中で動く、画面の名前の読み取り（isolated world。外の値を参照しない）。部品（`R`。`src/browser/in-page-readers.ts`。CC-068）の
+ * 標準の prototype の getter とメソッドで、最初の h1 の文字と、題（title）を読む（DOM clobbering を受けない）。
+ */
+function screenNameReader(R: StandardReaders, maxLength: number): unknown {
+  const textOf = (value: unknown): string | null => (typeof value === 'string' ? value.slice(0, maxLength) : null);
+  const heading = Document.prototype.querySelector.call(document, 'h1');
+  return {
+    heading: heading === null ? null : textOf(R.standardProperty(Node.prototype, 'textContent', heading)),
+    title: textOf(R.documentProperty('title')),
+  };
+}
+const screenNameInPage = composeInPage(screenNameReader);
+
+/**
+ * OP-K（K1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の指示書 OP-K）: SPA の見出し（h1）が後から描かれるのを、凍結の前に待つ時間の上限（ms）と、
+ * 確かめる間隔（ms）。見出しのない画面は、この上限だけ待って先へ進む。読み込みは足さない（今の読み込みの中で、isolated world で読むだけ）。
+ */
+export const DISCOVERY_SCREEN_HEADING_WAIT_MS = 2_000;
+export const DISCOVERY_SCREEN_HEADING_POLL_MS = 100;
+
+/** 画面の名前を読む（読めなければ null。例外を投げない）。`deadlineAtMs` は読み取りの期限（省略は今から `DISCOVERY_READ_TIMEOUT_MS`）。 */
+const readScreenName = async (page: Page, deadlineAtMs: number = Date.now() + DISCOVERY_READ_TIMEOUT_MS): Promise<DiscoveryScreenName | null> => {
+  const outcome = await readInIsolatedWorld(page, screenNameInPage, SCREEN_NAME_READ_LENGTH, deadlineAtMs);
+  if (outcome.status !== 'READ' || typeof outcome.value !== 'object' || outcome.value === null) {
+    return null;
+  }
+  const { heading, title } = outcome.value as Record<string, unknown>;
+  return discoveryScreenNameOf(heading, title);
+};
+
+/**
+ * OP-K（K1）: 見出し（h1 の文字。`discoveryScreenNameOf` で空・秘密に見える文でないもの）が見えるまで、`DISCOVERY_SCREEN_HEADING_WAIT_MS` を上限に待つ（凍結の前。
+ * ページを操作しない。読めない・閉じたときは待たない）。例外を投げない。
+ */
+const waitForScreenHeading = async (page: Page): Promise<void> => {
+  const deadlineAtMs = Date.now() + DISCOVERY_SCREEN_HEADING_WAIT_MS;
+  for (;;) {
+    if (page.isClosed()) {
+      return;
+    }
+    const name = await readScreenName(page, deadlineAtMs);
+    if (name === null || name.heading !== null || Date.now() + DISCOVERY_SCREEN_HEADING_POLL_MS >= deadlineAtMs) {
+      return;
+    }
+    await wait(DISCOVERY_SCREEN_HEADING_POLL_MS);
+  }
+};
 
 /** 結び付きの記録の空の値（落ち着きの待ちの digest の計算に使う。識別の digest は結び付きを含まない）。 */
 const NO_JS_BINDING: CandidateJsBinding = Object.freeze({
@@ -186,6 +243,8 @@ export async function settleAndFreezePage(
  * 1 つの画面の候補を、読むだけで見つける（例外を投げない）。ページを操作しない。凍結の後に読む。
  */
 export async function discoverPageCandidates(page: Page, options: DiscoverPageOptions): Promise<DiscoveryReadPageRecord> {
+  // OP-K（K1）: SPA の見出しが後から描かれるのを、凍結の前に、上限まで待つ（凍結の後は、ページの JS が描かない）。
+  await waitForScreenHeading(page);
   const frozen = await settleAndFreezePage(page, options);
   const reasons = new Set<IncompleteReason>(frozen.reasons);
   if (frozen.status !== 'FROZEN') {
@@ -236,5 +295,7 @@ export async function discoverPageCandidates(page: Page, options: DiscoverPageOp
       ...computeCandidateDigests(discovered),
     }));
   }
-  return pageRecord(location, reasons, candidates);
+  const screenName = await readScreenName(page);
+  const record = pageRecord(location, reasons, candidates);
+  return screenName === null ? record : Object.freeze({ ...record, screenName });
 }

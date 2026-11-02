@@ -58,7 +58,10 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { READ_CHECK_ADVANCED_SETTINGS, openAdvancedSettings } from './helpers/advanced-settings.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -198,15 +201,32 @@ const fillDefinition = async (
   await page.keyboard.press('Enter');
 };
 
-/** 候補の画面から、READ の候補の「READ の確かめを作る」を開く（キーボード）。 */
+/**
+ * READ の候補の、見るだけの確かめを作る画面を開く。PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 6、8 章）: 操作さがしの画面の候補ごとの
+ * 「見るだけの確かめを作る」のリンクはなくした（答え合わせは BeakSight が作る）。任意の見るだけの確かめは、候補の digest の URL で作成の画面を開く。
+ */
 const openNewDefinition = async (path: string): Promise<Page> => {
-  const page = await openPage(`/discovery/${PROFILE_ID}`);
-  const link = candidateRow(page, path, 'READ').first().getByTestId('candidate-create-read-check');
-  await tabTo(page, link);
-  await page.keyboard.press('Enter');
+  const digest = await readDigestOf(path);
+  const page = await openPage(`/read-checks/${PROFILE_ID}/new?candidate=${encodeURIComponent(digest)}`);
   await page.getByTestId('read-check-form').waitFor({ timeout: UI_TIMEOUT_MS });
   return page;
 };
+
+/** 操作さがしの値の候補（PL-5: 画面に出さなくなった種類・ドリフト・欄・probe の確かめは、画面と同じ値の Server Function で行う）。 */
+interface DiscoveryCandidateValue {
+  readonly pagePath: string;
+  readonly classification: string;
+  readonly drift: string;
+  readonly readCheckable: boolean;
+  readonly detail: {
+    readonly fields: readonly { readonly name: string; readonly sendable: boolean }[];
+    readonly submissionProbes: readonly { readonly result: string }[];
+  } | null;
+}
+const discoveryCandidatesOf = async (): Promise<readonly DiscoveryCandidateValue[]> =>
+  (await valueOf<{ candidates: readonly DiscoveryCandidateValue[] }>('discoveryPageFn', 'GET', { profileId: PROFILE_ID })).candidates;
+const candidateValueOf = (candidates: readonly DiscoveryCandidateValue[], path: string, classification: string): DiscoveryCandidateValue | undefined =>
+  candidates.find((candidate) => candidate.pagePath === path && candidate.classification === classification);
 
 /** fixture のサイトに届いた、GET と HEAD 以外の要求。 */
 const nonReadRequests = (): readonly string[] => nonReadRequestsOf(siteOf().requests);
@@ -258,7 +278,10 @@ afterAll(async () => {
 describe('local UI: the operation candidates (DISCOVERY)', () => {
   it('opens the candidates from the profile by keyboard, and shows AUTH_SETUP_MISSING without a start button', async () => {
     const page = await openPage(`/profiles/${PROFILE_ID}`);
-    await tabTo(page, page.getByTestId('profile-discovery').getByRole('link', { name: text.profileDetail.openDiscovery }));
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 操作さがしの結果への入口は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
+    await tabTo(page, page.getByTestId('profile-open-discovery'));
+    expect(await page.getByTestId('profile-open-discovery').textContent()).toBe(text.profileDetail.openDiscovery);
     await page.keyboard.press('Enter');
     await page.waitForURL(new RegExp(`/discovery/${PROFILE_ID}$`, 'u'), { timeout: UI_TIMEOUT_MS });
     await page.getByTestId('discovery-guidance').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -271,7 +294,7 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
 
   it('starts a discovery by keyboard, shows only the kind and the state on the job screen, and lists the classified candidates', async () => {
     const fixture = siteOf();
-    expect(await valueOf('saveAuthSetupFn', 'POST', {
+    expect(await saveAuthSetupRequestInStore(root, {
       setup: {
         ...FORM_NAVIGATION_SETUP_ITEMS,
         profileId: PROFILE_ID,
@@ -293,7 +316,8 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     const jobId = await startFrom(page, page.getByTestId('discovery-start'));
     state.discoveryJobs.push(jobId);
     expect(await page.getByTestId('job-kind').getAttribute('data-kind')).toBe('DISCOVERY');
-    expect(await page.getByTestId('job-no-progress').textContent()).toBe(text.job.noProgress);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 技術の文（進み具合を送らない旨）は出さない。
+    expect(await page.getByTestId('job-no-progress').count()).toBe(0);
     expect(await page.getByTestId('job-progress').count()).toBe(0);
     expect(await page.getByTestId('job-progress-empty').count()).toBe(0);
     await screenshot(page, '02-discovery-job-running');
@@ -314,6 +338,8 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     expect(await page.getByTestId('discovery-end-reason').getAttribute('data-reason')).toBe('COMPLETED');
     const p = DISCOVERY_SITE_PATHS;
     const r = DISCOVERY_SITE_READ_CHECK_PATHS;
+    // PL-5（設計書 3 章の 2）: 画面は分類の語だけ（詳しい内容の中）。ドリフト・実行の可否・欄の型・probe の結果は画面に出さず、同じ値の Server Function で確かめる。
+    const values = await discoveryCandidatesOf();
     for (const [path, classification] of [
       [p.search, 'READ'],
       [r.orders, 'READ'],
@@ -326,31 +352,22 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     ] as const) {
       const row = candidateRow(page, path, classification).first();
       expect(await row.count(), `${path} ${classification}`).toBe(1);
-      expect(await row.getAttribute('data-drift')).toBe('NEW');
       expect(await row.getByText(CANDIDATE_CLASSIFICATION_CATALOG[classification].label).count()).toBe(1);
-      expect(await row.getByTestId('candidate-execution').textContent())
-        .toContain(classification === 'READ' ? text.readCheckable : text.notExecutable);
+      expect(await row.getByTestId('candidate-execution').count()).toBe(0);
+      expect(candidateValueOf(values, path, classification), `${path} ${classification}`).toMatchObject({ drift: 'NEW', readCheckable: classification === 'READ' });
     }
-    // 詳しい内容: 欄の型と、値を送れるか（CSRF のトークンと hidden の欄は送れない）。
-    const orders = page.locator(`[data-testid="discovery-page"][data-page-path="${r.orders}"]`);
-    await orders.getByTestId('candidate-detail').first().locator('summary').click();
-    const fields = orders.getByTestId('candidate-fields').first();
-    expect(await fields.locator('tr[data-field-name]').evaluateAll((rows) =>
-      rows.map((row) => [row.getAttribute('data-field-name'), row.getAttribute('data-sendable')]))).toEqual([
-      ['authenticity_token', 'false'],
-      ['scope', 'false'],
-      ['q', 'true'],
-      ['status', 'true'],
+    // 値を送れるか（CSRF のトークンと hidden の欄は送れない）。PL-5: 欄の型の表は画面に出さない。
+    expect(candidateValueOf(values, r.orders, 'READ')?.detail?.fields.map(({ name, sendable }) => [name, sendable])).toEqual([
+      ['authenticity_token', false],
+      ['scope', false],
+      ['q', true],
+      ['status', true],
     ]);
-    // T37c（Task 37 の設計書 3.6）: JS の結び付きの候補（NEEDS_BINDING）の詳しい内容に、送らずに観察した結果を出す（fixture の JS の画面は、押しても
-    // 何も送らないので「要求なし」）。表示は表示のカタログのラベル。
-    const bound = candidateRow(page, p.js, 'NEEDS_BINDING').first();
-    const boundDetail = bound.locator('xpath=following-sibling::tr[1]').getByTestId('candidate-detail');
-    await boundDetail.locator('summary').click();
-    const probes = boundDetail.getByTestId('candidate-submission-probes');
-    expect(await probes.locator('[data-probe-result]').first().getAttribute('data-probe-result')).toBe('NO_REQUEST');
-    expect(await probes.getByText(SUBMISSION_PROBE_RESULT_CATALOG.NO_REQUEST.label).count()).toBeGreaterThan(0);
-    expect(await probes.getByText(text.submissionProbe.heading).count()).toBe(1);
+    expect(await page.getByTestId('candidate-fields').count()).toBe(0);
+    // T37c（Task 37 の設計書 3.6）: JS の結び付きの候補（NEEDS_BINDING）の、送らずに観察した結果（fixture の JS の画面は、押しても何も送らないので
+    // 「要求なし」）。PL-5: 画面には出さない（成果物と Server Function の値に残る）。
+    expect(candidateValueOf(values, p.js, 'NEEDS_BINDING')?.detail?.submissionProbes[0]?.result).toBe('NO_REQUEST');
+    expect(await page.getByTestId('candidate-submission-probes').count()).toBe(0);
     await screenshot(page, '04-discovery-candidates');
   }, SCENARIO_TIMEOUT_MS);
 
@@ -362,10 +379,12 @@ describe('local UI: the operation candidates (DISCOVERY)', () => {
     await waitForFinished(page);
     const discovery = await openPage(`/discovery/${PROFILE_ID}`);
     const variant = DISCOVERY_SITE_PATHS.variant;
-    expect(await candidateRow(discovery, variant, 'READ').getAttribute('data-drift')).toBe('CHANGED');
-    expect(await candidateRow(discovery, variant, 'CREATE').getAttribute('data-drift')).toBe('MISSING');
-    expect(await candidateRow(discovery, variant, 'CREATE').getByTestId('candidate-execution').textContent()).toContain(text.notExecutable);
-    expect(await candidateRow(discovery, DISCOVERY_SITE_PATHS.search, 'READ').getAttribute('data-drift')).toBe('UNCHANGED');
+    // PL-5（設計書 3 章の 2）: ドリフトは画面に出さない（初回はすべて「新しい」で、利用者が判断に使わない）。同じ値の Server Function で確かめる。
+    const values = await discoveryCandidatesOf();
+    expect(candidateValueOf(values, variant, 'READ')?.drift).toBe('CHANGED');
+    expect(candidateValueOf(values, variant, 'CREATE')).toMatchObject({ drift: 'MISSING', readCheckable: false });
+    expect(candidateValueOf(values, DISCOVERY_SITE_PATHS.search, 'READ')?.drift).toBe('UNCHANGED');
+    expect(await discovery.locator('[data-testid="discovery-candidate"][data-drift]').count()).toBe(0);
     // 消えた候補は、READ の確かめに使わない（最後の発見の結果にない）。
     await screenshot(discovery, '05-discovery-drift');
   }, SCENARIO_TIMEOUT_MS);
@@ -434,6 +453,8 @@ describe('local UI: the READ check definitions and results (READ_CHECK)', () => 
     const all = await search.getByTestId('read-check-definition').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-read-check-id') ?? ''));
     const removable = all.find((id) => id !== state.ordersCheckId && id !== state.lookupCheckId) ?? '';
     const edit = await openPage(`/read-checks/${PROFILE_ID}/${removable}`);
+    // PL-5 の修正の 1 回目（設計書 3 章の 1）: 削除は、定義の画面の詳しい内容の中。
+    await openAdvancedSettings(edit, READ_CHECK_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     await tabTo(edit, edit.getByTestId('read-check-remove'));
     await edit.keyboard.press('Enter');
     await edit.getByRole('dialog').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -450,13 +471,14 @@ describe('local UI: the READ check definitions and results (READ_CHECK)', () => 
     relay?.provide(await credentials());
     state.readCheckJob = await startFrom(page, page.getByTestId('read-check-start'));
     expect(await page.getByTestId('job-kind').getAttribute('data-kind')).toBe('READ_CHECK');
-    expect(await page.getByTestId('job-no-progress').textContent()).toBe(text.job.noProgress);
+    // PL-2（3 章の 2）: 技術の文（進み具合を送らない旨）は出さない。
+    expect(await page.getByTestId('job-no-progress').count()).toBe(0);
     await waitForFinished(page);
     await tabTo(page, page.getByTestId('job-open-read-checks'));
     await page.keyboard.press('Enter');
     await page.waitForURL(new RegExp(`/read-checks/${PROFILE_ID}$`, 'u'), { timeout: UI_TIMEOUT_MS });
     const results = page.locator(`[data-testid="read-check-result"][data-job-id="${state.readCheckJob}"]`);
-    await results.first().waitFor({ timeout: UI_TIMEOUT_MS });
+    await results.first().waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     const byId = new Map(await results.evaluateAll((rows) => rows.map((row) => [
       row.getAttribute('data-read-check-id') ?? '',
       [row.getAttribute('data-result'), row.getAttribute('data-detail')] as const,

@@ -34,13 +34,15 @@ import {
 } from '../../src/control/approval/scenario-store.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
-import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
+import { MIN_PROFILE_REVISION, type SiteProfile } from '../../src/control/contracts.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
 import { createStartingJob, recordLoginCheckFinished } from '../../src/control/job/job-store.js';
 import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, getProfile } from '../../src/control/store/profile-store.js';
+import { saveProfileAndAuthSetup } from '../../src/control/store/profile-auth-setup-store.js';
+import { withWriteTransaction } from '../../src/control/store/transaction.js';
 import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import { dateOfCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
@@ -48,7 +50,7 @@ import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoveryReadPagePaths, mergeDiscove
 import { observedSubmissionProbeOf, type SubmissionProbeInputField, type SubmissionProbeRecord } from '../../src/discovery/submission-probe-contracts.js';
 import { ALL_CONFIRMED, candidateOf } from '../unit/approval-samples.js';
 import { NO_JS_BINDING, sampleButton } from '../unit/discovery-candidate-samples.js';
-import { TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testWriteProfile } from './control-profile-fixtures.js';
+import { TEST_ORIGIN, TEST_TARGET_PATH, resolveTestContext, testAuthProfile, testWriteProfile } from './control-profile-fixtures.js';
 
 const PROFILE_ID = 'example-autodraft';
 const DISCOVERY_JOB_ID = 'job-autodraft-d1';
@@ -206,7 +208,8 @@ describe('FM2b: the automatic drafts saved through the current store', () => {
 
   it('cannot save an update draft without a changed key (so it never reaches the approval), and binds the update to the saved create', () => {
     const plan = planOf();
-    expect(plan.updates.map(({ status }) => status)).toEqual(['NEEDS_CHANGED_FIELDS']);
+    // OP-2（D10、規則 F）: 計画は変える鍵を決める（保存はしない。保存の口の守りは下で確かめるとおり変えない）。
+    expect(plan.updates.map(({ status }) => status)).toEqual(['NEW']);
     const [create] = plan.creates;
     if (create?.status !== 'NEW') {
       throw new Error(`the create is ${create?.status}`);
@@ -270,5 +273,161 @@ describe('FM2b: the automatic drafts saved through the current store', () => {
     }
     expect(createScenario(database, { scenarioId: CREATE_ID, draft: create.draft, discovery: DISCOVERY, at: CREATED_AT })).toMatchObject({ ok: true });
     expect(planOf().creates).toEqual([{ status: 'EXISTING', row: expect.objectContaining({ kind: 'CREATE' }), scenarioId: CREATE_ID }]);
+  });
+});
+
+// PL-U の修正の 1 回目（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14.1 の U5 と判断）: 操作さがしの結果の古さは、
+// `discovery-profile-freshness.ts` の 1 か所で決める。「書き込みも試す」の切り替え（モードを書き込みのモードにし、隔離の参照を変え、認証の設定を次の改訂に
+// 結びつけ直す）だけで進んだ改訂は、保存した改訂の記録で確かめられれば、同じ改訂とみなす。ほかの変更が挟まれば、今どおり古い。書き込みの OK と今の改訂を
+// 比べる判定（`PROFILE_REVISION_CHANGED`）は変えない。
+describe('PL-U: the discovery result stays usable after the write mode switch only', () => {
+  const SWITCH_PROFILE = 'example-switch';
+  const SWITCH_JOB = 'job-switch-d1';
+  const SWITCH_CREATE = 'scenario-switch-create';
+  const SWITCH_DISCOVERY = { ...DISCOVERY, jobId: SWITCH_JOB } as DiscoveryDocument;
+  const SWITCHED_REF = 'isolation-unverified-20261027';
+  const SWITCHED_AT = new Date('2026-10-22T00:05:00Z');
+
+  /** 読み取りのモードのサイトで操作さがしを 1 回した状態（改訂 1）。 */
+  const setUpPassiveSite = (): void => {
+    expect(createProfile(database, { ...testAuthProfile(SWITCH_PROFILE, MIN_PROFILE_REVISION), approvedServiceOrigins: [API_ORIGIN] },
+      { resolveContext: resolveTestContext }).ok).toBe(true);
+    expect(saveAuthSetup(database, { ...SETUP, profileId: SWITCH_PROFILE }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
+    expect(createStartingJob(database, {
+      jobId: SWITCH_JOB, jobKind: 'DISCOVERY', profileId: SWITCH_PROFILE, profileRevision: MIN_PROFILE_REVISION, startNew: true, createdAt: DISCOVERED_AT,
+    }, () => null)).toEqual({ ok: true });
+    expect(recordLoginCheckFinished(database, SWITCH_JOB, 0, DISCOVERED_AT)).toBe(true);
+    recordDiscoveryCandidates(database, {
+      profileId: SWITCH_PROFILE, jobId: SWITCH_JOB, at: DISCOVERED_AT, entries: CANDIDATES.map(discoveryIndexEntryOf), readPagePaths: discoveryReadPagePaths(SWITCH_DISCOVERY),
+    });
+  };
+
+  /** 次の改訂を、プロファイルと認証の設定の保存の部品で書く（「書き込みも試す」の切り替えと同じ書き方。`changes` は、その改訂の変更）。 */
+  const saveNextRevision = (changes: Partial<SiteProfile>): void => {
+    const stored = getProfile(database, SWITCH_PROFILE);
+    if (stored === null) {
+      throw new Error('the profile is missing');
+    }
+    const next = stored.profile.revision + 1;
+    expect(saveProfileAndAuthSetup(database, {
+      profile: { ...stored.profile, revision: next, ...changes },
+      expectedRevision: stored.profile.revision,
+      setup: { ...SETUP, profileId: SWITCH_PROFILE, profileRevision: next },
+    }, { resolveContext: resolveTestContext, now: () => SWITCHED_AT })).toMatchObject({ ok: true });
+  };
+  const switchToWrite = (changes: Partial<SiteProfile> = {}): void =>
+    saveNextRevision({ mode: 'TEST_APPROVED_WRITE', environmentEvidenceRef: SWITCHED_REF, ...changes });
+
+  const switchedPlanOf = () => {
+    const context = readScenarioDraftContext(database, SWITCH_PROFILE, SWITCH_JOB, null);
+    if (context === null) {
+      throw new Error('the draft context is not available');
+    }
+    return apiAutoDraftPlanOf({ profileId: SWITCH_PROFILE, candidates: CANDIDATES, context, scenarios: [] });
+  };
+  const switchedFactsOf = async (): Promise<ApprovalExternalFacts> => {
+    const stored = getProfile(database, SWITCH_PROFILE);
+    const external = stored === null ? null : await approvalExternalFactsOf(stored, {
+      database, repositoryRoot: workDirectory, credentialStore: { readMetadata: () => Promise.resolve(null) },
+    });
+    if (external === null) {
+      throw new Error('the external facts are not available');
+    }
+    return external;
+  };
+  /** 切り替えの後に、操作さがしをやり直さずに、下書きを保存し、副作用を確かめて OK を出す。 */
+  const draftAndApprove = async (): Promise<void> => {
+    const [create] = switchedPlanOf().creates;
+    if (create?.status !== 'NEW') {
+      throw new Error(`the create is ${create?.status ?? 'missing'}`);
+    }
+    const created = createScenario(database, { scenarioId: SWITCH_CREATE, draft: create.draft, discovery: SWITCH_DISCOVERY, at: CREATED_AT });
+    if (!created.ok) {
+      throw new Error(`the create draft was not saved: ${created.reason} ${JSON.stringify(created.draftErrors)}`);
+    }
+    expect(updateScenario(database, {
+      scenarioId: SWITCH_CREATE, expectedRevision: 1, draft: { ...create.draft, sideEffectConfirmations: ALL_CONFIRMED }, discovery: SWITCH_DISCOVERY, at: CHANGED_AT,
+    })).toMatchObject({ ok: true });
+    const external = await switchedFactsOf();
+    const status = readScenarioApprovalStatus(database, SWITCH_CREATE, external, dateOfCompactUtcTimestamp(APPROVED_AT));
+    expect(status?.validity.approved === false ? status.validity.reasons : []).not.toContain('API_DISCOVERY_PROFILE_STALE');
+    expect(approveScenario(database, {
+      scenarioId: SWITCH_CREATE, expectedRevision: 2, expectedApprovalDigest: status?.approvalDigest ?? '', receiptId: 'receipt-switch', external, at: APPROVED_AT,
+    })).toMatchObject({ ok: true, scenario: { state: 'APPROVED' } });
+  };
+
+  it('drafts, saves and approves from the discovery before the switch, without a new discovery', async () => {
+    setUpPassiveSite();
+    switchToWrite();
+    await draftAndApprove();
+    const approved = readScenarioApprovalStatus(database, SWITCH_CREATE, await switchedFactsOf(), dateOfCompactUtcTimestamp(APPROVED_AT));
+    expect(approved?.validity).toMatchObject({ approved: true });
+  });
+
+  it('still treats the discovery as stale when another change comes with the switch', () => {
+    setUpPassiveSite();
+    // 承認したサービスのアドレスの一覧を変えた切り替え（型の Origin は一覧の番号なので、同じとみなさない）。
+    switchToWrite({ approvedServiceOrigins: [API_ORIGIN, 'https://other-api.example.invalid'] });
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['REJECTED']);
+  });
+
+  it('still treats the discovery as stale when the revision moved on after the switch for another reason', () => {
+    setUpPassiveSite();
+    switchToWrite();
+    // 切り替えの後の、切り替えでない改訂（隔離の参照だけを変えた編集も、切り替えではない）。
+    saveNextRevision({ environmentEvidenceRef: 'evidence/example-test-env/isolation-check-2' });
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['REJECTED']);
+  });
+
+  it('makes the OK invalid as before when the revision moves on after the OK', async () => {
+    setUpPassiveSite();
+    switchToWrite();
+    await draftAndApprove();
+    saveNextRevision({});
+    const status = readScenarioApprovalStatus(database, SWITCH_CREATE, await switchedFactsOf(), dateOfCompactUtcTimestamp(APPROVED_AT));
+    expect(status?.validity).toMatchObject({ approved: false });
+    expect(status?.validity.approved === false ? status.validity.reasons : [])
+      .toEqual(expect.arrayContaining(['PROFILE_REVISION_CHANGED', 'API_DISCOVERY_PROFILE_STALE']));
+  });
+
+  // PL-F（安全のレビュー PL-REV の Minor 4）: レビューの実験で安全の側だった場面を固定する（今のコードで最初から PASS する、今の守りを固定するテスト）。
+  it('treats the discovery as stale after a switch, a switch back and another switch', () => {
+    setUpPassiveSite();
+    switchToWrite();
+    saveNextRevision({ mode: 'TEST_AUTH_PASSIVE' });
+    switchToWrite();
+    expect(getProfile(database, SWITCH_PROFILE)?.profile.revision).toBe(MIN_PROFILE_REVISION + 3);
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['REJECTED']);
+  });
+
+  it('treats the discovery as stale when the record of a revision between the discovery and now is missing', () => {
+    setUpPassiveSite();
+    switchToWrite();
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['NEW']);
+    // 操作さがしのときの改訂の記録が欠けると、切り替えだけかを確かめられない（fail-closed）。
+    withWriteTransaction(database, (connection) => {
+      connection.prepare('DELETE FROM profile_revisions WHERE profile_id = ? AND revision = ?').run(SWITCH_PROFILE, MIN_PROFILE_REVISION);
+    });
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['REJECTED']);
+  });
+
+  it('treats the discovery as stale when only the isolation reference was changed before the switch', () => {
+    setUpPassiveSite();
+    // 切り替えの前の、隔離の参照だけを変えた改訂（切り替えではない）。
+    saveNextRevision({ environmentEvidenceRef: 'evidence/example-test-env/isolation-check-9' });
+    switchToWrite();
+    expect(switchedPlanOf().creates.map(({ status }) => status)).toEqual(['REJECTED']);
+  });
+
+  it('makes the OK invalid when the site is switched back and switched again after the OK', async () => {
+    setUpPassiveSite();
+    switchToWrite();
+    await draftAndApprove();
+    saveNextRevision({ mode: 'TEST_AUTH_PASSIVE' });
+    switchToWrite();
+    const status = readScenarioApprovalStatus(database, SWITCH_CREATE, await switchedFactsOf(), dateOfCompactUtcTimestamp(APPROVED_AT));
+    expect(status?.validity).toMatchObject({ approved: false });
+    expect(status?.validity.approved === false ? status.validity.reasons : [])
+      .toEqual(expect.arrayContaining(['PROFILE_REVISION_CHANGED', 'API_DISCOVERY_PROFILE_STALE']));
   });
 });

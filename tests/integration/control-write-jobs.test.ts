@@ -194,8 +194,8 @@ const actionRunOf = (jobId: string, grantId: string, overrides: Partial<ActionRu
   grantId,
   seedRecord: '__START_SEED_RECORD__' as never,
   submittedValues: { name: '試験一郎' },
-  resultConditions: { successCondition: VERIFICATION_SPEC.successCondition ?? { pathPrefix: '/', selector: null },
-    inputErrorCondition: VERIFICATION_SPEC.inputErrorCondition ?? { pathPrefix: '/', selector: null } },
+  // PL-6a: 版 1.2 の記録は、成否の条件の代わりに結果の判定のしかたの印を持つ。
+  resultJudgement: 'FORM_STRUCTURE',
   submission: 'SENT',
   blockReason: null,
   httpStatus: 200,
@@ -388,8 +388,7 @@ describe('write jobs (T30e): the start', () => {
         request: { formMethod: 'POST', path: '/members' },
         candidate: { identityDigest: CREATE_CANDIDATE.identityDigest, ruleDigest: CREATE_CANDIDATE.ruleDigest },
         values: { name: '試験一郎' },
-        verification: { successCondition: VERIFICATION_SPEC.successCondition, inputErrorCondition: VERIFICATION_SPEC.inputErrorCondition,
-          recordId: VERIFICATION_SPEC.recordId },
+        verification: { resultJudgement: VERIFICATION_SPEC.resultJudgement, recordId: VERIFICATION_SPEC.recordId },
         readVerification: { readCheckId: 'rc-verify', readCheckRevision: 1, targetPage: null,
           definition: { parameters: { q: '試験一郎' }, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } },
       },
@@ -1122,7 +1121,7 @@ describe('write jobs (T40c): the FORM records of the version 1.1, and no record 
   it('does not use an API record for a FORM job (settles from the reports)', async () => {
     const { grantId, jobId } = issue(1);
     const ended = await runWriteJob('form-with-api', writeOf({ actionRunText: JSON.stringify(actionRunOf(jobId, grantId, {
-      transport: 'API', api: sampleApiSummary(), resultConditions: null, submittedValues: {},
+      transport: 'API', api: sampleApiSummary(), resultJudgement: null, submittedValues: {},
     })) }));
     expect(ended).toMatchObject({ jobKind: 'WRITE_CREATE', state: 'FAILED', failureReason: 'WRITE_RESULT_INVALID' });
     expect(readWriteResult(database, jobId)).toMatchObject({ submission: 'UNKNOWN', result: 'UNKNOWN', transport: 'FORM', api: null });

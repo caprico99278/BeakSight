@@ -109,9 +109,8 @@ describe('Server Functions: preparation and environment', () => {
       // だけである（`writeStartPageFn` は読むだけ）。画面のコードで実行の許可の発行を参照するのが、その 1 ファイルだけであることは、Gate
       // `approval-ssot` の (e) で確かめる。
       'approveScenarioFn',
-      // FM2b（手を減らす段 2 の設計書 3A.2）: シナリオの下書きをボタン 1 回で作る（一覧は GET で読むだけ、作るのと案内の後の規則は POST。
-      // `scenario-autodraft-functions.ts`。実行の許可を出す関数はない）。
-      'attachAutoDraftRulesFn',
+      // FM2b（手を減らす段 2 の設計書 3A.2）: シナリオの下書きをボタン 1 回で作る（一覧は GET で読むだけ、作るのは POST。
+      // `scenario-autodraft-functions.ts`。実行の許可を出す関数はない。PL-5 の修正の 1 回目: 案内の後の規則を付ける口は捨てた）。
       // T24f: 監査のジョブの Server Functions（Task 24 の設計書 4.8）。
       'auditStartSummaryFn',
       // T32g: 監査済みデータの台帳の画面の Server Function（Task 32 の設計書 4.1。読むだけ。`ledger-functions.ts`）。
@@ -150,9 +149,12 @@ describe('Server Functions: preparation and environment', () => {
       'previewCrawlLimitsFn',
       // FM-1（同 2.2）: プロファイルの表示の設定の読み（GET）と保存（POST）。`display-settings-functions.ts`。
       'profileDisplaySettingsFn',
+      // PL-5: PL-S の `profileIsolationFn`（書き込みの OK のダイアログの隔離の読み）は、書き込みの手順の詳細の値に入れたので捨てた。
       // T43a: プロファイルの詳細の「次にすること」と「監査を始める」の Server Function（Task 43 の設計書 4.1。読むだけ。
       // `profile-onboarding-functions.ts`）。T43b fix round 1 で期待に足した。
       'profileOnboardingFn',
+      // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 1）: サイトの一覧の行の段（サイトの画面と同じ判定）。読むだけ。
+      'profileStagesFn',
       'readCheckPageFn',
       'registerCredentialFn',
       'registerLoginStageRowFn',
@@ -165,7 +167,11 @@ describe('Server Functions: preparation and environment', () => {
       'saveAuthSetupWithServiceOriginsFn',
       'saveCrawlLimitsFn',
       'saveDataRulesFn',
+      // MI-F3（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 監査の開始の画面の読まないパスだけの保存（POST。`auth-setup-functions.ts`）。
+      'saveExcludedPathsFn',
       'saveProfileDisplaySettingsFn',
+      // OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.1 の D7'）: 「登録・更新を試せる画面」の一覧のチェックの保存（POST。許可は出さない）と、一覧の値（GET）。
+      'saveWriteScreenCheckFn',
       'scenarioAutoDraftPreviewFn',
       'scenarioDetailPageFn',
       'scenarioFormPageFn',
@@ -186,10 +192,12 @@ describe('Server Functions: preparation and environment', () => {
       'startWriteCreateThenUpdateFn',
       'startWriteUpdateFn',
       'stopAuditJobFn',
+      // OP-3: 「書き込みにも使う」の保存と確認のダイアログの値の 2 つ（MI-5）は、使い先がなくなったので消した（切り替えは一覧のチェックの保存の中）。
       'targetConfigCandidatesFn',
       'updateProfileFn',
       'updateReadCheckFn',
       'updateScenarioFn',
+      'writeScreensFn',
       'writeStartPageFn',
     ]);
   });
@@ -233,10 +241,17 @@ describe('Server Functions: input validation (schemas/control/ui-*)', () => {
       ['retireProfileFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 0 }],
       ['getProfileFn', 'GET', { profileId: '' }],
       ['checkTargetConfigFn', 'GET', { targetConfigPath: 1 }],
-      // T43d: まとめて保存の入力（足す Origin は 1 つ以上、画面が読んだ改訂は 1 以上の整数）。
-      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 1, addServiceOrigins: [] }],
-      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, addServiceOrigins: ['https://service.example.invalid'] }],
-      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 0, addServiceOrigins: ['https://service.example.invalid'] }],
+      // T43d・MI-F1: まとめて保存の入力（下書きを作ったジョブの行は必須で、形は表の 1 行の指定と同じ。画面が読んだ改訂は 1 以上の整数。画面の送る Origin は
+      // 受けない）。
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 1, addServiceOrigins: ['https://service.example.invalid'] }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 1 }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, row: { jobId: 'job-1', passed: false, index: 0 } }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 0, row: { jobId: 'job-1', passed: false, index: 0 } }],
+      ['saveAuthSetupWithServiceOriginsFn', 'POST', { setup: { profileId: PROFILE_ID }, expectedRevision: 1, row: { jobId: 'job-1', passed: false, index: 8 } }],
+      // MI-F3: 読まないパスだけの保存の入力（プロファイルの鍵、画面が読んだ改訂、文字列の一覧。設定の文書は受けない）。
+      ['saveExcludedPathsFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 1 }],
+      ['saveExcludedPathsFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 0, excludedPaths: [] }],
+      ['saveExcludedPathsFn', 'POST', { profileId: PROFILE_ID, expectedRevision: 1, excludedPaths: [], setup: { profileId: PROFILE_ID } }],
       // ML-b: 「ログインを終えた」の入力（ジョブの鍵）。
       ['confirmManualLoginFn', 'POST', { jobId: '' }],
       ['confirmManualLoginFn', 'POST', { jobId: 'job-1', extra: true }],
@@ -329,6 +344,11 @@ describe('Launcher: the control data preparation stops the start', () => {
       expect(result.status).toBe(PREPARATION_FAILED_EXIT_CODE);
       expect(result.output).toContain(CONTROL_STORE_FAILURE_DESCRIPTIONS.NOT_A_SQLITE_FILE.description);
       expect(result.output).toContain(CONTROL_STORE_FAILURE_DESCRIPTIONS.NOT_A_SQLITE_FILE.action);
+      // PL-2（PL-W の持ち越し。設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 理由の行は日本語の説明だけで、英大文字の理由のコードを入れない
+      // （理由のコードは「詳細」の行の英語の詳しいことに残る）。
+      const reasonLine = result.output.split(/\r?\n/u).find((line) => line.includes(CONTROL_STORE_FAILURE_DESCRIPTIONS.NOT_A_SQLITE_FILE.description));
+      expect(reasonLine).toBeDefined();
+      expect(reasonLine).not.toContain('NOT_A_SQLITE_FILE');
       expect(result.output).toContain(DATABASE_LOCATION);
       expect(result.output).not.toMatch(/token=/u);
       expect(createHash('sha256').update(readFileSync(databasePath)).digest('hex')).toBe(before);

@@ -28,6 +28,13 @@ const MARKER_BYTES = 8;
 export const SPA_API_DELAY_MS = 600;
 /** SPA の画面が、GET の応答を受けてから描くまでの時間（ms）。 */
 export const SPA_RENDER_DELAY_MS = 200;
+/**
+ * OP-K（K1）: 見出しを遅れて描く SPA の画面（`spaLateHeading`）が、読み込みの後に見出し（h1）を描くまでの時間（ms。落ち着きの待ちより長く、見出しを待つ上限
+ * `DISCOVERY_SCREEN_HEADING_WAIT_MS` より短い）と、その見出しの文字。
+ */
+export const SPA_LATE_HEADING_DELAY_MS = 1_200;
+export const SPA_LATE_HEADING_TEXT = '品物の登録';
+
 /** 落ち着かない SPA の画面が、候補を描き直す間隔（ms）。 */
 export const UNSTABLE_RENDER_INTERVAL_MS = 150;
 /** beacon の画面が、読み込みの後に、もう一度 beacon を送るまでの時間（ms。落ち着きの待ちの間に送る）。 */
@@ -48,6 +55,10 @@ export const DISCOVERY_FIXTURE_PATHS = Object.freeze({
   formButtons: '/form-buttons',
   spa: '/spa',
   spaUnstable: '/spa-unstable',
+  /** OP-K（K1）: 登録の form をすぐ描き、見出し（h1）を `SPA_LATE_HEADING_DELAY_MS` の後に描く SPA。 */
+  spaLateHeading: '/spa-late-heading',
+  /** OP-K（K1）: 登録の form をすぐ描き、見出し（h1）を描かない SPA。 */
+  spaNoHeading: '/spa-no-heading',
   controls: '/controls',
   shadowOpen: '/shadow-open',
   shadowClosed: '/shadow-closed',
@@ -260,6 +271,21 @@ const pageBodies = (markers: DiscoveryFixtureMarkers): Readonly<Record<string, (
             document.getElementById('app').innerHTML = '<form method="get" action="/items"><input type="search" name="q"><button type="submit">検索</button></form>';
           }, ${SPA_RENDER_DELAY_MS});
         });
+      </script>`),
+    [DISCOVERY_FIXTURE_PATHS.spaLateHeading]: () => page('SPA', `
+      <div id="app"></div>
+      <script>
+        document.getElementById('app').innerHTML = '<form method="post" action="/items"><input name="name"><button type="submit">登録</button></form>';
+        setTimeout(() => {
+          const heading = document.createElement('h1');
+          heading.textContent = '${SPA_LATE_HEADING_TEXT}';
+          document.body.prepend(heading);
+        }, ${SPA_LATE_HEADING_DELAY_MS});
+      </script>`),
+    [DISCOVERY_FIXTURE_PATHS.spaNoHeading]: () => page('SPA', `
+      <div id="app"></div>
+      <script>
+        document.getElementById('app').innerHTML = '<form method="post" action="/items"><input name="name"><button type="submit">登録</button></form>';
       </script>`),
     [DISCOVERY_FIXTURE_PATHS.spaUnstable]: () => page('SPA', `
       <div id="app"></div>

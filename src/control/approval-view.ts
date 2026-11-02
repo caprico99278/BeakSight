@@ -45,6 +45,8 @@ export {
   scenarioApiKeyFieldsOfProbe,
   // DEF-147: API のシナリオの公開の状態にあたる鍵（承認の画面と作成の画面の注意の印）。
   scenarioApiPublicationStateKeysOf,
+  // OP-2: 更新のシナリオの台帳（チェックの保存が、画面の登録と更新を結ぶ）。
+  updateLedgerScenarioIdOf,
 } from './approval/scenario-contracts.js';
 export type {
   ApprovalBoundFacts,
@@ -66,9 +68,11 @@ export type {
   RecordIdSource,
   ScenarioReadVerification,
   ScenarioRecordIdSpec,
-  ScenarioResultCondition,
   ScenarioVerification,
   ScenarioVerificationItem,
+  // PL-6a: form の登録の ID の取り方と、検証の指定の ID の取り方。
+  FormRecordIdSpec,
+  ScenarioVerificationRecordId,
   VerificationBinding,
   VerificationExpectation,
   VerificationExpectationKind,
@@ -87,6 +91,8 @@ export {
   // T40a-fix: 送り方ごとの、検証の指定で求める項目（画面の表示も同じ一覧に従う）。
   requiredVerificationItemsOf,
   unconfirmedSideEffectsOf,
+  // MI-6: 4 項目をすべて確かめた副作用の確認（承認のダイアログが入れる値。画面は、承認のときの前提の例に使う）。
+  CONFIRMED_SIDE_EFFECTS,
   validateScenarioDraft,
   // T41e-2: その型から API のシナリオを作れない理由（候補の一覧の入口で示す。下書きの確かめと同じ判定）。
   apiScenarioShapeRejectionOf,
@@ -104,6 +110,8 @@ export {
   SCENARIO_UPDATE_INPUT_REASONS,
   UNCONFIRMED_SIDE_EFFECTS,
   apiScenarioFormOf,
+  // OP-2: 規則 F で決めた更新の下書きを、自動の下書きが組み立てる。
+  apiScenarioDraftInputOf,
   isUsableRecordIdSegment,
 } from './approval/api-scenario-draft.js';
 export type {
@@ -128,6 +136,7 @@ export {
   autoDraftInferredItemsOf,
   autoDraftReadCheckChoiceOf,
   autoDraftReadVerificationOf,
+  isAutoDraftListPageChoice,
   autoDraftScenarioIdOf,
 } from './approval/api-scenario-autodraft.js';
 export type {
@@ -143,8 +152,25 @@ export type {
   AutoDraftScenarioFact,
   AutoDraftUpdatePlan,
   AutoDraftUpdatePreset,
+  AutoDraftUpdateResultStatus,
 } from './approval/api-scenario-autodraft.js';
 export type { DraftValue, DraftValueGround, DraftValueOrigin } from './approval/draft-value-origin.js';
+
+// PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8 章、8.1）: フォームの形の自動の下書き、API の形と共通の決まり、書き換えの検証の指定の台帳からの写し。
+export { FORM_AUTO_DRAFT_GAPS, FORM_UNUSABLE_SCREEN_REASONS, formRecordIdOf, formRecordIdFromUpdateOf, formTextFieldNamesOf, formAnswerReadChoiceOf, formAnswerReadVerificationOf, formAutoDraftPlanOf, formCandidateRejectionOf, formScenarioProbeDraftOf, formUpdateDraftPresetOf } from './approval/form-scenario-autodraft.js';
+export type { FormAutoDraftCreatePlan, FormAutoDraftGap, FormAutoDraftPlan, FormAutoDraftUpdatePlan, FormAutoDraftUpdatePreset } from './approval/form-scenario-autodraft.js';
+export {
+  autoDraftRecordIdTemplatesOf,
+  autoDraftScreenMayNotifyOf,
+  formAutoDraftRowsOf,
+  isAutoDraftRecordIdSegment,
+  // OP-F（M-3）: 行の「知らせを送ることがある」の 1 行と、更新の知らせをチェックが確かめたかの判定（1 か所）。
+  updateNotifyConfirmedByCheckOf,
+  writeScreenMayNotifyOf,
+} from './approval/autodraft-shared.js';
+export type { AutoDraftDefinitionFact, FormAutoDraftRow } from './approval/autodraft-shared.js';
+export { UPDATE_VERIFICATION_COPY_UNAVAILABLE_REASONS, updateVerificationCopyOf } from './approval/update-verification-copy.js';
+export type { UpdateVerificationCopy, UpdateVerificationCopyUnavailableReason } from './approval/update-verification-copy.js';
 
 export { APPROVAL_INVALIDITY_REASONS } from './approval/approval-validity.js';
 export type { ApprovalInvalidityReason, ApprovalValidity } from './approval/approval-validity.js';
@@ -183,6 +209,8 @@ export {
   // T41e-2: API の UPDATE の台帳の結び付きの誤り（開始の画面。発行の確かめ直しと同じ部品）。
   readApiUpdateLedgerBindingRejection,
   readUsedCumulativeWrites,
+  // PL-6b: 照合の専用の印で参照される READ の定義（フォームの形の自動の下書きが、同じ照合の専用の定義を使い回すかの判定に使う）。
+  readVerificationOnlyReadCheckIds,
   readWriteReservations,
   revokeScenarioApproval,
   updateScenario,
@@ -198,3 +226,14 @@ export type {
   ScenarioView,
   WriteReservationView,
 } from './approval/scenario-store.js';
+// OP-2 の修正の 3 回目: 更新の自動の下書きとチェックの範囲の承認（画面のサーバとジョブの管理が共有する 1 か所）。
+export {
+  apiUpdateAutoDraftOf,
+  approveForCheck,
+  attachInferredRules,
+  autoDraftReadCheckFactsOf,
+  autoDraftScenarioFactsOf,
+  draftUpdateForCreate,
+  formUpdateAutoDraftOf,
+} from './approval/update-autodraft.js';
+export type { AutoDraftClock, InferredRulesAttachment, UpdateAutoDraftFacts, UpdateAutoDraftOutcome } from './approval/update-autodraft.js';

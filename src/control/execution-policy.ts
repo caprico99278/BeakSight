@@ -18,6 +18,10 @@
 //   拒む理由は、今までの判定の順（モード → 認証の方式）と同じ値になるように表で表す: 操作の行にモードがなければ `MODE_NOT_EXECUTABLE`、モードは
 //   あっても方式が一覧になければ `AUTH_STRATEGY_NOT_EXECUTABLE`（例: 公開の監査のログインの確かめは、モードは受けるが方式が `NONE` なので
 //   方式の理由。T26d-2 から変えない）。
+// - MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 3 章のユーザーの判断 1（2026-10-26。書き込みにも使うプロファイルで、読み取りの監査も
+//   できるようにする。プロファイルを 1 つにする）、4.5、5 章）: 認証つきの監査（`AUDIT`）を、書き込みのモードでもログインを使う方式で許す。監査のジョブの
+//   送信の扱いは、プロファイルのモードでなくジョブの種類で決まる（ワーカー・Run の流れ・Safety・Browser はモードを見ない）ので、書き込みのモードでも
+//   監査は読み取りだけ（`tests/integration/write-mode-audit-read-only.test.ts`）。書き込みは、今までどおりシナリオの承認と実行の許可の後だけ。
 import { deepFreeze } from '../core/immutable.js';
 import type { AuditMode, AuthStrategy } from './contracts.js';
 import type { AuditJobStartRejectionReason } from './job/job-records.js';
@@ -63,7 +67,8 @@ const AUTOMATED_LOGIN_ONLY = ['AUTOMATED_LOGIN'] as const satisfies readonly Aut
  * 確かめ（Task 28 の設計書 10 章の 5）と、書き込みのシナリオ（T28e fix round 1。書き込みのモードだけの操作。書き込みは実行しない）だけ。
  */
 export const PROFILE_OPERATION_POLICY: Readonly<Record<ProfileOperation, Readonly<Partial<Record<AuditMode, readonly AuthStrategy[]>>>>> = deepFreeze({
-  AUDIT: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_STRATEGIES },
+  // MI-5（ユーザーの判断 2026-10-26。プロファイルを 1 つにする）: 書き込みのモードでも、読み取りの監査を許す（監査のジョブは読み取りだけ）。
+  AUDIT: { PUBLIC_PASSIVE: ['NONE'], TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
   // 公開の監査のプロファイルのログインの確かめは、方式の理由で拒む（T26d-2 から変えない）。
   LOGIN_CHECK: { PUBLIC_PASSIVE: [], TEST_AUTH_PASSIVE: AUTOMATED_LOGIN_ONLY, TEST_APPROVED_WRITE: AUTOMATED_LOGIN_ONLY },
   DISCOVERY: { TEST_AUTH_PASSIVE: LOGIN_STRATEGIES, TEST_APPROVED_WRITE: LOGIN_STRATEGIES },
@@ -119,7 +124,7 @@ export const profileOperationRejectionOf = (operation: ProfileOperation, mode: u
 export const isProfileOperationAllowed = (operation: ProfileOperation, mode: unknown, auth: unknown): boolean =>
   profileOperationRejectionOf(operation, mode, auth) === null;
 
-/** 今実行できる監査モード（公開の監査と、認証つきの読み取りの監査。`PROFILE_OPERATION_POLICY` の `AUDIT` の行）。 */
+/** 今実行できる監査モード（公開の監査と、認証つきの読み取りの監査と、MI-5 から書き込みのモード。`PROFILE_OPERATION_POLICY` の `AUDIT` の行）。 */
 export const EXECUTABLE_AUDIT_MODES: readonly AuditMode[] = deepFreeze(Object.keys(PROFILE_OPERATION_POLICY.AUDIT) as AuditMode[]);
 
 /** 今実行できる監査モードか（一覧にない値、文字列でない値は偽）。 */
@@ -127,8 +132,8 @@ export const isExecutableAuditMode = (mode: unknown): mode is AuditMode => strat
 
 /**
  * 今実行できるモードごとの、今実行できる認証の方式（T25d。`PROFILE_OPERATION_POLICY` の `AUDIT` の行）。公開の監査は認証なし、認証つきの読み取りの
- * 監査は手動のログインと自動ログイン（T26d-2。方式として実行できる。Windows だけであることは、ジョブの管理の開始の確かめで強制する）。一覧にない
- * モードは、どの方式でも実行できない。
+ * 監査は手動のログインと自動ログイン（T26d-2。方式として実行できる。Windows だけであることは、ジョブの管理の開始の確かめで強制する）。MI-5: 書き込みの
+ * モードも、認証つきの読み取りの監査と同じ方式。一覧にないモードは、どの方式でも実行できない。
  */
 export const EXECUTABLE_AUTH_STRATEGIES: Readonly<Partial<Record<AuditMode, readonly AuthStrategy[]>>> = PROFILE_OPERATION_POLICY.AUDIT;
 
@@ -145,8 +150,8 @@ export const AUTH_SETUP_REQUIRED_AUDIT_MODES: readonly AuditMode[] = deepFreeze(
 export const requiresAuthSetup = (mode: unknown): boolean => strategiesOf('AUTH_SETUP', mode) !== undefined;
 
 /**
- * その操作に、有効な認証の設定が要るか（T28b）。操作の行にあるモードで、認証の設定が要るモードのときだけ真（書き込みのモードの監査は、始められない
- * ので偽。開始の画面が、ログインの案内を出すかに使う）。T43c: 認証の設定が要らない操作（`AUTH_SETUP_FREE_OPERATIONS`）は、どのモードでも偽。
+ * その操作に、有効な認証の設定が要るか（T28b）。操作の行にあるモードで、認証の設定が要るモードのときだけ真（開始の画面が、ログインの案内を出すかに
+ * 使う。MI-5 から、書き込みのモードの監査も真）。T43c: 認証の設定が要らない操作（`AUTH_SETUP_FREE_OPERATIONS`）は、どのモードでも偽。
  */
 export const operationRequiresAuthSetup = (operation: ProfileOperation, mode: unknown): boolean =>
   !isAuthSetupFreeOperation(operation) && strategiesOf(operation, mode) !== undefined && requiresAuthSetup(mode);

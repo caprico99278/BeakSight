@@ -134,18 +134,23 @@ import {
   readEvidenceSummaryOf,
   type ReadEvidenceDocument,
 } from '../../discovery/read-check-evaluation.js';
-import type { ActionRunDocument } from '../actions/action-contracts.js';
+import { VERIFIED_ACTION_RESULT, type ActionRunDocument } from '../actions/action-contracts.js';
+import { readWriteResult } from '../actions/write-result-facts.js';
 import { actionRunMatchesWriteStart } from '../actions/action-api-summary.js';
 import { approvalSummaryFactsOf } from '../actions/approval-summary-facts.js';
 import { approvalExternalFactsOf } from '../approval-external-facts.js';
-import { scenarioTransportOf } from '../approval/scenario-contracts.js';
+import { DEFAULT_MAX_CREATES_PER_RUN, scenarioTransportOf, updateLedgerScenarioIdOf } from '../approval/scenario-contracts.js';
 import {
   assertGrantStillValid,
   closeOrphanedWriteResults,
   closeWriteWithoutSending,
   consumeExecutionGrant,
+  issueExecutionGrant,
+  listScenarios,
+  readScenario,
   readApprovalReceipts,
   readExecutionGrant,
+  readScenarioApprovalStatus,
   readScenarioRevisions,
   readUsedCumulativeWrites,
   readScenarioWriteGenerationHistory,
@@ -154,34 +159,60 @@ import {
   settleWriteResult,
   type ExecutionGrantView,
   type WriteOutcomeReport,
+  readVerificationOnlyReadCheckIds,
 } from '../approval/scenario-store.js';
-import { evaluateRuleSet } from '../data-rules/field-evaluation.js';
+import { approveUpdateForChain, draftUpdateForCreate } from '../approval/update-autodraft.js';
+import { evaluateRuleSet, planRuleSet } from '../data-rules/field-evaluation.js';
+import { uniqueEachRunFieldNamesOf } from '../data-rules/varying-values.js';
 import { readLatestRuleSet } from '../data-rules/rule-store.js';
 import { generateScenarioData } from '../data-rules/scenario-data.js';
-import { FORM_NAVIGATION_TRANSPORT, loginTransportOf, type AuthSetupValidationError } from '../auth/auth-setup-contracts.js';
+import { FORM_NAVIGATION_TRANSPORT, loginTransportOf, type AuthSetup, type AuthSetupValidationError } from '../auth/auth-setup-contracts.js';
+import {
+  automatedLoginSwitchOf,
+  manualLoginEveryTimeApplies,
+  offersAutomatedLoginSwitch,
+  writableLoginOriginOf,
+  type AutomatedLoginSelectors,
+} from '../auth/automated-login-switch.js';
 import { validateAuthSetup } from '../auth/auth-setup-policy.js';
+import { authSetupProposalProfileOf, entryCheckAuthSetupDecisionOf, proposedAuthSetupOf } from '../auth/auth-setup-proposal.js';
+import { isAutomatedLoginProfileAuth } from '../auth/credential-destination.js';
+import { startUrlPathOf } from '../../config/target-config-draft.js';
+import { isOriginInAllowedOrigins } from '../../crawl/normalize-url.js';
 import { AUTOMATED_LOGIN_SUBMISSION_NONE, AUTOMATED_LOGIN_UNKNOWN_RESULT } from '../auth/automated-login-results.js';
-import { MIN_PROFILE_REVISION, PROFILE_ID_PATTERN, type ProfileValidationError } from '../contracts.js';
-import { createCredentialStore, type CredentialMetadata, type CredentialStore } from '../credentials/credential-store.js';
-import { entryCheckSummaryOf, type EntryCheckDocument } from '../entry-check.js';
+import {
+  AUTOMATED_LOGIN_AUTH_STRATEGY,
+  MANUAL_EVERY_TIME_LOGIN_PREFERENCE,
+  MIN_PROFILE_REVISION,
+  PROFILE_ID_PATTERN,
+  WRITE_AUDIT_MODE,
+  loginPreferenceOf,
+  type ProfileValidationError,
+  type SiteProfile,
+} from '../contracts.js';
+import { CREDENTIAL_PLATFORM, CREDENTIAL_PROTECTION_AVAILABLE } from '../credentials/credential-platform.js';
+import { FIRST_CREDENTIAL_REVISION, createCredentialStore, type CredentialMetadata, type CredentialStore } from '../credentials/credential-store.js';
+import { entryCheckSummaryOf, type EntryCheckDocument, type EntryCheckEndReason } from '../entry-check.js';
 import { operationRequiresAuthSetup, profileOperationRejectionOf, type ProfileOperation } from '../execution-policy.js';
 import { isAcceptedTargetConfigPath, validateSiteProfile, type ProfileValidationContext } from '../profile-policy.js';
-import { CURRENT_AUTH_SETUP_FRESHNESS, getAuthSetup, type StoredAuthSetup } from '../store/auth-setup-store.js';
+import { CURRENT_AUTH_SETUP_FRESHNESS, getAuthSetup, saveAuthSetup, type StoredAuthSetup } from '../store/auth-setup-store.js';
 import type { ControlDatabase } from '../store/control-database.js';
-import { getProfile, readProfileDisplaySettings } from '../store/profile-store.js';
+import { getProfile, readProfileDisplaySettings, type StoredProfile } from '../store/profile-store.js';
 import { ACTIVE_PROFILE_STATUS } from '../store/profile-records.js';
 import { saveProfileAndAuthSetup } from '../store/profile-auth-setup-store.js';
-import { manualLoginRegistrationOf } from '../manual-login-registration.js';
+import { loginRegistrationAfterLoginOf, manualLoginRegistrationOf } from '../manual-login-registration.js';
+import { loginFieldDraftsOf } from '../login-observation-draft.js';
 import {
   MAX_WORKER_EXIT_CODE,
   MAX_WORKER_READ_CHECKS,
   WORKER_AUDIT_JOB_KIND,
   WORKER_DISCOVERY_JOB_KIND,
   WORKER_ENTRY_CHECK_JOB_KIND,
-  WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY,
+  WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY,
   WORKER_JOB_KINDS_WITH_JOB_BROWSER,
   WORKER_LOGIN_CHECK_JOB_KIND,
   WORKER_PROTOCOL_VERSION,
+  WORKER_LOGIN_REGISTRATION_TIMEOUT_MS,
   WORKER_READ_CHECK_JOB_KIND,
   WORKER_JOB_ID_PATTERN,
   WORKER_SESSION_LOST_STATE,
@@ -199,6 +230,9 @@ import {
   type ParentToWorkerMessage,
   type WorkerAuthState,
   type WorkerAutomatedLoginReport,
+  type WorkerCredentialSaveFailureCode,
+  type WorkerCredentialSavedMessage,
+  type WorkerJobKind,
   type WorkerChainStageSequence,
   type WorkerNextStageJobKind,
   type WorkerDiscoverySummary,
@@ -225,9 +259,11 @@ import {
   readAutoLoginLimitInputs,
   readAutoLoginLimitInputsWith,
   recordAutoLoginResult,
+  recordCredentialEvent,
 } from './auto-login-store.js';
 import {
   WRITE_READ_VERIFICATION_PAGE_TARGET,
+  apiCreateReadListPagePathOf,
   readVerificationTargetRejectionOf,
   writeBaseDateOf,
   writeStartSpecOf,
@@ -264,6 +300,7 @@ import {
   createStartingJob,
   hasActiveJobForProfile,
   interruptActiveJobs,
+  lastFinishedEntryCheckJobOf,
   readAllJobs,
   readJob,
   recordEnded,
@@ -278,6 +315,7 @@ import {
   recordWorkerPid,
   recordWriteReportCheck,
   recordLoginStageAutoRegistration,
+  type AuditJobAutomatedLoginUnavailableReason,
   type AuditJobLoginAutoRegistration,
   type AuditJobLoginAutoRegistrationSkipReason,
   type AuditJobView,
@@ -289,6 +327,11 @@ import {
   chainAdvanceDecisionOf,
   chainReadCheckDecisionOf,
   chainStagesOfMode,
+  chainWriteAdvanceDecisionOf,
+  chainWriteTargetsOf,
+  nextChainWriteStepOf,
+  type ChainWriteStep,
+  type ChainWriteTarget,
   // PRE42-CC 組 UI-K3（CC-113）: 連鎖と段の状態の名前つきの定数（文字列で比べない）。組 Z: 代入とオブジェクトの値も定数で書く。
   DONE_CHAIN_STAGE_STATE,
   FINISHED_CHAIN_STATE,
@@ -307,6 +350,15 @@ import {
 } from './stage-chain-policy.js';
 
 /** ターゲット JSON のパスから、検証の文脈を返す（読めなければ `undefined`）。画面のサーバは、`loadConfig` で読む。 */
+
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (f)）: 単独の READ の確かめのジョブで読む定義（取り消していない定義のうち、
+ * シナリオの照合の専用の印（`verificationOnly`）で参照されていないもの。作った順。上限 `MAX_WORKER_READ_CHECKS` まで）。
+ */
+const standaloneReadChecksOf = (database: ControlDatabase, profileId: string): readonly ReadCheckView[] => {
+  const verificationOnly = new Set(readVerificationOnlyReadCheckIds(database, profileId));
+  return listReadChecks(database, profileId).filter(({ readCheckId }) => !verificationOnly.has(readCheckId)).slice(0, MAX_WORKER_READ_CHECKS);
+};
 export type AuditJobContextResolver = (
   targetConfigPath: string,
 ) => Promise<ProfileValidationContext | undefined> | ProfileValidationContext | undefined;
@@ -335,6 +387,8 @@ export interface AuditJobTiming {
   readonly unownedWorkerStaleAfterMs: number;
   /** 管理のロックを失った後に、自分のワーカーの終わりを待つ時間（T24h-6）。 */
   readonly lockLostKillAfterMs: number;
+  /** OP-F（安全のレビューの I-1）: ログインの直後の登録で、許しを送ってからワーカーの `CREDENTIAL_SAVED` を待つ上限（本番は `WORKER_LOGIN_REGISTRATION_TIMEOUT_MS`）。 */
+  readonly loginRegistrationTimeoutMs: number;
 }
 
 /** 名前つきの時間（本番の値）。 */
@@ -351,6 +405,7 @@ export const AUDIT_JOB_TIMING: AuditJobTiming = Object.freeze({
   instanceHeartbeatIntervalMs: RUN_LOCK_HEARTBEAT_INTERVAL_MS,
   unownedWorkerStaleAfterMs: AUDIT_JOB_UNOWNED_WORKER_STALE_AFTER_MS,
   lockLostKillAfterMs: AUDIT_JOB_LOCK_LOST_KILL_AFTER_MS,
+  loginRegistrationTimeoutMs: WORKER_LOGIN_REGISTRATION_TIMEOUT_MS,
 });
 
 /** ジョブの管理を作るときに受け取るもの。 */
@@ -419,7 +474,26 @@ export interface EntryCheckStartRequest {
   readonly profileId: string;
   /** 画面が読んだプロファイルの改訂。 */
   readonly expectedRevision: number;
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D11、4.1.3 の 3）: 下調べが終わったら、続けて点検（まとめて実行）を始めるか（作成の画面の
+   * 「点検を始める」）。省略は偽。始めるかの判定は、ジョブの管理のこの 1 か所（`#startAfterEntryCheck`）。
+   */
+  readonly thenStartAudit?: boolean;
 }
+
+/**
+ * OP-1 修正の 2 回目: 下調べが開始のページを読めた終わりの理由（`src/control/entry-check.ts` の閉じた一覧の値）。続けて点検を始めるかの判定（`#startAfterEntryCheck`）に使う。
+ */
+const ENTRY_CHECK_READ_END_REASON = 'READ' satisfies EntryCheckEndReason;
+
+/**
+ * OP-1: 下調べの後に続けて始める点検の状態（`entryCheckFollowUpOf`。メモリの中だけ）。`WAITING` は下調べの終わりの処理を待つ、`STARTED` は始めた点検の最初の段の
+ * ジョブ、`SKIPPED` は始めなかった（下調べが読めなかった、ログインの設定を保存できなかった、開始を拒まれた）。
+ */
+export type EntryCheckFollowUp =
+  | { readonly state: 'WAITING' }
+  | { readonly state: 'STARTED'; readonly jobId: string }
+  | { readonly state: 'SKIPPED' };
 
 /** READ の確かめの開始の依頼（T27e。画面から受けた値。形もここで確かめる。再開しないので、新しく始めるかの指定はない）。 */
 export interface ReadCheckStartRequest {
@@ -513,13 +587,22 @@ export interface AuditJobManager {
    */
   startEntryCheck(request: EntryCheckStartRequest): Promise<AuditJobStartResult>;
   /**
-   * FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行を始める（`TEST_AUTH_PASSIVE` は監査 → 発見 → READ の確かめ、
-   * `TEST_APPROVED_WRITE` は発見 → READ の確かめ。`stage-chain-policy.ts`）。開始の確かめは最初の段のジョブと同じで、どの段の操作もそのモードで許されるときだけ
+   * FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行を始める（`TEST_AUTH_PASSIVE` と `TEST_APPROVED_WRITE` は、どちらも
+   * 監査 → 発見 → READ の確かめ。MI-5 で書き込みのモードも監査から始まる並びにした。`stage-chain-policy.ts`）。開始の確かめは最初の段のジョブと同じで、どの段の操作もそのモードで許されるときだけ
    * 始める。1 つのワーカーがログイン 1 回の後に段を続け、段ごとにジョブの行を作る（段の間に空きはない）。返すジョブは最初の段のもの。
    */
   startStageChain(request: AuditJobStartRequest): Promise<AuditJobStartResult>;
   /** FM2d: そのジョブを段に持つまとめて実行の表示（メモリの中だけ。なければ `null`）。 */
   getStageChainOfJob(jobId: string): StageChainView | null;
+  /**
+   * OP-G（指示書の 5）: 次の点検（まとめて実行）が書き込みの段の対象にする、チェックした画面の数（決め方は連鎖の書き込みの段の対象と同じ 1 か所 `#chainWriteTargets`。
+   * 書き込みのモードでないプロファイル・ないプロファイルは 0）。開始の画面の「何が起きるか」の文に使う。
+   */
+  checkedWriteScreenCountOf(profileId: string): number;
+  /** OP-1: 下調べのジョブ（`thenStartAudit` で始めたもの）の、続けて始める点検の状態（ないなら `null`）。 */
+  entryCheckFollowUpOf(jobId: string): EntryCheckFollowUp | null;
+  /** OP-1（D3）: 手でのログインを待つジョブで、BeakSight がログインの終わりを判定できるか（知らせを受けていなければ `null`）。 */
+  loginEndDetectionOf(jobId: string): boolean | null;
   /** 資格情報を変えてよいか（T26d-2。そのプロファイルのジョブが終わっていない間は `CREDENTIAL_IN_USE`）。 */
   checkCredentialChange(profileId: string): CredentialChangeCheck;
   stopAuditJob(jobId: string, options?: { readonly force?: boolean }): AuditJobStopResult;
@@ -615,6 +698,8 @@ interface WriteJobState {
   rejected: boolean;
   /** 送信の報告（受けていなければ null）。 */
   submission: Pick<WorkerWriteSubmissionMessage, 'submission' | 'blockReason'> | null;
+  /** OP-2: まとめて実行の書き込みの段で、次の段へ進む前に書き込みの結果を締めた（ワーカーが終わったときに締め直さない）。 */
+  settled: boolean;
 }
 
 /** 発見の結果を読めない・合わない（T27d）。 */
@@ -644,6 +729,8 @@ interface WorkerLaunch {
   readonly chain: ChainRun | null;
   /** FM2d: まとめて実行の段の位置（0 から。まとめて実行でなければ 0）。 */
   readonly chainStageIndex: number;
+  /** DEF-180: ワーカーが読み込むサイト（ターゲット設定の許可 Origin）。ワーカーが終わった時刻を、この Origin ごとに記録する。 */
+  readonly siteOrigins: readonly string[];
 }
 
 /**
@@ -653,8 +740,11 @@ interface WorkerLaunch {
 interface ChainRun {
   readonly chainId: string;
   readonly profileId: string;
-  /** 連鎖を始めた時のプロファイルの改訂（連鎖はこの改訂に結ぶ）。 */
-  readonly profileRevision: number;
+  /**
+   * 連鎖を始めた時のプロファイルの改訂（連鎖はこの改訂に結ぶ）。OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: ログインの直後の登録で
+   * 親が自分で進めた改訂だけ、ここを進めて受け入れる（ほかの改訂の変化は、今どおり `PROFILE_REVISION_CHANGED` で止める）。
+   */
+  profileRevision: number;
   readonly stages: WorkerChainStageSequence;
   /** ターゲット設定の開始の URL（READ の確かめの画面の path の定義の対象の画面を決めるため。開始の直前に読み直したもの）。 */
   readonly startUrl: string | null;
@@ -664,7 +754,41 @@ interface ChainRun {
   stopReason: ChainStopReason | null;
   /** 利用者が止めた（画面の「やめる」。連鎖の全体を止める）。 */
   stopRequested: boolean;
+  /**
+   * OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.2 の案 C）: 読み取りの段の後の書き込みの段の対象（チェックした画面。連鎖を始めた時に決める。
+   * 空なら書き込みの段はない）。
+   */
+  writeTargets: readonly ChainWriteTarget[];
+  /**
+   * OP-2 の修正の 3 回目（設計書 4.1.2 の R1）: 最初の書き込みの段の前の、更新の下書きと承認を済ませたか（1 回の点検で 1 回だけ。済ませた後に書き込みの段の対象を
+   * 求め直す）。
+   */
+  updatesPrepared: boolean;
+  /** OP-2: 今の書き込みの段（行っていなければ null）。 */
+  currentWriteStep: ChainWriteStep | null;
+  /** OP-2: 終えた最後の書き込みの段と、登録が照合まで済んだときの番号（次の段を決める）。 */
+  lastWrite: { readonly step: ChainWriteStep; readonly createRecordId: string | null } | null;
+  /** OP-2: 行った書き込みの段のジョブ（行った順）。 */
+  readonly writeStageJobIds: string[];
+  /**
+   * OP-F（安全のレビューの M-1）: チェックした画面のうち、試せなかった（許可を発行できない・書き込みの準備が通らない）段があったか。あれば、連鎖を「最後まで
+   * 行った」にせず、`WRITE_NOT_TRIED` で終える。
+   */
+  writeNotTried: boolean;
 }
+
+/**
+ * OP-F（安全のレビューの M-2）: 受け取った値を運んだ送り先（`carriedBy`）が、切り替えの後の認証の設定の資格情報の送り先に当たるか。送り先は、フォームの送り方なら
+ * フォームの送信先（`loginPostEndpoints`）、スクリプトの送り方なら token の送信先（`scriptLogin`）。Origin の比べは URL の意味の owner の部品
+ * （`isOriginInAllowedOrigins`）、path は完全一致。受け取っていない（null）なら偽。
+ */
+const credentialCarriedToLoginDestination = (setup: AuthSetup, carriedBy: { readonly origin: string; readonly path: string } | null): boolean => {
+  if (carriedBy === null) {
+    return false;
+  }
+  const destinations = loginTransportOf(setup) === FORM_NAVIGATION_TRANSPORT ? setup.loginPostEndpoints : setup.scriptLogin === null ? [] : [setup.scriptLogin];
+  return destinations.some(({ origin, path }) => isOriginInAllowedOrigins([origin], carriedBy.origin) && path === carriedBy.path);
+};
 
 /** この管理が起動したワーカー。 */
 interface TrackedJob extends WorkerLaunch {
@@ -693,6 +817,13 @@ interface TrackedJob extends WorkerLaunch {
    * 手動のログインの成功を受けていなければ `null`。
    */
   manualLoginRecords: { readonly passedRequests: WorkerLoginStageBlockedRequests; readonly observation: WorkerLoginObservation | undefined } | null;
+  /**
+   * OP-1（設計書 4.1.3 の 1）: ログインの直後の登録の状態（`START` に `loginRegistration` を入れたジョブだけ。ほかは `null`）。`WAITING` はログインの成功を待つ、
+   * `REGISTERING` は組み立て中、`AWAITING_SAVE` はワーカーの `CREDENTIAL_SAVED` を待つ（受け手 `onSaved`）、`DONE` は返事を送った。
+   */
+  loginRegistration: { phase: 'WAITING' | 'REGISTERING' | 'AWAITING_SAVE' | 'DONE'; onSaved: ((message: WorkerCredentialSavedMessage | null) => void) | null } | null;
+  /** OP-1（D3）: 最後のログインを待つ知らせの、BeakSight がログインの終わりを判定できるかの印（受けていなければ `null`）。 */
+  loginEndDetection: boolean | null;
   /** 書き込みのジョブの状態（T30e。`WRITE_CREATE` と、T31f から `WRITE_UPDATE` だけ。ほかは `null`）。 */
   readonly write: WriteJobState | null;
   /** `START` を送った（T26d-2 round 1。送っていなければ、ワーカーはログインの POST を送れない）。 */
@@ -883,6 +1014,13 @@ class JobManager implements AuditJobManager {
   readonly #now: () => Date;
   /** ML-a: 背後の、手動のログインの成功からの認証の設定の自動の登録（終わっていないもの）。 */
   readonly #registrations = new Set<Promise<void>>();
+  /** OP-1: 下調べの後に続けて始める点検（下調べのジョブの ID → 状態。メモリの中だけ）。 */
+  readonly #entryCheckFollowUps = new Map<string, EntryCheckFollowUp>();
+  /**
+   * DEF-180（OP-DEF 修正の 1 回目）: サイト（ターゲット設定の許可 Origin）ごとの、そのサイトを読んだ最後のワーカーが終わった時刻（エポックからの ms。ただの数。
+   * メモリの中だけ）。次のワーカーの `START` に、前の読み込みの時刻（`previousNavigationAtMs`）として渡す。待つのはワーカーの pacer だけ（ここでは待たない）。
+   */
+  readonly #siteWorkerEndedAtMs = new Map<string, number>();
   readonly #forkWorker: AuditWorkerForker;
   readonly #timing: AuditJobTiming;
   readonly #onBackgroundError: (error: unknown) => void;
@@ -1081,8 +1219,52 @@ class JobManager implements AuditJobManager {
     if (this.#closing || !isLoginCheckRequest(request)) {
       return startRejected('INVALID_REQUEST');
     }
+    if (request.thenStartAudit !== undefined && typeof request.thenStartAudit !== 'boolean') {
+      return startRejected('INVALID_REQUEST');
+    }
     // T43c: 入口の確かめのジョブは再開しない（いつも新しい Run）。行には真を書く。
-    return this.#start(WORKER_ENTRY_CHECK_JOB_KIND, request.profileId, request.expectedRevision, true);
+    const result = await this.#start(WORKER_ENTRY_CHECK_JOB_KIND, request.profileId, request.expectedRevision, true);
+    if (result.ok && request.thenStartAudit === true) {
+      this.#entryCheckFollowUps.set(result.job.jobId, Object.freeze({ state: 'WAITING' }));
+    }
+    return result;
+  }
+
+  entryCheckFollowUpOf(jobId: string): EntryCheckFollowUp | null {
+    return typeof jobId === 'string' ? (this.#entryCheckFollowUps.get(jobId) ?? null) : null;
+  }
+
+  loginEndDetectionOf(jobId: string): boolean | null {
+    const job = typeof jobId === 'string' ? this.#jobs.get(jobId) : undefined;
+    return job?.loginEndDetection ?? null;
+  }
+
+  /**
+   * OP-1（設計書 4.1 の D11、4.1.3 の 3）: 印つきの下調べが終わったら、ログインの設定の案の保存（`#saveEntryCheckProposal`）の後に、続けて点検（まとめて実行）を
+   * 始める。始めるのは、下調べが失敗の理由なしで終わって開始のページを読め（OP-1 修正の 2 回目）、人が止めておらず、プロファイルが有効で、ログインの設定を使うモードなら設定があるときだけ。開始の確かめは今の口
+   * （`startStageChain`。公開の画面だけのプロファイルは連鎖しないので、今の点検の口 `startAuditJob`）。始めなかったら `SKIPPED`（画面はサイトの画面へ移る）。
+   */
+  async #startAfterEntryCheck(job: TrackedJob, finishedWithoutFailure: boolean): Promise<void> {
+    if (this.#entryCheckFollowUps.get(job.jobId)?.state !== 'WAITING') {
+      return;
+    }
+    const notStarted = (): void => {
+      this.#entryCheckFollowUps.set(job.jobId, Object.freeze({ state: 'SKIPPED' }));
+    };
+    const current = getProfile(this.#database, job.profileId);
+    // OP-1 修正の 2 回目: 人が止めた下調べ（止める要求の記録がある）の後にも始めない。
+    if (!finishedWithoutFailure || job.stopRequested || this.#closing || current === null || current.status !== ACTIVE_PROFILE_STATUS
+      || (operationRequiresAuthSetup(WORKER_AUDIT_JOB_KIND, current.profile.mode) && getAuthSetup(this.#database, job.profileId) === null)) {
+      notStarted();
+      return;
+    }
+    const request = { profileId: job.profileId, expectedRevision: current.profile.revision, startNew: true };
+    const started = chainStagesOfMode(current.profile.mode) === null ? await this.startAuditJob(request) : await this.startStageChain(request);
+    if (started.ok) {
+      this.#entryCheckFollowUps.set(job.jobId, Object.freeze({ state: 'STARTED', jobId: started.job.jobId }));
+    } else {
+      notStarted();
+    }
   }
 
   startWriteCreate(request: WriteCreateStartRequest): Promise<AuditJobStartResult> {
@@ -1141,6 +1323,22 @@ class JobManager implements AuditJobManager {
   #credentials(): CredentialStore {
     this.#credentialStore ??= createCredentialStore(this.#credentialRoot);
     return this.#credentialStore;
+  }
+
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1・2）: 手でのログインの値の受け取りを許すか。希望が自動ログイン（`AUTOMATIC`）で、資格情報を
+   * 保存できるプラットフォームで、暗号化を使え、そのプロファイルの資格情報のファイルがない（読めない・壊れたファイルは、ある扱いにして許さない）ときだけ。
+   */
+  async #credentialCaptureAllowed(profile: SiteProfile): Promise<boolean> {
+    if (loginPreferenceOf(profile) === MANUAL_EVERY_TIME_LOGIN_PREFERENCE || process.platform !== CREDENTIAL_PLATFORM) {
+      return false;
+    }
+    const store = this.#credentials();
+    try {
+      return (await store.checkProtection()) === CREDENTIAL_PROTECTION_AVAILABLE && (await store.readMetadata(profile.profileId)) === null;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1203,7 +1401,8 @@ class JobManager implements AuditJobManager {
       return startRejected('PROFILE_REVISION_CONFLICT');
     }
     // T28b: ジョブの種類ごとに許すモードと認証の方式は、`execution-policy.ts` の閉じた一覧だけで決める（T26d-2 のログインの検証は自動ログインの
-    // プロファイルだけ、T27d・T27e の発見と READ の確かめは認証の設定のあるモードだけ。書き込みのモードは、監査だけを今までどおり拒む）。
+    // プロファイルだけ、T27d・T27e の発見と READ の確かめは認証の設定のあるモードだけ。MI-5 から、書き込みのモードでも監査を許す。監査のジョブの送信の
+    // 扱いは、モードでなくジョブの種類で決まり、読み取りだけのまま）。
     const operationRejection = profileOperationRejectionOf(jobKind, stored.profile.mode, stored.profile.auth);
     if (operationRejection !== null) {
       return startRejected(operationRejection);
@@ -1235,7 +1434,7 @@ class JobManager implements AuditJobManager {
     // T27e: READ の確かめは、取り消していない定義が 1 件以上あるときだけ始める（ターゲット設定を読む前に確かめる）。
     let readCheckDefinitions: readonly ReadCheckView[] = [];
     if (jobKind === WORKER_READ_CHECK_JOB_KIND) {
-      readCheckDefinitions = listReadChecks(this.#database, profileId).slice(0, MAX_WORKER_READ_CHECKS);
+      readCheckDefinitions = standaloneReadChecksOf(this.#database, profileId);
       if (readCheckDefinitions.length === 0) {
         return startRejected('READ_CHECK_DEFINITIONS_MISSING');
       }
@@ -1289,10 +1488,14 @@ class JobManager implements AuditJobManager {
           authSetupErrors: Object.freeze([...checked.errors]),
         } satisfies AuditJobStartResult);
       }
+      // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: 「毎回手でログインする」（`MANUAL_EVERY_TIME`）のプロファイルは、自動ログインの
+      // 設定があっても手でログインする（自動ログインのセレクタを外した設定を渡す。ログインの検証のジョブは自動ログインだけの操作なので、今どおり）。
+      const manualEveryTime = manualLoginEveryTimeApplies(validation.profile, jobKind);
+      const startSetup: AuthSetup = manualEveryTime && checked.setup.automatedLogin !== null ? { ...checked.setup, automatedLogin: null } : checked.setup;
       // T26d-2: 自動ログインの設定なら、自動ログインの開始の前の確かめ（資格情報、暗号化、上限）を行う。手動の方式へは切り替えない。
       let automatedLogin: WorkerStartAutomatedLogin | null = null;
-      if (checked.setup.automatedLogin !== null) {
-        const preflight = await this.#autoLoginPreflight(validation.profile, checked.setup);
+      if (startSetup.automatedLogin !== null) {
+        const preflight = await this.#autoLoginPreflight(validation.profile, startSetup);
         if ('ok' in preflight) {
           return preflight;
         }
@@ -1302,12 +1505,18 @@ class JobManager implements AuditJobManager {
       // T34a: プロファイルの承認したサービスの Origin は、あるときだけ渡す（ないプロファイルの `START` は今のまま）。T34c: あるときだけ SHA-256 にも
       // 入れる（ワーカーが同じ求め方で求め直す）。
       const approvedServiceOrigins = [...(validation.profile.approvedServiceOrigins ?? [])];
+      // OP-1（4.1.3 の 1）: 手動のログインのプロファイルのまとめて実行は、ログインの直後に登録する（ワーカーは返事を待つ）。受け取りを許すのは、切り替えられる
+      // プロファイルで、希望が自動ログインで、資格情報のファイルがなく、暗号化を使えるときだけ。
+      const loginRegistration = chainStages !== null && automatedLogin === null && offersAutomatedLoginSwitch(stored)
+        ? { credentialRoot: await this.#credentialCaptureAllowed(validation.profile) ? this.#credentialRoot : null }
+        : null;
       authentication = deepFreeze({
-        setup: checked.setup,
+        setup: startSetup,
         approvedTestOrigins,
         ...(approvedServiceOrigins.length === 0 ? {} : { approvedServiceOrigins }),
-        authenticationSha256: workerAuthenticationDigestOf(checked.setup, approvedTestOrigins, { jobKind, automatedLogin, approvedServiceOrigins }),
+        authenticationSha256: workerAuthenticationDigestOf(startSetup, approvedTestOrigins, { jobKind, automatedLogin, approvedServiceOrigins }),
         ...(automatedLogin === null ? {} : { automatedLogin }),
+        ...(loginRegistration === null ? {} : { loginRegistration }),
       });
     }
     // T27d: 出力先は、読み直したターゲット設定の値を、ワーカーの cwd（リポジトリの root）から解決する（ワーカーと同じ場所。結果を読む）。
@@ -1411,6 +1620,13 @@ class JobManager implements AuditJobManager {
         state: RUNNING_CHAIN_STATE,
         stopReason: null,
         stopRequested: false,
+        // OP-2: 書き込みのモードのプロファイルだけ、チェックした画面（承認した登録のシナリオ）を書き込みの段の対象にする。
+        writeTargets: this.#chainWriteTargets(profileId, stored.profile.mode),
+        updatesPrepared: false,
+        writeNotTried: false,
+        currentWriteStep: null,
+        lastWrite: null,
+        writeStageJobIds: [],
       };
     if (chain !== null) {
       this.#chains.set(jobId, chain);
@@ -1419,7 +1635,7 @@ class JobManager implements AuditJobManager {
     // 4. ワーカーを起動する。
     this.#launchWorker({
       jobId, jobKind, profileId, outputDirectory, targetConfigPath, startNew, targetConfigSha256: digestBefore, authentication, readChecks, writeSpec,
-      chain, chainStageIndex: 0,
+      chain, chainStageIndex: 0, siteOrigins: [...context.targetConfig.site.allowedOrigins],
     });
     const job = readJob(this.#database, jobId);
     if (job === null) {
@@ -1494,6 +1710,23 @@ class JobManager implements AuditJobManager {
     }
   }
 
+  /** DEF-180: ワーカーが終わった時刻を、そのワーカーが読むサイトの Origin ごとに記録する（ただの時刻。待たない）。 */
+  #recordSiteWorkerEnd(siteOrigins: readonly string[]): void {
+    const endedAtMs = Date.now();
+    for (const origin of siteOrigins) {
+      this.#siteWorkerEndedAtMs.set(origin, endedAtMs);
+    }
+  }
+
+  /** DEF-180: 同じサイト（許可 Origin のどれか）を読んだ前のワーカーが終わった、いちばん遅い時刻（なければ `null`）。 */
+  #previousNavigationAtMsOf(siteOrigins: readonly string[]): number | null {
+    const ends = siteOrigins.flatMap((origin) => {
+      const endedAtMs = this.#siteWorkerEndedAtMs.get(origin);
+      return endedAtMs === undefined ? [] : [endedAtMs];
+    });
+    return ends.length === 0 ? null : Math.max(...ends);
+  }
+
   /** ターゲット JSON（リポジトリの root からの相対パス）の内容の SHA-256。読めなければ `null`。 */
   async #targetConfigDigest(targetConfigPath: string): Promise<string | null> {
     try {
@@ -1546,6 +1779,8 @@ class JobManager implements AuditJobManager {
       lastAuthState: null,
       loginConfirmSent: false,
       manualLoginRecords: null,
+      loginRegistration: launch.authentication?.loginRegistration === undefined ? null : { phase: 'WAITING', onSaved: null },
+      loginEndDetection: null,
       write: launch.writeSpec === null ? null : {
         grantId: launch.writeSpec.grantId,
         scenarioId: launch.writeSpec.scenarioId,
@@ -1554,6 +1789,7 @@ class JobManager implements AuditJobManager {
         recheckAllowed: false,
         rejected: false,
         submission: null,
+        settled: false,
       },
       startSent: false,
       phase: 'FORKED',
@@ -1589,6 +1825,8 @@ class JobManager implements AuditJobManager {
       // 処理する）、それでも終わり方が決まっていなければ、その場で `WORKER_EXITED` に決める（以後のメッセージは捨てる。結果のファイルを読む間に
       // `FINISHED` が割り込まないように、読む前に決める）。
       // FM2d: まとめて実行では、終わったときの段のジョブで決める。
+      // DEF-180: ワーカーが終わった時刻（このワーカーの要求は、すべてこの時刻より前）を、読むサイトの Origin ごとに記録する。
+      this.#recordSiteWorkerEnd(launch.siteOrigins);
       const stageJob = current();
       stageJob.processExited = true;
       void this.#drainIpc(stageJob)
@@ -1677,6 +1915,8 @@ class JobManager implements AuditJobManager {
           return;
         }
         job.startSent = true;
+        // DEF-180（OP-DEF 修正の 1 回目）: 同じサイトを読んだ前のワーカーが終わった時刻（ただの数）。ワーカーの pacer が、ここから読み込みの間隔を空ける。
+        const previousNavigationAtMs = this.#previousNavigationAtMsOf(job.siteOrigins);
         this.#send(job, {
           protocol: WORKER_PROTOCOL_VERSION,
           type: 'START',
@@ -1692,15 +1932,24 @@ class JobManager implements AuditJobManager {
           ...(WORKER_JOB_KINDS_WITH_JOB_BROWSER.includes(job.jobKind)
             ? { showJobBrowser: readProfileDisplaySettings(this.#database, job.profileId).showJobBrowser }
             : {}),
-          // AS-b: 監査・発見・READ の確かめのジョブは、プロファイルの監査の段の送信の扱い（既定は読み取りだけ）を、ジョブの開始のときに読んで渡す。
-          ...(WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY.includes(job.jobKind)
+          // AS-b: 監査・発見・READ の確かめのジョブは、プロファイルの監査の段の送信の扱い（既定は読み取りだけ）を、ジョブの開始のときに読んで渡す。OP-N（設計書
+          // 4.1.7 の N2）: 書き込みのジョブも渡す（書き込みの段の Context にも、監査の段と同じ送信の扱いを当てる）。
+          ...(WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY.includes(job.jobKind)
             ? { auditSendPolicy: readProfileDisplaySettings(this.#database, job.profileId).auditSendPolicy }
             : {}),
           // PRE42-BN（2026-10-24 のユーザーの判断）: 監査のジョブは、プロファイルの名前（画面の「名前（profileId）」をそのまま）を渡す。ChatGPT 用バンドルの
           // ファイル名だけに使う（ワーカーは管理データを読まないので、`START` で渡す。成果物の中身には入れない）。
           ...(job.jobKind === WORKER_AUDIT_JOB_KIND ? { profileName: job.profileId } : {}),
           // FM2d: まとめて実行の段の並び（最初の段のジョブだけが `START` を送る）。
-          ...(job.chain === null ? {} : { chain: { stages: job.chain.stages } }),
+          // OP-2: チェックした画面があれば、読み取りの段の後に書き込みの段を続ける印を入れる。OP-H: 印と一緒に、チェックした画面の数だけを渡す（監査の段の報告が、
+          // この後に登録・更新することを言う。報告は判定しない）。
+          ...(job.chain === null ? {} : {
+            chain: {
+              stages: job.chain.stages,
+              ...(job.chain.writeTargets.length > 0 ? { writeStages: true as const, writeScreenCount: job.chain.writeTargets.length } : {}),
+            },
+          }),
+          ...(previousNavigationAtMs === null ? {} : { previousNavigationAtMs }),
         });
         return;
       case 'RUN_STARTED':
@@ -1803,9 +2052,34 @@ class JobManager implements AuditJobManager {
             ...(passedRequests === undefined ? {} : { passedRequests }),
             ...(loginStateNames === undefined ? {} : { stateNames: loginStateNames }),
           };
+        // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 値の受け取りのメタデータは、ログインの直後の登録を待つジョブの成功だけが持ち、
+        // 受け取ったのは受け取りを許したジョブだけ。違えば信用しない。
+        const capture = message.credentialCapture;
+        const registration = job.loginRegistration;
+        if (capture !== undefined && (registration === null || registration.phase !== 'WAITING'
+          || (capture.captured && job.authentication.loginRegistration?.credentialRoot === null))) {
+          this.#violate(job);
+          return;
+        }
+        if (message.loginEndDetection !== undefined) {
+          job.loginEndDetection = message.loginEndDetection;
+        }
         // DEF-138: セッションの切れの証拠（`SESSION_LOST` だけ。契約の確かめは済み）も、ジョブの行に 1 回だけ残す。
         recordAuthState(this.#database, job.jobId, message.state, message.sessionLostUrl, loginStage, message.sessionLoss ?? null);
         job.lastAuthState = message.state;
+        // OP-1: ログインの直後の登録を待つジョブは、ここで登録と切り替えを始める（ジョブの終わりの自動の登録はしない）。
+        if (message.state === 'AUTHENTICATED' && !automated && registration !== null && registration.phase === 'WAITING') {
+          registration.phase = 'REGISTERING';
+          const registering = this.#registerRightAfterLogin(job, {
+            passedRequests, observation: loginObservation, captured: capture?.captured === true, carriedBy: capture?.carriedBy ?? null,
+          }).catch((error: unknown) => {
+            this.#onBackgroundError(error);
+            this.#finishLoginRegistration(job, null);
+          });
+          this.#registrations.add(registering);
+          void registering.finally(() => this.#registrations.delete(registering));
+          return;
+        }
         // ML-a: 手動のログインの成功の記録（ジョブが終わった後の自動の登録の材料。メモリの中だけ）。
         if (message.state === 'AUTHENTICATED' && !automated && passedRequests !== undefined && job.manualLoginRecords === null) {
           job.manualLoginRecords = { passedRequests, observation: loginObservation };
@@ -1815,6 +2089,18 @@ class JobManager implements AuditJobManager {
           this.#settle(job, { kind: 'LOGIN_CHECKED' });
           this.#awaitExit(job);
         }
+        return;
+      }
+      case 'CREDENTIAL_SAVED': {
+        // OP-1: 受け取った値を書いたかの知らせは、許しを送って待っているときだけ（1 回）。
+        const registration = job.loginRegistration;
+        const onSaved = registration?.phase === 'AWAITING_SAVE' ? registration.onSaved : null;
+        if (registration === null || onSaved === null) {
+          this.#violate(job);
+          return;
+        }
+        registration.onSaved = null;
+        onSaved(message);
         return;
       }
       case 'HEARTBEAT':
@@ -1865,7 +2151,7 @@ class JobManager implements AuditJobManager {
         });
         // FM2d: まとめて実行の途中の段は、ワーカーを終えさせずに、次の段へ進めるかを決める（ワーカーは `NEXT_STAGE`・`CHAIN_END` を待つ）。
         const { chain } = job;
-        if (chain !== null && job.chainStageIndex < chain.stages.length - 1) {
+        if (chain !== null && this.#chainAwaitsParent(job, chain)) {
           void this.#advanceChain(job, chain).catch((error: unknown) => {
             this.#onBackgroundError(error);
             this.#guarded(() => this.#stopChainAt(job, chain, 'NEXT_STAGE_REJECTED'));
@@ -2035,7 +2321,10 @@ class JobManager implements AuditJobManager {
         return 'WRITE_DATA_NOT_GENERATED';
       }
       // T37d（設計者の判断 5）: 照合の READ に、画面の path の定義は使わない（書き込みは送らずに締める）。T38c: API のシナリオの `{id}` の型だけ通す。
-      const readVerificationRejection = readVerificationTargetRejectionOf(readCheck, scenarioTransportOf(revision.scenario));
+      // OP-R（設計書 4.1.9 の R1）: API の登録は、登録の画面の 1 つ上の一覧の画面の定義も通す（`apiCreateReadListPagePathOf`）。
+      const readVerificationRejection = readVerificationTargetRejectionOf(
+        readCheck, scenarioTransportOf(revision.scenario), apiCreateReadListPagePathOf(revision.scenario, revision.evidence),
+      );
       if (readVerificationRejection !== null) {
         return readVerificationRejection;
       }
@@ -2052,6 +2341,8 @@ class JobManager implements AuditJobManager {
         // T41R2-fix-B・T41R3-fix-B: 同じ台帳の書き込みの値の履歴（API の更新の、保つ鍵ごとの最後に分かっている値を求める。`knownKeptValuesOf`）。
         ledgerWrites: grant.targetRecordId === null ? [] : readLedgerValueWrites(this.#database, grant.scenarioId),
         approvalFacts,
+        // OP-REV6 の I-1: 一覧の画面の照合の READ は、実行のたびに違う値になる欄と比べるときだけ作る（許可の発行と同じ判定の部品）。
+        uniqueEachRunFieldNames: uniqueEachRunFieldNamesOf(planRuleSet(rules.ruleSet, revision.scenario, revision.evidence)),
       });
       // 書き込みの指定を、IPC の契約で確かめてから使う（送る値の長さ、送れる欄、照合の READ の上限など）。
       if (spec === null || !validateParentToWorkerMessage(input.startOf(spec)).ok) {
@@ -2180,6 +2471,20 @@ class JobManager implements AuditJobManager {
       this.#registrations.add(registration);
       void registration.finally(() => this.#registrations.delete(registration));
     }
+    // MI-3: 入口の確かめのジョブが確かめた成果物で終わったら、背後で（手動のログインの自動の登録と同じ作法）、認証の設定を案で保存する。
+    if (job.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && result?.kind === 'ENTRY_CHECK' && failedReason === null) {
+      const saving = this.#saveEntryCheckProposal(job, result.document).catch((error: unknown) => this.#onBackgroundError(error))
+        // OP-1: 印つきの下調べは、案の保存の後に続けて点検を始める（判定は `#startAfterEntryCheck` の 1 か所）。OP-1 修正の 2 回目: 開始のページを読めた
+        // （`READ`）ときだけ、失敗なしの終わりとして渡す（開けなかった・止めた下調べの後に、ログインの設定の要らない公開のサイトの点検を始めない）。
+        .then(() => this.#startAfterEntryCheck(job, result.document.endReason === ENTRY_CHECK_READ_END_REASON))
+        .catch((error: unknown) => this.#onBackgroundError(error));
+      this.#registrations.add(saving);
+      void saving.finally(() => this.#registrations.delete(saving));
+    } else if (job.jobKind === WORKER_ENTRY_CHECK_JOB_KIND) {
+      const following = this.#startAfterEntryCheck(job, false).catch((error: unknown) => this.#onBackgroundError(error));
+      this.#registrations.add(following);
+      void following.finally(() => this.#registrations.delete(following));
+    }
   }
 
   /**
@@ -2192,7 +2497,7 @@ class JobManager implements AuditJobManager {
       : (ending.kind === 'FINISHED' && result !== null ? this.#recordJobResult(job, result, at) : null);
     // T30e: 書き込みのジョブは、ジョブを終わりの状態にする前に、書き込みの結果を必ず 1 回締める。確かめ直しで拒んだジョブは `WRITE_GRANT_REJECTED`、
     // Run を実行した結果の `action-run.json` を使えなかったジョブは `WRITE_RESULT_INVALID` で `FAILED`。
-    if (job.write !== null) {
+    if (job.write !== null && !job.write.settled) {
       const fromDocument = this.#settleWrite(job, result, at);
       if (job.write.rejected) {
         failedReason = WRITE_GRANT_REJECTED_REASON;
@@ -2253,8 +2558,13 @@ class JobManager implements AuditJobManager {
    */
   async #advanceChain(job: TrackedJob, chain: ChainRun): Promise<void> {
     const ending = job.ending;
+    if (ending?.kind === 'FINISHED' && job.write !== null) {
+      // OP-2: 書き込みの段の後（結果を締め、残りの書き込みを続けるかを決める）。
+      await this.#advanceAfterWriteStage(job, chain, ending, job.write);
+      return;
+    }
     const nextKind = chain.stages[job.chainStageIndex + 1];
-    if (ending?.kind !== 'FINISHED' || nextKind === undefined || nextKind === WORKER_AUDIT_JOB_KIND) {
+    if (ending?.kind !== 'FINISHED' || nextKind === WORKER_AUDIT_JOB_KIND || (nextKind === undefined && chain.writeTargets.length === 0)) {
       this.#stopChainAt(job, chain, 'NEXT_STAGE_REJECTED');
       return;
     }
@@ -2279,8 +2589,13 @@ class JobManager implements AuditJobManager {
     let decision = decide();
     let readChecks: readonly WorkerStartReadCheck[] | null = null;
     if (decision.kind === 'CONTINUE' && nextKind === WORKER_READ_CHECK_JOB_KIND) {
-      const definitions = listReadChecks(this.#database, chain.profileId).slice(0, MAX_WORKER_READ_CHECKS);
+      const definitions = standaloneReadChecksOf(this.#database, chain.profileId);
       if (chainReadCheckDecisionOf(definitions.length) === 'NOT_NEEDED') {
+        // OP-2: チェックした画面があれば、READ の確かめを行わずに書き込みの段へ進む。
+        if (chain.writeTargets.length > 0 && !this.#closing && !this.#instanceLockLost) {
+          await this.#advanceToWriteStage(job, chain, ending);
+          return;
+        }
         // READ の確かめの定義がない: 行わなかったとして連鎖を終える（失敗にしない）。
         this.#closeChain(chain, null, NOT_NEEDED_CHAIN_STAGE_STATE);
         this.#send(job, { protocol: WORKER_PROTOCOL_VERSION, type: 'CHAIN_END' });
@@ -2301,8 +2616,335 @@ class JobManager implements AuditJobManager {
       this.#stopChainAt(job, chain, 'NEXT_STAGE_REJECTED');
       return;
     }
+    if (nextKind === undefined) {
+      // OP-2: 最後の読み取りの段の後は、書き込みの段。
+      await this.#advanceToWriteStage(job, chain, ending);
+      return;
+    }
     this.#advanceToNextStage(job, chain, ending, nextKind, readChecks);
   }
+
+  // -------------------------------------------------------------------------------------------------------------
+  // OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.1 の D7'〜D9'、4.1.2 の案 C）: 連鎖の最後の書き込みの段
+  // -------------------------------------------------------------------------------------------------------------
+
+  /**
+   * OP-2: 書き込みの段の対象（チェックした画面）。書き込みのモードのプロファイルの、承認した登録のシナリオと、その台帳に結ぶ承認した更新のシナリオ（決まりは
+   * `chainWriteTargetsOf`）。ほかのモードは空。
+   */
+  #chainWriteTargets(profileId: string, mode: SiteProfile['mode']): readonly ChainWriteTarget[] {
+    if (mode !== WRITE_AUDIT_MODE) {
+      return [];
+    }
+    return chainWriteTargetsOf(listScenarios(this.#database, profileId).map((scenario) => ({
+      scenarioId: scenario.scenarioId,
+      kind: scenario.current.kind,
+      approved: scenario.state === 'APPROVED',
+      ledgerScenarioId: updateLedgerScenarioIdOf(scenario.current),
+    })));
+  }
+
+  /**
+   * OP-2 の修正の 3 回目（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.2 の R1。設計者の判断（案 A））: 最初の書き込みの段の前の、更新の下書きと承認。
+   * - 対象は、承認が今も有効な登録のシナリオ（チェックした画面）のうち、その台帳に結ぶ更新のシナリオがまだないもの（取り消した・無効になった更新があれば、
+   *   作り直さず、承認し直さない。R3）。
+   * - 下書きは、この点検の発見の段の操作さがしの結果（索引の最後の発見が、この点検の発見の段のジョブのときだけ。ほかの発見の結果では作らない）で、共有の部品
+   *   （`draftUpdateForCreate`。画面の一覧のチェックの保存と同じ 1 か所）が作る。
+   * - 承認は、共有の部品（`approveForCheck`。`approveScenario` を `confirmSideEffects: true` で呼ぶ）。チェックの意味が「その画面で登録と更新を試す」なので、
+   *   チェックの範囲の中で行う。承認の有効さの判定は変えない（版・digest・今の事実は承認の口が確かめ直す）。許可は、ここでは出さない（次の段の前に今どおり発行する）。
+   * - 作れない・承認できない画面は、更新をしない（登録だけ）。誤りは知らせて、点検は続ける。
+   */
+  async #prepareChainUpdates(job: TrackedJob, chain: ChainRun): Promise<void> {
+    try {
+      const stored = getProfile(this.#database, chain.profileId);
+      const discoveryStage = chain.stages.indexOf(WORKER_DISCOVERY_JOB_KIND);
+      const discoveryJobId = discoveryStage < 0 ? null : chain.stageStates[discoveryStage]?.jobId ?? null;
+      if (stored === null || stored.status !== ACTIVE_PROFILE_STATUS || stored.profile.revision !== chain.profileRevision || stored.profile.mode !== WRITE_AUDIT_MODE
+        || discoveryJobId === null || readDiscoveryIndex(this.#database, chain.profileId).latestJobId !== discoveryJobId) {
+        return;
+      }
+      const scenarios = listScenarios(this.#database, chain.profileId);
+      const bound = new Set(scenarios.flatMap(({ current }) => {
+        const ledger = current.kind === 'UPDATE' ? updateLedgerScenarioIdOf(current) : null;
+        return ledger === null ? [] : [ledger];
+      }));
+      const creates = scenarios.filter(({ scenarioId, current, state }) => current.kind === 'CREATE' && state === 'APPROVED' && !bound.has(scenarioId));
+      if (creates.length === 0) {
+        return;
+      }
+      const external = await approvalExternalFactsOf(stored, {
+        database: this.#database, repositoryRoot: this.#repositoryRoot, credentialStore: this.#credentials(),
+      });
+      const runDirectory = readJob(this.#database, discoveryJobId)?.runDirectory ?? null;
+      const value = runDirectory === null ? null : await this.#readRunArtifact(job.outputDirectory, runDirectory, DISCOVERY_ARTIFACT_FILE_NAME, 'discovery');
+      if (job.processExited || external === null || value === null || (value as DiscoveryDocument).jobId !== discoveryJobId) {
+        return;
+      }
+      const facts = { database: this.#database, profileId: chain.profileId, discovery: value as DiscoveryDocument, clock: (): string => this.#timestamp() };
+      for (const { scenarioId } of creates) {
+        const status = readScenarioApprovalStatus(this.#database, scenarioId, external, this.#now());
+        if (status === null || !status.validity.approved) {
+          continue;
+        }
+        const updateScenarioId = draftUpdateForCreate(facts, scenarioId);
+        if (updateScenarioId !== null) {
+          // OP-F（M-3）: 更新の画面の知らせを、チェックが確かめていなければ承認しない（行に 1 行が出る）。
+          approveUpdateForChain(this.#database, scenarioId, updateScenarioId, external, facts.clock);
+        }
+      }
+    } catch (error) {
+      this.#onBackgroundError(error);
+    }
+  }
+
+  /** OP-2: 段の `FINISHED` の後に、ワーカーが親の `NEXT_STAGE`・`CHAIN_END` を待つか（途中の読み取りの段か、書き込みの段の印のある連鎖の後の段）。 */
+  #chainAwaitsParent(job: TrackedJob, chain: ChainRun): boolean {
+    return job.chainStageIndex < chain.stages.length - 1 || chain.writeTargets.length > 0;
+  }
+
+  /**
+   * OP-2: 書き込みの段の結果を締める（ワーカーが終わったときの締め `#recordExitedJob` と同じ部品と順。次の段へ進む前に 1 回だけ。締めた印を付ける）。記録した
+   * 失敗の理由（なければ `null`）を返す。
+   */
+  #settleChainWriteStage(job: TrackedJob, write: WriteJobState, ending: Extract<JobEnding, { readonly kind: 'FINISHED' }>, result: JobResultVerdict | null, at: string): AuditJobFailureReason | null {
+    let failedReason: AuditJobFailureReason | null = result === null ? null : this.#recordJobResult(job, result, at);
+    const fromDocument = this.#settleWrite(job, result, at);
+    write.settled = true;
+    if (write.rejected) {
+      failedReason = WRITE_GRANT_REJECTED_REASON;
+    } else if (ending.outcome.kind === 'RAN' && !fromDocument) {
+      failedReason = WRITE_RESULT_INVALID_REASON;
+    }
+    if (ending.outcome.kind === 'RAN') {
+      const reportCheck: WriteReportCheck = fromDocument && result?.kind === 'WRITE' ? result.reportCheck : WRITE_REPORT_RESULT_INVALID;
+      this.#guarded(() => recordWriteReportCheck(this.#database, job.jobId, reportCheck));
+    }
+    return failedReason;
+  }
+
+  /**
+   * OP-2: 書き込みの段の後。結果のファイルを読み、書き込みの結果を締め、残りの書き込みを続けるか（`chainWriteAdvanceDecisionOf`。結果が分からない・安全の違反・
+   * ログインの切れ・止める要求・改訂の変化なら止める）を決める。続けるなら次の書き込みの段へ。
+   */
+  async #advanceAfterWriteStage(job: TrackedJob, chain: ChainRun, ending: Extract<JobEnding, { readonly kind: 'FINISHED' }>, write: WriteJobState): Promise<void> {
+    const verdict = await this.#readJobResult(job);
+    if (job.processExited) {
+      return;
+    }
+    const failedReason = this.#settleChainWriteStage(job, write, ending, verdict, this.#timestamp());
+    job.recordedResult = { failedReason };
+    const settled = readWriteResult(this.#database, job.jobId);
+    const step = chain.currentWriteStep;
+    if (step !== null) {
+      chain.lastWrite = { step, createRecordId: step.kind === 'CREATE' && settled?.result === VERIFIED_ACTION_RESULT ? settled.recordId : null };
+    }
+    chain.currentWriteStep = null;
+    const current = getProfile(this.#database, chain.profileId);
+    const decision = chainWriteAdvanceDecisionOf({
+      stopRequested: job.stopRequested || chain.stopRequested,
+      result: settled?.result ?? null,
+      stageRunStatus: ending.outcome.runStatus,
+      sessionLost: job.sessionLost,
+      profileRevisionUnchanged: current !== null && current.status === ACTIVE_PROFILE_STATUS && current.profile.revision === chain.profileRevision,
+    });
+    if (decision.kind === 'STOP' || step === null) {
+      this.#stopChainAt(job, chain, decision.kind === 'STOP' ? decision.reason : 'NEXT_STAGE_REJECTED');
+      return;
+    }
+    if (this.#closing || this.#instanceLockLost) {
+      this.#stopChainAt(job, chain, 'NEXT_STAGE_REJECTED');
+      return;
+    }
+    await this.#advanceToWriteStage(job, chain, ending);
+  }
+
+  /**
+   * OP-2: 次の書き込みの段を始める（なければ連鎖を終える）。段ごとに、今の書き込みの流れの部品をそのまま通す。
+   * 1. 次の段（`nextChainWriteStepOf`。1 つの画面につき登録 1 件と更新 1 件まで）を決め、その画面の許可を発行する（`issueExecutionGrant`。承認の有効さ・上限・
+   *    更新の対象（登録の番号）を今の判定で確かめる）。発行を拒まれた画面は送らずに次へ（R3: 承認し直さない）。
+   * 2. 今の段の行を締めることと、次の段の行を作ることを、await を挟まずに続けて行う（段の間に、ほかのジョブを始める空きを作らない）。
+   * 3. 書き込みの準備（`#prepareWrite`。許可の消費、値の生成、書き込みの指定、送る前の記録）。止まったら、その段の行を `FAILED` にし、予約を締めて次へ。
+   * 4. ワーカーの今の段を置き換え、`NEXT_STAGE`（書き込みの指定つき）を送る。
+   */
+  async #advanceToWriteStage(job: TrackedJob, chain: ChainRun, ending: Extract<JobEnding, { readonly kind: 'FINISHED' }>): Promise<void> {
+    if (!chain.updatesPrepared) {
+      // OP-2 の修正の 3 回目（R1）: 最初の書き込みの段の前に 1 回だけ、この点検の操作さがしの結果で、更新がまだない画面の更新の下書きと承認を行い、対象を求め直す。
+      chain.updatesPrepared = true;
+      await this.#prepareChainUpdates(job, chain);
+      if (job.processExited) {
+        return;
+      }
+      chain.writeTargets = this.#chainWriteTargets(chain.profileId, getProfile(this.#database, chain.profileId)?.profile.mode ?? WRITE_AUDIT_MODE);
+    }
+    // OP-F（安全のレビューの M-1）: 止める要求（画面の「やめる」）は、親が書き込みの段を準備している間にも届く。許可の発行の前と `NEXT_STAGE` の前に見直す。
+    const stopRequested = (): boolean => job.stopRequested || chain.stopRequested;
+    for (;;) {
+      if (stopRequested()) {
+        this.#stopChainAt(job, chain, 'USER_STOPPED');
+        return;
+      }
+      const step = nextChainWriteStepOf(chain.writeTargets, chain.lastWrite);
+      if (step === null) {
+        // チェックした画面をすべて試した（行わなかった READ の確かめは「行わなかった」）。OP-F（M-1）: 試せなかった画面があれば、その理由で終える。
+        this.#closeChain(chain, chain.writeNotTried ? 'WRITE_NOT_TRIED' : null, NOT_NEEDED_CHAIN_STAGE_STATE);
+        this.#send(job, { protocol: WORKER_PROTOCOL_VERSION, type: 'CHAIN_END' });
+        this.#awaitExit(job);
+        return;
+      }
+      const target = chain.writeTargets[step.targetIndex];
+      const scenarioId = step.kind === 'CREATE' ? target?.createScenarioId : target?.updateScenarioId;
+      const stored = getProfile(this.#database, chain.profileId);
+      if (stored === null || stored.status !== ACTIVE_PROFILE_STATUS || stored.profile.revision !== chain.profileRevision) {
+        this.#stopChainAt(job, chain, 'PROFILE_REVISION_CHANGED');
+        return;
+      }
+      const scenario = scenarioId === undefined || scenarioId === null ? null : readScenario(this.#database, scenarioId);
+      const facts = scenario === null ? null : await approvalExternalFactsOf(stored, {
+        database: this.#database, repositoryRoot: this.#repositoryRoot, credentialStore: this.#credentials(),
+      });
+      if (job.processExited) {
+        return;
+      }
+      if (stopRequested()) {
+        this.#stopChainAt(job, chain, 'USER_STOPPED');
+        return;
+      }
+      const jobKind = step.kind === 'CREATE' ? WORKER_WRITE_CREATE_JOB_KIND : WORKER_WRITE_UPDATE_JOB_KIND;
+      const nextJobId = randomUUID();
+      const grantId = randomUUID();
+      const issuedAt = this.#timestamp();
+      const targetRecordId = step.kind === 'UPDATE' ? chain.lastWrite?.createRecordId ?? null : null;
+      const issued = scenario === null || facts === null || (step.kind === 'UPDATE' && targetRecordId === null)
+        ? null
+        : issueExecutionGrant(this.#database, {
+          scenarioId: scenario.scenarioId,
+          expectedRevision: scenario.revision,
+          grantId,
+          jobId: nextJobId,
+          count: DEFAULT_MAX_CREATES_PER_RUN,
+          ...(targetRecordId === null ? {} : { expectedTargetRecordId: targetRecordId }),
+          external: facts,
+          at: issuedAt,
+        });
+      if (issued === null || !issued.ok) {
+        // その画面は送らない（R3: 承認し直さない）。登録を送らなかった画面の更新もしない。OP-F（M-1）: 試せなかったことを連鎖の結果に残す。
+        chain.lastWrite = { step, createRecordId: null };
+        chain.writeNotTried = true;
+        continue;
+      }
+      if (!job.rowRecorded) {
+        this.#recordJobRow(job, ending, ending.outcome.exitCode, job.recordedResult?.failedReason ?? null, issuedAt);
+        job.rowRecorded = true;
+      }
+      const created = createStartingJob<AuditJobStartRejectionReason>(this.#database, {
+        jobId: nextJobId, jobKind, profileId: chain.profileId, profileRevision: chain.profileRevision, startNew: true, createdAt: issuedAt,
+      }, (connection) => {
+        if (!this.#holdsInstanceLock(connection)) {
+          return 'CONTROL_INSTANCE_LOCK_LOST';
+        }
+        const now = getProfile(this.#database, chain.profileId);
+        return now === null || now.status !== ACTIVE_PROFILE_STATUS || now.profile.revision !== chain.profileRevision ? 'PROFILE_REVISION_CONFLICT' : null;
+      });
+      if (!created.ok) {
+        this.#guarded(() => closeWriteWithoutSending(this.#database, { grantId, jobId: nextJobId, at: issuedAt }));
+        this.#stopChainAt(job, chain, created.reason === 'PROFILE_REVISION_CONFLICT' ? 'PROFILE_REVISION_CHANGED' : 'NEXT_STAGE_REJECTED');
+        return;
+      }
+      const grant = readExecutionGrant(this.#database, grantId);
+      const authentication = job.authentication === null ? null : (({ loginRegistration: _registration, ...kept }) => kept)(job.authentication);
+      const prepared = grant === null ? 'WRITE_GRANT_REJECTED' : await this.#prepareWrite({
+        jobId: nextJobId, stored, grant, outputDirectory: job.outputDirectory, startUrl: chain.startUrl ?? '',
+        startOf: (write) => ({
+          protocol: WORKER_PROTOCOL_VERSION, type: 'START', jobId: nextJobId, jobKind, targetConfigPath: job.targetConfigPath, startNew: true,
+          targetConfigSha256: job.targetConfigSha256, ...(authentication === null ? {} : { authentication }), write,
+        }),
+      });
+      if (typeof prepared === 'string' || job.processExited || stopRequested()) {
+        // 送らずに締め、その段の行を `FAILED` にする（ワーカーが終わっていたら、ここで終える）。OP-F（M-1）: 準備の間に止める要求が届いたときも、送らずに締めて
+        // 利用者の停止で止める。準備が通らなかった画面は、試せなかったことを連鎖の結果に残す。
+        const at = this.#timestamp();
+        this.#guarded(() => closeWriteWithoutSending(this.#database, { grantId, jobId: nextJobId, at }));
+        this.#endUntracked(nextJobId, 'FAILED', WRITE_GRANT_REJECTED_REASON);
+        chain.lastWrite = { step, createRecordId: null };
+        if (job.processExited) {
+          return;
+        }
+        if (typeof prepared !== 'string') {
+          this.#stopChainAt(job, chain, 'USER_STOPPED');
+          return;
+        }
+        chain.writeNotTried = true;
+        continue;
+      }
+      this.#startChainWriteStage(job, chain, step, nextJobId, jobKind, prepared);
+      return;
+    }
+  }
+
+  /** OP-2: ワーカーの今の段を書き込みの段に置き換え、`NEXT_STAGE`（書き込みの指定つき）を送る（`#advanceToNextStage` と同じ置き換え方）。 */
+  #startChainWriteStage(
+    job: TrackedJob,
+    chain: ChainRun,
+    step: ChainWriteStep,
+    nextJobId: string,
+    jobKind: WorkerWriteJobKind,
+    write: WorkerStartWrite | WorkerStartApiWrite,
+  ): void {
+    const next: TrackedJob = {
+      ...job,
+      jobId: nextJobId,
+      jobKind,
+      startNew: true,
+      readChecks: null,
+      writeSpec: write,
+      write: {
+        grantId: write.grantId, scenarioId: write.scenarioId, scenarioRevision: write.scenarioRevision,
+        recheckRequested: false, recheckAllowed: false, rejected: false, submission: null, settled: false,
+      },
+      // 書き込みの段は、最後の段として数える（ワーカーが終わったときの連鎖の終わり方の判定）。
+      chainStageIndex: chain.stages.length - 1,
+      automatedLoginReported: true,
+      loginConfirmSent: true,
+      manualLoginRecords: job.manualLoginRecords,
+      loginRegistration: null,
+      loginEndDetection: null,
+      startSent: true,
+      phase: 'STARTED',
+      runStarted: null,
+      ending: null,
+      exitTimer: undefined,
+      processExited: false,
+      stopRequested: false,
+      forceRequested: false,
+      finalizing: false,
+      lastHeartbeatMs: performance.now(),
+      lastProgressWriteMs: Number.NEGATIVE_INFINITY,
+      pendingProgress: null,
+      readyTimer: undefined,
+      killTimer: undefined,
+      progressTimer: undefined,
+      sessionLost: false,
+      recordedResult: null,
+      rowRecorded: false,
+    };
+    job.manualLoginRecords = null;
+    this.#jobs.delete(job.jobId);
+    this.#clearTimers(job);
+    this.#jobs.set(nextJobId, next);
+    this.#stageJobs.set(job.child, next);
+    this.#chains.set(nextJobId, chain);
+    chain.currentWriteStep = step;
+    chain.writeStageJobIds.push(nextJobId);
+    for (const stage of chain.stageStates) {
+      if (stage.state === RUNNING_CHAIN_STAGE_STATE) {
+        stage.state = DONE_CHAIN_STAGE_STATE;
+      }
+    }
+    this.#guarded(() => recordWorkerPid(this.#database, nextJobId, job.child.pid ?? 0));
+    this.#heartbeat(next);
+    this.#send(next, { protocol: WORKER_PROTOCOL_VERSION, type: 'NEXT_STAGE', jobId: nextJobId, jobKind, write });
+  }
+
 
   /**
    * FM2d: 今の段の行を締め、次の段の行を作り、ワーカーの今の段を置き換えて `NEXT_STAGE` を送る（await を挟まない。段の間に、ほかのジョブを始める空きを作らない）。
@@ -2350,6 +2992,9 @@ class JobManager implements AuditJobManager {
       loginConfirmSent: true,
       // ML-a: 手動のログインの自動の登録は、連鎖の最後に 1 回だけ（最後の段のジョブへ移す）。
       manualLoginRecords: job.manualLoginRecords,
+      // OP-1: ログインの直後の登録は、最初の段の中で済んでいる（次の段は待たない）。
+      loginRegistration: null,
+      loginEndDetection: null,
       startSent: true,
       phase: 'STARTED',
       runStarted: null,
@@ -2453,6 +3098,11 @@ class JobManager implements AuditJobManager {
     }
   }
 
+  checkedWriteScreenCountOf(profileId: string): number {
+    const stored = getProfile(this.#database, profileId);
+    return stored === null || stored.status !== ACTIVE_PROFILE_STATUS ? 0 : this.#chainWriteTargets(profileId, stored.profile.mode).length;
+  }
+
   getStageChainOfJob(jobId: string): StageChainView | null {
     const chain = typeof jobId === 'string' ? this.#chains.get(jobId) : undefined;
     if (chain === undefined) {
@@ -2469,6 +3119,7 @@ class JobManager implements AuditJobManager {
         state: chain.stageStates[index]?.state ?? NOT_STARTED_CHAIN_STAGE_STATE,
         jobId: chain.stageStates[index]?.jobId ?? null,
       })),
+      writeStageJobIds: [...chain.writeStageJobIds],
     });
   }
 
@@ -2530,6 +3181,338 @@ class JobManager implements AuditJobManager {
       return;
     }
     skip(result.part === 'PROFILE' && result.reason === 'PROFILE_REVISION_CONFLICT' ? 'PROFILE_CHANGED' : 'SAVE_REJECTED');
+  }
+
+  /**
+   * OP-1: ログインの直後の登録の返事を送る（新しい設定か、飛ばした）。1 回だけ（2 回目は何もしない）。`registered` が `null` なら飛ばした。
+   */
+  #finishLoginRegistration(job: TrackedJob, registered: { readonly setup: AuthSetup; readonly approvedServiceOrigins: readonly string[] } | null): void {
+    const registration = job.loginRegistration;
+    if (registration === null || registration.phase === 'DONE') {
+      return;
+    }
+    registration.phase = 'DONE';
+    registration.onSaved = null;
+    if (registered === null || job.authentication === null) {
+      this.#send(job, { protocol: WORKER_PROTOCOL_VERSION, type: 'LOGIN_REGISTRATION_SKIPPED' });
+      return;
+    }
+    const approvedServiceOrigins = [...registered.approvedServiceOrigins];
+    this.#send(job, {
+      protocol: WORKER_PROTOCOL_VERSION,
+      type: 'LOGIN_REGISTERED',
+      setup: registered.setup,
+      approvedServiceOrigins,
+      authenticationSha256: workerAuthenticationDigestOf(registered.setup, job.authentication.approvedTestOrigins, {
+        jobKind: job.jobKind as WorkerJobKind, automatedLogin: null, approvedServiceOrigins,
+      }),
+    });
+  }
+
+  /** OP-1: ワーカーの `CREDENTIAL_SAVED` を待つ（待つ上限・ワーカーの終わりなら `null`）。 */
+  #awaitCredentialSaved(job: TrackedJob): Promise<WorkerCredentialSavedMessage | null> {
+    const registration = job.loginRegistration;
+    if (registration === null) {
+      return Promise.resolve(null);
+    }
+    return new Promise((resolvePromise) => {
+      const timer = setTimeout(() => settle(null), this.#timing.loginRegistrationTimeoutMs);
+      const settle = (message: WorkerCredentialSavedMessage | null): void => {
+        clearTimeout(timer);
+        registration.onSaved = null;
+        // OP-F（発見事項）: 待ち終わったら、組み立ての続きの状態に戻す（上限を過ぎた・終わった後も、知らせを待つ状態のまま残さない。遅れて届く知らせは信用しない）。
+        if (registration.phase === 'AWAITING_SAVE') {
+          registration.phase = 'REGISTERING';
+        }
+        resolvePromise(message);
+      };
+      registration.phase = 'AWAITING_SAVE';
+      registration.onSaved = settle;
+      void job.exited.then(() => settle(null));
+    });
+  }
+
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D4、4.1.3 の 1）: 手動のログインの成功の直後（点検と操作さがしの前）に、手動のログインの後の
+   * 自動の登録（送信先・承認したサービスの Origin・観察した成功の画面の path）と、受け取った値があれば自動ログインへの切り替えを、1 回の保存で行う。書く順:
+   * 1. 登録を組み立て（`loginRegistrationAfterLoginOf`）、受け取った値があり、3 つのセレクタ（観察の `loginFields`）がそろうときだけ、切り替えも組み立てて検証に通し
+   *    （`automatedLoginSwitchOf`）、資格情報を書く前の確かめ（`writableLoginOriginOf`。動いているジョブは、このジョブだけ）を通す。
+   * 2. 通れば、ワーカーに許し（`CREDENTIAL_SAVE_ALLOWED`）を送り、書いた知らせ（`CREDENTIAL_SAVED`）を待つ。書いた資格情報のファイルの改訂とログインの Origin が
+   *    合うときだけ切り替える（合わなければ、このジョブが書いたファイルを消す）。
+   * 3. 登録と切り替えを `saveProfileAndAuthSetup` の 1 回で書く（改訂の照合と検証は保存の部品）。失敗したら、書いた資格情報のファイルを消す。
+   * 4. 切り替えたら資格情報の変更の記録（`CREATED`）を書き、連鎖の基準の改訂を、保存した改訂に進める。結果を最初の段のジョブの記録に残し、新しい設定を送る。
+   * 何も変わらないとき、プロファイルか認証の設定が変わっていたとき、保存が拒まれたときは、今の設定のまま点検を続ける（`LOGIN_REGISTRATION_SKIPPED`）。
+   * 値は扱わない（ワーカーが書く）。
+   */
+  async #registerRightAfterLogin(
+    job: TrackedJob,
+    records: {
+      readonly passedRequests: WorkerLoginStageBlockedRequests | undefined;
+      readonly observation: WorkerLoginObservation | undefined;
+      readonly captured: boolean;
+      /** OP-F（M-2）: 受け取った値を運んだ、観察した送り先（受け取っていなければ null）。 */
+      readonly carriedBy: { readonly origin: string; readonly path: string } | null;
+    },
+  ): Promise<void> {
+    const setup = job.authentication?.setup;
+    if (setup === undefined) {
+      this.#finishLoginRegistration(job, null);
+      return;
+    }
+    const record = (registration: AuditJobLoginAutoRegistration): void => {
+      recordLoginStageAutoRegistration(this.#database, job.jobId, registration);
+    };
+    // OP-K（K3）: 受け取った値があるのに切り替えられなかったときの理由（判定の順に、最初に当たったもの。保存の段の失敗は `REGISTRATION_NOT_SAVED`）。
+    let unavailable: AuditJobAutomatedLoginUnavailableReason = 'REGISTRATION_NOT_SAVED';
+    // OP-L（L2）: ワーカーが書けなかったと知らせた理由のコード（値を含まない。`CREDENTIAL_NOT_SAVED` の詳しい内容として残す）。
+    let saveFailure: WorkerCredentialSaveFailureCode | null = null;
+    const notAvailable = (): Pick<AuditJobLoginAutoRegistration, 'automatedLogin' | 'automatedLoginReason' | 'automatedLoginSaveFailure'> => {
+      if (!records.captured) {
+        return {};
+      }
+      return unavailable === 'CREDENTIAL_NOT_SAVED' && saveFailure !== null
+        ? { automatedLogin: 'NOT_AVAILABLE', automatedLoginReason: unavailable, automatedLoginSaveFailure: saveFailure }
+        : { automatedLogin: 'NOT_AVAILABLE', automatedLoginReason: unavailable };
+    };
+    const skip = (reason: AuditJobLoginAutoRegistrationSkipReason): void => {
+      record({ result: 'SKIPPED', reason, ...notAvailable() });
+      this.#finishLoginRegistration(job, null);
+    };
+    const revision = setup.profileRevision;
+    const unchanged = (): StoredProfile | null => {
+      const current = getProfile(this.#database, job.profileId);
+      const stored = getAuthSetup(this.#database, job.profileId);
+      return current === null || current.status !== ACTIVE_PROFILE_STATUS || current.profile.revision !== revision
+        || stored === null || stored.freshness !== CURRENT_AUTH_SETUP_FRESHNESS || JSON.stringify(stored.setup) !== JSON.stringify(setup)
+        ? null
+        : current;
+    };
+    const current = unchanged();
+    if (current === null) {
+      skip('PROFILE_CHANGED');
+      return;
+    }
+    const services = [...(current.profile.approvedServiceOrigins ?? [])];
+    const nextRevision = revision + 1;
+    const built = loginRegistrationAfterLoginOf({
+      setup,
+      profile: { approvedTestOrigins: current.profile.approvedTestOrigins, approvedServiceOrigins: services },
+      passedRequests: records.passedRequests,
+      observation: records.observation,
+      nextProfileRevision: nextRevision,
+    });
+    const { targetConfigPath } = current.profile;
+    let context: ProfileValidationContext | undefined;
+    try {
+      context = await this.#resolveContext(targetConfigPath);
+    } catch {
+      context = undefined;
+    }
+    const registeredProfile: SiteProfile = { ...current.profile, revision: nextRevision, approvedServiceOrigins: [...services, ...built.addServiceOrigins] };
+    // 1. 切り替えの組み立て（受け取った値があり、3 つのセレクタがそろうときだけ）。OP-K（K3）: セレクタは、手でのログインの観察（`loginFields`）→ 最後の下調べの案の
+    //    順に取る（SPA のログインの画面は、開いた直後に欄がなく、観察に入らないことがある。下調べの案は、同じ検出の部品が読んだもの。資格情報の照らしは変えない）。
+    const selectors = records.captured ? await this.#loginFieldSelectorsOf(job, records.observation) : null;
+    // DEF-182: token の送信先を登録できない（テスト環境と同じ Origin）ときは、自動ログインへ切り替えない（受け取った値は、許しを送らないのでワーカーが捨てる）。
+    const builtSwitch = records.captured && selectors !== null && context !== undefined && built.automatedLoginBlocked === null
+      ? automatedLoginSwitchOf(registeredProfile, built.setup, nextRevision, context, selectors)
+      : null;
+    // OP-F（安全のレビューの M-2）: 受け取った値を運んだ送り先が、切り替えの後の資格情報の送り先（フォームの送信先か token の送信先）のどれかに当たるときだけ
+    // 切り替える。当たらないときは許しを送らない（値はワーカーが捨てる）。要点は、今の「使えない」の 1 行。
+    const carriedToDestination = builtSwitch?.ok === true && credentialCarriedToLoginDestination(builtSwitch.nextSetup, records.carriedBy);
+    const switchPlan = builtSwitch?.ok === true && !carriedToDestination ? null : builtSwitch;
+    if (built.automatedLoginBlocked !== null) {
+      unavailable = 'TOKEN_TARGET_ON_TEST_ORIGIN';
+    } else if (selectors === null) {
+      unavailable = 'LOGIN_FIELDS_MISSING';
+    } else if (builtSwitch !== null && !builtSwitch.ok) {
+      unavailable = 'SWITCH_INVALID';
+    } else if (builtSwitch !== null && !carriedToDestination) {
+      unavailable = 'DESTINATION_MISMATCH';
+    }
+    const writable = switchPlan?.ok === true
+      ? writableLoginOriginOf({
+        database: this.#database,
+        // 動いているジョブは、このジョブだけ（同時に 1 つ）。ログインの段の口から書くときの、ジョブの確かめの 1 つの口。
+        checkCredentialChange: () => ({ ok: true }),
+        platformSupported: () => process.platform === CREDENTIAL_PLATFORM,
+      }, job.profileId, { auth: AUTOMATED_LOGIN_AUTH_STRATEGY, loginStartUrl: switchPlan.nextSetup.loginStartUrl })
+      : null;
+    // 2. 許しを送り、書いた知らせを待つ。
+    let switched: { readonly profile: SiteProfile; readonly setup: AuthSetup; readonly credentialRevision: number } | null = null;
+    // OP-F（OP-REV2 の m-3）: 許しを送った時刻（壁の時計。資格情報のファイルの部品が書く作った日時と同じ時計。秒の精度）。消すのは、この後に書かれた形のファイルだけ。
+    let allowedAt: string | null = null;
+    const removeWrittenAfterAllowance = async (): Promise<void> => {
+      const written = await this.#credentials().readMetadata(job.profileId).catch(() => null);
+      // このジョブの許しの後に書かれた形（改訂 1、作った日時が許しの後）でなければ消さない（資格情報の画面がほかの時に書いたファイルを消さない）。
+      if (allowedAt !== null && written !== null && written.credentialRevision === FIRST_CREDENTIAL_REVISION && written.createdAt >= allowedAt) {
+        await this.#credentials().remove(job.profileId).catch(() => false);
+      }
+    };
+    if (switchPlan?.ok === true && (writable === null || !('loginOrigin' in writable))) {
+      unavailable = 'CREDENTIAL_NOT_WRITABLE';
+    }
+    if (switchPlan?.ok === true && writable !== null && 'loginOrigin' in writable) {
+      unavailable = 'CREDENTIAL_NOT_SAVED';
+      allowedAt = formatCompactUtcTimestamp(new Date(), 'credential save allowance time');
+      this.#send(job, { protocol: WORKER_PROTOCOL_VERSION, type: 'CREDENTIAL_SAVE_ALLOWED', loginOrigin: writable.loginOrigin });
+      const saved = await this.#awaitCredentialSaved(job);
+      if (saved === null) {
+        // OP-F（安全のレビューの I-1）: 許しの後に、知らせの前にワーカーが終わった（落ちた）か、待つ上限を過ぎた。書いたかが分からないので、まだ動いていれば
+        // 止め（この後に書かせない。遅れて届く知らせも受けない）、終わりを待ってから確かめる。
+        if (!job.processExited) {
+          this.#end(job, 'INTERRUPTED', 'WORKER_UNRESPONSIVE');
+          this.#kill(job);
+        }
+        await job.exited;
+      }
+      if (saved !== null && !saved.saved) {
+        saveFailure = saved.failureCode;
+      }
+      const metadata = saved?.saved === true ? await this.#credentials().readMetadata(job.profileId).catch(() => null) : null;
+      if (saved?.saved === true && metadata !== null && metadata.credentialRevision === saved.credentialRevision && metadata.loginOrigin === writable.loginOrigin) {
+        switched = { profile: switchPlan.nextProfile, setup: switchPlan.nextSetup, credentialRevision: metadata.credentialRevision };
+        // ここから後の失敗は、設定の保存の失敗（書いたファイルは消す）。
+        unavailable = 'REGISTRATION_NOT_SAVED';
+      } else {
+        // 合わないファイルと、知らせのない（書けなかったと知らせた・知らせの前に終わった・上限を過ぎた）ときのファイルは、このジョブが書いたもの（始めたときは
+        // ファイルがなかった。受け取りを許すのはファイルがないときだけ）なので、あれば消す（このジョブの許しの後に書かれた形のときだけ）。
+        await removeWrittenAfterAllowance();
+      }
+    }
+    if (!built.changed && switched === null) {
+      skip(built.automatedLoginBlocked ?? 'NOTHING_NEW');
+      return;
+    }
+    // 3. 1 回の保存（待つ間に変わっていないかを、保存の直前にもう一度確かめる。ここから保存まで await を挟まない）。
+    const removeWritten = async (): Promise<void> => {
+      if (switched !== null) {
+        await removeWrittenAfterAllowance();
+      }
+    };
+    if (unchanged() === null || context === undefined) {
+      await removeWritten();
+      skip(context === undefined ? 'SAVE_REJECTED' : 'PROFILE_CHANGED');
+      return;
+    }
+    const resolved = context;
+    const profileToSave = switched?.profile ?? registeredProfile;
+    const setupToSave = switched?.setup ?? built.setup;
+    let result: ReturnType<typeof saveProfileAndAuthSetup> | null;
+    try {
+      result = saveProfileAndAuthSetup(this.#database, { profile: profileToSave, expectedRevision: revision, setup: setupToSave }, {
+        resolveContext: (path) => (path === targetConfigPath ? resolved : undefined),
+        now: this.#now,
+      });
+    } catch {
+      result = null;
+    }
+    if (result === null || !result.ok) {
+      await removeWritten();
+      skip(result !== null && result.part === 'PROFILE' && result.reason === 'PROFILE_REVISION_CONFLICT' ? 'PROFILE_CHANGED' : 'SAVE_REJECTED');
+      return;
+    }
+    // 4. 記録と連鎖の基準の改訂。
+    if (switched !== null) {
+      this.#guarded(() => recordCredentialEvent(this.#database, {
+        profileId: job.profileId, kind: 'CREATED', at: this.#timestamp(), credentialRevision: switched.credentialRevision,
+      }));
+    }
+    if (job.chain !== null && job.chain.profileRevision === revision) {
+      job.chain.profileRevision = nextRevision;
+    }
+    record({
+      result: 'SAVED',
+      profileRevision: nextRevision,
+      addedServiceOrigins: [...built.addServiceOrigins],
+      ...(switched === null ? notAvailable() : { automatedLogin: 'SWITCHED' as const }),
+    });
+    this.#finishLoginRegistration(job, { setup: setupToSave, approvedServiceOrigins: profileToSave.approvedServiceOrigins ?? [] });
+  }
+
+  /**
+   * OP-K（K3）: 自動ログインへの切り替えの 3 つのセレクタ。手でのログインの観察の案（`loginFields`）が 3 つともそろえば、それを使う。そろわなければ、そのプロファイルの
+   * 最後の終わった下調べ（入口の確かめ）の案（成果物 `entry-check.json` の `proposal.selectors`。資格情報の画面の切り替えの案と同じ順・同じもの）を使う。案への写しは
+   * 画面の案と同じ部品（`loginFieldDraftsOf`。認証の設定として受ける形だけ）。どちらにもそろわなければ `null`。値は扱わない。例外を投げない。
+   */
+  async #loginFieldSelectorsOf(job: TrackedJob, observation: WorkerLoginObservation | undefined): Promise<AutomatedLoginSelectors | null> {
+    const selectorsOf = (fields: WorkerLoginObservation['loginFields']): AutomatedLoginSelectors | null => {
+      const drafts = loginFieldDraftsOf(fields === undefined ? undefined : { loginFields: fields });
+      return drafts === null || drafts.username === null || drafts.password === null || drafts.submit === null
+        ? null
+        : { usernameSelector: drafts.username.value, passwordSelector: drafts.password.value, submitSelector: drafts.submit.value };
+    };
+    const observed = selectorsOf(observation?.loginFields);
+    if (observed !== null) {
+      return observed;
+    }
+    const entryCheck = lastFinishedEntryCheckJobOf(readAllJobs(this.#database), job.profileId);
+    if (entryCheck === null || entryCheck.runDirectory === null) {
+      return null;
+    }
+    const value = await this.#readRunArtifact(job.outputDirectory, entryCheck.runDirectory, ENTRY_CHECK_ARTIFACT_FILE_NAME, 'entry-check');
+    const document = value === null ? null : value as EntryCheckDocument;
+    return document === null || document.jobId !== entryCheck.jobId || document.proposal === null ? null : selectorsOf(document.proposal.selectors);
+  }
+
+  /**
+   * MI-3（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 入口の確かめの後に、認証の設定を案で保存する。判定は
+   * `entryCheckAuthSetupDecisionOf`（認証の設定を使うプロファイルで、設定がまだなく、「読んだ」で終わり、ログインの画面に見えたときだけ）、組み立ては
+   * `proposedAuthSetupOf`（認証の設定の画面の案と同じ 1 か所）、保存は今の認証の設定の保存の部品（`saveAuthSetup`。検証 `validateAuthSetup` と改訂の照合）。
+   * プロファイルの改訂は進めない。ジョブを始めた後にプロファイルの改訂が進んだ、設定ができた、対象の設定を読めない、検証を通らないときは保存しない。保存
+   * しなかった理由は記録しない（設計者の判断。画面は成果物と今の認証の設定から状態を求める）。すでにある設定は上書きしない（確かめと保存の間に await を
+   * 挟まない）。
+   */
+  async #saveEntryCheckProposal(job: TrackedJob, document: EntryCheckDocument): Promise<void> {
+    const revision = readJob(this.#database, job.jobId)?.profileRevision;
+    const proposable = (): { readonly targetConfigPath: string } | null => {
+      const current = getProfile(this.#database, job.profileId);
+      if (current === null || current.status !== ACTIVE_PROFILE_STATUS || current.profile.revision !== revision) {
+        return null;
+      }
+      // MI-F1（設計書 4.3。MI-R の Minor 3）: 案で保存するのは手動のログインのプロファイルだけ（自動ログインのプロファイルは、資格情報の送信先（フォームの
+      // 送信先、セレクタ）を人の確かめなしに保存しない）。
+      if (isAutomatedLoginProfileAuth(current.profile.auth)) {
+        return null;
+      }
+      const { usesAuthSetup } = authSetupProposalProfileOf(current.profile.mode, current.profile.auth);
+      const decision = entryCheckAuthSetupDecisionOf({
+        usesAuthSetup,
+        hasAuthSetup: getAuthSetup(this.#database, job.profileId) !== null,
+        entryCheck: document,
+      });
+      return decision === 'PROPOSE' ? { targetConfigPath: current.profile.targetConfigPath } : null;
+    };
+    const before = proposable();
+    if (before === null || revision === undefined) {
+      return;
+    }
+    let context: ProfileValidationContext | undefined;
+    try {
+      context = await this.#resolveContext(before.targetConfigPath);
+    } catch {
+      context = undefined;
+    }
+    // 待つ間に変わっていないかを、保存の直前にもう一度確かめる（ここから保存まで await を挟まない）。
+    const now = proposable();
+    if (context === undefined || now === null || now.targetConfigPath !== before.targetConfigPath) {
+      return;
+    }
+    const setup = proposedAuthSetupOf({
+      profileId: job.profileId,
+      profileRevision: revision,
+      // MI-F3（MI-F1 の報告の片付け）: 上で自動ログインのプロファイルを除くので、案はいつも手動のログインの形（自動ログインのセレクタを作らない）。
+      // 案の部品の `automated: true` の分岐は、認証の設定の画面の案（`AuthSetupForm.tsx`）と入口の確かめの状態（`entry-check-functions.ts`）が使う。
+      automated: false,
+      startUrlPath: startUrlPathOf(context.targetConfig.site.startUrl) ?? null,
+      entryProposal: document.proposal,
+    });
+    const resolved = context;
+    // MI-F1（設計書 4.3。MI-R の Minor 4）: 「設定がないときだけ保存する」の確かめは、保存のトランザクションの中で行う（`onlyWhenAbsent`）。
+    saveAuthSetup(this.#database, setup, {
+      resolveContext: (path) => (path === now.targetConfigPath ? resolved : undefined),
+      now: this.#now,
+      onlyWhenAbsent: true,
+    });
   }
 
   async confirmManualLogin(jobId: string): Promise<AuditJobLoginConfirmResult> {
@@ -2971,6 +3954,13 @@ class JobManager implements AuditJobManager {
           this.#requestStop(current, force);
         }
         const stored = readJob(this.#database, current.jobId);
+        return stored === null ? stopRejected('JOB_NOT_FOUND') : Object.freeze({ ok: true, job: stored });
+      }
+      // OP-F（安全のレビューの M-1）: 書き込みの段を準備している間（今の段の行を締めた後、次の段を始める前）は、止める要求の印で止まる（許可の発行の前と
+      // `NEXT_STAGE` の前に見直す）。受けたとして、準備している段のジョブを返す。
+      const preparing = [...this.#jobs.values()].find((candidate) => candidate.chain === chain);
+      if (preparing !== undefined) {
+        const stored = readJob(this.#database, preparing.jobId);
         return stored === null ? stopRejected('JOB_NOT_FOUND') : Object.freeze({ ok: true, job: stored });
       }
     }

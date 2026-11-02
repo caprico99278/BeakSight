@@ -1,8 +1,8 @@
-import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
+import { createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
-import { LOCAL_UI_SCENARIO_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../../../../../../src/presentation/messages.js';
+import { LOCAL_UI_SCENARIO_TEXT, LOCAL_UI_WRITE_STAGE_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../../../../../../src/presentation/messages.js';
 import { Notice } from '../../../../components/Notice';
-import { PageFrame } from '../../../../components/PageFrame';
+import { PageFrame, scenarioTrail } from '../../../../components/PageFrame';
 import { ScenarioCandidateFacts } from '../../../../components/ScenarioCandidateFacts';
 import { ScenarioForm } from '../../../../components/ScenarioForm';
 import { ScenarioProfilePanel } from '../../../../components/ScenarioProfilePanel';
@@ -44,8 +44,8 @@ function EditScenarioPage() {
   const { candidate } = form;
 
   return (
-    <PageFrame title={text.pages.editScenario}>
-      <ScenarioProfilePanel profile={profile} eligible={detail.eligible} editable={detail.editable} />
+    <PageFrame title={text.pages.editScenario} trail={scenarioTrail(profile.profileId, scenario.scenarioId)}>
+      <ScenarioProfilePanel eligible={detail.eligible} editable={detail.editable} />
       {!detail.editable ? null : candidate === null || form.candidateRejection !== null ? (
         <Notice kind="caution">
           <div data-testid="scenario-candidate-rejected" data-reason={form.candidateRejection ?? ''}>
@@ -54,13 +54,18 @@ function EditScenarioPage() {
           </div>
         </Notice>
       ) : (
+        // OP-3（設計書 PL 3 章の 1）: 作成の画面と同じ形（要点 → 主のボタン 1 つ → 詳しい内容 1 つ）。候補の要点は詳しい内容の中。
         <section className="panel">
-          <h2 className="panel-heading">{text.targetHeading}</h2>
-          <ScenarioCandidateFacts candidate={candidate} showOrigins={form.showOrigins} />
-          <h2 className="panel-heading">{text.formHeading}</h2>
+          <h2 className="panel-heading">{LOCAL_UI_WRITE_STAGE_TEXT.summaryHeading}</h2>
           <ScenarioForm
             key={`${scenario.scenarioId}:${String(scenario.revision)}`}
             candidate={candidate}
+            detailsLead={(
+              <>
+                <h3>{text.targetHeading}</h3>
+                <ScenarioCandidateFacts candidate={candidate} />
+              </>
+            )}
             readChecks={form.readChecks}
             rules={form.rules}
             update={form.update}
@@ -86,9 +91,6 @@ function EditScenarioPage() {
           />
         </section>
       )}
-      <div className="button-row">
-        <Link to="/scenarios/$profileId/$scenarioId" params={params} className="button">{text.backToScenario}</Link>
-      </div>
     </PageFrame>
   );
 }

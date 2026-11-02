@@ -105,7 +105,7 @@ describe('AS-b: the view model and the three surfaces', () => {
   it('marks PASS_EXCEPT_DELETE only as prominent in the display catalog', () => {
     expect(AUDIT_SEND_POLICY_CATALOG.PASS_EXCEPT_DELETE.prominent).toBe(true);
     expect(AUDIT_SEND_POLICY_CATALOG.READ_ONLY.prominent).toBe(false);
-    expect(notice).toBe('この監査では、ページが出す送信のうち削除のほかを通した（3件）');
+    expect(notice).toBe('この点検では、ページが出す送信のうち削除のほかを通した（3件）');
   });
 
   it('builds summary.auditSend once from run.json, reading a run without the item as READ_ONLY', () => {
@@ -136,5 +136,16 @@ describe('AS-b: the view model and the three surfaces', () => {
     expect(readOnlyHtml).toContain(AUDIT_SEND_POLICY_CATALOG.READ_ONLY.label);
     expect(runSummaryLines(passingModel.summary, 'output/RUN-1')).toContain(notice);
     expect(runSummaryLines(readOnlyModel.summary, 'output/RUN-1').join('\n')).not.toContain(NOTICE_PREFIX);
+  });
+
+  // PL-R（plain UI の設計書 14 章、7 章）: 技術の記録を末尾の記録の段へ移しても、送信を通した知らせは、報告の冒頭のまとめの段に残す（安全のために必ず見せる）。
+  it('keeps the notice in the overview at the top of the HTML report, before the first finding section', () => {
+    const passingHtml = renderHtmlReport(buildReportViewModel(passingRun()));
+    const notice = AUDIT_SEND_TEXT.passedNotice(formatCount(3));
+    const overviewStart = passingHtml.indexOf(' id="overview"');
+    const overviewEnd = passingHtml.indexOf(' id="critical-findings"');
+    expect(overviewStart).toBeGreaterThanOrEqual(0);
+    expect(passingHtml.slice(overviewStart, overviewEnd)).toContain(notice);
+    expect(renderHtmlReport(buildReportViewModel(auditRun())).slice(0, overviewEnd)).not.toContain(NOTICE_PREFIX);
   });
 });

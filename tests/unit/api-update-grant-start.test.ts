@@ -87,7 +87,7 @@ const UPDATE_SCENARIO: ScenarioRevision = (() => {
     limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
     approvalTtlDays: 30,
     verification: {
-      successCondition: null, inputErrorCondition: null, recordId: null,
+      resultJudgement: null, recordId: null,
       readVerification: { readCheckId: 'rc-page', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }] },
     },
     api: {
@@ -185,7 +185,8 @@ describe('T41b: the grant of an API UPDATE', () => {
   // `scenario-api-update-contract.test.ts` の `rejects an API UPDATE %s (saved before T41a)`、契約のある API の更新に許可を出す確かめは
   // `tests/integration/api-update-grant-start.test.ts`。
   it('has the reason of the filter not bound to the ledger id at the end of the closed list, with its description', () => {
-    expect(EXECUTION_GRANT_REJECTION_REASONS.at(-1)).toBe('SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID');
+    // MI-F1（設計書 4.7.1 の 5）: その後ろに、副作用の確認の済んでいない版の理由を足した（`execution-grant-side-effects.test.ts`）。
+    expect(EXECUTION_GRANT_REJECTION_REASONS.at(-2)).toBe('SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID');
     expect(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID.description.length).toBeGreaterThan(0);
   });
 });
@@ -281,7 +282,7 @@ describe('T41b: the START of an API UPDATE (the designer decision (2))', () => {
       submitterIdentityDigest: CANDIDATE.identityDigest,
       api: UPDATE_SCENARIO.api,
       values: VALUES,
-      verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+      verification: { resultJudgement: null, recordId: null },
       readVerification: {
         readCheckId: 'rc-page',
         readCheckRevision: 1,

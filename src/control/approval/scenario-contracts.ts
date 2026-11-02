@@ -18,6 +18,10 @@
 //   （`ScenarioUpdateSpec`。台帳の参照、更新の画面と送信先の path の型、保つ欄、候補から求めた型にした識別の digest）を足した。kind が `UPDATE` の
 //   下書きでは必須、`CREATE` は持てない（null）。LG-3: UPDATE の指定の前に保存した UPDATE の版（null）は、スキーマが拒むので読まない。変える欄は今の送る欄（`fieldNames`）、保つ欄は `keepFieldNames`。path の型の `{id}` の印は、候補の識別の
 //   owner（`src/discovery/fingerprint.ts` の `PATH_TEMPLATE_ID_SEGMENT`）と同じ値（登録の ID の取り方の path の型と共用）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。設計者の判断 (a)〜(f)）: 検証の指定の成功の条件と入力の誤りの条件（人が入れる path の
+//   前方一致と CSS セレクタ）を、結果の判定のしかたの印（`resultJudgement`。form は `FORM_STRUCTURE`、API は null）に置き換えた。form の登録の ID の取り方は
+//   ID の型の一覧（`FormRecordIdSpec`。`URL_PATH_PATTERNS`、2 つまで）だけ。照合の READ に照合の専用の印（`verificationOnly`）を足した。前の文書の成否の
+//   条件の項目（`RETIRED_SCENARIO_VERIFICATION_ITEMS`）は、スキーマが受け、読むときに捨てる。
 import { WRITE_AUDIT_MODE } from '../contracts.js';
 import {
   MAX_AUTH_SETUP_URL_LENGTH,
@@ -206,13 +210,31 @@ export const SCENARIO_ID_PATTERN = WORKER_JOB_ID_PATTERN;
 
 /**
  * 検証の指定の項目（閉じた一覧）。どれかが未指定（null）なら、実行の許可を出さない（`VERIFICATION_SPEC_MISSING`）。
- * - `successCondition`: 送信の後の画面が登録の成功に当たる条件。
- * - `inputErrorCondition`: 送信の後の画面が入力の誤りに当たる条件。
+ * - `resultJudgement`（PL-6a。設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。人が入れた成功の条件と入力の誤りの条件を置き換えた）: 結果の判定の
+ *   しかたの印。form のシナリオは構造の判定（`FORM_STRUCTURE_RESULT_JUDGEMENT`。下書きの確かめが付ける。人は入れない）、API のシナリオは null（応答の
+ *   状態で決めるので使わない）。
  * - `recordId`: 登録の ID の取り方。
  * - `readVerification`: 生成した値で読み直す照合の READ。
  */
-export const SCENARIO_VERIFICATION_ITEMS = Object.freeze(['successCondition', 'inputErrorCondition', 'recordId', 'readVerification'] as const);
+export const SCENARIO_VERIFICATION_ITEMS = Object.freeze(['resultJudgement', 'recordId', 'readVerification'] as const);
 export type ScenarioVerificationItem = (typeof SCENARIO_VERIFICATION_ITEMS)[number];
+
+/**
+ * PL-6a: 結果の判定のしかたの印（閉じた一覧）。`FORM_STRUCTURE`: form の書き込みの構造の判定（`src/control/actions/action-outcome.ts` の
+ * `formResultJudgementOf`。照合と、送った値を保った同じフォームの形と、URL の ID の型で決める）。承認の digest の項目なので、判定のしかたを変えたら印を変える。
+ */
+export const FORM_STRUCTURE_RESULT_JUDGEMENT = 'FORM_STRUCTURE';
+export const SCENARIO_RESULT_JUDGEMENTS = Object.freeze([FORM_STRUCTURE_RESULT_JUDGEMENT] as const);
+export type ScenarioResultJudgement = (typeof SCENARIO_RESULT_JUDGEMENTS)[number];
+
+/** PL-6a: form のシナリオで求める項目（`SCENARIO_VERIFICATION_ITEMS` のすべて。同じ順）。 */
+export const FORM_SCENARIO_VERIFICATION_ITEMS = SCENARIO_VERIFICATION_ITEMS;
+
+/**
+ * PL-6a（設計書 8.1 の「契約の変更」。LG の決まり（設計者の判断 (c)）: 前の文書の成否の条件の項目）: 前に保存したシナリオの文書が持つ、人が入れた成否の
+ * 条件の項目の名前。スキーマは受け、読むとき（`scenario-store.ts`）に捨てる。新しく書く文書は持たない。
+ */
+export const RETIRED_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['successCondition', 'inputErrorCondition'] as const);
 
 /**
  * T40a-fix（Task 40 の設計書 7 章の「T40a の報告（API の検証の指定）」）: API のシナリオの検証の指定で求める項目（`SCENARIO_VERIFICATION_ITEMS` の
@@ -228,11 +250,15 @@ export const API_UPDATE_SCENARIO_VERIFICATION_ITEMS = Object.freeze(['readVerifi
 
 /**
  * 登録の ID の取り方（閉じた一覧）。
- * - `URL_PATH_PATTERN`: 成功の後の URL の path を、型（例 `/items/{id}`）に当てて取る。
- * - `ELEMENT`: 成功の画面の要素（CSS セレクタ）の文字から取る。
+ * - `URL_PATH_PATTERN`: 成功の後の URL の path を、型（例 `/items/{id}`）に当てて取る（API のシナリオの画面の取り方）。
+ * - `ELEMENT`: 成功の画面の要素（CSS セレクタ）の文字から取る（API のシナリオの画面の取り方）。
+ * - `URL_PATH_PATTERNS`（PL-6a。設計書 8.1）: form のシナリオの取り方。送った後の URL を、ID の型（`MAX_FORM_RECORD_ID_PATTERNS` まで）に順に当てて取る。
+ *   form は、この取り方だけを持てる（人が入れる CSS セレクタの `ELEMENT` は使わない）。API は前の 2 つだけ。
  */
-export const RECORD_ID_SOURCES = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT'] as const);
+export const RECORD_ID_SOURCES = Object.freeze(['URL_PATH_PATTERN', 'ELEMENT', 'URL_PATH_PATTERNS'] as const);
 export type RecordIdSource = (typeof RECORD_ID_SOURCES)[number];
+/** PL-6a: form のシナリオの ID の取り方の値（`RECORD_ID_SOURCES` の名前つきの定数）。 */
+export const FORM_RECORD_ID_SOURCE = 'URL_PATH_PATTERNS' satisfies RecordIdSource;
 
 /** path の型の中の、登録の ID の場所の印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b: 候補の識別の owner の印と同じ値）。 */
 export const RECORD_ID_PLACEHOLDER = PATH_TEMPLATE_ID_SEGMENT;
@@ -240,10 +266,16 @@ export const RECORD_ID_PLACEHOLDER = PATH_TEMPLATE_ID_SEGMENT;
 /** path の型の最大長（UTF-16 のコード単位。シナリオの要求の path の上限と同じ）。 */
 export const MAX_RECORD_ID_PATH_PATTERN_LENGTH = MAX_CANDIDATE_URL_PART_LENGTH;
 
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「自動で決める項目」）: form の登録の ID の型の最大の件数（送信先の型と画面の型の 2 つ。
+ * 送った後の URL に、順に当てる。判定は `action-outcome.ts` の `recordIdOfResultUrl`）。
+ */
+export const MAX_FORM_RECORD_ID_PATTERNS = 2;
+
 /** 取り出した登録の ID の最大長（UTF-16 のコード単位。`action-run.json` の `recordId`）。 */
 export const MAX_RECORD_ID_LENGTH = 256;
 
-/** 結果の条件の path の前方一致の最大長（Task 26 の結果の条件と同じ上限）。 */
+/** 結果の条件の path の前方一致の最大長（Task 26 の結果の条件と同じ上限）。PL-6a: 前の文書と版 1.1 の記録の成否の条件（読むだけ）のスキーマの上限。 */
 export const MAX_RESULT_CONDITION_PATH_LENGTH = MAX_AUTH_SETUP_URL_LENGTH;
 
 /** 検証の指定のセレクタ（結果の条件、ID の要素）の最大長（Task 26 の結果の条件のセレクタと同じ上限）。 */
@@ -546,7 +578,7 @@ export interface ScenarioKindFact {
    * T31R-fix-1 の I-2: 今の版の検証の指定の登録の ID の取り方（未指定なら null。事実を持たない文脈は省く）。UPDATE の path の型の `{id}` の位置を
    * 台帳の取り方に結ぶ確かめ（`scenario-policy.ts` の `isUpdatePathBoundToLedger`）が使う。
    */
-  readonly recordId?: ScenarioRecordIdSpec | null;
+  readonly recordId?: ScenarioVerificationRecordId | null;
   /**
    * T41a（Task 41 の設計書 3.1 の「台帳の ID と filter の結び付け」）: 今の版の API の指定の登録の ID の取り方（応答の本文の鍵。API の登録でないか未指定
    * なら null。事実を持たない文脈は省く）。API の UPDATE の filter の名前を台帳の ID に結ぶ確かめ（`scenario-policy.ts` の
@@ -560,13 +592,36 @@ export interface ScenarioKindFact {
   readonly apiRequest?: Pick<ScenarioApiRequestShape, 'origin' | 'pathShape'> | null;
 }
 
-/** 結果の条件（Task 26 の結果の条件と同じ型。`{ pathPrefix, selector }`）。 */
+/** 結果の条件（Task 26 の結果の条件と同じ型。`{ pathPrefix, selector }`）。PL-6a: 前の文書と版 1.1 の記録の、読むだけの形。 */
 export type ScenarioResultCondition = LoginResultCondition;
 
-/** 登録の ID の取り方。 */
+/** 登録の ID の取り方（API のシナリオの、保存の後の画面の取り方）。 */
 export type ScenarioRecordIdSpec =
   | { readonly source: 'URL_PATH_PATTERN'; readonly pathPattern: string }
   | { readonly source: 'ELEMENT'; readonly selector: string };
+
+/** PL-6a: form のシナリオの登録の ID の取り方（ID の型 1〜`MAX_FORM_RECORD_ID_PATTERNS` 件。送った後の URL に順に当てる）。 */
+export interface FormRecordIdSpec {
+  readonly source: typeof FORM_RECORD_ID_SOURCE;
+  readonly pathPatterns: readonly string[];
+}
+
+/** PL-6a: 検証の指定の登録の ID の取り方（form は `FormRecordIdSpec`、API は `ScenarioRecordIdSpec`。下書きの確かめが送り方で分ける）。 */
+export type ScenarioVerificationRecordId = FormRecordIdSpec | ScenarioRecordIdSpec;
+
+/** PL-6a: 登録の ID の取り方が form の取り方か。 */
+export const isFormRecordIdSpec = (spec: ScenarioVerificationRecordId | null): spec is FormRecordIdSpec => spec?.source === FORM_RECORD_ID_SOURCE;
+
+/**
+ * PL-6a: 登録の ID の取り方の、URL の path の型の一覧（form は型のすべて、API の `URL_PATH_PATTERN` はその型、`ELEMENT` と null は空）。台帳の ID の
+ * 結び付けの確かめと、画面の注意が使う。
+ */
+export const recordIdPathPatternsOf = (spec: ScenarioVerificationRecordId | null): readonly string[] => {
+  if (spec === null || spec.source === 'ELEMENT') {
+    return [];
+  }
+  return spec.source === 'URL_PATH_PATTERN' ? [spec.pathPattern] : spec.pathPatterns;
+};
 
 /** 照合の READ の送る値 1 つを、生成した値（送る欄）に結び付ける（READ の送る値の名前 → シナリオの送る欄の名前）。 */
 export interface VerificationBinding {
@@ -588,20 +643,26 @@ export interface ScenarioReadVerification {
   readonly bindings: readonly VerificationBinding[];
   /** 期待（1 件以上。入力の順）。 */
   readonly expectations: readonly VerificationExpectation[];
+  /**
+   * PL-6a（設計書 8.1 の「契約の変更」、設計者の判断 (f)）: 照合の専用の印（真なら、参照する READ の定義は、このシナリオの照合だけに使い、単独の READ の
+   * 確かめのジョブでは読まない。管理データの版を上げずに、シナリオの文書に持つ）。省けば偽（人が作った READ の定義を照合にも使う今の形）。
+   */
+  readonly verificationOnly?: boolean;
 }
 
-/** 検証の指定（項目ごとに、未指定なら null）。 */
+/** 検証の指定（項目ごとに、未指定なら null）。PL-6a: 成否の条件の 2 項目を、結果の判定のしかたの印（`resultJudgement`）に置き換えた。 */
 export interface ScenarioVerification {
-  readonly successCondition: ScenarioResultCondition | null;
-  readonly inputErrorCondition: ScenarioResultCondition | null;
-  readonly recordId: ScenarioRecordIdSpec | null;
+  readonly resultJudgement: ScenarioResultJudgement | null;
+  readonly recordId: ScenarioVerificationRecordId | null;
   readonly readVerification: ScenarioReadVerification | null;
 }
 
+/** PL-6a: 下書きの検証の指定（結果の判定のしかたの印は、下書きの確かめが送り方から付ける。省いてよい。入れるなら付ける値と同じ）。 */
+export type ScenarioVerificationDraft = Omit<ScenarioVerification, 'resultJudgement'> & { readonly resultJudgement?: ScenarioResultJudgement | null };
+
 /** すべて未指定の検証の指定（下書きに検証の指定がないとき）。 */
 export const UNSPECIFIED_VERIFICATION: ScenarioVerification = Object.freeze({
-  successCondition: null,
-  inputErrorCondition: null,
+  resultJudgement: null,
   recordId: null,
   readVerification: null,
 });
@@ -751,4 +812,9 @@ export interface ScenarioReadCheckDefinitionFact extends ScenarioReadCheckFact {
    * ない）。API のシナリオだけ、型の定義を照合の READ に使える（結び付けは 0 件。`{id}` には台帳の ID だけを入れる。実際の照合は Task 40）。
    */
   readonly pageTemplate?: boolean;
+  /**
+   * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: 画面の path の定義の path（画面の path の定義だけが持つ。省略は分からない）。API の
+   * 登録のシナリオだけ、登録の画面の 1 つ上の一覧の画面（`read-list-page.ts` の `readListPagePathOf`）の定義を照合の READ に使える（結び付けは 0 件）。
+   */
+  readonly pagePath?: string;
 }

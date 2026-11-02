@@ -88,10 +88,14 @@ const withWrite = (overrides: Record<string, unknown>): Record<string, unknown> 
 
 describe('T30e: the write job messages and lists', () => {
   it('raises the protocol version and adds the message types at the end of each direction', () => {
-    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/2');
+    expect(WORKER_PROTOCOL_VERSION).toBe('beaksight-worker-message/7'); // OP-2: 書き込みの段で版 4。DEF-180: 前の読み込みの時刻で版 5。OP-H: チェックした画面の数で版 6。OP-L: 保存できなかった理由で版 7
     // ML-a: 「ログインを終えた」（`LOGIN_CONFIRMED`）を、親 → 子の最後に足した。FM2d: まとめて実行の `NEXT_STAGE`・`CHAIN_END` を、その後に足した。
-    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual(['START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END']);
-    expect(WORKER_TO_PARENT_MESSAGE_TYPES.slice(-2)).toEqual(['WRITE_RECHECK_REQUEST', 'WRITE_SUBMISSION']);
+    // OP-1: ログインの直後の登録の往復（`CREDENTIAL_SAVE_ALLOWED`・`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED`、子 → 親の `CREDENTIAL_SAVED`）を、それぞれの最後に足した。
+    expect(PARENT_TO_WORKER_MESSAGE_TYPES).toEqual([
+      'START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END',
+      'CREDENTIAL_SAVE_ALLOWED', 'LOGIN_REGISTERED', 'LOGIN_REGISTRATION_SKIPPED',
+    ]);
+    expect(WORKER_TO_PARENT_MESSAGE_TYPES.slice(-3)).toEqual(['WRITE_RECHECK_REQUEST', 'WRITE_SUBMISSION', 'CREDENTIAL_SAVED']);
     expect(WORKER_WRITE_CREATE_JOB_KIND).toBe('WRITE_CREATE');
     expect(WORKER_WRITE_RECHECK_REJECTION_REASONS).toEqual(['GRANT_INVALID', 'FACTS_UNAVAILABLE', 'RECHECK_REPEATED']);
     expect(WORKER_WRITE_SUBMISSION_STATES).toBe(SUBMISSION_STATES);
@@ -110,7 +114,20 @@ describe('T30e: START of a write job', () => {
   it('accepts WRITE_CREATE with the authentication and the write specification', () => {
     expect(errorsOf(start(WORKER_WRITE_CREATE_JOB_KIND, { write: write() }))).toEqual([]);
     expect(errorsOf(withWrite({ request: { ...(write().request as object), methodOverride: 'PATCH', enctype: 'multipart/form-data' } }))).toEqual([]);
-    expect(errorsOf(withWrite({ verification: { ...(write().verification as object), recordId: { source: 'ELEMENT', selector: '#id' } } }))).toEqual([]);
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: form の ID の取り方は ID の型の一覧（2 つまで）。人が入れる CSS セレクタ（`ELEMENT`）と、
+    // 型 1 つの API の取り方は受けない。結果の判定のしかたの印は構造の判定だけ（成否の条件の項目は受けない）。
+    expect(errorsOf(withWrite({
+      verification: { ...(write().verification as object), recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}', '/members/{id}/edit'] } },
+    }))).toEqual([]);
+    for (const verification of [
+      { ...(write().verification as object), recordId: { source: 'ELEMENT', selector: '#id' } },
+      { ...(write().verification as object), recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' } },
+      { ...(write().verification as object), recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/a/{id}', '/b/{id}', '/c/{id}'] } },
+      { ...(write().verification as object), resultJudgement: null },
+      { ...(write().verification as object), successCondition: { pathPrefix: '/members/', selector: null } },
+    ]) {
+      expect(errorsOf(withWrite({ verification })).length, JSON.stringify(verification)).toBeGreaterThan(0);
+    }
   });
 
   it('requires the write specification and the authentication for WRITE_CREATE, and allows it for no other kind', () => {
@@ -140,7 +157,9 @@ describe('T30e: START of a write job', () => {
     ['a bad scenario revision', { scenarioRevision: 0 }],
     ['a bad candidate digest', { candidate: { identityDigest: 'sha256:x', ruleDigest: RULE_DIGEST } }],
     ['a missing verification item', { verification: { successCondition: { pathPrefix: '/a', selector: null }, inputErrorCondition: { pathPrefix: '/b', selector: null } } }],
-    ['a null verification item', { verification: { ...(write().verification as object), recordId: null } }],
+    // PL-5 の 9 の (4)（設計書 8.1）: form の ID の取り方の null は受ける（決められなかった登録。ワーカーは ID を取らず、結果は ID なしの PARTIAL）。
+    // 結果の判定のしかたの印の null は今どおり拒む。
+    ['a null verification item', { verification: { ...(write().verification as object), resultJudgement: null } }],
     ['a verification READ with a secret-like parameter', { readVerification: { ...(write().readVerification as object),
       definition: { targetIdentityDigest: DIGEST, parameters: { password: 'x' }, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
     // T37d（設計者の判断 5）: 書き込みの照合の READ に、画面の path の定義は使わない（対象の画面が path と同じでも拒む）。

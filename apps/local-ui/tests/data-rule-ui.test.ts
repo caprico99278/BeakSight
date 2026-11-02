@@ -22,7 +22,7 @@ import { classifyCandidate } from '../../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../../src/discovery/fingerprint.js';
 import { RULE_SOURCE_CATALOG } from '../../../src/presentation/catalog.js';
-import { LOCAL_UI_DATA_RULE_TEXT, LOCAL_UI_SCENARIO_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_DATA_RULE_TEXT, LOCAL_UI_SCENARIO_TEXT, LOCAL_UI_WRITE_STAGE_TEXT } from '../../../src/presentation/messages.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeFakeWorker } from '../../../tests/helpers/fake-audit-worker.js';
@@ -41,7 +41,9 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
+import { DATA_RULE_ADVANCED_SETTINGS, openAdvancedSettings } from './helpers/advanced-settings.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403 });
 const WAIT_LIMIT_MS = 60_000;
@@ -113,7 +115,9 @@ const CREATE = candidateOf(sampleForm({
     sampleField('email', 'email'),
     sampleField('plan', 'select-one', { options: ['', 'basic', 'premium'] }),
     sampleField('notify', 'checkbox', { options: ['1'] }),
-    sampleField('code_x'),
+    // 推せない欄。OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D10）: pattern のない文字の欄は作り物の文字（`GENERIC_TEXT`）に推すので、
+    // 形の指定（pattern）のある欄にする（数字だけの固定の桁数ではないので、番号・コードにも推さない）。人の固定の値（A1 など）は、この形に合う。
+    sampleField('code_x', 'text', { constraints: { ...NO_CONSTRAINTS, pattern: '[A-Z][0-9]' } }),
     sampleField('api_key'),
     // FM2c: 範囲の手がかりのない日付の欄（既定の幅の画面の確かめ。最初のシナリオの送る欄ではない）。
     sampleField('visit_x', 'date'),
@@ -220,6 +224,8 @@ interface FieldView {
   readonly source: string | null;
   readonly secretLike: boolean;
   readonly allowedKinds: readonly string[];
+  /** MI-6: 承認のときに外部への通知がないことを確認する前提で作れる欄にした印。 */
+  readonly confirmationAtApproval: boolean;
 }
 interface PageView {
   readonly eligible: boolean;
@@ -273,7 +279,7 @@ beforeAll(async () => {
   cookie = parseSetCookie(exchange.headers['set-cookie'])?.pair ?? '';
   expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(WRITE_PROFILE_ID, state.writeTarget, 'TEST_APPROVED_WRITE', FIRST_REVISION) }))
     .toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(WRITE_PROFILE_ID) })).toMatchObject({ ok: true });
+  expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(WRITE_PROFILE_ID) })).toMatchObject({ ok: true });
   installFakeDiscovery('t29e-write-output');
   const job = await valueOf<{ ok: boolean; jobId: string }>('startDiscoveryFn', 'POST', { profileId: WRITE_PROFILE_ID, expectedRevision: FIRST_REVISION });
   expect(job.ok).toBe(true);
@@ -321,8 +327,18 @@ describe('T29e: data rule Server Functions (registration, input validation, CSRF
     // 許可の消費・予約の締めの Server Function はない）。発行を呼べる画面のコードが 1 ファイルだけであることは、Gate `approval-ssot` の (e)。
     const executionPaths = [...ids.keys()].filter((name) => /grant|reserv|consume|execut|settle|write/iu.test(name)).sort();
     // T31h-2: UPDATE の開始（`startWriteUpdateFn`）も、同じ書き込みの開始の画面のファイルにある。T41g: 作ってから更新する開始
-    // （`startWriteCreateThenUpdateFn`）も同じファイルにある（`scenario-ui` の同じ一覧と同じ）。
-    expect(executionPaths).toEqual(['startWriteCreateFn', 'startWriteCreateThenUpdateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
+    // （`startWriteCreateThenUpdateFn`）も同じファイルにある（`scenario-ui` の同じ一覧と同じ）。MI-5 の「書き込みにも使う」の
+    // 2 つは、OP-3 で消した（使い先がなくなった）。
+    // OP-2: サイトの画面の一覧（`writeScreensFn`。読むだけ）と、チェックの保存（`saveWriteScreenCheckFn`。切り替え・下書き・承認と、承認の取り消し。実行の許可は
+    // 出さない）も名前で当たる（`scenario-ui` の同じ一覧と同じ）。
+    expect(executionPaths).toEqual([
+      'saveWriteScreenCheckFn',
+      'startWriteCreateFn',
+      'startWriteCreateThenUpdateFn',
+      'startWriteUpdateFn',
+      'writeScreensFn',
+      'writeStartPageFn',
+    ]);
     expect(executionPaths.filter((name) => ['dataRulePageFn', 'saveDataRulesFn'].includes(name))).toEqual([]);
   });
 
@@ -338,7 +354,8 @@ describe('T29e: data rule Server Functions (registration, input validation, CSRF
     for (const [name, method, data] of rejected) {
       expect((await call(name, method, data)).response.status, `${name} ${JSON.stringify(data)}`).toBe(STATUS.BAD_REQUEST);
     }
-    expect((await pageOf(state.scenarioId)).ruleSet).toBeNull();
+    // PL-5 の 9 の (1): 作成のときに推した決まり（版 1）が付いている。拒んだ要求は何も保存しない（版は 1 のまま）。
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(1);
   });
 
   it('keeps the CSRF protection: a cross-site or other-origin POST is 403, and saves nothing', async () => {
@@ -355,38 +372,52 @@ describe('T29e: data rule Server Functions (registration, input validation, CSRF
       });
       expect(response.status, JSON.stringify(headers)).toBe(STATUS.FORBIDDEN);
     }
-    expect((await pageOf(state.scenarioId)).ruleSet).toBeNull();
+    // PL-5 の 9 の (1): 作成のときに推した決まり（版 1）が付いている。拒んだ要求は何も保存しない（版は 1 のまま）。
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(1);
   });
 });
 
 describe('T29e: the data rule screen', () => {
   it('shows the state, the detail and the source of each field, and no example while a field is undecided', async () => {
     const view = await pageOf(state.scenarioId);
-    expect(view).toMatchObject({ eligible: true, editable: true, inputRuleState: 'NOT_SET', ruleSet: null, examples: null });
+    // PL-5 の 9 の (1)（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8 章の「入れる値の決まり」）: 手で作った書き込みの手順も、保存のときに BeakSight が
+    // 推した決まりを付ける（版 1）。推せなかった欄（code_x）があるので「不足あり」。
+    expect(view).toMatchObject({ eligible: true, editable: true, inputRuleState: 'INSUFFICIENT', ruleSet: { revision: 1 }, examples: null });
     expect(view.fields.map(({ fieldName, status, problem, source }) => [fieldName, status, problem?.detail ?? null, source])).toEqual([
       ['code_x', 'NEEDS_RULE_INPUT', 'SEMANTIC_KIND_UNDECIDED', null],
-      ['email', 'DECIDED', null, 'TEMPLATE'],
-      ['name', 'DECIDED', null, 'TEMPLATE'],
+      // PL-5 の 9 の (1): 推して保存した決まりの欄は「保存した決まり」（推した印は、出どころの印の行）。
+      ['email', 'DECIDED', null, 'HUMAN'],
+      ['name', 'DECIDED', null, 'HUMAN'],
       ['notify', 'DECIDED', null, 'OPT_OUT'],
-      ['plan', 'DECIDED', null, 'GENERIC'],
+      ['plan', 'DECIDED', null, 'HUMAN'],
     ]);
     const page = await openPage(rulesPath());
     const field = (name: string): Locator => page.locator(`[data-testid="data-rule-field"][data-field-name="${name}"]`);
-    expect(await page.getByTestId('data-rule-state').getAttribute('data-state')).toBe('NOT_SET');
+    expect(await page.getByTestId('data-rule-state').getAttribute('data-state')).toBe('INSUFFICIENT');
     expect(await field('code_x').getByTestId('data-rule-status').getAttribute('data-detail')).toBe('SEMANTIC_KIND_UNDECIDED');
     expect(await field('notify').getAttribute('data-source')).toBe('OPT_OUT');
+    // MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6 の C）: 推せなかった欄（code_x）だけが見え、推せた欄は閉じた詳しい設定の中にある。
+    const advanced = page.getByTestId(DATA_RULE_ADVANCED_SETTINGS);
+    expect(await advanced.evaluate((element) => (element as HTMLDetailsElement).open)).toBe(false);
+    expect(await page.getByTestId('data-rule-fields').locator('[data-testid="data-rule-field"]').evaluateAll((rows) =>
+      rows.map((row) => row.getAttribute('data-field-name')))).toEqual(['code_x']);
+    expect(await advanced.locator('[data-testid="data-rule-field"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-field-name'))))
+      .toEqual(['email', 'name', 'notify', 'plan']);
+    expect(await advanced.getByTestId('data-rule-relations').count()).toBe(1);
+    expect(await advanced.getByTestId('data-rule-unique').count()).toBe(1);
+    expect(await page.getByTestId('data-rule-all-decided').count()).toBe(0);
     expect(await field('email').getByTestId('data-rule-external').textContent()).toContain(text.columns.external);
     expect(await page.getByTestId('data-rule-examples-unavailable').textContent()).toBe(text.examplesUnavailable);
     expect(await page.getByTestId('data-rule-no-execution').textContent()).toBe(text.noExecution);
     await screenshot(page, 'r01-rules-not-set');
 
     const detail = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}`);
-    expect(await detail.getByTestId('scenario-input-rules').getAttribute('data-state')).toBe('NOT_SET');
-    expect(await detail.getByTestId('scenario-input-rules').textContent()).toBe(scenarioText.inputRulesMissing);
+    // PL-5（設計書 8 章）: 書き込みの手順の詳細は、推せない欄があるときだけ要点に 1 行を出す（決まりの中身は出さない）。入口は詳しい内容の中。
+    expect(await detail.getByTestId('scenario-rules-insufficient').textContent()).toBe(LOCAL_UI_WRITE_STAGE_TEXT.scenario.rulesInsufficient);
     expect(await detail.getByTestId('scenario-open-rules').getAttribute('href')).toBe(rulesPath());
     const list = await openPage(`/scenarios/${WRITE_PROFILE_ID}`);
     expect(await list.locator(`[data-testid="scenario-row"][data-scenario-id="${state.scenarioId}"]`).getByTestId('scenario-input-rule-state')
-      .getAttribute('data-state')).toBe('NOT_SET');
+      .getAttribute('data-state')).toBe('INSUFFICIENT');
   });
 
   it('saves the rules only after the confirmation dialog, raises the scenario revision and shows examples that are not sent', async () => {
@@ -408,7 +439,7 @@ describe('T29e: the data rule screen', () => {
     await screenshot(page, 'r03-rules-save-dialog');
     await page.keyboard.press('Enter');
     await expect.poll(() => dialog.isVisible(), { timeout: UI_TIMEOUT_MS }).toBe(false);
-    expect((await pageOf(state.scenarioId)).ruleSet).toBeNull();
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(1);
     await save.focus();
     await page.keyboard.press('Enter');
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
@@ -416,15 +447,18 @@ describe('T29e: the data rule screen', () => {
     expect(await focusedText(page)).toBe(text.saveDialog.confirm);
     await page.keyboard.press('Enter');
     // DEF-137: 知らせの search は、保存した規則の集まりの版も持つ（画面の版がそれに届いたときだけ知らせを出す）。
-    await page.waitForURL(/\/rules\?notice=saved&savedRevision=1$/u, { timeout: UI_TIMEOUT_MS });
+    await page.waitForURL(/\/rules\?notice=saved&savedRevision=2$/u, { timeout: UI_TIMEOUT_MS });
     await expect.poll(() => page.getByTestId('data-rule-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('DECIDED');
     await page.getByTestId('data-rule-notice').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('data-rule-example').count()).toBe(EXAMPLE_COUNT);
     expect(await page.getByTestId('data-rule-synthetic').first().getAttribute('data-synthetic')).toBe('EMAIL');
+    // MI-6: すべての欄が推せたので、「すべての欄を BeakSight が作れます」を出し、見える欄はない（保存の押下だけ）。
+    expect(await page.getByTestId('data-rule-all-decided').textContent()).toBe(text.allDecided);
+    expect(await page.getByTestId('data-rule-fields').locator('[data-testid="data-rule-field"]').count()).toBe(0);
     await screenshot(page, 'r04-rules-saved-examples');
 
     const after = await pageOf(state.scenarioId);
-    expect(after).toMatchObject({ inputRuleState: 'DECIDED', ruleSet: { revision: 1 }, scenario: { revision: before.scenario.revision + 1, state: 'DRAFT' } });
+    expect(after).toMatchObject({ inputRuleState: 'DECIDED', ruleSet: { revision: 2 }, scenario: { revision: before.scenario.revision + 1, state: 'DRAFT' } });
     expect(after.fields.find((field) => field.fieldName === 'code_x')).toMatchObject({ status: 'DECIDED', source: 'HUMAN' });
     expect(after.examples).toHaveLength(EXAMPLE_COUNT);
     for (const example of after.examples ?? []) {
@@ -436,17 +470,21 @@ describe('T29e: the data rule screen', () => {
       expect(['basic', 'premium']).toContain(values.get('plan')?.value);
     }
     const detail = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}`);
-    expect(await detail.getByTestId('scenario-input-rules').getAttribute('data-state')).toBe('DECIDED');
+    expect(await detail.getByTestId('scenario-rules-insufficient').count()).toBe(0);
     await screenshot(detail, 'r05-scenario-detail-rules-decided');
   });
 
   it('shows the saved notice only when the rule set revision on the screen reached the saved revision (DEF-137)', async () => {
-    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(1);
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(2);
     const ahead = await openPage(`${rulesPath()}?notice=saved&savedRevision=1000`);
     await ahead.getByTestId('data-rule-state').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await ahead.getByTestId('data-rule-notice').count()).toBe(0);
-    const reached = await openPage(`${rulesPath()}?notice=saved&savedRevision=1`);
+    const reached = await openPage(`${rulesPath()}?notice=saved&savedRevision=2`);
     await reached.getByTestId('data-rule-notice').waitFor({ timeout: UI_TIMEOUT_MS });
+    // MI-C2 項目 19: 閉じた一覧にない知らせ（ルータが子へ渡す根の生の search）では、知らせを出さない。
+    const unknown = await openPage(`${rulesPath()}?notice=foo&savedRevision=2`);
+    await unknown.getByTestId('data-rule-state').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await unknown.getByTestId('data-rule-notice').count()).toBe(0);
   });
 
   it('turns an approved scenario back to needing approval when the rules are saved again', async () => {
@@ -458,9 +496,17 @@ describe('T29e: the data rule screen', () => {
     })).toMatchObject({ ok: true });
     const page = await pageOf(state.scenarioId);
     expect(page.scenario.state).toBe('APPROVED');
+    // MI-C 項目 9: 承認済みのシナリオがあるプロファイルでは、監査の開始の画面の「読まないパス」の欄の説明に、変えると承認し直しが要ること（件数）を出す。
+    expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({ approvedScenarioCount: 1 });
+    const start = await openPage(`/start/${WRITE_PROFILE_ID}`);
+    const reapproval = start.getByTestId('start-excluded-paths-reapproval');
+    // PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 読まないパスの欄と説明は、たたんだ詳しい内容の中。
+    await reapproval.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
+    // MI-F4: 期待は固定の文字で書く（同じ関数で期待を作ると、書式の誤り（「1件 件」）を捕まえないため）。
+    expect(await reapproval.textContent()).toBe('変えると、書き込みの OK を出した書き込みの手順（1件）は、OK を出し直す必要があります。');
     expect(await valueOf('saveDataRulesFn', 'POST', saveOf(state.scenarioId, page, {
       fieldRules: [{ ...FIXED_CODE_RULE, fixedValues: ['A3'] }], uniqueKeyFieldNames: ['code_x'],
-    }))).toMatchObject({ ok: true, ruleSetRevision: 2, scenarioRevision: page.scenario.revision + 1 });
+    }))).toMatchObject({ ok: true, ruleSetRevision: 3, scenarioRevision: page.scenario.revision + 1 });
     const changed = await valueOf<{ scenario: { state: string }; status: { displayState: string; reasons: readonly string[] } | null }>(
       'scenarioDetailPageFn', 'GET', { scenarioId: state.scenarioId },
     );
@@ -474,7 +520,7 @@ describe('T29e: the data rule screen', () => {
     await page.getByTestId('data-rule-form').waitFor({ timeout: UI_TIMEOUT_MS });
     const current = await pageOf(state.scenarioId);
     expect(await valueOf('saveDataRulesFn', 'POST', saveOf(state.scenarioId, current, { fieldRules: [FIXED_CODE_RULE] })))
-      .toMatchObject({ ok: true, ruleSetRevision: 3 });
+      .toMatchObject({ ok: true, ruleSetRevision: 4 });
     const save = page.getByTestId('data-rule-save');
     await tabTo(page, save);
     await page.keyboard.press('Enter');
@@ -484,7 +530,7 @@ describe('T29e: the data rule screen', () => {
     await page.getByTestId('data-rule-rejection').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('data-rule-rejection').getAttribute('data-reason')).toBe('RULE_SET_REVISION_CONFLICT');
     await screenshot(page, 'r06-rules-conflict');
-    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(3);
+    expect((await pageOf(state.scenarioId)).ruleSet?.revision).toBe(4);
   });
 
   it('rejects fixed values of a secret-looking field and an inconsistent content, and saves nothing', async () => {
@@ -561,6 +607,8 @@ describe('T29e: the data rule screen', () => {
 
     // 編集した規則は、人の規則として保存する（出どころの印を持たない）。一意にする欄の組を変えていなければ、組の印は残る。
     const edited = await openPage(path);
+    // MI-6: 推せた欄（name）は、たたんだ詳しい設定の中にある。
+    await openAdvancedSettings(edited, DATA_RULE_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     await edited.locator('select[data-kind-for="name"]').selectOption('FAMILY_NAME');
     const editedSave = edited.getByTestId('data-rule-save');
     await tabTo(edited, editedSave);
@@ -575,6 +623,45 @@ describe('T29e: the data rule screen', () => {
       relations: [],
       ...inferredMarks,
     });
+  });
+
+  // MI-6（設計書 4.6、ユーザーの判断 2）: 副作用の確認は承認のダイアログの 1 回なので、承認の前の入力の規則の画面では、確認がまだでも、メール・電話の欄を
+  // 「承認のときに確認します」の印で作れる欄として出す（推せなかった・止めたには見せない）。承認と書き込みの開始は、今どおり版の確認の値で判定する。
+  it('shows the email field of an unconfirmed scenario as a field that BeakSight makes, with the mark of the confirmation at the approval (MI-6)', async () => {
+    const unconfirmed = Object.fromEntries(Object.keys(ALL_CONFIRMED).map((item) => [item, false]));
+    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: {
+        profileId: WRITE_PROFILE_ID,
+        candidateIdentityDigest: CREATE.identityDigest,
+        fieldNames: ['name', 'email', 'plan'],
+        readChecks: [],
+        sideEffectConfirmations: unconfirmed,
+        limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
+        approvalTtlDays: 30,
+      },
+    });
+    expect(created).toMatchObject({ ok: true });
+    const view = await pageOf(created.scenarioId);
+    expect(view.fields.map(({ fieldName, status, problem, confirmationAtApproval }) => [fieldName, status, problem, confirmationAtApproval])).toEqual([
+      ['email', 'DECIDED', null, true],
+      ['name', 'DECIDED', null, false],
+      ['plan', 'DECIDED', null, false],
+    ]);
+    // 例も、承認のときの前提で作る（送らない）。メールは example.invalid の合成の宛先。
+    expect(view.examples).toHaveLength(EXAMPLE_COUNT);
+    expect(view.examples?.[0]?.values.find(({ fieldName }) => fieldName === 'email')?.synthetic).toBe('EMAIL');
+
+    const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${created.scenarioId}/rules`);
+    expect(await page.getByTestId('data-rule-all-decided').textContent()).toBe(text.allDecided);
+    const email = page.getByTestId(DATA_RULE_ADVANCED_SETTINGS).locator('[data-testid="data-rule-field"][data-field-name="email"]');
+    expect(await email.getByTestId('data-rule-status').getAttribute('data-status')).toBe('DECIDED');
+    expect(await email.getByTestId('data-rule-confirmation-at-approval').textContent()).toBe(text.confirmationAtApproval);
+    expect(await page.getByTestId('data-rule-confirmation-at-approval').count()).toBe(1);
+    await screenshot(page, 'r08-rules-confirmation-at-approval');
+
+    // 承認の前の確かめ（書き込みの開始）は、版の確認の値で判定する: 確認のない版は承認されていないので、書き込みを始められない。
+    const start = await valueOf<{ ok: boolean; reason?: string }>('startWriteCreateFn', 'POST', { scenarioId: created.scenarioId, expectedRevision: 1 });
+    expect(start.ok).toBe(false);
   });
 
   it('keeps the server parts of the data rules out of the browser bundle', () => {

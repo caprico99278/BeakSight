@@ -1,15 +1,12 @@
-import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
+import { createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
-import type { SideEffectConfirmation } from '../../../../../../src/control/approval-view.js';
-import { LOCAL_UI_AUTO_DRAFT_TEXT, LOCAL_UI_SCENARIO_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../../../../../src/presentation/messages.js';
-import { DraftValueMark } from '../../../components/DraftValueMark';
+import { LOCAL_UI_AUTO_DRAFT_TEXT, LOCAL_UI_SCENARIO_TEXT, LOCAL_UI_WRITE_STAGE_TEXT, SCENARIO_DRAFT_REJECTION_DESCRIPTIONS } from '../../../../../../src/presentation/messages.js';
 import { Notice } from '../../../components/Notice';
-import { PageFrame } from '../../../components/PageFrame';
+import { PageFrame, scenariosTrail } from '../../../components/PageFrame';
 import { ScenarioCandidateFacts } from '../../../components/ScenarioCandidateFacts';
 import { ScenarioForm } from '../../../components/ScenarioForm';
 import { ScenarioProfilePanel } from '../../../components/ScenarioProfilePanel';
 import { createScenarioFn, scenarioFormPageFn } from '../../../server/scenario-functions';
-import { attachAutoDraftRulesFn } from '../../../server/scenario-autodraft-functions';
 import { AUTO_DRAFT_SEARCH_MARK, isAutoDraftSearchMark } from '../../../display/auto-draft-search';
 
 /** 識別の digest の形（`sha256:` と小文字の 16 進 64 桁）。形が違えば、候補を選んでいない扱いにする。 */
@@ -67,8 +64,6 @@ export const Route = createFileRoute('/scenarios/$profileId/new')({
 
 const text = LOCAL_UI_SCENARIO_TEXT;
 const autoDraftText = LOCAL_UI_AUTO_DRAFT_TEXT;
-/** 作成したシナリオの版。 */
-const FIRST_SCENARIO_REVISION = 1;
 
 /**
  * シナリオを作る（Task 28 の設計書 4.6。T28e）。候補の画面の、登録（CREATE）・更新（UPDATE）の候補の「シナリオを作る」から開く。送る欄、照らす
@@ -78,7 +73,6 @@ function NewScenarioPage() {
   const page = Route.useLoaderData();
   const { autoDraft } = Route.useSearch();
   const create = useServerFn(createScenarioFn);
-  const attachRules = useServerFn(attachAutoDraftRulesFn);
   const navigate = useNavigate();
   const router = useRouter();
   const { profile, candidate, rules } = page;
@@ -87,8 +81,8 @@ function NewScenarioPage() {
   const preset = page.api?.preset ?? null;
 
   return (
-    <PageFrame title={text.pages.newScenario}>
-      <ScenarioProfilePanel profile={profile} eligible={page.eligible} editable={page.editable} />
+    <PageFrame title={text.pages.newScenario} trail={scenariosTrail(profile.profileId)}>
+      <ScenarioProfilePanel eligible={page.eligible} editable={page.editable} />
       {!page.editable ? null : candidate === null || page.candidateRejection !== null ? (
         <Notice kind="caution">
           <div data-testid="scenario-candidate-rejected" data-reason={page.candidateRejection ?? ''}>
@@ -97,11 +91,10 @@ function NewScenarioPage() {
           </div>
         </Notice>
       ) : (
-        <section className="panel">
-          <h2 className="panel-heading">{text.targetHeading}</h2>
-          <ScenarioCandidateFacts candidate={candidate} showOrigins={page.showOrigins} />
-          <h2 className="panel-heading">{text.formHeading}</h2>
-          <p>{text.noExecution}</p>
+        // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12 の 4、`2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 直す道として残るので、
+        // 3 章の形（要点 → 主のボタン 1 つ → 詳しい内容 1 つ）にそろえる。候補の要点（画面のアドレスの後ろ）と、書き込みをしないことの文は、詳しい内容の中。
+        <section className="panel" data-testid="scenario-new-summary">
+          <h2 className="panel-heading">{LOCAL_UI_WRITE_STAGE_TEXT.summaryHeading}</h2>
           {!guided || preset === null ? null : (
             <Notice kind="caution">
               <div data-testid="auto-draft-form-guide">
@@ -109,35 +102,21 @@ function NewScenarioPage() {
                 {preset.ledger !== null ? null : (
                   <p data-testid="auto-draft-form-ledger-guide">{preset.ledgerOptionCount === 0 ? autoDraftText.form.noLedger : autoDraftText.form.chooseLedger}</p>
                 )}
-                {preset.ledger === null && preset.formPathTemplate === null ? null : (
-                  <dl className="facts" data-testid="auto-draft-form-preset">
-                    {preset.ledger === null ? null : (
-                      <>
-                        <dt>{autoDraftText.form.presetLedger}</dt>
-                        <dd data-testid="auto-draft-form-preset-ledger" data-value={preset.ledger.value}>
-                          <code>{preset.ledger.value}</code>{' '}
-                          {preset.ledger.origin === null || preset.ledger.ground === null ? null
-                            : <DraftValueMark origin={preset.ledger.origin} ground={preset.ledger.ground} />}
-                        </dd>
-                      </>
-                    )}
-                    {preset.formPathTemplate === null ? null : (
-                      <>
-                        <dt>{autoDraftText.form.presetFormPathTemplate}</dt>
-                        <dd data-testid="auto-draft-form-preset-template" data-value={preset.formPathTemplate.value}>
-                          <code>{preset.formPathTemplate.value}</code>{' '}
-                          {preset.formPathTemplate.origin === null || preset.formPathTemplate.ground === null ? null
-                            : <DraftValueMark origin={preset.formPathTemplate.origin} ground={preset.formPathTemplate.ground} />}
-                        </dd>
-                      </>
-                    )}
-                  </dl>
-                )}
+                {/* PL-5（設計書 3 章の 2）: 前もって選んだ作ったデータの一覧と画面の形（ID とアドレスの形）は出さない（下の欄が選んだ形で始まる）。 */}
               </div>
             </Notice>
           )}
           <ScenarioForm
             candidate={candidate}
+            detailsLead={(
+              <>
+                <h3>{text.targetHeading}</h3>
+                <ScenarioCandidateFacts candidate={candidate} />
+                <p>{text.noExecution}</p>
+              </>
+            )}
+            // 作ったデータの一覧を前もって選べなかったときは、選ぶ欄のある詳しい内容を開いて出す。
+            openDetails={guided && preset !== null && preset.ledger === null}
             readChecks={page.readChecks}
             rules={rules}
             update={page.update}
@@ -145,26 +124,20 @@ function NewScenarioPage() {
             initial={{
               fieldNames: [],
               readChecks: [],
-              sideEffectConfirmations: Object.fromEntries(rules.sideEffects.map((item) => [item, false])) as Record<SideEffectConfirmation, boolean>,
+              // MI-F3（MI-R の Minor 12）: 初めの値は、サーバが渡す下書きの部品の定数（`UNCONFIRMED_SIDE_EFFECTS`）。ここで組み立てない。
+              sideEffectConfirmations: rules.unconfirmedSideEffects,
               maxCreatesPerRun: rules.maxCreatesPerRun,
               maxCumulativeCreates: rules.maxCumulativeCreates,
               approvalTtlDays: rules.maxTtlDays,
-              verification: { successCondition: null, inputErrorCondition: null, recordId: null, readVerification: null },
+              verification: { resultJudgement: null, recordId: null, readVerification: null },
               update: null,
               api: null,
             }}
             onSave={(content) => create({ data: { draft: { profileId: profile.profileId, candidateIdentityDigest: candidate.identityDigest, ...content } } })}
-            onSaved={(scenarioId) => {
-              const open = (notice: 'saved' | 'autoRules' | 'autoRulesFailed'): void => {
-                void navigate({ to: '/scenarios/$profileId/$scenarioId', params: { profileId: profile.profileId, scenarioId }, search: { notice } });
-              };
-              if (!guided) {
-                open('saved');
-                return;
-              }
-              // FM2b: 案内から開いた更新だけ、保存した版（作成は版 1）に、推した入力の規則を付ける（承認の前）。
-              void attachRules({ data: { scenarioId, expectedRevision: FIRST_SCENARIO_REVISION } })
-                .then((attached) => open(attached.ok ? 'autoRules' : 'autoRulesFailed'), () => open('autoRulesFailed'));
+            onSaved={(saved) => {
+              // PL-5 の 9 の (1): 推した入れる値の決まりは、保存の口が保存のときに付ける（画面は付けない）。案内から開いた更新だけ、付けたかの知らせを出す。
+              const notice = !guided ? 'saved' : saved.rules?.attached === true ? 'autoRules' : 'autoRulesFailed';
+              void navigate({ to: '/scenarios/$profileId/$scenarioId', params: { profileId: profile.profileId, scenarioId: saved.scenarioId }, search: { notice } });
             }}
             onReload={() => {
               void router.invalidate();
@@ -172,10 +145,6 @@ function NewScenarioPage() {
           />
         </section>
       )}
-      <div className="button-row">
-        <Link to="/scenarios/$profileId" params={{ profileId: profile.profileId }} className="button">{text.backToList}</Link>
-        <Link to="/discovery/$profileId" params={{ profileId: profile.profileId }} className="button">{text.openDiscovery}</Link>
-      </div>
     </PageFrame>
   );
 }

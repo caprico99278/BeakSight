@@ -72,6 +72,8 @@ describe('execution grant policy (T28d)', () => {
       'READ_VERIFICATION_NOT_VARYING',
       // T41b: API の更新の台帳の ID の鍵が、下書きの保存の後に変わり、filter の名前に結び付かなくなった（`api-update-grant-start.test.ts`）。
       'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID',
+      // MI-F1（設計書 4.7.1 の 5）: シナリオの今の版の副作用の確認が済んでいない（`execution-grant-side-effects.test.ts`）。
+      'SCENARIO_SIDE_EFFECTS_UNCONFIRMED',
     ]);
     expect(WRITE_RESERVATION_REJECTION_REASONS).toEqual(['RESERVATION_NOT_FOUND', 'RESERVATION_TRANSITION_NOT_ALLOWED']);
     expect(Object.isFrozen(EXECUTION_GRANT_REJECTION_REASONS) && Object.isFrozen(WRITE_RESERVATION_REJECTION_REASONS)).toBe(true);

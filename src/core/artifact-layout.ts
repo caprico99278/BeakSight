@@ -64,6 +64,13 @@ export const RUN_ARTIFACT_FILE_NAMES = Object.freeze({
 } as const);
 
 /**
+ * PL-R（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章、13 章の 13）: 監査の Run のディレクトリの直下の、報告の小さなまとめ
+ * （`schemas/report-summary.schema.json`）の名前。報告（`report.html`）を作る時に、同じ表示用モデルから `ArtifactWriter.writePresentation` が書く。画面の作業の
+ * 画面は、大きな `audit.json` を読まずに、これだけを読んで問題の数を出す。必ず書く成果物（`RUN_ARTIFACT_FILE_NAMES`）には入れない（前の書き手の Run にはない）。
+ */
+export const REPORT_SUMMARY_ARTIFACT_FILE_NAME = 'report-summary.json';
+
+/**
  * 発見のジョブ（Task 27。T27d）の Run のディレクトリの直下の成果物の名前。監査の Run の成果物（`RUN_ARTIFACT_FILE_NAMES`）とは別に置く
  * （監査の Run には書かないので、監査の Run のファイルの一覧に入れない）。
  */

@@ -22,7 +22,7 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
-import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
+import { createProfileOnScreen } from './helpers/profile-form.ts';
 import { cspViolationsOf, recordCspViolations } from './helpers/ui-page.ts';
 
 /** すべての応答に付く header（値まで確かめるもの）。 */
@@ -41,6 +41,8 @@ const CONNECT_TIMEOUT_MS = 2_000;
 
 /** Server Function の呼び出しを待つ上限（ミリ秒）。 */
 const SERVER_FN_TIMEOUT_MS = 10_000;
+/** OP-1 修正の 2 回目: 作成の画面が始めた下調べが終わり、サイトの画面へ移るまでを待つ上限（ms。`start-url-onboarding-ui.test.ts` と同じ）。 */
+const ENTRY_CHECK_TIMEOUT_MS = 60_000;
 
 const expectSecurityHeaders = (response: RawResponse, label: string): string => {
   for (const [name, value] of Object.entries(FIXED_SECURITY_HEADERS)) {
@@ -219,16 +221,22 @@ describe('launcher: browser and Server Function', () => {
       // 画面からプロファイルを登録し、そのときの Server Function（POST）の要求を記録する。
       // T43a: 左のメニューにも同じ名前のリンクがあるので、本文（一覧の上の帯）のリンクを選ぶ。
       await page.getByRole('main').getByRole('link', { name: LOCAL_UI_TEXT.profileList.newProfile }).click();
-      await page.getByLabel(LOCAL_UI_TEXT.profileForm.profileId).fill('t23e-csrf');
-      // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
-      await chooseExistingTargetConfig(page, 'config/targets/example.json', SERVER_FN_TIMEOUT_MS);
+      // MI-1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.2）: 使い方は「公開の画面だけ」（保存の POST は作成の 1 つだけ）。名前と設定の
+      // ファイルは、たたんだ詳しい設定の中。T43b: この流れは、すでにある設定のファイルを選ぶ。
+      // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 6 章の 1）: 見える入力は開始のアドレス・使い方・保存だけ。一時の root の設定のファイル
+      // （`config/targets/example.json`）の開始のアドレスを入れると、そのファイルを使い、名前は開始のアドレスから決まる。
       const serverFnPost = page.waitForRequest(
         (request: PlaywrightRequest) => request.url().includes('/_serverFn/') && request.method() === 'POST',
         { timeout: SERVER_FN_TIMEOUT_MS },
       );
-      await page.getByRole('button', { name: LOCAL_UI_TEXT.profileForm.save }).click();
+      // OP-1 修正の 2 回目（OP 設計書 4.1.3 の 3。設計者の判断「公開のサイトも点検を始める 1 つ」）: 作成の画面の「点検を始める」は、保存に続けて下調べを始め、下調べは
+      // 開始のページを実際に読みに行く。そのため、開始のアドレスは、どこにも接続しない予約の名前にした（前は `https://example.com/` で、保存の後にサイトの画面へ
+      // 移り、保存の知らせを出した）。記録するのは、最初の POST（作成）。
+      await createProfileOnScreen(page, { startUrl: 'https://launcher.example.test/', usage: 'PUBLIC' }, SERVER_FN_TIMEOUT_MS);
       const sent = await serverFnPost;
-      await page.getByText(LOCAL_UI_TEXT.profileForm.created).waitFor({ timeout: SERVER_FN_TIMEOUT_MS });
+      // 保存に続けて、下調べの作業の画面へ移る。下調べは開始のページを開けないので、点検を始めず、作業の画面がサイトの画面へ移す（作業が終わったことの確かめ）。
+      await page.waitForURL(/\/jobs\/[^/]+$/u, { timeout: SERVER_FN_TIMEOUT_MS });
+      await page.waitForURL(/\/profiles\/launcher-example-test\?/u, { timeout: ENTRY_CHECK_TIMEOUT_MS });
       const sentHeaders = await sent.allHeaders();
       serverFnCall = {
         path: new URL(sent.url()).pathname + new URL(sent.url()).search,
@@ -255,8 +263,9 @@ describe('launcher: browser and Server Function', () => {
 
     const sameOrigin = await send({ 'sec-fetch-site': 'same-origin', origin });
     expect(sameOrigin.status).toBe(200);
-    // 同じ登録の 2 回目なので、保存の部品が「既にある」で拒む（CSRF の確かめは通った）。
-    expect(sameOrigin.body).toContain('PROFILE_ALREADY_EXISTS');
+    // CSRF の確かめを通って、作成の処理まで届いた（PL-1: 作成の画面は名前を送らないので、同じ登録の 2 回目は、名前に -2 を付けたサイトとして保存する。
+    // 前は名前を送っていたので「既にある」で拒まれていた）。OP-1 修正の 2 回目: 名前は、作成の画面で入れた開始のアドレス（予約の名前）から決まる。
+    expect(sameOrigin.body).toContain('launcher-example-test-2');
     expectSecurityHeaders(sameOrigin, 'serverFn 200');
     expect((await send({ origin })).status).toBe(200);
 

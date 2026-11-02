@@ -38,7 +38,7 @@ import { isWorkerStartApiWrite, type WorkerStartApiWrite } from '../../src/contr
 import { ACTION_RUN_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
 import { formatCompactUtcTimestamp } from '../../src/core/utc-timestamp.js';
-import { executeWriteCreateRun, type WriteCreateRunOutcome } from '../../src/worker/write-create-run.js';
+import { executeWriteCreateRun, WRITE_SUBMISSION_WINDOW_SETTLE_MS, type WriteCreateRunOutcome } from '../../src/worker/write-create-run.js';
 import type { WorkerWriteRecheckOutcome, WorkerWriteSubmissionReport } from '../../src/worker/write-ipc.js';
 import { sampleApprovalFacts } from '../helpers/approval-facts-sample.js';
 import {
@@ -52,8 +52,11 @@ import { launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.j
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { cliTargetConfig } from '../helpers/run-harness.js';
 import {
+  SPA_AFTER_FILL_RERENDER_MS,
   SPA_APP_PATHS,
+  SPA_AUTO_REQUEST_PATHS,
   SPA_BACKEND_PATHS,
+  SPA_OTHER_COLLECT_PATH,
   SPA_OUT_OF_RANGE_STATUS,
   startSpaAuthSite,
   type SpaAuthSite,
@@ -81,6 +84,8 @@ const SHA256_HEX_LENGTH = 64;
 /** どの送信の要素にも当たらない識別の digest。 */
 const UNMATCHED_DIGEST = `sha256:${'0'.repeat(SHA256_HEX_LENGTH)}`;
 const ALLOWED = Object.freeze({ allowed: true });
+/** OP-L（L1）: SPA の登録の画面が、欄と保存のボタンを遅れて描く時間（ms。送る前の確かめの待つ上限より短い）。 */
+const LATE_RENDER_DELAY_MS = 1_500;
 const nowText = (): string => formatCompactUtcTimestamp(new Date(), 'test time');
 /** 鍵ごとの値（場面ごとに別の値。メールアドレスの鍵はメールアドレスの形）。 */
 const valuesFor = (keys: readonly string[], index: number): Record<string, string> =>
@@ -105,6 +110,9 @@ const detailPageReads = (since: number, id?: string): readonly string[] => site.
   .map((request) => request.path);
 /** 届いた読み取りでない要求（事前確認を含む）。 */
 const nonReads = (): number => site.requests.filter((request) => request.preflight || !READ_METHODS.has(request.method)).length;
+/** OP-N: 届いた、バックエンドへの要求（`since` 番目の記録から。method と path で選ぶ。事前確認は数えない）。 */
+const backendRequests = (since: number, method: string, path: string): number => site.requests.slice(since)
+  .filter((request) => request.origin === 'backend' && !request.preflight && request.method === method && request.path.startsWith(path)).length;
 
 beforeAll(async () => {
   site = await startSpaAuthSite({ memberScreenLayout: 'formless', memberDetailPage: true });
@@ -165,6 +173,8 @@ afterAll(async () => {
 describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, launch) => {
   /** これまでの場面で、サーバに届いてよいと確かめた登録の数。 */
   let expectedPosts = 0;
+  /** OP-N: これまでの場面で、届いてよいと確かめた、承認した登録のほかの読み取りでない要求（送信の扱いで通した、サイトが自動で送る通信）の数。 */
+  let expectedOtherNonReads = 0;
   let postsBefore = 0;
   let nonReadsBefore = 0;
 
@@ -179,16 +189,21 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
     site.setMemberSaveRecordId(null);
     site.setMemberDetailResponse(null);
     site.setMemberSaveOnInput(false);
+    site.setMemberSideRequestsOnInput(false);
+    site.setMemberAutoRequests(null);
     site.setMemberSaveAborted(false);
+    site.setMemberNewRenderDelay(null);
+    site.setMemberInputQuirk(null);
+    site.setMemberDetailRpcRead(false);
     expect(memberPosts().length - postsBefore, 'member POSTs that reached the server').toBe(expectedPosts);
-    expect(nonReads() - nonReadsBefore, 'non-read requests that reached the server').toBe(expectedPosts);
+    expect(nonReads() - nonReadsBefore, 'non-read requests that reached the server').toBe(expectedPosts + expectedOtherNonReads);
   });
 
   afterAll(async () => {
     // 遅れて届く要求を待って数え直す。
     await sleep(LATE_DELIVERY_SETTLE_MS);
     expect(memberPosts().length - postsBefore).toBe(expectedPosts);
-    expect(nonReads() - nonReadsBefore).toBe(expectedPosts);
+    expect(nonReads() - nonReadsBefore).toBe(expectedPosts + expectedOtherNonReads);
   }, TEST_TIMEOUT_MS);
 
   interface Run {
@@ -208,6 +223,8 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
   interface RunOptions {
     readonly change?: (write: WorkerStartApiWrite) => WorkerStartApiWrite;
     readonly extraExcludedPathPrefixes?: readonly string[];
+    /** OP-N: 監査の段の送信の扱い（プロファイルの設定。親が `START` で渡し、ワーカーが実効の設定の上書きにする値。省略は読み取りだけ）。 */
+    readonly auditSendPolicy?: 'READ_ONLY' | 'PASS_EXCEPT_DELETE';
     /** T40R-fix-A: 押す直前の確かめ直しの答え（省略は許す）。 */
     readonly recheck?: () => Promise<WorkerWriteRecheckOutcome>;
   }
@@ -221,7 +238,10 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
     const reports: WorkerWriteSubmissionReport[] = [];
     const outputDirectory = join(directory, `output-${String(caseNumber)}`);
     const outcome = await executeWriteCreateRun({
-      config: spaApiWriteConfigOf(site, outputDirectory, { crawl: { minNavigationIntervalMs: NAVIGATION_INTERVAL_MS } }),
+      config: spaApiWriteConfigOf(site, outputDirectory, {
+        crawl: { minNavigationIntervalMs: NAVIGATION_INTERVAL_MS },
+        ...(options.auditSendPolicy === undefined ? {} : { audit: { sendPolicy: options.auditSendPolicy } }),
+      }),
       jobId: `job-api-${String(caseNumber)}`,
       authentication: spaRunAuthenticationOf(site, options.extraExcludedPathPrefixes),
       write,
@@ -254,7 +274,7 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
     expectedPosts += 1;
     expect(site.memberCount).toBe(membersBefore + 1);
     expect(run.document).toMatchObject({
-      schemaVersion: 'action-run-schema/1.1', transport: 'API', resultConditions: null, submission: 'SENT', blockReason: null, httpStatus: 201,
+      schemaVersion: 'action-run-schema/1.2', transport: 'API', resultJudgement: null, submission: 'SENT', blockReason: null, httpStatus: 201,
       responseJudgement: 'SUCCESS', readVerification: { readCheckId: READ_CHECK_ID, result: 'MATCHED' }, reservationState: 'COMMITTED',
       result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED', submittedValues: run.write.values,
     });
@@ -348,6 +368,234 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
     expect(detailPageReads(run.since)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  // OP-M（本物のテスト環境の事実: 値を入れた後に、承認した送信のほかの要求が出て `UNEXPECTED_REQUEST` で止まった。何の要求だったかの記録がなかった）: 値を入れる
+  // 間に、ページが入力の確かめの手続きの呼び出し（本文に入れた値）、使われ方の記録の beacon、承認していない Origin への記録を出す。止める判定は今どおり
+  // （押さずに `PRECHECK_FAILED`・`UNEXPECTED_REQUEST`）で、証拠に、出た要求の形（送り方・送り先の区分・path の形・種類・時点・理由・目印の真偽）が値と
+  // 承認していない Origin の名前を含まずに残る。端末の負荷を抑えるため、テストの既定の Chromium だけで確かめる（OP-M の指示書）。
+  if (label === LAUNCHERS[0]?.[0]) {
+    it(`records the shape of the requests other than the approved send that the page sends after the values are typed, without values (${label})`, async () => {
+      site.setMemberSideRequestsOnInput(true);
+      const run = await runWrite('markedRepresentation');
+      expect(run.document).toMatchObject({
+        submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'UNEXPECTED_REQUEST', result: 'BLOCKED', reservationState: 'RELEASED',
+        httpStatus: null,
+      });
+      // 証拠の Guard の要約に、1 つの配列（`unexpectedRequests`）で残る（画面には出さない）。
+      const guard = run.evidence['guard'] as { readonly unexpectedRequests?: readonly Record<string, unknown>[]; readonly unexpectedRequestsUnlisted?: number };
+      const requests = guard.unexpectedRequests ?? [];
+      expect(Array.isArray(guard.unexpectedRequests)).toBe(true);
+      expect(guard.unexpectedRequestsUnlisted).toBeUndefined();
+      // ページのスクリプトの送信の種類は、Chromium が付ける種類のまま（`fetch()` でも `xhr` と付くことがある）。
+      const scriptSend = expect.stringMatching(/^(?:fetch|xhr)$/u);
+      // 入力の確かめの手続きの呼び出し: 承認したサービスの Origin、本文に入れた値の目印がある。
+      expect(requests).toContainEqual(expect.objectContaining({
+        method: 'POST', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: SPA_BACKEND_PATHS.rpcCheckMemberEmail, resourceType: scriptSend, timing: 'AFTER_FILL',
+        reason: 'NON_READ_METHOD', markerInBody: true, bodyKind: 'OBJECT', count: 1,
+      }));
+      // 使われ方の記録の beacon: テスト環境の Origin、本文に値はない。
+      expect(requests).toContainEqual(expect.objectContaining({
+        method: 'POST', destination: 'TEST_ORIGIN', pathShape: SPA_APP_PATHS.rum, resourceType: 'ping', timing: 'AFTER_FILL', reason: 'NON_READ_METHOD',
+        markerInBody: false, count: 1,
+      }));
+      // 承認していない Origin への記録: 区分だけ（Origin の名前は残さない）。窓の中なので、送信の窓の理由で止めた。
+      expect(requests).toContainEqual(expect.objectContaining({
+        method: 'GET', destination: 'OUTSIDE_ALLOWED_ORIGINS', pathShape: SPA_OTHER_COLLECT_PATH, resourceType: scriptSend, timing: 'AFTER_FILL',
+        reason: 'SUBMISSION_WINDOW', markerInBody: false, bodyKind: 'NONE', count: 1,
+      }));
+      // 押していないので、押した後の要求はない。
+      expect(requests.filter((request) => request['timing'] === 'AFTER_PRESS')).toEqual([]);
+      // 証拠の一覧に、入れた値と承認していない Origin の名前は出ない。
+      const listed = JSON.stringify(guard.unexpectedRequests);
+      for (const value of Object.values(run.write.values)) {
+        if (value !== null) expect(listed).not.toContain(value);
+      }
+      expect(JSON.stringify(run.evidence)).not.toContain(site.otherOrigin);
+      expect(detailPageReads(run.since)).toEqual([]);
+    }, TEST_TIMEOUT_MS);
+  }
+
+  /** OP-N: 証拠の Guard の要約の、止めた一覧と通した一覧。 */
+  const guardListsOf = (run: Run): { readonly blocked: readonly Record<string, unknown>[]; readonly passed: readonly Record<string, unknown>[] } => {
+    const guard = run.evidence['guard'] as { readonly unexpectedRequests?: readonly Record<string, unknown>[]; readonly passedRequests?: readonly Record<string, unknown>[] };
+    return { blocked: guard.unexpectedRequests ?? [], passed: guard.passedRequests ?? [] };
+  };
+  /** OP-N: 証拠に、入れた値と承認していない Origin の名前が出ない。 */
+  const expectNoValuesInEvidence = (run: Run): void => {
+    const text = JSON.stringify(run.evidence['guard']);
+    for (const value of Object.values(run.write.values)) {
+      if (value !== null) expect(text).not.toContain(value);
+    }
+    expect(JSON.stringify(run.evidence)).not.toContain(site.otherOrigin);
+  };
+  const scriptSendType = expect.stringMatching(/^(?:fetch|xhr)$/u);
+
+  // OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1。本物のテスト環境の事実: 値を入れた後に出たのは、realtime の WebSocket の張り直し
+  // 1 つだけで、目印はなかった）: 値を入れた後の、目印のない読み取りと WebSocket の張り直しは、止めたまま（サーバに届かない）、送る前の確かめを失敗にしない。
+  it(`keeps blocking a read and a WebSocket reconnection without the typed values after the values are typed, and still sends and verifies (N1) (${label})`, async () => {
+    site.setMemberAutoRequests('AFTER_FILL_READS');
+    const run = await runWrite('markedRepresentation');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    const { blocked } = guardListsOf(run);
+    // 止めた証拠: 値を入れた後の読み取りと、WebSocket の張り直し（どちらも目印なし）。
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'GET', destination: 'TEST_ORIGIN', pathShape: SPA_APP_PATHS.appConfig, resourceType: scriptSendType, timing: 'AFTER_FILL', reason: 'SUBMISSION_WINDOW',
+      markerInBody: false,
+    }));
+    expect(blocked).toContainEqual(expect.objectContaining({ method: 'GET', resourceType: 'websocket', timing: 'AFTER_FILL', pathShape: SPA_BACKEND_PATHS.realtime }));
+    // サーバには届かない（読み取りも、WebSocket の始まりも）。
+    expect(site.requests.slice(run.since).filter((request) => request.origin === 'app' && request.path === `${SPA_APP_PATHS.appConfig}?event=input`))
+      .toEqual([]);
+    expect(site.requests.slice(run.since).filter((request) => request.method === 'UPGRADE')).toEqual([]);
+    expectNoValuesInEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  // OP-N（N1）: 値を入れた後の、目印を含む要求と、読み取りでない要求は、今どおり `UNEXPECTED_REQUEST` で取りやめる（送信の扱いが `PASS_EXCEPT_DELETE` でも）。
+  // 承認した登録も、ほかの読み取りでない要求も、サーバに届かない。
+  it.each([
+    ['a POST with the typed value in a nested body', 'AFTER_FILL_MARKER_POST'],
+    ['a POST without the typed value', 'AFTER_FILL_PLAIN_POST'],
+    ['a GET with the typed value in the query', 'AFTER_FILL_MARKER_GET'],
+  ] as const)(`cancels the write for %s after the values are typed, even with PASS_EXCEPT_DELETE (N1) (${label})`, async (_name, mode) => {
+    site.setMemberAutoRequests(mode);
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+    expect(run.document).toMatchObject({
+      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'UNEXPECTED_REQUEST', result: 'BLOCKED', reservationState: 'RELEASED', httpStatus: null,
+    });
+    const { blocked, passed } = guardListsOf(run);
+    expect(blocked.filter((request) => request['timing'] === 'AFTER_FILL')).not.toEqual([]);
+    expect(passed.filter((request) => request['timing'] !== 'BEFORE_FILL')).toEqual([]);
+    if (mode === 'AFTER_FILL_MARKER_POST') {
+      expect(blocked).toContainEqual(expect.objectContaining({
+        method: 'POST', pathShape: SPA_BACKEND_PATHS.rpcCheckMemberEmail, timing: 'AFTER_FILL', reason: 'NON_READ_METHOD', markerInBody: true, bodyKind: 'OBJECT',
+      }));
+    }
+    if (mode === 'AFTER_FILL_MARKER_GET') {
+      // 目印を含む GET は、サーバに届かない。
+      expect(site.requests.slice(run.since).filter((request) => request.origin === 'app' && request.path.startsWith(`${SPA_APP_PATHS.appConfig}?email=`)))
+        .toEqual([]);
+    }
+    expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcCheckMemberEmail)).toBe(0);
+    expect(backendRequests(run.since, 'POST', SPA_AUTO_REQUEST_PATHS.rpcStatus)).toBe(0);
+    expect(detailPageReads(run.since)).toEqual([]);
+    expectNoValuesInEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  // OP-N（設計書 4.1.7 の N2）: 値を入れる前に、サイトが自動で送る通信（手続きの呼び出し）は、送信の扱いが `PASS_EXCEPT_DELETE` なら、監査の段と同じ判定で通す
+  // （書き込みには数えない。証拠に形と数を残す）。DELETE と、承認していない Origin の外のスクリプトは止まる。数える書き込みは承認した 1 件だけで、`VERIFIED`。
+  it(`passes the procedure call that the page sends before the values are typed with PASS_EXCEPT_DELETE, and stops the DELETE and the outside script (N2) (${label})`, async () => {
+    site.setMemberAutoRequests('BEFORE_FILL');
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    // OP-Q（設計書 4.1.8 の Q1。OP-REV3 の C-1 を改めた）: 手続きの呼び出しは、送る前の確かめの画面と書き込みの段の画面の 2 回届いた（送る前の確かめの Context にも、
+    // 書き込みの段の値を入れる前と同じ決まりで送信の扱いを当てる）。DELETE は届かない。
+    expect(backendRequests(run.since, 'POST', SPA_AUTO_REQUEST_PATHS.rpcStatus)).toBe(2);
+    expectedOtherNonReads += 2;
+    expect(backendRequests(run.since, 'DELETE', SPA_AUTO_REQUEST_PATHS.previews)).toBe(0);
+    const { blocked, passed } = guardListsOf(run);
+    // 書き込みの段で通した 1 回（値を入れる前。目印なし）。
+    expect(passed).toEqual([expect.objectContaining({
+      method: 'POST', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: SPA_AUTO_REQUEST_PATHS.rpcStatus, resourceType: scriptSendType, timing: 'BEFORE_FILL',
+      reason: 'AUDIT_SEND_PASSED', markerInBody: false, count: 1,
+    })]);
+    // 止めた DELETE と、承認していない Origin の外のスクリプト（値を入れる前）。
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'DELETE', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: SPA_AUTO_REQUEST_PATHS.previews, timing: 'BEFORE_FILL', reason: 'NON_READ_METHOD',
+    }));
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'GET', destination: 'OUTSIDE_ALLOWED_ORIGINS', pathShape: SPA_AUTO_REQUEST_PATHS.widget, timing: 'BEFORE_FILL', reason: 'OUTSIDE_ALLOWED_ORIGINS',
+    }));
+    expectNoValuesInEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  // OP-N（N2）: プロファイルが読み取りだけ（`READ_ONLY`）なら、今どおり、値を入れる前の自動の通信も止める（届かない）。書き込みは今どおり `VERIFIED`。
+  it(`stops the requests that the page sends before the values are typed with READ_ONLY, as now (N2) (${label})`, async () => {
+    site.setMemberAutoRequests('BEFORE_FILL');
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'READ_ONLY' });
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(backendRequests(run.since, 'POST', SPA_AUTO_REQUEST_PATHS.rpcStatus)).toBe(0);
+    expect(backendRequests(run.since, 'DELETE', SPA_AUTO_REQUEST_PATHS.previews)).toBe(0);
+    const { blocked, passed } = guardListsOf(run);
+    expect(passed).toEqual([]);
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'POST', pathShape: SPA_AUTO_REQUEST_PATHS.rpcStatus, timing: 'BEFORE_FILL', reason: 'NON_READ_METHOD',
+    }));
+  }, TEST_TIMEOUT_MS);
+
+  // OP-REV3（C-2。設計者の判断の案 a）: 押した後（承認した送信の後）は、送信の扱いを当てない（値をヘッダや Cookie に持つ要求も、値のない要求も、読み取りでない
+  // 要求はすべて止める。届かない）。N2 で通すのは、値を入れる前だけ。書き込みに数えるのは承認した 1 件だけ。
+  it(`stops every non-read request after the press, including the values in a header or a cookie, with PASS_EXCEPT_DELETE (N2) (${label})`, async () => {
+    site.setMemberAutoRequests('AFTER_PRESS');
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(backendRequests(run.since, 'POST', SPA_AUTO_REQUEST_PATHS.rpcStatus)).toBe(0);
+    expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcCheckMemberEmail)).toBe(0);
+    expect(site.requests.slice(run.since).filter((request) => request.origin === 'app' && request.path.startsWith(SPA_AUTO_REQUEST_PATHS.appSync))).toEqual([]);
+    const { blocked, passed } = guardListsOf(run);
+    expect(passed).toEqual([]);
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'POST', pathShape: SPA_AUTO_REQUEST_PATHS.rpcStatus, timing: 'AFTER_PRESS', reason: 'NON_READ_METHOD', markerInBody: false,
+    }));
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'POST', destination: 'TEST_ORIGIN', pathShape: SPA_AUTO_REQUEST_PATHS.appSync, timing: 'AFTER_PRESS', reason: 'NON_READ_METHOD',
+    }));
+    expectNoValuesInEvidence(run);
+  }, TEST_TIMEOUT_MS);
+
+  // OP-REV3（C-1・I-1）: 画面を開いた直後に、承認した送信先の形を変えた path（末尾の `/`）への値のない POST と、承認していない Origin への no-cors の POST を出す。
+  // OP-Q（Q1）: 送る前の確かめの Context にも送信の扱いを当てるが、決まりは書き込みの段の値を入れる前と同じ（承認した送信先とその下の path（正規化した形）、許可 Origin と
+  // 承認したサービスの Origin のほかは除く）なので、どちらも届かない。登録は 1 件だけ。
+  it(`stops a POST to the approved endpoint with another path form and a no-cors POST to an outside Origin before the values are typed (${label})`, async () => {
+    site.setMemberAutoRequests('BEFORE_FILL_ENDPOINT');
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(backendRequests(run.since, 'POST', SPA_AUTO_REQUEST_PATHS.membersTrailingSlash)).toBe(0);
+    expect(site.requests.slice(run.since).filter((request) => request.origin === 'other' && request.method === 'POST')).toEqual([]);
+    const { blocked, passed } = guardListsOf(run);
+    expect(passed).toEqual([]);
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'POST', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: SPA_AUTO_REQUEST_PATHS.membersTrailingSlash, timing: 'BEFORE_FILL',
+    }));
+    expect(blocked).toContainEqual(expect.objectContaining({
+      method: 'POST', destination: 'OUTSIDE_ALLOWED_ORIGINS', pathShape: SPA_AUTO_REQUEST_PATHS.outsideCollect, timing: 'BEFORE_FILL',
+    }));
+  }, TEST_TIMEOUT_MS);
+
+  // OP-Q（設計書 4.1.8 の Q1。本物のテスト環境の事実: 照合の READ の Context が読み取りだけだったので、詳細の画面のデータを取る手続きの呼び出しが止まり、
+  // `READ_VERIFICATION_UNDETERMINED` になった）: 照合の READ の Context にも、書き込みの段の値を入れる前と同じ決まりで送信の扱いを当てる。データを取る手続きの呼び出し
+  // （承認したサービスの Origin への POST。承認した送信先の下ではない）が 1 回届き、画面に作った値が出て `VERIFIED`。登録は 1 件だけ。
+  it(`passes the data procedure call of the verification READ page with PASS_EXCEPT_DELETE, and verifies (Q1) (${label})`, async () => {
+    site.setMemberDetailRpcRead(true);
+    const run = await runWrite('markedRepresentation', { auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+    expectedPosts += 1;
+    const recordId = run.document.recordId ?? '';
+    expect(recordId).toMatch(/^[0-9]+$/u);
+    expect(run.document).toMatchObject({
+      submission: 'SENT', responseJudgement: 'SUCCESS', readVerification: { result: 'MATCHED' }, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED',
+    });
+    expect(detailPageReads(run.since)).toEqual([`/admin/members/${recordId}`]);
+    expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcGetMember)).toBe(1);
+    expectedOtherNonReads += 1;
+  }, TEST_TIMEOUT_MS);
+
+  // OP-Q（Q1）: プロファイルが読み取りだけ（`READ_ONLY`）なら、今どおり、照合の READ の画面の手続きの呼び出しも止める（届かない。確かめられないので `PARTIAL`）。
+  // 端末の負荷を抑えるため、テストの既定の Chromium だけで確かめる。
+  if (label === LAUNCHERS[0]?.[0]) {
+    it(`stops the data procedure call of the verification READ page with READ_ONLY, as now (Q1) (${label})`, async () => {
+      site.setMemberDetailRpcRead(true);
+      const run = await runWrite('markedRepresentation', { auditSendPolicy: 'READ_ONLY' });
+      expectedPosts += 1;
+      expect(run.document).toMatchObject({
+        submission: 'SENT', responseJudgement: 'SUCCESS', readVerification: { result: 'UNDETERMINED' }, result: 'PARTIAL', reason: 'READ_VERIFICATION_UNDETERMINED',
+      });
+      expect(backendRequests(run.since, 'POST', SPA_BACKEND_PATHS.rpcGetMember)).toBe(0);
+    }, TEST_TIMEOUT_MS);
+  }
+
   // T40R-fix-A（T40R の I-2）: ID を画面から取る形で、登録の画面（`/admin/members/new`）自身が ID の型（`/admin/members/{id}`）に当たる。押す前の画面から同じ
   // 取り方で取れた値（`new`）は ID として使わない（`RECORD_ID_NOT_FOUND`。照合の READ は行わない）。保存の確かめ（T40R-fix-B）が拒む形なので、開始の指定を
   // テストの中で直接組み立てる。
@@ -398,5 +646,86 @@ describe.each(LAUNCHERS)('T40b-1: the API create write flow with %s', (label, la
     const run = await runWrite(null, { change: (write) => ({ ...write, submitterIdentityDigest: UNMATCHED_DIGEST }) });
     expect(run.document).toMatchObject({ submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', result: 'BLOCKED', reservationState: 'RELEASED' });
     expect(run.evidence).toMatchObject({ precheck: { candidateDigestMatched: false, blockReason: 'PRECHECK_FAILED' }, guard: null });
+    // OP-L（L1）: どこが違ったかを、値を含まない形で残す（送信の要素が見つからない。欄の位置はない）。
+    expect(run.evidence).toMatchObject({ precheck: { candidateMismatch: { reason: 'SUBMITTER_NOT_FOUND', fieldPosition: null } } });
+  }, TEST_TIMEOUT_MS);
+
+  // OP-O（O2 の (a)・(c)。本物のテスト環境の形）: SPA が値を入れる途中で欄を作り直す・最初の入力を戻すときは、上限の中で 1 回だけ確かめ直して入れ直し、
+  // 承認の登録を 1 回だけ送る（送る中身と回数は変えない）。
+  it.each([
+    ['rerenders the fields at the first input', 'rerenderOnFirstInput'],
+    ['reverts the first input of each field', 'revertOnFirstInput'],
+  ] as const)(`fills again within the limit when the SPA %s, then sends the approved create once and verifies (OP-O) (${label})`, async (_case, quirk) => {
+    site.setMemberInputQuirk(quirk);
+    const run = await runWrite('markedRepresentation');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(run.evidence).toMatchObject({ precheck: { candidateDigestMatched: true, blockReason: null } });
+    expect(run.evidence['precheck']).not.toHaveProperty('inputFailure');
+  }, TEST_TIMEOUT_MS);
+
+  // OP-P（P1・P2。本物のテスト環境の形）: 値を入れ終えた後、押す前に、SPA が保存のボタンか欄を作り直す。押す直前に、上限の中で 1 回だけ今の画面から
+  // 探し直し（送信の要素は承認の識別の digest で縛る）、今の要素の値を読み直してから、承認の登録を 1 回だけ送る（送る中身は Guard が照らす）。
+  it.each([
+    ['rebuilds the save button', 'rerenderSaveAfterFill'],
+    ['rebuilds the fields keeping the values', 'rerenderFieldsAfterFill'],
+  ] as const)(`finds the current elements once when the SPA %s after the fill, then sends the approved create once and verifies (OP-P) (${label})`, async (_case, quirk) => {
+    // 作り直しは、値を入れた後の落ち着きの待ちの中（押す前）に起きる。
+    expect(SPA_AFTER_FILL_RERENDER_MS).toBeLessThan(WRITE_SUBMISSION_WINDOW_SETTLE_MS);
+    site.setMemberInputQuirk(quirk);
+    const run = await runWrite('markedRepresentation');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(run.evidence).toMatchObject({ precheck: { candidateDigestMatched: true, blockReason: null } });
+    expect(run.evidence['precheck']).not.toHaveProperty('inputFailure');
+  }, TEST_TIMEOUT_MS);
+
+  // OP-P（P2）: 作り直しで値が消えたときは、外れた古い要素の値で通さず、送らない（押す段の VALUE_CHANGED。値は残さない）。
+  it(`does not send when the SPA empties the fields by a rebuild after the fill, and records it without values (OP-P) (${label})`, async () => {
+    site.setMemberInputQuirk('resetFieldsAfterFill');
+    const run = await runWrite(null);
+    expect(run.document).toMatchObject({
+      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'FORM_NOT_READY', result: 'BLOCKED', reservationState: 'RELEASED',
+    });
+    expect((run.evidence['precheck'] as Record<string, unknown>)['inputFailure']).toEqual({
+      stage: 'SUBMIT', reason: 'VALUE_CHANGED', fieldPosition: 0, fieldType: expect.stringMatching(/^(?:text|email)$/u), fieldAttributes: [], valueChange: 'EMPTIED',
+    });
+    const evidenceText = JSON.stringify(run.evidence['precheck']);
+    for (const value of Object.values(run.write.values)) {
+      expect(evidenceText).not.toContain(value);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // OP-O（O1）: 入れ直しても値が残らないときは送らず、段・理由・欄の位置・欄の種類・属性の有無・値の変わり方の区分を、値と値の長さを含まずに
+  // `action-evidence.json` の `precheck.inputFailure` に残す（画面には出さない）。
+  it(`records the stage, the reason and the field facts without values when the values do not stay (OP-O O1) (${label})`, async () => {
+    site.setMemberInputQuirk('clearOnEveryInput');
+    const run = await runWrite(null);
+    expect(run.document).toMatchObject({
+      submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail: 'FORM_NOT_READY', result: 'BLOCKED', reservationState: 'RELEASED',
+    });
+    expect(run.evidence).toMatchObject({ precheck: { candidateDigestMatched: true, blockReason: 'PRECHECK_FAILED' } });
+    expect((run.evidence['precheck'] as Record<string, unknown>)['inputFailure']).toEqual({
+      stage: 'FILL', reason: 'VALUE_CHANGED', fieldPosition: 0, fieldType: expect.stringMatching(/^(?:text|email)$/u), fieldAttributes: [], valueChange: 'EMPTIED',
+    });
+    // 値と、値の長さは残さない（記録の項目は決めた 6 つだけ）。
+    const evidenceText = JSON.stringify(run.evidence['precheck']);
+    for (const value of Object.values(run.write.values)) {
+      expect(evidenceText).not.toContain(value);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // OP-L（L1。本物のテスト環境の事実）: SPA の登録の画面が、欄と保存のボタンを遅れて描く。送る前の確かめは、欄が出そろうのを待ってから候補を読む
+  // （前は、描く前に読んで `CANDIDATE_CHANGED` で止まった）。照合の決まり（digest で縛る）は変えない。読み込みの回数も変えない。
+  it(`waits for the fields that the SPA draws late, then sends the approved create once and verifies (${label})`, async () => {
+    site.setMemberNewRenderDelay(LATE_RENDER_DELAY_MS);
+    const since = site.requests.length;
+    const run = await runWrite('markedRepresentation');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' });
+    expect(run.evidence).toMatchObject({ precheck: { candidateDigestMatched: true, blockReason: null } });
+    // 登録の画面の読み込みは、送る前の確かめと書き込みの段の 2 回だけ（待つ間に読み込み直さない）。
+    expect(site.requests.slice(since).filter((request) => request.origin === 'app' && request.method === 'GET' && request.path === SPA_APP_PATHS.memberNew))
+      .toHaveLength(2);
   }, TEST_TIMEOUT_MS);
 });

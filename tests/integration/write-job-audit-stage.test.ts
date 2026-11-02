@@ -195,9 +195,8 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
     candidateFields: formCandidate.fields.map(({ name, type, readonly, hidden, disabled }) => ({ name, type, readonly, hidden, disabled })),
     values: { name: `${NAME_VALUE} ${runCount}` },
     verification: {
-      successCondition: { pathPrefix: `${WRITE_SITE_PATHS.create}/`, selector: '.registered' },
-      inputErrorCondition: { pathPrefix: WRITE_SITE_PATHS.create, selector: '.error' },
-      recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${WRITE_SITE_PATHS.create}/{id}` },
+      resultJudgement: 'FORM_STRUCTURE',
+      recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
     },
     readVerification: readVerificationOf(verified),
     approvalFacts: sampleApprovalFacts({ kind: 'CREATE', profileId: 'example-write', scenarioId: 'scenario-w', scenarioRevision: 1, grantId: 'grant-w' }),
@@ -230,8 +229,10 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
 
   const NOT_SENT = { submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED' } as const;
 
+  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「事前の確かめ」）: 送る前に答え合わせの READ を読み、判定できなければ送らない
+  // （`VERIFICATION_READ_UNAVAILABLE`）。送る回の比べは、読める照合の READ の定義（`verified`）で行う（確かめたいのは監査の段の上限と鍵）。
   it('sends within the limit with the key (the comparison)', async () => {
-    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true));
+    const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
     expect(run.document.submission).toBe('SENT');
     expect(run.posts).toBe(1);
   }, TEST_TIMEOUT_MS);
@@ -262,13 +263,16 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
 
   // T37R-fix-B2（設計書 8 章の最後の行）: 許可 Origin（同じ Origin）への fetch・xhr の止めた要求は、数えて残すだけで判定に使わない。そのため M-3 の
   // 決まりの確かめは、判定に使う事実（止めたサービスの Origin への読み取りでない要求）で行う。
+  // PL-6a: 送る前の答え合わせの READ にも同じ決まりを当てる。同じ一覧の画面を、送る前にも読むので、送る前の答え合わせが判定できず、送らずに止める
+  // （`BLOCKED`・`PRECHECK_FAILED`・`VERIFICATION_READ_UNAVAILABLE`。前は送ってから照合できない `PARTIAL`。送らない側に変わった）。
   it('makes the verification READ UNDETERMINED when the list page POST to the service origin was blocked (M-3)', async () => {
     site.setListDataRequest(true, service.origin);
     const run = await runWrite(authenticationFor(WIDE_LIMITS, () => true), true);
     expect(run.document).toMatchObject({
-      submission: 'SENT', result: 'PARTIAL', reason: 'READ_VERIFICATION_UNDETERMINED', readVerification: { result: 'UNDETERMINED' },
+      ...NOT_SENT, precheckDetail: 'VERIFICATION_READ_UNAVAILABLE', result: 'BLOCKED', readVerification: null,
     });
-    expect(run.posts).toBe(1);
+    expect(run.reports).toEqual([NOT_SENT]);
+    expect(run.posts).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   // T37R-fix-B2: 今の振る舞いの固定。一覧の画面の同じ Origin の fetch の POST を Guard が止めても、照合の READ は判定できないことにはならず、照らした
@@ -283,7 +287,8 @@ describe.each(LAUNCHERS)('T37a fix round 1: the write job stops before sending a
   // 書き込みの段の Context は、承認したサービスの Origin へ送らない（Guard が止める。上限の部品にも数えない）。そのため、上限は書き込みの段の読み込みでは
   // 動かず、書き込みの段を開く前の確かめで足りる（T37a fix round 1 の報告）。画面の確かめの読み込みの分だけが届き、上限の中なら送る。
   it('sends no service request from the write stage, so the limit stays as it was after the form page check', async () => {
-    const run = await runWrite(authenticationFor(WITHIN_CHECK_LIMITS, () => true));
+    // PL-6a: 送る前の答え合わせが読める定義で送る（一覧の画面は、サービスの Origin へ送らない）。
+    const run = await runWrite(authenticationFor(WITHIN_CHECK_LIMITS, () => true), true);
     expect(run.serviceGets).toBe(SERVICE_READS_PER_LOAD);
     expect(run.document.submission).toBe('SENT');
     expect(run.posts).toBe(1);

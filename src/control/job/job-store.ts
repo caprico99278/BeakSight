@@ -12,6 +12,7 @@
 // - 読んだ行は、名前つきの一覧と契約の部品（`validateWorkerToParentMessage`、`isRunId`、`isPortableRelativeArtifactPath`）で確かめてから、
 //   凍結した写しにする。壊れた行は `ControlStoreError`（`DATABASE_INTEGRITY_FAILED`）で止める。
 import { isPortableRelativeArtifactPath } from '../../core/artifact-layout.js';
+import { FINISHED_AUDIT_JOB_STATE, WORKER_ENTRY_CHECK_JOB_KIND } from '../../core/audit-job-values.js';
 import { RUN_STATUSES, type RunId, type RunProgressReport, type RunStatus } from '../../core/contracts.js';
 import type { SessionLossEvidence } from '../../core/evidence-types.js';
 import { isRecord } from '../../core/guards.js';
@@ -39,8 +40,10 @@ import {
   WORKER_PROTOCOL_VERSION,
   WORKER_SESSION_LOST_STATE,
   WORKER_WRITE_JOB_KINDS,
+  isWorkerCredentialSaveFailureCode,
   validateWorkerToParentMessage,
   type WorkerAuthState,
+  type WorkerCredentialSaveFailureCode,
   type WorkerLoginFormInvalidReason,
   type WorkerLoginObservation,
   type WorkerLoginStateNames,
@@ -165,7 +168,8 @@ export interface AuditJobLoginStageSummary {
  * - `PROFILE_CHANGED`: ジョブを始めた後に、プロファイルか認証の設定が変わった（改訂が違う、設定がない・古い）。利用者の変更を上書きしない。
  * - `SAVE_REJECTED`: 保存の部品（プロファイルと認証の設定の検証）が拒んだ。
  */
-const [NO_PASSED_REQUESTS, NO_TOKEN_REQUEST, NO_STORAGE_KEY, NOTHING_NEW, MULTIPLE_TOKEN_TARGETS] = MANUAL_LOGIN_REGISTRATION_SKIP_REASONS;
+const [NO_PASSED_REQUESTS, NO_TOKEN_REQUEST, NO_STORAGE_KEY, NOTHING_NEW, MULTIPLE_TOKEN_TARGETS, TOKEN_TARGET_ON_TEST_ORIGIN] =
+  MANUAL_LOGIN_REGISTRATION_SKIP_REASONS;
 // ML-a-fix-3（ML-R2 の M-1）: 組み立ての部品の新しい理由（`MULTIPLE_TOKEN_TARGETS`）は、一覧の末尾に足す（前の理由の順を変えない）。
 export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS = Object.freeze([
   NO_PASSED_REQUESTS,
@@ -175,6 +179,8 @@ export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS = Object.freeze([
   'PROFILE_CHANGED',
   'SAVE_REJECTED',
   MULTIPLE_TOKEN_TARGETS,
+  // DEF-182（OP-DEF 修正の 1 回目）: token の送信先がテスト環境と同じ Origin（末尾に足す）。
+  TOKEN_TARGET_ON_TEST_ORIGIN,
 ] as const);
 export type AuditJobLoginAutoRegistrationSkipReason = (typeof AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS)[number];
 
@@ -182,9 +188,51 @@ export type AuditJobLoginAutoRegistrationSkipReason = (typeof AUDIT_JOB_LOGIN_AU
  * ML-a: 自動の登録の結果（値を持たない）。`SAVED` は、保存したプロファイルの改訂と、プロファイルの承認したサービスの Origin に足した Origin（保存した設定の
  * 中身は、認証の設定の保存の部品 `getAuthSetup` で読む）。`SKIPPED` は理由だけ。
  */
-export type AuditJobLoginAutoRegistration =
+export type AuditJobLoginAutoRegistration = (
   | { readonly result: 'SAVED'; readonly profileRevision: number; readonly addedServiceOrigins: readonly string[] }
-  | { readonly result: 'SKIPPED'; readonly reason: AuditJobLoginAutoRegistrationSkipReason };
+  | { readonly result: 'SKIPPED'; readonly reason: AuditJobLoginAutoRegistrationSkipReason }
+) & {
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 手でのログインの値を受け取ったときの、自動ログインへの切り替えの結果（受け取らなかったとき
+   * は持たない）。`SWITCHED` は切り替えた、`NOT_AVAILABLE` は切り替えられなかった（3 つのセレクタがそろわない、保存できないなど。値は捨てた）。
+   */
+  readonly automatedLogin?: AuditJobLoginAutoRegistrationSwitch;
+  /**
+   * OP-K（K3）: 切り替えられなかった（`NOT_AVAILABLE`）ときだけの、その理由（閉じた一覧 `AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS`。値を持たない）。前の書き手の
+   * 記録にはない（任意の項目）。
+   */
+  readonly automatedLoginReason?: AuditJobAutomatedLoginUnavailableReason;
+  /**
+   * OP-L（L2）: 理由が `CREDENTIAL_NOT_SAVED` で、ワーカーが書けなかった理由のコードを知らせたときだけの、そのコード（閉じた一覧
+   * `WORKER_CREDENTIAL_SAVE_FAILURE_CODES`。値を持たない）。前の書き手の記録にはない（任意の項目）。
+   */
+  readonly automatedLoginSaveFailure?: WorkerCredentialSaveFailureCode;
+};
+
+/** OP-1: 自動ログインへの切り替えの結果（閉じた一覧）。 */
+export const AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES = Object.freeze(['SWITCHED', 'NOT_AVAILABLE'] as const);
+export type AuditJobLoginAutoRegistrationSwitch = (typeof AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES)[number];
+
+/**
+ * OP-K（K3）: 受け取った値があるのに、自動ログインへ切り替えられなかった理由（閉じた一覧。判定の順は、ジョブの管理のログインの直後の登録）。
+ * - `TOKEN_TARGET_ON_TEST_ORIGIN`: ログインの送り先がテスト環境と同じ Origin（DEF-182）。
+ * - `LOGIN_FIELDS_MISSING`: ログインの 3 つの欄の場所が、手でのログインの観察にも、最後の下調べの案にもそろわない。
+ * - `SWITCH_INVALID`: 切り替えた後の設定が、確かめを通らない。
+ * - `DESTINATION_MISMATCH`: 受け取った値を運んだ送り先が、切り替えの後の資格情報の送り先に当たらない（OP-F の M-2）。
+ * - `CREDENTIAL_NOT_WRITABLE`: 資格情報を書く前の確かめが通らない（保存できないプラットフォームなど）。
+ * - `CREDENTIAL_NOT_SAVED`: ワーカーが資格情報を書けなかった（書いた知らせがない・合わない）。
+ * - `REGISTRATION_NOT_SAVED`: 設定の保存ができなかった（設定が変わった、対象の設定を読めない、保存の確かめが拒んだ）。
+ */
+export const AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS = Object.freeze([
+  'TOKEN_TARGET_ON_TEST_ORIGIN',
+  'LOGIN_FIELDS_MISSING',
+  'SWITCH_INVALID',
+  'DESTINATION_MISMATCH',
+  'CREDENTIAL_NOT_WRITABLE',
+  'CREDENTIAL_NOT_SAVED',
+  'REGISTRATION_NOT_SAVED',
+] as const);
+export type AuditJobAutomatedLoginUnavailableReason = (typeof AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS)[number];
 
 /** 足した Origin の数の上限（token の送信先と、ログインに伴う送信の上限の和）。 */
 const MAX_AUTO_REGISTRATION_ADDED_ORIGINS = 1 + MAX_LOGIN_SIDE_REQUESTS;
@@ -194,12 +242,27 @@ const isAutoRegistration = (value: unknown): value is AuditJobLoginAutoRegistrat
   if (!isRecord(value)) {
     return false;
   }
+  // OP-1: 切り替えの結果（任意）は、閉じた一覧の値だけ。OP-K（K3）: 使えない理由（任意）は、`NOT_AVAILABLE` のときだけ、閉じた一覧の値だけ。
+  const reasonKey = 'automatedLoginReason' in value ? 1 : 0;
+  // OP-L（L2）: 書けなかった理由のコード（任意）は、理由が `CREDENTIAL_NOT_SAVED` のときだけ、閉じた一覧の値だけ。
+  const saveFailureKey = 'automatedLoginSaveFailure' in value ? 1 : 0;
+  if (saveFailureKey === 1 && (value['automatedLoginReason'] !== 'CREDENTIAL_NOT_SAVED' || !isWorkerCredentialSaveFailureCode(value['automatedLoginSaveFailure']))) {
+    return false;
+  }
+  const switchKey = ('automatedLogin' in value ? 1 : 0) + reasonKey + saveFailureKey;
+  if (switchKey > 0 && !(AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SWITCHES as readonly unknown[]).includes(value['automatedLogin'])) {
+    return false;
+  }
+  if (reasonKey === 1 && (value['automatedLogin'] !== 'NOT_AVAILABLE'
+    || !(AUDIT_JOB_AUTOMATED_LOGIN_UNAVAILABLE_REASONS as readonly unknown[]).includes(value['automatedLoginReason']))) {
+    return false;
+  }
   const keys = Object.keys(value);
   if (value['result'] === 'SKIPPED') {
-    return keys.length === 2 && (AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS as readonly unknown[]).includes(value['reason']);
+    return keys.length === 2 + switchKey && (AUDIT_JOB_LOGIN_AUTO_REGISTRATION_SKIP_REASONS as readonly unknown[]).includes(value['reason']);
   }
   const { profileRevision, addedServiceOrigins } = value;
-  return value['result'] === 'SAVED' && keys.length === 3
+  return value['result'] === 'SAVED' && keys.length === 3 + switchKey
     && typeof profileRevision === 'number' && Number.isSafeInteger(profileRevision) && profileRevision > MIN_PROFILE_REVISION
     && Array.isArray(addedServiceOrigins) && addedServiceOrigins.length <= MAX_AUTO_REGISTRATION_ADDED_ORIGINS
     && new Set(addedServiceOrigins).size === addedServiceOrigins.length
@@ -880,6 +943,14 @@ export const readJobIn = (connection: SqliteConnection, jobId: string): AuditJob
 };
 
 /** すべてのジョブ（新しい順）。 */
+/**
+ * OP-K（共通化。画面のサーバの `lastFinishedEntryCheckOf` と、ジョブの管理の自動ログインへの切り替えのセレクタの 2 か所が使う 1 か所）: プロファイルの最後の、終わった
+ * （`FINISHED`）入口の確かめ（下調べ）のジョブ（Run の状態を問わない）。`jobs` は新しい順（`readAllJobs` の順）。なければ `null`。
+ */
+export const lastFinishedEntryCheckJobOf = (jobs: readonly AuditJobView[], profileId: string): AuditJobView | null =>
+  jobs.find((candidate) =>
+    candidate.profileId === profileId && candidate.jobKind === WORKER_ENTRY_CHECK_JOB_KIND && candidate.state === FINISHED_AUDIT_JOB_STATE) ?? null;
+
 export const readAllJobs = (database: ControlDatabase): readonly AuditJobView[] =>
   withReadTransaction(database, (connection) =>
     Object.freeze((connection.prepare(SELECT_ALL_JOBS_SQL).all() as unknown as JobRow[]).map(viewOf)));

@@ -14,6 +14,16 @@
  *    リンクの抽出の唯一の入口 `discoverLinks`（受け入れの判定 `classifyUrl`。許可 Origin は設定の `site.allowedOrigins`）、認証つきの Run の
  *    巡回の候補の除外 `isExcludedCrawlCandidate`（認証の設定の読まないパス・読む範囲・既定の危険な語と、セッションの切れの path）、読み込みの
  *    間隔 `createNavigationPacer`（`crawl.minNavigationIntervalMs`）。上限は `crawl.maxPages`（読んだ画面の数）と `crawl.maxRuntimeMs`。
+ *    OP-I（I2）: 読む順だけ、登録の画面らしいリンク（`isCreatePageLink`）を先にする（`CrawlFrontier` の `preferred`。点検の段の順は変えない）。
+ *    OP-J（J1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.6）: まとめて実行の連鎖で、直前の点検の段の Run のディレクトリ
+ *    （`chainedAuditRunDirectory`）を渡されたときは、その段の成果物（各ページの `page.json` の Desktop の `link` の Evidence。点検の段が見つけたリンクの
+ *    持ち主は 1 つ）から、登録の画面らしいリンク（`isCreatePageLink`）を、最大 `MAX_CHAINED_CREATE_PAGE_READS` ページ、先に読む（そのページのリンクは
+ *    たどらない）。続けて、今どおり入口から `crawl.maxPages` まで読む（登録の画面の数は、ページの上限に数えない。すでに読んだページは読み直さない）。
+ *    サイトへの負荷の上限は `MAX_CHAINED_CREATE_PAGE_READS` + `crawl.maxPages` ページ。読まないパス・危険な語・読む範囲・許可 Origin は、巡回の候補の除外と
+ *    同じ判定（`isExcludedCrawlCandidate`）で外し、間隔・時間の上限・Guard は今のまま。読む先が 1 つもなければ、今どおり（入口から、ページの上限まで）。
+ *    OP-R（設計書 4.1.9 の R2）: 登録の画面ごとに、その 1 つ上の一覧の画面（`readListPagePathOf`）も、点検の段のリンクにあるときだけ、登録の画面の直後に読む
+ *    （`MAX_CHAINED_CREATE_PAGE_READS` の中に数える。サイトへの負荷の上限は変わらない）。点検の段の成果物のリンクの読み方は、共通の部品
+ *    （`src/core/audit-stage-links.ts` の `readAuditStageLinks`。画面のサーバの自動の下書きも使う）。
  * 4. 画面ごと（凍結は戻せないので、画面ごとに新しい Context）: Guard の付いた新しい Passive の Context と page
  *    （`openPassiveSessionBeforeDeadline`。認証の状態は factory が世代つきで受け継ぐ）→ 進行中の要求の数え方（`InFlightRequestCounter`）を
  *    `goto` の前に作る → 読み込みの間隔を待つ → 読み込み（`navigatePage`）→ セッションの切れの確かめ → 発見（`discoverPageCandidates`。落ち着きの待ち → 凍結 → 読む）
@@ -61,7 +71,10 @@ import { formatCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { discoverLinks } from '../crawl/discover-links.js';
 import { internalNavigableUrlsOf } from '../crawl/internal-navigable-links.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
-import { normalizeUrl } from '../crawl/normalize-url.js';
+import { isOriginInAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
+import { readAuditStageLinks } from '../core/audit-stage-links.js';
+import { isCreatePageLink } from '../discovery/classify.js';
+import { readListPagePathOf } from '../discovery/read-check-contracts.js';
 import { discoverPageCandidates } from '../discovery/discover-page.js';
 import type { DiscoverySettlePolicy } from '../discovery/settle.js';
 import {
@@ -117,6 +130,12 @@ import { endWorkerRun, hasViolation, startWorkerRun, visitGuardedPage } from './
 /** 日時の名前（誤りの文に使う）。 */
 const DISCOVERY_TIME_SUBJECT = 'discovery run time';
 
+/**
+ * OP-J（J1。設計書 4.1.6）: まとめて実行の操作さがしの段で、直前の点検の段が見つけた登録の画面らしいリンクを読む数の上限（GET だけ。点検の段のページの上限
+ * `crawl.maxPages` とは別。サイトへの負荷: 1 回の点検で、操作さがしの段は、登録の画面を最大この数のページ、続けてページの上限まで開く）。
+ */
+export const MAX_CHAINED_CREATE_PAGE_READS = 10;
+
 /** 発見の流れの入力。秘密（認証の状態）はメモリの認証の指定の中だけ。 */
 export interface DiscoveryRunRequest {
   /** ワーカーが読んだ設定（`WORKER_CONFIG_OVERRIDES` の headless）。 */
@@ -159,6 +178,11 @@ export interface DiscoveryRunRequest {
    * 前の段の 1 分の窓から始め、Browser を閉じた後に factory の最新の状態と窓を `record` に渡す（`recordRunStageCarry`）。省略すると今のまま。
    */
   readonly stageCarry?: RunStageCarry | undefined;
+  /**
+   * OP-J（J1）: まとめて実行の連鎖で、直前の点検の段の Run のディレクトリ（絶対パス。ワーカーだけが渡す）。あれば、その段の成果物の登録の画面らしいリンクだけを
+   * 読む（ファイルの先頭の 3）。省略すると今のまま（単独の操作さがし）。
+   */
+  readonly chainedAuditRunDirectory?: string | undefined;
 }
 
 /** 観測の口（ワーカーの流れが IPC に写す）。 */
@@ -223,6 +247,8 @@ type PageVisit =
     readonly kind: 'READ';
     readonly record: DiscoveryReadPageRecord;
     readonly links: readonly NormalizedHttpUrlEvidence[];
+    /** OP-I（I2）: `links` のうち、登録の画面らしいリンク（`isCreatePageLink`）の URL。巡回の待ち行列で先に読む。 */
+    readonly preferredLinks: ReadonlySet<string>;
     readonly blockedRequests: number;
     /** DEF-129: Guard が通した main frame の文書の要求の数、T37R2-fix で子の frame の文書の要求の数、DEF-130-fix で文書でない要求の数。 */
     readonly requestCounts: PageRequestCounts;
@@ -261,6 +287,54 @@ interface CrawlResult {
   readonly sessionLoss: SessionLossEvidence | null;
   /** DEF-144: 違反で止まったときの違反の中身（なければ `null`）。 */
   readonly safetyViolation: JobSafetyViolation | null;
+  /** OP-J（J1）: 読んだ画面の数の上限（成果物の `maxPages`。先に読む登録の画面の数と `crawl.maxPages` の和）。 */
+  readonly maxPages: number;
+}
+
+/**
+ * OP-J（J1）: 直前の点検の段の成果物（`readAuditStageLinks`。ページの ID の順、リンクは文書の順）から、登録の画面らしいリンク（`isCreatePageLink`）の
+ * 正規化した URL を、見つけた順に重なりなく返す。正規化し直し（`normalizeUrl`。許す query の名前は設定のもの）、許可 Origin の外と、巡回の候補の除外
+ * （`isExcludedCrawlCandidate`。読まないパス・危険な語・読む範囲・セッションの切れの path）に当たるものは外す。読めないファイル・形の違うファイルは飛ばす
+ * （読む先がなければ、呼ぶ側が今どおりに巡回する）。
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R2）: 登録の画面ごとに、その 1 つ上の一覧の画面（`readListPagePathOf`）も、点検の段の
+ * リンクにあるときだけ（同じ正規化した URL。同じ除外の判定）、登録の画面の直後に入れる。呼ぶ側は、この並びの先頭から上限（`MAX_CHAINED_CREATE_PAGE_READS`）まで
+ * 読む（一覧の画面も上限の中に数える）。
+ */
+export async function chainedCreatePageUrlsOf(
+  auditRunDirectory: string,
+  options: {
+    readonly allowedQueryParameters: ReadonlySet<string>;
+    readonly allowedOrigins: ReadonlySet<string>;
+    readonly authentication: Pick<RunAuthentication, 'auditExclusions' | 'sessionLostPathPrefix'>;
+  },
+): Promise<readonly NormalizedHttpUrlEvidence[]> {
+  const usable = (url: string): NormalizedHttpUrlEvidence | null => {
+    const normalized = normalizeUrl(url, url, options.allowedQueryParameters);
+    return normalized.ok && isOriginInAllowedOrigins(options.allowedOrigins, new URL(normalized.url).origin)
+      && !isExcludedCrawlCandidate(normalized.url, options.allowedOrigins, options.authentication) ? normalized.url : null;
+  };
+  const links = await readAuditStageLinks(auditRunDirectory);
+  const linked = new Set(links.flatMap((link) => {
+    const url = usable(link.url);
+    return url === null ? [] : [url];
+  }));
+  const found = new Set<NormalizedHttpUrlEvidence>();
+  for (const link of links) {
+    const normalized = normalizeUrl(link.url, link.url, options.allowedQueryParameters);
+    const url = usable(link.url);
+    if (!normalized.ok || url === null || !isCreatePageLink({ ...link, normalized })) {
+      continue;
+    }
+    found.add(url);
+    // OP-R（R2）: 一覧の画面（点検の段のリンクにあるときだけ）。
+    const created = new URL(url);
+    const listPath = readListPagePathOf(created.pathname);
+    const list = listPath === null ? null : usable(`${created.origin}${listPath}`);
+    if (list !== null && linked.has(list)) {
+      found.add(list);
+    }
+  }
+  return [...found];
 }
 
 /** 発見の巡回（ファイルの先頭の 2〜5）。 */
@@ -290,6 +364,13 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
   // DEF-141: 監査の段の口があれば、承認したサービスの Origin への要求の 1 分あたりの上限で、次の画面の読み込みの前に待つ（Run Coordinator と共用する部品。
   // 待つたびに知らせる）。口がなければ、今の pacer のまま。
   const pacer = serviceRequestPacedNavigationPacer(intervalPacer, auditStage, sleep, (notice) => observer.onNotice?.(notice));
+  const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
+  // OP-J（J1）: まとめて実行の連鎖では、直前の点検の段が見つけた登録の画面らしいリンクを、上限まで先に読む（ページの上限とは別に数える）。
+  const chainedCreatePages: ReadonlySet<string> = new Set(request.chainedAuditRunDirectory === undefined
+    ? []
+    : (await chainedCreatePageUrlsOf(request.chainedAuditRunDirectory, { allowedQueryParameters, allowedOrigins: crawlAllowedOrigins, authentication }))
+      .slice(0, MAX_CHAINED_CREATE_PAGE_READS));
+  const maxPages = chainedCreatePages.size + config.crawl.maxPages;
   const preflight = await runPreflight({
     config,
     launchBrowser: request.launchBrowser,
@@ -309,15 +390,21 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
       auditStage,
       sessionLoss: null,
       safetyViolation: null,
+      maxPages,
     };
   }
   const { browser, factory } = preflight;
   try {
-    const crawlAllowedOrigins: ReadonlySet<string> = new Set(config.site.allowedOrigins);
     const linkPolicy = { allowedOrigins: crawlAllowedOrigins, allowedQueryParameters };
     const classificationPolicy = { allowedOrigins: new Set(authentication.approvedTestOrigins) };
     const frontier = new CrawlFrontier(config.crawl.maxDepth, new IdAllocator());
+    // OP-J（J1）: 登録の画面を先に読む（待ち行列の先頭）。続けて入口から。
+    for (const url of chainedCreatePages) {
+      frontier.discover(url as NormalizedHttpUrlEvidence, 0, { preferred: true });
+    }
     frontier.discover(start.url, 0);
+    /** OP-J（J1）: 入口からの巡回で読んだ画面の数（先に読んだ登録の画面は数えない。ページの上限と比べる）。 */
+    let crawledPages = 0;
     /** 除外に当たったリンク（見つけた順。重複なし）。 */
     const excluded = new Set<string>();
     const readPages: DiscoveryPageEntry[] = [];
@@ -344,7 +431,7 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
         endReason = 'STOPPED';
       } else if (now() - startedAtMs >= config.crawl.maxRuntimeMs) {
         endReason = 'MAX_RUNTIME_REACHED';
-      } else if (readPages.length >= config.crawl.maxPages) {
+      } else if (!chainedCreatePages.has(entry.url) && crawledPages >= config.crawl.maxPages) {
         endReason = 'MAX_PAGES_REACHED';
       }
       if (endReason !== 'COMPLETED') {
@@ -378,6 +465,10 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
       }
       if (visit.kind === 'READ') {
         frontier.markFinished(entry.url, 'AUDITED');
+        const chainedCreatePage = chainedCreatePages.has(entry.url);
+        if (!chainedCreatePage) {
+          crawledPages += 1;
+        }
         // 画面の記録は、成果物の形（`DiscoveryReadPageRecord`。発見の入口が返す型と同じ 1 つの型。CC-070 (a)）のまま入る。
         const record: DiscoveryReadPageRecord = visit.record;
         readPages.push({
@@ -390,12 +481,14 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
           ...(continued === null ? {} : { safetyViolations: continued.safetyViolations }),
           ...(continued?.reloaded === true ? { reloadedForProbe: true } : {}),
         });
-        for (const link of visit.links) {
+        // OP-J（J1）: 先に読んだ登録の画面のリンクはたどらない（入口が登録の画面のときは、入口としてたどる）。
+        for (const link of chainedCreatePage && entry.url !== start.url ? [] : visit.links) {
           if (isExcludedCrawlCandidate(link, crawlAllowedOrigins, authentication)) {
             excluded.add(link);
             continue;
           }
-          frontier.discover(link, entry.depth + 1);
+          // OP-I（I2）: 登録の画面らしいリンクを先に読む（読む範囲・上限・間隔は変えない。除外に当たるリンクは上で読まない）。
+          frontier.discover(link, entry.depth + 1, { preferred: visit.preferredLinks.has(link) });
         }
       } else {
         frontier.markFinished(entry.url, 'FAILED');
@@ -450,6 +543,7 @@ async function crawl(request: DiscoveryRunRequest, outputDirectory: string, obse
       sessionLoss,
       // DEF-144: 違反で止まったときだけ（ほかの終わり方では、違反の中身を書かない）。
       safetyViolation: endReason === 'SAFETY_VIOLATION' ? stopViolation : null,
+      maxPages,
     };
   } finally {
     await closeBrowserBeforeDeadline(browser);
@@ -502,10 +596,12 @@ async function visitPage(
     stopIfSessionLostAfterSettling();
     const base = options.reprobe?.record ?? discovered;
     let links: readonly NormalizedHttpUrlEvidence[] = [];
+    let preferredLinks: ReadonlySet<string> = new Set();
     if (options.reprobe === undefined) {
       try {
         const found = await discoverLinks(page, options.pageId, options.linkPolicy);
         links = internalNavigableUrlsOf(found.links);
+        preferredLinks = new Set(found.links.flatMap((link) => (isCreatePageLink(link) && link.normalized.ok ? [link.normalized.url] : [])));
       } catch {
         // リンクを読めなければ、その画面からは先へ進まない（読み込みを足して読み直さない）。
       }
@@ -547,7 +643,7 @@ async function visitPage(
       maxPresses: options.reprobe?.maxPresses,
     });
     settleCulprit();
-    return { record, links };
+    return { record, links, preferredLinks };
   });
   const safetyOf = (violation: boolean): PageVisitSafety => ({ violation, safetyViolation: violation ? safety.violation : null });
   switch (visit.kind) {
@@ -566,6 +662,7 @@ async function visitPage(
           kind: 'READ',
           record: pageLoadIncompleteReasonsOf(visit.pageLoad).reduce(withIncompleteReason, refusedRecord),
           links: visit.value.links,
+          preferredLinks: visit.value.preferredLinks,
           blockedRequests: visit.blockedRequests,
           requestCounts: pageRequestCountsOf(visit.pageLoad),
           probe: { culprit: probe.culprit, pressed: probe.pressed },
@@ -700,7 +797,7 @@ export async function executeDiscoveryRun(request: DiscoveryRunRequest, observer
       finishedAt: formatCompactUtcTimestamp(request.clock(), DISCOVERY_TIME_SUBJECT),
       runStatus: discoveryRunStatusOf(crawled),
       endReason: crawled.endReason,
-      maxPages: config.crawl.maxPages,
+      maxPages: crawled.maxPages,
       pages: crawled.pages,
       omittedUnreadPages: crawled.omittedUnreadPages,
       // T37a: 鍵の消失の詳しい理由と、監査の段の数（ブラウザを閉じた後の数。口がなければ書かない）。

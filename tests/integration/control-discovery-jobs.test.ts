@@ -238,9 +238,11 @@ describe('discovery jobs (T27d): the start', () => {
   });
 
   // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、認証の設定を保存して、発見の
-  // ジョブを始められる（確かめは認証つきの読み取りの監査と同じ）。認証つきの監査（`AUDIT`）は、今までどおり `MODE_NOT_EXECUTABLE` で、ワーカーを
-  // 起動しない。
-  it('saves the auth setup of a write mode profile, starts its DISCOVERY job, and still rejects its AUDIT (T28b)', async () => {
+  // ジョブを始められる（確かめは認証つきの読み取りの監査と同じ）。手動のログインなので、ログインの確かめは方式の理由で拒み、ワーカーを起動しない。
+  // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 認証つきの監査（`AUDIT`）は、書き込みのモードでも始められるようになったので、
+  // ここで拒むことは確かめない（書き込みのモードの監査の開始の確かめは `control-audit-jobs.test.ts`、読み取りだけであることは
+  // `write-mode-audit-read-only.test.ts`）。
+  it('saves the auth setup of a write mode profile, starts its DISCOVERY job, and rejects its LOGIN_CHECK (T28b)', async () => {
     expect(createProfile(database, testWriteProfile(WRITE_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
     expect(saveAuthSetup(database, { ...SETUP, profileId: WRITE_PROFILE_ID }, { resolveContext: resolveTestContext })).toMatchObject({ ok: true });
     const ended = await runDiscoveryJob('write-mode', okDocument([readEntry('/admin', [BUTTON])]), 'discovery', countingFork, WRITE_PROFILE_ID);
@@ -249,8 +251,6 @@ describe('discovery jobs (T27d): the start', () => {
       .toMatchObject({ jobKind: 'DISCOVERY', authentication: { approvedTestOrigins: [TEST_ORIGIN] } });
     expect(readDiscoveryIndex(database, WRITE_PROFILE_ID).candidates.map(({ identityDigest }) => identityDigest)).toEqual([BUTTON.identityDigest]);
     expect(forks.count()).toBe(1);
-    expect(await manager?.startAuditJob({ profileId: WRITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION, startNew: true }))
-      .toEqual({ ok: false, reason: 'MODE_NOT_EXECUTABLE', errors: [] });
     expect(await manager?.startLoginCheck({ profileId: WRITE_PROFILE_ID, expectedRevision: MIN_PROFILE_REVISION }))
       .toEqual({ ok: false, reason: 'AUTH_STRATEGY_NOT_EXECUTABLE', errors: [] });
     expect(forks.count()).toBe(1);

@@ -310,7 +310,7 @@ const saveDefinition = async (
     .then(async () => page.getByTestId('read-check-rejection').getAttribute('data-reason'));
   const reason = await Promise.race([saved, rejected]);
   if (reason === null) {
-    await page.getByTestId('read-check-definition').first().waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.getByTestId('read-check-definition').first().waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     await snapshot(page);
     const all = await page.getByTestId('read-check-definition').evaluateAll((rows) => rows.map((element) => element.getAttribute('data-read-check-id') ?? ''));
     definitionIds.set(profileId, all);
@@ -353,7 +353,7 @@ const createDefinitions = async (profileId: string, sendValue: string, rejectedV
 const readCheckResultsOf = async (profileId: string, jobId: string): Promise<readonly string[]> => {
   const page = await openPage(`/read-checks/${profileId}`);
   const results = page.locator(`[data-testid="read-check-result"][data-job-id="${jobId}"]`);
-  await results.first().waitFor({ timeout: UI_TIMEOUT_MS });
+  await results.first().waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
   await snapshot(page);
   return (await results.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-result') ?? ''))).sort();
 };

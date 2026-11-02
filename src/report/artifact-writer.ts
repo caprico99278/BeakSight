@@ -50,6 +50,7 @@ import {
   ACTION_EVIDENCE_ARTIFACT_FILE_NAME,
   ACTION_REPORT_ARTIFACT_FILE_NAME,
   APPROVAL_SUMMARY_ARTIFACT_FILE_NAME,
+  REPORT_SUMMARY_ARTIFACT_FILE_NAME,
   RUN_ARTIFACT_FILE_NAMES,
   actionBundleFileName,
   artifactFilePath,
@@ -101,6 +102,7 @@ import { deriveRunStatus, requiredArtifactInvalidReason, type RunStatusInput } f
 import { isTemporaryFileName, temporaryPathFor } from '../core/temporary-file-name.js';
 import { compareCodeUnits } from '../core/text.js';
 import { redactRecordedRequestUrlsInValue, redactUrlSecretsInValue, type RecordedRequestUrlRedactionOptions } from '../safety/redact.js';
+import { reportSummaryBytesOf, type ReportSummaryDocument } from './report-summary.js';
 
 /** audit.json の `schemaVersion`（`schemas/audit.schema.json`）。 */
 export const AUDIT_ARTIFACT_SCHEMA_VERSION = 'audit-schema/1.0';
@@ -181,6 +183,11 @@ export interface ArtifactWriteResult {
 export interface RunPresentationFiles {
   /** `report.html` の中身。改行は LF にして、UTF-8 で書く。 */
   readonly reportHtml?: string;
+  /**
+   * PL-R（plain UI の設計書 14 章、13 章の 13）: 報告の小さなまとめ（`report-summary.json`。`reportSummaryDocumentOf` で、報告と同じ表示用モデルから作ったもの）。
+   * 成果物の JSON の書式（`reportSummaryBytesOf`）で書く。
+   */
+  readonly reportSummary?: ReportSummaryDocument;
   /**
    * ChatGPT 用バンドル（`beaksight-audit-bundle_YYYYMMDDHHmmss.zip`。画面のジョブは `beaksight-audit-bundle_<名前の部分>_YYYYMMDDHHmmss.zip`。
    * ChatGPT 用バンドルのファイル名の設計書 2.1、2.2。PRE42-BN）。
@@ -951,7 +958,8 @@ export class ArtifactWriter {
   }
 
   /**
-   * 表示用モデルから作ったファイル（`report.html`、ChatGPT 用バンドル）を、`writeRun` が書いた Run のディレクトリに書く。
+   * 表示用モデルから作ったファイル（`report.html`、報告の小さなまとめ `report-summary.json`（PL-R）、ChatGPT 用バンドル）を、`writeRun` が書いた Run の
+   * ディレクトリに書く。
    * 与えられたものだけを、この順に、一時ファイルと rename で書く。書いたファイルの相対パスを返す。入出力の失敗は
    * `ArtifactWriteError` を投げる。
    * - バンドルの名前は、`bundle.lastExecutionFinishedAt`（最後の実行の終わりの時刻）と `bundle.profileName`（画面のジョブのプロファイルの名前。
@@ -978,6 +986,14 @@ export class ArtifactWriter {
     if (files.reportHtml !== undefined) {
       await writeFileAtomically(artifactFilePath(written.runDirectory, RUN_ARTIFACT_FILE_NAMES.report), toLf(files.reportHtml), this.#rename);
       writtenFiles.push(RUN_ARTIFACT_FILE_NAMES.report);
+    }
+    if (files.reportSummary !== undefined) {
+      await writeFileAtomically(
+        artifactFilePath(written.runDirectory, REPORT_SUMMARY_ARTIFACT_FILE_NAME),
+        reportSummaryBytesOf(files.reportSummary),
+        this.#rename,
+      );
+      writtenFiles.push(REPORT_SUMMARY_ARTIFACT_FILE_NAME);
     }
     if (bundle !== null) {
       await writeFileAtomically(artifactFilePath(written.runDirectory, bundle.name), bundle.bytes, this.#rename);

@@ -72,7 +72,25 @@ export interface SiteProfile {
    * 項目のないプロファイルの文書は今のまま。
    */
   readonly approvedServiceOrigins?: readonly string[];
+  /**
+   * OP-1 の修正の 1 回目（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: ログインのしかたの希望（任意の項目。省けば `AUTOMATIC`。
+   * `loginPreferenceOf` で読む）。`MANUAL_EVERY_TIME` なら、自動ログインのプロファイルでも毎回手でログインし、手でのログインの値を受け取らない（今ある資格情報の
+   * ファイルは消さない）。版を上げずに足した項目なので、項目のないプロファイルの文書は今のまま。
+   */
+  readonly loginPreference?: LoginPreference;
 }
+
+/** OP-1: ログインのしかたの希望（閉じた一覧。先頭が既定）。 */
+export const LOGIN_PREFERENCES = Object.freeze(['AUTOMATIC', 'MANUAL_EVERY_TIME'] as const);
+export type LoginPreference = (typeof LOGIN_PREFERENCES)[number];
+/** OP-1: 既定（自動ログイン）。 */
+export const AUTOMATIC_LOGIN_PREFERENCE = 'AUTOMATIC' satisfies LoginPreference;
+/** OP-1: 毎回手でログインする。 */
+export const MANUAL_EVERY_TIME_LOGIN_PREFERENCE = 'MANUAL_EVERY_TIME' satisfies LoginPreference;
+
+/** OP-1: プロファイルのログインのしかたの希望（項目がなければ既定 `AUTOMATIC`）。 */
+export const loginPreferenceOf = (profile: Pick<SiteProfile, 'loginPreference'>): LoginPreference =>
+  profile.loginPreference ?? AUTOMATIC_LOGIN_PREFERENCE;
 
 /** プロファイルの検証で拒否するときのコード（閉じた一覧。設計書 4.4）。表示の文言は Task 23 の表示カタログに置く。 */
 export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
@@ -90,6 +108,9 @@ export const PROFILE_VALIDATION_ERROR_CODES = Object.freeze([
   'PROFILE_SERVICE_ORIGIN_INVALID',
   // T34a: 承認したサービスの Origin が、ターゲット設定の `site.allowedOrigins` に入っている（テスト環境の Origin と重ねない）。
   'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET',
+  // PL-F 修正の 1 回目（PL-REV の Minor 2）: 環境の証跡の参照が秘密に見える（判定は `src/core/secret-like-text.ts` の `isSecretLikeText`）。
+  // 「書き込みも試す」の切り替えの拒否の理由と同じコード。
+  'ISOLATION_REFERENCE_SECRET_LIKE',
 ] as const);
 export type ProfileValidationErrorCode = (typeof PROFILE_VALIDATION_ERROR_CODES)[number];
 

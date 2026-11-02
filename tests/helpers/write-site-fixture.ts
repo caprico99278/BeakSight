@@ -35,6 +35,9 @@
 //   `js-enable-disabled` で、送信の前にページの JS が、それぞれをチェックする・選び直す・有効にして値を入れる（T31R2 の E8 の形）。
 //   `setSecretHiddenFields(true)` の間は、秘密に見える名前の一覧に当たる一般の名前の hidden（`code`・`key`）も出す。readonly の `code` は、秘密に
 //   見える名前なので `serial` に変えた。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。FV-0 の自前のサイトの場面を足した。既存の画面は変えない）: 登録せずに同じ登録の form を
+//   誤りの文と一緒に返す形（`input-error-form`・`input-error-form-422`・`input-error-form-cleared`・`input-error-form-js`）、一覧が 503 を返す形
+//   （`list-unavailable`）、更新せずに同じ更新の form を返す形（`setUpdateMode` の `input-error-form`）。
 // - ログイン（本物のワーカーの手動のログインの段のため。T30f）: GET `/login` はログインの form（欄 `#user`・`#pass`、送るボタン `#go`）。POST `/login`
 //   は、fixture が作った仮の資格情報（`fillCredentials` で入れる）に合えば、セッションの Cookie を付けて一覧（`/members`）へ 303。合わなければ
 //   ログインの画面へ 303。
@@ -48,6 +51,8 @@ const STATUS_OK = 200;
 const STATUS_SEE_OTHER = 303;
 const STATUS_TEMPORARY_REDIRECT = 307;
 const STATUS_TOO_MANY_REQUESTS = 429;
+const STATUS_UNPROCESSABLE_CONTENT = 422;
+const STATUS_SERVICE_UNAVAILABLE = 503;
 const STATUS_INTERNAL_SERVER_ERROR = 500;
 const STATUS_NOT_FOUND = 404;
 /** 最初の登録の ID。 */
@@ -104,7 +109,20 @@ export const WRITE_SITE_MODES = Object.freeze([
   // T40R-fix-A2（設計書 7 章の「T40R-fix-A・B の報告」）: 登録の後に書き込みの画面（`/members/new`）へ戻し、その画面に登録の印（`.registered`）を出す
   // （成功の条件に当たる画面が書き込みの画面のままで、その path が ID の型 `/members/{id}` に当たる形）。
   'stay-on-form',
+  // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。FV-0 の自前のサイトの場面）: 登録せずに、同じ登録の form を誤りの文と一緒に返す形。
+  // `input-error-form` は 200 で送った値を保ち、`input-error-form-422` は 422 で送った値を保ち、`input-error-form-cleared` は 200 で値を消す。
+  // `input-error-form-js` は 200 の空の画面を返し、ページの JS が同じ Origin の GET（`WRITE_SITE_ERROR_FRAGMENT_PATH`）で、送った値を保った form を
+  // 後から描く。
+  'input-error-form',
+  'input-error-form-422',
+  'input-error-form-cleared',
+  'input-error-form-js',
+  // PL-6a: 一覧（照合の READ の対象）が 503 を返す形（送る前の答え合わせを判定できない）。
+  'list-unavailable',
 ] as const);
+
+/** PL-6a: `input-error-form-js` の、ページの JS が後から読む誤りの form の path（GET）。 */
+export const WRITE_SITE_ERROR_FRAGMENT_PATH = '/members/error-form';
 
 /** T30R2-fix-1（M-b）: `js-navigate-slow` の応答の遅れ（ms。結果を待つ上限より短く、ページの JS の移動より十分長い）。 */
 export const WRITE_SITE_SLOW_RESPONSE_MS = 1_500;
@@ -138,6 +156,8 @@ export const WRITE_SITE_UPDATE_MODES = Object.freeze([
   'js-hidden-checkbox',
   'js-hidden-select',
   'js-enable-disabled',
+  // PL-6a（設計書 8.1）: 更新せずに、同じ更新の form を、送った値を保って誤りの文と一緒に 200 で返す形。
+  'input-error-form',
 ] as const);
 export type WriteSiteUpdateMode = (typeof WRITE_SITE_UPDATE_MODES)[number];
 
@@ -332,6 +352,19 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
         : `<script>for (let i = 0; i < ${serviceReads.count}; i += 1) fetch('${serviceReads.origin}/rest/v1/m' + i).catch(() => 0);</script>`);
   };
 
+  /** PL-6a: `input-error-form-js` で、ページの JS が後から読む誤りの form の値（最後に受けた登録の本文）。 */
+  let lastRejectedBody = '';
+  /**
+   * PL-6a: 登録の form（既定の画面と同じ form）を、誤りの文と一緒に作る。`fields` があれば、名前とメールの欄に送った値を入れる（保つ）。既定の画面は
+   * 変えない（文字列を差し替えた写しを作る）。
+   */
+  const errorFormHtml = (fields: URLSearchParams | null): string => {
+    const valueOf = (name: string): string => (fields === null ? '' : ` value="${escapeHtml(fields.get(name) ?? '')}"`);
+    return '<p class="error">入力に誤りがあります</p>' + formHtml(false)
+      .replace('<input name="name" id="name" required>', `<input name="name" id="name" required${valueOf('name')}>`)
+      .replace('<input type="email" name="email" id="email">', `<input type="email" name="email" id="email"${valueOf('email')}>`);
+  };
+
   const newMember = (id: number, name: string, email: string | null = null): (typeof members)[number] => ({
     id, name, email: email === null || email.length === 0 ? WRITE_SITE_MEMBER_DEFAULTS.email : email, note: keptMarker, newsletter: true,
     active: WRITE_SITE_MEMBER_DEFAULTS.active, published: true, updates: 0, editGets: 0,
@@ -385,6 +418,11 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
   /** T31g-2: 更新の送信先の応答（送った値で会員を書き換え、形に応じてサーバが別の欄も変える）。 */
   const update = (response: ServerResponse, member: (typeof members)[number], body: string): void => {
     const fields = new URLSearchParams(body);
+    if (updateMode === 'input-error-form') {
+      // PL-6a: 更新せずに、同じ更新の form を、送った名前を保って誤りの文と一緒に返す（写しで描く。会員の値は変えない）。
+      sendHtml(response, `<p class="error">入力に誤りがあります</p>${updateFormHtml({ ...member, name: fields.get('name') ?? member.name })}`);
+      return;
+    }
     member.name = fields.get('name') ?? member.name;
     member.email = fields.get('email') ?? member.email;
     member.note = fields.get('note') ?? member.note;
@@ -430,6 +468,20 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
     switch (mode) {
       case 'input-error':
         sendHtml(response, '<h1>会員の登録</h1><p class="error">入力に誤りがあります</p>');
+        return;
+      case 'input-error-form':
+        sendHtml(response, errorFormHtml(new URLSearchParams(body)));
+        return;
+      case 'input-error-form-422':
+        sendHtml(response, errorFormHtml(new URLSearchParams(body)), STATUS_UNPROCESSABLE_CONTENT);
+        return;
+      case 'input-error-form-cleared':
+        sendHtml(response, errorFormHtml(null));
+        return;
+      case 'input-error-form-js':
+        lastRejectedBody = body;
+        sendHtml(response, '<div id="slot"></div><script>fetch(' + `'${WRITE_SITE_ERROR_FRAGMENT_PATH}'`
+          + ").then((r) => r.text()).then((html) => { document.getElementById('slot').innerHTML = html; });</script>");
         return;
       case 'rate-limited':
         sendHtml(response, '<p>too many requests</p>', STATUS_TOO_MANY_REQUESTS);
@@ -565,7 +617,18 @@ export async function startWriteSite(options: WriteSiteOptions = {}): Promise<Wr
       }
     }
     if (request.method === 'GET' && url.pathname === p.list) {
+      // PL-6a: `list-unavailable` の間は、一覧（照合の READ の対象）が 503 を返す。
+      if (mode === 'list-unavailable') {
+        sendHtml(response, '<p>unavailable</p>', STATUS_SERVICE_UNAVAILABLE);
+        return;
+      }
       sendHtml(response, listHtml(url));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === WRITE_SITE_ERROR_FRAGMENT_PATH) {
+      // PL-6a: `input-error-form-js` のページの JS が読む、送った値を保った誤りの form（HTML の断片）。
+      response.writeHead(STATUS_OK, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      response.end(errorFormHtml(new URLSearchParams(lastRejectedBody)));
       return;
     }
     if (request.method === 'GET' && url.pathname === p.done) {

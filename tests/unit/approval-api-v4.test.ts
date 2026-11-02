@@ -77,8 +77,8 @@ const API_ITEMS = [
 const FORM_V3_DIGEST = 'sha256:f1d363c24e761a844bd54a540f2d39769201813176a94b484b91410eb0f269c0';
 
 describe('T38c: the approval digest v4', () => {
-  it('has the format beaksight-approval/4 and the API items at the end of the items', () => {
-    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/4');
+  it('has the format beaksight-approval/5 (PL-6a; v4 added the API items) and the API items at the end of the items', () => {
+    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/5');
     expect(APPROVAL_DIGEST_ITEMS.slice(-API_ITEMS.length)).toEqual([...API_ITEMS]);
     expect(APPROVAL_DIGEST_ITEMS.slice(0, -API_ITEMS.length)).toContain('updateTemplatedIdentityDigest');
   });
@@ -116,13 +116,14 @@ describe('T38c: the approval digest v4', () => {
 
   // LG-3（2026-10-24 の設計 3.7.2）: シナリオの版の前の形を捨てる前のコードで求めた、API の登録と更新の見本の値（捨てた後も変わらない）。
   it('keeps the digest values of the API CREATE and the API UPDATE samples (fixed values, LG-3)', () => {
-    expect(computeApprovalDigest(apiScenario(), DIGEST_FACTS)).toBe('sha256:48c194c26e2df556662352849bdd783255c6f751ca507fbfb77b8b730a2c703d');
+    // PL-6a: 印を v5 に上げたので、値を求め直した（API の項目の値は変わらない）。
+    expect(computeApprovalDigest(apiScenario(), DIGEST_FACTS)).toBe('sha256:55394b7393f0cbd2dd924da992f016896f8b7541d2e53fe1cc164732c50e9588');
     const update = apiScenario({
       request: { ...API_SPEC.request, method: 'PATCH' }, filterName: 'id', recordId: null,
       ledger: { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members/{id}/edit' }, keptKeys: [API_SPEC.keyFields[1] as never],
       templatedIdentityDigest: `sha256:${'e'.repeat(64)}`,
     }, { kind: 'UPDATE', update: null, fieldNames: ['email'] });
-    expect(computeApprovalDigest(update, DIGEST_FACTS)).toBe('sha256:2c28aa37ab3645515dee74bbf397c6e105db9cd2124b51902e6ae6ccb330437b');
+    expect(computeApprovalDigest(update, DIGEST_FACTS)).toBe('sha256:6eb495422da03b1f01b91b1a3addc182b7ba94edfee39ca834feae0cc4b0c103');
   });
 
   const UPDATE_LEDGER = { targetCreateScenarioId: 'scenario-ledger', formPathTemplate: '/admin/members/{id}/edit' };

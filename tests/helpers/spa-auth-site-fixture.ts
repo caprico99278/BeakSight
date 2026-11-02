@@ -32,6 +32,10 @@
 // - T44c（Task 44 の設計書 P1-1〜P1-4 の測り。実テスト環境の形）: 任意の指定 `innerScrollList`（一覧の内側のスクロールの領域）、`serviceReadOnList`（一覧の後の
 //   サービスへの読み取り）、`closingBeacon`（閉じるときの計測の送信）、`crowdedEditScreen`（押す候補の多い更新の画面）、`createSaveInDialog`（登録の画面だけ
 //   ダイアログの中の保存）。指定のないときの画面と振る舞いは変えない。
+// - OP-K（K3。本物のテスト環境の形）: 任意の指定 `deferredLoginForm`（ログインの画面の欄を、遅れて答える画面の設定を読んだ後に描く）。指定のないときの画面と
+//   振る舞いは変えない。
+// - OP-O（O2。本物のテスト環境の形）: 切り替え `setMemberInputQuirk`（form のない会員の画面の、値を入れるときの振る舞い。`SPA_MEMBER_INPUT_QUIRKS`）。指定のない
+//   ときの画面と振る舞いは変えない。
 import { createHash } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -74,6 +78,8 @@ export const SPA_APP_PATHS = Object.freeze({
   script: '/app.js',
   /** `rumBeacon`: 配信の側の計測の送信（アプリと同じ Origin への POST。204）。 */
   rum: '/cdn-cgi/rum',
+  /** OP-K（`deferredLoginForm`）: ログインの画面が、欄を描く前に読む画面の設定（GET。サーバは `SPA_DEFERRED_LOGIN_FORM_DELAY_MS` だけ遅らせて `{}` を返す）。 */
+  appConfig: '/app-config.json',
 } as const);
 
 /** アプリの更新の画面のパス（`/admin/members/<id>/edit`）。 */
@@ -91,7 +97,55 @@ export const SPA_BACKEND_PATHS = Object.freeze({
   /** `postLoginFunction`: ログインの成功の直後に出す、サーバの関数の呼び出し（状態を変える処理の形。Bearer が要る）。 */
   functionSyncAccess: '/functions/v1/sync_access',
   realtime: '/realtime/v1/websocket',
+  /** OP-M（`setMemberSideRequestsOnInput`）: 入力の事象で出す、入力の確かめの読み取りの手続きの呼び出し（POST。本文に入れた値を持つ）。 */
+  rpcCheckMemberEmail: '/rest/v1/rpc/check_member_email',
+  /** OP-Q（`setMemberDetailRpcRead`）: 会員の詳細の画面が、データを取る手続きの呼び出し（POST。本文に `{ id }`。本物のテスト環境の SPA の形）。 */
+  rpcGetMember: '/rest/v1/rpc/get_member',
 } as const);
+
+/** OP-M（`setMemberSideRequestsOnInput`）: 入力の事象で、承認していない Origin（`otherOrigin`）へ出す、使われ方の記録の path（GET）。 */
+export const SPA_OTHER_COLLECT_PATH = '/collect';
+
+/**
+ * OP-N（`setMemberAutoRequests`）: form のない登録の画面のスクリプトが自動で出す通信の path（バックエンドの手続きの呼び出し・プレビューの片付けの DELETE、承認して
+ * いない Origin の外のスクリプト）。
+ */
+export const SPA_AUTO_REQUEST_PATHS = Object.freeze({
+  rpcStatus: '/rest/v1/rpc/auto_status',
+  previews: '/rest/v1/previews',
+  widget: '/widget.js',
+  /** OP-REV3（C-1・I-1）: 承認した送信先の、形を変えた path（末尾の `/`）。 */
+  membersTrailingSlash: `${SPA_BACKEND_PATHS.members}/`,
+  /** OP-REV3（C-1）: 承認していない Origin への、no-cors の POST の送り先。 */
+  outsideCollect: '/collect-post',
+  /** OP-REV3（C-2）: 押した後に、値をヘッダか Cookie に持って送る、アプリの Origin の送り先。 */
+  appSync: '/api/auto-sync',
+} as const);
+
+/** OP-REV3（C-2）: 押した後の要求で、入れた値を持たせるヘッダの名前と、Cookie の名前。 */
+export const SPA_AUTO_DRAFT_HEADER = 'x-client-draft';
+export const SPA_AUTO_DRAFT_COOKIE = 'client_draft';
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1・N2。本物のテスト環境の形）: form のない登録の画面のスクリプトが自動で出す通信の形
+ * （`setMemberAutoRequests`）。
+ * - `AFTER_FILL_READS`: 3 つの欄がそろった入力の事象で、値を含まない読み取り（アプリの Origin の GET）と、realtime の WebSocket の張り直しを 1 回ずつ出す。
+ * - `AFTER_FILL_MARKER_POST`・`AFTER_FILL_PLAIN_POST`・`AFTER_FILL_MARKER_GET`: 同じ時機に、メールアドレスの値を本文に持つ POST、値のない POST、メールアドレスの
+ *   値を query に持つ GET を 1 回出す。
+ * - `BEFORE_FILL`: 画面を開いた直後（値を入れる前）に、手続きの呼び出しの POST、プレビューの片付けの DELETE、承認していない Origin の外のスクリプトを 1 回ずつ出す。
+ * - `AFTER_PRESS`: 保存の応答の後に、値のない手続きの呼び出しの POST、メールアドレスの値を本文に持つ POST、値をヘッダに持つ POST、値を Cookie に持つ POST を
+ *   1 回ずつ出す（OP-REV3 の C-2）。
+ * - `BEFORE_FILL_ENDPOINT`（OP-REV3 の C-1・I-1）: 画面を開いた直後に、承認した送信先の形を変えた path（末尾の `/`）への値のない POST と、承認していない Origin への
+ *   no-cors の POST を 1 回ずつ出す。
+ */
+export type SpaMemberAutoRequests =
+  | 'AFTER_FILL_READS'
+  | 'AFTER_FILL_MARKER_POST'
+  | 'AFTER_FILL_PLAIN_POST'
+  | 'AFTER_FILL_MARKER_GET'
+  | 'BEFORE_FILL'
+  | 'BEFORE_FILL_ENDPOINT'
+  | 'AFTER_PRESS';
 
 /** token の `grant_type`。 */
 export const SPA_GRANT_TYPES = Object.freeze({ password: 'password', refresh: 'refresh_token', other: 'pkce' } as const);
@@ -254,6 +308,32 @@ export const SPA_DIALOG_OPEN_BUTTON = Object.freeze({ id: 'open-member-dialog', 
  */
 export const SPA_HOSTILE_MEMBER_INPUTS = Object.freeze(['duplicateName', 'duplicateSubmit', 'rewriteOnInput', 'hiddenField', 'linkWrappedSubmit'] as const);
 export type SpaHostileMemberInput = (typeof SPA_HOSTILE_MEMBER_INPUTS)[number];
+/**
+ * OP-O（O2。本物のテスト環境の、React などで作られているとみられる SPA の形）: form のない会員の画面のスクリプトが、値を入れるときに見せる振る舞い
+ * （`setMemberInputQuirk`。省略は今のまま）。
+ * - `rerenderOnFirstInput`: 最初の入力の事象で、欄を作り直す（React の再描画。値は保つ。保存のボタンは作り直さない）。
+ * - `rerenderOnEveryInput`: 入力の事象のたびに、欄を作り直す（入れ直しても落ち着かない形）。
+ * - `revertOnFirstInput`: 欄ごとに、最初の入力の事象の値を、ページの状態の値（空）に戻す（制御された入力。状態の準備の前の入力を受けない）。
+ * - `clearOnEveryInput`: 入力の事象のたびに、値を空に戻す（入れ直しても受けない形）。
+ * - `numberField`: 数の欄（`SPA_NUMBER_FIELD`。type=number、min・max・step）を足し、入力の事象のたびに値を数の形に整える（`String(Number(value))`）。
+ * OP-P（P1・P2。本物のテスト環境の形）: 3 つの欄（名前・メールアドレス・備考）がそろった入力の事象の後、`SPA_AFTER_FILL_RERENDER_MS` だけ遅れて、1 回だけ
+ * 作り直す（React の再描画。値を入れ終えた後、押す前に起きる）。
+ * - `rerenderSaveAfterFill`: 保存のボタンを作り直す（押せる状態への切り替え。同じ形のボタンに、同じ押したときの受け手を付ける）。欄は作り直さない。
+ * - `rerenderFieldsAfterFill`: 欄を作り直す（値は保つ）。保存のボタンは作り直さない。
+ * - `resetFieldsAfterFill`: 欄を作り直し、値を空にする（作り直しで値が消える形）。保存のボタンは作り直さない。
+ */
+export const SPA_MEMBER_INPUT_QUIRKS = Object.freeze([
+  'rerenderOnFirstInput', 'rerenderOnEveryInput', 'revertOnFirstInput', 'clearOnEveryInput', 'numberField',
+  'rerenderSaveAfterFill', 'rerenderFieldsAfterFill', 'resetFieldsAfterFill',
+] as const);
+export type SpaMemberInputQuirk = (typeof SPA_MEMBER_INPUT_QUIRKS)[number];
+/**
+ * OP-P: 値を入れ終えた後に作り直すまでの遅れ（ms）。値を入れた後の読み直しより後で、書き込みの段の値を入れた後の落ち着きの待ち
+ * （`WRITE_SUBMISSION_WINDOW_SETTLE_MS`）より短い（押す前に作り直す）。
+ */
+export const SPA_AFTER_FILL_RERENDER_MS = 150;
+/** OP-O（`numberField`）: 足す数の欄（id と name、min・max・step）。本文には入れない（入力の部品の確かめだけに使う）。 */
+export const SPA_NUMBER_FIELD = Object.freeze({ id: 'display-order', name: 'display_order', min: '1', max: '100', step: '1' } as const);
 /** T39d: `duplicateSubmit` のもう 1 つのボタンの ID。 */
 export const SPA_DUPLICATE_SAVE_BUTTON_ID = 'save-copy';
 /** T39d: `rewriteOnInput` で、ページの JS が値の末尾に足す文字。 */
@@ -418,6 +498,11 @@ export interface SpaAuthSiteOptions {
   readonly websocket?: boolean;
   /** 認証（token）の送り先を、API のバックエンドと別の Origin（`authOrigin`）にする。 */
   readonly separateAuthOrigin?: boolean;
+  /**
+   * DEF-182（OP-DEF 修正の 1 回目）: 認証（token）の送り先を、アプリと同じ Origin（`appOrigin` の `SPA_BACKEND_PATHS.token`）にする。アプリの Origin は、その path の
+   * 要求だけをバックエンドと同じ振る舞いで答える（記録の Origin は `app`）。`separateAuthOrigin` より優先する。指定のないときの振る舞いは変えない。
+   */
+  readonly sameOriginAuth?: boolean;
   /** token の有効期限（ms。既定は `SPA_DEFAULT_TOKEN_LIFETIME_MS`）。 */
   readonly tokenLifetimeMs?: number;
   /** 敵対的なログイン（省略はふつうのログイン）。 */
@@ -449,6 +534,12 @@ export interface SpaAuthSiteOptions {
   readonly nativeFormSubmit?: boolean;
   /** T36R-fix: ログインの画面の形（`SPA_LOGIN_LAYOUTS`。省略は今の `/auth`）。 */
   readonly loginLayout?: SpaLoginLayout;
+  /**
+   * OP-K（K3。本物のテスト環境の形）: ログインの画面の 3 つの欄（今の `/auth` の form）を、HTML に置かず、画面の設定（`SPA_APP_PATHS.appConfig`。サーバは
+   * `SPA_DEFERRED_LOGIN_FORM_DELAY_MS` だけ遅らせて答える）を読んだ後に、スクリプトが描く（読み込みの直後には、欄がない）。セレクタは `SPA_LOGIN_FIELDS` のまま。
+   * `loginLayout` とは一緒に使わない。指定のないときの画面と振る舞いは変えない。
+   */
+  readonly deferredLoginForm?: boolean;
   /** T37b: 会員の登録と更新の画面の形（`SPA_MEMBER_SCREEN_LAYOUTS`。省略は今の form の画面）。 */
   readonly memberScreenLayout?: SpaMemberScreenLayout;
   /** T37b: form のない会員の画面の、保存の敵対的な送り方（`SPA_HOSTILE_MEMBER_SAVES`。指定すると画面の形は `formless`）。 */
@@ -488,6 +579,13 @@ export interface SpaAuthSiteOptions {
    * 描く（データを後から API で描く画面。読めなければ `data-state` を `error` にして何も描かない）。
    */
   readonly memberDetailPage?: boolean;
+  /**
+   * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1・R2）: 会員の一覧の画面（`SPA_MEMBER_LIST_PATH`。登録の画面の 1 つ上。本物のテスト環境の
+   * SPA の形）を出す（省略は出さない）。画面の骨組みは空の表で、スクリプトが手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers` への POST）で読んだ会員を、
+   * 行（番号・名前・メールアドレス）として後から描く。各行に「編集」のボタンがあり、押すとモーダル（`dialog`）が開いて名前の欄に値が入る。モーダルの「保存」で、
+   * `PATCH /rest/v1/members?id=eq.<番号>`（本文は名前だけ）を送る。
+   */
+  readonly memberListPage?: boolean;
   /**
    * T37d fix round 1: 管理画面が、一覧を描いた後に、一覧の手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers`。`rpcReads` のときだけ）をもう 1 回出す
    * （結果は見ない。登録した読み取りの手続きの呼び出しの、1 回の読み込みあたりの回数の上限を確かめる）。省略は出さない。
@@ -546,6 +644,11 @@ export const SPA_CLOSING_BEACON_EVENT = 'pagehide';
 export const SPA_CROWDED_ICON_BUTTON_COUNT = 6;
 /** T44c: `crowdedEditScreen` の、保存のボタンの後の道具のボタンの語（どれも登録・更新の語。保存と見えないボタンの語と重ならない。押しても何も送らない）。 */
 export const SPA_TOOLBAR_PRESS_WORDS = Object.freeze(['新規', '変更', '編集', '修正'] as const);
+
+/** OP-R: 会員の一覧の画面の path（`memberListPage` のときだけ出す。登録の画面 `SPA_APP_PATHS.memberNew` の 1 つ上）。 */
+export const SPA_MEMBER_LIST_PATH = '/admin/members';
+/** OP-R: 会員の一覧の画面の、行を描く表の ID と、モーダルの ID。 */
+export const SPA_MEMBER_LIST_ELEMENTS = Object.freeze({ table: 'member-list', dialog: 'member-edit-dialog' } as const);
 
 /** T37d: 会員の詳細の画面の path（`memberDetailPage` のときだけ出す）。 */
 export const spaMemberDetailPathOf = (id: number | string): string => `/admin/members/${id}`;
@@ -627,6 +730,21 @@ export interface SpaAuthSite {
    * `SPA_ABORTED_SAVE_RESPONSE_DELAY_MS` だけ遅らせる（初めは false。画面のスクリプトは次に読み込んだ画面から効く）。
    */
   setMemberSaveAborted(on: boolean): void;
+  /**
+   * OP-L（L1。本物のテスト環境の SPA の登録の画面の形）: form のない登録の画面が、欄と保存のボタンを、スクリプトの準備の後に `delayMs` だけ遅れて描く
+   * （null は遅らせない。初めは null。次に読み込んだ画面から効く）。描く前の画面には、欄も保存のボタンもない。
+   */
+  setMemberNewRenderDelay(delayMs: number | null): void;
+  /** OP-O（O2）: form のない会員の画面の、値を入れるときの振る舞い（`SPA_MEMBER_INPUT_QUIRKS`。null は今のまま。初めは null。次に読み込んだ画面から効く）。 */
+  setMemberInputQuirk(quirk: SpaMemberInputQuirk | null): void;
+  /**
+   * OP-M（本物のテスト環境の、値を入れた後に承認した送信のほかの要求が出た形）: form のない会員の画面のスクリプトが、3 つの欄がそろった入力の事象で、押されなくても
+   * 承認した送信のほかの要求を 1 回ずつ出す（初めは false。次に読み込んだ画面のスクリプトから効く）: 入力の確かめの読み取りの手続きの呼び出し（バックエンドへの
+   * POST。本文にメールアドレスの値）、使われ方の記録（アプリの Origin への `navigator.sendBeacon`。値を持たない）、承認していない Origin への使われ方の記録（GET）。
+   */
+  setMemberSideRequestsOnInput(on: boolean): void;
+  /** OP-N: form のない登録の画面のスクリプトが自動で出す通信の形（`SpaMemberAutoRequests`。null は出さない。初めは null。次に読み込んだ画面から効く）。 */
+  setMemberAutoRequests(mode: SpaMemberAutoRequests | null): void;
   /** T41d: form のない更新の画面のスクリプトが、更新の本文に読んだ値から変わった鍵だけを入れる（初めは false。次に読み込んだ画面から効く）。 */
   setMemberUpdateChangedOnly(on: boolean): void;
   /** T41d: サーバが、更新のたびに備考（保つ欄）を `SPA_SERVER_SIDE_EFFECT_NOTE` で始まる回ごとに違う値に変える（初めは false）。 */
@@ -640,6 +758,16 @@ export interface SpaAuthSite {
   setMemberValuesDelayed(on: boolean, delayMs?: number): void;
   /** T41R-fix: ID の絞り込みの読み取り（`GET /rest/v1/members?id=eq.<id>`）の応答を `delayMs` だけ遅らせる（null は遅らせない。初めは null）。 */
   setMemberDetailDelay(delayMs: number | null): void;
+  /**
+   * OP-Q（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.8 の Q1。本物のテスト環境の形）: 会員の詳細の画面が、項目を、GET の代わりにデータを取る手続きの
+   * 呼び出し（`SPA_BACKEND_PATHS.rpcGetMember` への POST）で読む（初めは false。次に読み込んだ画面のスクリプトから効く）。
+   */
+  setMemberDetailRpcRead(on: boolean): void;
+  /**
+   * OP-REV6 の I-1: 一覧の手続きの呼び出し（`SPA_BACKEND_PATHS.rpcListMembers`）が返す会員を、先頭からこの数までにする（null は全部）。新しい登録が一覧に
+   * まだ出ない場面を作る（一覧には前の登録だけが並ぶ）。
+   */
+  setMemberListRpcLimit(count: number | null): void;
   /** T41R-fix: 更新の画面で、名前の欄の入力の事象のたびに、ページが備考（保つ欄）を `SPA_REWRITTEN_NOTE` に書き換える（初めは false。次に読み込んだ画面から効く）。 */
   setMemberKeptRewriteOnInput(on: boolean): void;
   /**
@@ -685,6 +813,16 @@ const AUTH_PAGE = pageHtml('ログイン', '<h1>ログイン</h1><form id="login
   + '<label>パスワード <input id="password" name="password" type="password" autocomplete="current-password"></label>'
   + '<button id="login" type="submit">ログイン</button></form><p id="login-error" data-state="hidden" hidden></p><p id="tenant" data-state="none"></p>');
 
+/** OP-K（`deferredLoginForm`）: 画面の設定の応答を遅らせる時間（ms。ログインの画面を開いた直後の読み取りより長く、落ち着きの待ちが待てる長さ）。 */
+export const SPA_DEFERRED_LOGIN_FORM_DELAY_MS = 1_500;
+/** OP-K（`deferredLoginForm`）: 欄を描く前のログインの画面（欄を描く場所 `login-root` だけ）と、スクリプトが描く欄（今の `/auth` の form と同じ）。 */
+const DEFERRED_AUTH_PAGE = pageHtml('ログイン', '<h1>ログイン</h1><div id="login-root"></div>'
+  + '<p id="login-error" data-state="hidden" hidden></p><p id="tenant" data-state="none"></p>');
+const DEFERRED_LOGIN_FORM_HTML = '<form id="login-form">'
+  + '<label>メールアドレス <input id="email" name="email" type="email" autocomplete="username"></label>'
+  + '<label>パスワード <input id="password" name="password" type="password" autocomplete="current-password"></label>'
+  + '<button id="login" type="submit">ログイン</button></form>';
+
 /** T36R-fix: ログインの画面の形ごとの HTML（セレクタは `SPA_LOGIN_FIELDS`）。 */
 const LAYOUT_EMAIL = '<label>メールアドレス <input id="email" name="email" type="email" autocomplete="username"></label>';
 const LAYOUT_PASSWORD = '<label>パスワード <input id="password" name="password" type="password" autocomplete="current-password"></label>';
@@ -724,6 +862,12 @@ const memberFormHtml = (title: string, edit: boolean): string => pageHtml(title,
 
 const MEMBER_NEW_PAGE = memberFormHtml('会員の登録', false);
 const MEMBER_EDIT_PAGE = memberFormHtml('会員の更新', true);
+/** OP-R: 会員の一覧の画面（行はスクリプトが後から描く。「編集」で開くモーダルの名前の欄と保存のボタン）。 */
+const MEMBER_LIST_PAGE = pageHtml('会員の一覧', `<h1>会員の一覧</h1><p><a href="${SPA_APP_PATHS.memberNew}">会員の登録</a></p>`
+  + `<table id="${SPA_MEMBER_LIST_ELEMENTS.table}" data-state="loading"><thead><tr><th>ID</th><th>名前</th><th>メールアドレス</th><th>操作</th></tr></thead>`
+  + '<tbody></tbody></table>'
+  + `<dialog id="${SPA_MEMBER_LIST_ELEMENTS.dialog}"><h2>会員の編集</h2><label>名前 <input id="list-edit-name" type="text"></label>`
+  + '<button id="list-edit-save" type="button">保存</button></dialog>');
 /** T37d: 会員の詳細の画面（項目はスクリプトが後から描く）。 */
 const MEMBER_DETAIL_PAGE = pageHtml('会員の詳細', `<h1>会員の詳細</h1><dl id="${SPA_MEMBER_DETAIL_ELEMENT}" data-state="loading"></dl>`
   + '<p><a href="/admin">一覧へ</a></p>');
@@ -875,6 +1019,11 @@ const pages = {
     sendRum();
     // T36b: 送信を止めない画面（ブラウザがフォームを既定の GET で送る）。
     if (C.nativeFormSubmit) return;
+    // OP-K（deferredLoginForm）: 画面の設定を読んだ後に、欄を描く（読み込みの直後には欄がない）。
+    if (C.deferredLoginForm !== null) {
+      await send(C.appOrigin + C.paths.appConfig, {});
+      byId('login-root').innerHTML = C.deferredLoginForm;
+    }
     // 送信の受け手を先に付ける（手続きの呼び出しを待つ間に押されても、フォームをそのまま送らない）。
     const tenantUsable = resolveTenant();
     // T36R-fix: form の要素のない画面の形では、送信の要素を押したときに送る（form の送信の受け手は付けない）。
@@ -998,11 +1147,43 @@ const pages = {
       location.href = C.paths.admin;
     });
   },
+  // OP-R: 会員の一覧（手続きの呼び出しで読んだ会員を、後から行として描く。「編集」でモーダルを開き、保存で PATCH を送る）。
+  memberList: async () => {
+    const session = stored();
+    if (session === null) { location.replace(C.paths.auth); return; }
+    const response = await send(C.backendOrigin + C.rpcListPath, { method: 'POST', headers: jsonHeaders(session), body: '{}' });
+    if (!response.ok) { setState(C.memberList.table, 'error'); return; }
+    const tbody = byId(C.memberList.table).querySelector('tbody');
+    const dialog = byId(C.memberList.dialog);
+    let editing = null;
+    for (const member of await response.json()) {
+      const row = document.createElement('tr');
+      for (const text of [String(member.id), member.name, member.email]) {
+        const cell = document.createElement('td'); cell.textContent = text; row.append(cell);
+      }
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = '編集';
+      button.addEventListener('click', () => { editing = member.id; byId('list-edit-name').value = member.name; dialog.showModal(); });
+      const cell = document.createElement('td'); cell.append(button); row.append(cell);
+      tbody.append(row);
+    }
+    byId('list-edit-save').addEventListener('click', async () => {
+      if (editing === null) return;
+      await send(membersUrl('id=eq.' + editing), {
+        method: 'PATCH', headers: apiHeaders(session, { 'content-type': 'application/json', [C.prefer.name]: C.prefer.value }),
+        body: JSON.stringify({ name: byId('list-edit-name').value }),
+      });
+      dialog.close();
+    });
+    setState(C.memberList.table, 'loaded');
+  },
   // T37d: 会員の詳細（読んだ値を、後から dl の項目として描く）。
   memberDetail: async (id) => {
     const session = stored();
     if (session === null) { location.replace(C.paths.auth); return; }
-    const response = await send(membersUrl('id=eq.' + id), { headers: apiHeaders(session) });
+    // OP-Q: 手続きの呼び出しで読む形（detailRpcRead）。
+    const response = C.detailRpcRead
+      ? await send(C.backendOrigin + C.rpcGetMemberPath, { method: 'POST', headers: jsonHeaders(session), body: JSON.stringify({ id: Number(id) }) })
+      : await send(membersUrl('id=eq.' + id), { headers: apiHeaders(session) });
     const [member] = response.ok ? await response.json() : [];
     if (member === undefined) { setState(C.detail.element, 'error'); return; }
     const list = byId(C.detail.element);
@@ -1019,6 +1200,7 @@ const edit = /^\\/admin\\/members\\/([0-9]+)\\/edit$/u.exec(path);
 const detail = /^\\/admin\\/members\\/([0-9]+)$/u.exec(path);
 const route = () => {
   if (detail !== null) void pages.memberDetail(detail[1]);
+  else if (C.memberList.enabled && path === C.memberList.path) void pages.memberList();
   else if (edit !== null) void pages.memberEdit(edit[1]);
   else if (path === C.paths.auth) void pages.auth();
   else if (path === C.paths.logout) pages.logout();
@@ -1115,6 +1297,21 @@ const formlessMemberPageHtml = (
   + '</div><p id="member" data-state="idle"></p><p><a href="/admin">一覧へ</a></p></main></body></html>';
 
 const FORMLESS_MEMBER_NEW_PAGE = formlessMemberPageHtml('会員の登録', false);
+
+/** OP-L（L1）: 遅れて描く登録の画面の、欄と保存のボタンを入れておく template の id。 */
+const SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID = 'member-new-fields';
+/** OP-L（L1）: 登録の画面の、欄の箱の中身を template に移した形（描く前の画面には、欄も保存のボタンもない）。 */
+const deferredMemberNewPageOf = (page: string): string => {
+  const open = `<div id="${SPA_FORMLESS_MEMBER_BOX}" data-state="loading">`;
+  const close = '</div><p id="member"';
+  const start = page.indexOf(open);
+  const end = page.indexOf(close, start);
+  if (start < 0 || end < 0) {
+    throw new Error('the formless create page has no member box');
+  }
+  const inner = page.slice(start + open.length, end);
+  return `${page.slice(0, start)}<template id="${SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID}">${inner}</template>${open}${page.slice(end)}`;
+};
 const FORMLESS_MEMBER_EDIT_PAGE = formlessMemberPageHtml('会員の更新', true);
 
 /** T37b: form のない会員の画面のスクリプト（押すと `fetch` で送る。敵対的な送り方は `C.hostile`）。設定は、起動のたびに作る値を JSON で先頭に入れる。 */
@@ -1183,11 +1380,24 @@ const save = async (session, id) => {
     default: return ordinary(session, id, C.backendOrigin, memberBody());
   }
 };
+// OP-N: 登録の画面のスクリプトが自動で出す通信（\`C.autoRequests\`。登録の画面だけ）。
+const autoOnNew = (mode) => C.autoRequests === mode && location.pathname === C.memberNewPath;
 const run = async () => {
   const session = stored();
   if (session === null) { location.replace(C.authPath); return; }
   const edit = /^\\/admin\\/members\\/([0-9]+)\\/edit$/u.exec(location.pathname);
   const id = edit === null ? null : edit[1];
+  if (autoOnNew('BEFORE_FILL')) {
+    void send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'open' }) });
+    void send(urlOf(C.backendOrigin, C.autoPaths.previews, 'id=eq.1'), { method: 'DELETE', headers: writeHeaders(session) });
+    const widget = document.createElement('script');
+    widget.src = C.otherOrigin + C.autoPaths.widget;
+    document.head.append(widget);
+  }
+  if (autoOnNew('BEFORE_FILL_ENDPOINT')) {
+    void send(urlOf(C.backendOrigin, C.autoPaths.membersTrailingSlash), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({}) });
+    void send(urlOf(C.otherOrigin, C.autoPaths.outsideCollect), { method: 'POST', mode: 'no-cors', body: 'event=open' });
+  }
   if (id !== null) {
     const response = await send(urlOf(C.backendOrigin, C.membersPath, 'id=eq.' + id), { headers: apiHeaders(session) });
     const [member] = response.ok ? await response.json() : [];
@@ -1211,15 +1421,122 @@ const run = async () => {
     // T41R-fix: \`keptRewriteOnInput\` は、名前の欄の入力の事象のたびに、備考（保つ欄）を書き換える（押す直前の読み直しで見つける形）。
     if (C.keptRewriteOnInput) { byId('name').addEventListener('input', () => { byId('note').value = C.rewrittenNote; }); }
   }
+  // OP-L（L1）: 登録の画面の欄と保存のボタンを、準備の後に遅れて描く（本物のテスト環境の SPA の形）。
+  if (id === null && C.newRenderDelayMs !== null) {
+    await new Promise((resolve) => { setTimeout(resolve, C.newRenderDelayMs); });
+    const template = byId(C.newFieldsTemplateId);
+    if (template !== null) byId(C.box).append(template.content.cloneNode(true));
+  }
+  // OP-O（O2）: 値を入れるときの振る舞い（React などの SPA の形）。どれも、箱の入力の事象を受けて動く（欄を作り直しても受けられる）。
+  if (C.inputQuirk === 'numberField') {
+    const label = document.createElement('label');
+    label.textContent = '表示順 ';
+    const field = document.createElement('input');
+    Object.assign(field, { id: C.numberField.id, name: C.numberField.name, type: 'number', min: C.numberField.min, max: C.numberField.max, step: C.numberField.step });
+    label.append(field);
+    byId('save').before(label);
+  }
+  if (C.inputQuirk !== null) {
+    const box = byId(C.box);
+    const fieldsOf = () => Array.from(box.querySelectorAll('input, textarea, select'));
+    let rerendered = false;
+    const reverted = new Set();
+    box.addEventListener('input', (event) => {
+      const target = event.target;
+      if (C.inputQuirk === 'rerenderOnEveryInput' || (C.inputQuirk === 'rerenderOnFirstInput' && !rerendered)) {
+        rerendered = true;
+        for (const field of fieldsOf()) { const copy = field.cloneNode(true); copy.value = field.value; field.replaceWith(copy); }
+      } else if (C.inputQuirk === 'clearOnEveryInput' || (C.inputQuirk === 'revertOnFirstInput' && !reverted.has(target.id))) {
+        reverted.add(target.id);
+        target.value = '';
+      } else if (C.inputQuirk === 'numberField' && target.type === 'number' && target.value !== '' && Number.isFinite(Number(target.value))) {
+        target.value = String(Number(target.value));
+      }
+    });
+  }
   setState(C.box, 'ready');
-  byId('save').addEventListener('click', async () => {
+  const onSave = async () => {
     // T41R-fix-2: \`keptRewriteOnPress\` は、押したとき（保存の要求を組み立てる前）に備考（保つ欄）を書き換える。
     if (C.keptRewriteOnPress && id !== null) { byId('note').value = C.rewrittenNote; }
     const response = await save(session, id);
+    // OP-N: \`AFTER_PRESS\` は、保存の応答の後に、値のない手続きの呼び出しと、メールアドレスの値を本文に持つ呼び出しを 1 回ずつ出す。
+    if (autoOnNew('AFTER_PRESS')) {
+      await send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'saved' }) });
+      await send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ email: byId('member-email').value }) });
+      // OP-REV3（C-2）: 値をヘッダに持つ POST と、値を Cookie に持つ POST（本文と URL には値がない）。
+      await send(urlOf(C.appOrigin, C.autoPaths.appSync, 'via=header'), { method: 'POST', headers: { [C.autoDraftHeader]: byId('member-email').value }, body: 'event=saved' });
+      document.cookie = C.autoDraftCookie + '=' + encodeURIComponent(byId('member-email').value) + '; path=/';
+      await send(urlOf(C.appOrigin, C.autoPaths.appSync, 'via=cookie'), { method: 'POST', body: 'event=saved' });
+    }
     setState(C.member, response.ok ? 'saved' : 'error');
-  });
+  };
+  byId('save').addEventListener('click', onSave);
+  // OP-P（P1・P2）: 3 つの欄がそろった入力の事象の後、遅れて 1 回だけ、保存のボタンか欄を作り直す（React の再描画。押す前に起きる）。
+  if (C.inputQuirk === 'rerenderSaveAfterFill' || C.inputQuirk === 'rerenderFieldsAfterFill' || C.inputQuirk === 'resetFieldsAfterFill') {
+    const fieldIds = ['name', 'member-email', 'note'];
+    let scheduled = false;
+    byId(C.box).addEventListener('input', () => {
+      if (scheduled || fieldIds.some((fieldId) => byId(fieldId).value === '')) return;
+      scheduled = true;
+      setTimeout(() => {
+        if (C.inputQuirk === 'rerenderSaveAfterFill') {
+          const save = byId('save');
+          const copy = save.cloneNode(true);
+          copy.addEventListener('click', onSave);
+          save.replaceWith(copy);
+          return;
+        }
+        for (const fieldId of fieldIds) {
+          const field = byId(fieldId);
+          const copy = field.cloneNode(true);
+          copy.value = C.inputQuirk === 'resetFieldsAfterFill' ? '' : field.value;
+          field.replaceWith(copy);
+        }
+      }, C.afterFillRerenderMs);
+    });
+  }
+  // OP-N: \`AFTER_FILL_*\` は、3 つの欄がそろった入力の事象で、押されなくても、決めた形の通信を 1 回出す（値を入れた後の通信）。
+  if (typeof C.autoRequests === 'string' && C.autoRequests.startsWith('AFTER_FILL_') && location.pathname === C.memberNewPath) {
+    let autoFillSent = false;
+    for (const fieldId of ['name', 'member-email', 'note']) {
+      byId(fieldId).addEventListener('input', () => {
+        if (autoFillSent || byId('name').value === '' || byId('member-email').value === '' || byId('note').value === '') return;
+        autoFillSent = true;
+        const email = byId('member-email').value;
+        if (C.autoRequests === 'AFTER_FILL_READS') {
+          void send(urlOf(C.appOrigin, C.appConfigPath, 'event=input'));
+          try {
+            const socket = new WebSocket(C.realtimeUrl);
+            socket.addEventListener('error', () => undefined);
+          } catch {
+            // つなげない接続は捨てる。
+          }
+        } else if (C.autoRequests === 'AFTER_FILL_MARKER_POST') {
+          void send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ draft: { email } }) });
+        } else if (C.autoRequests === 'AFTER_FILL_PLAIN_POST') {
+          void send(urlOf(C.backendOrigin, C.autoPaths.rpcStatus), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ event: 'input' }) });
+        } else if (C.autoRequests === 'AFTER_FILL_MARKER_GET') {
+          void send(urlOf(C.appOrigin, C.appConfigPath, 'email=' + encodeURIComponent(email)));
+        }
+      });
+    }
+  }
   // T40R-fix-A: \`saveOnInput\` は、3 つの欄（名前・メールアドレス・備考）がそろった入力の事象で、押されなくても保存の要求を 1 回送る（ページが値を入れる間に
   // 承認どおりの要求を出す形）。
+  // OP-M: sideRequestsOnInput は、3 つの欄がそろった入力の事象で、押されなくても、承認した送信のほかの要求を 1 回ずつ出す（入力の確かめの手続きの呼び出し、
+  // 使われ方の記録の beacon、承認していない Origin への使われ方の記録）。
+  if (C.sideRequestsOnInput) {
+    let sideSent = false;
+    for (const fieldId of ['name', 'member-email', 'note']) {
+      byId(fieldId).addEventListener('input', () => {
+        if (sideSent || byId('name').value === '' || byId('member-email').value === '' || byId('note').value === '') return;
+        sideSent = true;
+        void send(urlOf(C.backendOrigin, C.rpcCheckMemberEmailPath), { method: 'POST', headers: writeHeaders(session), body: JSON.stringify({ email: byId('member-email').value }) });
+        navigator.sendBeacon(C.appOrigin + C.rumPath, JSON.stringify({ event: 'input' }));
+        void send(urlOf(C.otherOrigin, C.otherCollectPath, 'event=input'), { mode: 'no-cors' });
+      });
+    }
+  }
   if (C.saveOnInput) {
     let autoSent = false;
     for (const fieldId of ['name', 'member-email', 'note']) {
@@ -1362,8 +1679,16 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   let memberDetailResponse: SpaMemberDetailResponse | null = null;
   /** T40R-fix-A: 入力の事象で保存の要求を出すか（`setMemberSaveOnInput`）。 */
   let memberSaveOnInput = false;
+  /** OP-M: 入力の事象で、承認した送信のほかの要求を出すか（`setMemberSideRequestsOnInput`）。 */
+  let memberSideRequestsOnInput = false;
+  /** OP-N: 登録の画面のスクリプトが自動で出す通信の形（`setMemberAutoRequests`）。 */
+  let memberAutoRequests: SpaMemberAutoRequests | null = null;
   /** T40R-fix-A: ふつうの保存の要求をページが送った直後に取り消すか（`setMemberSaveAborted`）。 */
   let memberSaveAborted = false;
+  /** OP-L（L1）: 登録の画面の欄を遅れて描く時間（`setMemberNewRenderDelay`）。 */
+  let memberNewRenderDelayMs: number | null = null;
+  /** OP-O（O2）: 値を入れるときの振る舞い（`setMemberInputQuirk`）。 */
+  let memberInputQuirk: SpaMemberInputQuirk | null = null;
   /** T41d: 更新の切り替え（本文を変えた鍵だけにする、サーバの副作用、応答の形、値を遅れて入れる）。 */
   let memberUpdateChangedOnly = false;
   let memberUpdateSideEffect = false;
@@ -1375,6 +1700,10 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   let memberValuesDelayMs = SPA_MEMBER_VALUES_DELAY_MS;
   /** T41R-fix: ID の絞り込みの読み取りの応答の遅れ（ms。null は遅らせない）。 */
   let memberDetailDelayMs: number | null = null;
+  /** OP-Q: 会員の詳細の画面が、手続きの呼び出しで項目を読むか（`setMemberDetailRpcRead`）。 */
+  let memberDetailRpcRead = false;
+  /** OP-REV6 の I-1: 一覧の手続きの呼び出しが返す会員の数の上限（`setMemberListRpcLimit`。null は全部）。 */
+  let memberListRpcLimit: number | null = null;
   /** T41R-fix: 更新の画面で、名前の欄の入力の事象のたびに、ページが備考（保つ欄）を書き換えるか。 */
   let memberKeptRewriteOnInput = false;
   /** T41R-fix-2: 更新の画面で、押したときにページが備考（保つ欄）を書き換えるか。 */
@@ -1665,7 +1994,13 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         return;
       }
       if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcListMembers) {
-        sendJson(response, STATUS_OK, members);
+        sendJson(response, STATUS_OK, memberListRpcLimit === null ? members : members.slice(0, memberListRpcLimit));
+        return;
+      }
+      // OP-Q: 会員の詳細の画面の、データを取る手続きの呼び出し（本文の `id` の行だけ）。
+      if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcGetMember) {
+        const id = Number(body?.['id']);
+        sendJson(response, STATUS_OK, members.filter((member) => member.id === id));
         return;
       }
       if (request.method === 'POST' && url.pathname === SPA_BACKEND_PATHS.rpcLogLogin) {
@@ -1684,6 +2019,11 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   /** アプリの Origin の振る舞い（画面の HTML と、設定を入れたスクリプト）。 */
   const appListener = (request: IncomingMessage, response: ServerResponse): void => {
     const url = new URL(request.url ?? '/', originOf('app'));
+    // DEF-182: `sameOriginAuth` のときだけ、アプリの Origin の token の path を、バックエンドと同じ振る舞いで答える。
+    if (options.sameOriginAuth === true && url.pathname === SPA_BACKEND_PATHS.token) {
+      backendListener('app')(request, response);
+      return;
+    }
     const record = (bodyKeys: readonly string[]): void => {
       requests.push({
         origin: 'app', method: request.method ?? '', path: `${url.pathname}${url.search}`, headerNames: Object.keys(request.headers).sort(),
@@ -1726,6 +2066,11 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         tokenPath: SPA_BACKEND_PATHS.token,
         membersPath: SPA_BACKEND_PATHS.members,
         rpcListPath: SPA_BACKEND_PATHS.rpcListMembers,
+        // OP-Q: 会員の詳細の画面の、データを取る手続きの呼び出し。
+        rpcGetMemberPath: SPA_BACKEND_PATHS.rpcGetMember,
+        detailRpcRead: memberDetailRpcRead,
+        // OP-R: 会員の一覧の画面。
+        memberList: { enabled: options.memberListPage === true, path: SPA_MEMBER_LIST_PATH, ...SPA_MEMBER_LIST_ELEMENTS },
         logLoginPath: SPA_BACKEND_PATHS.rpcLogLogin,
         rpcResolveTenantPath: SPA_BACKEND_PATHS.rpcResolveTenant,
         functionSyncAccessPath: SPA_BACKEND_PATHS.functionSyncAccess,
@@ -1755,6 +2100,7 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         sideRequestBeforeToken: options.sideRequestBeforeToken ?? null,
         nativeFormSubmit: options.nativeFormSubmit === true,
         loginLayout: options.loginLayout ?? null,
+        deferredLoginForm: options.deferredLoginForm === true ? DEFERRED_LOGIN_FORM_HTML : null,
         detail: { element: SPA_MEMBER_DETAIL_ELEMENT, terms: SPA_MEMBER_DETAIL_TERMS },
         // DEF-138: クライアントの側でログインの画面へ移る画面（`client` のときだけ）。
         sessionLossPath: options.sessionLossPage === 'client' ? SPA_SESSION_LOSS_PATH : null,
@@ -1799,6 +2145,27 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
         duplicateSaveButtonId: SPA_DUPLICATE_SAVE_BUTTON_ID,
         duplicateSendsTwice: duplicateSaveSendsTwice,
         saveOnInput: memberSaveOnInput,
+        // OP-M: 入力の事象で出す、承認した送信のほかの要求（入力の確かめの手続き、使われ方の記録の beacon、承認していない Origin への記録）。
+        sideRequestsOnInput: memberSideRequestsOnInput,
+        // OP-N: 登録の画面のスクリプトが自動で出す通信の形と、その送り先。
+        autoRequests: memberAutoRequests,
+        autoPaths: SPA_AUTO_REQUEST_PATHS,
+        autoDraftHeader: SPA_AUTO_DRAFT_HEADER,
+        autoDraftCookie: SPA_AUTO_DRAFT_COOKIE,
+        memberNewPath: SPA_APP_PATHS.memberNew,
+        appConfigPath: SPA_APP_PATHS.appConfig,
+        realtimeUrl: `ws://${new URL(originOf('backend')).host}${SPA_BACKEND_PATHS.realtime}`,
+        appOrigin: originOf('app'),
+        rumPath: SPA_APP_PATHS.rum,
+        rpcCheckMemberEmailPath: SPA_BACKEND_PATHS.rpcCheckMemberEmail,
+        otherCollectPath: SPA_OTHER_COLLECT_PATH,
+        // OP-L（L1）: 登録の画面の欄を遅れて描く時間と、描く中身の template。
+        newRenderDelayMs: memberNewRenderDelayMs,
+        newFieldsTemplateId: SPA_MEMBER_NEW_FIELDS_TEMPLATE_ID,
+        // OP-O（O2）: 値を入れるときの振る舞いと、足す数の欄。
+        inputQuirk: memberInputQuirk,
+        numberField: SPA_NUMBER_FIELD,
+        afterFillRerenderMs: SPA_AFTER_FILL_RERENDER_MS,
         abortSave: memberSaveAborted,
         abortSaveAfterMs: SPA_SAVE_ABORT_AFTER_MS,
         changedOnly: memberUpdateChangedOnly,
@@ -1841,6 +2208,10 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     const plainFormless = extraPressTargets === 0 && !secondSaveButton && hostileInput === null && !pressPriorityTargets && !externalSchemeButton
       && !saveInDialog && !publicationStatusField && !crowdedEditScreen && !createSaveInDialog;
     if (formlessMemberScreens && url.pathname === SPA_APP_PATHS.memberNew) {
+      // OP-L（L1）: 遅れて描く指定のときは、欄と保存のボタンを template に入れ、スクリプトが遅れて描く。
+      if (plainFormless && memberNewRenderDelayMs !== null) {
+        return html(deferredMemberNewPageOf(FORMLESS_MEMBER_NEW_PAGE));
+      }
       return html(plainFormless
         ? FORMLESS_MEMBER_NEW_PAGE
         : formlessMemberPageHtml('会員の登録', false, extraPressTargets, secondSaveButton, hostileInput, pressPriorityTargets, externalSchemeButton,
@@ -1854,7 +2225,18 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     }
     // T43d: `sharedHeaderLink` のときは、ログインの画面と管理画面の両方に、同じ見出しのリンク（`SPA_SHARED_HEADER_LINK`）を出す。
     const shared = (page: string): string => (options.sharedHeaderLink === true ? withSharedHeaderLink(page) : page);
-    if (url.pathname === SPA_APP_PATHS.auth) return html(shared(options.loginLayout === undefined ? AUTH_PAGE : LOGIN_LAYOUT_PAGES[options.loginLayout]));
+    if (url.pathname === SPA_APP_PATHS.auth) {
+      // OP-K: `deferredLoginForm` は、欄を描く前の画面。
+      const authPage = options.deferredLoginForm === true ? DEFERRED_AUTH_PAGE : AUTH_PAGE;
+      return html(shared(options.loginLayout === undefined ? authPage : LOGIN_LAYOUT_PAGES[options.loginLayout]));
+    }
+    if (options.deferredLoginForm === true && url.pathname === SPA_APP_PATHS.appConfig) {
+      setTimeout(() => {
+        response.writeHead(STATUS_OK, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+        response.end('{}');
+      }, SPA_DEFERRED_LOGIN_FORM_DELAY_MS);
+      return;
+    }
     if (url.pathname === SPA_APP_PATHS.logout) return html(LOGOUT_PAGE);
     // DEF-138: セッションの切れの画面へのリンクを、管理画面の最初のリンクにする（指定のあるときだけ）。
     const lossLinked = (page: string): string => (options.sessionLossPage === undefined ? page : withSessionLossLink(page));
@@ -1875,6 +2257,8 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     }
     if (url.pathname === SPA_APP_PATHS.memberNew) return html(MEMBER_NEW_PAGE);
     if (/^\/admin\/members\/[0-9]+\/edit$/u.test(url.pathname)) return html(MEMBER_EDIT_PAGE);
+    // OP-R: 会員の一覧の画面（指定のあるときだけ）。
+    if (options.memberListPage === true && url.pathname === SPA_MEMBER_LIST_PATH) return html(MEMBER_LIST_PAGE);
     // T37d: 会員の詳細の画面（指定のあるときだけ）。T40b-2: `serverError` は 500。
     if (options.memberDetailPage === true && /^\/admin\/members\/[0-9]+$/u.test(url.pathname)) {
       if (memberDetailResponse === 'serverError') {
@@ -1899,7 +2283,7 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
   const backend = await start('backend');
   await start('auth');
   await start('other');
-  const tokenOrigin = (): string => originOf(options.separateAuthOrigin === true ? 'auth' : 'backend');
+  const tokenOrigin = (): string => originOf(options.sameOriginAuth === true ? 'app' : options.separateAuthOrigin === true ? 'auth' : 'backend');
 
   // WebSocket（バックエンドの `SPA_BACKEND_PATHS.realtime` だけ受け入れる。ほかの path は切る）。
   backend.server.on('upgrade', (request: IncomingMessage, socket: Duplex) => {
@@ -1980,8 +2364,20 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     setMemberSaveOnInput: (on) => {
       memberSaveOnInput = on;
     },
+    setMemberSideRequestsOnInput: (on) => {
+      memberSideRequestsOnInput = on;
+    },
+    setMemberAutoRequests: (mode) => {
+      memberAutoRequests = mode;
+    },
     setMemberSaveAborted: (on) => {
       memberSaveAborted = on;
+    },
+    setMemberNewRenderDelay: (delayMs) => {
+      memberNewRenderDelayMs = delayMs;
+    },
+    setMemberInputQuirk: (quirk) => {
+      memberInputQuirk = quirk;
     },
     setMemberUpdateChangedOnly: (on) => {
       memberUpdateChangedOnly = on;
@@ -1995,6 +2391,12 @@ export async function startSpaAuthSite(options: SpaAuthSiteOptions = {}): Promis
     setMemberValuesDelayed: (on, delayMs = SPA_MEMBER_VALUES_DELAY_MS) => {
       memberValuesDelayed = on;
       memberValuesDelayMs = delayMs;
+    },
+    setMemberDetailRpcRead: (on) => {
+      memberDetailRpcRead = on;
+    },
+    setMemberListRpcLimit: (count) => {
+      memberListRpcLimit = count;
     },
     setMemberDetailDelay: (delayMs) => {
       memberDetailDelayMs = delayMs;

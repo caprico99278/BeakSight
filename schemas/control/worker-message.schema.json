@@ -8,6 +8,9 @@
     { "$ref": "#/$defs/loginConfirmed" },
     { "$ref": "#/$defs/nextStage" },
     { "$ref": "#/$defs/chainEnd" },
+    { "$ref": "#/$defs/credentialSaveAllowed" },
+    { "$ref": "#/$defs/loginRegistered" },
+    { "$ref": "#/$defs/loginRegistrationSkipped" },
     { "$ref": "#/$defs/ready" },
     { "$ref": "#/$defs/runStarted" },
     { "$ref": "#/$defs/progress" },
@@ -18,10 +21,11 @@
     { "$ref": "#/$defs/finished" },
     { "$ref": "#/$defs/failed" },
     { "$ref": "#/$defs/writeRecheckRequest" },
-    { "$ref": "#/$defs/writeSubmission" }
+    { "$ref": "#/$defs/writeSubmission" },
+    { "$ref": "#/$defs/credentialSaved" }
   ],
   "$defs": {
-    "protocol": { "const": "beaksight-worker-message/2" },
+    "protocol": { "const": "beaksight-worker-message/7" },
     "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
     "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
     "runId": { "type": "string", "pattern": "^RUN-[0-9]{6,}$" },
@@ -37,6 +41,10 @@
         "targetConfigPath": { "$ref": "#/$defs/path" },
         "startNew": { "type": "boolean" },
         "targetConfigSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "previousNavigationAtMs": {
+          "description": "DEF-180 (protocol 5): the time (epoch ms) when the previous worker that read the same site (any allowed origin of the target configuration) ended. A plain number, not a secret. The worker passes it to its navigation pacer as the previous navigation and keeps the minimum navigation interval from it before the first navigation. Omitted means no wait.",
+          "$ref": "#/$defs/count"
+        },
         "authentication": { "$ref": "#/$defs/startAuthentication" },
         "readChecks": {
           "type": "array",
@@ -65,7 +73,17 @@
           "additionalProperties": false,
           "required": ["stages"],
           "properties": {
-            "stages": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "$ref": "#/$defs/chainStageKind" } }
+            "stages": { "type": "array", "minItems": 2, "maxItems": 3, "items": { "$ref": "#/$defs/chainStageKind" } },
+            "writeStages": {
+              "description": "OP-2: the worker may run the write stages (WRITE_CREATE, WRITE_UPDATE) after the read stages, each started by a NEXT_STAGE with the write specification. Only true; absent means no write stage.",
+              "const": true
+            },
+            "writeScreenCount": {
+              "description": "OP-H (version 6): the number of the checked screens that the inspection will try to create and update on after the read stages (no screen name or path). Required together with writeStages and allowed only with it (checked by worker-protocol.ts). The worker passes it to the report of the audit stage.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
           }
         }
       }
@@ -168,13 +186,16 @@
           }
         },
         "verification": {
+          "description": "PL-6a (plain UI design 8.1): the way to judge the result (the structure of the form) and the record id patterns of the form (they replaced the success and the input error conditions that a person typed).",
           "type": "object",
           "additionalProperties": false,
-          "required": ["successCondition", "inputErrorCondition", "recordId"],
+          "required": ["resultJudgement", "recordId"],
           "properties": {
-            "successCondition": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/resultCondition" },
-            "inputErrorCondition": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/resultCondition" },
-            "recordId": { "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/recordId" }
+            "resultJudgement": { "const": "FORM_STRUCTURE" },
+            "recordId": {
+              "description": "PL-5 9 (4) (plain UI design 8.1): null when the draft could not decide the record id way of the form (the worker takes no record id; the result is PARTIAL without a record id).",
+              "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/formRecordId" }, { "type": "null" }]
+            }
           }
         },
         "readVerification": { "$ref": "#/$defs/startReadCheck" },
@@ -205,14 +226,13 @@
           "additionalProperties": { "anyOf": [{ "type": "string", "maxLength": 8192 }, { "type": "null" }] }
         },
         "verification": {
-          "description": "T40a-fix (Task 40 design 7, the designer's decision on the verification spec of an API scenario): the success and the input error conditions are not used for an API write (always null); the record id way of the verification spec may be null when the API spec takes the record id from a key of the response body (worker-protocol.ts rejects both null).",
+          "description": "T40a-fix (Task 40 design 7, the designer's decision on the verification spec of an API scenario): an API write has no way to judge the result of a form (PL-6a: resultJudgement is always null); the record id way of the verification spec may be null when the API spec takes the record id from a key of the response body (worker-protocol.ts rejects both null).",
           "type": "object",
           "additionalProperties": false,
-          "required": ["successCondition", "inputErrorCondition", "recordId"],
+          "required": ["resultJudgement", "recordId"],
           "properties": {
-            "successCondition": { "type": "null" },
-            "inputErrorCondition": { "type": "null" },
-            "recordId": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/recordId" }, { "type": "null" }] }
+            "resultJudgement": { "type": "null" },
+            "recordId": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:scenario:1#/$defs/pageRecordId" }, { "type": "null" }] }
           }
         },
         "readVerification": { "$ref": "#/$defs/startReadCheck" },
@@ -288,7 +308,16 @@
           "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
         },
         "authenticationSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "automatedLogin": { "$ref": "#/$defs/startAutomatedLogin" }
+        "automatedLogin": { "$ref": "#/$defs/startAutomatedLogin" },
+        "loginRegistration": {
+          "description": "OP-1 (one pass flow design 4.1.3): wait for the registration of the parent right after the success of the manual login (a chained run with the manual login only; not with automatedLogin). The credential root is present only when the parent allows the worker to receive the credential the person types; null otherwise. Not in authenticationSha256.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["credentialRoot"],
+          "properties": {
+            "credentialRoot": { "anyOf": [{ "$ref": "#/$defs/path" }, { "type": "null" }] }
+          }
+        }
       }
     },
     "startAutomatedLogin": {
@@ -333,6 +362,57 @@
         "type": { "const": "LOGIN_CONFIRMED" }
       }
     },
+    "credentialSaveAllowed": {
+      "description": "OP-1 (4.1.3): the worker may write the received credential (parent to worker). Sent once after the parent built and validated the registration and the switch to the automated login. The login origin the credential is bound to; never a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "loginOrigin"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "CREDENTIAL_SAVE_ALLOWED" },
+        "loginOrigin": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      }
+    },
+    "loginRegistered": {
+      "description": "OP-1 (4.1.3): the parent saved the registration right after the login (parent to worker): the new auth setup, the approved service origins and their SHA-256 (the job kind and the approved test origins of START, without the automated login). The worker checks them again before it uses them in the next stages.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "setup", "approvedServiceOrigins", "authenticationSha256"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "LOGIN_REGISTERED" },
+        "setup": { "$ref": "urn:beaksight:schema:control:auth-setup:3" },
+        "approvedServiceOrigins": { "$ref": "#/$defs/startAuthentication/properties/approvedServiceOrigins" },
+        "authenticationSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "loginRegistrationSkipped": {
+      "description": "OP-1 (4.1.3): the parent did not save the registration right after the login (parent to worker); no item. The worker goes on with the current settings and discards the received credential.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "LOGIN_REGISTRATION_SKIPPED" }
+      }
+    },
+    "credentialSaved": {
+      "description": "OP-1 (4.1.3): whether the worker wrote the received credential (worker to parent); the credential revision only when written. OP-L (L2): the closed failure code only when not written (WORKER_CREDENTIAL_SAVE_FAILURE_CODES). Never a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "type", "saved", "credentialRevision", "failureCode"],
+      "properties": {
+        "protocol": { "$ref": "#/$defs/protocol" },
+        "type": { "const": "CREDENTIAL_SAVED" },
+        "saved": { "type": "boolean" },
+        "credentialRevision": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 9007199254740991 }, { "type": "null" }] },
+        "failureCode": { "anyOf": [{ "$ref": "#/$defs/credentialSaveFailureCode" }, { "type": "null" }] }
+      }
+    },
+    "credentialSaveFailureCode": {
+      "description": "OP-L (L2): why the worker could not write the received credential (WORKER_CREDENTIAL_SAVE_FAILURE_CODES). Never a value.",
+      "enum": ["CREDENTIAL_PROFILE_ID_INVALID", "CREDENTIAL_ORIGIN_INVALID", "CREDENTIAL_VALUE_EMPTY", "CREDENTIAL_VALUE_TOO_LONG", "CREDENTIAL_VALUE_TOO_SHORT", "CREDENTIAL_VALUE_MALFORMED", "CREDENTIAL_CHANGE_EMPTY", "CREDENTIAL_ALREADY_EXISTS", "CREDENTIAL_MISSING", "CREDENTIAL_STALE", "CREDENTIAL_FILE_INVALID", "CREDENTIAL_READ_FAILED", "CREDENTIAL_PLATFORM_UNSUPPORTED", "CREDENTIAL_STORAGE_UNSAFE", "CREDENTIAL_REPLACE_FAILED", "CREDENTIAL_DELETE_FAILED", "PROTECTION_UNAVAILABLE", "PROTECTION_FAILED", "PROTECTION_TIMEOUT", "PROTECTION_INPUT_INVALID", "CREDENTIAL_SAVE_UNAVAILABLE", "CREDENTIAL_SAVE_FAILED"]
+    },
     "chainStageKind": {
       "description": "FM2d: a stage kind of the chained run (WORKER_CHAIN_STAGE_KINDS).",
       "enum": ["AUDIT", "DISCOVERY", "READ_CHECK"]
@@ -346,8 +426,12 @@
         "protocol": { "$ref": "#/$defs/protocol" },
         "type": { "const": "NEXT_STAGE" },
         "jobId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
-        "jobKind": { "enum": ["DISCOVERY", "READ_CHECK"] },
-        "readChecks": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/startReadCheck" } }
+        "jobKind": { "enum": ["DISCOVERY", "READ_CHECK", "WRITE_CREATE", "WRITE_UPDATE"] },
+        "readChecks": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "$ref": "#/$defs/startReadCheck" } },
+        "write": {
+          "description": "OP-2: the write specification of a write stage of the chained run (the same shape as the START write; required for the write stages only). The parent issued, consumed and recorded the grant of this stage before it sent it.",
+          "oneOf": [{ "$ref": "#/$defs/startWrite" }, { "$ref": "#/$defs/startApiWrite" }]
+        }
       }
     },
     "chainEnd": {
@@ -543,7 +627,34 @@
           "description": "DEF-138: the evidence of the load where the session was lost (SESSION_LOST only; the same shape as authentication.sessionLoss of run.json); never a whole URL, a query value, a token or a cookie value.",
           "$ref": "urn:beaksight:schema:run:1.0#/$defs/sessionLoss"
         },
-        "loginStateNames": { "$ref": "#/$defs/loginStateNames" }
+        "loginStateNames": { "$ref": "#/$defs/loginStateNames" },
+        "loginEndDetection": {
+          "description": "OP-1 (D3): whether BeakSight detects the end of the login by itself (AWAITING_LOGIN only). When true, the screen does not show the login confirmation button.",
+          "type": "boolean"
+        },
+        "credentialCapture": {
+          "description": "OP-1 (D2): the metadata of the received credential (the success of the manual login only): whether it was received and the observed destination that carried it. Never a value or a length.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["captured", "carriedBy"],
+          "properties": {
+            "captured": { "type": "boolean" },
+            "carriedBy": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["origin", "path"],
+                  "properties": {
+                    "origin": { "type": "string", "minLength": 1, "maxLength": 2048 },
+                    "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                  }
+                },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
       }
     },
     "loginStateNameShape": {
@@ -669,6 +780,12 @@
             "password": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
             "submit": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 }
           }
+        },
+        "successPathPrefix": {
+          "description": "OP-1 (D3): the first path segment of the success screen of the manual login (the form /admin; never a value-like segment), observed to fill an empty success condition.",
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 256
         }
       }
     },

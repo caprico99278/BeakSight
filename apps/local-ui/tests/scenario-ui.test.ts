@@ -81,13 +81,16 @@ import { classifyCandidate } from '../../../src/discovery/classify.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDocument } from '../../../src/discovery/discovery-result.js';
 import { computeCandidateDigests } from '../../../src/discovery/fingerprint.js';
 import {
+  SCENARIO_DISPLAY_STATE_CATALOG,
   ACTION_OUTCOME_REASON_CATALOG,
   APPROVAL_DIGEST_ITEM_CATALOG,
+  HTTP_METHOD_LABELS,
   SCENARIO_TRANSPORT_CATALOG,
+  SIDE_EFFECT_CONFIRMATION_CATALOG,
   WRITE_CHAIN_STOP_REASON_CATALOG,
   WRITE_REPORT_CHECK_CATALOG,
 } from '../../../src/presentation/catalog.js';
-import { formatCount } from '../../../src/presentation/format.js';
+import { formatCount, formatInteger } from '../../../src/presentation/format.js';
 import {
   EXECUTION_GRANT_REJECTION_DESCRIPTIONS,
   LOCAL_UI_CRAWL_LIMITS_TEXT,
@@ -100,7 +103,10 @@ import {
   SCENARIO_REQUEST_REJECTION_DESCRIPTIONS,
   WRITE_START_LOCAL_REJECTION_DESCRIPTIONS,
   listText,
+  LOCAL_UI_JOB_SUMMARY_TEXT,
+  LOCAL_UI_WRITE_STAGE_TEXT,
 } from '../../../src/presentation/messages.js';
+import { httpMethodLabel } from '../src/display/labels';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeFakeWorker, type FakeWorkerValues } from '../../../tests/helpers/fake-audit-worker.js';
@@ -120,8 +126,13 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
+import { createProfileInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
+import { SCENARIO_ADVANCED_SETTINGS, SCENARIO_DETAIL_ADVANCED_SETTINGS, openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { ISOLATION_NOTICE_FRAGMENT, axeViolationsOf, expectAtMostOnePrimaryButton, primaryButtonLabelsInMain } from './helpers/screen-shape.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
+import { isolationUnverifiedEvidenceRefOf } from '../src/server/isolation-evidence-ref';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403, NOT_FOUND: 404, MISDIRECTED: 421 });
 /** ジョブの終わりを待つ上限と、読み直す間隔（ms）。 */
@@ -348,9 +359,10 @@ const authSetup = (profileId: string): Record<string, unknown> => ({
   automatedLogin: null,
 });
 
+/** 副作用の確認の 4 項目（表示の順）。 */
+const SIDE_EFFECT_ITEMS = ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE'] as const;
 /** 副作用の確認（4 項目）。 */
-const confirmations = (confirmed: boolean): Record<string, boolean> =>
-  Object.fromEntries(['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE'].map((item) => [item, confirmed]));
+const confirmations = (confirmed: boolean): Record<string, boolean> => Object.fromEntries(SIDE_EFFECT_ITEMS.map((item) => [item, confirmed]));
 
 /** 下書き（作成の形）。 */
 const draftOf = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -408,7 +420,7 @@ beforeAll(async () => {
     [PASSIVE_PROFILE_ID, passiveTarget, 'TEST_AUTH_PASSIVE'],
   ] as const) {
     expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(profileId, target, mode, FIRST_REVISION) })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(profileId) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(profileId) })).toMatchObject({ ok: true });
   }
   browser = await launchHeadlessChromium();
   context = await browser.newContext();
@@ -447,9 +459,19 @@ describe('T28e: scenario Server Functions (registration, input validation, CSRF,
       'auditedDataLedgerPageFn',
     ]));
     // T30g: 書き込みの開始の画面の Server Function だけ（許可の消費・予約の締めの Server Function はない）。T31h-2: UPDATE の開始を足した。T41g: 登録してから
-    // 更新する（今の開始の口を順に呼ぶ）を足した。
+    // 更新する（今の開始の口を順に呼ぶ）を足した。MI-5 の「書き込みにも使う」の 2 つ
+    // は、OP-3 で消した（切り替えは、一覧のチェックの保存の中。`write-mode-switch.ts` は実行の許可と予約の部品を import しない）。
     expect([...ids.keys()].filter((name) => /grant|reserv|consume|execut|settle|write/iu.test(name)).sort())
-      .toEqual(['startWriteCreateFn', 'startWriteCreateThenUpdateFn', 'startWriteUpdateFn', 'writeStartPageFn']);
+      .toEqual([
+        // OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.1 の D7'）: サイトの画面の一覧（`writeScreensFn`。読むだけ）と、チェックの保存（切り替え・
+        // 下書き・承認と、承認の取り消し。実行の許可は出さず、消費しない。発行は点検の書き込みの段の前に、ジョブの管理が行う。Gate `approval-ssot` の (e)）。
+        'saveWriteScreenCheckFn',
+        'startWriteCreateFn',
+        'startWriteCreateThenUpdateFn',
+        'startWriteUpdateFn',
+        'writeScreensFn',
+        'writeStartPageFn',
+      ]);
   });
 
   it('rejects inputs that do not match the schemas with 400, and creates nothing', async () => {
@@ -504,20 +526,35 @@ describe('T28e: the scenario screens', () => {
     await discover(WRITE_PROFILE_ID, 't28e-write-output');
     await discover(PASSIVE_PROFILE_ID, 't28e-passive-output');
 
+    // PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 6）: 候補ごとの作るリンクはなくし、書き込みの手順の下書きは要点の主のボタン 1 つ
+    // （書き込みのモードのサイトだけ）。登録・更新の候補だけが書き込みの手順にできることは、画面と同じ値の Server Function で確かめる。
     const write = await openPage(`/discovery/${WRITE_PROFILE_ID}`);
-    for (const [candidate, shown] of [[CREATE, 1], [UPDATE, 1], [SEARCH, 0]] as const) {
-      expect(await write.locator(`[data-testid="discovery-candidate"][data-digest="${candidate.identityDigest}"]`)
-        .getByTestId('candidate-create-scenario').count(), candidate.classification).toBe(shown);
+    await write.getByTestId('discovery-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await write.getByTestId('candidate-create-scenario').count()).toBe(0);
+    expect(await write.getByTestId('auto-draft-open').count()).toBe(1);
+    const writeValues = await valueOf<{ candidates: readonly { identityDigest: string; scenarioCreatable: boolean }[] }>(
+      'discoveryPageFn', 'GET', { profileId: WRITE_PROFILE_ID },
+    );
+    for (const [candidate, creatable] of [[CREATE, true], [UPDATE, true], [SEARCH, false]] as const) {
+      expect(writeValues.candidates.find(({ identityDigest }) => identityDigest === candidate.identityDigest)?.scenarioCreatable, candidate.classification)
+        .toBe(creatable);
     }
     await screenshot(write, 'e01-discovery-create-scenario-links');
     const passive = await openPage(`/discovery/${PASSIVE_PROFILE_ID}`);
-    expect(await passive.getByTestId('candidate-create-scenario').count()).toBe(0);
+    await passive.getByTestId('discovery-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await passive.getByTestId('auto-draft-open').count()).toBe(0);
+    expect((await valueOf<{ candidates: readonly { scenarioCreatable: boolean }[] }>('discoveryPageFn', 'GET', { profileId: PASSIVE_PROFILE_ID }))
+      .candidates.some(({ scenarioCreatable }) => scenarioCreatable)).toBe(false);
 
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1、6 章の 7）: 書き込みの手順への入口は 1 つ（段によって、要点の主のボタンか、詳しい内容の中）。
     const writeDetail = await openPage(`/profiles/${WRITE_PROFILE_ID}`);
-    expect(await writeDetail.getByTestId('profile-scenarios').getByRole('link', { name: text.profileDetail.open }).getAttribute('href'))
-      .toBe(`/scenarios/${WRITE_PROFILE_ID}`);
+    await writeDetail.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    const scenariosLink = writeDetail.locator('main [data-action="SCENARIOS"]');
+    expect(await scenariosLink.count()).toBe(1);
+    expect(await scenariosLink.getAttribute('href')).toBe(`/scenarios/${WRITE_PROFILE_ID}`);
     const passiveDetail = await openPage(`/profiles/${PASSIVE_PROFILE_ID}`);
-    expect(await passiveDetail.getByTestId('profile-scenarios').count()).toBe(0);
+    await passiveDetail.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await passiveDetail.locator('main [data-action="SCENARIOS"]').count()).toBe(0);
 
     // サーバも拒む（画面の動線がなくても、書き込みのモードでないプロファイルにはシナリオを作らない）。
     expect(await valueOf('scenarioListPageFn', 'GET', { profileId: PASSIVE_PROFILE_ID })).toMatchObject({ eligible: false, editable: false });
@@ -552,6 +589,8 @@ describe('T28e: the scenario screens', () => {
       minTtlDays: 1,
       maxTtlDays: 30,
       sideEffects: ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE'],
+      // MI-F3（MI-R の Minor 12）: 作成の画面の副作用の確認の初めの値（すべて偽。下書きの部品の定数をサーバが渡す）。
+      unconfirmedSideEffects: { TEST_RECORDS_ONLY: false, NO_EXTERNAL_NOTIFICATION: false, NO_PAYMENT_OR_EXTERNAL_SERVICE: false, NOT_DESTRUCTIVE: false },
     });
     expect(await valueOf('scenarioFormPageFn', 'GET', { profileId: WRITE_PROFILE_ID, candidateIdentityDigest: SEARCH.identityDigest }))
       .toMatchObject({ candidateRejection: 'SCENARIO_CANDIDATE_NOT_WRITABLE' });
@@ -560,12 +599,15 @@ describe('T28e: the scenario screens', () => {
 
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/new?candidate=${encodeURIComponent(CREATE.identityDigest)}`);
     const checkbox = (name: string): Locator => page.locator(`[data-testid="scenario-field"][data-field-name="${name}"] input[type="checkbox"]`);
-    for (const name of ['name', 'email', 'plan']) {
+    for (const name of ['name', 'email']) {
       expect(await checkbox(name).isDisabled(), name).toBe(false);
     }
+    // MI-6: 既定の値が分からない欄（select の plan）は、送る欄にしないと保存できない（1 つの値しか通らない）ので、選ぶ入力でなく表示だけ。
+    expect(await page.locator('[data-testid="scenario-field"][data-field-name="plan"]').getByTestId('scenario-field-must-send').count()).toBe(1);
+    expect(await checkbox('plan').count()).toBe(0);
+    // PL-5（設計書 4 章の 5）: 送れない欄の checkbox は出さない（選べない理由は上の Server Function の値。サーバも下の場面で拒む）。
     for (const name of ['authenticity_token', 'api_key', 'delete_flag', 'kept', 'pin']) {
-      expect(await checkbox(name).isDisabled(), name).toBe(true);
-      expect(await page.locator(`[data-testid="scenario-field"][data-field-name="${name}"]`).getByTestId('scenario-field-blocked').count(), name).toBe(1);
+      expect(await page.locator(`[data-testid="scenario-field"][data-field-name="${name}"]`).count(), name).toBe(0);
     }
     await screenshot(page, 'e02-scenario-new');
   });
@@ -601,20 +643,31 @@ describe('T28e: the scenario screens', () => {
     expect(await valueOf('scenarioListPageFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({ scenarios: [] });
   });
 
-  it('creates a scenario by keyboard from the candidate, and does not approve it while a side effect is unconfirmed', async () => {
-    const discovery = await openPage(`/discovery/${WRITE_PROFILE_ID}`);
-    await tabTo(discovery, discovery.locator(`[data-testid="discovery-candidate"][data-digest="${CREATE.identityDigest}"]`).getByTestId('candidate-create-scenario'));
-    await discovery.keyboard.press('Enter');
+  // MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 作成の画面に副作用の確認のチェックはない（承認のダイアログの
+  // 1 回で確かめる）。1 つの値しか通らない欄（既定の値が分からない送る欄、1 回の Run の上限）は表示だけ。累積の上限と期限は、たたんだ詳しい設定に置く。
+  // 副作用の確認がまだでも、承認のボタンは出る（前は、そろうまで出さなかった）。
+  it('creates a scenario by keyboard from the candidate without the side effect checks, and offers the approval while they are unconfirmed', async () => {
+    // PL-5（設計書 4 章の 6）: 手で作る書き込みの手順は、作成の画面の URL（候補の digest）で開く（候補ごとのリンクはなくした）。
+    const discovery = await openPage(`/scenarios/${WRITE_PROFILE_ID}/new?candidate=${encodeURIComponent(CREATE.identityDigest)}`);
     await discovery.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await discovery.getByTestId('scenario-target').getAttribute('data-digest')).toBe(CREATE.identityDigest);
+    expect(await discovery.locator('input[data-side-effect]').count()).toBe(0);
+    expect(await discovery.getByTestId('scenario-side-effects').count()).toBe(0);
+    // T30f fix round 1・2（DEF-098）: CREATE は、既定の値が分からない見える欄（select の plan）も送る欄にする。MI-6: 1 つの値しか通らないので表示だけ。
+    const plan = discovery.locator('[data-testid="scenario-field"][data-field-name="plan"]');
+    expect(await plan.getAttribute('data-must-send')).toBe('true');
+    expect(await plan.locator('input').count()).toBe(0);
+    expect(await plan.getByTestId('scenario-field-must-send').textContent()).toContain(text.mustSendHint);
+    // 1 回の Run の上限は表示だけ。累積の上限と承認の期限は、閉じた詳しい設定の中（既定のまま保存できる）。
+    expect(await discovery.getByTestId('scenario-per-run-fixed').getAttribute('data-value')).toBe('1');
+    expect(await discovery.locator('input[name="maxCreatesPerRun"]').count()).toBe(0);
+    const advanced = discovery.getByTestId(SCENARIO_ADVANCED_SETTINGS);
+    expect(await advanced.evaluate((element) => (element as HTMLDetailsElement).open)).toBe(false);
+    expect(await advanced.locator('input[name="maxCumulativeCreates"]').inputValue()).toBe('20');
+    expect(await advanced.locator('input[name="approvalTtlDays"]').inputValue()).toBe('30');
     for (const target of [
       discovery.locator('[data-testid="scenario-field"][data-field-name="name"] input[type="checkbox"]'),
       discovery.locator('[data-testid="scenario-field"][data-field-name="email"] input[type="checkbox"]'),
-      // T30f fix round 1・2（DEF-098）: CREATE は、既定の値が分からない見える欄（select の plan）も送る欄にする。
-      discovery.locator('[data-testid="scenario-field"][data-field-name="plan"] input[type="checkbox"]'),
-      discovery.locator('input[data-side-effect="TEST_RECORDS_ONLY"]'),
-      discovery.locator('input[data-side-effect="NO_EXTERNAL_NOTIFICATION"]'),
-      discovery.locator('input[data-side-effect="NO_PAYMENT_OR_EXTERNAL_SERVICE"]'),
     ]) {
       await tabTo(discovery, target);
       await discovery.keyboard.press('Space');
@@ -624,20 +677,23 @@ describe('T28e: the scenario screens', () => {
     await discovery.keyboard.press('Enter');
     await discovery.waitForURL(new RegExp(`/scenarios/${WRITE_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     state.scenarioId = new URL(discovery.url()).pathname.split('/').at(-1) ?? '';
-    await discovery.getByTestId('scenario-state').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5（設計書 3 章の 1）: 要点は今の様子の文と、主のボタン「書き込みの OK」1 つ（副作用の確認は承認のダイアログの 1 回）。状態の印は詳しい内容の中。
+    await discovery.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await discovery.getByTestId('scenario-state').getAttribute('data-state')).toBe('DRAFT');
-    expect(await discovery.getByTestId('scenario-unconfirmed').count()).toBe(1);
-    expect(await discovery.getByTestId('scenario-approve').count()).toBe(0);
-    expect(await discovery.getByTestId('scenario-input-rules').textContent()).toBe(text.inputRulesMissing);
+    expect(await primaryButtonLabelsInMain(discovery)).toEqual([LOCAL_UI_WRITE_STAGE_TEXT.scenario.approve]);
+    expect(await discovery.getByTestId('scenario-approve').count()).toBe(1);
+    // PL-5 の 9 の (1): 作成の保存で推した入れる値の決まりが付く（この候補はすべて推せるので、要点に足りない欄の 1 行は出ない）。
+    expect(await discovery.getByTestId('scenario-rules-insufficient').count()).toBe(0);
     await screenshot(discovery, 'e04-scenario-detail-draft');
 
     const detail = await detailOf(state.scenarioId);
-    expect(detail.scenario).toMatchObject({ revision: 1, state: 'DRAFT', fieldNames: ['email', 'name', 'plan'] });
-    expect(detail.unconfirmedSideEffects).toEqual(['NOT_DESTRUCTIVE']);
+    // PL-5 の 9 の (1): 作成の保存で推した規則を付けたので、版は 2（作成の 1 と、規則を付けた 1）。
+    expect(detail.scenario).toMatchObject({ revision: 2, state: 'DRAFT', fieldNames: ['email', 'name', 'plan'] });
+    expect(detail.unconfirmedSideEffects).toEqual(['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']);
     expect(detail.status).toMatchObject({ displayState: 'DRAFT', reasons: [] });
-    // 画面を通さずに承認を送っても、副作用の未確認で拒む。
+    // 画面を通さずに承認を送っても、ダイアログの確認（`sideEffectsConfirmed`）がなければ、副作用の未確認で拒む。
     expect(await valueOf('approveScenarioFn', 'POST', {
-      scenarioId: state.scenarioId, expectedRevision: 1, expectedApprovalDigest: detail.status?.approvalDigest,
+      scenarioId: state.scenarioId, expectedRevision: 2, expectedApprovalDigest: detail.status?.approvalDigest,
     })).toMatchObject({ ok: false, reason: 'SCENARIO_SIDE_EFFECTS_UNCONFIRMED' });
     expect((await detailOf(state.scenarioId)).history).toEqual([]);
 
@@ -652,11 +708,10 @@ describe('T28e: the scenario screens', () => {
   it('shows the revision conflict when the scenario changed after the edit screen opened, and saves the change after a reload', async () => {
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}/edit`);
     await page.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
+    // MI-6: 副作用の確認は、画面で変えない（今の版の値を引き継ぐ）。ここでは、ほかの保存（すべて確かめた版）が先に入る。
     expect(await valueOf('updateScenarioFn', 'POST', {
-      scenarioId: state.scenarioId, expectedRevision: 1, draft: changeOf({ fieldNames: ['email', 'name', 'plan'], sideEffectConfirmations: { ...confirmations(true), NOT_DESTRUCTIVE: false } }),
-    })).toMatchObject({ ok: true, revision: 2 });
-    await tabTo(page, page.locator('input[data-side-effect="NOT_DESTRUCTIVE"]'));
-    await page.keyboard.press('Space');
+      scenarioId: state.scenarioId, expectedRevision: 2, draft: changeOf({ fieldNames: ['email', 'name', 'plan'] }),
+    })).toMatchObject({ ok: true, revision: 3 });
     await tabTo(page, page.getByTestId('scenario-save'));
     await page.keyboard.press('Enter');
     await page.getByTestId('scenario-rejection').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -664,15 +719,17 @@ describe('T28e: the scenario screens', () => {
     await screenshot(page, 'e06-scenario-edit-conflict');
 
     const reloaded = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}/edit`);
-    await tabTo(reloaded, reloaded.locator('input[data-side-effect="NOT_DESTRUCTIVE"]'));
-    await reloaded.keyboard.press('Space');
+    // MI-6: 詳しい設定を開くと、今の版の累積の上限と期限が入っている（変えずに保存する）。
+    await openAdvancedSettings(reloaded, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    expect(await reloaded.locator('input[name="maxCumulativeCreates"]').inputValue()).toBe('20');
     await tabTo(reloaded, reloaded.getByTestId('scenario-save'));
     await reloaded.keyboard.press('Enter');
     await reloaded.waitForURL(new RegExp(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     const detail = await detailOf(state.scenarioId);
-    expect(detail.scenario.revision).toBe(3);
+    expect(detail.scenario.revision).toBe(4);
+    // MI-6: 変更の画面の保存は、今の版（すべて確かめた版 3）の副作用の確認を引き継ぐ。
     expect(detail.unconfirmedSideEffects).toEqual([]);
-    expect(detail.revisions.map(({ revision }) => revision)).toEqual([1, 2, 3]);
+    expect(detail.revisions.map(({ revision }) => revision)).toEqual([1, 2, 3, 4]);
   });
 
   it('approves only after the confirmation dialog: the dialog opens on the cancel button, and Enter or Escape does not approve', async () => {
@@ -683,7 +740,10 @@ describe('T28e: the scenario screens', () => {
     const dialog = page.getByRole('dialog');
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await focusedText(page)).toBe(text.approveDialog.cancel);
-    expect(await dialog.getByTestId('scenario-approve-details').textContent()).toContain(text.noApproval);
+    // PL-5（設計書 3 章の 2、7 章）: ダイアログは何を・どこへ・何件と 4 つの約束（最後の OK との違いの表は出さない。違いは Server Function の値）。
+    expect(await dialog.getByTestId('scenario-approve-target').textContent()).toBe(text.approveDialog.targetCreate(CREATE.page.path, '1'));
+    expect(await dialog.getByTestId('scenario-approve-side-effects').locator('li').count()).toBe(4);
+    expect((await detailOf(state.scenarioId)).lastApprovalRevision).toBeNull();
     await screenshot(page, 'e07-scenario-approve-dialog');
     await page.keyboard.press('Enter');
     await expect.poll(() => dialog.isVisible(), { timeout: UI_TIMEOUT_MS }).toBe(false);
@@ -702,14 +762,14 @@ describe('T28e: the scenario screens', () => {
     await page.keyboard.press('Enter');
     await page.waitForURL(new RegExp(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}\\?notice=approved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
-    expect(await page.getByTestId('scenario-differences').getByTestId('scenario-diff-empty').count()).toBe(1);
+    expect((await detailOf(state.scenarioId)).differences).toEqual([]);
     await screenshot(page, 'e08-scenario-approved');
     const detail = await detailOf(state.scenarioId);
     expect(detail.scenario.state).toBe('APPROVED');
     expect(detail.status?.displayState).toBe('APPROVED');
     expect(detail.status?.expiresAt).not.toBeNull();
-    expect(detail.history).toEqual([expect.objectContaining({ kind: 'APPROVAL', scenarioRevision: 3 })]);
-    expect(detail.lastApprovalRevision).toBe(3);
+    expect(detail.history).toEqual([expect.objectContaining({ kind: 'APPROVAL', scenarioRevision: 4 })]);
+    expect(detail.lastApprovalRevision).toBe(4);
     expect(detail.differences).toEqual([]);
   });
 
@@ -724,6 +784,8 @@ describe('T28e: the scenario screens', () => {
       profileId: WRITE_PROFILE_ID, expectedTargetConfigDigest: view.targetConfigDigest, limits: { ...view.limits, maxPages: 11 },
     })).toMatchObject({ ok: true, approvedScenarioCount: 1 });
     const page = await openPage(`/profiles/${WRITE_PROFILE_ID}`);
+    // PL-1: 監査の負荷の欄は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
     const panel = page.getByTestId('profile-crawl-limits');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     await panel.getByLabel(limitsText.fields.maxPages, { exact: true }).fill('11');
@@ -744,28 +806,28 @@ describe('T28e: the scenario screens', () => {
     const before = await detailOf(state.scenarioId);
     const oldDigest = before.status?.approvalDigest;
     expect(await valueOf('updateScenarioFn', 'POST', {
-      scenarioId: state.scenarioId, expectedRevision: 3, draft: changeOf({ fieldNames: ['name', 'plan'], limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 5 } }),
-    })).toMatchObject({ ok: true, revision: 4 });
-    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId: state.scenarioId, expectedRevision: 3, expectedApprovalDigest: oldDigest }))
-      .toMatchObject({ ok: false, reason: 'SCENARIO_REVISION_CONFLICT' });
+      scenarioId: state.scenarioId, expectedRevision: 4, draft: changeOf({ fieldNames: ['name', 'plan'], limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 5 } }),
+    })).toMatchObject({ ok: true, revision: 5 });
     expect(await valueOf('approveScenarioFn', 'POST', { scenarioId: state.scenarioId, expectedRevision: 4, expectedApprovalDigest: oldDigest }))
+      .toMatchObject({ ok: false, reason: 'SCENARIO_REVISION_CONFLICT' });
+    expect(await valueOf('approveScenarioFn', 'POST', { scenarioId: state.scenarioId, expectedRevision: 5, expectedApprovalDigest: oldDigest }))
       .toMatchObject({ ok: false, reason: 'SCENARIO_APPROVAL_DIGEST_MISMATCH' });
 
     const changed = await detailOf(state.scenarioId);
     expect(changed.status).toMatchObject({ displayState: 'NEEDS_REAPPROVAL', reasons: ['SCENARIO_REVISION_CHANGED'] });
     expect(changed.differences).toEqual([
-      { item: 'scenarioRevision', previous: 3, current: 4 },
+      { item: 'scenarioRevision', previous: 4, current: 5 },
       { item: 'fieldNames', previous: ['email', 'name', 'plan'], current: ['name', 'plan'] },
       { item: 'limits', previous: [1, 20], current: [1, 5] },
     ]);
 
     // 画面を開いた後に、プロファイルが変わった（承認の digest が変わる）。画面の古い digest の承認は拒まれ、理由を出す。
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${state.scenarioId}`);
-    const diff = page.getByTestId('scenario-differences');
-    expect(await diff.locator('[data-testid="scenario-diff-item"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-item'))))
-      .toEqual(['scenarioRevision', 'fieldNames', 'limits']);
-    expect(await diff.locator('[data-item="limits"] th').textContent()).toBe(APPROVAL_DIGEST_ITEM_CATALOG.limits.label);
-    expect(await diff.locator('[data-item="limits"] code').textContent()).toBe(text.diffValue('[1,20]', '[1,5]'));
+    // PL-5（設計書 3 章の 2）: 版と承認の差分の表は出さない（差分は上の Server Function の値）。要点に、OK の出し直しが要る理由を出す。
+    expect(await page.getByTestId('scenario-differences').count()).toBe(0);
+    expect(await page.getByTestId('scenario-summary').getByTestId('scenario-reasons').locator('li').evaluateAll((rows) =>
+      rows.map((row) => row.getAttribute('data-reason')))).toEqual(['SCENARIO_REVISION_CHANGED']);
+    expect(await page.getByTestId('scenario-state-description').textContent()).toBe(SCENARIO_DISPLAY_STATE_CATALOG.NEEDS_REAPPROVAL.description);
     await screenshot(page, 'e09-scenario-needs-reapproval');
     expect(await valueOf('updateProfileFn', 'POST', {
       profile: profileDocument(WRITE_PROFILE_ID, state.writeTarget, 'TEST_APPROVED_WRITE', FIRST_REVISION + 1), expectedRevision: FIRST_REVISION,
@@ -773,7 +835,7 @@ describe('T28e: the scenario screens', () => {
     await tabTo(page, page.getByTestId('scenario-approve'));
     await page.keyboard.press('Enter');
     await page.getByRole('dialog').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await page.getByRole('dialog').getByTestId('scenario-diff-item').count()).toBe(3);
+    expect(await page.getByRole('dialog').getByTestId('scenario-diff-item').count()).toBe(0);
     await page.keyboard.press('Tab');
     await page.keyboard.press('Enter');
     await page.getByTestId('scenario-action-rejection').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -797,6 +859,8 @@ describe('T28e: the scenario screens', () => {
     await page.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
     await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
 
+    // PL-5（設計書 3 章の 1）: OK の取り消しは、詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const revoke = page.getByTestId('scenario-revoke');
     await tabTo(page, revoke);
     await page.keyboard.press('Enter');
@@ -829,10 +893,65 @@ describe('T28e: the scenario screens', () => {
     await screenshot(list, 'e13-scenario-list-revoked');
   });
 
+  // MI-6（設計書 4.6、ユーザーの判断 2、受け入れ条件 5）: 副作用の確認がまだの版でも、承認のダイアログに 4 項目の中身が出て、1 回の「承認する」で、
+  // 4 項目を確かめた次の版が作られ、その版が承認される（承認が縛る digest は、その版のもの）。終わりに撤回する（ほかの場面の数に入れない）。
+  it('approves a revision whose side effects are unconfirmed by one press of the dialog, binding the revision with every confirmation (MI-6)', async () => {
+    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: draftOf({ fieldNames: ['email', 'name', 'plan'], sideEffectConfirmations: confirmations(false) }),
+    });
+    expect(created.ok).toBe(true);
+    const { scenarioId } = created;
+    const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${scenarioId}`);
+    // PL-5（設計書 3 章の 1）: 要点は今の様子の文と主のボタン 1 つ。確かめていない副作用の項目は、承認のダイアログで 4 つの約束として出す（下）。
+    expect((await detailOf(scenarioId)).unconfirmedSideEffects).toEqual([...SIDE_EFFECT_ITEMS]);
+    expect(await primaryButtonLabelsInMain(page)).toEqual([LOCAL_UI_WRITE_STAGE_TEXT.scenario.approve]);
+    await tabTo(page, page.getByTestId('scenario-approve'));
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: text.approveDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await focusedText(page)).toBe(text.approveDialog.cancel);
+    expect(await dialog.textContent()).toContain(text.approveDialog.sideEffectsNote);
+    const items = dialog.getByTestId('scenario-approve-side-effects').locator('li');
+    expect(await items.evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-item'), row.getAttribute('data-confirmed')])))
+      .toEqual(SIDE_EFFECT_ITEMS.map((item) => [item, 'false']));
+    expect(await items.allTextContents()).toEqual(SIDE_EFFECT_ITEMS.map((item) =>
+      `${SIDE_EFFECT_CONFIRMATION_CATALOG[item].label}${SIDE_EFFECT_CONFIRMATION_CATALOG[item].description}`));
+    // PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 9 章の 3）: 何を・どこへ・何件（画面の path を 1 つ）。隔離を確かめたプロファイルには、未確認の注意を出さない。
+    expect(await dialog.getByTestId('scenario-approve-target').textContent()).toBe(text.approveDialog.targetCreate(CREATE.page.path, formatInteger(1)));
+    expect(await dialog.getByTestId('scenario-approve-isolation-unverified').count()).toBe(0);
+    await screenshot(page, 'e14-scenario-approve-side-effects');
+    // 取り消すと、版も記録も変わらない。
+    await page.keyboard.press('Enter');
+    await expect.poll(() => dialog.isVisible(), { timeout: UI_TIMEOUT_MS }).toBe(false);
+    // PL-5 の 9 の (1): 作成の保存で推した規則を付けたので、版は 2。
+    expect(await detailOf(scenarioId)).toMatchObject({ scenario: { revision: 2, state: 'DRAFT' }, history: [] });
+    await page.getByTestId('scenario-approve').focus();
+    await page.keyboard.press('Enter');
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.keyboard.press('Tab');
+    expect(await focusedText(page)).toBe(text.approveDialog.confirm);
+    await page.keyboard.press('Enter');
+    await page.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
+    await expect.poll(() => page.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
+
+    const detail = await detailOf(scenarioId);
+    expect(detail.scenario).toMatchObject({ revision: 3, state: 'APPROVED' });
+    expect(detail.unconfirmedSideEffects).toEqual([]);
+    expect(detail.history).toEqual([expect.objectContaining({ kind: 'APPROVAL', scenarioRevision: 3 })]);
+    expect(detail.status?.displayState).toBe('APPROVED');
+    const [receipt] = withControlData((database) => readApprovalReceipts(database, scenarioId));
+    // 承認が縛る digest は、確認を入れた版 3 の今の digest（画面が出した版 2 の digest ではない）。
+    expect(receipt?.kind === 'APPROVAL' ? receipt.approvalDigest : null).toBe(detail.status?.approvalDigest);
+    expect(withControlData((database) => readScenario(database, scenarioId)?.current.sideEffectConfirmations)).toEqual(confirmations(true));
+    expect(await valueOf('revokeScenarioFn', 'POST', { scenarioId, expectedRevision: 3 })).toMatchObject({ ok: true });
+  });
+
   it('has no button that runs a write, and shows no cookie, screen token or option value in the screens and the responses', async () => {
     const allowedButtons = new Set<string>([
       text.approve, text.revoke, text.save, text.reload, text.approveDialog.confirm, text.approveDialog.cancel, text.revokeDialog.confirm,
       text.revokeDialog.cancel,
+      // PL-5（設計書 5 章）: 要点の主のボタンの語「書き込みの OK」（承認のダイアログを開くだけ。書き込みは始めない）。
+      LOCAL_UI_WRITE_STAGE_TEXT.scenario.approve,
     ]);
     const paths = [
       `/scenarios/${WRITE_PROFILE_ID}`,
@@ -898,6 +1017,8 @@ interface WriteStartPage {
   readonly remaining: number;
   readonly notificationConfirmed: boolean;
   readonly evidencePresent: boolean;
+  /** PL-S: 環境の証跡の参照が、隔離が未確認の形か。 */
+  readonly isolationUnverified: boolean;
   readonly startBlocker: string | null;
 }
 /** 書き込みの scenario（検証の指定と承認つき）。 */
@@ -914,6 +1035,20 @@ const withControlData = <T>(use: (database: ControlDatabase) => T): T => {
     return use(database);
   } finally {
     closeControlDatabase(database);
+  }
+};
+
+/**
+ * PL-5 の 9 の (1): 保存の口が作成のときに推した規則の集まりを付けるので、テストの規則は、その集まりの今の版の次の版として保存する（規則がなければ null）。
+ */
+const ruleSetRevisionOf = async (scenarioId: string): Promise<number | null> =>
+  (await valueOf<{ ruleSet: { revision: number } | null }>('dataRulePageFn', 'GET', { scenarioId })).ruleSet?.revision ?? null;
+
+/** PL-5（設計書 3 章の 2）: 画面に出さない技術の値（ID・path の型など）が、本文の文字にないこと。 */
+const expectNoTechnicalTextOf = async (page: Page, values: readonly string[]): Promise<void> => {
+  const shown = (await page.locator('main').textContent()) ?? '';
+  for (const value of values) {
+    expect(shown.includes(value), value).toBe(false);
   }
 };
 
@@ -960,9 +1095,14 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     const missing = page.getByTestId('scenario-verification-missing');
     await missing.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await missing.getAttribute('data-reason')).toBe('VERIFICATION_SPEC_MISSING');
-    expect(await missing.locator('li').evaluateAll((items) => items.map((item) => item.getAttribute('data-item'))))
-      .toEqual(['successCondition', 'inputErrorCondition', 'recordId', 'readVerification']);
-    expect(await page.getByTestId('scenario-open-write').count()).toBe(1);
+    // PL-5（設計書 3 章の 2、8.1）: 要点は、答え合わせを決められなかった 1 行（項目の名前は出さない）。足りない項目は Server Function の値で確かめる。
+    // PL-6a: 結果の判定のしかたの印は BeakSight が付ける。PL-5 の 9 の (4): フォームの ID の取り方は不足に数えないので、足りないのは答え合わせだけ。
+    expect(await missing.textContent()).toBe(LOCAL_UI_WRITE_STAGE_TEXT.scenario.verificationMissing);
+    expect((await valueOf<{ missingVerification: readonly string[] }>('scenarioDetailPageFn', 'GET', { scenarioId: writeState.scenarioId }))
+      .missingVerification).toEqual(['readVerification']);
+    // PL-5: 下書きの主のボタンは「書き込みの OK」（「書き込みを始める」は、OK の後の主のボタン）。
+    expect(await primaryButtonLabelsInMain(page)).toEqual([LOCAL_UI_WRITE_STAGE_TEXT.scenario.approve]);
+    expect(await page.getByTestId('scenario-open-write').count()).toBe(0);
     expect(await page.getByTestId('write-history-empty').textContent()).toBe(writeText.noWrites);
     await screenshot(page, 'g01-scenario-verification-missing');
   });
@@ -970,38 +1110,33 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
   it('saves the verification spec from the edit screen, and shows it on the detail screen', async () => {
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}/edit`);
     await page.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
-    const success = page.getByTestId('scenario-verification-successCondition');
-    await success.getByLabel(writeText.conditionPathPrefix, { exact: true }).fill('/admin/members/');
-    await success.getByLabel(writeText.conditionSelector, { exact: true }).fill('.registered');
-    const inputError = page.getByTestId('scenario-verification-inputErrorCondition');
-    await inputError.getByLabel(writeText.conditionPathPrefix, { exact: true }).fill('/admin/members/new');
-    await inputError.getByLabel(writeText.conditionSelector, { exact: true }).fill('.error');
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成功の条件と入力の誤りの条件の欄はない（BeakSight が構造で判定する）。
+    // form の ID の取り方は、送った後のアドレスの形の一覧（`URL_PATH_PATTERNS`）。PL-5: 検証の欄は、たたんだ詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const recordId = page.getByTestId('scenario-verification-recordId');
-    await recordId.getByLabel(writeText.recordIdSource, { exact: true }).selectOption('URL_PATH_PATTERN');
+    await recordId.getByLabel(writeText.recordIdSource, { exact: true }).selectOption('URL_PATH_PATTERNS');
     await recordId.getByLabel(writeText.recordIdValue, { exact: true }).fill('/admin/members/{id}');
     const read = page.getByTestId('scenario-verification-readVerification');
     await read.getByLabel(writeText.readVerificationCheck, { exact: true }).selectOption(writeState.readCheckId);
     await read.locator('[data-testid="scenario-verification-binding"][data-parameter-name="q"] select').selectOption('name');
     await read.getByTestId('scenario-verification-add-expectation').click();
     await read.locator('[data-testid="scenario-verification-expectation"][data-index="0"]').getByLabel(writeText.expectationCount, { exact: true }).fill('1');
-    for (const item of await page.locator('input[data-side-effect]').all()) {
-      await item.check();
-    }
+    // MI-6: 副作用の確認のチェックはない（今の版の値を引き継ぐ。承認のダイアログで確かめる）。
+    expect(await page.locator('input[data-side-effect]').count()).toBe(0);
     await screenshot(page, 'g02-scenario-verification-filled');
     await page.getByTestId('scenario-save').click();
     await page.waitForURL(/notice=saved$/u, { timeout: UI_TIMEOUT_MS });
-    await page.getByTestId('scenario-verification-values').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5（設計書 3 章の 2）: 検証の指定の値は詳細に出さない（下の Server Function の値で確かめる）。そろったので、決められなかった 1 行も出ない。
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('scenario-verification-missing').count()).toBe(0);
-    expect(await page.getByTestId('scenario-verification-values').locator('dd').evaluateAll((items) => items.map((item) => item.getAttribute('data-set'))))
-      .toEqual(['true', 'true', 'true', 'true']);
+    expect(await page.getByTestId('scenario-verification-values').count()).toBe(0);
     const detail = await valueOf<{ scenario: { revision: number; verification: Record<string, unknown> }; missingVerification: readonly string[] }>(
       'scenarioDetailPageFn', 'GET', { scenarioId: writeState.scenarioId },
     );
     expect(detail.missingVerification).toEqual([]);
     expect(detail.scenario.verification).toEqual({
-      successCondition: { pathPrefix: '/admin/members/', selector: '.registered' },
-      inputErrorCondition: { pathPrefix: '/admin/members/new', selector: '.error' },
-      recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' },
+      resultJudgement: 'FORM_STRUCTURE',
+      recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/admin/members/{id}'] },
       readVerification: { readCheckId: writeState.readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
         expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
     });
@@ -1027,9 +1162,8 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
       draft: draftOf({
         fieldNames: ['email', 'name', 'plan'],
         verification: {
-          successCondition: { pathPrefix: '/admin/members/', selector: '.registered' },
-          inputErrorCondition: { pathPrefix: '/admin/members/new', selector: '.error' },
-          recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' },
+          resultJudgement: 'FORM_STRUCTURE',
+          recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/admin/members/{id}'] },
           readVerification: { readCheckId: pageCheck.readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
             expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
         },
@@ -1048,12 +1182,18 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     expect(await page.getByTestId('write-start-open').count()).toBe(0);
     expect(await page.getByTestId('write-start-approval').getAttribute('data-approved')).toBe('false');
     expect(await page.getByTestId('write-start-notification').getAttribute('data-confirmed')).toBe('true');
-    expect(await page.getByTestId('write-start-evidence').getAttribute('data-present')).toBe('true');
+    // OP-2 の修正の 1 回目（判断 5、設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6）: 本番からの切り離しの記録の行は出さない（始められるかの
+    // 判定は今どおり。値は `writePageOf` の `evidencePresent` で確かめる）。
+    expect(await page.getByTestId('write-start-evidence').count()).toBe(0);
     expect(await page.getByTestId('write-start-next').getAttribute('data-next')).toBe('');
     expect(await page.getByTestId('write-start-fields').textContent()).toContain('name');
     await screenshot(page, 'g04-write-start-unapproved');
     const view = await writePageOf(writeState.scenarioId);
-    expect(view).toMatchObject({ eligible: true, startable: false, approved: false, missingVerification: [], used: 0, remaining: 20, remainingInWindow: 5 });
+    expect(view).toMatchObject({
+      eligible: true, startable: false, approved: false, missingVerification: [], used: 0, remaining: 20, remainingInWindow: 5,
+    });
+    // OP-2 の修正の 1 回目（判断 5、D6）: 開始の画面の値は、隔離の印を持たない。
+    expect(view).not.toHaveProperty('isolationUnverified');
     const revision = (await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId: writeState.scenarioId })).scenario.revision;
     const result = await valueOf<WriteStartResult>('startWriteCreateFn', 'POST', { scenarioId: writeState.scenarioId, expectedRevision: revision });
     expect(result).toMatchObject({ ok: false, stage: 'GRANT', reason: 'GRANT_APPROVAL_INVALID' });
@@ -1091,7 +1231,7 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     const saved = await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
       scenarioId: writeState.scenarioId,
       expectedScenarioRevision: detail.scenario.revision,
-      expectedRuleSetRevision: null,
+      expectedRuleSetRevision: await ruleSetRevisionOf(writeState.scenarioId),
       fieldRules: [
         { fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: ['t30g-name'] },
         { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: ['t30g@example.invalid'] },
@@ -1117,6 +1257,8 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     const dialog = page.getByRole('dialog', { name: writeText.startDialog.title });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await focusedText(page)).toBe(writeText.startDialog.cancel);
+    // D6: 隔離の注意は出さない。
+    expect(await dialog.getByTestId('write-start-isolation-unverified').count()).toBe(0);
     await dialog.getByRole('button', { name: writeText.startDialog.confirm, exact: true }).click();
     await page.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
     writeState.jobId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
@@ -1128,6 +1270,14 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     expect(await unknown.textContent()).toBe(writeText.unknownBody);
     expect(await job.getByTestId('write-result').getAttribute('data-result')).toBe('UNKNOWN');
     expect(await job.getByRole('alert').filter({ hasText: writeText.unknownHeading }).count()).toBe(1);
+    // PL-S（設計書 7 章）: 書き込みの後の作業の画面の要点に、BeakSight は作ったデータを消さないこと。
+    expect(await job.getByTestId('job-summary-panel').getByTestId('job-write-no-cleanup').textContent()).toBe(writeText.noCleanup);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・5、7 章）: 結果が分からない書き込みの要点は「送ったかどうか分かりません」で、主のボタンは
+    // 1 つまで、アクセシビリティの違反は 0。読み込み直しても、書き込みの手順の画面へ移らない。
+    expect(await job.locator('[data-testid="job-result"][data-result="WRITE_UNKNOWN"]').count()).toBe(1);
+    await expectAtMostOnePrimaryButton(job);
+    expect(await axeViolationsOf(job)).toEqual([]);
+    expect(new URL(job.url()).pathname).toBe(`/jobs/${writeState.jobId}`);
     await screenshot(job, 'g06-write-result-unknown');
     withControlData((database) => {
       const reservations = readWriteReservations(database, writeState.scenarioId);
@@ -1142,7 +1292,7 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
     const again = await valueOf<WriteStartResult>('startWriteCreateFn', 'POST', { scenarioId: writeState.scenarioId, expectedRevision: revision });
     expect(again).toMatchObject({ ok: false, stage: 'GRANT', reason: 'GRANT_WRITE_INTERVAL_NOT_ELAPSED' });
     const rejected = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}/write`);
-    await rejected.getByTestId('write-start-next').waitFor({ timeout: UI_TIMEOUT_MS });
+    await rejected.getByTestId('write-start-next').waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await rejected.getByTestId('write-start-next').getAttribute('data-next')).not.toBe('');
     expect(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.GRANT_WRITE_INTERVAL_NOT_ELAPSED.description.length).toBeGreaterThan(0);
     withControlData((database) => expect(readWriteReservations(database, writeState.scenarioId).map(({ state: reservationState }) => reservationState))
@@ -1179,7 +1329,7 @@ describe('T30g: the write screens (verification spec, start, results)', () => {
       });
     });
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}`);
-    await page.getByTestId('write-history').waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.getByTestId('write-history').waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('write-history-entry').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-result'))))
       .toEqual(['BLOCKED', 'PARTIAL', 'VERIFIED', 'UNKNOWN']);
     await screenshot(page, 'g07-write-history');
@@ -1293,7 +1443,7 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     expect(await valueOf('createScenarioFn', 'POST', { draft: updateScenarioDraftOf(writeState.scenarioId) }))
       .toMatchObject({ ok: false, reason: 'SCENARIO_MODE_NOT_WRITE' });
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/new?candidate=${encodeURIComponent(UPDATE.identityDigest)}`);
-    await page.getByTestId('scenario-profile').waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.getByTestId('scenario-not-eligible').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('scenario-form').count()).toBe(0);
     expect(await page.getByTestId('scenario-update').count()).toBe(0);
 
@@ -1327,9 +1477,9 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     ]);
     expect(form.candidate?.fields.filter(({ roleRequired }) => !roleRequired).map(({ name }) => name)).toEqual(['_method', 'lock_version', 'kept']);
     expect(form.update?.placeholder).toBe(RECORD_ID_PLACEHOLDER);
+    // PL-5 の 9 の (3)（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 型の選択肢の ID の区切りは、自動の下書きと同じ判定（数字か UUID の形の
+    // 区切りだけ。core の `isRecordIdLikePathSegment`）。`admin`・`members` の区切りは ID にしない。
     expect(form.update?.templateOptions).toEqual([
-      { formPathTemplate: `/${RECORD_ID_PLACEHOLDER}/members/1/edit`, actionPathTemplate: `/${RECORD_ID_PLACEHOLDER}/members/1`, recordId: 'admin' },
-      { formPathTemplate: `/admin/${RECORD_ID_PLACEHOLDER}/1/edit`, actionPathTemplate: `/admin/${RECORD_ID_PLACEHOLDER}/1`, recordId: 'members' },
       { formPathTemplate: UPDATE_FORM_TEMPLATE, actionPathTemplate: UPDATE_ACTION_TEMPLATE, recordId: '1' },
     ]);
     // 台帳の選択肢は、同じプロファイルの登録（CREATE）のシナリオだけ。
@@ -1356,30 +1506,33 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
 
   // T31R-fix-1 の I-2: 型の組のうち、台帳の登録の ID の取り方（T30g の場面の登録のシナリオは `/admin/members/{id}`）に結び付かない組（`{id}` の前の
   // 区切りが `members` でない組）は選べず、選んだ組が結び付かなくなったら理由を出す。サーバも、結び付かない型の下書きを拒む。
+  // PL-5 の 9 の (3): 選択肢は ID の形の区切り（`1`）の組だけになったので、選択肢はどちらの台帳にも結び付く（結び付かない組は、手で入れた型でサーバが拒む）。
   it('does not offer the template options not bound to the record id of the ledger, and the server rejects them (T31R-fix-1 I-2)', async () => {
     const form = await updateFormPageOf(UPDATE);
     const bound = form.update?.ledgerOptions.find(({ scenarioId }) => scenarioId === writeState.scenarioId);
-    expect(bound?.unboundTemplates).toEqual([0, 1]);
+    expect(bound?.unboundTemplates).toEqual([]);
     // T28e の場面の登録のシナリオは、登録の ID の取り方が未指定（確かめない）。
     expect(form.update?.ledgerOptions.find(({ scenarioId }) => scenarioId === state.scenarioId)?.unboundTemplates).toEqual([]);
 
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/new?candidate=${encodeURIComponent(UPDATE.identityDigest)}`);
     await page.getByTestId('scenario-update').waitFor({ timeout: UI_TIMEOUT_MS });
+    // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12 の 4）: 作ったデータの一覧とアドレスの形は、詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const ledger = page.getByTestId('scenario-update-ledger');
     const template = page.getByTestId('scenario-update-template');
     await ledger.selectOption(state.scenarioId);
     await template.selectOption('0');
     expect(await page.getByTestId('scenario-update-template-unbound').count()).toBe(0);
     await ledger.selectOption(writeState.scenarioId);
-    expect(await page.getByTestId('scenario-update-template-unbound').textContent())
-      .toBe(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID.description);
+    expect(await page.getByTestId('scenario-update-template-unbound').count()).toBe(0);
     expect(await template.locator('option').evaluateAll((options) => options.map((option) => [option.getAttribute('value'), (option as HTMLOptionElement).disabled])))
-      .toEqual([['0', true], ['1', true], ['2', false], ['manual', false]]);
+      .toEqual([['0', false], ['manual', false]]);
     await screenshot(page, 'h01b-update-template-unbound');
 
+    // 結び付かない組（`{id}` の前の区切りが `members` でない）を手で入れた下書きは、サーバが拒む。
     const rejected = await valueOf<DraftRejection>('createScenarioFn', 'POST', {
       draft: updateScenarioDraftOf(writeState.scenarioId, {}, {
-        formPathTemplate: form.update?.templateOptions[0]?.formPathTemplate, actionPathTemplate: form.update?.templateOptions[0]?.actionPathTemplate,
+        formPathTemplate: `/admin/${RECORD_ID_PLACEHOLDER}/1/edit`, actionPathTemplate: `/admin/${RECORD_ID_PLACEHOLDER}/1`,
       }),
     });
     expect(rejected).toMatchObject({ ok: false, reason: 'SCENARIO_DRAFT_INVALID' });
@@ -1403,10 +1556,28 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     expect(await roleRadioOf(page, 'status', 'CHANGE').isDisabled()).toBe(true);
     expect(await page.locator('[data-testid="scenario-update-role"][data-field-name="status"]').getByTestId('scenario-update-role-blocked').textContent())
       .toBe(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_STATE_FIELD_NOT_CHANGEABLE.description);
+    // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12 の 4、`2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 要点（欄の役割）→ 主のボタン
+    // 「保存する」1 つ → 詳しい内容 1 つ。役割のない欄の名前、データの ID の区切りの説明、候補のアドレスの後ろは、詳しい内容の中だけ。
+    const details = page.getByTestId(SCENARIO_ADVANCED_SETTINGS);
+    expect(await details.evaluate((element) => (element as HTMLDetailsElement).open)).toBe(false);
+    expect(await page.locator('main [data-testid="scenario-update-other-fields"], main [data-testid="scenario-update-templates"], main [data-testid="scenario-target"]')
+      .evaluateAll((items) => items.every((item) => item.closest('[data-testid="scenario-advanced-settings"]') !== null))).toBe(true);
+    const outsideDetails = await page.locator('main').evaluate((main) => {
+      const copy = main.cloneNode(true) as HTMLElement;
+      copy.querySelectorAll('[data-testid="scenario-advanced-settings"]').forEach((element) => element.remove());
+      return copy.textContent ?? '';
+    });
+    for (const technical of ['_method', 'lock_version', UPDATE.page.path, text.update.templatesHint(RECORD_ID_PLACEHOLDER)]) {
+      expect(outsideDetails, technical).not.toContain(technical);
+    }
+    expect(await primaryButtonLabelsInMain(page)).toEqual([text.save]);
+    await expectAtMostOnePrimaryButton(page);
+    expect(await axeViolationsOf(page)).toEqual([]);
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     expect(await page.getByTestId('scenario-update-other-field').evaluateAll((items) => items.map((item) => item.getAttribute('data-field-name'))))
       .toEqual(['_method', 'lock_version', 'kept']);
-    // 型は、候補の path の最後の組（ID の区切り）が既定。候補の path を出す。
-    expect(await page.getByTestId('scenario-update-template').inputValue()).toBe('2');
+    // 型は、候補の path の最後の組（ID の区切り）が既定。候補の path を出す。PL-5 の 9 の (3): ID の形の区切りの組だけなので、選択肢は 1 つ。
+    expect(await page.getByTestId('scenario-update-template').inputValue()).toBe('0');
     expect(await page.getByTestId('scenario-update-candidate-paths').textContent())
       .toBe(text.update.candidatePaths(UPDATE.page.path, UPDATE.action?.path ?? ''));
     await screenshot(page, 'h02-update-new');
@@ -1422,14 +1593,12 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     updateState.scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
 
     // 詳細: UPDATE の指定と、更新の予定のレコード（台帳の照合済みの登録の最新。T30g の場面の `rec-1`）。
-    const section = page.getByTestId('scenario-update-section');
-    await section.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await section.getByTestId('scenario-update-ledger-value').getAttribute('data-scenario-id')).toBe(writeState.scenarioId);
-    expect(await section.getByTestId('scenario-update-form-template').textContent()).toBe(UPDATE_FORM_TEMPLATE);
-    expect(await section.getByTestId('scenario-update-action-template').textContent()).toBe(UPDATE_ACTION_TEMPLATE);
-    expect(await section.getByTestId('scenario-update-changed').textContent()).toBe(listText(['name']));
-    expect(await section.getByTestId('scenario-update-kept').textContent()).toBe(listText(UPDATE_KEPT_FIELDS));
-    expect(await section.getByTestId('scenario-update-planned').getAttribute('data-target')).toBe('rec-1');
+    // PL-5（設計書 3 章の 2）: 台帳の ID と path の型は画面に出さない（下の Server Function の値で確かめる）。詳しい内容に、変える欄と書き換えの対象。
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('scenario-update-section').count()).toBe(0);
+    expect(await page.getByTestId('scenario-field-names').textContent()).toBe(listText(['name']));
+    expect(await page.getByTestId('scenario-update-planned').getAttribute('data-target')).toBe('rec-1');
+    await expectNoTechnicalTextOf(page, [UPDATE_FORM_TEMPLATE, UPDATE_ACTION_TEMPLATE, writeState.scenarioId]);
     await screenshot(page, 'h04-update-detail');
     const detail = await valueOf<UpdateDetail>('scenarioDetailPageFn', 'GET', { scenarioId: updateState.scenarioId });
     expect(detail.scenario).toMatchObject({ kind: 'UPDATE', fieldNames: ['name'] });
@@ -1444,8 +1613,9 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     // 変更の画面は、保存した UPDATE の指定から始まる。
     const edit = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${updateState.scenarioId}/edit`);
     await edit.getByTestId('scenario-update').waitFor({ timeout: UI_TIMEOUT_MS });
+    await openAdvancedSettings(edit, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     expect(await edit.getByTestId('scenario-update-ledger').inputValue()).toBe(writeState.scenarioId);
-    expect(await edit.getByTestId('scenario-update-template').inputValue()).toBe('2');
+    expect(await edit.getByTestId('scenario-update-template').inputValue()).toBe('0');
     expect(await edit.getByTestId('scenario-update-role').evaluateAll((items) => items.map((item) => item.getAttribute('data-role'))))
       .toEqual(['CHANGE', 'KEEP', 'KEEP', 'KEEP', 'KEEP']);
   });
@@ -1453,6 +1623,8 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
   it('shows the draft errors near the UPDATE inputs (typed templates, no field to change), and the server rejects the roles by field', async () => {
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/new?candidate=${encodeURIComponent(UPDATE_NO_TEMPLATE.identityDigest)}`);
     await page.getByTestId('scenario-update').waitFor({ timeout: UI_TIMEOUT_MS });
+    // OP-3: アドレスの形は、詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     // 型を作れない画面は、手で入力する。
     expect(await page.getByTestId('scenario-update-no-template').count()).toBe(1);
     expect(await page.getByTestId('scenario-update-template').inputValue()).toBe('manual');
@@ -1496,7 +1668,7 @@ describe('T31h-1: the UPDATE spec on the scenario screens', () => {
     expect(await valueOf<UpdateDetail>('scenarioDetailPageFn', 'GET', { scenarioId: created.scenarioId })).toMatchObject({ plannedUpdateTarget: null });
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${created.scenarioId}`);
     const planned = page.getByTestId('scenario-update-planned');
-    await planned.waitFor({ timeout: UI_TIMEOUT_MS });
+    await planned.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await planned.getAttribute('data-target')).toBe('');
     expect(await planned.textContent()).toBe(text.update.noPlannedTarget);
     await screenshot(page, 'h06-update-no-target');
@@ -1551,9 +1723,8 @@ const NEXT_REGISTRATION_OFFSET_MS = 5 * SEEDED_WRITE_STEP_MS;
 
 /** UPDATE の検証の指定（照合の READ は T30g の場面の定義。結び付ける値は変える欄 `name`）。 */
 const updateVerificationOf = (): Record<string, unknown> => ({
-  successCondition: { pathPrefix: '/admin/members/', selector: '.updated' },
-  inputErrorCondition: { pathPrefix: '/admin/members/', selector: '.error' },
-  recordId: { source: 'URL_PATH_PATTERN', pathPattern: `/admin/members/${RECORD_ID_PLACEHOLDER}` },
+  resultJudgement: 'FORM_STRUCTURE',
+  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`/admin/members/${RECORD_ID_PLACEHOLDER}`] },
   readVerification: { readCheckId: writeState.readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
     expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
 });
@@ -1576,7 +1747,7 @@ const prepareUpdateWrite = async (ledgerId: string, value: string, approve: bool
   expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
     scenarioId: created.scenarioId,
     expectedScenarioRevision: detail.scenario.revision,
-    expectedRuleSetRevision: null,
+    expectedRuleSetRevision: await ruleSetRevisionOf(created.scenarioId),
     fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [value] }],
     relations: [],
     uniqueKeyFieldNames: ['name'],
@@ -1619,7 +1790,8 @@ const updateActionRunTextOf = (
     grantId: '__START_GRANT_ID__',
     seedRecord: '__START_SEED_RECORD__',
     submittedValues: { name: value },
-    resultConditions: { successCondition: verification['successCondition'], inputErrorCondition: verification['inputErrorCondition'] },
+    // PL-6a: 版 1.2 の記録は、成否の条件の代わりに結果の判定のしかたの印を持つ。
+    resultJudgement: verification['resultJudgement'],
     submission: 'SENT',
     blockReason: null,
     httpStatus: 200,
@@ -1714,16 +1886,19 @@ describe('T31h-2: the UPDATE write start and results', () => {
     expect(await page.getByTestId('write-start-target').textContent()).toBe(planned);
     expect(await page.getByTestId('write-start-changed').textContent()).toBe(listText(['name']));
     expect(await page.getByTestId('write-start-kept').textContent()).toBe(listText(UPDATE_KEPT_FIELDS));
-    expect(await page.getByTestId('write-start-action').getAttribute('data-path')).toBe(`/admin/members/${planned}`);
-    expect(await page.getByTestId('write-start-form').getAttribute('data-path')).toBe(`/admin/members/${planned}/edit`);
+    // PL-5（設計書 3 章の 2）: 送り先と画面の path（予定の ID を入れた形）は画面に出さない（上の Server Function の値で確かめた）。要点は何を・どこへ・何件。
+    expect(await page.getByTestId('write-start-action').count()).toBe(0);
+    expect(await page.getByTestId('write-start-form').count()).toBe(0);
+    await expectNoTechnicalTextOf(page, [`/admin/members/${planned}/edit`, updateWriteState.verifiedId]);
+    expect(await page.getByTestId('write-start-target-text').textContent()).toBe(text.approveDialog.targetUpdate(UPDATE.page.path, '1'));
     expect(await page.getByTestId('write-start-fields').count()).toBe(0);
     expect(await page.getByTestId('write-start-open').count()).toBe(0);
-    expect(await page.getByText(writeText.confirmNoteUpdate, { exact: true }).count()).toBe(1);
     await screenshot(page, 'h2-01-update-start-unapproved');
-    // 詳細から開始の画面へ移れる。
+    // PL-5（3 章の 1）: OK の前の詳細の主のボタンは「書き込みの OK」（開始の画面へは、OK の後に主のボタンで移る）。
     const detail = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${updateWriteState.verifiedId}`);
     await detail.getByTestId('scenario-status').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await detail.getByTestId('scenario-open-write').count()).toBe(1);
+    expect(await primaryButtonLabelsInMain(detail)).toEqual([LOCAL_UI_WRITE_STAGE_TEXT.scenario.approve]);
+    expect(await detail.getByTestId('scenario-open-write').count()).toBe(0);
 
     const revision = view.scenario.revision;
     expect(await valueOf<WriteStartResult>('startWriteUpdateFn', 'POST', {
@@ -1772,7 +1947,7 @@ describe('T31h-2: the UPDATE write start and results', () => {
     expect(view).toMatchObject({ approved: true, startable: false, update: { plannedTarget: null, formPath: null, actionPath: null } });
     const page = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${scenarioId}/write`);
     const target = page.getByTestId('write-start-target');
-    await target.waitFor({ timeout: UI_TIMEOUT_MS });
+    await target.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await target.getAttribute('data-target')).toBe('');
     expect(await target.textContent()).toBe(text.update.noPlannedTarget);
     expect(await page.getByTestId('write-start-open').count()).toBe(0);
@@ -1853,6 +2028,8 @@ describe('T31h-2: the UPDATE write start and results', () => {
 
     // 履歴: 対象の ID の列を出す。
     const detail = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${updateWriteState.verifiedId}`);
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(detail, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const entry = detail.getByTestId('write-history-entry');
     await entry.first().waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await entry.evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-result'), row.getAttribute('data-target')])))
@@ -2049,21 +2226,31 @@ describe('T32g: the write report on the screens, and the audited data ledger', (
 
     // ジョブの詳細: 報告を開く・落とすリンク。開いた HTML は、CSP の下でクラスの色が当たる（CSP の違反と console の誤りは、ページの記録の補助が
     // 0 件を確かめる）。
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 13）: 報告を開くリンクは、要点の主のボタン「結果を見る」の 1 つだけ。ZIP は、たたんだ
+    // 詳しい内容の中の 1 つだけ（「できたファイル」に報告の HTML と ZIP を重ねて出さない）。
+    expect(detail.write?.report.check).toBe('VALID');
     const job = await openPage(`/jobs/${jobId}`);
-    const report = job.getByTestId('write-report');
-    await report.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await report.getAttribute('data-check')).toBe('VALID');
-    expect(await job.getByTestId('write-report-open').getAttribute('href')).toBe(detail.write?.report.reportHref);
-    expect(await job.getByTestId('write-report-open').textContent()).toBe(reportText.openReport);
+    const open = job.getByTestId('job-summary-panel').getByTestId('write-report-open');
+    await open.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await open.getAttribute('href')).toBe(detail.write?.report.reportHref);
+    expect(await open.textContent()).toBe(LOCAL_UI_JOB_SUMMARY_TEXT.openResult);
+    expect(await primaryButtonLabelsInMain(job)).toEqual([LOCAL_UI_JOB_SUMMARY_TEXT.openResult]);
+    expect(await job.getByTestId('write-report').count()).toBe(0);
+    await openAdvancedSettings(job, 'job-details', UI_TIMEOUT_MS);
     expect(await job.getByTestId('write-report-download').getAttribute('href')).toBe(detail.write?.report.bundleHref);
     expect(await job.getByTestId('write-report-download').getAttribute('download')).not.toBeNull();
-    expect(await job.locator('[data-artifact="ACTION_REPORT"]').count()).toBe(1);
+    expect(await job.getByTestId('write-report-download').count()).toBe(1);
+    expect(await job.locator('[data-artifact="ACTION_REPORT"]').count()).toBe(0);
+    expect(await job.locator('[data-artifact="ACTION_BUNDLE"]').count()).toBe(0);
+    expect(await job.locator('[data-artifact="ACTION_EVIDENCE_JSON"]').count()).toBe(1);
     await screenshot(job, 'g32-02-report-links');
     const opened = await openPage(`/artifacts/${jobId}/${ACTION_REPORT_ARTIFACT_FILE_NAME}`);
     expect(await opened.getByTestId('t32g-mark').evaluate((element) => getComputedStyle(element).color)).toBe(REPORT_STYLE_COLOR);
 
     // 書き込みの履歴: 報告の欄に開くリンク。
     const history = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${detail.write?.scenarioId ?? ''}`);
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(history, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
     await entry.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await entry.getAttribute('data-report-check')).toBe('VALID');
@@ -2091,6 +2278,8 @@ describe('T32g: the write report on the screens, and the audited data ledger', (
     expect(await job.getByText(reportText.notDistributed, { exact: true }).count()).toBe(1);
     await screenshot(job, 'g32-04-report-not-distributed');
     const history = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${detail.write?.scenarioId ?? ''}`);
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(history, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
     await entry.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await entry.getAttribute('data-report-check')).toBe('BUNDLE_MISMATCH');
@@ -2128,6 +2317,8 @@ describe('T32g: the write report on the screens, and the audited data ledger', (
 
   it('shows the audited data ledger of the profile from the profile screen by keyboard, the same as the control data', async () => {
     const profile = await openPage(`/profiles/${WRITE_PROFILE_ID}`);
+    // PL-1: 作ったデータの一覧への入口は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(profile, UI_TIMEOUT_MS);
     await tabTo(profile, profile.getByTestId('profile-open-ledger'));
     await profile.keyboard.press('Enter');
     await profile.waitForURL(new RegExp(`/ledger/${WRITE_PROFILE_ID}$`, 'u'), { timeout: UI_TIMEOUT_MS });
@@ -2259,10 +2450,11 @@ const apiDraftOf = (candidate: DiscoveryCandidate, api: Record<string, unknown>)
 describe('T38c: the summary of the request shape on the approval screen of an API scenario', () => {
   it('shows the shape (method, origin, path, keys and fields, page keys, headers, the filter with a caution) and approves without a grant', async () => {
     const target = writeTarget(API_PROFILE_ID, `${API_PROFILE_ID}-output`);
-    expect(await valueOf('createProfileFn', 'POST', {
-      profile: { ...profileDocument(API_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN] },
+    // MI-F1（設計書 4.7.1 の 1）: 承認したサービスの Origin は、画面の作成の口では受けない。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(rootOf().root, {
+      ...profileDocument(API_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN],
     })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(API_PROFILE_ID) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(API_PROFILE_ID) })).toMatchObject({ ok: true });
     const at = formatCompactUtcTimestamp(new Date(), 'T38c test time');
     const document: DiscoveryDocument = {
       ...discoveryDocument(),
@@ -2301,22 +2493,21 @@ describe('T38c: the summary of the request shape on the approval screen of an AP
       expect(updated, JSON.stringify(updated)).toMatchObject({ ok: true });
     });
 
+    // PL-5（設計書 3 章の 2）: 要求の形（method・Origin・path の型・鍵と欄・ヘッダ・filter）は画面に出さない。承認が縛る同じ値を、Server Function で確かめる。
+    const updateDetail = await valueOf<{ scenario: { api: Record<string, unknown> | null } }>('scenarioDetailPageFn', 'GET', { scenarioId: 'scenario-t38c-update' });
+    expect(updateDetail.scenario.api).toMatchObject({
+      shapeDigest: API_UPDATE.submissionProbe?.shapeDigest,
+      request: { method: 'PATCH', origin: API_SERVICE_ORIGIN, pathShape: '/rest/v1/members' },
+      filterName: 'id',
+      pageKeys: [],
+    });
+    expect((updateDetail.scenario.api?.['keyFields'] as readonly { key: string }[]).map(({ key }) => key)).toEqual(['name']);
+    expect((updateDetail.scenario.api?.['keptKeys'] as readonly { key: string }[]).map(({ key }) => key)).toEqual(['email']);
+    expect(updateDetail.scenario.api?.['headerNames']).toEqual(['authorization', 'content-type', 'prefer']);
     const page = await openPage(`/scenarios/${API_PROFILE_ID}/scenario-t38c-update`);
-    const shape = page.getByTestId('scenario-api-shape');
-    await shape.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await shape.getAttribute('data-shape-digest')).toBe(API_UPDATE.submissionProbe?.shapeDigest);
-    expect(await shape.locator('[data-item="method"]').textContent()).toBe('PATCH');
-    expect(await shape.locator('[data-item="origin"]').textContent()).toBe(API_SERVICE_ORIGIN);
-    expect(await shape.locator('[data-item="pathShape"]').textContent()).toBe('/rest/v1/members');
-    // T41e: 更新の型の要約は、変える鍵と保つ鍵を分けて出す（ページが決める鍵はない）。
-    expect(await shape.locator('[data-item="keyFields"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['name']);
-    expect(await shape.locator('[data-item="keyFields"]').textContent()).toContain(text.api.fieldName('name'));
-    expect(await shape.locator('[data-item="keptKeys"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['email']);
-    expect(await shape.locator('[data-item="keptKeys"]').textContent()).toContain(text.api.fieldName('email'));
-    expect(await shape.locator('[data-item="pageKeys"]').textContent()).toBe(text.api.none);
-    expect(await shape.locator('[data-item="headerNames"]').textContent()).toBe(listText(['authorization', 'content-type', 'prefer']));
-    expect(await shape.locator('[data-item="filterName"] strong').textContent()).toBe('id');
-    expect(await page.getByTestId('scenario-api-shape-filter-caution').textContent()).toBe(text.api.filterCaution);
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('scenario-api-shape').count()).toBe(0);
+    await expectNoTechnicalTextOf(page, [API_SERVICE_ORIGIN, '/rest/v1/members', 'PATCH', 'authorization']);
     await screenshot(page, 't38c-01-api-shape');
 
     // 承認の前の状態は下書きで、再承認の理由はない（型が索引の候補の型と合う。未承認は下書きの状態で示す）。
@@ -2326,8 +2517,9 @@ describe('T38c: the summary of the request shape on the approval screen of an AP
     await page.keyboard.press('Enter');
     const dialog = page.getByRole('dialog', { name: text.approveDialog.title });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await dialog.getByTestId('scenario-approve-api-shape').locator('[data-item="method"]').textContent()).toBe('PATCH');
-    expect(await dialog.getByTestId('scenario-approve-api-shape-filter-caution').isVisible()).toBe(true);
+    // PL-5（設計書 7 章）: ダイアログは何を・どこへ・何件と 4 つの約束（要求の形は出さない）。
+    expect(await dialog.getByTestId('scenario-approve-api-shape').count()).toBe(0);
+    expect(await dialog.getByTestId('scenario-approve-target').textContent()).toBe(text.approveDialog.targetUpdate(API_UPDATE.page.path, '1'));
     await screenshot(page, 't38c-02-api-approve-dialog');
     await dialog.getByRole('button', { name: text.approveDialog.confirm, exact: true }).click();
     await page.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
@@ -2343,12 +2535,14 @@ describe('T38c: the summary of the request shape on the approval screen of an AP
 
     // 登録のシナリオは filter を持たない（注意を出さない）。目印の値は画面に出ない。
     const create = await openPage(`/scenarios/${API_PROFILE_ID}/scenario-t38c-create`);
-    await create.getByTestId('scenario-api-shape').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await create.getByTestId('scenario-api-shape-filter-caution').count()).toBe(0);
-    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="method"]').textContent()).toBe('POST');
-    // T41e: 登録のページが決める鍵は今のまま（欄の識別なし）。登録は保つ鍵を持たない（項目を出さない）。
-    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="pageKeys"]').textContent()).toBe(text.api.pageKey('tenant_id', 'string'));
-    expect(await create.getByTestId('scenario-api-shape').locator('[data-item="keptKeys"]').count()).toBe(0);
+    await create.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await create.getByTestId('scenario-api-shape').count()).toBe(0);
+    // T41e: 登録のページが決める鍵は今のまま（欄の識別なし）。登録は保つ鍵を持たない（PL-5: Server Function の値で確かめる）。
+    const createApi = (await valueOf<{ scenario: { api: Record<string, unknown> | null } }>('scenarioDetailPageFn', 'GET', { scenarioId: 'scenario-t38c-create' }))
+      .scenario.api;
+    expect(createApi).toMatchObject({ request: { method: 'POST' }, filterName: null });
+    expect((createApi?.['pageKeys'] as readonly { key: string }[]).map(({ key }) => key)).toEqual(['tenant_id']);
+    expect(createApi?.['keptKeys'] ?? []).toEqual([]);
     for (const body of [await page.content(), await create.content()]) {
       for (const marker of [...API_MARKERS, 'tenant-t38c']) {
         expect(body.includes(marker), marker).toBe(false);
@@ -2450,10 +2644,11 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
 
   it('offers a create link by probe row of an API candidate, and makes, saves and approves an API scenario by the form (no grant)', async () => {
     const target = writeTarget(API_FLOW_PROFILE_ID, API_FLOW_OUTPUT);
-    expect(await valueOf('createProfileFn', 'POST', {
-      profile: { ...profileDocument(API_FLOW_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN] },
+    // MI-F1（設計書 4.7.1 の 1）: 承認したサービスの Origin は、画面の作成の口では受けない。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(rootOf().root, {
+      ...profileDocument(API_FLOW_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION), approvedServiceOrigins: [API_SERVICE_ORIGIN],
     })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(API_FLOW_PROFILE_ID) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(API_FLOW_PROFILE_ID) })).toMatchObject({ ok: true });
     for (const path of [FLOW_TEMPLATE_READ, '/admin/members']) {
       expect(await valueOf('createReadCheckFn', 'POST', {
         profileId: API_FLOW_PROFILE_ID, definition: { targetPagePath: path, parameters: {}, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
@@ -2462,24 +2657,39 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
     await discover(API_FLOW_PROFILE_ID, API_FLOW_OUTPUT, apiFlowDocument());
 
     // 発見の結果: API の候補の probe の行ごとに「シナリオを作る」を出す（型の digest で行を選ぶ）。偽った型の行にも出し、作成の画面が理由を出す。
-    const discoveryPage = await openPage(`/discovery/${API_FLOW_PROFILE_ID}`);
-    const createRow = discoveryPage.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_CREATE.identityDigest}"]`);
-    expect(await createRow.getByTestId('candidate-create-api-scenario').evaluateAll((links) => links.map((link) => link.getAttribute('data-shape-digest'))))
+    // PL-5（設計書 4 章の 6）: 候補の行ごとの作るリンクはなくした（下書きは要点の主のボタン 1 つ）。型の行は、画面と同じ値の Server Function で確かめ、
+    // 手で作る作成の画面は、候補と型の digest の URL で開く。
+    const flowValues = await valueOf<{ candidates: readonly { identityDigest: string; apiScenarioRows: readonly { shapeDigest: string }[] }[] }>(
+      'discoveryPageFn', 'GET', { profileId: API_FLOW_PROFILE_ID },
+    );
+    expect(flowValues.candidates.find(({ identityDigest }) => identityDigest === FLOW_CREATE.identityDigest)?.apiScenarioRows.map(({ shapeDigest }) => shapeDigest))
       .toEqual([FLOW_CREATE.submissionProbe?.shapeDigest, FLOW_CREATE_OTHER.submissionProbe?.shapeDigest]);
-    expect(await createRow.getByTestId('candidate-create-scenario').count()).toBe(0);
-    await screenshot(discoveryPage, 't38f-01-discovery-api-rows');
-    await tabTo(discoveryPage, createRow.getByTestId('candidate-create-api-scenario').first());
-    await discoveryPage.keyboard.press('Enter');
+    const listed = await openPage(`/discovery/${API_FLOW_PROFILE_ID}`);
+    await listed.getByTestId('discovery-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await listed.getByTestId('candidate-create-api-scenario').count()).toBe(0);
+    expect(await listed.getByTestId('candidate-create-scenario').count()).toBe(0);
+    await screenshot(listed, 't38f-01-discovery-api-rows');
+    const discoveryPage = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_CREATE.identityDigest)}&shape=${
+      encodeURIComponent(FLOW_CREATE.submissionProbe?.shapeDigest ?? '')}`);
     const form = discoveryPage.getByTestId('scenario-api-fields');
     await form.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await form.getAttribute('data-shape-digest')).toBe(FLOW_CREATE.submissionProbe?.shapeDigest);
-    // 鍵と欄の対応は probe から埋める（確かめる）。ページが決める鍵は選ぶ。ヘッダの名前はブラウザが付ける名前を除いた案。
-    expect(await form.locator('[data-testid="scenario-api-key"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-key')))).toEqual(['email', 'name']);
-    expect(await form.locator('input[data-api-key]:checked').count()).toBe(2);
-    expect(await form.locator('[data-testid="scenario-api-page-key"]').evaluateAll((rows) => rows.map((row) => row.getAttribute('data-key')))).toEqual(['tenant_id']);
-    // 型の要約の案は、承認の画面と同じ部品で出す。
-    expect(await form.getByTestId('scenario-form-api-shape').locator('[data-item="headerNames"]').textContent())
-      .toBe(listText(['authorization', 'content-type', 'prefer']));
+    // 鍵と欄の対応は probe から埋める（確かめる）。ヘッダの名前はブラウザが付ける名前を除いた案。MI-6（設計書 4.6）: 登録の送る鍵（すべて送る）と
+    // ページが決める鍵（すべて許す。既定も全部オン）は、1 つの値しか通らないので、入力でなく表示だけ。
+    expect(await form.locator('[data-testid="scenario-api-key"]').evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-key'), row.getAttribute('data-sent')])))
+      .toEqual([['email', 'true'], ['name', 'true']]);
+    // PL-5 の修正の 1 回目（設計書 3 章の 1・2）: ページが決める鍵・ID の項目・検証の欄は、フォームのたたんだ詳しい内容（1 つ）の中。
+    await openAdvancedSettings(discoveryPage, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    expect(await discoveryPage.getByTestId(SCENARIO_ADVANCED_SETTINGS).getByTestId('scenario-api-advanced').count()).toBe(1);
+    expect(await discoveryPage.locator('details[data-testid]').count()).toBe(1);
+    expect(await discoveryPage.locator('[data-testid="scenario-api-page-key"]').evaluateAll((rows) =>
+      rows.map((row) => [row.getAttribute('data-key'), row.getAttribute('data-allowed')]))).toEqual([['tenant_id', 'true']]);
+    expect(await discoveryPage.locator('input[data-api-key], input[data-api-page-key]').count()).toBe(0);
+    // 型の要約の案（ヘッダの名前）は画面に出さず、画面と同じ値の Server Function で確かめる。
+    expect(await form.getByTestId('scenario-form-api-shape').count()).toBe(0);
+    expect((await valueOf<{ api: { proposal: { headerNames: readonly string[] } | null } | null }>('scenarioFormPageFn', 'GET', {
+      profileId: API_FLOW_PROFILE_ID, candidateIdentityDigest: FLOW_CREATE.identityDigest, shapeDigest: FLOW_CREATE.submissionProbe?.shapeDigest,
+    })).api?.proposal?.headerNames).toEqual(['authorization', 'content-type', 'prefer']);
     // 照合の READ は、API のシナリオでは `{id}` の型の画面の READ の定義も選べる（型でない画面の READ は出さない）。
     const readOptions = await discoveryPage.locator('select[name="readVerification-check"] option').evaluateAll((options) =>
       options.map((option) => (option as HTMLOptionElement).value).filter((value) => value !== ''));
@@ -2489,16 +2699,8 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
     expect(await discoveryPage.getByTestId('scenario-verification-successCondition').count()).toBe(0);
     expect(await discoveryPage.getByTestId('scenario-verification-inputErrorCondition').count()).toBe(0);
     expect(await discoveryPage.getByTestId('scenario-verification-api-note').textContent()).toBe(LOCAL_UI_WRITE_TEXT.apiVerificationNote);
-    // 保存の前に、ページが決める鍵を選ばずに保存すると、鍵ごとの理由が出る。
-    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
-      await discoveryPage.locator(`input[data-side-effect="${side}"]`).check();
-    }
-    await discoveryPage.getByTestId('scenario-save').click();
-    await discoveryPage.getByTestId('scenario-api-errors').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await discoveryPage.getByTestId('scenario-api-errors').textContent())
-      .toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_KEY_NOT_ALLOWED.description);
-    await tabTo(discoveryPage, form.locator('input[data-api-page-key="tenant_id"]'));
-    await discoveryPage.keyboard.press('Space');
+    // MI-6: 副作用の確認のチェックはない（承認のダイアログで確かめる）。ページが決める鍵は、既定のまま（全部オン）で保存できる。
+    expect(await discoveryPage.locator('input[data-side-effect]').count()).toBe(0);
     await discoveryPage.locator('input[name="api-recordIdKey"]').fill('id');
     await discoveryPage.locator('select[name="readVerification-check"]').selectOption(apiState.readCheckId);
     await discoveryPage.getByTestId('scenario-verification-add-expectation').click();
@@ -2522,27 +2724,37 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
     await discoveryPage.waitForURL(new RegExp(`/scenarios/${API_FLOW_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     apiState.createId = new URL(discoveryPage.url()).pathname.split('/').at(-1) ?? '';
 
-    // 詳細: 送り方と型の要約（承認の画面と同じ部品）、ID の取り方（LG-3b: 送り方の理由の表示は捨てた）。
+    // 詳細: PL-5（設計書 3 章の 2）: 送り方・型の要約・検証の指定の値は画面に出さない。同じ値を Server Function で確かめる。
     const detail = discoveryPage;
-    await detail.getByTestId('scenario-api-shape').waitFor({ timeout: UI_TIMEOUT_MS });
-    // CC-103（T40R-fix-B）: 送り方は表示のカタログのラベルで出す（生の値 `API` ではない）。
-    expect(await detail.getByTestId('scenario-api-shape').locator('[data-item="transport"]').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
-    expect(await detail.getByTestId('scenario-api-shape').locator('[data-item="recordId"]').textContent()).toBe('id');
-    // T40a-fix: 検証の指定は、API で求める項目（ID の取り方と照合の READ）だけを出す。ID は API の `recordId` で取るので、不足の理由は出さない。
-    expect(await detail.getByTestId('scenario-verification-values').locator('dd').evaluateAll((items) => items.map((item) => item.getAttribute('data-item'))))
-      .toEqual(['recordId', 'readVerification']);
+    await detail.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await detail.getByTestId('scenario-api-shape').count()).toBe(0);
+    expect(await detail.getByTestId('scenario-verification-values').count()).toBe(0);
+    // T40a-fix: ID は API の `recordId` で取るので、不足の理由は出さない。
     expect(await detail.getByTestId('scenario-verification-missing').count()).toBe(0);
-    // T40R2-fix: 保存した ID の型は登録の画面に当たるので、詳細にも注意を出す（保存の画面と同じ文言）。
-    expect(await detail.getByTestId('scenario-record-id-caution').textContent()).toContain(LOCAL_UI_WRITE_TEXT.recordIdPatternCaution);
+    const apiDetail = await valueOf<{
+      scenario: { transport: string; api: { recordId: { key: string } | null } | null }; verificationItems: readonly string[]; recordIdPatternCaution: boolean;
+    }>('scenarioDetailPageFn', 'GET', { scenarioId: apiState.createId });
+    expect(apiDetail.scenario.transport).toBe('API');
+    expect(apiDetail.scenario.api?.recordId?.key).toBe('id');
+    expect(apiDetail.verificationItems).toEqual(['recordId', 'readVerification']);
+    // T40R2-fix: 保存した ID の型は登録の画面に当たる（保存の画面では注意を出した。詳細の値に残る）。
+    expect(apiDetail.recordIdPatternCaution).toBe(true);
     const saved = await detailOf(apiState.createId);
     expect(saved.scenario).toMatchObject({ state: 'DRAFT', fieldNames: ['email', 'name'] });
+    // MI-6: 既定のまま保存したページが決める鍵（全部オン）。
+    expect(withControlData((database) => readScenario(database, apiState.createId)?.current.api?.pageKeys.map(({ key }) => key))).toEqual(['tenant_id']);
     expect(saved.status).toMatchObject({ displayState: 'DRAFT', reasons: [] });
     await screenshot(detail, 't38f-03-api-detail');
     await tabTo(detail, detail.getByTestId('scenario-approve'));
     await detail.keyboard.press('Enter');
     const dialog = detail.getByRole('dialog', { name: text.approveDialog.title });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await dialog.getByTestId('scenario-approve-api-shape').count()).toBe(1);
+    expect(await dialog.getByTestId('scenario-approve-api-shape').count()).toBe(0);
+    // PL-S（設計書 9 章の 3）: API の形の OK のダイアログも、フォームの形と同じ「何を・どこへ・何件」（操作を見つけた画面の path）。
+    const apiEvidence = await valueOf<{ evidence: { pagePath: string } }>('scenarioDetailPageFn', 'GET', { scenarioId: apiState.createId });
+    expect(await dialog.getByTestId('scenario-approve-target').textContent()).toBe(text.approveDialog.targetCreate(apiEvidence.evidence.pagePath, formatInteger(1)));
+    // MI-6: 副作用の 4 項目は、ダイアログに出て、1 回の「承認する」で確かめる。
+    expect(await dialog.getByTestId('scenario-approve-side-effects').locator('li').count()).toBe(SIDE_EFFECT_ITEMS.length);
     await dialog.getByRole('button', { name: text.approveDialog.confirm, exact: true }).click();
     await detail.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
     await expect.poll(() => detail.getByTestId('scenario-state').getAttribute('data-state'), { timeout: UI_TIMEOUT_MS }).toBe('APPROVED');
@@ -2563,19 +2775,22 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
     const form = page.getByTestId('scenario-api-fields');
     await form.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await form.getAttribute('data-kind')).toBe('UPDATE');
-    expect(await page.locator('input[name="api-filterName"]').inputValue()).toBe('id');
-    expect(await page.getByTestId('scenario-form-api-shape-filter-caution').textContent()).toBe(text.api.filterCaution);
+    // PL-5 の修正の 1 回目: filter の名前・台帳・画面の型は、フォームのたたんだ詳しい内容（1 つ）の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    // MI-6: 更新の filter の名前は、型の filter の名前しか通らないので、表示だけ。PL-5: 型の要約（filter の列の注意を含む）は出さない。
+    expect(await page.getByTestId('scenario-api-filter-name').getAttribute('data-value')).toBe('id');
+    expect(await page.locator('input[name="api-filterName"]').count()).toBe(0);
+    expect(await page.getByTestId('scenario-form-api-shape-filter-caution').count()).toBe(0);
     await page.locator('select[name="api-ledger"]').selectOption(apiState.createId);
-    expect(await page.locator('select[name="api-formPathTemplate"]').inputValue()).toBe(`/admin/members/${RECORD_ID_PLACEHOLDER}/edit`);
+    // MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 画面の型の選択肢が 1 つなので、表示だけ（選ぶ入力はない）。
+    expect(await page.getByTestId('scenario-api-form-path-template').getAttribute('data-value')).toBe(`/admin/members/${RECORD_ID_PLACEHOLDER}/edit`);
+    expect(await page.locator('select[name="api-formPathTemplate"]').count()).toBe(0);
     // T41e（Task 41 の設計書 3.1、3.5）: 目印を入れた欄の鍵は、既定で保つ（メールアドレスも保つ。近くに知らせる）。変える鍵に `name` を選ぶ。
     const roles = form.locator('[data-testid="scenario-api-key"]');
     expect(await roles.evaluateAll((rows) => rows.map((row) => [row.getAttribute('data-key'), row.getAttribute('data-role')])))
       .toEqual([['email', 'KEEP'], ['name', 'KEEP']]);
     expect(await form.locator('[data-testid="scenario-api-key"][data-key="email"] [data-testid="scenario-api-contact-hint"]').textContent())
       .toBe(text.update.contactFieldHint);
-    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
-      await page.locator(`input[data-side-effect="${side}"]`).check();
-    }
     // 変える鍵がないまま保存すると、理由を API の指定の近くに出す（既定はすべて保つ）。
     await page.getByTestId('scenario-save').click();
     await form.getByTestId('scenario-api-errors').locator('[data-code="SCENARIO_UPDATE_NO_CHANGED_FIELD"]').waitFor({ timeout: UI_TIMEOUT_MS });
@@ -2592,11 +2807,12 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
     expect(savedApi?.api?.keyFields.map(({ key }) => key)).toEqual(['name']);
     expect(savedApi?.api?.keptKeys?.map(({ key }) => key)).toEqual(['email']);
     expect(savedApi?.api?.pageKeys).toEqual([]);
-    await page.getByTestId('scenario-update-section').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5（設計書 3 章の 2）: 台帳の ID・画面の型・filter は画面に出さない。保存した API の指定で確かめる。
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('scenario-update-spec-missing').count()).toBe(0);
-    expect(await page.getByTestId('scenario-update-ledger-value').getAttribute('data-scenario-id')).toBe(apiState.createId);
-    expect(await page.getByTestId('scenario-update-form-template').textContent()).toBe(`/admin/members/${RECORD_ID_PLACEHOLDER}/edit`);
-    expect(await page.getByTestId('scenario-api-shape').locator('[data-item="filterName"] strong').textContent()).toBe('id');
+    expect(savedApi?.api?.ledger).toEqual({ targetCreateScenarioId: apiState.createId, formPathTemplate: `/admin/members/${RECORD_ID_PLACEHOLDER}/edit` });
+    expect(savedApi?.api?.filterName).toBe('id');
+    await expectNoTechnicalTextOf(page, [apiState.createId, `/admin/members/${RECORD_ID_PLACEHOLDER}/edit`]);
     await screenshot(page, 't38f-05-api-update-detail');
 
     // 変更の画面も、型で行を選んで同じ API の入力を出す（今の版の値を入れる）。
@@ -2619,10 +2835,14 @@ describe('T38f: the API scenario screens from the discovery result (G38 on the s
 
     const secret = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/new?candidate=${encodeURIComponent(FLOW_SECRET_KEY.identityDigest)}&shape=${
       encodeURIComponent(FLOW_SECRET_KEY.submissionProbe?.shapeDigest ?? '')}`);
+    // PL-5 の修正の 1 回目: ページが決める鍵・台帳・画面の型は、フォームのたたんだ詳しい内容（1 つ）の中。
+    await openAdvancedSettings(secret, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const pageKey = secret.locator('[data-testid="scenario-api-page-key"][data-key="access_token"]');
     await pageKey.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await pageKey.getAttribute('data-rejection')).toBe('SCENARIO_API_PAGE_KEY_SECRET_LIKE');
-    expect(await pageKey.locator('input').isDisabled()).toBe(true);
+    // MI-6: ページが決める鍵は表示だけ（選ぶ入力はない）。秘密に見える名前の鍵には、「許す」でなく理由を出す。
+    expect(await pageKey.locator('input').count()).toBe(0);
+    expect(await pageKey.textContent()).not.toContain(text.api.pageKeyAllowed);
     expect(await pageKey.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_SECRET_LIKE.description);
     // 目印と値は、画面に出ない。
     for (const body of [await stateKey.content(), await secret.content()]) {
@@ -2684,7 +2904,7 @@ const apiActionRunTextOf = (scenarioId: string, scenarioRevision: number, api: S
     seedRecord: '__START_SEED_RECORD__',
     // T40R2-fix: 送った値は生成した値（email は実行のたびに変わる）なので、偽のワーカーが `START` の値を書き写す印。
     submittedValues: '__START_VALUES__',
-    resultConditions: null,
+    resultJudgement: null,
     submission: 'SENT',
     blockReason: null,
     httpStatus: API_WRITE_HTTP_STATUS,
@@ -2711,7 +2931,7 @@ describe('T40d: the API create on the write start, result, job and history scree
     expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
       scenarioId,
       expectedScenarioRevision: before.scenario.revision,
-      expectedRuleSetRevision: null,
+      expectedRuleSetRevision: await ruleSetRevisionOf(scenarioId),
       fieldRules: [
         { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.email] },
         { fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.name] },
@@ -2741,7 +2961,7 @@ describe('T40d: the API create on the write start, result, job and history scree
     expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
       scenarioId,
       expectedScenarioRevision: constantRevision.scenario.revision,
-      expectedRuleSetRevision: 1,
+      expectedRuleSetRevision: await ruleSetRevisionOf(scenarioId),
       fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [API_WRITE_VALUES.name] }],
       relations: [],
       uniqueKeyFieldNames: [],
@@ -2761,12 +2981,12 @@ describe('T40d: the API create on the write start, result, job and history scree
     // 開始の画面: 送り方のラベルと、承認した API の要求の型（form と同じ確かめの後に、開始のボタン）。
     const start = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
     await start.getByTestId('write-start-open').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await start.getByTestId('write-start-transport').getAttribute('data-transport')).toBe('API');
-    expect(await start.getByTestId('write-start-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
-    const startShape = start.getByTestId('write-start-api-shape');
-    expect(await startShape.getAttribute('data-shape-digest')).toBe(api.shapeDigest);
-    expect(await startShape.locator('[data-item="method"]').textContent()).toBe('POST');
-    expect(await start.getByTestId('write-start-action').getAttribute('data-path')).toBe(api.request.pathShape);
+    // PL-5（設計書 3 章の 2）: 送り方・要求の型・送り先は画面に出さない（承認した値は上の Server Function の値で確かめた）。要点は何を・どこへ・何件。
+    expect(await start.getByTestId('write-start-transport').count()).toBe(0);
+    expect(await start.getByTestId('write-start-api-shape').count()).toBe(0);
+    expect(await start.getByTestId('write-start-action').count()).toBe(0);
+    await expectNoTechnicalTextOf(start, [api.request.origin, api.request.pathShape, scenarioId]);
+    expect(await start.getByTestId('write-start-target-text').textContent()).toContain(text.approveDialog.targetCreate(FLOW_CREATE.page.path, '1'));
     const startHtml = await start.content();
     await screenshot(start, 't40d-01-api-write-start');
     await start.getByTestId('write-start-open').click();
@@ -2792,7 +3012,9 @@ describe('T40d: the API create on the write start, result, job and history scree
     const summary = job.getByTestId('write-result-api');
     expect(await summary.getAttribute('data-shape-digest')).toBe(stored?.api?.shapeDigest);
     expect(await summary.locator('dd').evaluateAll((items) => items.map((item) => [item.getAttribute('data-item'), item.textContent])))
-      .toEqual([['method', stored?.api?.method], ['origin', stored?.api?.origin], ['pathShape', stored?.api?.pathShape], ['shapeDigest', stored?.api?.shapeDigest]]);
+      .toEqual([['method', httpMethodLabel(stored?.api?.method ?? '')], ['origin', stored?.api?.origin], ['pathShape', stored?.api?.pathShape], ['shapeDigest', stored?.api?.shapeDigest]]);
+    // PL-W: 送り方は日本語の名前で出し、生の値は data-method に残す。
+    expect(await summary.locator('[data-item="method"]').getAttribute('data-method')).toBe(stored?.api?.method);
     expect(await summary.getByTestId('write-result-api-note').textContent()).toBe(writeText.api.judgementNote);
     expect(await job.getByTestId('write-result-record-id').textContent()).toBe(API_WRITE_VALUES.recordId);
     const jobDetail = await valueOf<ApiWriteSummaryOnServer>('getAuditJobFn', 'GET', { jobId });
@@ -2801,13 +3023,17 @@ describe('T40d: the API create on the write start, result, job and history scree
 
     // 書き込みの履歴: 送り方のラベル（API の登録のシナリオと、form の登録のシナリオ）。
     const history = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(history, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
     await entry.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await entry.getAttribute('data-transport')).toBe('API');
     expect(await entry.getByTestId('write-history-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.API.label);
     await screenshot(history, 't40d-03-api-write-history');
     const formHistory = await openPage(`/scenarios/${WRITE_PROFILE_ID}/${writeState.scenarioId}`);
-    await formHistory.getByTestId('write-history').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(formHistory, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    await formHistory.getByTestId('write-history').waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     const formRows = formHistory.getByTestId('write-history-entry');
     expect(new Set(await formRows.evaluateAll((rows) => rows.map((row) => row.getAttribute('data-transport'))))).toEqual(new Set(['FORM']));
     expect(await formRows.first().getByTestId('write-history-transport').textContent()).toBe(SCENARIO_TRANSPORT_CATALOG.FORM.label);
@@ -2841,35 +3067,37 @@ describe('T41e: the API update scenario screens', () => {
     const form = page.getByTestId('scenario-api-fields');
     await form.waitFor({ timeout: UI_TIMEOUT_MS });
     // 画面の型は、最後の ID の区切り（会員の `1`）だけ（組織の `7` を `{id}` にした型は、保存で拒まれるので出さない）。
-    expect(await page.locator('select[name="api-formPathTemplate"] option').evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)))
-      .toEqual([`/orgs/7/members/${RECORD_ID_PLACEHOLDER}/edit`]);
+    // MI-7（設計書 4.6）: 選択肢が 1 つなので、表示だけ。
+    // PL-5 の修正の 1 回目: ページが決める鍵・台帳・画面の型は、フォームのたたんだ詳しい内容（1 つ）の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    expect(await page.getByTestId('scenario-api-form-path-template').getAttribute('data-value')).toBe(`/orgs/7/members/${RECORD_ID_PLACEHOLDER}/edit`);
+    expect(await page.locator('select[name="api-formPathTemplate"]').count()).toBe(0);
     // 欄として識別できるページが決める鍵（選択の欄 `plan`）は選べる。
-    const plan = form.locator('[data-testid="scenario-api-page-key"][data-key="plan"]');
+    const plan = page.locator('[data-testid="scenario-api-page-key"][data-key="plan"]');
     expect(await plan.getAttribute('data-rejection')).toBe('');
-    await plan.locator('input').check();
+    // MI-6: ページが決める鍵は、既定で許す（表示だけ）。
+    expect(await plan.getAttribute('data-allowed')).toBe('true');
     await form.locator('input[data-api-role="name"][value="CHANGE"]').check();
     await page.locator('select[name="api-ledger"]').selectOption(apiState.createId);
-    for (const side of ['TEST_RECORDS_ONLY', 'NO_EXTERNAL_NOTIFICATION', 'NO_PAYMENT_OR_EXTERNAL_SERVICE', 'NOT_DESTRUCTIVE']) {
-      await page.locator(`input[data-side-effect="${side}"]`).check();
-    }
     await screenshot(page, 't41e-01-api-update-form');
     await page.getByTestId('scenario-save').click();
     await page.waitForURL(new RegExp(`/scenarios/${API_FLOW_PROFILE_ID}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     apiUpdateState.nestedId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
 
-    // 詳細: 変える鍵、保つ鍵、欄の識別つきのページが決める鍵。承認の確認のダイアログも同じ部品で出す。
-    const shape = page.getByTestId('scenario-api-shape');
-    await shape.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await shape.locator('[data-item="keyFields"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['name']);
-    expect(await shape.locator('[data-item="keptKeys"] li').evaluateAll((items) => items.map((item) => item.getAttribute('data-key')))).toEqual(['email']);
-    expect(await shape.locator('[data-item="keptKeys"] li').textContent()).toBe(text.api.keptKey('email', 'string', text.api.fieldName('email')));
-    expect(await shape.locator('[data-item="pageKeys"] li').textContent()).toBe(text.api.pageKeyField('plan', 'string', text.api.fieldName('plan')));
+    // 詳細: 変える鍵、保つ鍵、欄の識別つきのページが決める鍵。PL-5（設計書 3 章の 2）: 要求の形は画面に出さず、保存した API の指定で確かめる。
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('scenario-api-shape').count()).toBe(0);
+    const nestedApi = withControlData((database) => readScenario(database, apiUpdateState.nestedId)?.current.api ?? null);
+    expect(nestedApi?.keyFields.map(({ key }) => key)).toEqual(['name']);
+    expect(nestedApi?.keptKeys?.map(({ key }) => key)).toEqual(['email']);
+    expect(nestedApi?.pageKeys.map(({ key }) => key)).toEqual(['plan']);
     await screenshot(page, 't41e-02-api-update-detail');
     await tabTo(page, page.getByTestId('scenario-approve'));
     await page.keyboard.press('Enter');
     const dialog = page.getByRole('dialog', { name: text.approveDialog.title });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await dialog.getByTestId('scenario-approve-api-shape').locator('[data-item="keptKeys"] li').count()).toBe(1);
+    expect(await dialog.getByTestId('scenario-approve-api-shape').count()).toBe(0);
+    expect(await dialog.getByTestId('scenario-approve-side-effects').locator('li').count()).toBe(SIDE_EFFECT_ITEMS.length);
     await dialog.getByRole('button', { name: text.approveDialog.cancel, exact: true }).click();
   });
 
@@ -2878,9 +3106,11 @@ describe('T41e: the API update scenario screens', () => {
       encodeURIComponent(FLOW_UPDATE_TENANT.submissionProbe?.shapeDigest ?? '')}`);
     const form = page.getByTestId('scenario-api-fields');
     await form.waitFor({ timeout: UI_TIMEOUT_MS });
-    const tenant = form.locator('[data-testid="scenario-api-page-key"][data-key="tenant_id"]');
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    const tenant = page.locator('[data-testid="scenario-api-page-key"][data-key="tenant_id"]');
     expect(await tenant.getAttribute('data-rejection')).toBe('SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE');
-    expect(await tenant.locator('input').isDisabled()).toBe(true);
+    // MI-6: ページが決める鍵は表示だけ（選ぶ入力はない）。
+    expect(await tenant.locator('input').count()).toBe(0);
     expect(await tenant.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE.description);
     await screenshot(page, 't41e-05-api-update-page-key-not-identifiable');
   });
@@ -2908,7 +3138,7 @@ describe('T41e: the API update scenario screens', () => {
       items.map((item) => (item as HTMLOptionElement).value).filter((value) => value !== ''));
     expect(options).toContain(apiState.createId);
     expect(options).not.toContain(ledger.scenarioId);
-    expect(await form.getByTestId('scenario-api-no-ledger').count()).toBe(0);
+    expect(await page.getByTestId('scenario-api-no-ledger').count()).toBe(0);
     await screenshot(page, 't41e-03-api-update-ledger-options');
   });
 
@@ -2922,10 +3152,15 @@ describe('T41e: the API update scenario screens', () => {
     expect(await page.getByTestId('write-start-target').getAttribute('data-target')).toBe(planned ?? '');
     expect(await page.getByTestId('write-start-changed').textContent()).toBe(listText(['name']));
     expect(await page.getByTestId('write-start-kept').textContent()).toBe(listText(['email']));
-    expect(await page.getByTestId('write-start-action').getAttribute('data-path')).toBe('/rest/v1/members');
-    expect(await page.getByTestId('write-start-api-shape').locator('[data-item="keptKeys"] li').count()).toBe(1);
-    const view = await valueOf<{ update: { plannedTarget: string | null; keptFieldNames: readonly string[] } | null }>('writeStartPageFn', 'GET', { scenarioId });
+    // PL-5（設計書 3 章の 2）: 送り先と要求の型は画面に出さない（Server Function の値で確かめる）。
+    expect(await page.getByTestId('write-start-action').count()).toBe(0);
+    expect(await page.getByTestId('write-start-api-shape').count()).toBe(0);
+    await expectNoTechnicalTextOf(page, ['/rest/v1/members']);
+    const view = await valueOf<{ update: { plannedTarget: string | null; keptFieldNames: readonly string[]; actionPath: string | null } | null }>(
+      'writeStartPageFn', 'GET', { scenarioId },
+    );
     expect(view.update).toMatchObject({ plannedTarget: planned, keptFieldNames: ['email'] });
+    expect(view.update?.actionPath).toContain('/rest/v1/members');
     await screenshot(page, 't41e-04-api-update-write-start');
   });
 });
@@ -2952,7 +3187,7 @@ const apiUpdateDraftOf = (ledgerId: string): Record<string, unknown> => ({
   limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
   approvalTtlDays: 30,
   verification: {
-    successCondition: null, inputErrorCondition: null, recordId: null,
+    resultJudgement: null, recordId: null,
     readVerification: { readCheckId: apiState.readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }] },
   },
   api: {
@@ -2969,7 +3204,7 @@ const prepareApiUpdate = async (ledgerId: string): Promise<string> => {
   expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
     scenarioId: created.scenarioId,
     expectedScenarioRevision: detail.scenario.revision,
-    expectedRuleSetRevision: null,
+    expectedRuleSetRevision: await ruleSetRevisionOf(created.scenarioId),
     fieldRules: [{ fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [...API_UPDATE_NAMES] }],
     relations: [],
     uniqueKeyFieldNames: [],
@@ -2994,7 +3229,7 @@ const apiUpdateActionRunTextOf = (scenarioId: string, scenarioRevision: number, 
     grantId: '__START_GRANT_ID__',
     seedRecord: '__START_SEED_RECORD__',
     submittedValues: { name: '__START_VALUE:name__' },
-    resultConditions: null,
+    resultJudgement: null,
     submission: 'SENT',
     blockReason: null,
     httpStatus: 200,
@@ -3024,18 +3259,21 @@ const apiUpdateActionRunTextOf = (scenarioId: string, scenarioRevision: number, 
 
 describe('T41e-2: the API update from the candidate list to the result', () => {
   it('shows the reason instead of the create link for a shape that cannot become an API update scenario, on the candidate list', async () => {
+    // PL-5（設計書 4 章の 6）: 候補の行ごとの作るリンクと作れない理由の欄はなくした（下書きは要点の主のボタン 1 つ。作れない形の理由は、その確認の一覧に
+    // 出る）。作れない理由は、画面と同じ値の Server Function で確かめる（判定はサーバの下書きの確かめと同じ部品）。
+    const values = await valueOf<{ candidates: readonly { identityDigest: string; apiScenarioRows: readonly { shapeDigest: string; rejection: string | null }[] }[] }>(
+      'discoveryPageFn', 'GET', { profileId: API_FLOW_PROFILE_ID },
+    );
+    const rowsOf = (digest: string) => values.candidates.find(({ identityDigest }) => identityDigest === digest)?.apiScenarioRows ?? [];
+    expect(rowsOf(FLOW_UPDATE_TENANT.identityDigest)).toEqual([
+      { shapeDigest: FLOW_UPDATE_TENANT.submissionProbe?.shapeDigest, rejection: 'SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE' },
+    ].map((row) => expect.objectContaining(row)));
+    // 作れる更新の型（欄として識別できるページが決める鍵だけ）は、理由を持たない。
+    expect(rowsOf(FLOW_UPDATE_NESTED.identityDigest).map(({ rejection }) => rejection)).toEqual([null]);
     const page = await openPage(`/discovery/${API_FLOW_PROFILE_ID}`);
-    const tenantRow = page.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_UPDATE_TENANT.identityDigest}"]`);
-    const rejected = tenantRow.getByTestId('candidate-api-scenario-rejected');
-    await rejected.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await rejected.getAttribute('data-reason')).toBe('SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE');
-    expect(await rejected.getAttribute('data-shape-digest')).toBe(FLOW_UPDATE_TENANT.submissionProbe?.shapeDigest);
-    expect(await rejected.textContent()).toContain(SCENARIO_DRAFT_REJECTION_DESCRIPTIONS.SCENARIO_API_PAGE_KEY_NOT_IDENTIFIABLE.description);
-    expect(await tenantRow.getByTestId('candidate-create-api-scenario').count()).toBe(0);
-    // 作れる更新の型（欄として識別できるページが決める鍵だけ）は、今どおり作成の画面へのリンクを出す。
-    const nestedRow = page.locator(`[data-testid="discovery-candidate"][data-digest="${FLOW_UPDATE_NESTED.identityDigest}"]`);
-    expect(await nestedRow.getByTestId('candidate-create-api-scenario').count()).toBe(1);
-    expect(await nestedRow.getByTestId('candidate-api-scenario-rejected').count()).toBe(0);
+    await page.getByTestId('discovery-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('candidate-api-scenario-rejected').count()).toBe(0);
+    expect(await page.getByTestId('candidate-create-api-scenario').count()).toBe(0);
     await screenshot(page, 't41e2-01-candidate-rejected');
   });
 
@@ -3044,9 +3282,9 @@ describe('T41e-2: the API update from the candidate list to the result', () => {
     const scenarioId = await prepareApiUpdate(ledgerId);
     // 検証の指定は、API の更新で求める項目（照合の READ）だけを出す（ID の取り方は対象の ID なので求めない）。
     const detail = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
-    await detail.getByTestId('scenario-verification-values').waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await detail.getByTestId('scenario-verification-values').locator('dd').evaluateAll((items) => items.map((item) => item.getAttribute('data-item'))))
-      .toEqual(['readVerification']);
+    // PL-5（設計書 3 章の 2）: 検証の指定の値は画面に出さない（Server Function の値で確かめる）。
+    await detail.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect((await valueOf<{ verificationItems: readonly string[] }>('scenarioDetailPageFn', 'GET', { scenarioId })).verificationItems).toEqual(['readVerification']);
     expect(await detail.getByTestId('scenario-verification-missing').count()).toBe(0);
 
     // 予定のレコードは、台帳（API の登録のシナリオ）の照合済みの登録（T40d の場面の登録）。
@@ -3061,7 +3299,10 @@ describe('T41e-2: the API update from the candidate list to the result', () => {
     const start = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}/write`);
     await start.getByTestId('write-start-open').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await start.getByTestId('write-start-target').getAttribute('data-target')).toBe(planned);
-    expect(await start.getByTestId('write-start-form').getAttribute('data-path')).toBe(`/orgs/7/members/${API_WRITE_VALUES.recordId}/edit`);
+    // PL-5（設計書 3 章の 2）: 書き換えの画面のアドレス（予定の ID を入れた形）は画面に出さない（Server Function の値で確かめる）。
+    expect(await start.getByTestId('write-start-form').count()).toBe(0);
+    expect((await valueOf<{ update: { formPath: string | null } | null }>('writeStartPageFn', 'GET', { scenarioId })).update?.formPath)
+      .toBe(`/orgs/7/members/${API_WRITE_VALUES.recordId}/edit`);
     expect(await start.getByTestId('write-start-ledger-unbound').count()).toBe(0);
     const startHtml = await start.content();
     await screenshot(start, 't41e2-02-api-update-start');
@@ -3094,6 +3335,8 @@ describe('T41e-2: the API update from the candidate list to the result', () => {
       .toEqual([['email', 'true'], ['plan', 'true']]);
     await screenshot(job, 't41e2-03-api-update-result');
     const history = await openPage(`/scenarios/${API_FLOW_PROFILE_ID}/${scenarioId}`);
+    // PL-5（設計書 3 章の 1）: 書き込みの結果の履歴は、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(history, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     const entry = history.locator(`[data-testid="write-history-entry"][data-job-id="${jobId}"]`);
     await entry.waitFor({ timeout: UI_TIMEOUT_MS });
     expect([await entry.getAttribute('data-transport'), await entry.getAttribute('data-target')]).toEqual(['API', planned]);
@@ -3149,7 +3392,7 @@ describe('T41e-3: the ledger options of an API update scenario', () => {
     await form.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await teams.locator('select[name="api-ledger"] option').evaluateAll((items) =>
       items.map((item) => (item as HTMLOptionElement).value).filter((value) => value !== ''))).toEqual([]);
-    expect(await form.getByTestId('scenario-api-no-ledger').textContent()).toBe(text.api.noLedgerOptions);
+    expect(await teams.getByTestId('scenario-api-no-ledger').textContent()).toBe(text.api.noLedgerOptions);
     await screenshot(teams, 't41e3-01-api-update-no-ledger');
 
     // 会員の表の更新: 同じ表の API の登録（応答の鍵が filter の名前と同じもの）だけを選べる（判定は下書きの確かめと同じ部品）。
@@ -3177,7 +3420,7 @@ const prepareApiCreateLedger = async (): Promise<string> => {
       profileId: API_FLOW_PROFILE_ID, candidateIdentityDigest: FLOW_CREATE.identityDigest, transport: 'API', fieldNames: ['email', 'name'], readChecks: [],
       sideEffectConfirmations: confirmations(true), limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 }, approvalTtlDays: 30,
       verification: {
-        successCondition: null, inputErrorCondition: null, recordId: null,
+        resultJudgement: null, recordId: null,
         readVerification: { readCheckId: apiState.readCheckId, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
       },
       api: {
@@ -3191,7 +3434,7 @@ const prepareApiCreateLedger = async (): Promise<string> => {
   expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
     scenarioId: created.scenarioId,
     expectedScenarioRevision: detail.scenario.revision,
-    expectedRuleSetRevision: null,
+    expectedRuleSetRevision: await ruleSetRevisionOf(created.scenarioId),
     fieldRules: [
       // 照合の READ が比べるメールアドレスは、実行のたびに変わる値（2 つの値の固定の一覧）にする（許可の発行の `READ_VERIFICATION_NOT_VARYING` の決まり）。
       { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [...CHAIN_VALUES.emails] },
@@ -3218,7 +3461,7 @@ const chainCreateActionRunTextOf = (scenarioId: string, scenarioRevision: number
     grantId: '__START_GRANT_ID__',
     seedRecord: '__START_SEED_RECORD__',
     submittedValues: { email: '__START_VALUE:email__', name: '__START_VALUE:name__' },
-    resultConditions: null,
+    resultJudgement: null,
     submission: 'SENT',
     blockReason: null,
     httpStatus: 201,
@@ -3323,16 +3566,20 @@ describe('T41g: create then update in one operation', () => {
       apiUpdateActionRunTextOf(updateId, update.revision, update.current.api),
     );
     const { jobId: createJobId, page: createPage } = await startChainPageOnScreen(updateId, 't41g-01-chain-dialog');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 5）: 見ていた画面が移った先（読み込み直さない移動も数える）。
+    const movedTo: string[] = [];
+    createPage.on('framenavigated', (frame) => {
+      if (frame === createPage.mainFrame()) {
+        movedTo.push(new URL(frame.url()).pathname + new URL(frame.url()).search);
+      }
+    });
     expect(await waitForEnd(createJobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
     const chain = await settledChainOf(createJobId);
     expect(chain).toMatchObject({ state: 'UPDATE_STARTED', reason: null, updateScenarioId: updateId });
     const updateJobId = chain.updateJobId ?? '';
-    // T41g-2: 移った登録のジョブの画面は、登録のジョブが終わった後も、続けて更新する予定が「登録中」の間は読み直し、読み込み直さずに更新のジョブへの
-    // リンクを出す（読み直しの間隔はジョブの画面と同じ）。
-    const liveLink = createPage.getByTestId('job-write-chain-update');
-    await liveLink.waitFor({ timeout: WAIT_LIMIT_MS });
-    expect(await liveLink.getAttribute('href')).toBe(`/jobs/${updateJobId}`);
-    expect(await createPage.getByTestId('job-write-chain').getAttribute('data-state')).toBe('UPDATE_STARTED');
+    // T41g-2: 移った登録のジョブの画面は、登録のジョブが終わった後も、続けて更新する予定が「登録中」の間は読み直す（読み直しの間隔はジョブの画面と同じ）。
+    // PL-2（設計書 3 章の 5）: 登録が成功で終わって続けて更新のジョブを始めたので、読み込み直さずに、更新のジョブの画面へ自動で移る（移った印つき）。
+    await expect.poll(() => movedTo, { timeout: WAIT_LIMIT_MS }).toContain(`/jobs/${updateJobId}?arrived=auto`);
     expect(await createPage.evaluate(() => document.documentElement.dataset['t41gNoReload'])).toBe('kept');
     expect(await waitForEnd(updateJobId)).toMatchObject({ state: 'FINISHED', failureReason: null });
     expect(withControlData((database) => readWriteResult(database, createJobId))).toMatchObject({ result: 'VERIFIED', recordId: 'rec-t41g-1' });
@@ -3421,5 +3668,92 @@ describe('T41g: create then update in one operation', () => {
       expect(readWriteReservations(database, ledgerId)).toEqual([]);
       expect(readWriteReservations(database, updateId)).toEqual([]);
     });
+  });
+});
+
+/**
+ * OP-2 の修正の 1 回目（判断 5。設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6）: 本番からの切り離しは、聞かない・出さない。隔離をまだ
+ * 確かめていない（参照が `isolation-unverified-` の形の。いまは内部の固定の値）テスト環境のプロファイルでも、直す道の画面（書き込みの OK のダイアログ、書き込みの
+ * 開始の画面とダイアログ）に、隔離の注意も記録の行も出さない（前の PL-S の注意を置き換えた）。実行の許可の判定は変えない（参照が空でなければ始められる。
+ * 2026-10-21 のユーザーの判断）。書き込みは始めない（開始のダイアログはやめる）。
+ */
+describe('OP-2 (D6): the write screens of a profile whose isolation is not checked yet', () => {
+  const UNVERIFIED_PROFILE_ID = 'pls-unverified';
+  const UNVERIFIED_OUTPUT = 'pls-unverified-output';
+
+  it('shows no isolation caution on the approval dialog, the start screen and the start dialog, and still lets the write start', async () => {
+    const target = writeTarget('pls-unverified', UNVERIFIED_OUTPUT);
+    expect(await valueOf('createProfileFn', 'POST', {
+      profile: {
+        ...profileDocument(UNVERIFIED_PROFILE_ID, target, 'TEST_APPROVED_WRITE', FIRST_REVISION),
+        environmentEvidenceRef: isolationUnverifiedEvidenceRefOf(new Date('2026-10-26T03:00:00Z')),
+      },
+    })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(rootOf(), { setup: authSetup(UNVERIFIED_PROFILE_ID) })).toMatchObject({ ok: true });
+    await discover(UNVERIFIED_PROFILE_ID, UNVERIFIED_OUTPUT);
+    const readCheck = await valueOf<{ ok: boolean; readCheckId: string }>('createReadCheckFn', 'POST', {
+      profileId: UNVERIFIED_PROFILE_ID,
+      definition: { targetIdentityDigest: SEARCH.identityDigest, parameters: { q: 'pls' }, expectations: [{ kind: 'ROW_COUNT_AT_LEAST', count: 1 }] },
+    });
+    expect(readCheck.ok).toBe(true);
+    const created = await valueOf<{ ok: boolean; scenarioId: string }>('createScenarioFn', 'POST', {
+      draft: draftOf({
+        profileId: UNVERIFIED_PROFILE_ID,
+        fieldNames: ['email', 'name', 'plan'],
+        verification: {
+          resultJudgement: 'FORM_STRUCTURE',
+          recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/admin/members/{id}'] },
+          readVerification: { readCheckId: readCheck.readCheckId, revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }],
+            expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] },
+        },
+      }),
+    });
+    expect(created).toMatchObject({ ok: true });
+    const { scenarioId } = created;
+    const rules = await valueOf<{ scenario: { revision: number } }>('scenarioDetailPageFn', 'GET', { scenarioId });
+    expect(await valueOf<{ ok: boolean }>('saveDataRulesFn', 'POST', {
+      scenarioId,
+      expectedScenarioRevision: rules.scenario.revision,
+      expectedRuleSetRevision: await ruleSetRevisionOf(scenarioId),
+      fieldRules: [
+        { fieldName: 'name', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: ['pls-name'] },
+        { fieldName: 'email', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: ['pls@example.invalid'] },
+        { fieldName: 'plan', semanticKind: 'FIXED_LIST', method: 'FROM_FIXED_LIST', range: null, fixedValues: [OPTION_MARKER] },
+      ],
+      relations: [],
+      uniqueKeyFieldNames: [],
+    })).toMatchObject({ ok: true });
+
+    // 書き込みの OK のダイアログ: 隔離の注意は出さない（何を・どこへ・何件は出す）。OK はダイアログで押す。
+    const detail = await openPage(`/scenarios/${UNVERIFIED_PROFILE_ID}/${scenarioId}`);
+    await tabTo(detail, detail.getByTestId('scenario-approve'));
+    await detail.keyboard.press('Enter');
+    const approveDialog = detail.getByRole('dialog', { name: text.approveDialog.title });
+    await approveDialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await approveDialog.getByTestId('scenario-approve-isolation-unverified').count()).toBe(0);
+    expect(await approveDialog.textContent()).not.toContain(ISOLATION_NOTICE_FRAGMENT);
+    expect(await approveDialog.getByTestId('scenario-approve-target').textContent()).toBe(text.approveDialog.targetCreate(CREATE.page.path, formatInteger(1)));
+    await screenshot(detail, 'pls-01-approve-isolation-unverified');
+    await approveDialog.getByRole('button', { name: text.approveDialog.confirm, exact: true }).click();
+    await detail.waitForURL(/notice=approved$/u, { timeout: UI_TIMEOUT_MS });
+
+    // 書き込みの開始の画面: 隔離の注意も、記録の行も出さない。始められる（実行の許可の判定は変えない）。画面の値にも隔離の印を持たない。
+    const view = await writePageOf(scenarioId);
+    expect(view).toMatchObject({ evidencePresent: true, startable: true });
+    expect(view).not.toHaveProperty('isolationUnverified');
+    const page = await openPage(`/scenarios/${UNVERIFIED_PROFILE_ID}/${scenarioId}/write`);
+    await page.getByTestId('write-start').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('write-start-evidence').count()).toBe(0);
+    expect(await page.getByTestId('write-start-isolation-unverified-summary').count()).toBe(0);
+    expect(await page.locator('main').textContent()).not.toContain(ISOLATION_NOTICE_FRAGMENT);
+    expect(await page.getByTestId('write-start').getAttribute('data-startable')).toBe('true');
+    await page.getByTestId('write-start-open').click();
+    const dialog = page.getByRole('dialog', { name: writeText.startDialog.title });
+    await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await dialog.getByTestId('write-start-isolation-unverified').count()).toBe(0);
+    await screenshot(page, 'pls-02-start-isolation-unverified');
+    await dialog.getByRole('button', { name: writeText.startDialog.cancel, exact: true }).click();
+    await expect.poll(() => dialog.isVisible(), { timeout: UI_TIMEOUT_MS }).toBe(false);
+    withControlData((database) => expect(readWriteReservations(database, scenarioId)).toEqual([]));
   });
 });

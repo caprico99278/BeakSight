@@ -9,10 +9,10 @@
 
 | 画面の操作 | 送信 | 本文の鍵のうち、状態の語に当たったもの（見立て） |
 | --- | --- | --- |
-| 画面 A の新規の「保存」 | `POST /rest/v1/notes` | `status`、`published_at` |
+| 画面 A の新規の「保存」 | `POST /rest/v1/<x1>` | `status`、`published_at` |
 | 画面 B の新規の「保存」 | `POST /rest/v1/<x2>` | `is_published` |
 | 画面 C の新規の「保存」 | `POST /rest/v1/<x3>` | `is_published` |
-| 画面 D の編集の「保存」 | `PATCH /rest/v1/tasks?id=eq.<画面の ID>` | `status` |
+| 画面 D の編集の「保存」 | `PATCH /rest/v1/<x4>?id=eq.<画面の ID>` | `status` |
 
 今の分類（`src/discovery/api-shape-classification.ts`）は、本文の鍵の名前が状態の語の一覧（`fieldNameHasStateWord`。status・published・unpublished など）に当たると、`SOFT_DELETE_KEY` で実行しない側にする（T37R-fix-A）。この一覧は、論理削除の語と、公開の状態の語を区別していない。
 

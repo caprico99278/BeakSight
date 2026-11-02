@@ -1,0 +1,13 @@
+{
+  "$id": "urn:beaksight:schema:control:ui-write-screen-check:1",
+  "description": "Local UI Server Function input: save the check of one screen in the list of the screens that can try a create and an update (OP-2; one pass flow design 4.1.1 D7'). rowKey is the identity digest of the create candidate of the screen in the latest discovery. checked true switches the profile to the write mode if needed, drafts the create (and the update chosen by rule F) and approves them; false revokes the approvals of the screen. No grant is issued here. mayNotifyShown (OP-F) is whether the screen showed the line about notifications when it drew the row; when it differs from the value of the server now (or is absent while the server shows the line), the update is not approved (the create only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["profileId", "rowKey", "checked"],
+  "properties": {
+    "profileId": { "$ref": "urn:beaksight:schema:control:profile:1#/properties/profileId" },
+    "rowKey": { "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/digest" },
+    "checked": { "type": "boolean" },
+    "mayNotifyShown": { "type": "boolean" }
+  }
+}

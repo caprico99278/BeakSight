@@ -6,10 +6,14 @@
  * - 止める（確かめのダイアログ）→ 一部未完了（PARTIAL）。画面を閉じて開き直すと同じ状態。実行履歴と、一覧の「最後の Run」。
  * - 画面のサーバを強制終了 → ワーカーと Chromium が残らない → 起動し直すと、そのジョブが「中断」→ 「前回の続きから再開する」で、同じ Run の
  *   続きから再開する（`RESUME`。Run の ID が同じで、実行の記録が 2 回）。
+ * - PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1、4 章の 4）: 開始の画面は、要点のパネルの主のボタン「点検を始める」1 つと、詳しい内容 1 つ。
+ *   始め方（続きから・新しく）の選択は、前回の点検が最後まで終わらなかったときだけ、詳しい内容に出す（既定は続きから）。まだ点検していないときは出さない。
+ *   主のボタンの数と axe の違反 0 を確かめる。
  * - 監査の間、fixture のサイトに届く要求の間隔が、設定の間隔以上（画面のポーリングで変わらない）。届いた要求は GET と HEAD だけ。
  * - すべての画面で、CSP の違反と console の誤りが 0 件、外部への要求が 0 件。node と Chromium の process が残らない。
  * 管理データ、ターゲット設定、出力先は、一時の root の中だけ。スクリーンショットは、環境変数 `T24F_SCREENSHOT_DIR` があれば、そこに保存する。
  */
+import { AUDIT_JOB_POLL_INTERVAL_MS } from '../src/display/job-polling';
 import { readFileSync } from 'node:fs';
 import type { Browser, BrowserContext, Download, Locator, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -24,12 +28,15 @@ import {
   LOCAL_UI_AUDIT_TEXT,
   LOCAL_UI_JOB_NEXT_STEPS,
   LOCAL_UI_JOB_CONSOLE_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
   LOCAL_UI_TEXT,
+  LOCAL_UI_JOB_SUMMARY_TEXT,
 } from '../../../src/presentation/messages.js';
 import { BROWSER_DEFAULT_FAVICON_PATH, launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { READ_METHODS } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
 import {
+  START_PATH,
   outputDirectoryOf,
   publicProfileDocument,
   startTimedSite,
@@ -48,9 +55,11 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
-import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
+import { createProfileOnScreen } from './helpers/profile-form.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { axeViolationsOf, expectAtMostOnePrimaryButton, primaryButtonLabelsInMain } from './helpers/screen-shape.ts';
 
 /** 画面の操作を待つ上限（ミリ秒）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -143,38 +152,78 @@ const createProfile = async (profileId: string): Promise<void> => {
   expect(created.value).toMatchObject({ ok: true });
 };
 
-/** 一覧の行の「監査を始める」から、開始の画面を開く（キーボードだけ）。 */
+/**
+ * 一覧の行の「続ける」からサイトの画面へ進み、要点のパネルの主のボタン「点検を始める」から、開始の画面を開く（キーボードだけ）。PL-1（設計書
+ * `2026-10-26-beaksight-plain-ui-design.md` 3 章、4 章の 1）: 一覧の行のボタンは「続ける」1 つ（前は行に「監査を始める」があった）。
+ */
 const openStartFromList = async (profileId: string): Promise<Page> => {
   const page = await openPage('/');
   const row = page.locator(`tr[data-profile-id="${profileId}"]`);
-  await tabTo(page, row.getByRole('link', { name: text.profileList.startAudit }));
+  await tabTo(page, row.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.continue }));
+  await page.keyboard.press('Enter');
+  await page.waitForURL(new RegExp(`/profiles/${profileId}$`, 'u'), { timeout: UI_TIMEOUT_MS });
+  await tabTo(page, page.getByTestId('profile-summary').getByRole('link', { name: text.profileList.startAudit }));
   await page.keyboard.press('Enter');
   await page.waitForURL(new RegExp(`/start/${profileId}$`, 'u'), { timeout: UI_TIMEOUT_MS });
-  await page.getByTestId('start-target').waitFor({ timeout: UI_TIMEOUT_MS });
+  await page.getByTestId('start-summary').waitFor({ timeout: UI_TIMEOUT_MS });
   return page;
 };
 
+/**
+ * 開始の画面の始め方。PL-3（4 章の 4）: `FIRST` は、まだ点検していないサイト（始め方の選択を出さない）。`RESUME`・`NEW` は、前回の点検が最後まで終わらな
+ * かったサイト（詳しい内容に選択を出し、既定は続きから）。
+ */
+type StartChoice = 'FIRST' | 'RESUME' | 'NEW';
+
 /** 開始の画面で、始め方を選んで開始し、ジョブの画面に移る（キーボードだけ）。ジョブの ID を返す。 */
-const startFromStartPage = async (page: Page, startNew: boolean): Promise<string> => {
-  const radio = page.getByRole('radio', { name: startNew ? text.start.startNew : text.start.resume });
-  await tabTo(page, page.getByRole('radio', { name: text.start.resume }));
-  if (startNew) {
-    await page.keyboard.press('ArrowDown');
+const startFromStartPage = async (page: Page, choice: StartChoice): Promise<string> => {
+  if (choice === 'FIRST') {
+    expect(await page.locator('input[name="start-mode"]').count()).toBe(0);
+    expect(await page.getByTestId('start-resume-note').count()).toBe(0);
+  } else {
+    expect(await page.getByTestId('start-resume-note').textContent()).toBe(text.start.resumeNote(LOCAL_UI_TEXT.advancedSettings.summary));
+    // 選択は、たたんだ詳しい内容の中（キーボードで見出しを開く）。既定は続きから。
+    await tabTo(page, page.getByTestId('start-advanced-settings').locator('summary'));
+    await page.keyboard.press('Enter');
+    expect(await page.getByRole('radio', { name: text.start.resume }).isChecked()).toBe(true);
+    if (choice === 'NEW') {
+      await tabTo(page, page.getByRole('radio', { name: text.start.resume }));
+      await page.keyboard.press('ArrowDown');
+      expect(await page.getByRole('radio', { name: text.start.startNew }).isChecked()).toBe(true);
+    }
   }
-  expect(await radio.isChecked()).toBe(true);
+  // 3 章の 1: 主のボタンは 1 つ（公開の画面だけのサイトは、点検だけを始める）。
+  expect(await primaryButtonLabelsInMain(page)).toEqual([text.start.submit]);
+  expect(await page.getByTestId('start-submit').getAttribute('data-kind')).toBe('AUDIT_ONLY');
   await tabTo(page, page.getByRole('button', { name: text.start.submit }));
   await page.keyboard.press('Enter');
   await page.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
   return new URL(page.url()).pathname.split('/').at(-1) ?? '';
 };
 
+/** PL-U: 止めた点検が作業の画面に残ることを見る間（自動で移すなら、読み直しの間隔の数回で移る）。 */
+const STAY_AFTER_STOP_MS = AUDIT_JOB_POLL_INTERVAL_MS * 2;
+
 const jobState = (page: Page, state: keyof typeof AUDIT_JOB_STATE_CATALOG): Locator =>
   page.locator(`[data-testid="job-state"][data-state="${state}"]`);
 
 /** 進み具合で、監査を終えたページが 1 つ以上になるまで待つ（画面のポーリングで、読み込み直さずに変わる）。 */
 const waitForFirstPage = async (page: Page): Promise<void> => {
+  // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 進み具合の数は、たたんだ詳しい内容の中（開いたまま、読み直しで変わる）。
+  await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
   await page.getByTestId('job-pages-finished').waitFor({ timeout: AUDIT_TIMEOUT_MS });
   await expect.poll(async () => page.getByTestId('job-pages-finished').textContent(), { timeout: AUDIT_TIMEOUT_MS }).not.toBe(formatCount(0));
+};
+
+/**
+ * PL-2（設計書 3 章の 5）: 見ていた点検が成功で終わると、サイトの詳細へ自動で移る。終わった（または移った）ら、終わった作業の画面を開き直してから確かめる
+ * （開き直した画面は移らない）。
+ */
+const waitForFinishedOnJobPage = async (page: Page, jobId: string): Promise<void> => {
+  const onJobPage = (): boolean => new URL(page.url()).pathname === `/jobs/${jobId}`;
+  await expect.poll(async () => !onJobPage() || await jobState(page, 'FINISHED').count() > 0, { timeout: AUDIT_TIMEOUT_MS }).toBe(true);
+  await page.goto(new URL(`/jobs/${jobId}`, page.url()).href);
+  await jobState(page, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
 };
 
 /** 読み込みの間隔（ページの読み込みの開始で数える。ブラウザ自身のアイコンの要求は除く）。 */
@@ -223,29 +272,43 @@ describe('local UI: audit from the screen', () => {
   it('registers a profile, starts the audit, follows the progress to the end, opens the report and downloads JSON and ZIP', async () => {
     // プロファイルの登録（画面）。
     const form = await openPage('/profiles/new');
-    await form.getByLabel(LOCAL_UI_TEXT.profileForm.profileId).fill(FULL_PROFILE);
-    // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
-    await chooseExistingTargetConfig(form, targetConfigPathOf(FULL_PROFILE), UI_TIMEOUT_MS);
-    await form.getByText(LOCAL_UI_TEXT.profileForm.configOk).waitFor({ timeout: UI_TIMEOUT_MS });
-    await form.getByRole('button', { name: LOCAL_UI_TEXT.profileForm.save }).click();
-    await form.getByText(LOCAL_UI_TEXT.profileForm.created).waitFor({ timeout: UI_TIMEOUT_MS });
-
-    // 一覧の「監査を始める」→ 開始の画面（設定の要点は読むだけ）。
-    const start = await openStartFromList(FULL_PROFILE);
-    expect(await start.getByTestId('start-interval').textContent()).toBe(formatDuration(FULL_INTERVAL_MS));
-    expect(await start.getByTestId('start-target').locator('input, select, textarea').count()).toBe(0);
-    await screenshot(start, '01-start');
+    // OP-1 修正の 2 回目（OP 設計書 4.1.3 の 3。設計者の判断「公開のサイトも点検を始める 1 つ」）: 作成の画面の「点検を始める」は、保存 → 下調べ → 点検（公開の
+    // サイトは単独の点検）へ、ジョブの管理が進める。作業の画面は、下調べの作業から、続けて始めた点検の作業へ移る（前は、保存の後にサイトの画面へ移り、開始の画面から
+    // 点検を始めていた。開始の画面の確かめは、点検の後に行う）。作業の画面が移った先を記録する（点検が終わると、さらにサイトの画面へ移るため）。
+    const visited: string[] = [];
+    form.on('framenavigated', (frame) => {
+      if (frame === form.mainFrame()) {
+        visited.push(new URL(frame.url()).pathname);
+      }
+    });
+    // MI-1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.2）: 使い方は「公開の画面だけ」。
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 6 章の 1）: 見える入力は開始のアドレス・使い方・保存だけ。この root の設定のファイルは、どれも同じ
+    // 開始のアドレスなので、保存の拒否の知らせの中で、使うファイル（FULL_PROFILE の設定）を選ぶ。名前は開始のアドレスから決まる。
+    await createProfileOnScreen(form, { startUrl: `${site?.origin ?? ''}${START_PATH}`, usage: 'PUBLIC', targetConfigPath: targetConfigPathOf(FULL_PROFILE) }, UI_TIMEOUT_MS);
+    await form.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
+    const entryJobId = new URL(form.url()).pathname.split('/').at(-1) ?? '';
+    const isAuditJobPath = (path: string): boolean => path.startsWith('/jobs/') && path !== `/jobs/${entryJobId}`;
+    await expect.poll(() => visited.some(isAuditJobPath), { timeout: AUDIT_TIMEOUT_MS }).toBe(true);
     const auditStartedAt = Date.now();
-    const jobId = await startFromStartPage(start, true);
-
+    const jobId = visited.find(isAuditJobPath)?.split('/').at(-1) ?? '';
+    const start = form;
+    const ids = readServerFunctionIds(`${root?.root ?? ''}/apps/local-ui/dist/server/server.js`);
+    const auditJob = (await callServerFunction({ port: started().port, origin: started().origin, cookie, ids }, 'getAuditJobFn', 'GET', { jobId })).value as {
+      readonly jobKind: string; readonly profileId: string; readonly stageChain: unknown;
+    };
+    // 続けて始めたのは、単独の点検（公開の画面だけのサイトは、まとめて実行しない）。
+    expect(auditJob).toMatchObject({ jobKind: 'AUDIT', stageChain: null });
+    const fullProfileId = auditJob.profileId;
     // 進み具合（ポーリング）→ 終わり。
     await waitForFirstPage(start);
     await recordDescendants();
     await screenshot(start, '02-progress');
-    await jobState(start, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+    await waitForFinishedOnJobPage(start, jobId);
     const auditFinishedAt = Date.now();
     await start.getByTestId('job-run-status').waitFor();
     expect(await start.getByTestId('job-run-status').getAttribute('data-run-status')).toMatch(/^(?:COMPLETE|PARTIAL)$/u);
+    // PL-2（13 章の 13）: JSON と ChatGPT 用のファイルは、たたんだ詳しい内容の中。
+    await openAdvancedSettings(start, 'job-details', UI_TIMEOUT_MS);
     await start.getByTestId('job-artifacts').waitFor();
     await screenshot(start, '03-finished');
 
@@ -253,7 +316,8 @@ describe('local UI: audit from the screen', () => {
     const [report] = await Promise.all([
       context?.waitForEvent('page') ?? Promise.reject(new Error('no context')),
       (async () => {
-        await tabTo(start, start.getByRole('link', { name: text.job.openReport }));
+        // PL-2（13 章の 13）: 報告は、要点の主のボタン「結果を見る」で開く。
+        await tabTo(start, start.getByRole('link', { name: LOCAL_UI_JOB_SUMMARY_TEXT.openResult }));
         await start.keyboard.press('Enter');
       })(),
     ]);
@@ -287,19 +351,30 @@ describe('local UI: audit from the screen', () => {
     expect(names[0]).toMatch(/run\.json$/u);
     expect(names[1]).toMatch(/audit\.json$/u);
     // PRE42-BN: 画面のジョブのバンドルの名前は、プロファイルの名前（profileId）を含む。
-    expect(names[2]).toMatch(new RegExp(`^beaksight-audit-bundle_${FULL_PROFILE}_\\d{14}\\.zip$`, 'u'));
+    expect(names[2]).toMatch(new RegExp(`^beaksight-audit-bundle_${fullProfileId}_\\d{14}\\.zip$`, 'u'));
     const runJson = JSON.parse(readFileSync(await downloads[0]?.path() ?? '', 'utf8')) as { runId: string };
     expect(await start.getByTestId('job-run-id').textContent()).toBe(runJson.runId);
 
     // 監査の間、fixture のサイトに届いた読み込みの間隔は、設定の間隔以上（画面のポーリングの間も）。
     expectPacedArrivals(navigationArrivals(site?.requests() ?? [], auditStartedAt, auditFinishedAt), FULL_INTERVAL_MS);
+
+    // 一覧の「続ける」→ サイトの画面の「点検を始める」→ 開始の画面（設定の要点は読むだけ。OP-1 修正の 2 回目: 点検の後に確かめる。始めない）。
+    const startPage = await openStartFromList(fullProfileId);
+    expect(await startPage.getByTestId('start-interval').textContent()).toBe(formatDuration(FULL_INTERVAL_MS));
+    expect(await startPage.getByTestId('start-target').locator('input, select, textarea').count()).toBe(0);
+    // PL-3（3 章の 1）: 読む量の上限は、たたんだ詳しい内容の中（1 つだけ）。主のボタンは 1 つ、axe の違反は 0。
+    expect(await startPage.locator('main details').count()).toBe(1);
+    expect(await startPage.getByTestId('start-target').isVisible()).toBe(false);
+    await expectAtMostOnePrimaryButton(startPage);
+    expect(await axeViolationsOf(startPage)).toEqual([]);
+    await screenshot(startPage, '01-start');
   }, SCENARIO_TIMEOUT_MS);
 
   it('stops the audit through the confirmation dialog (PARTIAL), and shows the same state after reopening the page', async () => {
     await createProfile(STOP_PROFILE);
     const start = await openStartFromList(STOP_PROFILE);
     const auditStartedAt = Date.now();
-    const jobId = await startFromStartPage(start, false);
+    const jobId = await startFromStartPage(start, 'FIRST');
     await waitForFirstPage(start);
     await recordDescendants();
 
@@ -317,6 +392,9 @@ describe('local UI: audit from the screen', () => {
     await start.keyboard.press('Enter');
     await jobState(start, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
     const auditFinishedAt = Date.now();
+    // PL-U の修正の 1 回目（設計書 14.1 の判断）: 利用者が止めた点検は、一部のページを見ずに終わっても（PARTIAL）、作業の画面に残る（自動で移らない）。
+    await start.waitForTimeout(STAY_AFTER_STOP_MS);
+    expect(new URL(start.url()).pathname).toBe(`/jobs/${jobId}`);
     expect(await start.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
     expect(await start.getByRole('button', { name: text.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT), exact: true }).count()).toBe(0);
     expectPacedArrivals(navigationArrivals(site?.requests() ?? [], auditStartedAt, auditFinishedAt), SLOW_INTERVAL_MS);
@@ -326,7 +404,8 @@ describe('local UI: audit from the screen', () => {
     const reopened = await openPage(`/jobs/${jobId}`);
     await jobState(reopened, 'FINISHED').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await reopened.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
-    expect(await reopened.getByTestId('job-run-status').textContent()).toContain(RUN_STATUS_CATALOG.PARTIAL.label);
+    // PL-2（3 章の 1・2）: 要点の結果の 1 行（点検の回の状態の札は、たたんだ詳しい内容の表）。
+    expect(await reopened.getByTestId('job-run-status').textContent()).toBe(LOCAL_UI_JOB_SUMMARY_TEXT.finished.AUDIT_PARTIAL);
     // T44e（Task 44 の設計書 P2-7）: 終わり方と Run の理由を、表示のカタログの文で出し、次にできることも出す。
     const runEnd = reopened.getByTestId('job-run-end');
     await runEnd.waitFor({ timeout: UI_TIMEOUT_MS });
@@ -343,19 +422,30 @@ describe('local UI: audit from the screen', () => {
     // 実行履歴と、一覧の「最後の Run」。
     const jobs = await openPage('/jobs');
     await jobs.locator(`tr[data-job-id="${jobId}"]`).waitFor();
-    expect(await jobs.locator('tbody tr').count()).toBe(2);
+    // OP-1 修正の 2 回目: 最初の場面の作成の画面の「点検を始める」が、下調べと点検の 2 つの作業を作る（前は点検の 1 つ）。この場面の点検と合わせて 3 つ。
+    expect(await jobs.locator('tbody tr').count()).toBe(3);
     await screenshot(jobs, '07-jobs');
     const list = await openPage('/');
     const row = list.locator(`tr[data-profile-id="${STOP_PROFILE}"]`);
     expect(await row.getByTestId('last-run-state').textContent()).toBe(AUDIT_JOB_STATE_CATALOG.FINISHED.label);
     expect(await row.getByTestId('last-run-status').textContent()).toBe(RUN_STATUS_CATALOG.PARTIAL.label);
     await screenshot(list, '08-profiles');
+
+    // PL-3（4 章の 4）: 前回の点検が途中で終わったので、開始の画面は始め方の選択を詳しい内容に出す（既定は続きから）。要点に一文。
+    const again = await openPage(`/start/${STOP_PROFILE}`);
+    expect(await again.getByTestId('start-resume-note').textContent()).toBe(text.start.resumeNote(LOCAL_UI_TEXT.advancedSettings.summary));
+    expect(await again.locator('input[name="start-mode"]').count()).toBe(2);
+    expect(await again.locator('input[name="start-mode"][value="resume"]').isChecked()).toBe(true);
+    expect(await again.getByRole('radio', { name: text.start.resume }).count()).toBe(0);
+    await expectAtMostOnePrimaryButton(again);
+    expect(await axeViolationsOf(again)).toEqual([]);
+    await screenshot(again, '08b-start-resume-choice');
   }, SCENARIO_TIMEOUT_MS);
 
   it('marks the job interrupted after the server is killed, leaves no process, and resumes the same Run from the screen', async () => {
     await createProfile(RESUME_PROFILE);
     const start = await openStartFromList(RESUME_PROFILE);
-    const firstJobId = await startFromStartPage(start, true);
+    const firstJobId = await startFromStartPage(start, 'FIRST');
     await waitForFirstPage(start);
     const firstRunId = await start.getByTestId('job-run-id').textContent();
     expect(firstRunId).toMatch(/^RUN-\d+$/u);
@@ -388,12 +478,13 @@ describe('local UI: audit from the screen', () => {
 
     // 「前回の続きから再開する」で、同じ Run の続きから再開する。
     const resume = await openStartFromList(RESUME_PROFILE);
-    const secondJobId = await startFromStartPage(resume, false);
+    const secondJobId = await startFromStartPage(resume, 'RESUME');
     expect(secondJobId).not.toBe(firstJobId);
+    await openAdvancedSettings(resume, 'job-details', UI_TIMEOUT_MS);
     await resume.getByTestId('job-run-id').filter({ hasText: /^RUN-/u }).waitFor({ timeout: AUDIT_TIMEOUT_MS });
     expect(await resume.getByTestId('job-run-id').textContent()).toBe(firstRunId);
     await recordDescendants();
-    await jobState(resume, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+    await waitForFinishedOnJobPage(resume, secondJobId);
     await screenshot(resume, '10-resumed');
     const runJson = JSON.parse(readFileSync(`${root?.root ?? ''}/${outputDirectoryOf(RESUME_PROFILE)}/${firstRunId ?? ''}/run.json`, 'utf8')) as {
       runId: string;
@@ -407,9 +498,10 @@ describe('local UI: audit from the screen', () => {
   it('shows the reason and the next step when the audit stops at the page limit (MAX_PAGES_REACHED)', async () => {
     await createProfile(LIMIT_PROFILE);
     const start = await openStartFromList(LIMIT_PROFILE);
-    await startFromStartPage(start, true);
+    const jobId = await startFromStartPage(start, 'FIRST');
     await recordDescendants();
-    await jobState(start, 'FINISHED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
+    // PL-U（14.1 の U1）: ページの上限で終わった点検（PARTIAL）も、サイトの画面へ自動で移る。終わった作業の画面を開き直してから確かめる。
+    await waitForFinishedOnJobPage(start, jobId);
     expect(await start.getByTestId('job-run-status').getAttribute('data-run-status')).toBe('PARTIAL');
     const runEnd = start.getByTestId('job-run-end');
     await runEnd.waitFor({ timeout: UI_TIMEOUT_MS });
@@ -428,7 +520,7 @@ describe('local UI: audit from the screen', () => {
     const requestsBefore = site?.requests().length ?? 0;
     await createProfile(SECRET_QUERY_PROFILE);
     const start = await openStartFromList(SECRET_QUERY_PROFILE);
-    await startFromStartPage(start, true);
+    await startFromStartPage(start, 'FIRST');
     await recordDescendants();
     await jobState(start, 'FAILED').waitFor({ timeout: AUDIT_TIMEOUT_MS });
     const failure = start.getByTestId('job-failure');

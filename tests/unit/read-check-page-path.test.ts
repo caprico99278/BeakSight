@@ -118,6 +118,22 @@ describe('T40b-2: the URL of the {id} page of the verification READ of an API wr
     }
   });
 
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: API の登録の一覧の画面（`{id}` のない画面の path。IPC が登録の画面の 1 つ上だけを
+  // 受ける）は、ID を入れずに、その画面を読む。親が入れた対象の画面と、画面の path の確かめと事前の判定は、`{id}` の型と同じくかけ直す。
+  it('builds the URL of the list page without the record id, and checks it again as the {id} page (OP-R R1)', () => {
+    const list = pageReadCheck({
+      targetPage: { origin: ORIGIN, path: '/admin/members' },
+      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: 'x' }] },
+    });
+    expect(recordPageReadTargetOf(list, '7', config, authentication)).toEqual({ ok: true, url: `${ORIGIN}/admin/members` });
+    const excluded = { ...authentication, auditExclusions: { ...authentication.auditExclusions, excludedPathPrefixes: ['/admin/members'] } };
+    expect(recordPageReadTargetOf(list, '7', config, excluded)).toEqual({ ok: false, detail: 'REQUEST_POLICY', url: `${ORIGIN}/admin/members` });
+    expect(recordPageReadTargetOf(pageReadCheck({ ...list, targetPage: { origin: ORIGIN, path: '/admin' } }), '7', config, authentication))
+      .toEqual({ ok: false, detail: 'URL_NOT_BUILT', url: null });
+    expect(recordPageReadTargetOf(pageReadCheck({ ...list, targetPage: { origin: OTHER_ORIGIN, path: '/admin/members' } }), '7', config, authentication))
+      .toEqual({ ok: false, detail: 'URL_NOT_BUILT', url: null });
+  });
+
   it('keeps rejecting a page path definition in the verification READ of a form write (T37d, the decision 5), without reading', async () => {
     const checked = await verifyReadCheck(null as never, null as never, pageReadCheck(), {
       config, allowedQueryParameters: new Set(), authentication,

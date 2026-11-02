@@ -48,8 +48,8 @@ const readChange = (change: Partial<NonNullable<ScenarioRevision['verification']
   verificationChange({ readVerification: { ...READ, ...change } });
 
 describe('approval digest (T28a)', () => {
-  it('has a versioned format mark (version 4 since the API items, T38c; version 3 was the UPDATE spec, T31b) and returns a sha256 fingerprint', () => {
-    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/4');
+  it('has a versioned format mark (version 5 since PL-6a replaced the result conditions; version 4 was the API items, T38c) and returns a sha256 fingerprint', () => {
+    expect(APPROVAL_DIGEST_FORMAT).toBe('beaksight-approval/5');
     expect(isSha256Fingerprint(BASE_DIGEST)).toBe(true);
   });
 
@@ -103,15 +103,15 @@ describe('approval digest (T28a)', () => {
     ['the READ check id', { readChecks: [{ readCheckId: 'rc-2', revision: 2 }] }],
     ['the READ check revision', { readChecks: [{ readCheckId: 'rc-1', revision: 3 }] }],
     ['no READ check', { readChecks: [] }],
-    // T30a: 検証の指定の各項目。
-    ['the success condition path', verificationChange({ successCondition: { pathPrefix: '/done/', selector: '.registered' } })],
-    ['the success condition selector', verificationChange({ successCondition: { pathPrefix: '/members/', selector: null } })],
-    ['no success condition', verificationChange({ successCondition: null })],
-    ['the input error condition path', verificationChange({ inputErrorCondition: { pathPrefix: '/members/edit', selector: '.error' } })],
-    ['the input error condition selector', verificationChange({ inputErrorCondition: { pathPrefix: '/members/new', selector: '.alert' } })],
-    ['no input error condition', verificationChange({ inputErrorCondition: null })],
-    ['the record id path pattern', verificationChange({ recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}/show' } })],
-    ['the record id source', verificationChange({ recordId: { source: 'ELEMENT', selector: '/members/{id}' } })],
+    // T30a: 検証の指定の各項目（PL-6a: 成否の条件の代わりに、結果の判定のしかたの印。form の ID の取り方は型の一覧で、順も縛る）。
+    ['no result judgement', verificationChange({ resultJudgement: null })],
+    ['the record id path pattern', verificationChange({ recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}/show'] } })],
+    ['one more record id path pattern', verificationChange({ recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}', '/members/{id}/edit'] } })],
+    ['the order of the record id path patterns', verificationChange({
+      recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}/edit', '/members/{id}'] },
+    })],
+    ['the record id source', verificationChange({ recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' } })],
+    ['the verification only mark', verificationChange({ readVerification: { ...FULL_VERIFICATION.readVerification!, verificationOnly: true } })],
     ['no record id', verificationChange({ recordId: null })],
     ['the verification READ check id', readChange({ readCheckId: 'rc-2', revision: 2 })],
     ['the verification READ check revision', readChange({ revision: 3 })],

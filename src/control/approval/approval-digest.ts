@@ -27,6 +27,10 @@
 //   になり、再承認が要る（意図した変化。`approval-validity.ts`）。
 // - T41a（Task 41 の設計書 3.1）: v4 は未公開なので、印の版を上げずに、保つ鍵の項目（`apiKeptKeys`。登録は null）を一覧の末尾に足した。受けたページが
 //   決める鍵の欄の識別は `apiPageKeys` の 1 件に、画面の path を型にした識別の digest は `apiLedger` に入れる（どちらも UPDATE だけ。登録の値は変えない）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (e)）: 検証の指定の成功の条件と入力の誤りの条件の 2 項目を、結果の判定の
+//   しかたの印の 1 項目（`verificationResultJudgement`）に置き換え、印の版を `/5` に上げた（今までの承認は、digest が合わないので、すべて承認し直しになる。
+//   `approval-validity.ts` の `SCENARIO_REVISION_CHANGED`）。登録の ID の取り方は form の ID の型の一覧（当てる順のまま）も表し、照合の READ は照合の専用の
+//   印（真のときだけ）も並べる。
 import { apiFieldIdentityValueOf } from '../../core/api-field-identity.js';
 import { createSha256Fingerprint } from '../../core/ids.js';
 import { deepFreeze } from '../../core/immutable.js';
@@ -39,14 +43,13 @@ import {
   type ScenarioApiKeyField,
   type ScenarioApiPageKey,
   type ScenarioApiSpec,
-  type ScenarioRecordIdSpec,
-  type ScenarioResultCondition,
   type ScenarioRevision,
+  type ScenarioVerificationRecordId,
   type VerificationExpectation,
 } from './scenario-contracts.js';
 
 /** 承認の digest の入力の形の印（版つき）。 */
-export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/4';
+export const APPROVAL_DIGEST_FORMAT = 'beaksight-approval/5';
 
 /** 承認の digest が縛る、シナリオの外の事実（承認の時点の値）。 */
 export interface ApprovalDigestFacts {
@@ -97,9 +100,8 @@ export const APPROVAL_DIGEST_ITEMS = Object.freeze([
   'approvalTtlDays',
   'inputRuleReference',
   'readChecks',
-  // T30a: 検証の指定。
-  'verificationSuccessCondition',
-  'verificationInputErrorCondition',
+  // T30a: 検証の指定（PL-6a: 成否の条件の 2 項目を、結果の判定のしかたの印に置き換えた）。
+  'verificationResultJudgement',
   'verificationRecordId',
   'verificationRead',
   // T31b: UPDATE の指定。
@@ -129,14 +131,13 @@ export type ApprovalDigestValue = string | number | boolean | null | readonly Ap
 /** 照らす READ の定義の参照の 1 件の形（`[id, 版]` の JSON）。 */
 const readCheckEntryOf = (reference: ReadCheckReference): string => JSON.stringify([reference.readCheckId, reference.revision]);
 
-/** 結果の条件の値（`[path の前方一致, セレクタ]`。未指定なら null）。 */
-const resultConditionEntryOf = (condition: ScenarioResultCondition | null): ApprovalDigestValue =>
-  condition === null ? null : [condition.pathPrefix, condition.selector];
-
-/** 登録の ID の取り方の値（`[取り方, path の型かセレクタ]`。未指定なら null）。 */
-const recordIdEntryOf = (spec: ScenarioRecordIdSpec | null): ApprovalDigestValue => {
+/** 登録の ID の取り方の値（`[取り方, path の型かセレクタ]`。PL-6a: form は `[取り方, 型の一覧（当てる順）]`。未指定なら null）。 */
+const recordIdEntryOf = (spec: ScenarioVerificationRecordId | null): ApprovalDigestValue => {
   if (spec === null) {
     return null;
+  }
+  if (spec.source === 'URL_PATH_PATTERNS') {
+    return [spec.source, [...spec.pathPatterns]];
   }
   return spec.source === 'URL_PATH_PATTERN' ? [spec.source, spec.pathPattern] : [spec.source, spec.selector];
 };
@@ -153,7 +154,10 @@ const verificationExpectationEntryOf = (expectation: VerificationExpectation): s
   }
 };
 
-/** 照合の READ の値（`[id, 版, 結び付け, 期待]`。結び付けと期待は並べ替えた JSON の一覧。未指定なら null）。 */
+/**
+ * 照合の READ の値（`[id, 版, 結び付け, 期待]`。結び付けと期待は並べ替えた JSON の一覧。未指定なら null）。PL-6a: 照合の専用の印が真なら、末尾に `true` を
+ * 足す（印のない照合の READ の値は変えない）。
+ */
 const verificationReadEntryOf = (scenario: ApprovalDigestScenario): ApprovalDigestValue => {
   const read = scenario.verification.readVerification;
   return read === null ? null : [
@@ -161,6 +165,7 @@ const verificationReadEntryOf = (scenario: ApprovalDigestScenario): ApprovalDige
     read.revision,
     read.bindings.map(({ parameterName, fieldName }) => JSON.stringify([parameterName, fieldName])).sort(compareCodeUnits),
     read.expectations.map(verificationExpectationEntryOf).sort(compareCodeUnits),
+    ...(read.verificationOnly === true ? [true] : []),
   ];
 };
 
@@ -231,8 +236,7 @@ export const approvalDigestEntriesOf = (
     approvalTtlDays: scenario.approvalTtlDays,
     inputRuleReference: inputRuleReference === null ? null : [inputRuleReference.ruleSetId, inputRuleReference.revision, inputRuleReference.digest],
     readChecks: scenario.readChecks.map(readCheckEntryOf).sort(compareCodeUnits),
-    verificationSuccessCondition: resultConditionEntryOf(scenario.verification.successCondition),
-    verificationInputErrorCondition: resultConditionEntryOf(scenario.verification.inputErrorCondition),
+    verificationResultJudgement: scenario.verification.resultJudgement,
     verificationRecordId: recordIdEntryOf(scenario.verification.recordId),
     verificationRead: verificationReadEntryOf(scenario),
     updateTargetCreateScenarioId: update?.targetCreateScenarioId ?? null,

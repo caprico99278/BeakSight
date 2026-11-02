@@ -22,6 +22,7 @@ import {
   effectiveConfigInputOf,
   isReservedTargetConfigName,
   isTargetConfigCreationFailure,
+  startsAtSameUrl,
   startUrlOriginOf,
   startUrlPathOf,
   startUrlProblemOf,
@@ -69,6 +70,32 @@ describe('T43b: the start URL', () => {
     expect(startUrlPathOf('https://example.test/admin/list?x=1')).toBe('/admin/list');
     expect(startUrlPathOf('https://example.test')).toBe('/');
     expect(startUrlPathOf('not a url')).toBeUndefined();
+  });
+});
+
+// MI-C（MI-1 の報告。設計者の判断）: 作成の自動の選び方で、既にある設定のファイルを使うのは、ファイルの開始の URL が、入れた開始の URL と、監査の開始と
+// 同じ正規化（`normalizeUrl` と、そのファイルの `crawl.allowedQueryParameters`）で同じときだけ。
+describe('MI-C: the same start URL of a target configuration', () => {
+  const configOf = (startUrl: string, allowedQueryParameters: readonly string[] = []) => ({
+    site: { startUrl, allowedOrigins: ['https://example.test'] },
+    crawl: { allowedQueryParameters },
+  });
+
+  it('compares the start URLs after the normalization of the audit start', () => {
+    expect(startsAtSameUrl(configOf('https://example.test/admin/'), 'https://example.test/admin/')).toBe(true);
+    // 追跡の引数と、許していない引数と、空白は、開始の URL を変えない。
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?utm_source=mail'), ' https://example.test/admin/ ')).toBe(true);
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1'), 'https://example.test/admin/')).toBe(true);
+    expect(startsAtSameUrl(configOf('https://Example.TEST:443/admin/'), 'https://example.test/admin/')).toBe(true);
+    // 許した引数は開始の URL の一部。
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1', ['tab']), 'https://example.test/admin/')).toBe(false);
+    expect(startsAtSameUrl(configOf('https://example.test/admin/?tab=1', ['tab']), 'https://example.test/admin/?tab=1')).toBe(true);
+    // パスが違えば別の開始の URL（末尾の / も）。
+    expect(startsAtSameUrl(configOf('https://example.test/top/'), 'https://example.test/admin/')).toBe(false);
+    expect(startsAtSameUrl(configOf('https://example.test/admin'), 'https://example.test/admin/')).toBe(false);
+    // 正規化できない URL は、同じとしない。
+    expect(startsAtSameUrl(configOf('https://example.test/admin/'), 'not a url')).toBe(false);
+    expect(startsAtSameUrl(configOf('https://example.test/admin/'), 'ftp://example.test/admin/')).toBe(false);
   });
 });
 
@@ -188,16 +215,33 @@ describe('T43b: the create input schema', () => {
 
   it('accepts the profile alone (the existing file) and the profile with a new target site, and nothing else', () => {
     const profile = { profileId: 'example-test' };
+    const newTargetSite = { startUrl: 'https://example.test/', allowedOrigins: ['https://example.test'] };
     expect(validateControlDocument('ui-profile-create', { profile }).ok).toBe(true);
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'NEW', profile, newTargetSite }).ok).toBe(true);
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'NEW', profile, newTargetSite: { startUrl: 'https://example.test/' } }).ok)
+      .toBe(false);
     expect(validateControlDocument('ui-profile-create', {
-      profile,
-      newTargetSite: { startUrl: 'https://example.test/', allowedOrigins: ['https://example.test'] },
-    }).ok).toBe(true);
-    expect(validateControlDocument('ui-profile-create', { profile, newTargetSite: { startUrl: 'https://example.test/' } }).ok).toBe(false);
-    expect(validateControlDocument('ui-profile-create', {
+      targetChoice: 'NEW',
       profile,
       newTargetSite: { startUrl: 'https://example.test/', allowedOrigins: [], extra: true },
     }).ok).toBe(false);
     expect(validateControlDocument('ui-profile-create', { profile, other: 1 }).ok).toBe(false);
+  });
+
+  // MI-C（MI-1 の報告。設計者の判断）: 対象の設定の選び方は、明示の項目 `targetChoice`（`AUTO`・`NEW`・`EXISTING`）で示す。開始の URL から決める
+  // 選び方（`AUTO`・`NEW`）は `newTargetSite` を要り、すでにあるファイルを使う選び方（`EXISTING`。省略も同じ）は `newTargetSite` を受けない。
+  it('says how to choose the target configuration with the explicit targetChoice', () => {
+    const profile = { profileId: 'example-test' };
+    const newTargetSite = { startUrl: 'https://example.test/', allowedOrigins: ['https://example.test'] };
+    for (const targetChoice of ['AUTO', 'NEW']) {
+      expect(validateControlDocument('ui-profile-create', { targetChoice, profile, newTargetSite }).ok, targetChoice).toBe(true);
+      expect(validateControlDocument('ui-profile-create', { targetChoice, profile }).ok, targetChoice).toBe(false);
+    }
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'EXISTING', profile }).ok).toBe(true);
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'EXISTING', profile, newTargetSite }).ok).toBe(false);
+    // 開始の URL を送るのに選び方を書かない入力（MI-1 の暗黙の決まり）は受けない。
+    expect(validateControlDocument('ui-profile-create', { profile, newTargetSite }).ok).toBe(false);
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'OTHER', profile, newTargetSite }).ok).toBe(false);
+    expect(validateControlDocument('ui-profile-create', { targetChoice: 'auto', profile, newTargetSite }).ok).toBe(false);
   });
 });

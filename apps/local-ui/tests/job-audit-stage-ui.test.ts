@@ -19,6 +19,7 @@ import type { RunAuthenticationSummary } from '../../../src/core/contracts.js';
 import { DISCOVERY_ARTIFACT_SCHEMA_VERSION } from '../../../src/discovery/discovery-result.js';
 import { READ_EVIDENCE_ARTIFACT_SCHEMA_VERSION } from '../../../src/discovery/read-check-evaluation.js';
 import { formatCount, formatDuration, formatTimes } from '../../../src/presentation/format.js';
+import { HTTP_METHOD_LABELS } from '../../../src/presentation/catalog.js';
 import {
   JOB_SAFETY_VIOLATION_STAGE_LABELS,
   LOCAL_UI_AUDIT_STAGE_TEXT,
@@ -41,6 +42,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -181,6 +183,8 @@ describe('T37a: the counts of the audit stage on the job detail of the discovery
     it(`shows the counts of the ${jobKind} job from its artifact`, async () => {
       writeFinishedJob(jobId, jobKind, runId, SUMMARY);
       const page = await openPage(`/jobs/${jobId}`);
+      // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 数と記録は、たたんだ詳しい内容の中。開いてから確かめる。
+      await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
       const panel = page.getByTestId('job-audit-stage');
       await panel.waitFor({ timeout: UI_TIMEOUT_MS });
       expect(await panel.getByRole('heading', { name: text.heading }).count()).toBe(1);
@@ -204,6 +208,8 @@ describe('T37a: the counts of the audit stage on the job detail of the discovery
     const summary: RunAuthenticationSummary = { ...SUMMARY, serviceRequestLimitReached: false, serviceRequestPacingWaits: 3, serviceRequestPacingWaitMs: 125_000 };
     writeFinishedJob('job-def141-waits', 'DISCOVERY', 'RUN-20261017010004', summary);
     const page = await openPage('/jobs/job-def141-waits');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 数と記録は、たたんだ詳しい内容の中。開いてから確かめる。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const panel = page.getByTestId('job-audit-stage');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     const facts = await panel.getByTestId('job-audit-stage-counts').evaluate((list) =>
@@ -249,6 +255,8 @@ describe('T37a: the counts of the audit stage on the job detail of the discovery
   it('does not show the counts of a job without them', async () => {
     writeFinishedJob('job-t37a-no-stage', 'DISCOVERY', 'RUN-20261017010003', null);
     const page = await openPage('/jobs/job-t37a-no-stage');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 数と記録は、たたんだ詳しい内容の中。開いてから確かめる。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     await page.getByTestId('job-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('job-audit-stage').count()).toBe(0);
     // DEF-144: 違反の中身のないジョブには、違反の欄を出さない。
@@ -290,25 +298,32 @@ describe('DEF-144: the content of the safety violation on the job detail', () =>
       const page = await openPage(`/jobs/${jobId}`);
       const panel = page.getByTestId('job-safety-violation');
       await panel.waitFor({ timeout: UI_TIMEOUT_MS });
+      // PL-2（設計書 7 章、3 章の 2）: 止めた事実・ステップ・画面・押していたボタンの語は、ふだんの画面に出す。押していたボタンの識別、違反の数と表は、
+      // たたんだ詳しい内容の中（`job-safety-violation-details`）。
+      await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
+      const details = page.getByTestId('job-safety-violation-details');
       expect(await panel.getByRole('heading', { name: text.heading }).count()).toBe(1);
       expect(await panel.getByTestId('job-safety-violation-stage').textContent())
         .toBe(JOB_SAFETY_VIOLATION_STAGE_LABELS[jobKind === 'DISCOVERY' ? 'SUBMISSION_PROBE' : 'PAGE_LOAD']);
       expect(await panel.getByTestId('job-safety-violation-page').textContent()).toBe('/admin/staff');
-      expect(await panel.getByTestId('job-safety-violation-count').textContent()).toBe(formatCount(3));
+      expect(await details.getByTestId('job-safety-violation-count').textContent()).toBe(formatCount(3));
       if (jobKind === 'DISCOVERY') {
         expect(await panel.getByTestId('job-safety-violation-press-words').textContent()).toBe('保存');
-        expect(await panel.getByTestId('job-safety-violation-press-identity').textContent()).toBe(IDENTITY_DIGEST);
+        expect(await details.getByTestId('job-safety-violation-press-identity').textContent()).toBe(IDENTITY_DIGEST);
       } else {
         expect(await panel.getByTestId('job-safety-violation-press-words').count()).toBe(0);
       }
-      const rows = await panel.getByTestId('job-safety-violation-list').evaluate((table) =>
+      const rows = await details.getByTestId('job-safety-violation-list').evaluate((table) =>
         [...table.querySelectorAll('tbody tr')].map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent ?? '')));
       expect(rows).toEqual([
-        ['PASSIVE_GUARD_PAGE_NOT_READY', 'Navigation started before explicit page readiness', 'GET', TEST_ORIGIN, '/admin/staff/1/edit'],
-        ['GUARD_TASK_LIMIT_REACHED', 'requestfailed callback', text.noRequest],
+        // PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2・4）: 違反の記号と送り方は、日本語の名前で出す（記号は行の data-code に残る）。
+        [text.codeFamilies.GUARD, 'Navigation started before explicit page readiness', HTTP_METHOD_LABELS.GET, TEST_ORIGIN, '/admin/staff/1/edit'],
+        [text.codeFamilies.GUARD, 'requestfailed callback', text.noRequest],
       ]);
       // 一覧に載せなかった違反の数（数は全体）。
-      expect(await panel.getByTestId('job-safety-violation-omitted').textContent()).toBe(text.omittedText(formatCount(1)));
+      expect(await details.getByTestId('job-safety-violation-omitted').textContent()).toBe(text.omittedText(formatCount(1)));
+      // MI-F3: 期待は固定の文字でも書く（同じ関数で期待を作ると、「1件 件」の誤りを捕まえないため）。
+      expect(await details.getByTestId('job-safety-violation-omitted').textContent()).toBe('一覧に載せなかった違反が 1件あります。');
       await screenshot(page, `def144-${jobKind.toLowerCase()}-safety-violation`);
     }, SCENARIO_TIMEOUT_MS);
   }
@@ -319,6 +334,8 @@ describe('DEF-144: the content of the safety violation on the job detail', () =>
     const probeText = LOCAL_UI_EXTERNAL_SCHEME_PROBE_TEXT;
     writeFinishedJob('job-def144-external-scheme', 'DISCOVERY', 'RUN-20261017010008', null, { externalSchemeProbes: { notPressed: 2, reloadedPages: 1 } });
     const page = await openPage('/jobs/job-def144-external-scheme');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 数と記録は、たたんだ詳しい内容の中。開いてから確かめる。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const panel = page.getByTestId('job-external-scheme-probes');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await panel.getByRole('heading', { name: probeText.heading }).count()).toBe(1);
@@ -335,6 +352,8 @@ describe('DEF-144: the content of the safety violation on the job detail', () =>
     const limitText = LOCAL_UI_PRESS_LIMIT_PROBE_TEXT;
     writeFinishedJob('job-t44c-press-limit', 'DISCOVERY', 'RUN-20261021010009', null, { pressLimitProbes: { priorityNotPressed: 4 } });
     const page = await openPage('/jobs/job-t44c-press-limit');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 数と記録は、たたんだ詳しい内容の中。開いてから確かめる。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const panel = page.getByTestId('job-press-limit-probes');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await panel.getByRole('heading', { name: limitText.heading }).count()).toBe(1);

@@ -18,6 +18,8 @@
  *    - どれかの page の main frame が成功の条件（許可 Origin で、path が `successCondition.pathPrefix` の前方一致。セレクタがあれば、その要素が
  *      ある）に当たる → 成功。T34c: スクリプトで送るログインでは、加えて、Node の側で読んだ状態（許可 Origin に絞ったもの）に成功の鍵の形
  *      （`successStorageKey`）の鍵の名前があること（値は読まない）。なければ待ち続ける。成功を確かめたら、Guard の送信の窓を閉じる。
+ *    - OP-1（D3。DEF-181）: 成功の条件がない（成功の画面の path が空で、セレクタもない）ときは、上の成功の条件を見ない（空の条件はログインの画面にも当たる）。
+ *      代わりに、ログインの画面を離れた page があり、状態の名前がログインの画面を開いたときより増えたら成功（`login-end-detection.ts`）。
  *    - 名前つきの時間（`LOGIN_WAIT_TIMEOUT_MS`）を過ぎた → `LOGIN_TIMEOUT`。
  *    - ML-a（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md`）: 利用者が「ログインを終えた」を押した（`loginConfirmed`）→ 成功。
  *    ML-a: 手動のログインの段の Guard は、ページの読み取りでない送信（ログインの送信、手続きの呼び出し）を止めずに通し（読み取りは今のまま）、読み取りでない
@@ -65,6 +67,10 @@ import {
   scriptLoginCountsOf,
   waitOrAbort,
 } from './login-stage-checks.js';
+import { startLoginCredentialCapture, type CapturedLoginCredential, type LoginCredentialCapture } from './login-credential-capture.js';
+import { hasLeftLoginPage, hasNewStateNames, hasSuccessCondition, stateNameKeysOf, successPathPrefixOf } from './login-end-detection.js';
+
+export type { CapturedLoginCredential };
 import { observeLoginPageStart, observeLoginStageEnd } from './login-stage-observation.js';
 
 /** 人がログインするのを待つ時間の上限（ms。10 分。Task 25 の設計書 4.4）。過ぎたら `LOGIN_TIMEOUT`。 */
@@ -86,7 +92,8 @@ export const LOGIN_BROWSER_HEADLESS = false;
  * 作れた後なら、同じ数と一覧を持つ（ワーカーが親に渡してから終わる）。
  */
 export type LoginStageResult = LoginStageRecords & (
-  | { readonly kind: 'AUTHENTICATED'; readonly state: AuthenticatedState }
+  // OP-1（D1・D2）: 受け取りを頼んだときだけ、確かめた資格情報（`login-credential-capture.ts`。値は JSON・文字列に出ない）を持つ。IPC・記録に載せない。
+  | { readonly kind: 'AUTHENTICATED'; readonly state: AuthenticatedState; readonly capturedCredential?: CapturedLoginCredential }
   | { readonly kind: WorkerLoginFailureState }
   | { readonly kind: 'STOPPED' }
   // EL-3: ログイン用の Browser を、起動の部品が閉じた理由で断った（ワーカーの中だけ。`LOGIN_BROWSER_LAUNCH_REFUSED`）。
@@ -126,12 +133,19 @@ export interface LoginStageRequest {
   /** 止める印（`STOP`・Ctrl+C）。 */
   readonly signal: AbortSignal;
   /** ログインの画面を開いた（ワーカーが `AWAITING_LOGIN` を送る）。 */
-  readonly onAwaitingLogin: () => void;
+  /** OP-1（D3）: 引数は、BeakSight がログインの終わりを自分で判定できるか（画面は、判定できるときは「ログインを終えた」を出さない）。 */
+  readonly onAwaitingLogin: (loginEndDetection?: boolean) => void;
   /**
    * ML-a（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 2.2）: 利用者が「ログインを終えた」を押したか（親の `LOGIN_CONFIRMED` を受けたか）。
    * 真なら、成功の条件に当たらなくても成功として、今の成功の後の手順（状態の取り出しと絞り込み、空なら `UNSUPPORTED_AUTH_STATE`）に進む。省略は偽。
    */
   readonly loginConfirmed?: (() => boolean) | undefined;
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D1・D2）: 人がログインの画面で入れた ID とパスワードを受け取るか（省略は偽）。真なら、
+   * 受け取りの部品（`login-credential-capture.ts`。「欄の値は読まない」の、ログインの段だけの名前つきの例外）を使い、成功し、かつ値が観察した送り先の要求に
+   * 入っていたときだけ、結果に `capturedCredential` を付ける。
+   */
+  readonly captureCredential?: boolean | undefined;
 }
 
 /** ログインの段の依存（本番の値は入口 `audit-worker.ts` が渡す）。 */
@@ -178,6 +192,8 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
   // T44e（Task 44 の設計書 P2-8）: 成功の鍵がまだない（手動のログインのプロファイルで、入口の確かめの案のまま保存した）スクリプトで送るログインは、
   // フォームの送信と同じく成功の条件の画面だけで終える（鍵は、成功の後の自動の登録が観察から埋める）。鍵があれば今どおり状態の側も確かめる。
   const checksStoredState = loginTransportOf(setup) === SCRIPT_REQUEST_TRANSPORT && setup.successStorageKey !== null;
+  // OP-1: 値の受け取り（頼まれたときだけ。どの終わり方でも捨てる）。
+  let capture: LoginCredentialCapture | null = null;
   try {
     const ledger = new SafetyLedger();
     const { page, context: loginContext, browser: loginBrowser, monitor } = await openLoginStagePage(resources, {
@@ -196,11 +212,42 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
     // T43d: ログインの画面の鍵の名前と、要素の候補の CSS を読む（値を読まない。ページを操作しない）。
     // FM2e: ログインの 3 つの欄の検出も頼む（自動ログインの設定の画面の案。値を読まない）。
     const baseline = await observeLoginPageStart(page, setup.loginStartUrl, { detectLoginFields: true });
-    request.onAwaitingLogin();
+    // OP-1（D1・D2）: 頼まれたときだけ、人が入れる値の受け取りを始める（隔離した世界で読む。ページからは見えない）。
+    if (request.captureCredential === true) {
+      capture = await startLoginCredentialCapture(page, loginContext);
+    }
+    // OP-1（D3。DEF-181）: 成功の条件がない設定では、ログインの画面を開いたときの状態の名前（値を持たない。メモリだけ）を始めにして、ログインが済んだことを
+    // BeakSight が判定する（`login-end-detection.ts`）。空の成功の条件は、それだけでは成功にしない。
+    const configuredSuccess = hasSuccessCondition(setup);
+    const baselineStateNames = configuredSuccess
+      ? null
+      : stateNameKeysOf((await readAuthenticatedState(loginContext, approvedTestOrigins, approvedServiceOrigins).catch(() => null))?.state ?? null);
+    // OP-1（D3）: BeakSight がログインの終わりを判定できるか（成功の条件があるか、ログインの画面にパスワードの欄がちょうど 1 つ見えた）。
+    request.onAwaitingLogin(hasSuccessCondition(setup) || (baseline.loginFields?.password ?? null) !== null);
     dependencies.onLoginPageReady?.(page).catch(() => undefined);
 
     // T43d: 成功の条件に当たった page（終わりの観察に使う）。
     let successPage: Page | undefined;
+    // OP-1（D3）: 成功の条件がないときの判定。ログインの画面を離れた page があり、状態の名前が始めより増えたときだけ成功（スクリプトで送るログインで成功の鍵の
+    // 形があれば、その鍵も要る）。決まらなければ `null`。
+    const detectedLoginEnd = async (baselineNames: ReadonlySet<string>): Promise<LoginCheck> => {
+      for (const candidate of loginContext.pages()) {
+        if (!(await hasLeftLoginPage(candidate, setup, approvedTestOrigins))) {
+          continue;
+        }
+        // 読めなければ（Context が閉じかけているなど）決めない（次の確かめで、閉じたことを今の手順が見る）。
+        const stored = await readAuthenticatedState(loginContext, approvedTestOrigins, approvedServiceOrigins).catch(() => null);
+        if (stored === null || !hasNewStateNames(baselineNames, stateNameKeysOf(stored.state))) {
+          return null;
+        }
+        if (checksStoredState && (stored.state === null || !meetsSuccessStateCondition(stored.state, setup, monitor))) {
+          return null;
+        }
+        successPage = candidate;
+        return { kind: 'SUCCEEDED', state: stored.state, names: stored.names };
+      }
+      return null;
+    };
     const check = async (): Promise<LoginCheck> => {
       if (signal.aborted) {
         return { kind: 'STOPPED' };
@@ -211,7 +258,13 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
       if (loginStageAttemptsExceeded(ledger, monitor, allowedOrigins, setup)) {
         return { kind: 'LOGIN_ATTEMPTS_EXCEEDED' };
       }
-      for (const candidate of loginContext.pages()) {
+      if (baselineStateNames !== null) {
+        const detected = await detectedLoginEnd(baselineStateNames);
+        if (detected !== null) {
+          return detected;
+        }
+      }
+      for (const candidate of configuredSuccess ? loginContext.pages() : []) {
         if (await isSuccessPage(candidate, setup, approvedTestOrigins)) {
           successPage = candidate;
           if (!checksStoredState) {
@@ -249,7 +302,10 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
     // T43d: 終わりの観察（鍵の名前の差分。成功のときだけ、凍結した後の成功の画面のセレクタの案）。止めた一覧の写しを取った後に読む。
     const observedWith = async (succeeded: boolean): Promise<LoginStageRecords> => {
       const observedPage = successPage ?? (loginContext.pages().find((candidate) => !candidate.isClosed()));
-      const loginObservation = await observeLoginStageEnd(observedPage, baseline, succeeded);
+      // OP-1（D3）: 成功のときは、成功の画面の path の最初の区切りも観察に載せる（成功の条件の画面の path を観察から決める）。
+      const successPathPrefix = succeeded && successPage !== undefined ? successPathPrefixOf(successPage.url(), setup) : null;
+      const observed = await observeLoginStageEnd(observedPage, baseline, succeeded);
+      const loginObservation = successPathPrefix === null ? observed : { ...observed, successPathPrefix };
       return { ...withCounts, ...(loginObservation === undefined ? {} : { loginObservation }) };
     };
     if (outcome.kind === 'STOPPED') {
@@ -269,7 +325,16 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
     const { state } = reading;
     // T43d: 状態を取った後に、凍結して読む（凍結の後は、この Context で読み込みも要求もしない。閉じるだけ）。
     const records = { ...await observedWith(state !== null), stateNames: reading.names };
-    return state === null ? { kind: 'UNSUPPORTED_AUTH_STATE', ...records } : { kind: 'AUTHENTICATED', state, ...records };
+    if (state === null) {
+      return { kind: 'UNSUPPORTED_AUTH_STATE', ...records };
+    }
+    // OP-1（D2）: 成功し、値が観察した送り先（通した要求の行）の要求に入っていたときだけ、受け取った資格情報を付ける。
+    // OP-J（J2。設計書 4.1.6）: 登録したスクリプトの送信先（token の送信。Guard は「通した要求」の行に入れない）も、観察した送り先に入れる。
+    const scriptLoginTarget = loginTransportOf(setup) === SCRIPT_REQUEST_TRANSPORT && setup.scriptLogin !== null
+      ? { origin: setup.scriptLogin.origin, path: setup.scriptLogin.path }
+      : null;
+    const capturedCredential = capture?.settle({ passedRequests, loginPostEndpoints: setup.loginPostEndpoints, scriptLoginTarget }) ?? null;
+    return { kind: 'AUTHENTICATED', state, ...records, ...(capturedCredential === null ? {} : { capturedCredential }) };
   } catch (error) {
     // 起動・Context の作成・Guard の準備・状態の取り出しの失敗（閉じた Context を含む）。誤りの文は使わない（秘密を含みうる値を出さない）。
     // EL-3: 起動の部品が閉じた理由で断ったときは、設定の見直し（`AUTH_SETUP_REQUIRED`）ではなく、その理由で終える。
@@ -279,6 +344,7 @@ export async function runLoginStage(request: LoginStageRequest, dependencies: Lo
     }
     return signal.aborted ? { kind: 'STOPPED' } : { kind: 'AUTH_SETUP_REQUIRED' };
   } finally {
+    await capture?.discard();
     await closeLoginStage(resources);
   }
 }

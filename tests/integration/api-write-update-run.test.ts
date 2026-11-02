@@ -168,7 +168,7 @@ beforeAll(async () => {
       submitterIdentityDigest: update.candidate.identityDigest,
       api: updateApi,
       values: { name },
-      verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+      verification: { resultJudgement: null, recordId: null },
       readVerification: {
         ...base.readVerification,
         definition: { ...base.readVerification.definition, expectations: [{ kind: 'TEXT_CONTAINS', text: name }] },

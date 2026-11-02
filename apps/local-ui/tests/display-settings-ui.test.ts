@@ -28,6 +28,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, isServerFunctionUrlOf, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -84,6 +85,8 @@ const isSaveRequest = (url: URL): boolean => isServerFunctionUrlOf(ids, 'savePro
 /** FM-3: プロファイルの画面を開き、表示の設定の欄と、ジョブのブラウザのチェックを返す。 */
 const openDisplaySettings = async (): Promise<{ page: Page; panel: Locator; toggle: Locator }> => {
   const page = await openPage(`/profiles/${PROFILE_ID}`);
+  // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: この欄は、サイトの画面の詳しい内容の中。
+  await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
   const panel = page.getByTestId('profile-display-settings');
   await panel.waitFor({ timeout: UI_TIMEOUT_MS });
   return { page, panel, toggle: panel.getByRole('checkbox', { name: text.showJobBrowser }) };
@@ -135,6 +138,8 @@ afterAll(async () => {
 describe('FM-1: the display setting of the job browser and the watch-only notice', () => {
   it('shows the job browser by default, warns not to operate it on a running job, and not on an ended job', async () => {
     const profile = await openPage(`/profiles/${PROFILE_ID}`);
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: この欄は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(profile, UI_TIMEOUT_MS);
     const panel = profile.getByTestId('profile-display-settings');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await panel.getByRole('checkbox', { name: text.showJobBrowser }).isChecked()).toBe(true);
@@ -144,7 +149,8 @@ describe('FM-1: the display setting of the job browser and the watch-only notice
     await notice.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await notice.textContent()).toContain(text.watchOnly);
     const ended = await openPage(`/jobs/${ENDED_JOB_ID}`);
-    await ended.getByTestId('job-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 要点は結果の 1 行（前の表は、たたんだ詳しい内容の中）。
+    await ended.getByTestId('job-result').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await ended.getByTestId('job-browser-watch-only').count()).toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 
@@ -180,15 +186,18 @@ describe('FM-1: the display setting of the job browser and the watch-only notice
     // 保存の後も、切り替えたチェックにフォーカスが残る（キーボードで続けて操作できる）。
     expect(await toggle.evaluate((element) => element === document.activeElement)).toBe(true);
     expect(await panel.getByTestId('profile-display-settings-saving').count()).toBe(0);
-    expect(await storedSettings()).toEqual({ showJobBrowser: false, auditSendPolicy: 'READ_ONLY' });
+    // OP-I（I1）: 送信の扱いは、サイトの既定（削除のほかを通す）のまま保存される。
+    expect(await storedSettings()).toEqual({ showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
     expect(await profileRevision()).toBe(before);
     await screenshot(page, 'fm3-10-saved-on-switch');
     const again = await openPage(`/profiles/${PROFILE_ID}`);
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: この欄は、サイトの画面の詳しい内容の中。
+    await openProfileAdvancedSettings(again, UI_TIMEOUT_MS);
     const reloaded = again.getByTestId('profile-display-settings');
     await reloaded.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await reloaded.getByRole('checkbox', { name: text.showJobBrowser }).isChecked()).toBe(false);
     const running = await openPage(`/jobs/${RUNNING_JOB_ID}`);
-    await running.getByTestId('job-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    await running.getByTestId('job-result').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await running.getByTestId('job-browser-watch-only').count()).toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 

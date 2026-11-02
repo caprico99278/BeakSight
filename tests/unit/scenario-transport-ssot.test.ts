@@ -31,7 +31,8 @@ describe('T40R-fix-B: the transport values', () => {
     'src/control/approval/scenario-store.ts',
     'src/control/worker-protocol.ts',
     'src/worker/write-create-run.ts',
-    'apps/local-ui/src/components/ScenarioApiShape.tsx',
+    // PL-5 の修正の 1 回目: 送り方を表示する画面の部品は、書き込みの結果（`ScenarioApiShape.tsx` は使い先がなくなったので捨てた）。
+    'apps/local-ui/src/components/WriteResultDetails.tsx',
   ])('defines no transport value constant of its own in %s', (path) => {
     expect(sourceOf(path)).not.toMatch(TRANSPORT_LITERAL_CONSTANT);
   });

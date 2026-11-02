@@ -2,8 +2,8 @@
 // （`tests/helpers/fake-audit-worker.ts`）を本物の `fork` で起動する（本物のワーカーでの確かめは `audit-worker-auth-fork.test.ts`）。
 // - 開始の確かめ: 手動のログイン（`MANUAL_SESSION`）で、認証の設定が `CURRENT` で、開始の直前に `validateAuthSetup` を通り直すときだけ始める。
 //   設定なし（`AUTH_SETUP_MISSING`）、古い設定（`AUTH_SETUP_STALE`）、検証を通らない設定（`AUTH_SETUP_INVALID`）、自動ログイン
-//   （T26d-2: 方式としては実行できるので、設定がなければ `AUTH_SETUP_MISSING`）、書き込みの監査（`MODE_NOT_EXECUTABLE`）は、行を作らず、
-//   ワーカーを起動しない。
+//   （T26d-2: 方式としては実行できるので、設定がなければ `AUTH_SETUP_MISSING`）、書き込みのモードの監査（MI-5 から始められるので、設定がなければ
+//   `AUTH_SETUP_MISSING`。前は `MODE_NOT_EXECUTABLE`）は、行を作らず、ワーカーを起動しない。
 // - `START` に、検証した設定の文書と `approvedTestOrigins` と、その SHA-256（`workerAuthenticationDigestOf`）を入れる。
 // - `AUTH_STATE` を受けたら、ジョブの行に最後の認証の状態を記録する（`SESSION_LOST` では止まったページの URL も）。公開の監査のジョブの
 //   `AUTH_STATE`、`RUN_STARTED` の前の `SESSION_LOST` は、契約の違反（`PROTOCOL_VIOLATION`）。
@@ -219,8 +219,10 @@ describe('audit jobs (T25d): the checks right before an authenticated start', ()
     // T26d-2: 自動ログインは方式として実行できる（認証の設定がないので、ターゲット設定を読む前に拒む）。自動ログインの開始の確かめ（Windows で
     // ないときの `CREDENTIAL_PROTECTION_UNAVAILABLE` を含む）は `control-audit-jobs-auto-login.test.ts`。
     expect(await jobManager.startAuditJob(authRequest())).toEqual({ ok: false, reason: 'AUTH_SETUP_MISSING', errors: [] });
+    // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 書き込みのモードの監査も始められる（認証の設定がないので、ターゲット設定を
+    // 読む前に拒む）。
     expect(await jobManager.startAuditJob({ ...authRequest(), profileId: 'example-write-job' }))
-      .toEqual({ ok: false, reason: 'MODE_NOT_EXECUTABLE', errors: [] });
+      .toEqual({ ok: false, reason: 'AUTH_SETUP_MISSING', errors: [] });
     expect(resolverCalls).toEqual([]);
     expect(forks.count()).toBe(0);
   });

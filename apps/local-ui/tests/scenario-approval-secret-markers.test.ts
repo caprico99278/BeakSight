@@ -40,7 +40,7 @@ import { rmSync, writeFileSync } from 'node:fs';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { DEFAULT_MAX_CREATES_PER_RUN } from '../../../src/control/approval/scenario-contracts.js';
 import type { RuleSetContent } from '../../../src/control/data-rules/rule-contracts.js';
-import { saveRuleSetAndAttach } from '../../../src/control/data-rules/rule-store.js';
+import { readLatestRuleSet, saveRuleSetAndAttach } from '../../../src/control/data-rules/rule-store.js';
 import {
   issueExecutionGrant,
   readApprovalReceipts,
@@ -70,8 +70,17 @@ const AUTOMATED_SKIP_REASON = 'the automated login saves the credential with the
 
 /** 1 つの場面のジョブの数（発見だけ。シナリオの作成・承認・撤回はジョブを始めない）。 */
 const JOBS_PER_SCENE = 1;
-/** シナリオの版: 作成で 1、入力の規則の参照を付けて 1 つ上がる。 */
-const REVISION_AFTER_INPUT_RULES = FIRST_REVISION + 1;
+/**
+ * シナリオの版: 作成で 1。PL-5 の 9 の (1): 作成の保存で、BeakSight が推した入力の規則を付けて 1 つ上がる。テストだけの入力の規則（人の固定の値）を、その
+ * 規則の集まりの次の版として保存して付けると、もう 1 つ上がる。
+ */
+const REVISION_AFTER_CREATE = FIRST_REVISION + 1;
+const REVISION_AFTER_INPUT_RULES = REVISION_AFTER_CREATE + 1;
+/**
+ * MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 画面で作ったシナリオは副作用の確認がまだなので、承認のダイアログの
+ * 1 回の「承認する」で、4 項目を確かめた次の版を作り、その版を承認する（許可はその版に出る）。
+ */
+const REVISION_AFTER_APPROVAL = REVISION_AFTER_INPUT_RULES + 1;
 /** 実行の許可で予約する件数（1 回の Run の既定の上限）。 */
 const GRANT_COUNT = DEFAULT_MAX_CREATES_PER_RUN;
 /**
@@ -170,15 +179,21 @@ const flow = createScenarioMarkerFlow({
   isScreenSecretPlace: isScenarioScreenPlace,
 });
 
-/** テストだけの操作: 入力の規則を保存し（版 7 の表）、シナリオの最初の版に、その参照を付ける（2 段の手順。シナリオの版が 1 つ上がる）。 */
+/**
+ * テストだけの操作: 入力の規則を保存し（版 7 の表）、シナリオの今の版に、その参照を付ける（2 段の手順。シナリオの版が 1 つ上がる）。PL-5 の 9 の (1): 作成の
+ * 保存で付いた推した規則の集まりの、次の版として保存する。
+ */
 const attachInputRules = (scenarioId: string): void => {
   flow.withControlData((database) => {
+    const inferred = readLatestRuleSet(database, scenarioId);
+    expect(inferred).not.toBeNull();
+    expect(readScenario(database, scenarioId)?.revision).toBe(REVISION_AFTER_CREATE);
     const saved = saveRuleSetAndAttach(database, {
-      ruleSetId: inputRuleSetIdOf(scenarioId),
+      ruleSetId: inferred?.ruleSet.ruleSetId ?? inputRuleSetIdOf(scenarioId),
       scenarioId,
-      expectedRevision: null,
+      expectedRevision: inferred?.ruleSet.revision ?? null,
       content: INPUT_RULE_CONTENT,
-      expectedScenarioRevision: FIRST_REVISION,
+      expectedScenarioRevision: REVISION_AFTER_CREATE,
       at: flow.nowTimestamp(),
     });
     expect(saved.ruleSet.ok && saved.ruleSet.evaluation.executable).toBe(true);
@@ -227,7 +242,11 @@ const runScene = async (profileId: string, site: DiscoverySite, automated: boole
   await flow.approveOnScreen(profileId, scenarioId);
   const grantId = `t28f-grant-${profileId}`;
   const issued = issueGrant(scenarioId, grantId);
-  expect(issued.ok && issued.grant).toMatchObject({ scenarioRevision: REVISION_AFTER_INPUT_RULES, consumedAt: null, reservation: { state: 'RESERVED' } });
+  expect(issued.ok && issued.grant).toMatchObject({ scenarioRevision: REVISION_AFTER_APPROVAL, consumedAt: null, reservation: { state: 'RESERVED' } });
+  flow.withControlData((database) => {
+    expect(lastApprovalOf(database, scenarioId).scenarioRevision).toBe(REVISION_AFTER_APPROVAL);
+    expect(Object.values(readScenario(database, scenarioId)?.current.sideEffectConfirmations ?? {})).toEqual([true, true, true, true]);
+  });
   const approvalDigest = flow.withControlData((database) => lastApprovalOf(database, scenarioId).approvalDigest);
   await flow.revokeOnScreen(profileId, scenarioId);
 

@@ -15,6 +15,8 @@
  *   変えない。ジョブの種類は `write-kinds.ts`（`WRITE_CREATE`・`WRITE_UPDATE`）。
  * - T40d（Task 40 の設計書 3.5）: 開始の画面の値に、送り方と、承認した API の指定（API のシナリオだけ。型と名前で、値を持たない）を足した。API の
  *   登録も、form と同じ確かめ（許可、上限、予約、検証の指定）と同じ開始の口（`startWriteCreateFn`）で始める。
+ * - OP-2 の修正の 1 回目（判断 5。設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6）: 本番からの切り離しは出さない。前の PL-S の「隔離が
+ *   未確認の形か」の値は捨てた。実行の許可の判定（参照が空でないか）は変えない（2026-10-21 のユーザーの判断）。
  * - 実行の許可の発行を参照する画面のコードは、このファイルだけ（Gate `approval-ssot` の (e)）。
  * - 返す値に、資格情報・Cookie・CSRF のトークン・hidden の値は入らない（シナリオの契約と管理データにない）。日時は ISO 8601。
  */
@@ -51,6 +53,7 @@ import { readLatestRuleSet, readVerificationVaryingRejectionOf } from '../../../
 import { concretePathOfTemplate } from '../../../../src/control/discovery-view.js';
 import { isProfileOperationAllowed } from '../../../../src/control/execution-policy.js';
 import { ACTIVE_AUDIT_JOB_STATES, type AuditJobStartRejectionReason } from '../../../../src/control/job/job-records.js';
+import { readReadCheck } from '../../../../src/control/job/read-check-store.js';
 import { getProfile, type StoredProfile } from '../../../../src/control/store/profile-store.js';
 import { MINUTE_MS } from '../../../../src/core/time-units.js';
 import { shownInvalidityReasonsOf } from '../display/scenarios';
@@ -149,6 +152,8 @@ export interface WriteStartPageView {
     /** T40d: 送り方（`scenarioTransportOf`）と、承認した API の指定（API のシナリオだけ。値を持たない型と名前。FORM は null）。 */
     readonly transport: ScenarioTransport;
     readonly api: ScenarioApiSpec | null;
+    /** PL-5（設計書 7 章）: 操作を見つけた画面のアドレスの後ろ（何を・どこへ・何件の文の「どこへ」。書き込みの OK のダイアログと同じ値）。 */
+    readonly pagePath: string;
   };
   /** 累積の使った件数（発行の判定と同じ数え方）と残り。 */
   readonly used: number;
@@ -209,6 +214,12 @@ export type WriteChainStartRejectionReason = (typeof WRITE_CHAIN_START_REJECTION
 // ---------------------------------------------------------------------------------------------------------------
 // 値の組み立て
 // ---------------------------------------------------------------------------------------------------------------
+
+/** OP-REV6 の I-1: 照合の READ の定義の画面の path（定義がない・画面の path の定義でなければ null。同じプロファイルの定義だけ）。 */
+const readTargetPagePathOf = (profileId: string, readCheckId: string | undefined): string | null => {
+  const readCheck = readCheckId === undefined ? null : readReadCheck(localUiStore(), readCheckId);
+  return readCheck === null || readCheck.profileId !== profileId ? null : readCheck.definition.targetPagePath ?? null;
+};
 
 /** 登録・更新のシナリオの種類（T31h-2。CC-106: 種類の一覧の owner の名前つきの定数）。 */
 const CREATE_KIND = CREATE_SCENARIO_KIND;
@@ -300,6 +311,7 @@ interface StartFacts {
   readonly startableExceptTarget: boolean;
 }
 
+
 /** 開始の画面の値（T41g の `chain` を除く）。 */
 const startFactsOf = async (scenario: ScenarioView, stored: StoredProfile): Promise<StartFacts> => {
   const now = new Date();
@@ -325,7 +337,8 @@ const startFactsOf = async (scenario: ScenarioView, stored: StoredProfile): Prom
   const latestRules = readLatestRuleSet(localUiStore(), scenario.scenarioId);
   const readVerificationVaryingRejection = latestRules === null
     ? null
-    : readVerificationVaryingRejectionOf(latestRules.ruleSet, current, scenario.evidence);
+    // OP-REV6 の I-1: 一覧の画面の照合の READ は、実行のたびに違う値になる欄で判定する（許可の発行と同じ部品に、定義の画面の path を渡す）。
+    : readVerificationVaryingRejectionOf(latestRules.ruleSet, current, scenario.evidence, readTargetPagePathOf(profile.profileId, current.verification.readVerification?.readCheckId));
   // T41g: 書き込む相手（更新の予定のレコード）のほかの確かめ（「登録してから更新する」は、相手のない更新もこの確かめで始められるかを見る）。
   const startableExceptTarget = eligible && approved === true && missingVerification.length === 0 && notificationConfirmed
     && evidencePresent && schedule.nextWriteAllowedAt === null && remaining > 0 && startBlocker === null
@@ -344,6 +357,7 @@ const startFactsOf = async (scenario: ScenarioView, stored: StoredProfile): Prom
       limits: { ...current.limits },
       transport: scenarioTransportOf(current),
       api: current.api === undefined ? null : structuredClone(current.api) as ScenarioApiSpec,
+      pagePath: scenario.evidence.page.path,
     },
     used,
     remaining,

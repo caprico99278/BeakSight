@@ -8,6 +8,10 @@
  *   使った欄（推測の印。画面のサーバが求めた `defaultRange`）を一覧にする。編集していない規則は、保存した規則のまま送る（出どころの印と基準日からの
  *   幅と桁の数を残す）。編集した規則は人の規則として送る（意味の種類を変えていなければ、基準日からの幅（範囲を入れていないとき）と桁の数は残す）。
  *   一意にする欄の組は、変えていなければ出どころの印を残す。テンプレートの既定を保存した印は、そのまま送る。
+ * - MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6 の C）: 推せた欄（判定の問題がない欄）と、欄どうしの関係・一意にする欄の組は、
+ *   たたんだ「詳しい設定」（`AdvancedSettings`）に置く。見えるのは、推せなかった欄（利用者が決める欄）だけ。推せなかった欄がなければ、「すべての欄を
+ *   BeakSight が作れます」を出し、保存の押下だけにする。副作用の確認を承認のときに確かめる前提で作れる欄にしたメール・電話の欄には、その印を出す
+ *   （判定と印は、判定の owner `field-evaluation.ts` の値を、画面のサーバが返したもの）。
  */
 import { useState } from 'react';
 import type {
@@ -46,6 +50,7 @@ import {
   toneClass,
 } from '../display/labels';
 import type { DataRuleFieldView, DataRulePageView, DataRuleSaveView } from '../server/data-rule-functions';
+import { AdvancedSettings } from './AdvancedSettings';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FieldFrame } from './FieldFrame';
 import { Notice } from './Notice';
@@ -216,6 +221,110 @@ export function DataRuleForm({ page, onSave, onSaved, onReload }: Readonly<{
     setRelations([...relations, relation]);
   };
 
+  /** 欄 1 つの行（判定の結果と、人の規則の編集）。 */
+  const fieldRow = (field: DataRuleFieldView) => {
+    const draft = drafts[field.fieldName] ?? draftOf(null);
+    const source = field.source === null ? null : ruleSourceDisplay(field.source);
+    const origin = field.humanRule === null ? null : ruleOriginDisplay(field.humanRule.origin ?? UNMARKED_ORIGIN);
+    const window = field.humanRule?.baseDateWindow ?? null;
+    return (
+      <div key={field.fieldName} className="field" data-testid="data-rule-field" data-field-name={field.fieldName} data-selected={String(field.selected)}
+        data-source={field.source ?? ''}>
+        <p>
+          <code>{field.fieldName}</code>
+          {' '}
+          <span className="field-hint">
+            {listText([
+              field.type ?? LOCAL_UI_DISCOVERY_TEXT.noFlags,
+              candidateFieldConstraintsText(field),
+            ])}
+          </span>
+        </p>
+        <FieldStatus field={field} />
+        {/* MI-6: 承認のときに外部への通知がないことを確認する前提で作れる欄にした、メール・電話の欄の印。 */}
+        {field.confirmationAtApproval ? <p className="field-hint" data-testid="data-rule-confirmation-at-approval">{text.confirmationAtApproval}</p> : null}
+        <p className="field-hint">
+          {`${text.columns.source}: `}
+          {source === null ? text.noSource : <span className={toneClass(source.tone)} data-testid="data-rule-source">{source.label}</span>}
+          {field.rule === null ? null : (
+            <span data-testid="data-rule-applied" data-kind={field.rule.semanticKind}>
+              {` / ${text.columns.rule}: ${listText([semanticKindDisplay(field.rule.semanticKind).label, generationMethodDisplay(field.rule.method).label])}`}
+            </span>
+          )}
+        </p>
+        {origin === null || field.humanRule === null ? null : (
+          <p className="field-hint" data-testid="data-rule-origin" data-origin={field.humanRule.origin ?? UNMARKED_ORIGIN}
+            data-default-range={String(field.defaultRange)}>
+            {`${inferenceText.originLabel}: `}
+            <span className={toneClass(origin.tone)}>{origin.label}</span>
+            {field.defaultRange ? ` / ${inferenceText.defaultRangeBadge}` : null}
+            {window === null
+              ? null
+              : ` / ${inferenceText.baseDateWindowLabel}: ${inferenceText.baseDateWindowText(formatInteger(window.fromDays), formatInteger(window.toDays))}`}
+          </p>
+        )}
+        <p className="field-hint" data-testid="data-rule-external">
+          {`${text.columns.external}: `}
+          {field.externalDeliveryKinds.length === 0 ? text.noExternal : listText(field.externalDeliveryKinds.map((kind) => externalDeliveryKindDisplay(kind).label))}
+        </p>
+        {!field.selected ? <p className="field-hint">{text.notSelected}</p> : (
+          <div className="form-grid">
+            <FieldFrame label={text.kindLabel} errors={[]}>
+              {({ id, describedBy }) => (
+                <select id={id} className="input" name={`kind-${field.fieldName}`} data-kind-for={field.fieldName} value={draft.kind}
+                  aria-describedby={describedBy} disabled={!page.editable}
+                  onChange={(event) => setDraft(field.fieldName, { kind: event.target.value as FieldDraft['kind'] })}>
+                  <option value={AUTO_KIND}>{text.autoKind}</option>
+                  {field.allowedKinds.map((kind) => <option key={kind} value={kind}>{semanticKindDisplay(kind).label}</option>)}
+                </select>
+              )}
+            </FieldFrame>
+            {draft.kind === AUTO_KIND ? null : (
+              <>
+                <FieldFrame label={text.methodLabel} errors={[]}>
+                  {({ id, describedBy }) => (
+                    <select id={id} className="input" name={`method-${field.fieldName}`} data-method-for={field.fieldName} value={draft.method}
+                      aria-describedby={describedBy} disabled={!page.editable}
+                      onChange={(event) => setDraft(field.fieldName, { method: event.target.value as GenerationMethod })}>
+                      {page.choices.generationMethods.map((method) => (
+                        <option key={method} value={method}>{generationMethodDisplay(method).label}</option>
+                      ))}
+                    </select>
+                  )}
+                </FieldFrame>
+                {draft.method !== FIXED_METHOD ? null : (
+                  <FieldFrame label={text.fixedValuesLabel}
+                    hint={text.fixedValuesHint(formatCount(page.choices.maxFixedValues), formatInteger(page.choices.maxFixedValueLength))} errors={[]}>
+                    {({ id, describedBy }) => (
+                      <textarea id={id} className="input" name={`fixed-${field.fieldName}`} data-fixed-for={field.fieldName} value={draft.fixed}
+                        aria-describedby={describedBy} disabled={!page.editable}
+                        onChange={(event) => setDraft(field.fieldName, { fixed: event.target.value })} />
+                    )}
+                  </FieldFrame>
+                )}
+                <fieldset className="field-group">
+                  <legend className="field-group-heading">{text.rangeLabel}</legend>
+                  {([['min', text.rangeMin], ['max', text.rangeMax], ['step', text.rangeStep]] as const).map(([key, label]) => (
+                    <FieldFrame key={key} label={label} errors={[]}>
+                      {({ id, describedBy }) => (
+                        <input id={id} className="input" name={`${key}-${field.fieldName}`} data-range-for={`${field.fieldName}:${key}`} value={draft[key]}
+                          aria-describedby={describedBy} disabled={!page.editable}
+                          onChange={(event) => setDraft(field.fieldName, { [key]: event.target.value })} />
+                      )}
+                    </FieldFrame>
+                  ))}
+                </fieldset>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+  // MI-6: 推せなかった欄（判定の問題がある欄）だけを見せ、推せた欄はたたむ。
+  const undecidedFields = page.fields.filter((field) => field.problem !== null);
+  const decidedFields = page.fields.filter((field) => field.problem === null);
+
   return (
     <form
       className="form-grid"
@@ -262,178 +371,95 @@ export function DataRuleForm({ page, onSave, onSaved, onReload }: Readonly<{
             </div>
           </Notice>
         )}
-        {page.fields.length === 0 ? <p>{text.noFields}</p> : page.fields.map((field) => {
-          const draft = drafts[field.fieldName] ?? draftOf(null);
-          const source = field.source === null ? null : ruleSourceDisplay(field.source);
-          const origin = field.humanRule === null ? null : ruleOriginDisplay(field.humanRule.origin ?? UNMARKED_ORIGIN);
-          const window = field.humanRule?.baseDateWindow ?? null;
-          return (
-            <div key={field.fieldName} className="field" data-testid="data-rule-field" data-field-name={field.fieldName} data-selected={String(field.selected)}
-              data-source={field.source ?? ''}>
-              <p>
-                <code>{field.fieldName}</code>
-                {' '}
-                <span className="field-hint">
-                  {listText([
-                    field.type ?? LOCAL_UI_DISCOVERY_TEXT.noFlags,
-                    candidateFieldConstraintsText(field),
-                  ])}
-                </span>
-              </p>
-              <FieldStatus field={field} />
-              <p className="field-hint">
-                {`${text.columns.source}: `}
-                {source === null ? text.noSource : <span className={toneClass(source.tone)} data-testid="data-rule-source">{source.label}</span>}
-                {field.rule === null ? null : (
-                  <span data-testid="data-rule-applied" data-kind={field.rule.semanticKind}>
-                    {` / ${text.columns.rule}: ${listText([semanticKindDisplay(field.rule.semanticKind).label, generationMethodDisplay(field.rule.method).label])}`}
-                  </span>
-                )}
-              </p>
-              {origin === null || field.humanRule === null ? null : (
-                <p className="field-hint" data-testid="data-rule-origin" data-origin={field.humanRule.origin ?? UNMARKED_ORIGIN}
-                  data-default-range={String(field.defaultRange)}>
-                  {`${inferenceText.originLabel}: `}
-                  <span className={toneClass(origin.tone)}>{origin.label}</span>
-                  {field.defaultRange ? ` / ${inferenceText.defaultRangeBadge}` : null}
-                  {window === null
-                    ? null
-                    : ` / ${inferenceText.baseDateWindowLabel}: ${inferenceText.baseDateWindowText(formatInteger(window.fromDays), formatInteger(window.toDays))}`}
-                </p>
-              )}
-              <p className="field-hint" data-testid="data-rule-external">
-                {`${text.columns.external}: `}
-                {field.externalDeliveryKinds.length === 0 ? text.noExternal : listText(field.externalDeliveryKinds.map((kind) => externalDeliveryKindDisplay(kind).label))}
-              </p>
-              {!field.selected ? <p className="field-hint">{text.notSelected}</p> : (
-                <div className="form-grid">
-                  <FieldFrame label={text.kindLabel} errors={[]}>
-                    {({ id, describedBy }) => (
-                      <select id={id} className="input" name={`kind-${field.fieldName}`} data-kind-for={field.fieldName} value={draft.kind}
-                        aria-describedby={describedBy} disabled={!page.editable}
-                        onChange={(event) => setDraft(field.fieldName, { kind: event.target.value as FieldDraft['kind'] })}>
-                        <option value={AUTO_KIND}>{text.autoKind}</option>
-                        {field.allowedKinds.map((kind) => <option key={kind} value={kind}>{semanticKindDisplay(kind).label}</option>)}
-                      </select>
-                    )}
-                  </FieldFrame>
-                  {draft.kind === AUTO_KIND ? null : (
-                    <>
-                      <FieldFrame label={text.methodLabel} errors={[]}>
-                        {({ id, describedBy }) => (
-                          <select id={id} className="input" name={`method-${field.fieldName}`} data-method-for={field.fieldName} value={draft.method}
-                            aria-describedby={describedBy} disabled={!page.editable}
-                            onChange={(event) => setDraft(field.fieldName, { method: event.target.value as GenerationMethod })}>
-                            {page.choices.generationMethods.map((method) => (
-                              <option key={method} value={method}>{generationMethodDisplay(method).label}</option>
-                            ))}
-                          </select>
-                        )}
-                      </FieldFrame>
-                      {draft.method !== FIXED_METHOD ? null : (
-                        <FieldFrame label={text.fixedValuesLabel}
-                          hint={text.fixedValuesHint(formatCount(page.choices.maxFixedValues), formatInteger(page.choices.maxFixedValueLength))} errors={[]}>
-                          {({ id, describedBy }) => (
-                            <textarea id={id} className="input" name={`fixed-${field.fieldName}`} data-fixed-for={field.fieldName} value={draft.fixed}
-                              aria-describedby={describedBy} disabled={!page.editable}
-                              onChange={(event) => setDraft(field.fieldName, { fixed: event.target.value })} />
-                          )}
-                        </FieldFrame>
-                      )}
-                      <fieldset className="field-group">
-                        <legend className="field-group-heading">{text.rangeLabel}</legend>
-                        {([['min', text.rangeMin], ['max', text.rangeMax], ['step', text.rangeStep]] as const).map(([key, label]) => (
-                          <FieldFrame key={key} label={label} errors={[]}>
-                            {({ id, describedBy }) => (
-                              <input id={id} className="input" name={`${key}-${field.fieldName}`} data-range-for={`${field.fieldName}:${key}`} value={draft[key]}
-                                aria-describedby={describedBy} disabled={!page.editable}
-                                onChange={(event) => setDraft(field.fieldName, { [key]: event.target.value })} />
-                            )}
-                          </FieldFrame>
-                        ))}
-                      </fieldset>
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {page.fields.length === 0 ? <p>{text.noFields}</p> : undecidedFields.length === 0
+          ? <p data-testid="data-rule-all-decided">{text.allDecided}</p>
+          : (
+            <>
+              <p className="field-hint">{text.undecidedNote}</p>
+              {undecidedFields.map(fieldRow)}
+            </>
+          )}
       </fieldset>
 
-      <fieldset className="field-group" data-testid="data-rule-relations">
-        <legend className="field-group-heading">{text.relationsHeading}</legend>
-        <p className="field-hint">{text.relationsNote}</p>
-        {relations.length === 0 ? <p>{text.noRelations}</p> : (
-          <ul>
-            {relations.map((relation, index) => (
-              <li key={`${relation.kind}:${String(index)}`} data-testid="data-rule-relation" data-kind={relation.kind}
-                data-origin={relation.origin ?? UNMARKED_ORIGIN}>
-                {relationTextOf(relation, rolesOf(relation.kind))}
-                {` / ${inferenceText.originLabel}: ${ruleOriginDisplay(relation.origin ?? UNMARKED_ORIGIN).label}`}
-                {' '}
-                {page.editable ? (
-                  <button type="button" className="button" onClick={() => setRelations(relations.filter((_relation, other) => other !== index))}>
-                    {text.removeRelation}
-                  </button>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        )}
-        {!page.editable || fieldNames.length === 0 ? null : (
-          <div className="form-grid">
-            <FieldFrame label={text.relationKindLabel} errors={[]}>
-              {({ id, describedBy }) => (
-                <select id={id} className="input" name="relation-kind" value={newKind} aria-describedby={describedBy}
-                  onChange={(event) => setNewKind(event.target.value as FieldRelationKind)}>
-                  {page.choices.relationKinds.map((kind) => <option key={kind} value={kind}>{fieldRelationKindDisplay(kind).label}</option>)}
-                </select>
-              )}
-            </FieldFrame>
-            {rolesOf(newKind).map((role) => (
-              <FieldFrame key={role} label={text.relationRoles[role as keyof typeof text.relationRoles]} errors={[]}>
+      {/* MI-6: 推せた欄と、欄どうしの関係・一意にする欄の組は、たたんだ詳しい設定に置く（保存を拒まれたら開く）。 */}
+      <AdvancedSettings testId="data-rule-advanced-settings" openRequested={rejection !== null}>
+        <p className="field-hint" data-testid="data-rule-decided-note">{text.decidedNote(formatCount(decidedFields.length))}</p>
+        {decidedFields.map(fieldRow)}
+
+        <fieldset className="field-group" data-testid="data-rule-relations">
+          <legend className="field-group-heading">{text.relationsHeading}</legend>
+          <p className="field-hint">{text.relationsNote}</p>
+          {relations.length === 0 ? <p>{text.noRelations}</p> : (
+            <ul>
+              {relations.map((relation, index) => (
+                <li key={`${relation.kind}:${String(index)}`} data-testid="data-rule-relation" data-kind={relation.kind}
+                  data-origin={relation.origin ?? UNMARKED_ORIGIN}>
+                  {relationTextOf(relation, rolesOf(relation.kind))}
+                  {` / ${inferenceText.originLabel}: ${ruleOriginDisplay(relation.origin ?? UNMARKED_ORIGIN).label}`}
+                  {' '}
+                  {page.editable ? (
+                    <button type="button" className="button" onClick={() => setRelations(relations.filter((_relation, other) => other !== index))}>
+                      {text.removeRelation}
+                    </button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+          {!page.editable || fieldNames.length === 0 ? null : (
+            <div className="form-grid">
+              <FieldFrame label={text.relationKindLabel} errors={[]}>
                 {({ id, describedBy }) => (
-                  <select id={id} className="input" name={`relation-${role}`} data-role={role} value={newRoles[role] ?? fieldNames[0] ?? ''}
-                    aria-describedby={describedBy} onChange={(event) => setNewRoles({ ...newRoles, [role]: event.target.value })}>
-                    {fieldNames.map((name) => <option key={name} value={name}>{name}</option>)}
+                  <select id={id} className="input" name="relation-kind" value={newKind} aria-describedby={describedBy}
+                    onChange={(event) => setNewKind(event.target.value as FieldRelationKind)}>
+                    {page.choices.relationKinds.map((kind) => <option key={kind} value={kind}>{fieldRelationKindDisplay(kind).label}</option>)}
                   </select>
                 )}
               </FieldFrame>
-            ))}
-            <div className="button-row">
-              <button type="button" className="button" data-testid="data-rule-add-relation" onClick={addRelation}>{text.addRelation}</button>
+              {rolesOf(newKind).map((role) => (
+                <FieldFrame key={role} label={text.relationRoles[role as keyof typeof text.relationRoles]} errors={[]}>
+                  {({ id, describedBy }) => (
+                    <select id={id} className="input" name={`relation-${role}`} data-role={role} value={newRoles[role] ?? fieldNames[0] ?? ''}
+                      aria-describedby={describedBy} onChange={(event) => setNewRoles({ ...newRoles, [role]: event.target.value })}>
+                      {fieldNames.map((name) => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  )}
+                </FieldFrame>
+              ))}
+              <div className="button-row">
+                <button type="button" className="button" data-testid="data-rule-add-relation" onClick={addRelation}>{text.addRelation}</button>
+              </div>
             </div>
-          </div>
-        )}
-        <p data-testid="data-rule-effective-relations">
-          {`${text.effectiveRelationsLabel}: `}
-          {page.relations.length === 0 ? text.noEffectiveRelations : listText(page.relations.map((relation) => relationTextOf(relation, rolesOf(relation.kind))))}
-        </p>
-      </fieldset>
-
-      <fieldset className="field-group" data-testid="data-rule-unique">
-        <legend className="field-group-heading">{text.uniqueHeading}</legend>
-        <p className="field-hint">{text.uniqueNote}</p>
-        {page.content.uniqueKeyFieldNames.length === 0 ? null : (
-          <p className="field-hint" data-testid="data-rule-unique-origin" data-origin={page.content.uniqueKeyOrigin ?? UNMARKED_ORIGIN}>
-            {`${inferenceText.originLabel}: ${ruleOriginDisplay(page.content.uniqueKeyOrigin ?? UNMARKED_ORIGIN).label}`}
+          )}
+          <p data-testid="data-rule-effective-relations">
+            {`${text.effectiveRelationsLabel}: `}
+            {page.relations.length === 0 ? text.noEffectiveRelations : listText(page.relations.map((relation) => relationTextOf(relation, rolesOf(relation.kind))))}
           </p>
-        )}
-        {fieldNames.map((name) => (
-          <div key={name} className="field">
-            <label className="choice">
-              <input type="checkbox" name={`unique-${name}`} data-unique={name} checked={unique.includes(name)} disabled={!page.editable}
-                onChange={(event) => setUnique(event.target.checked ? [...unique.filter((other) => other !== name), name] : unique.filter((other) => other !== name))} />
-              <span><code>{name}</code></span>
-            </label>
-          </div>
-        ))}
-        <p data-testid="data-rule-effective-unique">
-          {`${text.effectiveUniqueLabel}: `}
-          {page.uniqueKeyFieldNames.length === 0 ? text.noUnique : listText(page.uniqueKeyFieldNames)}
-        </p>
-      </fieldset>
+        </fieldset>
+
+        <fieldset className="field-group" data-testid="data-rule-unique">
+          <legend className="field-group-heading">{text.uniqueHeading}</legend>
+          <p className="field-hint">{text.uniqueNote}</p>
+          {page.content.uniqueKeyFieldNames.length === 0 ? null : (
+            <p className="field-hint" data-testid="data-rule-unique-origin" data-origin={page.content.uniqueKeyOrigin ?? UNMARKED_ORIGIN}>
+              {`${inferenceText.originLabel}: ${ruleOriginDisplay(page.content.uniqueKeyOrigin ?? UNMARKED_ORIGIN).label}`}
+            </p>
+          )}
+          {fieldNames.map((name) => (
+            <div key={name} className="field">
+              <label className="choice">
+                <input type="checkbox" name={`unique-${name}`} data-unique={name} checked={unique.includes(name)} disabled={!page.editable}
+                  onChange={(event) => setUnique(event.target.checked ? [...unique.filter((other) => other !== name), name] : unique.filter((other) => other !== name))} />
+                <span><code>{name}</code></span>
+              </label>
+            </div>
+          ))}
+          <p data-testid="data-rule-effective-unique">
+            {`${text.effectiveUniqueLabel}: `}
+            {page.uniqueKeyFieldNames.length === 0 ? text.noUnique : listText(page.uniqueKeyFieldNames)}
+          </p>
+        </fieldset>
+      </AdvancedSettings>
 
       {page.editable ? (
         <div className="button-row">
@@ -446,6 +472,7 @@ export function DataRuleForm({ page, onSave, onSaved, onReload }: Readonly<{
         body={text.saveDialog.body}
         confirmLabel={text.saveDialog.confirm}
         cancelLabel={text.saveDialog.cancel}
+        confirmTone="primary"
         busy={saving}
         onCancel={() => setDialog(false)}
         onConfirm={save}

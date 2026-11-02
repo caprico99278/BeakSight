@@ -31,7 +31,9 @@ import { createHash } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
 import type { WriteReportCheck } from '../../../../src/control/job/job-records.js';
-import type { AuditJobView } from '../../../../src/control/job/job-store.js';
+import { readAllJobs, type AuditJobView } from '../../../../src/control/job/job-store.js';
+import { FINISHED_AUDIT_JOB_STATE, WORKER_AUDIT_JOB_KIND } from '../../../../src/core/audit-job-values.js';
+import { readAuditStageLinks } from '../../../../src/core/audit-stage-links.js';
 import { getProfile } from '../../../../src/control/store/profile-store.js';
 import { WORKER_JOB_ID_PATTERN } from '../../../../src/control/worker-protocol.js';
 import {
@@ -43,6 +45,7 @@ import {
   ENTRY_CHECK_ARTIFACT_FILE_NAME,
   PAGES_ARTIFACT_DIRECTORY,
   READ_EVIDENCE_ARTIFACT_FILE_NAME,
+  REPORT_SUMMARY_ARTIFACT_FILE_NAME,
   RUN_ARTIFACT_FILE_NAMES,
   SCREENSHOT_FILE_NAMES,
   actionBundleFileName,
@@ -72,7 +75,7 @@ import { loadTargetContext } from './target-config';
  * 成果物の 1 つのファイルを読む大きさの上限（バイト）。値は、リンクをたどらない読み取りの部品の既定の上限（ChatGPT 用バンドルの ZIP を
  * 十分に超える値）と同じにする（同じ意味の値を 2 つ持たない）。`audit.json` を読んで参照を集めるときも、この上限で読む。
  */
-export const ARTIFACT_FILE_MAX_BYTES = DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES;
+const ARTIFACT_FILE_MAX_BYTES = DEFAULT_CONTAINED_ARTIFACT_FILE_MAX_BYTES;
 
 /** 成果物の応答の状態。 */
 const ARTIFACT_STATUS = Object.freeze({ OK: 200, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405 } as const);
@@ -207,6 +210,25 @@ const runDirectoryOf = async (job: AuditJobView): Promise<string | null> => {
   return artifactFilePath(resolve(localUiRepositoryRoot(), context.targetConfig.output.directory), job.runDirectory);
 };
 
+/**
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: プロファイルの、`notAfter`（UTC の 14 桁。null は問わない）までに作った最後の終わった
+ * 点検（監査）のジョブの成果物の、点検の段が見つけたリンクの URL（見つけた順。読み方は J1 と同じ共通の部品 `readAuditStageLinks`）。ジョブがない・読めなければ空。
+ * 自動の下書きが、登録の画面の 1 つ上の一覧の画面を、点検の段のリンクから選ぶために使う。
+ */
+export const readLatestAuditStageLinkUrls = createServerOnlyFn(async (profileId: string, notAfter: string | null): Promise<readonly string[]> => {
+  const job = readAllJobs(localUiStore()).find((candidate) => candidate.profileId === profileId && candidate.jobKind === WORKER_AUDIT_JOB_KIND
+    && candidate.state === FINISHED_AUDIT_JOB_STATE && candidate.runDirectory !== null && (notAfter === null || candidate.createdAt <= notAfter));
+  if (job === undefined) {
+    return [];
+  }
+  try {
+    const runDirectory = await runDirectoryOf(job);
+    return runDirectory === null ? [] : (await readAuditStageLinks(runDirectory)).map(({ url }) => url);
+  } catch {
+    return [];
+  }
+});
+
 /** 相対パスが、リンクでないファイルとしてあるか（調べられないときは、ないとみなす）。 */
 const isRealFile = async (runDirectory: string, relativePath: string): Promise<boolean> => {
   try {
@@ -257,12 +279,18 @@ const JOB_RESULT_DOCUMENTS = Object.freeze({
   // AS-b: 監査の Run の `run.json`（ジョブの詳細が、監査の段の送信の扱いと通した数を読む）。ジョブの ID を持たないので、Run の ID がこのジョブの Run の ID で
   // あることを確かめる（`isDocumentOfJob`）。
   run: { fileName: RUN_ARTIFACT_FILE_NAMES.run, schema: 'run' },
+  // PL-R（plain UI の設計書 14 章、13 章の 13）: 監査の報告の小さなまとめ（作業の画面の要点が、問題の数を読む。`audit.json` は読まない）。`run.json` と同じく、
+  // Run の ID で確かめる。配らない（許可の一覧には入れない）。
+  'report-summary': { fileName: REPORT_SUMMARY_ARTIFACT_FILE_NAME, schema: 'report-summary' },
 } as const satisfies Record<string, { readonly fileName: string; readonly schema: ArtifactSchemaName }>);
 export type JobResultDocumentKind = keyof typeof JOB_RESULT_DOCUMENTS;
 
-/** 文書がこのジョブのものか（`run.json` は Run の ID、ほかはジョブの ID で確かめる）。 */
+/** ジョブの ID を持たず、Run の ID で確かめる文書（`run.json` と、PL-R の報告の小さなまとめ）。 */
+const RUN_ID_CHECKED_DOCUMENTS: ReadonlySet<JobResultDocumentKind> = new Set(['run', 'report-summary']);
+
+/** 文書がこのジョブのものか（`run.json` と報告の小さなまとめは Run の ID、ほかはジョブの ID で確かめる）。 */
 const isDocumentOfJob = (job: AuditJobView, kind: JobResultDocumentKind, value: Readonly<Record<string, unknown>>): boolean =>
-  kind === 'run' ? job.runId !== null && value['runId'] === job.runId : value['jobId'] === job.jobId;
+  RUN_ID_CHECKED_DOCUMENTS.has(kind) ? job.runId !== null && value['runId'] === job.runId : value['jobId'] === job.jobId;
 
 /** T32g: 配る前にスキーマとジョブの ID を確かめ直す、書き込みの報告の JSON（Run のディレクトリからの相対パス → 文書の種類）。 */
 const CHECKED_WRITE_REPORT_DOCUMENTS: ReadonlyMap<string, JobResultDocumentKind> = new Map([

@@ -70,7 +70,9 @@ import {
 } from './secret-markers.ts';
 import { callServerFunction, readServerFunctionIds, type ServerFunctionCall } from './server-functions.ts';
 import { waitForJobViaServerFunctions } from './server-function-job-wait.ts';
+import { createProfileInStore, saveAuthSetupRequestInStore } from './profile-store-setup.ts';
 import { createUiPageKit } from './ui-page.ts';
+import { SCENARIO_ADVANCED_SETTINGS, SCENARIO_DETAIL_ADVANCED_SETTINGS, openAdvancedSettings } from './advanced-settings.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 export const UI_TIMEOUT_MS = 20_000;
@@ -118,10 +120,6 @@ const writeText = LOCAL_UI_WRITE_TEXT;
  * 画面の構造のセレクタだけ（値ではない）。照合の READ は、照会の定義の送る値 `id` を送る欄に結び付ける。
  */
 const VERIFICATION_VALUES = Object.freeze({
-  successPathPrefix: DISCOVERY_SITE_PATHS.admin,
-  successSelector: '#t-created',
-  inputErrorPathPrefix: DISCOVERY_SITE_PATHS.create,
-  inputErrorSelector: '#t-input-error',
   recordIdPathPattern: `${DISCOVERY_SITE_PATHS.admin}/items/{id}`,
   lookupParameter: 'id',
 });
@@ -396,7 +394,7 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     await row.getByLabel(readText.expectationValue, { exact: true }).fill(DETAIL_VALUE);
     await page.getByTestId('read-check-save').click();
     await page.waitForURL(new RegExp(`/read-checks/${profileId}\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    await page.getByTestId('read-check-definition').first().waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.getByTestId('read-check-definition').first().waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     await snapshot(page);
     const all = await page.getByTestId('read-check-definition').evaluateAll((rows) => rows.map((element) => element.getAttribute('data-read-check-id') ?? ''));
     expect(all).toHaveLength(1);
@@ -404,31 +402,30 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
   };
 
   /**
-   * 候補の画面の登録（CREATE）の候補から「シナリオを作る」で作成の画面へ移り、送る欄と照らす READ と副作用の確認（すべての項目）を選んで保存する
-   * （上限と期限は既定のまま）。T30g: 検証の指定（成功と入力の誤りの条件、登録の ID の取り方、照合の READ）も画面で入れる。候補の digest と
+   * 候補の画面の登録（CREATE）の候補から「シナリオを作る」で作成の画面へ移り、送る欄と照らす READ を選んで保存する（上限と期限は既定のまま。
+   * MI-6: 副作用の確認のチェックは画面にない。承認のダイアログの 1 回で確かめる）。T30g: 検証の指定（成功と入力の誤りの条件、登録の ID の取り方、照合の READ）も画面で入れる。候補の digest と
    * シナリオの ID を返す。
    */
   const createScenarioOnScreen = async (profileId: string, readCheckId: string): Promise<{ readonly candidateDigest: string; readonly scenarioId: string }> => {
-    const page = await openPage(`/discovery/${profileId}`);
-    const candidate = page.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.create, 'CREATE')).first();
+    // PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 6）: 操作さがしの画面の候補ごとの「書き込みの手順を作る」のリンクはなくした（下書きは
+    // 「書き込みの手順を作る」の 1 つ）。手で作る作成の画面は、候補の digest の URL で開く（候補の digest は詳しい内容の中の候補の行の印）。
+    const discovery = await openPage(`/discovery/${profileId}`);
+    const candidate = discovery.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.create, 'CREATE')).first();
+    await candidate.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     const candidateDigest = await candidate.getAttribute('data-digest') ?? '';
-    await candidate.getByTestId('candidate-create-scenario').click();
+    const page = await openPage(`/scenarios/${profileId}/new?candidate=${encodeURIComponent(candidateDigest)}`);
     await page.getByTestId('scenario-form').waitFor({ timeout: UI_TIMEOUT_MS });
     await snapshot(page);
     await page.locator(`[data-testid="scenario-field"][data-field-name="${SCENARIO_FIELD_NAME}"] input[type="checkbox"]`).check();
-    await page.locator(`[data-testid="scenario-read-check"][data-read-check-id="${readCheckId}"] input[type="checkbox"]`).check();
-    for (const item of await page.locator('input[data-side-effect]').all()) {
-      await item.check();
-    }
+    // PL-5（4 章の 5、8 章）: 照らす見るだけの確かめを選ぶ所はない。答え合わせ（検証の指定）は、たたんだ詳しい内容の中で入れる。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
+    // MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 副作用の確認のチェックはない。
+    expect(await page.locator('input[data-side-effect]').count()).toBe(0);
     // T30g: 検証の指定。
-    const success = page.getByTestId('scenario-verification-successCondition');
-    await success.getByLabel(writeText.conditionPathPrefix, { exact: true }).fill(VERIFICATION_VALUES.successPathPrefix);
-    await success.getByLabel(writeText.conditionSelector, { exact: true }).fill(VERIFICATION_VALUES.successSelector);
-    const inputError = page.getByTestId('scenario-verification-inputErrorCondition');
-    await inputError.getByLabel(writeText.conditionPathPrefix, { exact: true }).fill(VERIFICATION_VALUES.inputErrorPathPrefix);
-    await inputError.getByLabel(writeText.conditionSelector, { exact: true }).fill(VERIFICATION_VALUES.inputErrorSelector);
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 成功の条件と入力の誤りの条件の欄はない（BeakSight が構造で判定する）。
+    // form の ID の取り方は、送った後のアドレスの形の一覧（`URL_PATH_PATTERNS`）。
     const recordId = page.getByTestId('scenario-verification-recordId');
-    await recordId.getByLabel(writeText.recordIdSource, { exact: true }).selectOption('URL_PATH_PATTERN');
+    await recordId.getByLabel(writeText.recordIdSource, { exact: true }).selectOption('URL_PATH_PATTERNS');
     await recordId.getByLabel(writeText.recordIdValue, { exact: true }).fill(VERIFICATION_VALUES.recordIdPathPattern);
     const read = page.getByTestId('scenario-verification-readVerification');
     await read.getByLabel(writeText.readVerificationCheck, { exact: true }).selectOption(readCheckId);
@@ -438,7 +435,8 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     await page.getByTestId('scenario-save').click();
     await page.waitForURL(new RegExp(`/scenarios/${profileId}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     const scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
-    await page.getByTestId('scenario-state').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5: 状態の印は、詳しい内容の中（要点は今の様子の文）。
+    await page.getByTestId('scenario-state').waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('scenario-state').getAttribute('data-state')).toBe('DRAFT');
     await snapshot(page);
     return { candidateDigest, scenarioId };
@@ -452,18 +450,23 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
     profileId: string,
     ledgerScenarioId: string,
   ): Promise<{ readonly candidateDigest: string; readonly scenarioId: string }> => {
-    const page = await openPage(`/discovery/${profileId}`);
-    const candidate = page.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.update, 'UPDATE')).first();
+    // PL-5: 作成の画面は、候補の digest の URL で開く（`createScenarioOnScreen` の説明）。
+    const discovery = await openPage(`/discovery/${profileId}`);
+    const candidate = discovery.locator(candidateSelectorOf(DISCOVERY_SITE_PATHS.update, 'UPDATE')).first();
+    await candidate.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     const candidateDigest = await candidate.getAttribute('data-digest') ?? '';
-    await candidate.getByTestId('candidate-create-scenario').click();
+    const page = await openPage(`/scenarios/${profileId}/new?candidate=${encodeURIComponent(candidateDigest)}`);
     await page.getByTestId('scenario-update').waitFor({ timeout: UI_TIMEOUT_MS });
     await snapshot(page);
+    // OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12 の 4）: 作ったデータの一覧を選ぶ欄は、詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     await page.getByTestId('scenario-update-ledger').selectOption(ledgerScenarioId);
     await page.locator(`[data-testid="scenario-update-role"][data-field-name="${SCENARIO_FIELD_NAME}"] input[type="radio"][value="CHANGE"]`).check();
     await page.getByTestId('scenario-save').click();
     await page.waitForURL(new RegExp(`/scenarios/${profileId}/[a-z0-9-]+\\?notice=saved$`, 'u'), { timeout: UI_TIMEOUT_MS });
     const scenarioId = new URL(page.url()).pathname.split('/').at(-1) ?? '';
-    await page.getByTestId('scenario-update-section').waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-5: 書き換えの手順の詳細は、要点のパネルと詳しい内容（書き換えの対象）。
+    await page.getByTestId('scenario-summary').waitFor({ timeout: UI_TIMEOUT_MS });
     await snapshot(page);
     return { candidateDigest, scenarioId };
   };
@@ -484,6 +487,8 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
   /** 詳細の画面で、確認のダイアログの後に撤回する（`REVOKED` になるまで待つ）。ダイアログと撤回の後の画面の HTML を集める。 */
   const revokeOnScreen = async (profileId: string, scenarioId: string): Promise<void> => {
     const page = await openPage(`/scenarios/${profileId}/${scenarioId}`);
+    // PL-5（設計書 3 章の 1）: OK の取り消しは、書き込みの手順の詳細の詳しい内容の中。
+    await openAdvancedSettings(page, SCENARIO_DETAIL_ADVANCED_SETTINGS, UI_TIMEOUT_MS);
     await page.getByTestId('scenario-revoke').click();
     const dialog = page.getByRole('dialog', { name: scenarioText.revokeDialog.title });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
@@ -501,20 +506,20 @@ export const createScenarioMarkerFlow = (options: ScenarioMarkerFlowOptions) => 
   const prepareProfile = async (profileId: string, site: DiscoverySite, automated: boolean): Promise<void> => {
     const targetConfigPath = writeAuthTargetConfig(rootOf(), profileId, site.origin, DISCOVERY_SITE_PATHS.admin, MAX_PAGES,
       options.navigationIntervalMs ?? 0);
-    expect(await valueOf('createProfileFn', 'POST', {
-      profile: {
-        schemaVersion: 'beaksight-profile/1',
-        profileId,
-        revision: FIRST_REVISION,
-        targetConfigPath,
-        environment: 'TEST',
-        mode: options.profileMode ?? 'TEST_APPROVED_WRITE',
-        auth: automated ? 'AUTOMATED_LOGIN' : 'MANUAL_SESSION',
-        approvedTestOrigins: [site.origin],
-        environmentEvidenceRef: `${options.label}-evidence`,
-      },
-    })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetupOf(profileId, site, automated) })).toMatchObject({ ok: true });
+    const profile = {
+      schemaVersion: 'beaksight-profile/1',
+      profileId,
+      revision: FIRST_REVISION,
+      targetConfigPath,
+      environment: 'TEST',
+      mode: options.profileMode ?? 'TEST_APPROVED_WRITE',
+      auth: automated ? 'AUTOMATED_LOGIN' : 'MANUAL_SESSION',
+      approvedTestOrigins: [site.origin],
+      environmentEvidenceRef: `${options.label}-evidence`,
+    };
+    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+    expect(automated ? await createProfileInStore(rootOf(), profile) : await valueOf('createProfileFn', 'POST', { profile })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetupOf(profileId, site, automated) })).toMatchObject({ ok: true });
   };
 
   /** 資格情報の画面で、新しく登録する（パスワードは 2 回）。登録の後の画面の HTML を集める。 */

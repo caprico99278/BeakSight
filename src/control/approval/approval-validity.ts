@@ -49,6 +49,7 @@ import {
 } from '../../core/approval-invalidity-reasons.js';
 import { RETIRED_PROFILE_STATUS, type ProfileStatus } from '../store/profile-records.js';
 import { computeApprovalDigest } from './approval-digest.js';
+import { isDiscoveryProfileRevisionCurrent } from './discovery-profile-freshness.js';
 import {
   APPROVAL_TTL_DAY_MS,
   MIN_APPROVAL_TTL_DAYS,
@@ -133,6 +134,11 @@ export interface ApprovalCurrentFacts {
   readonly apiShapeOriginIndex: number | null;
   /** 索引を書いた最新の発見のジョブのプロファイルの改訂（T38R-fix の C-2。API のシナリオだけが使う。分からなければ null）。 */
   readonly latestDiscoveryProfileRevision: number | null;
+  /**
+   * PL-U の修正の 1 回目（設計書 14.1 の U5）: その発見の改訂から今の改訂まで「書き込みも試す」の切り替えだけで進んだことを、保存した改訂の記録で確かめられたか
+   * （`discovery-profile-freshness.ts`。省けば偽 = 古い）。
+   */
+  readonly latestDiscoverySwitchOnlySinceDiscovery?: boolean;
   /** 入力の規則の今の参照（規則の集まりの今の版と digest。参照がなければ null）。 */
   readonly inputRuleReference: InputRuleReference | null;
   /** 照らす READ の定義の今の事実（プロファイルの定義の一覧。シナリオが参照しない定義を含んでよい）。 */
@@ -264,7 +270,7 @@ const apiCandidateReasonsOf = (
     return found.reasons;
   }
   const { api } = scenario;
-  const { apiShapeOriginIndex, latestDiscoveryProfileRevision, profile } = facts;
+  const { apiShapeOriginIndex, latestDiscoveryProfileRevision, latestDiscoverySwitchOnlySinceDiscovery, profile } = facts;
   // T38R-fix の C-2: 型の Origin の番号の位置に、シナリオの Origin が今もあること。索引を書いた発見の改訂が今の改訂であること。
   // Origin の比べ方は、URL の意味の owner（`src/crawl/normalize-url.ts`）の部品に任せる（GATE-ARCH04）。
   const approvedAtIndex = apiShapeOriginIndex === null ? undefined : profile.approvedServiceOrigins[apiShapeOriginIndex];
@@ -272,7 +278,12 @@ const apiCandidateReasonsOf = (
   return [
     ...found.reasons,
     ...(originApproved ? [] : ['API_ORIGIN_NOT_APPROVED' as const]),
-    ...(latestDiscoveryProfileRevision === profile.revision ? [] : ['API_DISCOVERY_PROFILE_STALE' as const]),
+    // PL-U の修正の 1 回目（14.1 の U5）: 発見の結果の古さは、判定の 1 か所（`isDiscoveryProfileRevisionCurrent`）で決める。
+    ...(isDiscoveryProfileRevisionCurrent({
+      discoveryJob: latestDiscoveryProfileRevision,
+      current: profile.revision,
+      switchOnlySinceDiscovery: latestDiscoverySwitchOnlySinceDiscovery === true,
+    }) ? [] : ['API_DISCOVERY_PROFILE_STALE' as const]),
   ];
 };
 

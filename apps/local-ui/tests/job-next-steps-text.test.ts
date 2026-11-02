@@ -49,10 +49,13 @@ describe('T44e: the next steps on the job screen', () => {
     }
     expect(hasText(steps.discoveryEndReasons.PREFLIGHT_FAILED)).toBe(true);
     expect(hasText(steps.readCheckEndReasons.PREFLIGHT_FAILED)).toBe(true);
-    // ページの上限と時間の上限は、画面の「監査の負荷」へ導く（P2-1）。
-    expect(steps.runReasons.MAX_PAGES_REACHED).toContain('監査の負荷');
-    expect(steps.runExecutionEndReasons.STOPPED_BY_RUNTIME_LIMIT).toContain('監査の負荷');
-    expect(steps.runExecutionEndReasons.STOPPED_BY_RUNTIME_LIMIT).toContain('前回の続きから再開する');
+    // ページの上限と時間の上限は、画面の「点検の負荷」（PL-W で「監査の負荷」から言い換えた）へ導く（P2-1）。
+    expect(steps.runReasons.MAX_PAGES_REACHED).toContain('点検の負荷');
+    expect(steps.runExecutionEndReasons.STOPPED_BY_RUNTIME_LIMIT).toContain('点検の負荷');
+    // PL-TD（PL-T の 3。設計書 `2026-10-26-beaksight-plain-ui-design.md` 4 章の 4）: 始め方の既定が「続きから」になったので、「前回の続きから再開する」を
+    // 選ぶ手順は書かない。「点検を始める」を押すと続きから点検することだけを書く。
+    expect(steps.runExecutionEndReasons.STOPPED_BY_RUNTIME_LIMIT).toContain('「点検を始める」を押すと、続きから点検します');
+    expect(steps.runExecutionEndReasons.STOPPED_BY_RUNTIME_LIMIT).not.toContain('前回の続きから再開する');
   });
 
   it('has an entry for every code, with no text for the successful endings', () => {

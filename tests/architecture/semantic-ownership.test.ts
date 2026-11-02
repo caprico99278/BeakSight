@@ -821,7 +821,14 @@ const EXCLUSIONS: Readonly<Record<ExclusionScope, ReadonlyMap<string, string>>> 
     ],
   ]),
   'ARCH07-cross-page': new Map(),
-  'ARCH07-reporter': new Map(),
+  'ARCH07-reporter': new Map([
+    // OP-R2（PL 設計書 14 章。UI の SSOT の決まり「Finding の文言は Rule が持つ」）: 報告の本文に出すやさしい文の持ち主は Rule の定義なので、表示用モデルが、
+    // Finding の ruleId から Rule の定義の文を引く `rulePlainMessageOf` を import する（Rule を評価しない。評価の部品の名前と `.evaluate(` の検出は、そのまま効く）。
+    [
+      'src/report/view-model.ts: ../audit/cross-page-rules.js',
+      '表示用モデルが、Rule の定義のやさしい文を ruleId で引くだけ（`rulePlainMessageOf`）。Rule を評価しない',
+    ],
+  ]),
   ARCH08: new Map([
     [
       'src/evidence/screenshot-collector.ts: .screenshot({ path:',

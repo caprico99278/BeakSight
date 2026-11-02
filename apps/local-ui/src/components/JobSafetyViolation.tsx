@@ -2,6 +2,9 @@
  * ジョブの詳細の、安全の違反の中身（DEF-144。発見と READ の確かめのジョブが `SAFETY_VIOLATION` で止まったとき）。成果物の `safetyViolation`（`run.json` の
  * `safety` と同じ形の一覧と数に、起きた段・画面の path・押していた候補を足したもの）を出す。値（本文、query の値、Cookie、token）は成果物にない。リンクに
  * しない。文言はカタログ（`LOCAL_UI_SAFETY_VIOLATION_TEXT`、`JOB_SAFETY_VIOLATION_STAGE_LABELS`）。
+ * PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 7 章、3 章の 2）: 止めた事実・ステップ・画面・押していたボタンの語は、ふだんの画面に
+ * 出す（`JobSafetyViolation`）。押していたボタンの識別（digest）、違反の数と表（理由の種類・送り方・サイトのアドレス）は、たたんだ詳しい内容に入れる
+ * （`JobSafetyViolationDetails`）。
  */
 import type { DiscoveryExternalSchemeProbes, DiscoveryPressLimitProbes } from '../../../../src/control/discovery-view.js';
 import type { JobSafetyViolation as JobSafetyViolationRecord } from '../../../../src/core/contracts.js';
@@ -12,6 +15,7 @@ import {
   LOCAL_UI_PRESS_LIMIT_PROBE_TEXT,
   LOCAL_UI_SAFETY_VIOLATION_TEXT,
 } from '../../../../src/presentation/messages.js';
+import { httpMethodLabel, safetyViolationCodeLabel } from '../display/labels';
 import { Notice } from './Notice';
 
 /**
@@ -59,12 +63,11 @@ export function PressLimitProbes({ counts }: Readonly<{ counts: DiscoveryPressLi
 
 const text = LOCAL_UI_SAFETY_VIOLATION_TEXT;
 
-/** 違反の中身（記録がなければ何も出さない）。 */
+/** 違反の要点（止めた事実・ステップ・画面・押していたボタンの語。記録がなければ何も出さない）。 */
 export function JobSafetyViolation({ violation }: Readonly<{ violation: JobSafetyViolationRecord | null }>) {
   if (violation === null) {
     return null;
   }
-  const omitted = Math.max(0, violation.invariantViolationCount - violation.invariantViolations.length);
   return (
     <section className="panel" data-testid="job-safety-violation" data-stage={violation.stage}>
       <h2 className="panel-heading">{text.heading}</h2>
@@ -82,6 +85,25 @@ export function JobSafetyViolation({ violation }: Readonly<{ violation: JobSafet
             <dd data-testid="job-safety-violation-press-words">
               {violation.press.submitterWords.length === 0 ? text.pressedNoWords : violation.press.submitterWords.join('、')}
             </dd>
+          </>
+        )}
+      </dl>
+    </section>
+  );
+}
+
+/** 違反の詳しい記録（押していたボタンの識別、数、表。たたんだ詳しい内容に入れる。記録がなければ何も出さない）。 */
+export function JobSafetyViolationDetails({ violation }: Readonly<{ violation: JobSafetyViolationRecord | null }>) {
+  if (violation === null) {
+    return null;
+  }
+  const omitted = Math.max(0, violation.invariantViolationCount - violation.invariantViolations.length);
+  return (
+    <section className="panel" data-testid="job-safety-violation-details">
+      <h2 className="panel-heading">{text.heading}</h2>
+      <dl className="facts">
+        {violation.press === null ? null : (
+          <>
             <dt>{text.pressedIdentity}</dt>
             <dd className="cell-break"><code data-testid="job-safety-violation-press-identity">{violation.press.identityDigest}</code></dd>
           </>
@@ -106,13 +128,13 @@ export function JobSafetyViolation({ violation }: Readonly<{ violation: JobSafet
             {violation.invariantViolations.map(({ code, message, request }, index) => (
               // 同じ種類の違反が並びうるので、順の番号を鍵にする（並べ替えない）。
               <tr key={index} data-code={code}>
-                <td><code>{code}</code></td>
+                <td>{safetyViolationCodeLabel(code)}</td>
                 <td className="cell-break">{message}</td>
                 {request === undefined ? (
                   <td colSpan={3} className="muted">{text.noRequest}</td>
                 ) : (
                   <>
-                    <td><code>{request.method}</code></td>
+                    <td>{httpMethodLabel(request.method)}</td>
                     <td className="cell-break">{request.origin === null ? <span className="muted">{text.noOrigin}</span> : <code>{request.origin}</code>}</td>
                     <td className="cell-break"><code>{request.path}</code></td>
                   </>

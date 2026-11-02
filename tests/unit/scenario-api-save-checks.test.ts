@@ -66,7 +66,7 @@ const apiDraftOf = (
   sideEffectConfirmations: ALL_CONFIRMED,
   limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
   approvalTtlDays: 30,
-  verification: { successCondition: null, inputErrorCondition: null, recordId, readVerification: { ...read, revision: 1 } },
+  verification: { resultJudgement: null, recordId, readVerification: { ...read, revision: 1 } },
   api: { shapeDigest: CANDIDATE.submissionProbe?.shapeDigest, pageKeys: [], filterName: null, recordId: apiRecordId, ledger: null },
 });
 
@@ -144,7 +144,8 @@ describe('T40R2-fix: the record id pattern the page of the write matches is save
 
   it('keeps the FORM scenario as it is (out of this check; the form page /members/new against /members/{id})', () => {
     expect(FORM_CANDIDATE.page.path).toBe('/members/new');
-    expect(FULL_VERIFICATION.recordId).toEqual({ source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' });
+    // PL-6a: form の ID の取り方は ID の型の一覧。
+    expect(FULL_VERIFICATION.recordId).toEqual({ source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}'] });
     expect(codesOf(validateScenarioDraft(sampleDraft({ verification: FULL_VERIFICATION }), FORM_CANDIDATE, READ_CHECK_FACTS, CONTEXT))).toEqual([]);
   });
 });

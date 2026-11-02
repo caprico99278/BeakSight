@@ -6,7 +6,10 @@
  * ダイアログを出さない。保存は表示の設定と一緒（改訂の外）。
  * FM-3: 欄の専用の保存のボタンはなくし、チェックを切り替えたらその場で保存する（通す側へは、確認のダイアログで「通す」を選んだ時点）。保存の間はチェックを
  * 押せず、保存できたら欄の中に「保存しました」を出す。保存できなければ（拒まれた・Server Function が例外を投げた）、チェックを元の値に戻し、理由を出す。
+ * PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 7 章、PL-S の発見事項）: 保存できたら、画面（loader）を読み直す（サイトの画面の要点の「削除のほかを
+ * 通す」の印を、すぐ今の設定に合わせる）。サイトの画面では、この欄は詳しい内容の中に置く。
  */
+import { useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import { useEffect, useId, useRef, useState } from 'react';
 import { AUDIT_SEND_PASS_EXCEPT_DELETE, AUDIT_SEND_READ_ONLY } from '../../../../src/core/audit-send-policy.js';
@@ -42,6 +45,7 @@ export function DisplaySettingsPanel({ profileId, settings, editable }: Readonly
   editable: boolean;
 }>) {
   const save = useServerFn(saveProfileDisplaySettingsFn);
+  const router = useRouter();
   const [current, setCurrent] = useState<ProfileDisplaySettings>(settings);
   /** AS-b: 通す側へ切り替える確認のダイアログを開いているか。 */
   const [confirmingPass, setConfirmingPass] = useState(false);
@@ -81,6 +85,7 @@ export function DisplaySettingsPanel({ profileId, settings, editable }: Readonly
         if (outcome.kind === 'ACCEPTED') {
           setCurrent(outcome.result.settings);
           setSaved(true);
+          void router.invalidate();
         } else {
           setCurrent(previous);
           setFailure(outcome);
@@ -141,6 +146,7 @@ export function DisplaySettingsPanel({ profileId, settings, editable }: Readonly
           body={text.auditSendDialogBody}
           confirmLabel={text.auditSendConfirm}
           cancelLabel={text.auditSendCancel}
+          confirmTone="danger"
           busy={false}
           onConfirm={() => {
             setConfirmingPass(false);

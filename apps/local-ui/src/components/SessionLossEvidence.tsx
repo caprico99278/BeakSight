@@ -7,6 +7,7 @@
 import type { SessionLossEvidence as SessionLossEvidenceRecord } from '../../../../src/core/evidence-types.js';
 import { formatCount, formatTimes } from '../../../../src/presentation/format.js';
 import { LOCAL_UI_AUTH_TEXT, SESSION_LOSS_BLOCKED_REQUEST_REASON_DESCRIPTIONS } from '../../../../src/presentation/messages.js';
+import { httpMethodLabel } from '../display/labels';
 
 const text = LOCAL_UI_AUTH_TEXT.job.sessionLoss;
 
@@ -68,7 +69,7 @@ export function SessionLossEvidence({ evidence }: Readonly<{ evidence: SessionLo
             <tbody>
               {blockedRequests.map((request) => (
                 <tr key={JSON.stringify([request.method, request.originKind, request.path, request.reason])} data-reason={request.reason}>
-                  <td><code>{request.method}</code></td>
+                  <td>{httpMethodLabel(request.method)}</td>
                   <td>{text.originKindLabels[request.originKind]}</td>
                   <td className="cell-break"><code>{request.path}</code></td>
                   <td>{SESSION_LOSS_BLOCKED_REQUEST_REASON_DESCRIPTIONS[request.reason]}</td>

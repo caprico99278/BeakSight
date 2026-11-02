@@ -22,6 +22,7 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
 
 /** HTTP の状態。 */
@@ -216,6 +217,12 @@ describe('auth setup Server Functions: save, errors by field, CURRENT and STALE,
   });
 
   it('saves a valid setup as CURRENT, and the start screen shows the login summary without a blocker', async () => {
+    // MI-F5（設計書 4.7.1 の 6）: 画面の最初の保存は、送信先（ログインの画面の URL のほかのフォームの送信先）が入口の確かめの案と同じときだけ受ける。この
+    // プロファイルには入口の確かめがないので、フォームの送信先のある設定の最初の保存は拒む。送信先は入口の確かめと手動のログインの観察からだけ入るので、テストの
+    // 準備では、観察の後の形の設定を保存の部品で直接保存し、画面の保存は、送信先を変えない保存し直しで確かめる。
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: setupFor(FIRST_REVISION) }))
+      .toMatchObject({ ok: false, reason: 'CREDENTIAL_DESTINATION_OBSERVED_ONLY' });
+    expect(await saveAuthSetupRequestInStore(root, { setup: setupFor(FIRST_REVISION) })).toMatchObject({ ok: true });
     const saved = await valueOf<{ ok: boolean; stored: { freshness: string; setup: unknown; updatedAt: string } }>(
       'saveAuthSetupFn',
       'POST',
@@ -262,5 +269,64 @@ describe('auth setup Server Functions: save, errors by field, CURRENT and STALE,
   it('creates no job and sends nothing to the fixture site through these checks', async () => {
     expect(await listJobs()).toEqual([]);
     expect(site?.requests()).toEqual([]);
+  });
+});
+
+// MI-F3（独立レビュー MI-R の Minor 5。設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 監査の開始の画面の「読まないパス」の保存は、
+// サーバが今保存してある認証の設定を読み、読まないパスだけを替えて、今の保存の部品で保存する（画面が読んだ時の設定の全体を送り直さない。別のタブで保存した
+// 変更を古い値に戻さない）。画面が読んだ改訂の照合は保つ。
+describe('MI-F3: saving only the excluded paths of the stored auth setup (the audit start screen)', () => {
+  /** 上の場面の後の、保存してある設定（改訂 2 に結びつく）。 */
+  const storedSetup = async (): Promise<Record<string, unknown> | undefined> => (await getPage(AUTH_PROFILE))?.stored?.setup;
+
+  it('lists the Server Function by name, and rejects inputs that do not match its schema with 400 (saves nothing)', async () => {
+    expect([...ids.keys()]).toContain('saveExcludedPathsFn');
+    const before = await storedSetup();
+    for (const data of [
+      {},
+      { profileId: AUTH_PROFILE, expectedRevision: SECOND_REVISION },
+      { profileId: AUTH_PROFILE, expectedRevision: SECOND_REVISION, excludedPaths: '/admin/logout' },
+      { profileId: AUTH_PROFILE, expectedRevision: SECOND_REVISION, excludedPaths: [1] },
+      { profileId: AUTH_PROFILE, expectedRevision: SECOND_REVISION, excludedPaths: [], setup: setupFor(SECOND_REVISION) },
+      { profileId: '../x', expectedRevision: SECOND_REVISION, excludedPaths: [] },
+    ]) {
+      const result = await call('saveExcludedPathsFn', 'POST', data);
+      expect(result.response.status, JSON.stringify(data)).toBe(STATUS.BAD_REQUEST);
+    }
+    expect(await storedSetup()).toEqual(before);
+  });
+
+  it('replaces only the excluded paths, and keeps a change saved in another tab (the audit path prefixes)', async () => {
+    // 別のタブ（認証の設定の画面）で、読む範囲のパスを変えて保存した。
+    const elsewhere = setupFor(SECOND_REVISION, { auditPathPrefixes: ['/admin/reports'] });
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: elsewhere })).toMatchObject({ ok: true });
+    const saved = await valueOf('saveExcludedPathsFn', 'POST', {
+      profileId: AUTH_PROFILE,
+      expectedRevision: SECOND_REVISION,
+      excludedPaths: ['/admin/logout', '/admin/exit'],
+    });
+    const expected = { ...elsewhere, excludedPaths: ['/admin/logout', '/admin/exit'] };
+    expect(saved).toMatchObject({ ok: true, stored: { freshness: 'CURRENT', setup: expected } });
+    expect(await storedSetup()).toEqual(expected);
+  });
+
+  it('returns the validation errors of the save by field, and saves nothing', async () => {
+    const before = await storedSetup();
+    expect(await valueOf('saveExcludedPathsFn', 'POST', { profileId: AUTH_PROFILE, expectedRevision: SECOND_REVISION, excludedPaths: ['/admin/logout', 'admin'] }))
+      .toEqual({ ok: false, reason: 'AUTH_SETUP_INVALID', errors: [{ code: 'AUTH_SETUP_PATH_INVALID', field: 'excludedPaths', line: 2 }] });
+    expect(await storedSetup()).toEqual(before);
+  });
+
+  it('rejects a revision the screen did not read, an unknown profile and a profile without an auth setup, and saves nothing', async () => {
+    const before = await storedSetup();
+    expect(await valueOf('saveExcludedPathsFn', 'POST', { profileId: AUTH_PROFILE, expectedRevision: FIRST_REVISION, excludedPaths: [] }))
+      .toEqual({ ok: false, reason: 'PROFILE_REVISION_CONFLICT', errors: [] });
+    expect(await valueOf('saveExcludedPathsFn', 'POST', { profileId: 'not-there', expectedRevision: FIRST_REVISION, excludedPaths: [] }))
+      .toEqual({ ok: false, reason: 'PROFILE_NOT_FOUND', errors: [] });
+    expect(await valueOf('saveExcludedPathsFn', 'POST', { profileId: PUBLIC_PROFILE, expectedRevision: FIRST_REVISION, excludedPaths: [] }))
+      .toEqual({ ok: false, reason: 'AUTH_SETUP_NOT_FOUND', errors: [] });
+    expect(await storedSetup()).toEqual(before);
+    expect(await getPage(PUBLIC_PROFILE)).toMatchObject({ stored: null });
+    expect(await listJobs()).toEqual([]);
   });
 });

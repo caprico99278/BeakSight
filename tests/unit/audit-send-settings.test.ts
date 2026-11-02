@@ -16,6 +16,7 @@ import {
   AUDIT_SEND_POLICIES,
   AUDIT_SEND_READ_ONLY,
   DEFAULT_AUDIT_SEND_POLICY,
+  DEFAULT_SITE_AUDIT_SEND_POLICY,
   auditSendPolicyOf,
   isAuditSendPolicyName,
 } from '../../src/core/audit-send-policy.js';
@@ -63,6 +64,9 @@ describe('AS-b: the values of the audit send policy', () => {
     expect(AUDIT_SEND_READ_ONLY).toBe('READ_ONLY');
     expect(AUDIT_SEND_PASS_EXCEPT_DELETE).toBe('PASS_EXCEPT_DELETE');
     expect(DEFAULT_AUDIT_SEND_POLICY).toBe(AUDIT_SEND_READ_ONLY);
+    // OP-I（I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: サイト（プロファイル）の既定は、削除のほかを通す。項目のない設定・記録の
+    // 読み方と、設定ファイルの既定（上の `DEFAULT_AUDIT_SEND_POLICY`）は、読み取りだけのまま。
+    expect(DEFAULT_SITE_AUDIT_SEND_POLICY).toBe(AUDIT_SEND_PASS_EXCEPT_DELETE);
     expect(GUARD_PASS_EXCEPT_DELETE).toBe(AUDIT_SEND_PASS_EXCEPT_DELETE);
     expect(Object.isFrozen(AUDIT_SEND_POLICIES)).toBe(true);
     expect(AUDIT_SEND_POLICIES.every(isAuditSendPolicyName)).toBe(true);

@@ -73,9 +73,9 @@ export const VERIFICATION_READ_CHECK_ID = 'rc-verify';
 
 /** すべての項目を指定した検証の指定（T30d。送る欄 `name` の生成した値で読み直す）。 */
 export const VERIFICATION_SPEC: ScenarioVerification = Object.freeze<ScenarioVerification>({
-  successCondition: { pathPrefix: '/members/', selector: '.registered' },
-  inputErrorCondition: { pathPrefix: '/members/new', selector: '.error' },
-  recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/members/{id}' },
+  // PL-6a: 成否の条件の代わりに、結果の判定のしかたの印（form の構造の判定）。ID の取り方は ID の型の一覧。
+  resultJudgement: 'FORM_STRUCTURE',
+  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: ['/members/{id}'] },
   readVerification: {
     readCheckId: VERIFICATION_READ_CHECK_ID,
     revision: 1,
@@ -104,12 +104,15 @@ export const discoveryDocumentOf = (jobId: string, candidates: readonly Discover
 });
 
 /** 書き込みのモードのプロファイルと、最後の発見のジョブを作る。最後の発見の文書を返す。 */
-export const prepareGrantProfile = (database: ControlDatabase): DiscoveryDocument => {
+export const prepareGrantProfile = (
+  database: ControlDatabase,
+  // OP-F（M-3）: 発見の候補を替える（既定は `CREATE_CANDIDATE` と `UPDATE_CANDIDATE`）。
+  candidates: readonly DiscoveryCandidate[] = [CREATE_CANDIDATE, UPDATE_CANDIDATE],
+): DiscoveryDocument => {
   const created = createProfile(database, testWriteProfile(GRANT_PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext });
   if (!created.ok) {
     throw new Error(`could not create the profile: ${created.reason}`);
   }
-  const candidates = [CREATE_CANDIDATE, UPDATE_CANDIDATE];
   const document = discoveryDocumentOf(DISCOVERY_JOB_ID, candidates);
   recordDiscoveryCandidates(database, {
     profileId: GRANT_PROFILE_ID,
@@ -144,6 +147,10 @@ export interface ScenarioPreparation {
   readonly verification?: ScenarioVerification | null;
   /** T31e: UPDATE のシナリオにする（参照する CREATE のシナリオの id。省略すると CREATE のシナリオ）。 */
   readonly updateOf?: string;
+  /** OP-F（M-3）: シナリオの候補（省略は `CREATE_CANDIDATE`・`UPDATE_CANDIDATE`。送る欄は今のまま）。 */
+  readonly candidate?: DiscoveryCandidate;
+  /** OP-F（M-3）: UPDATE のシナリオの保つ欄（省略は空）。 */
+  readonly keepFieldNames?: readonly string[];
 }
 
 /** T31e: UPDATE のシナリオの path の型（`UPDATE_CANDIDATE` の画面 `/members/1/edit` と送信先 `/members/1` に戻る型）。 */
@@ -173,18 +180,18 @@ export const prepareScenario = (
       // T31e: UPDATE のシナリオは、更新の候補（`name` を変える欄にし、保つ欄はない）と UPDATE の指定。
       ...(options.updateOf === undefined
         ? {
-          candidateIdentityDigest: CREATE_CANDIDATE.identityDigest,
+          candidateIdentityDigest: (options.candidate ?? CREATE_CANDIDATE).identityDigest,
           // T30f fix round 1（DEF-098）: CREATE の候補の見えていて編集できる select（`plan`）も送る欄にする。
           fieldNames: ['name', 'plan'],
         }
         : {
-          candidateIdentityDigest: UPDATE_CANDIDATE.identityDigest,
+          candidateIdentityDigest: (options.candidate ?? UPDATE_CANDIDATE).identityDigest,
           fieldNames: ['name'],
           update: {
             targetCreateScenarioId: options.updateOf,
             formPathTemplate: UPDATE_FORM_PATH_TEMPLATE,
             actionPathTemplate: UPDATE_ACTION_PATH_TEMPLATE,
-            keepFieldNames: [],
+            keepFieldNames: [...(options.keepFieldNames ?? [])],
           },
         }),
       readChecks: [],

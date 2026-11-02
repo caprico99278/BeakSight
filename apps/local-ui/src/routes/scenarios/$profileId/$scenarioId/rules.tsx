@@ -1,19 +1,20 @@
-import { Link, createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
+import { createFileRoute, notFound, useNavigate, useRouter } from '@tanstack/react-router';
 import { useServerFn } from '@tanstack/react-start';
 import { formatDateTime, formatInteger } from '../../../../../../../src/presentation/format.js';
 import { LOCAL_UI_DATA_RULE_TEXT, LOCAL_UI_SCENARIO_TEXT } from '../../../../../../../src/presentation/messages.js';
 import { DataRuleForm } from '../../../../components/DataRuleForm';
 import { Notice } from '../../../../components/Notice';
-import { PageFrame } from '../../../../components/PageFrame';
+import { PageFrame, scenarioTrail } from '../../../../components/PageFrame';
 import { ScenarioProfilePanel } from '../../../../components/ScenarioProfilePanel';
 import { inputRuleStateDisplay, toneClass } from '../../../../display/labels';
 import { isSavedNoticeCurrent, savedRevisionOf } from '../../../../display/saved-notice';
+import { closedSearchValueOf, isClosedSearchValue } from '../../../../display/search-values';
 import { dataRulePageFn, saveDataRulesFn, type DataRuleExampleValueView, type DataRulePageView } from '../../../../server/data-rule-functions';
 
 /** 操作の後に出す知らせ（URL の search で渡す。値は閉じた一覧）。 */
 const NOTICES = Object.freeze(['saved'] as const);
 type DataRuleNotice = (typeof NOTICES)[number];
-const isDataRuleNotice = (value: unknown): value is DataRuleNotice => NOTICES.some((notice) => notice === value);
+const isDataRuleNotice = (value: unknown): value is DataRuleNotice => isClosedSearchValue(NOTICES, value);
 
 export const Route = createFileRoute('/scenarios/$profileId/$scenarioId/rules')({
   // DEF-137: 保存した規則の集まりの版（`savedRevision`）も受ける（知らせは、画面の版がそれに届いたときだけ出す）。
@@ -97,18 +98,20 @@ function DataRulePage() {
   const { profile, scenario, ruleSet } = page;
   // DEF-137: 保存の知らせは、画面の規則の集まりの版が保存した版に届いたときだけ出す（改訂のない知らせは今のまま）。
   const currentRuleSetRevision = ruleSet?.revision ?? 0;
-  const notice = search.notice !== undefined && isSavedNoticeCurrent(search.savedRevision, currentRuleSetRevision) ? search.notice : undefined;
+  // MI-C2 項目 19: ルータは根の生の search も子へ渡すので、知らせの値は描く前に閉じた一覧でもう一度確かめる（`display/search-values.ts`）。
+  const checkedNotice = closedSearchValueOf(NOTICES, search.notice);
+  const notice = checkedNotice !== undefined && isSavedNoticeCurrent(savedRevisionOf(search.savedRevision), currentRuleSetRevision) ? checkedNotice : undefined;
   const params = { profileId: profile.profileId, scenarioId: scenario.scenarioId };
   const state = inputRuleStateDisplay(page.inputRuleState);
 
   return (
-    <PageFrame title={text.pages.rules}>
+    <PageFrame title={text.pages.rules} trail={scenarioTrail(profile.profileId, scenario.scenarioId)}>
       {notice === undefined ? null : (
         <Notice kind="positive">
           <p data-testid="data-rule-notice" data-notice={notice}>{text.saved}</p>
         </Notice>
       )}
-      <ScenarioProfilePanel profile={profile} eligible={page.eligible} editable={page.editable} />
+      <ScenarioProfilePanel eligible={page.eligible} editable={page.editable} />
       {!page.eligible ? null : (
         <>
           <section className="panel" data-testid="data-rule-state" data-state={page.inputRuleState} data-scenario-id={scenario.scenarioId}
@@ -165,9 +168,6 @@ function DataRulePage() {
           </section>
         </>
       )}
-      <div className="button-row">
-        <Link to="/scenarios/$profileId/$scenarioId" params={params} className="button">{text.backToScenario}</Link>
-      </div>
     </PageFrame>
   );
 }

@@ -38,6 +38,7 @@ import * as readCheckEvaluation from '../../src/discovery/read-check-evaluation.
 import { INTERACTION_CANDIDATE_LIMITS } from '../../src/safety/interaction-policy.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
 import { WRITE_STAGE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/api-write-payload-policy.js';
+import { WRITE_STAGE_REQUEST_DESTINATIONS, WRITE_STAGE_REQUEST_TIMINGS } from '../../src/safety/write-stage-unexpected-requests.js';
 
 type SchemaName =
   | 'action-evidence'
@@ -51,6 +52,7 @@ type SchemaName =
   | 'finding'
   | 'page'
   | 'read-evidence'
+  | 'report-summary'
   | 'run'
   | 'site-unavailable-diagnostic';
 
@@ -301,13 +303,26 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('action-run', '/$defs/transport/enum', 'SCENARIO_TRANSPORTS'),
   // T44e（Task 44 の設計書 P2-4）: 送らずに止めた具体的な理由（任意の項目）。
   mapping('action-run', '/properties/precheckDetail/enum', 'PRECHECK_FAILURE_DETAILS'),
+  // PL-6a: 版 1.2 の記録の結果の判定のしかたの印（シナリオの契約の一覧）。
+  mapping('action-run', '/properties/resultJudgement/anyOf/0/enum', 'SCENARIO_RESULT_JUDGEMENTS'),
   mapping('action-evidence', '/properties/schemaVersion/enum', 'ACTION_EVIDENCE_READABLE_SCHEMA_VERSIONS'),
+  // OP-L（L1）: 送る前の確かめで候補が合わなかったときの、どこが違ったかの理由。
+  mapping('action-evidence', '/$defs/candidateMismatch/properties/reason/enum', 'PRECHECK_CANDIDATE_MISMATCH_REASONS'),
+  // OP-O（O1）: 書き込みの段の、確かめ・入力・押す操作の失敗の記録（段・理由・欄の属性・値の変わり方の区分）。
+  mapping('action-evidence', '/$defs/inputFailure/properties/stage/enum', 'WRITE_INPUT_FAILURE_STAGES'),
+  mapping('action-evidence', '/$defs/inputFailure/properties/reason/enum', 'WRITE_INPUT_FAILURE_REASONS'),
+  mapping('action-evidence', '/$defs/inputFailure/properties/fieldAttributes/anyOf/0/items/enum', 'WRITE_INPUT_FIELD_ATTRIBUTES'),
+  mapping('action-evidence', '/$defs/inputFailure/properties/valueChange/anyOf/0/enum', 'WRITE_INPUT_VALUE_CHANGES'),
   // T32c（Task 32 の設計書 4.1）: 書き込みの報告。ほかの値の一覧は `action-run`・`read-evidence`・`control/scenario` を `$ref` で使うので、ここに
   // 来るのは新しい enum だけ。Guard の要約の理由の鍵は、Guard の閉じた一覧（`src/safety/request-policy.ts`、`src/safety/write-payload-policy.ts`。
   // `src/control/` は読み込めないので契約に書き写さない）と一致する。人が決めたこと・自動で行うことは `src/control/actions/action-contracts.ts`。
   mapping('action-evidence', '/$defs/guardSummary/properties/blockedByReason/propertyNames/enum', 'SUBMISSION_STAGE_BLOCK_REASONS'),
   // T39a: 送る中身の照合の理由の鍵は、form の照合と API の照合の理由を重ねずに合わせた一覧（`src/safety/api-write-payload-policy.ts`）。
   mapping('action-evidence', '/$defs/guardSummary/properties/blockedByPayloadReason/propertyNames/enum', 'WRITE_STAGE_PAYLOAD_BLOCK_REASONS'),
+  // OP-M: 止めた、承認した送信のほかの要求の一覧の、送り先の区分と時点（owner は Guard の一覧の部品）と、本文の種類（owner は型の作り手）。
+  mapping('action-evidence', '/$defs/unexpectedRequests/items/properties/destination/enum', 'WRITE_STAGE_REQUEST_DESTINATIONS'),
+  mapping('action-evidence', '/$defs/unexpectedRequests/items/properties/timing/enum', 'WRITE_STAGE_REQUEST_TIMINGS'),
+  mapping('action-evidence', '/$defs/unexpectedRequests/items/properties/bodyKind/enum', 'API_REQUEST_BODY_KINDS'),
   // T32d: 事実の形は `$defs/facts` に 1 回だけ置き（IPC の `START` も `$ref` で使う）、種類ごとの一覧の決まりは `$defs/kindLists`。
   mapping('approval-summary', '/$defs/facts/properties/humanDecisions/items/enum', 'HUMAN_DECISIONS'),
   mapping('approval-summary', '/$defs/facts/properties/automatedActions/items/enum', 'AUTOMATED_ACTIONS'),
@@ -319,6 +334,8 @@ const ENUM_MAPPINGS: readonly EnumMapping[] = Object.freeze([
   mapping('entry-check', '/$defs/form/properties/placement/enum', 'ENTRY_CHECK_FORM_PLACEMENTS', NULLABLE),
   mapping('entry-check', '/$defs/form/properties/method/enum', 'ENTRY_CHECK_FORM_METHODS', NULLABLE),
   mapping('entry-check', '/$defs/proposal/properties/loginTransport/enum', 'ENTRY_CHECK_LOGIN_TRANSPORTS', NULLABLE),
+  // PL-R（plain UI の設計書 14 章）: 監査の報告の小さなまとめ report-summary.json（Run Status の一覧は core）。
+  mapping('report-summary', '/properties/runStatus/enum', 'RUN_STATUSES'),
 ]);
 
 const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
@@ -333,8 +350,14 @@ const coreExports: Readonly<Record<string, unknown>> = Object.freeze({
   // T32c: Guard の要約の理由の鍵（owner は `src/safety/`。名前を指定して足し、ほかの名前を混ぜない）。
   SUBMISSION_STAGE_BLOCK_REASONS,
   WRITE_STAGE_PAYLOAD_BLOCK_REASONS,
+  // OP-M: 書き込みの段の止めた要求の一覧の区分と時点（owner は `src/safety/write-stage-unexpected-requests.ts`）と、本文の種類（owner は型の作り手）。
+  WRITE_STAGE_REQUEST_DESTINATIONS,
+  WRITE_STAGE_REQUEST_TIMINGS,
+  API_REQUEST_BODY_KINDS: apiRequestShape.API_REQUEST_BODY_KINDS,
   // T40c: 記録の送り方（owner はシナリオの契約 `src/control/approval/scenario-contracts.ts`。名前を指定して足す）。
   SCENARIO_TRANSPORTS: scenarioContracts.SCENARIO_TRANSPORTS,
+  // PL-6a: 記録の結果の判定のしかたの印（owner はシナリオの契約。名前を指定して足す）。
+  SCENARIO_RESULT_JUDGEMENTS: scenarioContracts.SCENARIO_RESULT_JUDGEMENTS,
   // AS-b: 監査の段の送信の扱い（owner は `src/core/audit-send-policy.ts`。名前を指定して足す）。
   AUDIT_SEND_POLICIES,
 });
@@ -391,7 +414,7 @@ describe('F12: schema enums and the core value arrays', () => {
   it('reads every schema that the mapping table refers to', () => {
     expect([...schemas.keys()].sort()).toEqual([
       'action-evidence', 'action-run', 'approval-summary', 'audit', 'checkpoint', 'checkpoint-page', 'discovery', 'entry-check', 'finding', 'page',
-      'read-evidence', 'run',
+      'read-evidence', 'report-summary', 'run',
       'site-unavailable-diagnostic',
     ]);
   });
@@ -460,12 +483,16 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('profile', '/properties/environment/enum', 'ENVIRONMENT_KINDS'),
   controlMapping('profile', '/properties/mode/enum', 'AUDIT_MODES'),
   controlMapping('profile', '/properties/auth/enum', 'AUTH_STRATEGIES'),
+  // OP-1 の修正の 1 回目: ログインのしかたの希望。
+  controlMapping('profile', '/properties/loginPreference/enum', 'LOGIN_PREFERENCES'),
   // control/worker-message.schema.json（Task 24 の設計書 4.3。T24d）。値の一覧は `src/control/worker-protocol.ts`。メッセージの種類と知らせの種類は
   // 分岐の const で表すので、`tests/unit/worker-protocol.test.ts` で確かめる。
   controlMapping('worker-message', '/$defs/runStarted/properties/resumeDecision/properties/kind/enum', 'WORKER_RESUME_DECISION_KINDS'),
   controlMapping('worker-message', '/$defs/outcome/properties/kind/enum', 'WORKER_OUTCOME_KINDS'),
   controlMapping('worker-message', '/$defs/outcome/properties/runStatus/anyOf/0/enum', 'WORKER_RUN_STATUSES'),
   controlMapping('worker-message', '/$defs/failed/properties/reason/enum', 'WORKER_FAILURE_REASONS'),
+  // OP-L（L2）: ワーカーが受け取った資格情報を書けなかった理由のコード。
+  controlMapping('worker-message', '/$defs/credentialSaveFailureCode/enum', 'WORKER_CREDENTIAL_SAVE_FAILURE_CODES'),
   // T25d: 認証の状態の知らせ（Task 25 の設計書 4.4）。
   controlMapping('worker-message', '/$defs/authState/properties/state/enum', 'WORKER_AUTH_STATES'),
   // T34e: ログインの段で止めた読み取りでない要求の一覧の、要求の種類と理由（Task 34 の設計書 3.5）。
@@ -516,6 +543,8 @@ const CONTROL_ENUM_MAPPINGS: readonly ControlEnumMapping[] = Object.freeze([
   controlMapping('scenario', '/$defs/request/properties/enctype/enum', 'FORM_ENCTYPES'),
   // T38b（Task 38 の設計書 3.2）: 送り方と API の指定（値の一覧は `scenario-contracts.ts` と probe の型の契約 `src/core/api-request-shape.ts`）。
   controlMapping('scenario', '/properties/transport/enum', 'SCENARIO_TRANSPORTS'),
+  // PL-6a: 検証の指定の結果の判定のしかたの印。
+  controlMapping('scenario', '/$defs/verification/properties/resultJudgement/anyOf/0/enum', 'SCENARIO_RESULT_JUDGEMENTS'),
   controlMapping('scenario', '/$defs/apiJsonType/enum', 'API_JSON_VALUE_TYPES'),
   // T38R2-fix（M-2）: 送る鍵の欄の型（`SCENARIO_API_FIELD_JSON_TYPES` の欄の型）。
   controlMapping('scenario', '/$defs/apiFieldType/enum', 'SCENARIO_API_FIELD_TYPES'),
@@ -614,6 +643,8 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-audit-job-key',
       'ui-audit-job-start',
       'ui-audit-job-stop',
+      // MI-F3: 画面の監査の開始の画面から、認証の設定の読まないパスだけを替えて保存する Server Function の入力（入力を極限まで減らす設計書 4.3。enum を持たない）。
+      'ui-auth-setup-excluded-paths-save',
       // T43d: 画面の認証の設定とプロファイルのまとめて保存の Server Function の入力（Task 43 の設計書 4.4。enum を持たない）。
       'ui-auth-setup-profile-save',
       // T25e: 画面の認証の設定の保存の Server Function の入力（Task 25 の設計書 4.5。enum を持たない）。
@@ -648,7 +679,6 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-scenario-approve',
       // FM2b: 画面のシナリオの下書きをボタン 1 回で作る Server Function の入力（手を減らす段 2 の設計書 3A.2。enum を持たない）。
       'ui-scenario-auto-draft',
-      'ui-scenario-auto-rules',
       'ui-scenario-create',
       'ui-scenario-form',
       'ui-scenario-key',
@@ -659,6 +689,8 @@ describe('T22a: control schema enums and the src/control value arrays', () => {
       'ui-target-crawl-limits',
       // T41g-3: 画面の「登録してから更新する」の Server Function の入力（Task 41 の設計書 3.5.1。enum を持たない）。
       'ui-write-chain-start',
+      // OP-2: 画面の「登録・更新を試せる画面」の一覧のチェックの保存の Server Function の入力（enum を持たない）。
+      'ui-write-screen-check',
       // T30g fix round 1: 画面の書き込みの開始の Server Function の入力（Task 30 の設計書 3 章、10 章。enum を持たない）。
       'ui-write-start',
       // T31h-2: 画面の更新の書き込みの開始の Server Function の入力（Task 31 の設計書 3 章、10 章。enum を持たない）。

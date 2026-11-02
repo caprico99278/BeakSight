@@ -55,6 +55,7 @@ import {
 } from '../core/contracts.js';
 import { MAX_SESSION_LOSS_PATH_LENGTH, type SessionLossEvidence } from '../core/evidence-types.js';
 import { isRunId, isSha256Fingerprint, sha256HexOfBytes, sha256HexOfText } from '../core/ids.js';
+import { errorCodeOf } from '../core/errors.js';
 import { deepFreeze } from '../core/immutable.js';
 import { jsonPointerOf } from '../core/json-pointer.js';
 import { isJsonValueConvertible } from '../core/json-value.js';
@@ -68,6 +69,7 @@ import { canonicalHttpOriginOf, isOriginInAllowedOrigins } from '../crawl/normal
 import { isMethodOverrideFieldName, type CandidateField, type CandidateFieldType, type CandidateLocation } from '../discovery/candidate-contracts.js';
 import { PATH_TEMPLATE_ID_SEGMENT, concretePathOfTemplate } from '../discovery/fingerprint.js';
 import {
+  readListPagePathOf,
   MAX_READ_CHECKS_PER_JOB,
   hasGeneratedValueExpectation,
   isReadCheckPageTemplatePath,
@@ -91,10 +93,11 @@ import {
   type SubmissionState,
 } from './actions/action-contracts.js';
 import type {
+  FormRecordIdSpec,
   ScenarioApiSpec,
   ScenarioRecordIdSpec,
   ScenarioRequestShape,
-  ScenarioResultCondition,
+  ScenarioResultJudgement,
 } from './approval/scenario-contracts.js';
 import { API_SCENARIO_TRANSPORT } from '../core/scenario-transport.js';
 // CC-106（PRE42-CC の組 2）: UPDATE のシナリオの種類（T32d。承認の要約の種類と、書き込みの指定の UPDATE の指定の有無を照らす）。シナリオの契約は
@@ -139,14 +142,27 @@ import { isAcceptedTargetConfigPath } from './profile-policy.js';
 // 値の一覧と上限
 // ---------------------------------------------------------------------------------------------------------------
 
-/** IPC のメッセージの版。スキーマの `$defs/protocol` の const と一致する。 */
-export const WORKER_PROTOCOL_VERSION = 'beaksight-worker-message/2';
+/**
+ * IPC のメッセージの版。スキーマの `$defs/protocol` の const と一致する。OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3）で 3 に上げた
+ * （ログインの直後の登録 `loginRegistration`、値の受け取りのメタデータ、ログインの終わりを判定できるかの印、登録の往復のメッセージを足したため）。
+ * OP-H（撮影 UI-W4 の 3）で 6 に上げた（`START` の `chain` に、チェックした画面の数 `writeScreenCount` を足したため）。
+ * OP-L（L2）で 7 に上げた（`CREDENTIAL_SAVED` に、書けなかった理由のコード `failureCode` を足したため）。
+ */
+export const WORKER_PROTOCOL_VERSION = 'beaksight-worker-message/7';
+
+/**
+ * OP-1: ログインの段の後に、ワーカーが親の登録の返事（`CREDENTIAL_SAVE_ALLOWED`・`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED`）を待つ上限（ms。1 分）。
+ * 過ぎたら、今の設定のまま点検を続ける（受け取った値は捨てる）。
+ */
+export const WORKER_LOGIN_REGISTRATION_TIMEOUT_MS = 60_000;
 
 /** 親（画面のサーバ）から子（ワーカー）へのメッセージの種類。 */
 // ML-a（設計書 `2026-10-19-beaksight-manual-login-pass-through-design.md` 2.2）: `LOGIN_CONFIRMED`（利用者が「ログインを終えた」を押した）。
 // FM2d（設計書 `2026-10-19-beaksight-fewer-manual-steps-design.md` 3A.1）: まとめて実行の次の段（`NEXT_STAGE`）と、次の段を始めない（`CHAIN_END`）。
+// OP-1: ログインの直後の登録の往復（値の保存の許し、登録した新しい設定、登録を飛ばした）。
 export const PARENT_TO_WORKER_MESSAGE_TYPES = Object.freeze([
   'START', 'STOP', 'WRITE_RECHECK_RESULT', 'LOGIN_CONFIRMED', 'NEXT_STAGE', 'CHAIN_END',
+  'CREDENTIAL_SAVE_ALLOWED', 'LOGIN_REGISTERED', 'LOGIN_REGISTRATION_SKIPPED',
 ] as const);
 export type ParentToWorkerMessageType = (typeof PARENT_TO_WORKER_MESSAGE_TYPES)[number];
 
@@ -165,6 +181,8 @@ export const WORKER_TO_PARENT_MESSAGE_TYPES = Object.freeze([
   // T30e: 書き込みのジョブの、送る直前の確かめ直しの依頼と、送信の報告。
   'WRITE_RECHECK_REQUEST',
   'WRITE_SUBMISSION',
+  // OP-1: 受け取った資格情報を保存したか（値を持たない）。
+  'CREDENTIAL_SAVED',
 ] as const);
 export type WorkerToParentMessageType = (typeof WORKER_TO_PARENT_MESSAGE_TYPES)[number];
 
@@ -217,21 +235,32 @@ export const WORKER_CHAIN_STAGE_KINDS = Object.freeze(['AUDIT', 'DISCOVERY', 'RE
 export type WorkerChainStageKind = (typeof WORKER_CHAIN_STAGE_KINDS)[number];
 
 /**
- * FM2d: まとめて実行の段の並び（閉じた一覧）。`TEST_AUTH_PASSIVE` は監査 → 発見 → READ の確かめ、`TEST_APPROVED_WRITE` は発見 → READ の確かめ（監査は
- * 書き込みのモードで動かない）。モードとの対応は、ジョブの管理の決まり（`src/control/job/stage-chain-policy.ts`）が持つ。
+ * FM2d: まとめて実行の段の並び（閉じた一覧）。監査 → 発見 → READ の確かめ（`TEST_AUTH_PASSIVE` と、MI-5 から `TEST_APPROVED_WRITE` も）。MI-C（MI-5 の
+ * 発見事項）: 書き込みのモードの前の並び（発見 → READ の確かめ）は、どのモードも使わなくなったので、契約から外した（その並びの `START` は拒む）。
+ * モードとの対応は、ジョブの管理の決まり（`src/control/job/stage-chain-policy.ts`）が持つ。
  */
 export const WORKER_CHAIN_STAGE_SEQUENCES = Object.freeze([
   Object.freeze(['AUDIT', 'DISCOVERY', 'READ_CHECK'] as const),
-  Object.freeze(['DISCOVERY', 'READ_CHECK'] as const),
 ] as const);
 export type WorkerChainStageSequence = (typeof WORKER_CHAIN_STAGE_SEQUENCES)[number];
 
 /** FM2d: `FINISHED` の未完了の理由のコード（core の `INCOMPLETE_REASON_CODES` そのもの。スキーマの enum との対応のため、この名前でも公開する）。 */
 export const WORKER_INCOMPLETE_REASON_CODES = INCOMPLETE_REASON_CODES;
 
-/** FM2d: 次の段になれる種類（最初の段にだけなる監査を除く）。 */
-export const WORKER_NEXT_STAGE_JOB_KINDS = Object.freeze(['DISCOVERY', 'READ_CHECK'] as const satisfies readonly WorkerChainStageKind[]);
+/**
+ * OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.2 の案 C）: まとめて実行の最後に足す、書き込みの段の種類（閉じた一覧）。`START` の `chain` に
+ * 書き込みの段の印（`writeStages`）があるときだけ、読み取りの段の後に、親が `NEXT_STAGE` で指す（チェックした画面ごとに、登録 →（あれば）更新）。
+ */
+export const WORKER_CHAIN_WRITE_STAGE_JOB_KINDS = Object.freeze(['WRITE_CREATE', 'WRITE_UPDATE'] as const satisfies readonly WorkerJobKind[]);
+export type WorkerChainWriteStageJobKind = (typeof WORKER_CHAIN_WRITE_STAGE_JOB_KINDS)[number];
+
+/** FM2d: 次の段になれる種類（最初の段にだけなる監査を除く）。OP-2: 書き込みの段も足した。 */
+export const WORKER_NEXT_STAGE_JOB_KINDS = Object.freeze(['DISCOVERY', 'READ_CHECK', ...WORKER_CHAIN_WRITE_STAGE_JOB_KINDS] as const);
 export type WorkerNextStageJobKind = (typeof WORKER_NEXT_STAGE_JOB_KINDS)[number];
+
+/** OP-2: 次の段が書き込みの段か。 */
+export const isWorkerChainWriteStageJobKind = (kind: string): kind is WorkerChainWriteStageJobKind =>
+  (WORKER_CHAIN_WRITE_STAGE_JOB_KINDS as readonly string[]).includes(kind);
 
 /**
  * FM2d: まとめて実行のワーカーが、途中の段の `FINISHED` を送ってから、親の `NEXT_STAGE` か `CHAIN_END` を待つ上限（ms）。過ぎたら、次の段を始めずに、
@@ -511,7 +540,15 @@ export interface WorkerLoginObservation {
   readonly successSelector?: LoginObservedSuccessSelector;
   readonly credentialDiscarded?: number;
   readonly loginFields?: WorkerLoginFieldProposals;
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D3）: 手動のログインの成功の画面の path の、ログインの画面の path とセッションの切れの path に
+   * 当たらないいちばん短い区切りまでの前方（`/admin` の形。値に見える区切りと、`/` だけは持たない）。成功の条件の画面の path を観察から決めるため（ログインの直後の登録が、空の成功の条件を埋める）。手動のログインの成功だけが持てる。
+   */
+  readonly successPathPrefix?: string;
 }
+
+/** OP-1: 成功の画面の path の案の長さの上限。 */
+export const MAX_WORKER_SUCCESS_PATH_PREFIX_LENGTH = 256;
 
 /**
  * FM2e: ログインの 3 つの欄の CSS の案（各欄の見える候補がちょうど 1 つのときだけ、その一意な CSS。ほかは `null`。どれかは案がある）。検出は入口の確かめと
@@ -704,7 +741,8 @@ export interface WorkerStartMessage extends WorkerMessageBase<'START'> {
   readonly showJobBrowser?: boolean;
   /**
    * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査の段の送信の扱い（親が、ジョブの開始のときにプロファイルの設定を読んで入れる）。
-   * 監査・発見・READ の確かめのジョブ（`WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY`）だけが持てる。ワーカーは、実効の設定の上書き（`audit.sendPolicy`）として当てる。
+   * 監査・発見・READ の確かめのジョブと、OP-N から書き込みのジョブ（`WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY`）だけが持てる。ワーカーは、実効の設定の上書き
+   * （`audit.sendPolicy`）として当てる。
    * 省略は読み取りだけ（ワーカーはターゲット JSON の値によらず `READ_ONLY` で読む）。
    */
   readonly auditSendPolicy?: AuditSendPolicyName;
@@ -720,11 +758,28 @@ export interface WorkerStartMessage extends WorkerMessageBase<'START'> {
    * （1 つのジョブで終える）。
    */
   readonly chain?: WorkerStartChain;
+  /**
+   * DEF-180（OP-DEF 修正の 1 回目。版 5）: 同じサイト（ターゲット設定の許可 Origin のどれか）を読んだ前のワーカーが終わった時刻（エポックからの ms。0 以上の安全な
+   * 整数。ただの数で、秘密ではない）。親がメモリに持ち、あるときだけ入れる。ワーカーは、最初の読み込みの前に、この時刻を前の読み込みとして pacer
+   * （`createNavigationPacer` の `initial`）に渡し、読み込みの間隔（`crawl.minNavigationIntervalMs`）を空ける。省略は待たない。
+   */
+  readonly previousNavigationAtMs?: number;
 }
 
 /** FM2d: まとめて実行の段の並び（`START` の `chain`）。 */
 export interface WorkerStartChain {
   readonly stages: WorkerChainStageSequence;
+  /**
+   * OP-2（設計書 4.1.2 の案 C）: 読み取りの段の後に、書き込みの段（`WORKER_CHAIN_WRITE_STAGE_JOB_KINDS`）を続けられる（真だけ。省略は今のまま）。親が、チェックした
+   * 画面があるときだけ入れる。ワーカーは、読み取りの段の後に、書き込みの段の `NEXT_STAGE` か `CHAIN_END` を待つ。
+   */
+  readonly writeStages?: true;
+  /**
+   * OP-H（撮影 UI-W4 の 3。設計者の判断（案 (a)））: この点検で、読み取りの段の後に登録・更新を試す、チェックした画面の数（1 以上の整数。画面の名前や path は
+   * 持たない）。`writeStages` と必ず一緒（片方だけは受けない）。ワーカーは、監査の段の報告のまとめに「この後に登録・更新する」1 行を出すために、監査の中核の指定
+   * （`AuditRunOptions.plannedWriteScreenCount`）へ写す。
+   */
+  readonly writeScreenCount?: number;
 }
 
 /**
@@ -735,6 +790,18 @@ export const WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY: readonly WorkerJobKind[] =
   'AUDIT',
   'DISCOVERY',
   'READ_CHECK',
+] satisfies WorkerJobKind[]);
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: `START` に監査の段の送信の扱い（`auditSendPolicy`）を持てるジョブの種類。結果に送信の扱いの
+ * 要約を持つ種類（`WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY`）に、書き込みのジョブを足したもの（書き込みの段の Context にも、監査の段と同じ送信の扱いを渡す）。
+ * ログインの確かめと入口の確かめは持たない（ログインの段には口を渡さない）。項目を足すだけで形は変えないので、版は上げない（古いワーカーは書き込みのジョブの項目を
+ * 拒む。fail-closed）。
+ */
+export const WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY: readonly WorkerJobKind[] = Object.freeze([
+  ...WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY,
+  'WRITE_CREATE',
+  'WRITE_UPDATE',
 ] satisfies WorkerJobKind[]);
 
 /** FM-2: ジョブのブラウザの表示の設定を持てるジョブの種類（Run の Browser を起動する種類。ログインの確かめと入口の確かめは持たない）。 */
@@ -760,7 +827,8 @@ export type WorkerStartWriteField = Pick<CandidateField, 'name' | 'readonly' | '
  * - `candidateFields`: 承認した候補の欄（名前・型・readonly・hidden・disabled。照合の名前の一覧を作るのに使う。値は持たない）。
  * - `values`: 送る欄の生成した値（欄の名前 → 値。null は、その欄を選ばない・送らない）。送れる欄だけ（hidden・readonly・disabled・password・
  *   file・`_method` でない）。
- * - `verification`: 結果の判定の 2 つの条件と、登録の ID の取り方（どれも指定済み）。
+ * - `verification`: 結果の判定のしかたの印（PL-6a。構造の判定 `FORM_STRUCTURE`。人が入れた成否の条件を置き換えた）と、登録の ID の取り方（ID の型の
+ *   一覧。PL-5 の 9 の (4): 決められなかったときは null）。
  * - `readVerification`: 照合の READ（READ の定義の id と版、対象の画面、生成した値を結び付けた送る値と、生成した値で作った期待）。
  * - `update`（T31f。Task 31 の設計書 4 章の「IPC」）: UPDATE の指定。`WRITE_UPDATE` で必ず持ち、ほかの種類では持てない。UPDATE では、`formPage` の
  *   path と `request` の path は、親がシナリオの path の型に対象の ID を入れた具体的な path（ワーカーは型を扱わない）。`values` は変える欄の新しい
@@ -782,9 +850,9 @@ export interface WorkerStartWrite {
   readonly candidateFields: readonly WorkerStartWriteField[];
   readonly values: Readonly<Record<string, string | null>>;
   readonly verification: {
-    readonly successCondition: ScenarioResultCondition;
-    readonly inputErrorCondition: ScenarioResultCondition;
-    readonly recordId: ScenarioRecordIdSpec;
+    readonly resultJudgement: ScenarioResultJudgement;
+    /** PL-5 の 9 の (4)（設計書 8.1）: 決められなかった ID の取り方は null（ワーカーは ID を取らない。結果は ID なしの `PARTIAL`）。 */
+    readonly recordId: FormRecordIdSpec | null;
   };
   readonly readVerification: WorkerStartReadCheck;
   /** T31f: UPDATE の指定（`WRITE_UPDATE` だけ）。 */
@@ -829,8 +897,8 @@ export interface WorkerStartApiWrite {
    * 検証の指定の `recordId`（保存の後の画面の URL・要素）で、API の `recordId`（応答の本文の鍵）があれば null でもよい（2 つとも null は契約で拒む）。
    */
   readonly verification: {
-    readonly successCondition: null;
-    readonly inputErrorCondition: null;
+    /** PL-6a: API の書き込みは結果の判定のしかたの印を持たない（応答の状態で決める）。 */
+    readonly resultJudgement: null;
     readonly recordId: ScenarioRecordIdSpec | null;
   };
   readonly readVerification: WorkerStartReadCheck;
@@ -904,6 +972,105 @@ export interface WorkerStartAuthentication {
   readonly approvedServiceOrigins?: readonly string[];
   readonly authenticationSha256: string;
   readonly automatedLogin?: WorkerStartAutomatedLogin;
+  /**
+   * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: 手動のログインの成功の直後に、親の登録の返事を待つ（まとめて実行の手動のログインだけ。
+   * `automatedLogin` と一緒には持てない）。`authenticationSha256` には入れない。
+   */
+  readonly loginRegistration?: WorkerStartLoginRegistration;
+}
+
+/**
+ * OP-1: ログインの直後の登録の指定。`credentialRoot` は、受け取りを許すときだけ資格情報のフォルダを決める根の絶対パス（親が、資格情報のファイルがなく、
+ * 自動ログインに切り替えられるプロファイルのときだけ入れる）。許さないときは `null`（ワーカーは値を受け取らない）。
+ */
+export interface WorkerStartLoginRegistration {
+  readonly credentialRoot: string | null;
+}
+
+/**
+ * OP-1: 受け取った資格情報を書いてよい（親 → 子）。親が登録と自動ログインへの切り替えを組み立て、検証を通した後に 1 回だけ送る。`loginOrigin` は資格情報を
+ * 結びつけるログインの Origin（正規の直列化）。値を持たない。
+ */
+export interface WorkerCredentialSaveAllowedMessage extends WorkerMessageBase<'CREDENTIAL_SAVE_ALLOWED'> {
+  readonly loginOrigin: string;
+}
+
+/**
+ * OP-1: ログインの直後の登録を保存した（親 → 子）。新しい認証の設定と承認したサービスの Origin と、その SHA-256（`workerAuthenticationDigestOf` を、ワーカーの
+ * `START` のジョブの種類と許可 Origin と、自動ログインの指定なしで求めたもの）。ワーカーは、求め直して比べてから、この後の段に使う。
+ */
+export interface WorkerLoginRegisteredMessage extends WorkerMessageBase<'LOGIN_REGISTERED'> {
+  readonly setup: AuthSetup;
+  readonly approvedServiceOrigins: readonly string[];
+  readonly authenticationSha256: string;
+}
+
+/** OP-1: ログインの直後の登録をしなかった（親 → 子。項目なし）。ワーカーは今の設定のまま進む（受け取った値は捨てる）。 */
+export type WorkerLoginRegistrationSkippedMessage = WorkerMessageBase<'LOGIN_REGISTRATION_SKIPPED'>;
+
+/**
+ * OP-L（L2）: ワーカーが受け取った資格情報を書けなかった理由のコード（閉じた一覧。値を持たない）。資格情報のファイルの部品の誤りのコード
+ * （`CREDENTIAL_STORE_ERROR_CODES`）と、暗号化の部品の誤りのコード（`CREDENTIAL_PROTECTION_ERROR_CODES`）を、そのまま運ぶ。
+ * この一覧は画面のコードにも読まれるので、Node 専用の 2 つの部品を実行時に読み込まずに、ここに書き写す（owner の一覧との一致は
+ * `tests/unit/worker-protocol-login-registration.test.ts`）。ほかに次の 2 つ。
+ * - `CREDENTIAL_SAVE_UNAVAILABLE`: 書く口がない。
+ * - `CREDENTIAL_SAVE_FAILED`: 上のどれでもない失敗（誤りの文は使わない。値を含みうる）。
+ */
+export const WORKER_CREDENTIAL_SAVE_FAILURE_CODES = Object.freeze([
+  'CREDENTIAL_PROFILE_ID_INVALID',
+  'CREDENTIAL_ORIGIN_INVALID',
+  'CREDENTIAL_VALUE_EMPTY',
+  'CREDENTIAL_VALUE_TOO_LONG',
+  'CREDENTIAL_VALUE_TOO_SHORT',
+  'CREDENTIAL_VALUE_MALFORMED',
+  'CREDENTIAL_CHANGE_EMPTY',
+  'CREDENTIAL_ALREADY_EXISTS',
+  'CREDENTIAL_MISSING',
+  'CREDENTIAL_STALE',
+  'CREDENTIAL_FILE_INVALID',
+  'CREDENTIAL_READ_FAILED',
+  'CREDENTIAL_PLATFORM_UNSUPPORTED',
+  'CREDENTIAL_STORAGE_UNSAFE',
+  'CREDENTIAL_REPLACE_FAILED',
+  'CREDENTIAL_DELETE_FAILED',
+  'PROTECTION_UNAVAILABLE',
+  'PROTECTION_FAILED',
+  'PROTECTION_TIMEOUT',
+  'PROTECTION_INPUT_INVALID',
+  'CREDENTIAL_SAVE_UNAVAILABLE',
+  'CREDENTIAL_SAVE_FAILED',
+] as const);
+export type WorkerCredentialSaveFailureCode = (typeof WORKER_CREDENTIAL_SAVE_FAILURE_CODES)[number];
+/** 上のどれでもない失敗のコード。 */
+export const WORKER_CREDENTIAL_SAVE_FAILED = 'CREDENTIAL_SAVE_FAILED' satisfies WorkerCredentialSaveFailureCode;
+/** 書く口がないときのコード。 */
+export const WORKER_CREDENTIAL_SAVE_UNAVAILABLE = 'CREDENTIAL_SAVE_UNAVAILABLE' satisfies WorkerCredentialSaveFailureCode;
+
+/** 書けなかった理由の閉じた一覧の値か。 */
+export const isWorkerCredentialSaveFailureCode = (value: unknown): value is WorkerCredentialSaveFailureCode =>
+  (WORKER_CREDENTIAL_SAVE_FAILURE_CODES as readonly unknown[]).includes(value);
+
+/** 誤りの `code` が、書けなかった理由の閉じた一覧の値なら、その値（ほかは `CREDENTIAL_SAVE_FAILED`）。誤りの文は読まない。 */
+export const workerCredentialSaveFailureCodeOf = (error: unknown): WorkerCredentialSaveFailureCode => {
+  const code = errorCodeOf(error);
+  return isWorkerCredentialSaveFailureCode(code) ? code : WORKER_CREDENTIAL_SAVE_FAILED;
+};
+
+/**
+ * OP-1: 受け取った資格情報を書いたか（子 → 親）。書いたときだけ資格情報の改訂の番号。値を持たない。OP-L（L2）: 書けなかったときだけ、その理由のコード
+ * （`failureCode`。閉じた一覧）。
+ */
+export interface WorkerCredentialSavedMessage extends WorkerMessageBase<'CREDENTIAL_SAVED'> {
+  readonly saved: boolean;
+  readonly credentialRevision: number | null;
+  readonly failureCode: WorkerCredentialSaveFailureCode | null;
+}
+
+/** OP-1: 値の受け取りのメタデータ（`AUTH_STATE` の `credentialCapture`。手動のログインの成功だけ）。値を持たない。 */
+export interface WorkerCredentialCapture {
+  readonly captured: boolean;
+  /** 値を運んだ、観察した送り先（受け取ったときだけ）。 */
+  readonly carriedBy: { readonly origin: string; readonly path: string } | null;
 }
 
 /**
@@ -942,6 +1109,11 @@ export interface WorkerNextStageMessage extends WorkerMessageBase<'NEXT_STAGE'> 
   readonly jobId: string;
   readonly jobKind: WorkerNextStageJobKind;
   readonly readChecks?: readonly WorkerStartReadCheck[];
+  /**
+   * OP-2（設計書 4.1.2 の案 C）: 書き込みの段の書き込みの指定（`START` の `write` と同じ形。書き込みの段だけ必ず持つ）。親が、段の前ごとに許可を発行し、
+   * 消費し、値を作り、送る前の記録を書いてから載せる。ワーカーは、`START` の確かめ（承認したサービスの Origin を含む）と同じ確かめをしてから使う。
+   */
+  readonly write?: WorkerStartWrite | WorkerStartApiWrite;
 }
 
 /** FM2d: まとめて実行の次の段を始めない（親 → 子。項目なし）。ワーカーは、終えた段の終了コードで終える。 */
@@ -953,7 +1125,10 @@ export type ParentToWorkerMessage =
   | WorkerWriteRecheckResultMessage
   | WorkerLoginConfirmedMessage
   | WorkerNextStageMessage
-  | WorkerChainEndMessage;
+  | WorkerChainEndMessage
+  | WorkerCredentialSaveAllowedMessage
+  | WorkerLoginRegisteredMessage
+  | WorkerLoginRegistrationSkippedMessage;
 
 /** 再開の判断（`RESUME` のときだけ、保存の、監査を終えたページの数を持つ）。 */
 export type WorkerResumeDecision =
@@ -1048,6 +1223,12 @@ export interface WorkerAuthStateMessage extends WorkerMessageBase<'AUTH_STATE'> 
    * `blockedRequests` と同じ状態だけが持てる。ログインの段の終わりに状態を読んだときだけ送る。値を持たない。
    */
   readonly loginStateNames?: WorkerLoginStateNames;
+  /**
+   * OP-1（D3）: BeakSight がログインの終わりを自分で判定できるか（`AWAITING_LOGIN` だけが持てる）。真なら、画面は「ログインを終えた」を出さない。
+   */
+  readonly loginEndDetection?: boolean;
+  /** OP-1（D2）: 値の受け取りのメタデータ（手動のログインの成功だけが持てる。値を持たない）。 */
+  readonly credentialCapture?: WorkerCredentialCapture;
 }
 
 /**
@@ -1163,7 +1344,8 @@ export type WorkerToParentMessage =
   | WorkerFinishedMessage
   | WorkerFailedMessage
   | WorkerWriteRecheckRequestMessage
-  | WorkerWriteSubmissionMessage;
+  | WorkerWriteSubmissionMessage
+  | WorkerCredentialSavedMessage;
 
 /** 検証の結果。受けるときは深く凍結した写し、拒むときは英語の技術的な誤りの一覧（1 件以上）。 */
 export type WorkerMessageValidation<Message> =
@@ -1251,9 +1433,15 @@ const isObservedQuery = ({ names, values }: WorkerLoginObservedQuery): boolean =
 };
 
 /** T43d: 観察の誤り（スキーマで書けない規則）。誤りの文に値を入れない。 */
-const loginObservationErrors = ({ storageKeys, successSelector, credentialDiscarded, loginFields }: WorkerLoginObservation): readonly string[] => {
+/** OP-1: 成功の画面の path の案の形（`/` で始まり、空でない区切りが 1 つ以上。値に見える区切りを含まない。制御文字を含まない）。 */
+export const isSuccessPathPrefix = (value: string): boolean =>
+  value.startsWith('/') && value.slice(1).split('/').every((segment) => segment.length > 0) && isCleanText(value, MAX_WORKER_SUCCESS_PATH_PREFIX_LENGTH)
+  && !hasValueLikePathSegment(value);
+
+const loginObservationErrors = ({ storageKeys, successSelector, credentialDiscarded, loginFields, successPathPrefix }: WorkerLoginObservation): readonly string[] => {
   const errors: string[] = [];
-  if (storageKeys === undefined && successSelector === undefined && credentialDiscarded === undefined && loginFields === undefined) {
+  if (storageKeys === undefined && successSelector === undefined && credentialDiscarded === undefined && loginFields === undefined
+    && successPathPrefix === undefined) {
     errors.push('/loginObservation must have the storage key shapes, the success selector, the discarded count or the login fields');
   }
   if (loginFields !== undefined) {
@@ -1396,6 +1584,15 @@ const parentRuleErrors = (message: ParentToWorkerMessage): readonly string[] => 
   if (message.type === 'NEXT_STAGE') {
     return nextStageRuleErrors(message);
   }
+  // OP-1: 値の保存の許しの Origin は正規の直列化。登録した新しい設定は、SHA-256 の形と、サービスの Origin の規則（`START` と同じ）。
+  if (message.type === 'CREDENTIAL_SAVE_ALLOWED') {
+    return canonicalHttpOriginOf(message.loginOrigin) === message.loginOrigin
+      ? []
+      : ['/loginOrigin must be the canonical serialization of an http(s) origin'];
+  }
+  if (message.type === 'LOGIN_REGISTERED') {
+    return loginRegisteredRuleErrors(message);
+  }
   if (message.type !== 'START') {
     return [];
   }
@@ -1416,13 +1613,23 @@ const parentRuleErrors = (message: ParentToWorkerMessage): readonly string[] => 
   if (message.showJobBrowser !== undefined && !WORKER_JOB_KINDS_WITH_JOB_BROWSER.includes(message.jobKind)) {
     errors.push(`/showJobBrowser is not allowed for ${message.jobKind}`);
   }
-  // AS-b: 監査の段の送信の扱いは、監査・発見・READ の確かめのジョブだけが持てる（値の一覧はスキーマが確かめる）。
-  if (message.auditSendPolicy !== undefined && !WORKER_JOB_KINDS_WITH_AUDIT_SEND_POLICY.includes(message.jobKind)) {
+  // AS-b: 監査の段の送信の扱いは、監査・発見・READ の確かめのジョブだけが持てる（値の一覧はスキーマが確かめる）。OP-N: 書き込みのジョブも持てる。
+  if (message.auditSendPolicy !== undefined && !WORKER_JOB_KINDS_ACCEPTING_AUDIT_SEND_POLICY.includes(message.jobKind)) {
     errors.push(`/auditSendPolicy is not allowed for ${message.jobKind}`);
   }
   // PRE42-BN: プロファイルの名前（バンドルのファイル名だけに使う）は、監査のジョブだけが持てる（長さはスキーマが確かめる）。
   if (message.profileName !== undefined && message.jobKind !== WORKER_AUDIT_JOB_KIND) {
     errors.push(`/profileName is not allowed for ${message.jobKind}`);
+  }
+  // OP-1: ログインの直後の登録は、まとめて実行の手動のログインだけ（自動ログインの指定と一緒に持てない）。受け取りの根は絶対パス。
+  const loginRegistration = message.authentication?.loginRegistration;
+  if (loginRegistration !== undefined) {
+    if (message.chain === undefined || message.authentication?.automatedLogin !== undefined) {
+      errors.push('/authentication/loginRegistration is allowed only for a chained run with the manual login');
+    }
+    if (loginRegistration.credentialRoot !== null && !isCredentialRoot(loginRegistration.credentialRoot)) {
+      errors.push('/authentication/loginRegistration/credentialRoot must be a clean absolute path');
+    }
   }
   // T26d-2: ログインの検証は、自動ログインの指定を必ず持つ（手動のログインと公開の監査では行わない）。
   if (message.jobKind === WORKER_LOGIN_CHECK_JOB_KIND && message.authentication?.automatedLogin === undefined) {
@@ -1484,6 +1691,21 @@ const parentRuleErrors = (message: ParentToWorkerMessage): readonly string[] => 
 const isChainStageSequence = (stages: readonly string[]): boolean =>
   WORKER_CHAIN_STAGE_SEQUENCES.some((sequence) => sequence.length === stages.length && sequence.every((kind, index) => stages[index] === kind));
 
+/**
+ * OP-2: 書き込みの段の `NEXT_STAGE` を、その段の `START` の形にする（ワーカーが、`START` と同じ確かめ `validateParentToWorkerMessage` で、承認したサービスの
+ * Origin を含めて確かめる。まとめて実行の印と READ の定義は外す）。書き込みの段でなければ null。
+ */
+export const nextStageWriteStartOf = (start: WorkerStartMessage, next: WorkerNextStageMessage): WorkerStartMessage | null => {
+  if (!isWorkerChainWriteStageJobKind(next.jobKind) || next.write === undefined) {
+    return null;
+  }
+  const { chain: _chain, readChecks: _readChecks, showJobBrowser: _shown, auditSendPolicy: _policy, profileName: _name, ...rest } = start;
+  const authentication = start.authentication === undefined
+    ? undefined
+    : (({ loginRegistration: _registration, ...kept }) => kept)(start.authentication);
+  return { ...rest, jobId: next.jobId, jobKind: next.jobKind, ...(authentication === undefined ? {} : { authentication }), write: next.write };
+};
+
 /** FM2d: `START` の `chain` の、スキーマで書けない規則の誤り（並びの一覧、最初の段の種類、認証つき）。 */
 const chainRuleErrors = (message: WorkerStartMessage, chain: WorkerStartChain): readonly string[] => {
   const errors: string[] = [];
@@ -1496,14 +1718,36 @@ const chainRuleErrors = (message: WorkerStartMessage, chain: WorkerStartChain): 
   if (message.authentication === undefined) {
     errors.push('/authentication is required for the chained run');
   }
+  // OP-H: チェックした画面の数は、書き込みの段の印と必ず一緒（数の形はスキーマが確かめる）。
+  if ((chain.writeStages === true) !== (chain.writeScreenCount !== undefined)) {
+    errors.push('/chain/writeScreenCount is required with /chain/writeStages and allowed only with it');
+  }
   return errors;
 };
 
-/** FM2d: `NEXT_STAGE` の、スキーマで書けない規則の誤り（ジョブの ID の形、READ の確かめだけが定義の一覧を持つ、定義の一覧の規則）。 */
+/**
+ * FM2d: `NEXT_STAGE` の、スキーマで書けない規則の誤り（ジョブの ID の形、READ の確かめだけが定義の一覧を持つ、定義の一覧の規則）。OP-2: 書き込みの段だけが
+ * 書き込みの指定を持ち（更新の段だけが UPDATE の指定を持つ）、形の規則は `START` と同じ（API の送り先の Origin の確かめは、`START` の承認したサービスの Origin が
+ * 要るので、ワーカーが `START` の確かめ（`nextStageWriteStartOf`）で行う）。
+ */
 const nextStageRuleErrors = (message: WorkerNextStageMessage): readonly string[] => {
   const errors: string[] = [];
   if (!WORKER_JOB_ID_PATTERN.test(message.jobId)) {
     errors.push(`/jobId must match ${WORKER_JOB_ID_PATTERN.source}`);
+  }
+  if (isWorkerChainWriteStageJobKind(message.jobKind)) {
+    if (message.write === undefined) {
+      errors.push(`/write is required for ${message.jobKind}`);
+    } else {
+      if ((message.jobKind === WORKER_WRITE_UPDATE_JOB_KIND) !== (message.write.update !== undefined)) {
+        errors.push(`/write/update is required for ${WORKER_WRITE_UPDATE_JOB_KIND} and allowed only for it`);
+      }
+      if (!isWorkerStartApiWrite(message.write)) {
+        errors.push(...writeRuleErrors(message.write));
+      }
+    }
+  } else if (message.write !== undefined) {
+    errors.push(`/write is allowed only for ${WORKER_WRITE_JOB_KINDS.join(' and ')}`);
   }
   if (message.jobKind === WORKER_READ_CHECK_JOB_KIND) {
     if (message.readChecks === undefined) {
@@ -1653,9 +1897,13 @@ const apiWriteRuleErrors = (write: WorkerStartApiWrite, approvedServiceOrigins: 
   });
   errors.push(...readCheckItemRuleErrors(WRITE_READ_VERIFICATION_POINTER_SEGMENTS, write.readVerification, false));
   const { targetPage, definition } = write.readVerification;
-  if (definition.targetPagePath !== undefined && (!isReadCheckPageTemplatePath(definition.targetPagePath)
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、書き込みの画面（登録の画面）の 1 つ上の
+  // 一覧の画面の path（唯一の判定 `readListPagePathOf`）も受ける（送る値なし。下の生成した値と比べる期待の確かめは同じ）。
+  const listPagePath = update === undefined ? readListPagePathOf(write.formPage.path) : null;
+  if (definition.targetPagePath !== undefined && (
+    !(isReadCheckPageTemplatePath(definition.targetPagePath) || (listPagePath !== null && definition.targetPagePath === listPagePath))
     || targetPage === null || !isOriginInAllowedOrigins([write.formPage.origin], targetPage.origin))) {
-    errors.push('/write/readVerification/definition must target a READ candidate or a page path template on the origin of the page of the write');
+    errors.push('/write/readVerification/definition must target a READ candidate or a page path template (or the list page one above the create page) on the origin of the page of the write');
   }
   // T40R-fix-B（I-2 (a)）: `{id}` の型の照合の READ は、生成した値と比べる期待を 1 つ以上持つ（保存の確かめと同じ `hasGeneratedValueExpectation`）。
   // T40R2-fix（M-1）: 比べる値は、送る値（生成した値。null を除く）のどれか（書き写した文字ではない）。実行のたびに変わる欄かは、入力の規則を読める
@@ -1897,6 +2145,39 @@ const authenticationRuleErrors = (authentication: WorkerStartAuthentication): re
 };
 
 /**
+ * OP-1: `LOGIN_REGISTERED` の、スキーマで書けない規則の誤り: SHA-256 の形と、サービスの Origin が正規の直列化であること（許可 Origin との重なりと、設定の
+ * 送信先の Origin がサービスの Origin に含まれることは、ワーカーが `START` の許可 Origin で確かめ直す。`loginRegisteredAuthenticationErrors`）。
+ */
+const loginRegisteredRuleErrors = (message: WorkerLoginRegisteredMessage): readonly string[] => {
+  const errors: string[] = [];
+  if (!WORKER_AUTHENTICATION_SHA256_PATTERN.test(message.authenticationSha256)) {
+    errors.push(`the digest of the registered authentication must match ${WORKER_AUTHENTICATION_SHA256_PATTERN.source}`);
+  }
+  message.approvedServiceOrigins.forEach((origin, index) => {
+    if (canonicalHttpOriginOf(origin) !== origin) {
+      errors.push(`/approvedServiceOrigins/${index} must be the canonical serialization of an http(s) origin`);
+    }
+  });
+  return errors;
+};
+
+/**
+ * OP-1: ワーカーが、`LOGIN_REGISTERED` の新しい設定を、`START` の許可 Origin と合わせて確かめる（`START` の認証の指定と同じ規則。自動ログインの指定は持たない）。
+ * 誤りがなければ空。
+ */
+export const loginRegisteredAuthenticationErrors = (
+  message: WorkerLoginRegisteredMessage,
+  approvedTestOrigins: readonly string[],
+): readonly string[] =>
+  // 自動ログインのセレクタ（切り替えた設定）は、この Run では使わない（ログインは済んでいる）ので、自動ログインの指定の有無の規則からは外して確かめる。
+  authenticationRuleErrors({
+    setup: { ...message.setup, automatedLogin: null },
+    approvedTestOrigins,
+    approvedServiceOrigins: message.approvedServiceOrigins,
+    authenticationSha256: message.authenticationSha256,
+  });
+
+/**
  * `AUTH_STATE` の自動ログインの結果の、スキーマで書けない規則の誤り（T26d-2）: 結果を持てる状態、`AUTOMATED_LOGIN_FAILED` は成功以外の結果を
  * 必ず持つ、ほかの状態は成功の結果だけ、成功は送信 `YES` だけ、`Retry-After` の期限は 429 のときだけ（14 桁）、理由のコードはフォームの
  * 確かめのときだけ。
@@ -2013,6 +2294,32 @@ const workerRuleErrors = (message: WorkerToParentMessage): readonly string[] => 
           return ['/loginObservation/loginFields is only for the success of the manual login stage'];
         }
       }
+      // OP-1: ログインの終わりを判定できるかの印は、ログインを待っている知らせだけ。受け取りのメタデータは、手動のログインの成功だけ（送り先は受け取ったときだけ）。
+      if (message.loginEndDetection !== undefined && state !== WORKER_AWAITING_LOGIN_STATE) {
+        return [`/loginEndDetection is only for ${WORKER_AWAITING_LOGIN_STATE}`];
+      }
+      if (message.credentialCapture !== undefined) {
+        const { captured, carriedBy } = message.credentialCapture;
+        if (state !== 'AUTHENTICATED' || message.automatedLogin !== undefined) {
+          return ['/credentialCapture is only for the success of the manual login stage'];
+        }
+        if (captured !== (carriedBy !== null)) {
+          return ['/credentialCapture/carriedBy must be present exactly when captured'];
+        }
+        const { origin: carriedOrigin, path: carriedPath } = carriedBy ?? { origin: '', path: '' };
+        if (carriedBy !== null && (canonicalHttpOriginOf(carriedOrigin) !== carriedOrigin || !isBlockedRequestPath(carriedPath))) {
+          return ['/credentialCapture/carriedBy must be a canonical origin and a path'];
+        }
+      }
+      const successPathPrefix = message.loginObservation?.successPathPrefix;
+      if (successPathPrefix !== undefined) {
+        if (state !== 'AUTHENTICATED' || message.automatedLogin !== undefined) {
+          return ['/loginObservation/successPathPrefix is only for the success of the manual login stage'];
+        }
+        if (!isSuccessPathPrefix(successPathPrefix)) {
+          return ['/loginObservation/successPathPrefix must be path segments that are not value-like'];
+        }
+      }
       // DEF-139: 状態の名前の記録も、ログインの段の結果だけが持てる。
       if (message.loginStateNames !== undefined) {
         if (!mayCarryLoginStageCounts(state, message.automatedLogin)) {
@@ -2074,6 +2381,14 @@ const workerRuleErrors = (message: WorkerToParentMessage): readonly string[] => 
       return (message.submission === 'NOT_SENT') === (message.blockReason !== null)
         ? []
         : ['/blockReason must be a reason exactly when the submission is NOT_SENT'];
+    case 'CREDENTIAL_SAVED':
+      // OP-1: 書いたときだけ、資格情報の改訂の番号を持つ。
+      // OP-L（L2）: 書けなかったときだけ、閉じた一覧の理由のコードを持つ（一覧の値はスキーマで確かめる）。
+      return message.saved === (message.credentialRevision !== null)
+        && (message.credentialRevision === null || (Number.isSafeInteger(message.credentialRevision) && message.credentialRevision >= MIN_WORKER_CREDENTIAL_REVISION))
+        && message.saved === (message.failureCode === null)
+        ? []
+        : ['/credentialRevision and /failureCode must be a credential revision exactly when saved, and a failure code exactly when not saved'];
     case 'READY':
     case 'PROGRESS':
     case 'HEARTBEAT':

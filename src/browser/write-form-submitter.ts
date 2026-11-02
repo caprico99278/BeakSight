@@ -113,7 +113,15 @@ import {
 } from '../safety/write-payload-policy.js';
 import { isPageIssuedTokenFieldName, isSecretLikeStateField, isUnreadableSecretField } from '../discovery/read-check-contracts.js';
 import { elementPathSelectorOf } from './element-path-engine.js';
-import { FORM_POST_METHOD, FORM_SELF_TARGETS, FORM_STEP_TIMEOUT_MS, lineFeedForm, sameValue } from './form-submission-common.js';
+import {
+  FORM_POST_METHOD,
+  FORM_SELF_TARGETS,
+  FORM_STEP_TIMEOUT_MS,
+  lineFeedForm,
+  sameValue,
+  valueChangeKindOf,
+  type WriteInputValueChange,
+} from './form-submission-common.js';
 
 /** フォームを読む・値を入れる・送る、それぞれの時間の上限（ms。ログインの入力の部品と同じ値）。 */
 export const WRITE_FORM_STEP_TIMEOUT_MS = FORM_STEP_TIMEOUT_MS;
@@ -239,11 +247,23 @@ export type WriteFormInspection =
   | { readonly ok: true; readonly form: InspectedWriteForm }
   | { readonly ok: false; readonly reason: WriteFormReason };
 
-export type WriteFormStepResult = { readonly ok: true } | { readonly ok: false; readonly reason: WriteFormReason };
+/**
+ * OP-O（O1）: 値が生成した値のとおりでなかった（`VALUE_NOT_APPLIED`）ときの細目（値と、値の長さは持たない）。`fieldIndex` は送る欄の名前（`submittedFieldNames`）の
+ * 順の 0 から、`fieldType` はその欄の型、`valueChange` は text 系・textarea の欄で読み直した値を読めたときの、変わり方の区分。
+ */
+export interface WriteFormValueDetail {
+  readonly fieldIndex: number;
+  readonly fieldType: string;
+  readonly valueChange?: WriteInputValueChange;
+}
+
+export type WriteFormStepResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: WriteFormReason; readonly valueDetail?: WriteFormValueDetail };
 
 export type WriteFormSubmission =
   | { readonly ok: true; readonly outcome: 'SUBMITTED' }
-  | { readonly ok: false; readonly reason: WriteFormReason; readonly clickAttempted: boolean };
+  | { readonly ok: false; readonly reason: WriteFormReason; readonly clickAttempted: boolean; readonly valueDetail?: WriteFormValueDetail };
 
 /** 選んで送る欄の型（checkbox と radio）。 */
 const CHECKABLE_TYPES: ReadonlySet<CandidateFieldType> = new Set(['checkbox', 'radio']);
@@ -1172,6 +1192,38 @@ function inputOperationsOf(
   return operations;
 }
 
+/**
+ * OP-O（O1）: 生成した値のとおりでない、最初の送る欄の細目（`valuesApplied` と同じ比べ方。どれも同じか、欄がなければ null。値は返さない）。
+ */
+function valueNotAppliedDetailOf(
+  spec: WriteFormSpec,
+  form: ReadForm,
+  values: Readonly<Record<string, string | null>>,
+): WriteFormValueDetail | null {
+  for (const [fieldIndex, name] of spec.submittedFieldNames.entries()) {
+    const first = form.controls.find((control) => control.name === name);
+    if (first === undefined || valuesApplied({ ...spec, submittedFieldNames: [name] }, form, values)) {
+      continue;
+    }
+    const value = values[name] ?? null;
+    const textual = !CHECKABLE_TYPES.has(first.type as CandidateFieldType) && !SELECT_TYPES.has(first.type as CandidateFieldType);
+    return textual && value !== null && first.value !== null
+      ? { fieldIndex, fieldType: first.type, valueChange: valueChangeKindOf(value, first.value) }
+      : { fieldIndex, fieldType: first.type };
+  }
+  return null;
+}
+
+/** OP-O（O1）: `VALUE_NOT_APPLIED` の失敗（分かれば細目を添える）。 */
+const valueNotAppliedOf = (
+  spec: WriteFormSpec,
+  form: ReadForm,
+  values: Readonly<Record<string, string | null>>,
+): { readonly ok: false; readonly reason: 'VALUE_NOT_APPLIED'; readonly valueDetail?: WriteFormValueDetail } => {
+  const valueDetail = valueNotAppliedDetailOf(spec, form, values);
+  return valueDetail === null ? { ok: false, reason: 'VALUE_NOT_APPLIED' } : { ok: false, reason: 'VALUE_NOT_APPLIED', valueDetail };
+};
+
 /** 読み直した値が、生成した値のとおりか。 */
 function valuesApplied(spec: WriteFormSpec, form: ReadForm, values: Readonly<Record<string, string | null>>): boolean {
   return spec.submittedFieldNames.every((name) => {
@@ -1245,7 +1297,7 @@ export async function fillWriteForm(
     if (state.update !== undefined && !matchesPrior(after.form, state.update.roles, state.update.prior, false)) {
       return { ok: false, reason: 'PRIOR_VALUE_CHANGED' };
     }
-    return valuesApplied(state.spec, after.form, values) ? { ok: true } : { ok: false, reason: 'VALUE_NOT_APPLIED' };
+    return valuesApplied(state.spec, after.form, values) ? { ok: true } : valueNotAppliedOf(state.spec, after.form, values);
   } catch {
     return { ok: false, reason: 'INPUT_FAILED' };
   }
@@ -1277,7 +1329,7 @@ export async function submitWriteForm(
     return { ok: false, reason: 'PRIOR_VALUE_CHANGED', clickAttempted: false };
   }
   if (!valuesApplied(state.spec, checked.form, values)) {
-    return { ok: false, reason: 'VALUE_NOT_APPLIED', clickAttempted: false };
+    return { ...valueNotAppliedOf(state.spec, checked.form, values), clickAttempted: false };
   }
   try {
     // T32R-fix-I1: 合図つきの Locator で、送信ボタンの位置の要素が確かめの時の要素かを照らしてから押す（入れ替わっていれば押さずに

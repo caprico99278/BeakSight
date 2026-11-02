@@ -12,6 +12,7 @@
 import type { AuditConfig } from '../config/types.js';
 import { isPortableRelativeArtifactPath } from '../core/artifact-layout.js';
 import { isRecord } from '../core/guards.js';
+import { isSecretLikeText } from '../core/secret-like-text.js';
 import { deepFreeze } from '../core/immutable.js';
 import { hasBidiControl, hasControlOrLineSeparator, hasLoneSurrogate } from '../core/text.js';
 import { canonicalHttpOriginOf, isLoopbackUrl, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
@@ -208,6 +209,12 @@ const evidenceErrors = (profile: SiteProfile): readonly ProfileValidationError[]
       'PROFILE_ENVIRONMENT_EVIDENCE_REQUIRED',
       `environmentEvidenceRef must be at most ${MAX_ENVIRONMENT_EVIDENCE_REF_LENGTH} UTF-16 code units, must not be blank or only `
         + 'zero width characters, and must not contain control characters, line breaks, bidirectional controls or lone surrogates',
+    ));
+  } else if (isSecretLikeText(evidence)) {
+    // PL-F 修正の 1 回目（PL-REV の Minor 2）: 秘密に見える参照（userinfo のある URL、秘密に見える名前の `name=value`、認証の scheme と値）は書かせない。
+    errors.push(errorOf(
+      'ISOLATION_REFERENCE_SECRET_LIKE',
+      'environmentEvidenceRef must not contain a secret-like value (a URL with userinfo, a secret-like name=value pair, or an authorization scheme with a value)',
     ));
   }
   return errors;

@@ -101,6 +101,16 @@ export const DISCOVERY_CREATE_WORDS = Object.freeze([
 ] as const);
 
 /**
+ * OP-I（I2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 操作さがしの段で、先に読む登録の画面らしいリンクの語（登録の語と、
+ * 「新しく」）。リンクの文字・`aria-label`・`title`・アドレスの path の語に当てる（比べ方は登録の語と同じ。`classify.ts` の `isCreatePageLink`）。読む順だけに
+ * 使う（候補の分類・`submitterWords`・識別の digest・成果物のスキーマには入れない。読むかどうかの判定は今の除外の判定のまま）。
+ */
+export const DISCOVERY_CREATE_PAGE_LINK_WORDS = Object.freeze([
+  ...DISCOVERY_CREATE_WORDS,
+  '新しく',
+] as const);
+
+/**
  * 送信ボタンの語の閉じた一覧（T27R-fix-1。DEF-086）: 危険な語、検索の語、更新の語、登録の語を、この順に並べたもの。候補は送信ボタンの文言を持たず、
  * 文言が当たったこの一覧の語だけを持つ（`classify.ts` の `submitterWordsOf`）。4 つの一覧は重ならない（語ごとに、どの一覧の語かが決まる。
  * `tests/unit/discovery-classify.test.ts` で確かめる）。成果物の候補のスキーマ（`schemas/control/candidate.schema.json` の `submitterWords`）の

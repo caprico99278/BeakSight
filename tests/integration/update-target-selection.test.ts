@@ -23,7 +23,7 @@ import {
   updateScenario,
   type ExecutionGrantResult,
 } from '../../src/control/approval/scenario-store.js';
-import type { ScenarioRecordIdSpec } from '../../src/control/approval/scenario-contracts.js';
+import type { ScenarioVerificationRecordId } from '../../src/control/approval/scenario-contracts.js';
 import { readPlannedUpdateTarget as readPlannedUpdateTargetOfView } from '../../src/control/approval-view.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
@@ -239,7 +239,7 @@ describe('T31e: the choice and the binding in one transaction between two proces
 // T31R-fix-1 の I-2（Task 31 の設計書 11 章の T31R の行）: 下書きの保存の後に、台帳（参照した CREATE のシナリオ）の登録の ID の取り方が変わった場面。
 describe('T31R-fix-1 I-2: the issue checks the record id segment of the templates against the current ledger', () => {
   /** 台帳の登録の ID の取り方を変えて保存し直す（テストだけ。版が進む。UPDATE の発行は台帳の承認を求めない）。 */
-  const changeLedgerRecordId = (recordId: ScenarioRecordIdSpec, at: string): void => {
+  const changeLedgerRecordId = (recordId: ScenarioVerificationRecordId, at: string): void => {
     const ledger = readScenario(database, CREATE_SCENARIO_ID);
     if (ledger === null) {
       throw new Error('the ledger scenario is missing');
@@ -266,11 +266,12 @@ describe('T31R-fix-1 I-2: the issue checks the record id segment of the template
   it('rejects the issue after the ledger takes the record id from another segment, writes nothing, and issues again when it is bound', () => {
     register(0, 'rec-1');
     // 台帳の型 `/items/{id}` の `{id}` の前の区切り（`items`）は、UPDATE の送信先の型 `/members/{id}` の前の区切り（`members`）と違う。
-    changeLedgerRecordId({ source: 'URL_PATH_PATTERN', pathPattern: '/items/{id}' }, writeSlotAt(1));
+    // PL-6a: form の台帳の ID の取り方は、ID の型の一覧（`URL_PATH_PATTERNS`）。
+    changeLedgerRecordId({ source: 'URL_PATH_PATTERNS', pathPatterns: ['/items/{id}'] }, writeSlotAt(1));
     expect(reasonOf(issueUpdate('grant-u1', 'rec-1', writeSlotAt(1)))).toBe('SCENARIO_UPDATE_PATH_NOT_BOUND_TO_LEDGER_ID');
     expect(readExecutionGrant(database, 'grant-u1')).toBeNull();
-    // 要素から取る取り方は、送信先の型の `{id}` が最後の区切りなら結び付く。
-    changeLedgerRecordId({ source: 'ELEMENT', selector: '#record-id' }, writeSlotAt(2));
+    // PL-6a: 台帳の型の一覧のどれかが結び付けば、結び付く（どの型で取った ID も同じレコードの ID）。
+    changeLedgerRecordId({ source: 'URL_PATH_PATTERNS', pathPatterns: ['/items/{id}', '/members/{id}'] }, writeSlotAt(2));
     const issued = issueUpdate('grant-u2', 'rec-1', writeSlotAt(2));
     expect(issued.ok ? issued.grant.targetRecordId : reasonOf(issued)).toBe('rec-1');
   });
@@ -295,7 +296,7 @@ describe('T31R2-fix-1 I-1: the issue checks the segments after {id} and all the 
         sideEffectConfirmations: ALL_CONFIRMED,
         limits: { ...ledger.current.limits },
         approvalTtlDays: ledger.current.approvalTtlDays,
-        verification: { ...VERIFICATION_SPEC, recordId: { source: 'URL_PATH_PATTERN', pathPattern } },
+        verification: { ...VERIFICATION_SPEC, recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [pathPattern] } },
       },
       discovery: discoveryDocumentOf(DISCOVERY_JOB_ID, [CREATE_CANDIDATE, UPDATE_CANDIDATE]),
       at: writeSlotAt(1),

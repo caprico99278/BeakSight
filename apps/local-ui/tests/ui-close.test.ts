@@ -27,6 +27,7 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
+import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 
 /** 注入する猶予（閉じた知らせの後）。読み込み直しが戻るのに足りる長さ。 */
 const CLOSED_GRACE_MS = 3_000;
@@ -128,6 +129,51 @@ afterAll(async () => {
   rootOf().remove();
 });
 
+/** OP-P: 終わりの記録のファイルの行（一時の root。記録は、同じ root の画面のサーバが足していく）。 */
+const logLines = (): readonly Record<string, unknown>[] => {
+  let text = '';
+  try {
+    text = readFileSync(resolveUiServerLogPath(rootOf().root), 'utf8');
+  } catch {
+    return [];
+  }
+  return text.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
+};
+
+/** OP-P: 偽のワーカー（`hold`。止める要求まで動く）で、プロファイルを作ってジョブを始める。 */
+const startHeldJob = async (server: StartedServer, profileId: string) => {
+  const directory = `${rootOf().root}/fake-workers/${profileId}`;
+  mkdirSync(directory, { recursive: true });
+  const worker = writeFakeWorker(directory, 'hold', fakeWorkerValuesOf({ runId: 'RUN-20261102000000', otherRunId: 'RUN-20261102000999' }, {
+    heartbeatIntervalMs: FAKE_HEARTBEAT_INTERVAL_MS,
+  }));
+  writeFileSync(`${rootOf().root}/${WORKER_ENTRY}`, readFileSync(worker.path, 'utf8'), 'utf8');
+  const targetConfigPath = writeAuditTargetConfig(rootOf().root, profileId, 'http://127.0.0.1:9', { minNavigationIntervalMs: 0, screenshots: false });
+  const cookie = await cookieOf(server);
+  const ids = readServerFunctionIds(`${rootOf().root}/apps/local-ui/dist/server/server.js`);
+  const call = async <T>(name: string, method: 'GET' | 'POST', data: unknown): Promise<T> => {
+    const result = await callServerFunction({ port: server.port, origin: server.origin, cookie, ids }, name, method, data);
+    expect(result.response.status, name).toBe(STATUS.OK);
+    return result.value as T;
+  };
+  expect(await call('createProfileFn', 'POST', { profile: publicProfileDocument(profileId, targetConfigPath) })).toMatchObject({ ok: true });
+  const start = await call<{ ok: boolean; jobId: string }>('startAuditJobFn', 'POST', { profileId, expectedRevision: 1, startNew: true });
+  expect(start.ok, JSON.stringify(start)).toBe(true);
+  return {
+    /** ジョブを終える（止める要求。偽のワーカーは結果を返して終わる）。 */
+    end: async (): Promise<void> => {
+      expect(await call('stopAuditJobFn', 'POST', { jobId: start.jobId, force: false })).toMatchObject({ ok: true });
+    },
+    /** ジョブが終わるのを待つ。 */
+    waitEnded: async (): Promise<void> => {
+      await waitForJobViaServerFunctions((jobId) => call<{ active: boolean }>('getAuditJobFn', 'GET', { jobId }), start.jobId, (job) => !job.active, {
+        limitMs: JOB_WAIT_LIMIT_MS,
+        stepMs: WAIT_STEP_MS,
+      });
+    },
+  };
+};
+
 describe('UI-close: closing the local UI stops the server', () => {
   it('keeps running on a reload and while another tab is open, and stops after the grace when the last page is closed (1, 2)', async () => {
     const server = await startServer();
@@ -153,6 +199,9 @@ describe('UI-close: closing the local UI stops the server', () => {
     const logText = readFileSync(resolveUiServerLogPath(rootOf().root), 'utf8');
     const lines = logText.split('\n').filter((line) => line.length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(lines.at(-1)).toMatchObject({ kind: 'SHUTDOWN', reason: 'UI_CLOSED', immediate: false, runningJobs: 0 });
+    // OP-P（P3）: 起動の行と、止める決まりを受けた行（終わりの処理の前）も書く。
+    expect(lines.map((line) => line['kind'])).toEqual(['START', 'STOP_REQUESTED', 'SHUTDOWN']);
+    expect(lines.at(-2)).toMatchObject({ kind: 'STOP_REQUESTED', reason: 'UI_CLOSED', runningJobs: 0 });
     expect(typeof lines.at(-1)?.['at']).toBe('string');
     expect(lines.filter((line) => line['kind'] === 'EXIT')).toEqual([]);
     const token = server.tokenUrl.searchParams.get('token') ?? '';
@@ -178,6 +227,46 @@ describe('UI-close: closing the local UI stops the server', () => {
     await sleep(SILENCE_LIMIT_MS + CLOSED_GRACE_MS);
     expect(isRunning(server)).toBe(true);
     expect((await rawRequest(server.port, '/', { headers: { cookie } })).status).toBe(STATUS.OK);
+  }, SCENARIO_TIMEOUT_MS);
+
+  // OP-P（P3。本物のテスト環境の事実の再現）: ジョブが終わったときに、開いている管理画面のページがあれば、画面のサーバは止まらない。
+  it('keeps running when a job ends while the page stays open (OP-P)', async () => {
+    const before = logLines().length;
+    const server = await startServer();
+    const context = await newContext();
+    await openUi(context, server);
+    const job = await startHeldJob(server, 'op-p-open-page');
+    await job.end();
+    await job.waitEnded();
+    await sleep(CLOSED_GRACE_MS * 2);
+    expect(isRunning(server), server.output()).toBe(true);
+    expect(logLines().slice(before).filter((line) => line['kind'] === 'STOP_REQUESTED' || line['kind'] === 'SHUTDOWN')).toEqual([]);
+  }, SCENARIO_TIMEOUT_MS);
+
+  // OP-P（P3）: ジョブの間にページの知らせが途絶えた（隠れたタブの凍結など。知らせの要求を止めて作る）ときは、ジョブが終わったときに止まり、終わり方は途絶え
+  // （`UI_SILENT`）として、止める決まりを受けた行と終わりの行に残る。前の起動の終わりの記録がないこと（テストの強制の終わり）も、起動のときに残る。
+  it('stops at the end of a job with the silence reason when the page went silent during the job, and records the unrecorded previous end (OP-P)', async () => {
+    // 前の起動を、終わりの記録のないまま強制で終わらせる（テストの片付けと同じ終わらせ方）。
+    const previous = await startServer();
+    await stopServer(previous);
+    const before = logLines().length;
+    const server = await startServer();
+    const context = await newContext();
+    const page = await openUi(context, server);
+    const job = await startHeldJob(server, 'op-p-frozen-page');
+    // ページの知らせを、画面のサーバに届かないようにする（隠れたタブの凍結などで、知らせが途絶えた形）。ページは開いたまま。
+    await page.route(`**${UI_PRESENCE_ALIVE_PATH}*`, (route) => route.abort());
+    // 途絶えの上限を過ぎても、ジョブが動いている間は止まらない。
+    await sleep(SILENCE_LIMIT_MS + CLOSED_GRACE_MS);
+    expect(isRunning(server)).toBe(true);
+    await job.end();
+    await waitForExit(server, JOB_WAIT_LIMIT_MS);
+    const lines = logLines().slice(before);
+    expect(lines[0]).toMatchObject({ kind: 'PREVIOUS_END_UNRECORDED' });
+    expect(typeof lines[0]?.['previousStartedAt']).toBe('string');
+    expect(lines.map((line) => line['kind'])).toEqual(['PREVIOUS_END_UNRECORDED', 'START', 'STOP_REQUESTED', 'SHUTDOWN']);
+    expect(lines.at(-2)).toMatchObject({ reason: 'UI_SILENT', runningJobs: 0 });
+    expect(lines.at(-1)).toMatchObject({ reason: 'UI_SILENT', immediate: false, runningJobs: 0 });
   }, SCENARIO_TIMEOUT_MS);
 
   it('does not stop while a job runs, and stops after the job ends (4)', async () => {

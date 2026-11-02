@@ -2,7 +2,7 @@ import type { EvidenceId } from '../core/contracts.js';
 import type { SafetyEventsEvidence } from '../core/evidence-types.js';
 import { listText } from '../presentation/messages.js';
 import { isReadMethod } from '../safety/request-policy.js';
-import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
+import type { AuditRule, FindingDraft, PageRuleInput, RulePlainMessageOwner } from './rule.js';
 import { distinctSorted, evidenceOfType } from './rule-helpers.js';
 
 const RULE_VERSION = 1;
@@ -18,7 +18,7 @@ interface SafetyEventFact {
   readonly kind: string | null;
 }
 
-interface SafetyRuleDefinition {
+interface SafetyRuleDefinition extends RulePlainMessageOwner {
   readonly ruleId: string;
   /** 1つの Evidence から、この Rule が数える事象を取り出す。 */
   readonly facts: (payload: SafetyEventsEvidence) => readonly SafetyEventFact[];
@@ -38,6 +38,7 @@ const safetyRule = (definition: SafetyRuleDefinition): AuditRule => ({
   version: RULE_VERSION,
   category: 'SAFETY',
   severity: 'SAFETY',
+  plainMessage: definition.plainMessage,
   evaluate(input: PageRuleInput): readonly FindingDraft[] {
     const facts: SafetyEventFact[] = [];
     const evidenceRefs: EvidenceId[] = [];
@@ -77,6 +78,7 @@ const safetyRule = (definition: SafetyRuleDefinition): AuditRule => ({
 export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   safetyRule({
     ruleId: 'SAFETY_NON_READ_REQUEST_BLOCKED',
+    plainMessage: 'サイトの中身を変えるかもしれない送信を、安全のために止めました。',
     facts: (payload) => [...payload.blockedRequests, ...payload.blockedInteractionRequests]
       .filter((event) => !isReadMethod(event.method))
       .map((event) => ({ sample: `${event.method} ${event.url}`, kind: event.method })),
@@ -85,12 +87,14 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   }),
   safetyRule({
     ruleId: 'SAFETY_EXTERNAL_NAVIGATION_BLOCKED',
+    plainMessage: '点検しているサイトの外へ移ろうとした動きを、安全のために止めました。',
     facts: (payload) => payload.blockedNavigations.map((event) => ({ sample: event.url, kind: null })),
     describe: (count, _kinds, sample) =>
       `許可Originの外へのメインフレームのナビゲーションを ${count} 件遮断しました（例: ${sample}）。`,
   }),
   safetyRule({
     ruleId: 'SAFETY_EXTERNAL_ACTION_BLOCKED',
+    plainMessage: '外へ何かを送るかもしれないボタンなどを、安全のために押しませんでした。',
     facts: (payload) => payload.blockedExternalActions.map((event) => ({
       sample: `候補 ${event.candidateId}、URL: ${event.url ?? 'なし'}`,
       kind: event.reason,
@@ -100,6 +104,7 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   }),
   safetyRule({
     ruleId: 'SAFETY_DOWNLOAD_BLOCKED',
+    plainMessage: 'ファイルのダウンロードを、安全のために止めました。',
     facts: (payload) => payload.blockedDownloads.map((event) => ({
       sample: `${event.url}、ファイル名: ${event.suggestedFilename}`,
       kind: event.reason,
@@ -109,11 +114,13 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   }),
   safetyRule({
     ruleId: 'SAFETY_POPUP_BLOCKED',
+    plainMessage: '新しく開こうとした別の画面を、安全のために止めました。',
     facts: (payload) => payload.blockedPopups.map((event) => ({ sample: event.url, kind: null })),
     describe: (count, _kinds, sample) => `popup を ${count} 件遮断しました（例: ${sample}）。`,
   }),
   safetyRule({
     ruleId: 'SAFETY_WEBSOCKET_BLOCKED',
+    plainMessage: 'サイトとつなぎっぱなしにする通信を、安全のために止めました。',
     facts: (payload) => [...payload.blockedWebSockets, ...payload.blockedInteractionWebSockets]
       .map((event) => ({ sample: event.url, kind: event.reason })),
     describe: (count, kinds, sample) =>
@@ -121,6 +128,7 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   }),
   safetyRule({
     ruleId: 'SAFETY_INTERACTION_CANDIDATE_EXCLUDED',
+    plainMessage: '押すと困るかもしれないボタンなどを、安全のために、押す対象から外しました。',
     facts: (payload) => payload.excludedInteractionCandidates.map((event) => ({
       sample: `候補 ${event.candidateId}`,
       kind: event.reason,
@@ -132,6 +140,7 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   // 数えるのは、ページによる移動の試み（止められない経路）だけである。Guard が止めたサーバのリダイレクトは、下の Rule が数える。
   safetyRule({
     ruleId: 'SAFETY_EXTERNAL_SCHEME_NAVIGATION_ATTEMPTED',
+    plainMessage: 'ページが、ほかのアプリ（メールや電話など）を開こうとしたことを記録しました。',
     facts: (payload) => payload.externalSchemeNavigations
       .filter((event) => event.reason === 'EXTERNAL_SCHEME_NAVIGATION')
       .map((event) => ({ sample: event.url, kind: event.scheme })),
@@ -142,6 +151,7 @@ export const SAFETY_RULES: readonly AuditRule[] = Object.freeze([
   // ページによる移動の試みと区別して、1つの Finding にまとめる。
   safetyRule({
     ruleId: 'SAFETY_EXTERNAL_SCHEME_REDIRECT_BLOCKED',
+    plainMessage: 'サイトが、ほかのアプリを開く場所へ移そうとしたので、安全のために止めました。',
     facts: (payload) => payload.externalSchemeNavigations
       .filter((event) => event.reason === 'EXTERNAL_SCHEME_REDIRECT_BLOCKED')
       .map((event) => ({ sample: event.url, kind: event.scheme })),

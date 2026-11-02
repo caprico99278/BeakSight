@@ -45,6 +45,7 @@ import {
   type ListenerKind,
 } from './candidate-contracts.js';
 import {
+  DISCOVERY_CREATE_PAGE_LINK_WORDS,
   DISCOVERY_CREATE_WORDS,
   DISCOVERY_DESTRUCTIVE_WORDS,
   DISCOVERY_GRAPHQL_PATH_WORDS,
@@ -194,6 +195,29 @@ export const submitterWordsOf = (text: string): readonly string[] => {
  * 比べ方）。送らずに観察する probe の押す順だけが使う（候補の語・識別の digest には入れない）。
  */
 export const submitterTextHasSubmitWord = (text: string): boolean => containsWord(DISCOVERY_SUBMIT_PRESS_WORDS, [text]);
+
+/** OP-I（I2）: 登録の画面らしいリンクの判定が読む、リンクの Evidence の項目（`LinkEvidence` の一部と同じ形）。 */
+export interface CreatePageLinkFacts {
+  readonly anchorText: string;
+  readonly ariaLabel: string | null;
+  readonly title: string | null;
+  readonly normalized: { readonly ok: true; readonly url: string } | { readonly ok: false };
+}
+
+/**
+ * OP-I（I2。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）: 操作さがしの段で先に読む、登録の画面らしいリンクか。手がかりは、リンクの文字・
+ * `aria-label`・`title`・アドレスの path（percent-encode を外した形も）の語。語の一覧は `DISCOVERY_CREATE_PAGE_LINK_WORDS`（比べ方は登録の語と同じ語の
+ * 境界。日本語は部分一致）。危険な語（`DISCOVERY_DESTRUCTIVE_WORDS`）にも当たるリンクと、正規化できないリンクは、先に読まない（読むかどうかは、呼ぶ側の
+ * 今の除外の判定のまま。ここは読む順だけを決める）。
+ */
+export const isCreatePageLink = (link: CreatePageLinkFacts): boolean => {
+  if (!link.normalized.ok) {
+    return false;
+  }
+  const texts = [link.anchorText, link.ariaLabel ?? '', link.title ?? '', ...percentDecodedForms(new URL(link.normalized.url).pathname)]
+    .filter((text) => text.length > 0);
+  return !containsDestructiveWord(texts) && containsWord(DISCOVERY_CREATE_PAGE_LINK_WORDS, texts);
+};
 
 /**
  * READ の確かめで送る値（名前 → 値）の名前か値が、発見の分類の危険な語に当たるか（T27R-fix-1。DEF-088 の (b)）。比べ方は分類の危険な語と同じ

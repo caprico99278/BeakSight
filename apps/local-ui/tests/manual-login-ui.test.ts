@@ -13,7 +13,7 @@ import { AUTH_SETUP_SCHEMA_VERSION_3 } from '../../../src/control/auth/auth-setu
 import { createStartingJob, recordAuthState, recordEnded } from '../../../src/control/job/job-store.js';
 import { closeControlDatabase, openControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
-import { LOCAL_UI_MANUAL_LOGIN_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_JOB_SUMMARY_TEXT, LOCAL_UI_MANUAL_LOGIN_TEXT } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import {
@@ -27,7 +27,9 @@ import {
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds } from './helpers/server-functions.ts';
+import { updateProfileInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -130,10 +132,11 @@ beforeAll(async () => {
     mode: 'TEST_AUTH_PASSIVE', auth: 'MANUAL_SESSION', approvedTestOrigins: [TEST_ORIGIN], environmentEvidenceRef: `${PROFILE_ID}-evidence`,
   };
   expect(await valueOf('createProfileFn', 'POST', { profile })).toMatchObject({ ok: true });
-  // 自動で登録したとする設定: プロファイルの承認したサービスの Origin（改訂が進む）と、認証の設定の版 3。
-  expect(await valueOf('updateProfileFn', 'POST', { profile: { ...profile, revision: 2, approvedServiceOrigins: [SERVICE_ORIGIN] }, expectedRevision: 1 }))
+  // 自動で登録したとする設定: プロファイルの承認したサービスの Origin（改訂が進む）と、認証の設定の版 3。MI-F1（設計書 4.7.1 の 1）: 画面の編集の口では
+  // 承認したサービスの Origin を足せない（手動のログインの観察だけが足す）ので、テストの準備は保存の部品で直接更新する。
+  expect(await updateProfileInStore(rootOf().root, { ...profile, revision: 2, approvedServiceOrigins: [SERVICE_ORIGIN] }, 1))
     .toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', { setup: scriptSetupOf(PROFILE_ID, 2) })).toMatchObject({ ok: true });
+  expect(await saveAuthSetupRequestInStore(root, { setup: scriptSetupOf(PROFILE_ID, 2) })).toMatchObject({ ok: true });
   writeJob(AUTHENTICATED_JOB_ID, 'AUTHENTICATED', true);
   writeJob(AWAITING_JOB_ID, 'AWAITING_LOGIN', false);
 }, SCENARIO_TIMEOUT_MS);
@@ -152,10 +155,13 @@ afterAll(async () => {
 describe('ML-b: the "login finished" button while the job awaits the manual login', () => {
   it('shows the button and the note only while the job awaits the login, and shows the reason when the job manager does not accept it', async () => {
     const page = await openPage(`/jobs/${AWAITING_JOB_ID}`);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 11）: 待つ間は 1 つのパネル（要点）に、要点の 1 行「開いたブラウザで、ログインして
+    // ください」と、主のボタン「ログインを終えた」。前の説明の文（送信の形の記録など）は出さない。
+    const button = page.getByTestId('job-summary-panel').getByTestId('job-manual-login-confirm');
+    await button.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('job-result').textContent()).toBe(LOCAL_UI_JOB_SUMMARY_TEXT.active.AWAITING_LOGIN);
+    expect(await page.getByTestId('job-manual-login-note').count()).toBe(0);
     const panel = page.getByTestId('job-manual-login');
-    await panel.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await panel.getByTestId('job-manual-login-note').textContent()).toBe(text.note);
-    const button = panel.getByTestId('job-manual-login-confirm');
     expect(await button.textContent()).toBe(text.confirm);
     await screenshot(page, 'mlb-01-awaiting-login');
     await button.click();
@@ -183,16 +189,33 @@ describe('ML-b: the "login finished" button while the job awaits the manual logi
 
   it('does not show the button when the job does not await the login', async () => {
     const page = await openPage(`/jobs/${AUTHENTICATED_JOB_ID}`);
-    await page.getByTestId('job-auth').waitFor({ timeout: UI_TIMEOUT_MS });
+    await page.getByTestId('job-result').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('job-auth').count()).toBe(1);
     expect(await page.getByTestId('job-manual-login').count()).toBe(0);
+    expect(await page.getByTestId('job-manual-login-confirm').count()).toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 });
 
 describe('ML-b: the settings registered from the manual login', () => {
-  it('shows the registered settings on the job and the profile screens, with the way to review them and the note of the profile revision', async () => {
-    for (const [path, testId] of [[`/jobs/${AUTHENTICATED_JOB_ID}`, 'job-login-setup'], [`/profiles/${PROFILE_ID}`, 'profile-login-setup']] as const) {
+  it('shows the registered settings on the job screen with the note of the profile revision, and keeps them off the profile screen', async () => {
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章、3 章の 1。作業記録 UX-1 の画面 A の 1.3「手動のログインから登録した設定」は隠す）: サイトの
+    // 画面には、登録した設定の欄（token の送信先・承認したサービスの Origin などの技術の値）を出さない。見直す道は、詳しい内容の「ログインの設定を開く」。
+    // 前はサイトの画面にも同じ欄を出していた。
+    const profilePage = await openPage(`/profiles/${PROFILE_ID}`);
+    await profilePage.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await profilePage.getByTestId('profile-login-setup').count()).toBe(0);
+    expect(await profilePage.getByRole('main').innerText()).not.toContain(SERVICE_ORIGIN);
+    expect(await profilePage.getByTestId('profile-detail-actions').locator('[data-action="AUTH_SETUP"]').getAttribute('href')).toBe(`/auth-setup/${PROFILE_ID}`);
+    // PL-1（4 章の 1）: 「次から自動でログインする」は、手でログインした点検が 1 回終わってから出す（この場面の点検は、どれも終わっていない）。
+    expect(await profilePage.locator('main [data-action="AUTOMATED_LOGIN_SETUP"]').count()).toBe(0);
+    await screenshot(profilePage, 'mlb-02-profile-summary');
+    for (const [path, testId] of [[`/jobs/${AUTHENTICATED_JOB_ID}`, 'job-login-setup']] as const) {
       const page = await openPage(path);
       const panel = page.getByTestId(testId);
+      // PL-2（3 章の 1・2）: 作業の画面では、登録した設定はたたんだ詳しい内容の中。
+      if (testId === 'job-login-setup') {
+        await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
+      }
       await panel.waitFor({ timeout: UI_TIMEOUT_MS });
       expect(await panel.locator('[data-item="token"]').textContent()).toContain(`${SERVICE_ORIGIN}${TOKEN_PATH}`);
       expect(await panel.locator('[data-item="token"]').textContent()).toContain('grant_type');
@@ -200,12 +223,14 @@ describe('ML-b: the settings registered from the manual login', () => {
       expect(await panel.locator('[data-item="serviceOrigins"]').textContent()).toBe(SERVICE_ORIGIN);
       expect(await panel.locator('[data-item="successKey"]').textContent()).toBe(text.successKeyValue('', '-auth-token'));
       expect(await panel.getByTestId(`${testId}-revision-note`).textContent()).toBe(text.revisionNote);
-      expect(await panel.getByTestId(`${testId}-review`).getAttribute('href')).toBe(`/auth-setup/${PROFILE_ID}`);
+      // PL-2（4 章の 2）: 作業の画面は、済んだ登録の見直しの入口を出さない。
+      expect(await panel.getByTestId(`${testId}-review`).count()).toBe(0);
       // 値（query の値・token）は出さない。
       expect(await panel.textContent()).not.toContain('password');
-      // FM-1（手動の操作を減らす設計書 2.3）: プロファイルの画面は、手動のログインのプロファイルで設定があれば「次から自動でログインする」を出す。
-      // ジョブの画面は、そのジョブが登録した（SAVED）ときだけ（このジョブは登録の結果を持たない）。
-      expect(await panel.getByTestId(`${testId}-automated-login`).count()).toBe(testId === 'profile-login-setup' ? 1 : 0);
+      // MI-C 項目 11・MI-4（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.4）: 「次から自動でログインする」の案内は、登録した設定の欄
+      // （`LoginSetupPanel`）には出さない（PL-1: サイトの画面の要点の主のボタンの 1 か所）。
+      expect(await panel.getByTestId(`${testId}-automated-login`).count()).toBe(0);
+      expect(await page.locator('main [data-action="AUTOMATED_LOGIN_SETUP"]').count()).toBe(0);
       await screenshot(page, `mlb-02-${testId}`);
     }
   }, SCENARIO_TIMEOUT_MS);

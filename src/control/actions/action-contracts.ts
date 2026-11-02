@@ -24,6 +24,7 @@ import type {
   ScenarioKind,
   ScenarioLimits,
   ScenarioResultCondition,
+  ScenarioResultJudgement,
   ScenarioTransport,
   SideEffectConfirmations,
   WriteReservationState,
@@ -31,15 +32,22 @@ import type {
 import type { SeedRecord } from '../data-rules/scenario-data.js';
 import type { ReadCheckResult } from '../../discovery/read-check-contracts.js';
 import type { ReadCheckEvidenceState, ReadCheckExecutedEvidence } from '../../discovery/read-check-evaluation.js';
-
-/** `action-run.json` の文書の形の印（書き手が書く版。T40c で 1.1）。 */
-export const ACTION_RUN_SCHEMA_VERSION = 'action-run-schema/1.1';
+import type { CandidateFieldType } from '../../core/candidate-field-types.js';
 
 /**
- * `action-run.json` の読み手が受ける版（T40c。スキーマの `schemaVersion` の enum と同じ）。LG-4（テストの組の設計書 3.7.3）: 前の版 1.0 は捨て、今の版だけを
- * 受ける（前の版の記録は、スキーマに合わないので、親の締めでも画面の読み出しでも使わない）。
+ * `action-run.json` の文書の形の印（書き手が書く版。T40c で 1.1、PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (d)）で 1.2。
+ * 1.2 は、結果の判定に使った人の条件（`resultConditions`）を、結果の判定のしかたの印（`resultJudgement`）に置き換えた）。
  */
-export const ACTION_RUN_READABLE_SCHEMA_VERSIONS = Object.freeze([ACTION_RUN_SCHEMA_VERSION] as const);
+export const ACTION_RUN_SCHEMA_VERSION = 'action-run-schema/1.2';
+
+/** PL-6a: 前の版 1.1 の印（読み手は受ける。書き手は書かない）。 */
+export const ACTION_RUN_PREVIOUS_SCHEMA_VERSION = 'action-run-schema/1.1';
+
+/**
+ * `action-run.json` の読み手が受ける版（T40c。スキーマの `schemaVersion` の enum と同じ）。LG-4（テストの組の設計書 3.7.3）: 前の版 1.0 は捨てた。PL-6a: 1.1
+ * （前の成果物）と 1.2 の両方を受ける。
+ */
+export const ACTION_RUN_READABLE_SCHEMA_VERSIONS = Object.freeze([ACTION_RUN_PREVIOUS_SCHEMA_VERSION, ACTION_RUN_SCHEMA_VERSION] as const);
 export type ActionRunSchemaVersion = (typeof ACTION_RUN_READABLE_SCHEMA_VERSIONS)[number];
 
 /**
@@ -275,8 +283,13 @@ export interface ActionRunDocument {
    * 鍵は `api.keyNames` の中）。
    */
   readonly submittedValues: Readonly<Record<string, string>>;
-  /** 結果の判定に使った条件（シナリオの検証の指定の写し）。T40c: API の記録は null（成否の条件を使わない。FORM は必須）。 */
-  readonly resultConditions: ActionRunResultConditions | null;
+  /**
+   * 結果の判定に使った条件（シナリオの検証の指定の写し）。T40c: API の記録は null（成否の条件を使わない。FORM は必須）。PL-6a: 版 1.1 の記録だけが持つ（読み手が
+   * 前の成果物を読むため。書き手は書かない）。
+   */
+  readonly resultConditions?: ActionRunResultConditions | null;
+  /** PL-6a: 結果の判定のしかたの印（版 1.2 の記録だけ。FORM は `FORM_STRUCTURE`、API は null）。 */
+  readonly resultJudgement?: ScenarioResultJudgement | null;
   readonly submission: SubmissionState;
   /** 送らずに止めた理由（送らずに止めたときだけ。ほかは null）。 */
   readonly blockReason: ActionBlockReason | null;
@@ -318,6 +331,10 @@ export interface ActionRunDocument {
  * - `RECHECK_REFUSED`: 送る直前の確かめ直しで、承認か実行の許可が外れていた。
  * - `AUDIT_STAGE_STOPPED`: 監査の段の事実（ログインの状態の鍵の消失、サービスへの要求の上限）。
  * - `PREFLIGHT_FAILED`: Run の前の確認（ブラウザの起動など）に失敗した。
+ * - `VALUE_ALREADY_PRESENT`（PL-6a。設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「事前の確かめ」）: form の登録を送る前に、同じ値で答え合わせの
+ *   READ を読んだら、値がもう見えていた（照合に使えないので、送らない）。
+ * - `VERIFICATION_READ_UNAVAILABLE`（PL-6a）: form の登録を送る前の答え合わせの READ を判定できなかった（読めない、候補が変わった、止められた）。送った後の
+ *   照合にも使えないので、送らない。
  */
 export const PRECHECK_FAILURE_DETAILS = Object.freeze([
   'STOPPED',
@@ -333,8 +350,21 @@ export const PRECHECK_FAILURE_DETAILS = Object.freeze([
   'RECHECK_REFUSED',
   'AUDIT_STAGE_STOPPED',
   'PREFLIGHT_FAILED',
+  'VALUE_ALREADY_PRESENT',
+  'VERIFICATION_READ_UNAVAILABLE',
 ] as const);
 export type PrecheckFailureDetail = (typeof PRECHECK_FAILURE_DETAILS)[number];
+
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「判定の順」）: form の更新の、更新の後の照合の分け方（閉じた一覧。判定
+ * `formResultJudgementOf` の入力。記録しない）。
+ * - `UPDATED`: 変えた欄が新しい値で、保つ欄が前の値のまま（`fieldsMatchedOf` が真）。
+ * - `UNCHANGED`: 変えた欄が前の値のままで、保つ欄も前の値のまま（更新されていない）。
+ * - `CHANGED_OTHERWISE`: そのほかの一致しない欄がある（副作用の疑い）。
+ * - `UNDETERMINED`: 更新の後の画面を読めない・照合できない欄がある。
+ */
+export const FORM_UPDATE_POSTCHECKS = Object.freeze(['UPDATED', 'UNCHANGED', 'CHANGED_OTHERWISE', 'UNDETERMINED'] as const);
+export type FormUpdatePostcheck = (typeof FORM_UPDATE_POSTCHECKS)[number];
 
 // ---------------------------------------------------------------------------------------------------------------
 // 書き込みの報告（T32c。Task 32 の設計書 4.1、ユーザーの判断 3・6・7）
@@ -357,14 +387,126 @@ export type ActionEvidenceSchemaVersion = (typeof ACTION_EVIDENCE_READABLE_SCHEM
 export const APPROVAL_SUMMARY_SCHEMA_VERSION = 'approval-summary-schema/1.0';
 
 /**
+ * OP-L（L1）: 送る前の確かめで、承認に縛った候補が今の画面と合わなかったときの、どこが違ったかの理由（閉じた一覧。値を含まない）。
+ * - `IDENTITY_NOT_FOUND`・`IDENTITY_AMBIGUOUS`: 承認の識別（form の登録は識別、更新は型にした識別）と同じ候補が、画面にない・2 つ以上ある。
+ * - `RULE_DIGEST_CHANGED`: 同じ識別の候補はちょうど 1 つあるが、規則の digest（欄の数・名前・送り先の形）が違う。
+ * - `RECORD_ID_NOT_IN_PATH`: API の更新で、候補の画面の path の ID の区切りが、対象の ID でない。
+ * - ほか: API の入力の前の確かめ（`inspectApiWriteInput`）の理由（`src/browser/api-write-submitter.ts` の `API_WRITE_INPUT_REASONS` の確かめの理由。
+ *   control は browser を読み込まないので、ここに書き写す。一致は `tests/unit/write-precheck-mismatch.test.ts`）。
+ */
+export const PRECHECK_CANDIDATE_MISMATCH_REASONS = Object.freeze([
+  'IDENTITY_NOT_FOUND',
+  'IDENTITY_AMBIGUOUS',
+  'RULE_DIGEST_CHANGED',
+  'RECORD_ID_NOT_IN_PATH',
+  'SPEC_INVALID',
+  'PAGE_UNREADABLE',
+  'FIELD_NOT_FOUND',
+  'FIELD_AMBIGUOUS',
+  'FIELD_TYPE_NOT_SUPPORTED',
+  'FIELD_NOT_VISIBLE',
+  'FIELD_NOT_EDITABLE',
+  'SUBMITTER_NOT_FOUND',
+  'SUBMITTER_AMBIGUOUS',
+  'SUBMITTER_INSIDE_LINK',
+] as const);
+export type PrecheckCandidateMismatchReason = (typeof PRECHECK_CANDIDATE_MISMATCH_REASONS)[number];
+
+/**
+ * OP-L（L1）: 候補が合わなかったときの、どこが違ったか（値を含まない）。
+ * - `pageCandidateCount`: 画面で読めた候補の数（form と API の更新。API の登録は、候補を読まないので null）。
+ * - `sameIdentityCount`: 承認の識別と同じ候補の数（form と API の更新。API の登録は null）。
+ * - `fieldPosition`: API の登録で、外れた鍵の欄の位置（承認の鍵の欄の順の 0 から。欄の確かめでないときは null）。
+ */
+export interface ActionEvidenceCandidateMismatch {
+  readonly reason: PrecheckCandidateMismatchReason;
+  readonly pageCandidateCount: number | null;
+  readonly sameIdentityCount: number | null;
+  readonly fieldPosition: number | null;
+}
+
+/**
+ * OP-O（O1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の後の OP-O）: 書き込みの段で、確かめ・入力・押す操作が失敗したときの記録の一覧
+ * （閉じた一覧。値と、値の長さは持たない）。owner は入力の部品の共通の値（`src/browser/form-submission-common.ts` の `WRITE_INPUT_FAILURE_STAGES`・
+ * `WRITE_INPUT_FIELD_ATTRIBUTES`・`WRITE_INPUT_VALUE_CHANGES`）と、それぞれの部品の理由の語（`src/browser/api-write-submitter.ts` の
+ * `API_WRITE_INPUT_REASONS`、`src/browser/write-form-submitter.ts` の `WRITE_FORM_REASONS`。重ねずに、API、form の順に合わせた一覧）。control は browser を
+ * 読み込まないので、ここに書き写す（一致は `tests/unit/write-input-failure.test.ts`）。
+ */
+export const WRITE_INPUT_FAILURE_STAGES = Object.freeze(['INSPECT', 'FILL', 'SUBMIT'] as const);
+export type WriteInputFailureStage = (typeof WRITE_INPUT_FAILURE_STAGES)[number];
+export const WRITE_INPUT_FAILURE_REASONS = Object.freeze([
+  'SPEC_INVALID',
+  'PAGE_UNREADABLE',
+  'FIELD_NOT_FOUND',
+  'FIELD_AMBIGUOUS',
+  'FIELD_TYPE_NOT_SUPPORTED',
+  'FIELD_NOT_VISIBLE',
+  'FIELD_NOT_EDITABLE',
+  'SUBMITTER_NOT_FOUND',
+  'SUBMITTER_AMBIGUOUS',
+  'SUBMITTER_INSIDE_LINK',
+  'ELEMENT_CHANGED',
+  'INPUT_FAILED',
+  'VALUE_CHANGED',
+  'SUBMIT_FAILED',
+  'FORM_UNREADABLE',
+  'FORM_NOT_FOUND',
+  'FORM_AMBIGUOUS',
+  'FIELD_OWNED_BY_OTHER_FORM',
+  'FORM_FIELDS_CHANGED',
+  'FIELD_TYPE_MISMATCH',
+  'METHOD_NOT_POST',
+  'ACTION_NOT_ALLOWED',
+  'ENCTYPE_NOT_ALLOWED',
+  'ENCTYPE_MISMATCH',
+  'FORM_TARGET_NOT_SELF',
+  'ACCEPT_CHARSET_NOT_UTF8',
+  'FORM_CHANGED',
+  'VALUE_NOT_SUPPORTED',
+  'VALUE_NOT_APPLIED',
+  'PRIOR_VALUE_CHANGED',
+  'CHECKBOX_PAIR_NOT_ADJACENT',
+  'SECRET_LIKE_STATE_FIELD',
+  'SECRET_LIKE_PASSTHROUGH_FIELD',
+] as const);
+export type WriteInputFailureReason = (typeof WRITE_INPUT_FAILURE_REASONS)[number];
+export const WRITE_INPUT_FIELD_ATTRIBUTES = Object.freeze(['readonly', 'disabled', 'maxlength', 'pattern', 'min', 'max', 'step'] as const);
+export type WriteInputFieldAttribute = (typeof WRITE_INPUT_FIELD_ATTRIBUTES)[number];
+export const WRITE_INPUT_VALUE_CHANGES = Object.freeze(['EMPTIED', 'SURROUNDING_WHITESPACE', 'DIGIT_GROUPING', 'NUMBER_FORMAT', 'OTHER'] as const);
+export type WriteInputValueChange = (typeof WRITE_INPUT_VALUE_CHANGES)[number];
+
+/**
+ * OP-O（O1）: 書き込みの段の、確かめ・入力・押す操作の失敗の記録（値と、値の長さは持たない）。
+ * - `stage`: 段（`INSPECT`: 入力の前の確かめ、`FILL`: 値の入力と入れた後の読み直し、`SUBMIT`: 押す直前の読み直しと押す操作）。
+ * - `reason`: 部品の理由の語（`ELEMENT_CHANGED`・`INPUT_FAILED`・`VALUE_CHANGED` など）。
+ * - `fieldPosition`: 欄の位置（API は承認の鍵の欄の順、form は送る欄の順の 0 から）。欄でない・分からないときは null。
+ * - `fieldType`: 欄の種類（input の type・`textarea`・`select-one` など）。分からないときは null。
+ * - `fieldAttributes`: 欄にある属性（`readonly`・`disabled`・`maxlength`・`pattern`・`min`・`max`・`step` のうち、あるもの）。読まなかったときは null。
+ * - `valueChange`: `VALUE_CHANGED`・`VALUE_NOT_APPLIED` のときの、変わり方の区分（ほかは null）。
+ */
+export interface ActionEvidenceInputFailure {
+  readonly stage: WriteInputFailureStage;
+  readonly reason: WriteInputFailureReason;
+  readonly fieldPosition: number | null;
+  readonly fieldType: CandidateFieldType | null;
+  readonly fieldAttributes: readonly WriteInputFieldAttribute[] | null;
+  readonly valueChange: WriteInputValueChange | null;
+}
+
+/**
  * 送る前の確かめの結果（`action-evidence.json` の `precheck`）。
  * - `candidateDigestMatched`: 今の画面の候補の digest（CREATE は識別と規則、UPDATE は型にした識別と規則）が承認のものと一致したか。確かめまで
  *   進まなかったら null。送った回は真だけ（スキーマで確かめる）。
  * - `blockReason`: 送らずに止めた理由（送った回は null。`action-run.json` の `blockReason` と同じ値）。
+ * - `candidateMismatch`（OP-L の L1。任意）: `candidateDigestMatched` が偽で、どこが違ったかが分かったときだけ。任意の項目なので版は上げない。
+ * - `inputFailure`（OP-O の O1。任意）: 書き込みの段で、確かめ・入力・押す操作が失敗して送らなかったとき（`PRECHECK_FAILED`）だけ。任意の項目なので版は
+ *   上げない。画面には出さない（成果物だけに残す）。
  */
 export interface ActionEvidencePrecheck {
   readonly candidateDigestMatched: boolean | null;
   readonly blockReason: ActionBlockReason | null;
+  readonly candidateMismatch?: ActionEvidenceCandidateMismatch;
+  readonly inputFailure?: ActionEvidenceInputFailure;
 }
 
 /**
@@ -423,7 +565,45 @@ export interface ActionGuardSummary {
   readonly documentCharsetRead: boolean;
   /** 応答をブラウザに返せなかった印（`RESPONSE_NOT_DELIVERED` の根拠）。 */
   readonly responseDeliveryCanceled: boolean;
+  /**
+   * OP-M（任意。止めた要求があったときだけ）: 書き込みの段で止めた、承認した送信のほかの要求の一覧（Guard の
+   * `src/safety/write-stage-unexpected-requests.ts` の写し。Origin・query・本文・値を持たない）。任意の項目なので版は上げない。
+   */
+  readonly unexpectedRequests?: readonly ActionGuardUnexpectedRequest[];
+  /** OP-M（任意。1 以上のときだけ）: 一覧に入れなかった、止めた要求の数（上限を超えた新しい形と、型を作れなかった要求）。 */
+  readonly unexpectedRequestsUnlisted?: number;
+  /**
+   * OP-N（任意。通した要求があったときだけ。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 書き込みの段で、監査の段の送信の扱い
+   * `PASS_EXCEPT_DELETE` で通した、サイトが自動で送る通信の一覧（止めた一覧と同じ形。理由は `AUDIT_SEND_PASSED`。書き込みには数えない）。任意の項目なので版は
+   * 上げない。
+   */
+  readonly passedRequests?: readonly ActionGuardUnexpectedRequest[];
+  /** OP-N（任意。1 以上のときだけ）: 通した一覧に入れなかった要求の数。 */
+  readonly passedRequestsUnlisted?: number;
 }
+
+/**
+ * OP-M: 書き込みの段で止めた、承認した送信のほかの要求の 1 行（`action-evidence.json` の `guard.unexpectedRequests` の配列の要素）。閉じた一覧（送り先の区分、
+ * 時点、本文の種類）の owner は Guard と型の作り手（`src/control/` は読み込めないので文字列で受ける）。スキーマの enum との一致は
+ * `schema-enum-consistency.test.ts` で確かめる。
+ */
+export interface ActionGuardUnexpectedRequest {
+  readonly method: string;
+  /** 送り先の区分（テスト環境の Origin／承認したサービスの Origin／許可の外。Origin の名前は残さない）。 */
+  readonly destination: string;
+  readonly pathShape: string;
+  readonly resourceType: string;
+  /** いつ出たか（値を入れる前／入れた後／押した後）。 */
+  readonly timing: string;
+  /** 止めた理由のコード。 */
+  readonly reason: string;
+  /** 入れた値の目印が本文に入っていたか（値は残さない）。 */
+  readonly markerInBody: boolean;
+  /** 本文の種類（JSON の object のほかは、目印を照らしていない）。 */
+  readonly bodyKind: string;
+  readonly count: number;
+}
+
 
 /**
  * 書き込みの報告の証拠（`action-evidence.json`。`schemas/action-evidence.schema.json` の形。日時は UTC の 14 桁）。`action-run.json` と同じ

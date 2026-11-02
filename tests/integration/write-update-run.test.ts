@@ -5,8 +5,10 @@
 // （確かめ直し、送信の報告）は、テストが偽の親として受ける。
 // - 承認に縛る型にした識別の digest と規則の digest、照合の READ の対象の識別の digest は、本物の発見の入口（`readCandidatePage`）で読んだ候補から取る。
 // - 成功 → `VERIFIED`（証拠の `CHANGED` は前の値と新しい値、`KEPT` は値なし、どの欄も一致）。サーバが保つ欄・状態も変える → `UNKNOWN`
-//   （`UNEXPECTED_FIELD_CHANGE`）。成功の画面の ID が対象と違う → `UNKNOWN`（`RECORD_ID_MISMATCH`）。更新の後に更新の画面が開けない → `PARTIAL`
-//   （`UPDATE_POSTCHECK_UNDETERMINED`）。
+//   （`UNEXPECTED_FIELD_CHANGE`）。成功の画面の ID が対象と違う → `UNKNOWN`（`RECORD_ID_MISMATCH`）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。構造の判定 (b2)）: 成否は人が入れた条件ではなく、更新の後の照合で決める。更新の後に更新の
+//   画面が開けない → 判定できない（`UNKNOWN`・`NO_CONDITION_MATCHED`。前は成功の条件に当たったので `PARTIAL`）。更新せずに同じ更新の form が送った値を
+//   保って出る → `FAILED`（`INPUT_ERROR`）。
 // - 送らない（POST 0）: 前の読み取りと書き込みの画面の間に値が変わる、ページの JS が送信の前に保つ欄・状態の hidden・組の hidden・`_method` を
 //   変える、確かめ直しの拒否、止める印、変える欄の前の値が証拠の長さの上限を超える。サーバの記録で回ごとに数え、全部の回の後に 2 秒待って数え直す。
 // - `action-run.json` がスキーマに合い、秘密の目印（セッションの値、CSRF、`lock_version`）と保つ欄の値を含まない。送信の報告は 1 回で、成果物と同じ。
@@ -172,9 +174,8 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     candidateFields: (candidateOverride ?? editCandidate).fields.map(({ name, type, readonly, hidden, disabled }) => ({ name, type, readonly, hidden, disabled })),
     values: { name: newName },
     verification: {
-      successCondition: { pathPrefix: `${WRITE_SITE_PATHS.create}/`, selector: '.registered' },
-      inputErrorCondition: { pathPrefix: WRITE_SITE_PATHS.create, selector: '.error' },
-      recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${WRITE_SITE_PATHS.create}/{id}` },
+      resultJudgement: 'FORM_STRUCTURE',
+      recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
     },
     readVerification: {
       readCheckId: 'rc-verify',
@@ -331,19 +332,38 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
     expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS', recordId: `${run.memberId}9`, result: 'UNKNOWN', reason: 'RECORD_ID_MISMATCH' });
   }, TEST_TIMEOUT_MS);
 
-  it('writes PARTIAL (UPDATE_POSTCHECK_UNDETERMINED) when the update form cannot be opened after the update', async () => {
+  // PL-6a（設計書 8.1 の「判定の順」の 3）: 更新の後の照合を判定できない（後の画面が開けない）と、更新できたか分からない（成功の条件はもうない）ので
+  // `UNKNOWN`（`NO_CONDITION_MATCHED`）。照合の READ は行わない（成功と判定した回だけ）。
+  it('writes UNKNOWN (NO_CONDITION_MATCHED) when the update form cannot be opened after the update', async () => {
     const run = await runUpdate('postcheck-missing');
     expectedPosts += 1;
-    expect(run.document).toMatchObject({ submission: 'SENT', responseJudgement: 'SUCCESS', result: 'PARTIAL', reason: 'UPDATE_POSTCHECK_UNDETERMINED' });
+    expect(run.document).toMatchObject({
+      submission: 'SENT', responseJudgement: 'NO_CONDITION_MATCHED', readVerification: null, result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED',
+    });
     expect(run.document.update?.updateEvidence?.fields).toEqual([
       { fieldName: 'name', role: 'CHANGED', previousValue: run.priorName, newValue: run.newName, matched: null },
       ...keptEvidence({ email: null, note: null, newsletter: null, published: null, active: null }),
     ]);
-    // T32e: 更新の後の照合を判定できない（一致しない欄はない）ので、照合の READ は行われ、その証拠の全体が入る。変えた欄の前の値はあるので、人の値の
-    // 印は真。
+    // T32e: 変えた欄の前の値はあるので、人の値の印は真。照合の READ は実行しなかった印。
     expect(run.report.evidence).toMatchObject({
-      containsHumanEnteredValues: true, readVerification: { state: 'EXECUTED' }, result: 'PARTIAL', reason: 'UPDATE_POSTCHECK_UNDETERMINED',
+      containsHumanEnteredValues: true, readVerification: { state: 'NOT_EXECUTED' }, result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED',
     });
+  }, TEST_TIMEOUT_MS);
+
+  // PL-6a（設計書 8.1 の「判定の順」の 3。FV-0 の `u-error-200` の場面）: 更新せずに、同じ更新の form を送った値を保って返す。更新の後の照合は、変えた欄が前の値の
+  // まま（`UNCHANGED`）で、同じ形の form が送った値を保っているので、入力の誤り（`FAILED`）。サイトの値は変わっていない（誤って失敗にしない）。
+  it('writes FAILED (INPUT_ERROR) when the site shows the same update form again with the sent values and does not update', async () => {
+    const run = await runUpdate('input-error-form');
+    expectedPosts += 1;
+    expect(run.document).toMatchObject({
+      submission: 'SENT', httpStatus: 200, responseJudgement: 'INPUT_ERROR', recordId: null, readVerification: null, reservationState: 'COMMITTED',
+      result: 'FAILED', reason: 'INPUT_ERROR',
+    });
+    expect(run.document.update?.updateEvidence?.fields).toEqual([
+      { fieldName: 'name', role: 'CHANGED', previousValue: run.priorName, newValue: run.newName, matched: false },
+      ...keptEvidence(),
+    ]);
+    expect(site.memberOf(run.memberId)).toMatchObject({ name: run.priorName });
   }, TEST_TIMEOUT_MS);
 
   // T31i: 応答の前に接続が切れても、更新の POST は 1 件（BeakSight の送り手が 1 回だけ送る）。結果は `UNKNOWN`、成功と偽らない。
@@ -435,7 +455,7 @@ describe.each(LAUNCHES)('T31g-2: the update write job flow (%s)', (_name, launch
   it('after all the runs, no POST arrives late (counted again after a named wait)', async () => {
     await wait(LATE_DELIVERY_SETTLE_MS);
     expect(site.postBodies.length).toBe(expectedPosts);
-    // 成功、サーバが欄を変える 2 回、ID の違い、後の画面が開けない回、応答の前の切断、CSRF の書き換え（T31R-fix-1）。
-    expect(expectedPosts).toBe(7);
+    // 成功、サーバが欄を変える 2 回、ID の違い、後の画面が開けない回、応答の前の切断、CSRF の書き換え（T31R-fix-1）、同じ form の誤り（PL-6a）。
+    expect(expectedPosts).toBe(8);
   }, TEST_TIMEOUT_MS);
 });

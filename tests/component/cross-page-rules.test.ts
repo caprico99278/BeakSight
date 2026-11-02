@@ -1058,6 +1058,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
       version: 1,
       category: 'CROSS_PAGE',
       severity: 'WARN',
+      plainMessage: 'テストの指摘です。',
       evaluate: () => {
         throw new Error('fixture cross-page rule failure');
       },
@@ -1092,6 +1093,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
       version: 1,
       category: 'CROSS_PAGE',
       severity: 'INFO',
+      plainMessage: 'テストの指摘です。',
       evaluate: () => [],
     });
     const input: CrossPageRuleInput = {
@@ -1138,6 +1140,7 @@ describe('evaluateCrossPageRules: determinism and contract', () => {
         version: brokenLink.version,
         category: brokenLink.category,
         severity: brokenLink.severity,
+        plainMessage: brokenLink.plainMessage,
         evaluate: (index) =>
           brokenLink.evaluate(index).map(({ context, draft }) => ({ context, draft: { ...draft, ruleId, ...override } })),
       });

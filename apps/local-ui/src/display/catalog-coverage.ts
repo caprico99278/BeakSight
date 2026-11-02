@@ -13,20 +13,21 @@ import type {
   SubmissionState,
 } from '../../../../src/control/actions/action-contracts.js';
 import type {
+  ApiScenarioLedgerOption,
   AutoDraftBlocker,
   AutoDraftCreatePlan,
-  AutoDraftExpectationOutcome,
   AutoDraftInferredItemKind,
-  AutoDraftReadCheckOutcome,
-  AutoDraftUpdatePlan,
+  AutoDraftUpdateResultStatus,
   DraftValueGround,
   DraftValueOrigin,
   ExecutionGrantRejectionReason,
+  FormAutoDraftGap,
+  UpdateVerificationCopyUnavailableReason,
   RecordIdSource,
   ScenarioTransport,
   ScenarioVerificationItem,
 } from '../../../../src/control/approval-view.js';
-import type { DRAFT_VALUE_TEXT, LOCAL_UI_AUTO_DRAFT_TEXT } from '../../../../src/presentation/messages.js';
+import type { DRAFT_VALUE_TEXT, LOCAL_UI_AUTO_DRAFT_TEXT, LOCAL_UI_SCENARIO_TEXT } from '../../../../src/presentation/messages.js';
 import type { DRAFT_VALUE_ORIGIN_CATALOG } from '../../../../src/presentation/catalog.js';
 import type {
   ACTION_BLOCK_REASON_CATALOG,
@@ -50,6 +51,12 @@ import type {
   STAGE_CHAIN_STOP_REASON_CATALOG,
 } from '../../../../src/presentation/catalog.js';
 import type { LOCAL_UI_WRITE_TEXT } from '../../../../src/presentation/messages.js';
+import type { LOCAL_UI_FRAME_TEXT } from '../../../../src/presentation/messages.js';
+import type { LOCAL_UI_JOB_SUMMARY_TEXT } from '../../../../src/presentation/messages.js';
+import type { AuditPrimaryStartKind, JobSummaryActiveResult, JobSummaryFinishedResult } from '../server/audit-job-functions';
+import type { JobSummaryChainStage } from './job-summary-values';
+import type { LOCAL_UI_AUDIT_TEXT } from '../../../../src/presentation/messages.js';
+import type { NoticeKind } from '../components/Notice';
 import type { AutomatedLoginResult, AutomatedLoginSubmission } from '../../../../src/control/auth/automated-login-results.js';
 import type { CredentialChangeKind } from '../../../../src/control/credentials/credential-store.js';
 import type { AuditMode, AuthStrategy, EnvironmentKind, ProfileValidationErrorCode } from '../../../../src/control/contracts.js';
@@ -85,10 +92,14 @@ import type { LoginTransport } from '../../../../src/control/auth/auth-setup-con
 import type { ProfileStatus } from '../../../../src/control/store/profile-records.js';
 import type {
   WorkerAuthState,
+  WorkerChainStageKind,
   WorkerLoginFormInvalidReason,
   WorkerLoginStageBlockReason,
   WorkerOutcomeKind,
+  WorkerRequestResourceType,
+  WorkerWriteJobKind,
 } from '../../../../src/control/worker-protocol.js';
+import type { REQUEST_RESOURCE_TYPE_LABELS } from '../../../../src/presentation/catalog.js';
 import type {
   AUDIT_JOB_AUTH_STATE_CATALOG,
   AUDIT_JOB_KIND_CATALOG,
@@ -126,6 +137,7 @@ import type {
   AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS,
   AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
   CREDENTIAL_REQUEST_REJECTION_DESCRIPTIONS,
+  PROFILE_SAVE_GUARD_REJECTION_DESCRIPTIONS,
   LOGIN_FORM_INVALID_REASON_DESCRIPTIONS,
   LOGIN_STAGE_BLOCK_REASON_LABELS,
   PROFILE_VALIDATION_ERROR_DESCRIPTIONS,
@@ -162,8 +174,7 @@ import type { SCENARIO_DRAFT_REJECTION_DESCRIPTIONS, SCENARIO_REQUEST_REJECTION_
 import type { CredentialRequestRejectionReason } from '../server/credential-errors';
 import type { ScenarioRequestLocalRejectionReason } from '../server/scenario-facts';
 import type { ScenarioDisplayState } from './scenarios';
-import type { AuditStartUnavailableReason, NextStepState, ProfileNextStep } from './next-steps';
-import type { NEXT_STEP_STATE_CATALOG, PROFILE_NEXT_STEP_CATALOG } from '../../../../src/presentation/catalog.js';
+import type { ProfileAction, ProfileNextStep, ProfileStageKind } from './next-steps';
 import type { LOCAL_UI_NEXT_STEP_TEXT } from '../../../../src/presentation/messages.js';
 import type {
   EXTERNAL_DELIVERY_KIND_CATALOG,
@@ -195,6 +206,8 @@ import type {
 } from '../../../../src/control/data-rules-view.js';
 import type { FIELD_RELATION_ROLES } from '../../../../src/control/data-rules-view.js';
 import type { DataRuleRequestLocalRejectionReason } from '../server/data-rule-functions';
+import type { AuthSetupSaveRejectionReason } from '../server/auth-setup-functions';
+import type { ProfileSaveGuardRejection } from '../../../../src/control/auth/credential-destination.js';
 import type {
   TargetConfigCreationFailure,
   TargetCrawlLimitField,
@@ -218,7 +231,7 @@ import type {
 import type { InputRuleState } from './data-rules';
 import type { CredentialEnvironmentState } from '../server/credential-runtime';
 import type { AuditJobLoginConfirmRejectionReason } from '../../../../src/control/job/audit-job-manager.js';
-import type { AuditJobLoginAutoRegistrationSkipReason } from '../../../../src/control/job/job-store.js';
+import type { AuditJobAutomatedLoginUnavailableReason, AuditJobLoginAutoRegistrationSkipReason } from '../../../../src/control/job/job-store.js';
 import type { ChainStageState, ChainState, ChainStopReason } from '../../../../src/control/job/stage-chain-policy.js';
 import type {
   LOCAL_UI_DISPLAY_SETTINGS_TEXT,
@@ -230,7 +243,15 @@ import type { ProfileDisplaySettingsRejectionReason } from '../../../../src/cont
 import type { LoginStageRowRejectionReason } from '../server/login-stage-registration-functions';
 // FM2e: 1 回の操作で自動ログインの設定を終える画面の理由と戻しの一覧（型だけ）。
 import type { AutomatedLoginSetupRejectionReason, AutomatedLoginSetupRollback } from '../server/credential-service';
+// FM2e: 自動ログインにする画面の文言（型だけ。理由と戻しの一覧の網羅）。
 import type { LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT } from '../../../../src/presentation/messages.js';
+import type { LOCAL_UI_UNUSABLE_PROFILE_TEXT, LOCAL_UI_WRITE_SCREENS_TEXT } from '../../../../src/presentation/messages.js';
+import type { WriteScreenCheckRejection, WriteScreenRowState } from '../server/write-screen-functions';
+import type { InspectionWriteOutcome, WriteScreenNotCheckableKind, WriteScreenUpdateState } from './write-screen-values';
+import type { UnusableProfileReason } from '../../../../src/control/unusable-profile.js';
+// MI-3: 入口の確かめの後の認証の設定の状態の一覧（型だけ）。
+import type { EntryCheckAuthSetupState } from '../../../../src/control/auth/auth-setup-proposal.js';
+import type { LOCAL_UI_AUTH_SETUP_PROPOSAL_TEXT } from '../../../../src/presentation/messages.js';
 
 type SameKeys<Left extends PropertyKey, Right extends PropertyKey> = [Left] extends [Right]
   ? [Right] extends [Left]
@@ -252,6 +273,10 @@ export type TargetSiteProblemDescriptionsCoverEveryProblem = AssertTrue<
 >;
 export type TargetConfigCreationFailureDescriptionsCoverEveryFailure = AssertTrue<
   SameKeys<TargetConfigCreationFailure, keyof typeof TARGET_CONFIG_CREATION_FAILURE_DESCRIPTIONS>
+>;
+// MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 1・2）: プロファイルの作成・編集の口が拒む理由のすべてに、説明がある。
+export type ProfileSaveGuardRejectionDescriptionsCoverEveryReason = AssertTrue<
+  SameKeys<ProfileSaveGuardRejection, keyof typeof PROFILE_SAVE_GUARD_REJECTION_DESCRIPTIONS>
 >;
 
 // 監査のジョブ（Task 24 の設計書 4.8。T24f）: 状態、終わり方、開始と停止を拒む理由、失敗と中断の理由のすべてに、表示と説明がある。
@@ -321,8 +346,9 @@ export type AuditJobAuthStateCatalogCoversEveryState = AssertTrue<SameKeys<Worke
 export type AuthSetupValidationErrorDescriptionsCoverEveryCode = AssertTrue<
   SameKeys<AuthSetupValidationErrorCode, keyof typeof AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS>
 >;
+// MI-C 項目 12: 認証の設定の画面の保存の理由（保存の部品の理由と、自動ログインのプロファイルの `NEW_TARGET_FROM_AUTOMATED_LOGIN`）。
 export type AuthSetupStoreRejectionDescriptionsCoverEveryReason = AssertTrue<
-  SameKeys<AuthSetupStoreRejectionReason, keyof typeof AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS>
+  SameKeys<AuthSetupSaveRejectionReason, keyof typeof AUTH_SETUP_STORE_REJECTION_DESCRIPTIONS>
 >;
 export type AuthSetupFreshnessCatalogCoversEveryValue = AssertTrue<SameKeys<AuthSetupFreshness, keyof typeof AUTH_SETUP_FRESHNESS_CATALOG>>;
 // T34d: ログインの送り方のすべてに表示がある。
@@ -466,14 +492,16 @@ export type ScenarioTransportCatalogCoversEveryTransport = AssertTrue<SameKeys<S
 // T32g（Task 32 の設計書 4.1 の「親の確かめと画面の配布」）: 書き込みの報告の親の確かめの結果のすべてに表示がある。
 export type WriteReportCheckCatalogCoversEveryCheck = AssertTrue<SameKeys<WriteReportCheck, keyof typeof WRITE_REPORT_CHECK_CATALOG>>;
 
-// T43a（Task 43 の設計書 4.1）: プロファイルの「次にすること」の手順と状態のすべてに表示があり、保存の後の次の手順のすべてにリンクの文言があり、
-// 一覧で監査を始められない理由のすべてに短い文がある（値の一覧は `next-steps.ts`）。
-export type ProfileNextStepCatalogCoversEveryStep = AssertTrue<SameKeys<ProfileNextStep, keyof typeof PROFILE_NEXT_STEP_CATALOG>>;
-export type NextStepStateCatalogCoversEveryState = AssertTrue<SameKeys<NextStepState, keyof typeof NEXT_STEP_STATE_CATALOG>>;
+// T43a（Task 43 の設計書 4.1）: 保存の後の次の手順のすべてにリンクの文言がある。PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1、6 章）: サイトの
+// 画面の段のすべてに今の様子の文と一覧の短い文があり、ボタンの行き先のすべてに名前がある（値の一覧は `next-steps.ts`）。
 export type NextStepActionTextCoversEveryStep = AssertTrue<SameKeys<ProfileNextStep, keyof typeof LOCAL_UI_NEXT_STEP_TEXT.after.actions>>;
-export type AuditStartUnavailableTextCoversEveryReason = AssertTrue<
-  SameKeys<AuditStartUnavailableReason, keyof typeof LOCAL_UI_NEXT_STEP_TEXT.auditStartUnavailable>
+export type ProfileStageTextCoversEveryStage = AssertTrue<SameKeys<ProfileStageKind, keyof typeof LOCAL_UI_NEXT_STEP_TEXT.stages>>;
+export type ProfileStageListTextCoversEveryStage = AssertTrue<SameKeys<ProfileStageKind, keyof typeof LOCAL_UI_NEXT_STEP_TEXT.listStages>>;
+// OP-3: 点検から移ってきたときの段の文は、段の一覧の中の鍵だけ（余分がない）。
+export type ProfileStageAfterArrivalTextIsWithinStages = AssertTrue<
+  [keyof typeof LOCAL_UI_NEXT_STEP_TEXT.afterAuditArrival] extends [ProfileStageKind] ? true : false
 >;
+export type ProfileActionTextCoversEveryAction = AssertTrue<SameKeys<ProfileAction, keyof typeof LOCAL_UI_NEXT_STEP_TEXT.actions>>;
 
 // T43c（Task 43 の設計書 4.3）: 入口の確かめの終わり方と、3 つの要素の置き方と、欄のすべてに表示がある（値の一覧は `src/control/entry-check.ts`）。
 export type EntryCheckEndReasonCatalogCoversEveryReason = AssertTrue<SameKeys<EntryCheckEndReason, keyof typeof ENTRY_CHECK_END_REASON_CATALOG>>;
@@ -495,6 +523,10 @@ export type DisplaySettingsTextCoversEveryReason = AssertTrue<
 export type LoginStageRowRegisterTextCoversEveryReason = AssertTrue<
   SameKeys<LoginStageRowRejectionReason, keyof typeof LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT.reasons>
 >;
+// OP-K（K3）: 自動ログインへ切り替えられなかった理由のすべてに、1 行の文がある。
+export type AutomatedLoginUnavailableTextCoversEveryReason = AssertTrue<
+  SameKeys<AuditJobAutomatedLoginUnavailableReason, keyof typeof LOCAL_UI_MANUAL_LOGIN_TEXT.autoRegistration.automatedLoginReasons>
+>;
 export type ManualLoginAutoRegistrationSkipTextCoversEveryReason = AssertTrue<
   SameKeys<AuditJobLoginAutoRegistrationSkipReason, keyof typeof LOCAL_UI_MANUAL_LOGIN_TEXT.autoRegistration.skipReasons>
 >;
@@ -504,21 +536,29 @@ export type StageChainCatalogCoversEveryState = AssertTrue<SameKeys<ChainState, 
 export type StageChainCatalogCoversEveryStageState = AssertTrue<SameKeys<ChainStageState, keyof typeof STAGE_CHAIN_STAGE_STATE_CATALOG>>;
 export type StageChainCatalogCoversEveryStopReason = AssertTrue<SameKeys<ChainStopReason, keyof typeof STAGE_CHAIN_STOP_REASON_CATALOG>>;
 export type StageChainTextCoversEveryStopReason = AssertTrue<SameKeys<ChainStopReason, keyof typeof LOCAL_UI_STAGE_CHAIN_TEXT.stopReasons>>;
-// FM2b（手を減らす段 2 の設計書 3A.2）: 下書きをボタン 1 回で作るときの押せない理由・行の状態・照合の READ の定義の扱い・推測の項目、案の出どころと
+// PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 3、3 章の 1）: 開始の画面の主のボタンが始めるもの（まとめて実行か、点検だけか）のすべてに、
+// 1 回押すと何が起きるかの文がある。
+export type StartTextCoversEveryPrimaryStartKind = AssertTrue<
+  SameKeys<AuditPrimaryStartKind, keyof typeof LOCAL_UI_AUDIT_TEXT.start.whatHappens>
+>;
+// FM2b（手を減らす段 2 の設計書 3A.2）: 下書きをボタン 1 回で作るときの押せない理由・行の状態・推測の項目、案の出どころと
 // 根拠のすべてに文言がある（値の一覧は `src/control/approval/api-scenario-autodraft.ts` と `draft-value-origin.ts`）。
 export type AutoDraftTextCoversEveryBlocker = AssertTrue<SameKeys<AutoDraftBlocker, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.blockers>>;
 export type AutoDraftTextCoversEveryCreateStatus = AssertTrue<SameKeys<AutoDraftCreatePlan['status'], keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.createStatuses>>;
-export type AutoDraftTextCoversEveryUpdateStatus = AssertTrue<SameKeys<AutoDraftUpdatePlan['status'], keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.updateStatuses>>;
-export type AutoDraftTextCoversEveryReadCheckOutcome = AssertTrue<
-  SameKeys<AutoDraftReadCheckOutcome, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.readCheckOutcomes>
->;
-export type AutoDraftTextCoversEveryPlannedReadCheckOutcome = AssertTrue<
-  SameKeys<Exclude<AutoDraftReadCheckOutcome, 'REJECTED' | 'NOT_LINKED' | 'NOT_ATTEMPTED'>, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.readCheckPlannedOutcomes>
->;
+// OP-2: 作った結果の状態（保存した・作れなかった）も含める。
+export type AutoDraftTextCoversEveryUpdateStatus = AssertTrue<SameKeys<AutoDraftUpdateResultStatus, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.updateStatuses>>;
 export type AutoDraftTextCoversEveryInferredItem = AssertTrue<SameKeys<AutoDraftInferredItemKind, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.inferredItems>>;
-// FM2R の Minor 10: 照合の READ の期待を結んだか・結ばなかった理由のすべてに文言がある。
-export type AutoDraftTextCoversEveryExpectationOutcome = AssertTrue<
-  SameKeys<AutoDraftExpectationOutcome, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.expectationOutcomes>
+// MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 更新の照合の READ を台帳から埋められない理由のすべてに文言がある（値の一覧は
+// `src/control/approval/api-scenario-draft.ts` の `API_UPDATE_LEDGER_READ_UNAVAILABLE_REASONS`）。
+export type ApiUpdateLedgerReadTextCoversEveryReason = AssertTrue<SameKeys<
+  Extract<ApiScenarioLedgerOption['readVerification'], { readonly status: 'UNAVAILABLE' }>['reason'],
+  keyof typeof LOCAL_UI_SCENARIO_TEXT.api.ledgerReadUnavailable
+>>;
+// PL-6b（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: フォームの形の下書きの決められなかった理由と、書き換えの検証の指定を台帳から写せない理由の
+// すべてに文言がある（値の一覧は `form-scenario-autodraft.ts` の `FORM_AUTO_DRAFT_GAPS` と `update-verification-copy.ts`）。
+export type AutoDraftTextCoversEveryFormGap = AssertTrue<SameKeys<FormAutoDraftGap, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.formGaps>>;
+export type AutoDraftTextCoversEveryUpdateCopyReason = AssertTrue<
+  SameKeys<UpdateVerificationCopyUnavailableReason, keyof typeof LOCAL_UI_AUTO_DRAFT_TEXT.updateCopyUnavailable>
 >;
 // FM2b: 案の出どころの表示（名前・順・色の区分）は表示カタログの 1 か所。
 export type DraftValueOriginCatalogCoversEveryOrigin = AssertTrue<SameKeys<DraftValueOrigin, keyof typeof DRAFT_VALUE_ORIGIN_CATALOG>>;
@@ -530,4 +570,51 @@ export type AutomatedLoginSetupTextCoversEveryRejection = AssertTrue<
 >;
 export type AutomatedLoginSetupTextCoversEveryRollback = AssertTrue<
   SameKeys<AutomatedLoginSetupRollback, keyof typeof LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.rollbacks>
+>;
+// PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 切り替えの画面にセレクタの案のもとの説明を出さなくなったので、案のもとの文言の網羅は外した。
+// OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D6・D7'）: 「書き込みにも使う」の確認のダイアログと文言はなくした（切り替えは、一覧の
+// チェックの保存が中で行い、拒んだときは `LOCAL_UI_WRITE_SCREENS_TEXT.rejections.MODE_SWITCH_FAILED` の 1 行を出す）。
+// OP-2 の修正の 2 回目（判断 2・R1）: サイトの画面の一覧の、試せない行の理由の種類と、更新の 1 行の状態と、行の状態と、保存を拒む理由のすべてに文言がある（値の
+// 一覧は `src/display/write-screen-values.ts` と `src/server/write-screen-functions.ts`）。
+export type WriteScreensTextCoversEveryNotCheckableKind = AssertTrue<
+  SameKeys<WriteScreenNotCheckableKind, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.notCheckable>
+>;
+export type WriteScreensTextCoversEveryUpdateState = AssertTrue<SameKeys<WriteScreenUpdateState, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.update>>;
+/** OP-G: 点検の要点の書き込みの 1 行の種類と、その文。 */
+export type WriteScreensTextCoversEveryInspectionWriteOutcome = AssertTrue<SameKeys<InspectionWriteOutcome, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.inspectionWrite>>;
+export type WriteScreensTextCoversEveryRowState = AssertTrue<SameKeys<WriteScreenRowState, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.states>>;
+export type WriteScreensTextCoversEveryRejection = AssertTrue<
+  SameKeys<WriteScreenCheckRejection, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.rejections>
+>;
+// OP-F: 前の点検の結果の「前回は試せませんでした」の理由（送らずに締めた理由のすべて）。
+export type WriteScreensTextCoversEveryNotSentReason = AssertTrue<SameKeys<ActionBlockReason, keyof typeof LOCAL_UI_WRITE_SCREENS_TEXT.lastResult.notSentReasons>>;
+// MI-3（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 入口の確かめの後の認証の設定の状態（`NOT_USED` と、文を出さない `PRESENT` を除く）のすべてに文言がある（値の一覧は
+// `src/control/auth/auth-setup-proposal.ts`）。
+export type AuthSetupProposalTextCoversEveryState = AssertTrue<
+  SameKeys<Exclude<EntryCheckAuthSetupState, 'NOT_USED' | 'PRESENT'>, keyof typeof LOCAL_UI_AUTH_SETUP_PROPOSAL_TEXT.states>
+>;
+// MI-F3 項目 6: 起動のときに使えないプロファイルを自動で取り消す理由のすべてに、ログの文言がある（値の一覧は `src/control/unusable-profile.ts`）。
+export type UnusableProfileTextCoversEveryReason = AssertTrue<
+  SameKeys<UnusableProfileReason, keyof typeof LOCAL_UI_UNUSABLE_PROFILE_TEXT.reasons>
+>;
+// PL-V（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 6）: 知らせの種類のすべてに、見出しがないときに出す種類の語がある（種類の一覧は
+// `components/Notice.tsx` の `NoticeKind`）。
+export type NoticeKindTextCoversEveryKind = AssertTrue<SameKeys<NoticeKind, keyof typeof LOCAL_UI_FRAME_TEXT.noticeKinds>>;
+// PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2・4）: 要求の種類のすべてに、画面の日本語の名前がある（値の一覧は
+// `src/control/worker-protocol.ts` の `WORKER_REQUEST_RESOURCE_TYPES`）。
+export type RequestResourceTypeLabelsCoverEveryType = AssertTrue<
+  SameKeys<WorkerRequestResourceType, keyof typeof REQUEST_RESOURCE_TYPE_LABELS>
+>;
+// PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・5）: 作業の画面の要点の結果の 1 行のすべてに文言がある（値の一覧は
+// `server/audit-job-functions.ts` の `JOB_SUMMARY_ACTIVE_RESULTS`・`JOB_SUMMARY_FINISHED_RESULTS`。止めている間は、種類ごとの `AUDIT_JOB_STOP_REQUESTED_TEXTS`）。
+export type JobSummaryTextCoversEveryActiveResult = AssertTrue<
+  SameKeys<Exclude<JobSummaryActiveResult, 'STOPPING'>, keyof typeof LOCAL_UI_JOB_SUMMARY_TEXT.active>
+>;
+export type JobSummaryTextCoversEveryFinishedResult = AssertTrue<SameKeys<JobSummaryFinishedResult, keyof typeof LOCAL_UI_JOB_SUMMARY_TEXT.finished>>;
+// OP-G2（OP-G の指示書の 6）: 点検の画面にとどまる間の今の段のすべてに、結果の 1 行の文言がある（値の一覧は `display/job-summary-values.ts` の
+// `JOB_SUMMARY_CHAIN_STAGES`）。
+export type JobSummaryTextCoversEveryChainStage = AssertTrue<SameKeys<JobSummaryChainStage, keyof typeof LOCAL_UI_JOB_SUMMARY_TEXT.chainStage>>;
+// OP-H: 今の段の一覧の、段の値は、IPC の契約の読み取りの段と書き込みの段のちょうど全部（`NEXT` は段と段の間）。
+export type JobSummaryChainStagesAreTheChainStages = AssertTrue<
+  SameKeys<Exclude<JobSummaryChainStage, 'NEXT'>, WorkerChainStageKind | WorkerWriteJobKind>
 >;

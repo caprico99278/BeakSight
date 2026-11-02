@@ -14,7 +14,7 @@
 // - 拒否は、閉じた一覧の理由の値（`PROFILE_STORE_REJECTION_REASONS`）で返す。日本語の説明は `src/presentation/messages.ts`（T23d）。
 //   データベースそのものの誤り（busy の待ちを過ぎた、読み取り専用、保存された文書が読めない）は `ControlStoreError` で投げる。
 // - 生の接続（`ControlDatabase.connection`）を外へ出さない。返す値は凍結した写し。
-import { DEFAULT_AUDIT_SEND_POLICY, isAuditSendPolicyName, type AuditSendPolicyName } from '../../core/audit-send-policy.js';
+import { DEFAULT_SITE_AUDIT_SEND_POLICY, isAuditSendPolicyName, type AuditSendPolicyName } from '../../core/audit-send-policy.js';
 import { isRecord } from '../../core/guards.js';
 import { deepFreeze } from '../../core/immutable.js';
 import { formatCompactUtcTimestamp } from '../../core/utc-timestamp.js';
@@ -24,6 +24,7 @@ import {
   type SiteProfile,
   type ValidatedSiteProfile,
 } from '../contracts.js';
+import { CREDENTIAL_DESTINATION_LOCKED_REASON, profileCredentialDestinationChangesOf } from '../auth/credential-destination.js';
 import { validateControlDocument } from '../control-schema-validator.js';
 import {
   assertProfileRevisionAdvance,
@@ -64,6 +65,11 @@ export const PROFILE_STORE_REJECTION_REASONS = Object.freeze([
   'PROFILE_REVISION_NOT_ADVANCED',
   /** 保存されている文書が壊れている（形がスキーマに合わない、行と一致しない。`errors` に形の誤り）。変更しない。 */
   'STORED_PROFILE_INVALID',
+  /**
+   * MI-F1（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 3）: 保存の前も後も自動ログインのプロファイルで、資格情報の送信先の項目（設定の
+   * ファイル、テスト環境の Origin を足すこと、承認したサービスの Origin を足すこと。判定は `profileCredentialDestinationChangesOf`）が変わる。変更しない。
+   */
+  CREDENTIAL_DESTINATION_LOCKED_REASON,
 ] as const);
 export type ProfileStoreRejectionReason = (typeof PROFILE_STORE_REJECTION_REASONS)[number];
 
@@ -76,6 +82,25 @@ export interface ProfileWriteOptions {
   /** 今の時刻（既定は `new Date()`）。 */
   readonly now?: () => Date;
 }
+
+/**
+ * MI-F5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 7。再レビュー MI-R2 の Important I-A）: 更新の選択肢。`gate` は、画面の口の判定
+ * （判定の関数は口の側の 1 か所。例: `profileSaveGuardRejectionOf`）。書き込みのトランザクションの中で、今の行の確かめ（画面が読んだ改訂の照合を含む）の後、
+ * 資格情報の送信先の確かめの前に、保存してある改訂に対して呼ぶ。理由を返したら、その理由で拒み、何も書かない。
+ */
+export interface ProfileUpdateOptions<TGate extends string = never> extends ProfileWriteOptions {
+  readonly gate?: (previous: SiteProfile) => TGate | null;
+}
+
+/** 口の判定のある更新の結果（拒否の理由に、口の判定の理由が入る）。 */
+export type GatedProfileStoreResult<TGate extends string> =
+  | Extract<ProfileStoreResult, { ok: true }>
+  | {
+    readonly ok: false;
+    readonly reason: ProfileStoreRejectionReason | TGate;
+    readonly detail: string;
+    readonly errors: readonly ProfileValidationError[];
+  };
 
 /** 取り消しの選択肢（ターゲット設定を読まないので、文脈は求めない）。 */
 export interface ProfileRetireOptions {
@@ -332,47 +357,74 @@ export const createProfile = (database: ControlDatabase, input: unknown, options
   });
 };
 
+/** 書く前の確かめを通った更新（保存してあった改訂と、次の改訂）。 */
+interface PreparedUpdate {
+  readonly ok: true;
+  readonly previous: SiteProfile;
+  readonly next: ValidatedSiteProfile;
+}
+
 /**
- * 検証した次の改訂を書く（書き込みのトランザクションの中だけで呼ぶ。今の行の確かめ、改訂の照合、改訂が増えることの確かめ、行と履歴の書き込み）。
- * T43d: `updateProfile` と `updateProfileWithFollowingWrite` が共有する。
+ * 検証した次の改訂を書く前の確かめ（書き込みのトランザクションの中だけで呼ぶ。今の行の確かめ、改訂の照合、MI-F1 の資格情報の送信先の確かめ、改訂が増える
+ * ことの確かめ）。T43d: `updateProfile` と `updateProfileWithFollowingWrite` が共有する。
  */
-const applyUpdate = (
+const prepareUpdate = <TGate extends string = never>(
   connection: SqliteConnection,
   candidate: ValidatedSiteProfile,
   expectedRevision: number,
-  now: (() => Date) | undefined,
-): ProfileStoreResult => {
+  gate?: (previous: SiteProfile) => TGate | null,
+): PreparedUpdate | Rejection | Extract<GatedProfileStoreResult<TGate>, { ok: false }> => {
   const current = currentForChange(connection, candidate.profileId, expectedRevision);
   if (!current.ok) {
     return current;
+  }
+  // MI-F5（設計書 4.7.1 の 7）: 口の判定を、トランザクションの中で読んだ保存してある改訂に対して呼ぶ（改訂の照合の後）。
+  const gated = gate?.(current.profile) ?? null;
+  if (gated !== null) {
+    return deepFreeze({ ok: false, reason: gated, detail: 'the gate of the caller rejected the profile update', errors: [] });
+  }
+  // MI-F1（設計書 4.7.1 の 3・4）: 保存の前も後も自動ログインのプロファイルなら、資格情報の送信先の項目を変えない（今保存してある値と比べる）。
+  const locked = profileCredentialDestinationChangesOf(current.profile, candidate);
+  if (locked.length > 0) {
+    return rejected(CREDENTIAL_DESTINATION_LOCKED_REASON, `the credential destination of an AUTOMATED_LOGIN profile cannot change: ${locked.join(', ')}`);
   }
   const advance = advanceOf(current.profile, candidate);
   if (!advance.ok) {
     return advance;
   }
-  return accepted(replaceRow(connection, current.profile.revision, advance.profile, ACTIVE_PROFILE_STATUS, 'UPDATED', timestampOf(now)));
+  return { ok: true, previous: current.profile, next: advance.profile };
 };
 
-/** プロファイルを更新する（次の改訂。履歴は `UPDATED`）。 */
-export const updateProfile = (
+/** 確かめを通った次の改訂を書く（書き込みのトランザクションの中だけで呼ぶ。行と履歴の書き込み）。 */
+const writeUpdate = (connection: SqliteConnection, prepared: PreparedUpdate, now: (() => Date) | undefined): StoredProfile =>
+  replaceRow(connection, prepared.previous.revision, prepared.next, ACTIVE_PROFILE_STATUS, 'UPDATED', timestampOf(now));
+
+/** プロファイルを更新する（次の改訂。履歴は `UPDATED`）。MI-F5: 口の判定（`options.gate`）があれば、トランザクションの中で呼ぶ。 */
+export const updateProfile = <TGate extends string = never>(
   database: ControlDatabase,
   request: ProfileUpdateRequest,
-  options: ProfileWriteOptions,
-): ProfileStoreResult => {
+  options: ProfileUpdateOptions<TGate>,
+): GatedProfileStoreResult<TGate> => {
   const incoming = validateIncoming(request.profile, options.resolveContext);
   if (!incoming.ok) {
     return incoming;
   }
   const candidate = incoming.profile;
-  return withWriteTransaction(database, (connection) => applyUpdate(connection, candidate, request.expectedRevision, options.now));
+  return withWriteTransaction(database, (connection): GatedProfileStoreResult<TGate> => {
+    const prepared = prepareUpdate(connection, candidate, request.expectedRevision, options.gate);
+    return prepared.ok ? accepted(writeUpdate(connection, prepared, options.now)) as Extract<ProfileStoreResult, { ok: true }> : prepared;
+  });
 };
 
 /**
  * T43d（Task 43 の設計書 4.4）: プロファイルの次の改訂の後に、同じトランザクションで続けて書くもの。`validate` は次の改訂を検証した後、トランザクション
  * の外で呼ぶ（検証の結果を返す）。`write` は、プロファイルの行を書いた直後に、同じ書き込みのトランザクションの中で呼ぶ（投げると両方を元に戻す）。
+ * MI-F1（設計書 4.7.1 の 4）: `check` は、書き込みのトランザクションの中で、プロファイルの確かめの後、どちらも書く前に呼ぶ（保存してあった改訂 `previous` と
+ * 次の改訂 `next` と、検証した値。拒むなら理由を返し、どちらも書かない）。
  */
 export interface ProfileFollowingWrite<TValidated, TRejection, TWritten> {
   readonly validate: (candidate: ValidatedSiteProfile) => { readonly ok: true; readonly value: TValidated } | { readonly ok: false; readonly rejection: TRejection };
+  readonly check?: (connection: SqliteConnection, previous: SiteProfile, next: ValidatedSiteProfile, value: TValidated) => TRejection | null;
   readonly write: (connection: SqliteConnection, value: TValidated) => TWritten;
 }
 
@@ -402,11 +454,16 @@ export const updateProfileWithFollowingWrite = <TValidated, TRejection, TWritten
     return { ok: false, part: 'FOLLOWING', rejection: followed.rejection };
   }
   return withWriteTransaction(database, (connection): ProfileFollowingWriteResult<TRejection, TWritten> => {
-    const updated = applyUpdate(connection, candidate, request.expectedRevision, options.now);
-    if (!updated.ok) {
-      return { ok: false, part: 'PROFILE', rejection: updated };
+    const prepared = prepareUpdate(connection, candidate, request.expectedRevision);
+    if (!prepared.ok) {
+      return { ok: false, part: 'PROFILE', rejection: prepared };
     }
-    return { ok: true, stored: updated.stored, written: following.write(connection, followed.value) };
+    const checked = following.check?.(connection, prepared.previous, prepared.next, followed.value) ?? null;
+    if (checked !== null) {
+      return { ok: false, part: 'FOLLOWING', rejection: checked };
+    }
+    const stored = writeUpdate(connection, prepared, options.now);
+    return { ok: true, stored, written: following.write(connection, followed.value) };
   });
 };
 
@@ -445,21 +502,21 @@ export interface ProfileDisplaySettings {
   readonly showJobBrowser: boolean;
   /**
    * AS-b（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.1）: 監査・発見・READ の確かめのジョブの、監査の段の送信の扱い（管理データの版 17 の
-   * `audit_send_policy`。行がなければ既定の `READ_ONLY`）。ジョブの開始のときに `START` の `auditSendPolicy` で渡す。
+   * `audit_send_policy`。行がなければサイトの既定の `PASS_EXCEPT_DELETE`。OP-I の I1）。ジョブの開始のときに `START` の `auditSendPolicy` で渡す。
    */
   readonly auditSendPolicy: AuditSendPolicyName;
 }
 
-/** 保存の入力（AS-b: 監査の段の送信の扱いを省略すると、今の値を変えない。行がなければ既定の `READ_ONLY`）。 */
+/** 保存の入力（AS-b: 監査の段の送信の扱いを省略すると、今の値を変えない。行がなければサイトの既定の `PASS_EXCEPT_DELETE`。OP-I の I1）。 */
 export interface ProfileDisplaySettingsInput {
   readonly showJobBrowser: boolean;
   readonly auditSendPolicy?: AuditSendPolicyName;
 }
 
-/** 行のないプロファイルの表示の設定（既定は表示する・読み取りだけ）。 */
+/** 行のないプロファイルの表示の設定（既定は表示する・削除のほかを通す。OP-I の I1）。 */
 export const DEFAULT_PROFILE_DISPLAY_SETTINGS: ProfileDisplaySettings = Object.freeze({
   showJobBrowser: true,
-  auditSendPolicy: DEFAULT_AUDIT_SEND_POLICY,
+  auditSendPolicy: DEFAULT_SITE_AUDIT_SEND_POLICY,
 });
 
 /** 表示の設定の保存が拒む理由（閉じた一覧）。 */
@@ -472,8 +529,11 @@ export type ProfileDisplaySettingsSaveResult =
   | { readonly ok: false; readonly reason: ProfileDisplaySettingsRejectionReason };
 
 const SELECT_DISPLAY_SETTINGS_SQL = 'SELECT show_job_browser, audit_send_policy FROM profile_display_settings WHERE profile_id = ?';
-/** 行がなければ、扱いは列の既定（`READ_ONLY`）で作る。扱いを省略した保存は、行があれば扱いを変えない。 */
-const UPSERT_DISPLAY_SETTINGS_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, updated_at) VALUES (?, ?, ?)
+/**
+ * 扱いを省略した保存。行がなければ、扱いはサイトの既定（`DEFAULT_SITE_AUDIT_SEND_POLICY`）を明示して書く（OP-I の I1: 列の既定の `READ_ONLY` に頼らない。
+ * 列の既定は管理データの形のまま変えない）。行があれば扱いを変えない。
+ */
+const UPSERT_DISPLAY_SETTINGS_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, audit_send_policy, updated_at) VALUES (?, ?, ?, ?)
   ON CONFLICT (profile_id) DO UPDATE SET show_job_browser = excluded.show_job_browser, updated_at = excluded.updated_at`;
 /** AS-b: 扱いも書く保存。 */
 const UPSERT_DISPLAY_AND_AUDIT_SEND_SETTINGS_SQL = `INSERT INTO profile_display_settings (profile_id, show_job_browser, audit_send_policy, updated_at)
@@ -499,7 +559,7 @@ export const readProfileDisplaySettings = (database: ControlDatabase, profileId:
 
 /**
  * プロファイルの表示の設定を保存する（行があれば置き換える）。プロファイルがなければ `PROFILE_NOT_FOUND`、表示の値が真偽でないか、AS-b の監査の段の送信の
- * 扱いが一覧の値でなければ `SETTINGS_INVALID`（どちらも書かない）。扱いを省略すると、今の値を変えない（行がなければ既定の `READ_ONLY`）。プロファイルの行と
+ * 扱いが一覧の値でなければ `SETTINGS_INVALID`（どちらも書かない）。扱いを省略すると、今の値を変えない（行がなければサイトの既定の `PASS_EXCEPT_DELETE`）。プロファイルの行と
  * 改訂と履歴は変えない。データベースそのものの誤りは `ControlStoreError` で投げる。結果の設定は、保存した後の行の値。
  */
 export const saveProfileDisplaySettings = (
@@ -522,7 +582,7 @@ export const saveProfileDisplaySettings = (
     if (isAuditSendPolicyName(auditSendPolicy)) {
       connection.prepare(UPSERT_DISPLAY_AND_AUDIT_SEND_SETTINGS_SQL).run(profileId, showJobBrowser ? 1 : 0, auditSendPolicy, updatedAt);
     } else {
-      connection.prepare(UPSERT_DISPLAY_SETTINGS_SQL).run(profileId, showJobBrowser ? 1 : 0, updatedAt);
+      connection.prepare(UPSERT_DISPLAY_SETTINGS_SQL).run(profileId, showJobBrowser ? 1 : 0, DEFAULT_SITE_AUDIT_SEND_POLICY, updatedAt);
     }
     const row = connection.prepare(SELECT_DISPLAY_SETTINGS_SQL).get(profileId) as { readonly show_job_browser: number; readonly audit_send_policy: unknown };
     return Object.freeze({ ok: true, settings: displaySettingsOfRow(row) } as const);

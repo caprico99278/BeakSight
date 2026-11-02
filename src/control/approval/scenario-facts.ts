@@ -51,6 +51,7 @@ import {
   updateLedgerScenarioIdOf,
 } from './scenario-contracts.js';
 import { assertStorableApprovalReceipt, storedScenarioRevisionOf } from './scenario-policy.js';
+import { discoveryProfileRevisionsIn } from './discovery-profile-freshness.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // 形
@@ -288,6 +289,8 @@ export const readCheckFactsIn = (connection: SqliteConnection, profileId: string
       targetKind: readCheckTargetKindOf(definition),
       // T38c: 画面の path の定義が `{id}` つきの型か（API のシナリオの照合の READ だけに使える）。
       ...(definition.targetPagePath === undefined ? {} : { pageTemplate: isReadCheckPageTemplatePath(definition.targetPagePath) }),
+      // OP-R（R1）: 画面の path の定義の path（API の登録の照合の READ に、一覧の画面の定義を使えるかを、下書きの確かめが見る）。
+      ...(definition.targetPagePath === undefined ? {} : { pagePath: definition.targetPagePath }),
     }))
     .sort((left, right) => compareCodeUnits(left.readCheckId, right.readCheckId)));
 
@@ -307,6 +310,18 @@ export const scenarioKindFactsIn = (connection: SqliteConnection, profileId: str
         apiRequest: api === undefined ? null : Object.freeze({ origin: api.request.origin, pathShape: api.request.pathShape }),
       });
     }));
+
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1、設計者の判断 (f)）: プロファイルのシナリオの今の版のうち、照合の READ に照合の専用の印
+ * （`verificationOnly`）を持つものが参照する READ の定義の id（id の順。重なりなし）。単独の READ の確かめのジョブは、この定義を読まない（管理データの版を
+ * 上げずに、シナリオの文書の印で決める）。
+ */
+export const verificationOnlyReadCheckIdsIn = (connection: SqliteConnection, profileId: string): readonly string[] =>
+  Object.freeze([...new Set((connection.prepare(SELECT_PROFILE_SCENARIO_REVISIONS_SQL).all(profileId) as unknown as RevisionRow[])
+    .flatMap((row) => {
+      const read = revisionViewOf(row).scenario.verification.readVerification;
+      return read?.verificationOnly === true ? [read.readCheckId] : [];
+    }))].sort(compareCodeUnits));
 
 /**
  * 同じ台帳のシナリオの id（T31e。生成の履歴に使う。id の順）。台帳は、CREATE のシナリオと、どれかの版でそれを参照する UPDATE のシナリオの集まり。
@@ -403,6 +418,7 @@ export const currentFactsIn = (
   if (stored === null) {
     throw integrityError('scenarios', 'the profile of the scenario does not exist');
   }
+  const latestDiscoveryRevision = latestDiscoveryProfileRevisionIn(connection, scenario.profileId, snapshot);
   return Object.freeze({
     profile: Object.freeze({
       profileId: stored.profile.profileId,
@@ -422,7 +438,10 @@ export const currentFactsIn = (
     // T38R-fix: 鍵と欄の対応の digest の一覧（I-1）、根拠の型の Origin の番号と最新の発見のジョブの改訂（C-2）。
     candidateKeyFieldDigests: candidateKeyFieldDigestsOf(snapshot, scenario.candidate.identityDigest),
     apiShapeOriginIndex: apiShapeOriginIndexIn(connection, scenario),
-    latestDiscoveryProfileRevision: latestDiscoveryProfileRevisionIn(connection, scenario.profileId, snapshot),
+    latestDiscoveryProfileRevision: latestDiscoveryRevision,
+    // PL-U の修正の 1 回目（設計書 14.1 の U5）: その発見の改訂から今の改訂まで「書き込みも試す」の切り替えだけか（判定の 1 か所 `discovery-profile-freshness.ts`）。
+    latestDiscoverySwitchOnlySinceDiscovery: discoveryProfileRevisionsIn(connection, scenario.profileId, latestDiscoveryRevision, stored.profile.revision)
+      .switchOnlySinceDiscovery === true,
     // T29d: 入力の規則の今の参照は、規則の集まりの最新の版（シナリオ自身の参照ではない）。
     inputRuleReference: latestRuleSetReferenceIn(connection, scenario.scenarioId),
     readChecks: readCheckFactsIn(connection, scenario.profileId),

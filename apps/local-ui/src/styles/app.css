@@ -23,6 +23,42 @@ a {
   color: var(--color-accent-strong);
 }
 
+/*
+ * 見出しの段（PL-V。設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 2）: h1 26px・h2 20px・h3 17px・h4 16px。h3・h4 は前は UA の既定の
+ * 大きさで、h3 が h2 より大きかった。
+ */
+h1,
+h2,
+h3,
+h4 {
+  line-height: var(--line-height-heading);
+}
+
+h1 {
+  font-size: var(--font-size-title);
+}
+
+h2 {
+  font-size: var(--font-size-heading);
+}
+
+h3 {
+  font-size: var(--font-size-subheading);
+  margin: var(--space-5) 0 var(--space-2);
+}
+
+h4 {
+  font-size: var(--font-size-body);
+  margin: var(--space-4) 0 var(--space-2);
+}
+
+/* 等幅（13 章の 8）: UA の既定の等幅をやめ、l と I を見分けやすい字体にする。長い値は枠の中で折り返す。 */
+code {
+  font-family: var(--font-family-mono);
+  font-size: 0.95em;
+  overflow-wrap: anywhere;
+}
+
 :focus-visible {
   outline: var(--focus-ring-width) solid var(--color-focus);
   outline-offset: var(--focus-ring-offset);
@@ -94,6 +130,12 @@ a {
   background: var(--color-panel);
 }
 
+/* 環境に問題があるときだけ出す項目（13 章の 14） */
+.nav-link--problem {
+  color: var(--color-critical);
+  font-weight: 700;
+}
+
 .nav-link[aria-current='page'] {
   background: var(--color-panel-raised);
   color: var(--color-accent-strong);
@@ -109,6 +151,7 @@ a {
 
 .top-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
@@ -120,6 +163,23 @@ a {
 .page-title {
   margin: 0;
   font-size: var(--font-size-title);
+}
+
+/* 今どこにいるかの 1 行と題を縦に並べる枠（13 章の 4。h1 の上の 1 行は、画面の一番下の戻るボタンの代わり） */
+.top-bar-titles {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.page-context {
+  margin: 0;
+  font-size: var(--font-size-small);
+  color: var(--color-text-muted);
+}
+
+.page-context-separator {
+  margin: 0 var(--space-2);
 }
 
 .content {
@@ -140,6 +200,13 @@ a {
 .panel-heading {
   margin: 0 0 var(--space-4);
   font-size: var(--font-size-heading);
+}
+
+/* 要点の 1 行目（画面の形の 1 つ目。新しい区画ではなく、パネルの中の文の大きさ） */
+.panel-lead {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-lead);
+  font-weight: 700;
 }
 
 .toolbar {
@@ -240,22 +307,26 @@ th {
   color: var(--color-neutral);
 }
 
-/* ボタン */
+/* ボタン（13 章の 1・9: 二次のボタンの縁を 3:1 以上に、押せる大きさを 44px 以上に、押せない状態は薄く灰色に） */
 .button {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--control-min-height);
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-small);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   background: var(--color-panel-raised);
   color: var(--color-text);
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
   text-decoration: none;
 }
 
 .button--primary {
   background: var(--color-accent);
-  border-color: var(--color-accent);
+  border-color: var(--color-accent-strong);
   color: var(--color-text-on-accent);
   font-weight: 700;
 }
@@ -267,6 +338,7 @@ th {
 
 .button:disabled {
   opacity: var(--opacity-disabled);
+  filter: grayscale(1);
   cursor: not-allowed;
 }
 
@@ -300,16 +372,42 @@ th {
 .field-error {
   color: var(--color-critical);
   font-size: var(--font-size-small);
+  font-weight: 600;
 }
 
+/* 欄（13 章の 1・9: 縁を 3:1 以上に、押せる大きさを 44px 以上に） */
 .input {
   width: 100%;
+  min-height: var(--control-min-height);
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-small);
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   background: var(--color-background);
   color: var(--color-text);
   font: inherit;
+}
+
+.input:disabled {
+  opacity: var(--opacity-disabled);
+  filter: grayscale(1);
+  cursor: not-allowed;
+}
+
+/* checkbox と radio（13 章の 9: 大きく、差し色で。縁は UA が `accent-color` から描く） */
+input[type='checkbox'],
+input[type='radio'] {
+  inline-size: var(--choice-size);
+  block-size: var(--choice-size);
+  margin: 0;
+  flex: none;
+  accent-color: var(--color-accent);
+}
+
+input[type='checkbox']:disabled,
+input[type='radio']:disabled {
+  opacity: var(--opacity-disabled);
+  filter: grayscale(1);
+  cursor: not-allowed;
 }
 
 .input[aria-invalid='true'] {
@@ -330,16 +428,20 @@ textarea.input {
   margin-bottom: var(--space-4);
 }
 
+/* 13 章の 6: 色の帯に加えて、面の色でも種類を示す（意味は見出しの語でも伝える。`Notice.tsx`） */
 .notice--caution {
   border-left-color: var(--color-caution);
+  background: var(--color-caution-surface);
 }
 
 .notice--critical {
   border-left-color: var(--color-critical);
+  background: var(--color-critical-surface);
 }
 
 .notice--positive {
   border-left-color: var(--color-positive);
+  background: var(--color-positive-surface);
 }
 
 .notice-heading {
@@ -367,14 +469,15 @@ textarea.input {
   margin: 0;
 }
 
-/* 確認のダイアログ */
+/* 確認のダイアログ（13 章の 7: 後ろの暗さから、面と縁と影で立てる） */
 .dialog {
-  border: 1px solid var(--color-border);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius);
-  background: var(--color-panel);
+  background: var(--color-panel-raised);
   color: var(--color-text);
   padding: var(--space-5);
   max-width: var(--dialog-max-width);
+  box-shadow: var(--shadow-dialog);
 }
 
 .dialog::backdrop {
@@ -391,6 +494,9 @@ textarea.input {
   max-height: var(--dialog-details-max-height);
   overflow: auto;
   margin-bottom: var(--space-4);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
 }
 
 /* 監査のジョブ（Task 24 の設計書 4.8。T24f） */
@@ -406,10 +512,17 @@ textarea.input {
   white-space: nowrap;
 }
 
+/* OP-I（I3）: 表の中の短い文（「次にすること」の段の文など）。折り返し、列の幅を押し広げない。 */
+.data-table .cell-text {
+  margin: 0;
+  white-space: normal;
+}
+
 .choice {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-height: var(--control-min-height);
   margin-top: var(--space-2);
 }
 
@@ -459,6 +572,16 @@ fieldset.field {
   padding: 0 var(--space-1);
 }
 
+/* たたんだ「詳しい設定」（`AdvancedSettings`）: 閉じているときの下の空き（grid の gap）をなくし、見出しを押せる大きさにする */
+details.field-group:not([open]) {
+  gap: 0;
+}
+
+summary.field-group-heading {
+  cursor: pointer;
+  padding-block: var(--space-2);
+}
+
 .field-group-subheading {
   margin: var(--space-2) 0 0;
   font-weight: 600;
@@ -481,4 +604,77 @@ fieldset.field {
 
 .section-gap {
   margin-top: var(--space-5);
+}
+
+/*
+ * 狭い画面（小さい窓、拡大 200% 以上。13 章の 5、WCAG 1.4.10）: 左のメニューを上に積み、横にはみ出さないようにする。
+ * 48rem は tokens.css の `--layout-stack-width` と同じ値（`@media` の条件は変数を使えないので、ここに同じ値を書く。変えるときは両方を変える）。
+ */
+@media (max-width: 48rem) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .brand {
+    margin: 0 0 var(--space-2);
+  }
+
+  .nav-list {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .content,
+  .top-bar {
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
+  }
+
+  /*
+   * OP-I（I3）: 狭い画面では、行ごとの縦の並びにする表（サイトの一覧）。列の見出しは読み上げのために残して見えなくし、列の名前を各値の前に出す
+   * （`data-label`。文言はカタログの列の名前）。
+   */
+  .data-table--stack thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .data-table--stack,
+  .data-table--stack tbody,
+  .data-table--stack tr,
+  .data-table--stack th,
+  .data-table--stack td {
+    display: block;
+    width: 100%;
+  }
+
+  .data-table--stack tr {
+    padding: var(--space-3) 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .data-table--stack tbody th,
+  .data-table--stack td {
+    padding: var(--space-1) 0;
+    border-bottom: 0;
+    white-space: normal;
+    min-width: 0;
+  }
+
+  .data-table--stack [data-label]::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--color-text-muted);
+    font-size: var(--font-size-small);
+  }
 }

@@ -13,7 +13,8 @@ const ATTEMPT_LIMIT_PHRASE = '回数の上限';
 const UNSUPPORTED_LOGIN_PHRASE = 'BeakSight が扱えない形のログイン';
 /** 手順の、扱えない形のログインかを確かめる語と、回数の上限の場合の語。 */
 const FORM_SUBMISSION_PHRASE = 'フォームの送信';
-const CREDENTIALS_PHRASE = '資格情報';
+// PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 5 章）: 画面の言葉は、資格情報 →「ID とパスワード」。
+const CREDENTIALS_PHRASE = 'ID とパスワード';
 
 describe('T25g-4: the screen texts of LOGIN_ATTEMPTS_EXCEEDED agree', () => {
   it('says both cases in the auth state description and in the failure reason description', () => {

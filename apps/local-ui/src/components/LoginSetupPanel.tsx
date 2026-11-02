@@ -4,54 +4,40 @@
  * 見直して直す入口（認証の設定の画面）と、保存でプロファイルの改訂が進むことの知らせを置く。値は持たない（query は名前だけ）。文言はカタログだけ。
  * ML-b-2: ジョブの画面は、このジョブからの自動の登録の結果（`children`）を同じ欄に出す。スクリプトで送るログインの設定がまだない（`setup` が null）
  * ときは、結果と入口だけを出す。
+ * MI-C 項目 11（MI-4 の報告）: 「次から自動でログインする」の案内（前の `AutomatedLoginOffer`）は消した。PL-1: 案内は、サイトの画面の要点の主のボタン（段の決め方は
+ * `display/next-steps.ts` の `profileStageOf`）の 1 か所だけ。サイトの画面には、この欄を出さない（作業の画面だけ）。
+ * PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 13 章の 10、4 章の 2）: 読み上げの区画（`aria-live`）は持たない（作業の画面の読み上げは
+ * 要点の 1 つだけ）。作業の画面は、自動の登録が済んだ後の見直しの入口を出さない（`showReview` を偽にする）。
  */
 import { Link } from '@tanstack/react-router';
 import type { ReactNode } from 'react';
 import { formatCount } from '../../../../src/presentation/format.js';
-import { LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT, LOCAL_UI_MANUAL_LOGIN_TEXT, listText } from '../../../../src/presentation/messages.js';
+import { LOCAL_UI_MANUAL_LOGIN_TEXT, listText } from '../../../../src/presentation/messages.js';
+import { httpMethodLabel } from '../display/labels';
 import type { LoginSetupView } from '../server/login-setup-view';
 
 const text = LOCAL_UI_MANUAL_LOGIN_TEXT;
 
-export function LoginSetupPanel({ profileId, setup, testId, offerAutomatedLogin = false, children }: Readonly<{
+export function LoginSetupPanel({ profileId, setup, testId, children, showReview = true }: Readonly<{
   profileId: string;
   setup: LoginSetupView | null;
   testId: string;
-  /** FM-1（手動の操作を減らす設計書 2.3）: 「次から自動でログインする」の案内を出すか。 */
-  offerAutomatedLogin?: boolean;
   children?: ReactNode;
+  /** 見直しの入口（ログインの設定の画面へのリンク）を出すか（既定は出す）。 */
+  showReview?: boolean;
 }>) {
   return (
-    <section className="panel" aria-live="polite" data-testid={testId}>
+    <section className="panel" data-testid={testId}>
       <h2 className="panel-heading">{text.setupHeading}</h2>
       <p className="muted">{text.setupNote}</p>
       {children}
       {setup === null ? null : <LoginSetupFacts setup={setup} testId={testId} />}
-      <p>
-        <Link to="/auth-setup/$profileId" params={{ profileId }} className="button" data-testid={`${testId}-review`}>{text.review}</Link>
-      </p>
-      {offerAutomatedLogin ? <AutomatedLoginOffer profileId={profileId} testId={`${testId}-automated-login`} /> : null}
+      {showReview ? (
+        <p>
+          <Link to="/auth-setup/$profileId" params={{ profileId }} className="button" data-testid={`${testId}-review`}>{text.review}</Link>
+        </p>
+      ) : null}
     </section>
-  );
-}
-
-/**
- * FM-1（手動の操作を減らす設計書 2.3）: 「次から自動でログインする」。FM2e（同 3A.4）: 3 つの画面を順に導く代わりに、1 つの画面（資格情報の画面の、
- * 手動のログインのプロファイルの形）へ進む。その画面で、認証の方式の変更・ログインの欄のセレクタ（手動のログインの段の観察の案）・資格情報を、確認 1 回で
- * 保存する。自動ログインの上限と厳しさは今のまま。
- */
-function AutomatedLoginOffer({ profileId, testId }: Readonly<{ profileId: string; testId: string }>) {
-  const offer = LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.offer;
-  return (
-    <div data-testid={testId}>
-      <h3>{offer.heading}</h3>
-      <p>{offer.body}</p>
-      <p>
-        <Link to="/credentials/$profileId" params={{ profileId }} className="button button--primary" data-testid="automated-login-offer-setup">
-          {offer.open}
-        </Link>
-      </p>
-    </div>
   );
 }
 
@@ -75,7 +61,7 @@ function LoginSetupFacts({ setup, testId }: Readonly<{ setup: LoginSetupView; te
             <ul>
               {setup.sideRequests.map((request) => (
                 <li key={`${request.origin}${request.path}`} data-path={request.path}>
-                  {text.sideRequestValue(request.method, `${request.origin}${request.path}`, formatCount(request.maxPerLoginStage))}
+                  {text.sideRequestValue(httpMethodLabel(request.method), `${request.origin}${request.path}`, formatCount(request.maxPerLoginStage))}
                 </li>
               ))}
             </ul>

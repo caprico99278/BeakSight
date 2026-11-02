@@ -7,13 +7,18 @@
 // - 開始の拒否（`readVerificationTargetRejectionOf`）は、API の型の READ を通す（FORM と、型でない画面の READ は今のまま拒む）。
 // - 作った指定は、IPC の契約（`validateParentToWorkerMessage`）を通る。
 import { describe, expect, it } from 'vitest';
-import type { ScenarioRevision } from '../../src/control/approval/scenario-contracts.js';
+import { scenarioTransportOf, type ScenarioRevision } from '../../src/control/approval/scenario-contracts.js';
 import { validateScenarioDraft } from '../../src/control/approval/scenario-policy.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import type { SeedRecord } from '../../src/control/data-rules/scenario-data.js';
 import type { ReadCheckView } from '../../src/control/job/read-check-store.js';
-import { WRITE_READ_VERIFICATION_PAGE_TARGET, readVerificationTargetRejectionOf, writeStartSpecOf } from '../../src/control/job/write-job-start.js';
+import {
+  WRITE_READ_VERIFICATION_PAGE_TARGET,
+  apiCreateReadListPagePathOf,
+  readVerificationTargetRejectionOf,
+  writeStartSpecOf,
+} from '../../src/control/job/write-job-start.js';
 import {
   WORKER_PROTOCOL_VERSION,
   isWorkerStartApiWrite,
@@ -66,19 +71,24 @@ const CANDIDATE_READ: ReadCheckView = {
   ...TEMPLATE_READ, readCheckId: 'rc-search',
   definition: { targetIdentityDigest: DIGEST, parameters: { q: '' }, expectations: [] },
 };
-const FIXED_PAGE_READ: ReadCheckView = { ...TEMPLATE_READ, readCheckId: 'rc-page-fixed', definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [] } };
+// OP-R（設計書 4.1.9 の R1）: 登録の画面の 1 つ上（`/admin/members`）は一覧の画面として使えるようになったので、使えない画面の path の見本は、ほかの画面（`/admin`）にした。
+const FIXED_PAGE_READ: ReadCheckView = { ...TEMPLATE_READ, readCheckId: 'rc-page-fixed', definition: { targetPagePath: '/admin', parameters: {}, expectations: [] } };
+/** OP-R（R1）: 登録の画面の 1 つ上の一覧の画面の定義。 */
+const LIST_PATH = '/admin/members';
+const LIST_READ: ReadCheckView = { ...TEMPLATE_READ, readCheckId: 'rc-list', definition: { targetPagePath: LIST_PATH, parameters: {}, expectations: [] } };
 const READ_FACTS = [
   { readCheckId: 'rc-page', profileId: PROFILE_ID, revision: 1, canceledAt: null, parameterNames: [], targetKind: 'PAGE', pageTemplate: true },
   { readCheckId: 'rc-search', profileId: PROFILE_ID, revision: 1, canceledAt: null, parameterNames: ['q'], targetKind: 'CANDIDATE' },
+  { readCheckId: 'rc-list', profileId: PROFILE_ID, revision: 1, canceledAt: null, parameterNames: [], targetKind: 'PAGE', pageTemplate: false, pagePath: LIST_PATH },
 ] as const;
 
+/** PL-6a: API のシナリオの、画面から ID を取る検証の指定（成否の条件はもうない。結果の判定のしかたの印は null）。 */
 const VERIFICATION_CONDITIONS = {
-  successCondition: { pathPrefix: '/admin/members', selector: null },
-  inputErrorCondition: { pathPrefix: NEW_PATH, selector: '.error' },
+  resultJudgement: null,
   recordId: { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' },
 } as const;
 /** T40a-fix: API のシナリオは、成否の条件と入力の誤りの条件を求めない（ID の取り方は `api.recordId` があればよい）。 */
-const NO_CONDITIONS = { successCondition: null, inputErrorCondition: null, recordId: null } as const;
+const NO_CONDITIONS = { resultJudgement: null, recordId: null } as const;
 const RESPONSE_KEY = { source: 'RESPONSE_BODY_KEY', key: 'id' } as const;
 
 /** 下書きの確かめ（T38b・T38c）が作る API の登録のシナリオの版（照合の READ、検証の指定の残り、API の ID の取り方は引数）。 */
@@ -114,6 +124,8 @@ const apiScenarioOf = (
 };
 
 const TEMPLATE_SCENARIO = apiScenarioOf({ readCheckId: 'rc-page', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] });
+/** OP-R（R1）: 一覧の画面の照合の READ の API の登録のシナリオ。 */
+const LIST_SCENARIO = apiScenarioOf({ readCheckId: 'rc-list', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] });
 const SEARCH_SCENARIO = apiScenarioOf({
   readCheckId: 'rc-search', revision: 1, bindings: [{ parameterName: 'q', fieldName: 'name' }], expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }],
 });
@@ -216,14 +228,14 @@ describe('T40a: the write specification of an API CREATE scenario', () => {
     expect(validateParentToWorkerMessage(startOf(spec))).toMatchObject({ ok: true });
   });
 
-  // T40a-fix: 下書きに成否の条件と入力の誤りの条件があっても（拒まない）、API の書き込みの指定では使わない（null）。ID の取り方は検証の指定の
+  // T40a-fix: API の書き込みの指定は、結果の判定のしかたの印を持たない（null。PL-6a: 成否の条件はもうない）。ID の取り方は検証の指定の
   // `recordId` を載せる（API の `recordId` がなくても、検証の指定の取り方で作る）。
-  it('leaves out the two conditions of an API scenario that has them, and carries the record id of the verification spec', () => {
+  it('has no result judgement for an API scenario, and carries the record id of the verification spec', () => {
     const withConditions = apiScenarioOf({ readCheckId: 'rc-page', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
       VERIFICATION_CONDITIONS, null);
-    expect(withConditions.verification).toMatchObject({ successCondition: VERIFICATION_CONDITIONS.successCondition });
+    expect(withConditions.verification).toMatchObject({ resultJudgement: null, recordId: VERIFICATION_CONDITIONS.recordId });
     const spec = writeStartSpecOf(inputsOf(withConditions, TEMPLATE_READ, TEMPLATE_PATH));
-    expect(spec?.verification).toEqual({ successCondition: null, inputErrorCondition: null, recordId: VERIFICATION_CONDITIONS.recordId });
+    expect(spec?.verification).toEqual({ resultJudgement: null, recordId: VERIFICATION_CONDITIONS.recordId });
     expect(spec !== null && isWorkerStartApiWrite(spec) ? spec.api.recordId : 'none').toBeNull();
     expect(validateParentToWorkerMessage(startOf(spec))).toMatchObject({ ok: true });
   });
@@ -239,7 +251,11 @@ describe('T40a: the write specification of an API CREATE scenario', () => {
       ...TEMPLATE_SCENARIO, verification: { ...TEMPLATE_SCENARIO.verification, readVerification: null },
     }, TEMPLATE_READ, TEMPLATE_PATH))],
     ['a READ definition of another revision', () => writeStartSpecOf(inputsOf(TEMPLATE_SCENARIO, { ...TEMPLATE_READ, revision: 2 }, TEMPLATE_PATH))],
-    ['a page path READ that is not a template', () => writeStartSpecOf(inputsOf(TEMPLATE_SCENARIO, { ...FIXED_PAGE_READ, readCheckId: 'rc-page' }, '/admin/members'))],
+    ['a page path READ that is not a template nor the list page', () => writeStartSpecOf(inputsOf(TEMPLATE_SCENARIO, { ...FIXED_PAGE_READ, readCheckId: 'rc-page' }, '/admin'))],
+    // OP-R（R1）: 一覧の画面の定義は、API の登録だけ（更新は作らない）。
+    ['the list page READ of an API UPDATE scenario', () => writeStartSpecOf({
+      ...inputsOf({ ...LIST_SCENARIO, kind: 'UPDATE' }, LIST_READ, LIST_PATH), targetRecordId: '1',
+    })],
     ['an API scenario without the API spec', () => {
       const { api: _api, ...withoutApi } = TEMPLATE_SCENARIO;
       return writeStartSpecOf(inputsOf(withoutApi, TEMPLATE_READ, TEMPLATE_PATH));
@@ -254,5 +270,64 @@ describe('T40a: the write specification of an API CREATE scenario', () => {
     expect(readVerificationTargetRejectionOf(CANDIDATE_READ, 'API')).toBeNull();
     expect(readVerificationTargetRejectionOf(TEMPLATE_READ, 'FORM')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
     expect(readVerificationTargetRejectionOf(FIXED_PAGE_READ, 'API')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+    expect(readVerificationTargetRejectionOf(FIXED_PAGE_READ, 'API', apiCreateReadListPagePathOf(TEMPLATE_SCENARIO, CANDIDATE))).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+  });
+
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、登録の画面の 1 つ上の一覧の画面の定義を
+  // 照合の READ に使う（送る値なし。期待は生成した値。GET 1 回は、ワーカーが行う）。FORM と API の更新と、ほかの画面の path は、今のまま使わない。
+  it('lets the list page READ one above the create page through the start check for an API create only (OP-R R1)', () => {
+    const rejectionOf = (scenario: ScenarioRevision, evidence: DiscoveryCandidate) =>
+      readVerificationTargetRejectionOf(LIST_READ, scenarioTransportOf(scenario), apiCreateReadListPagePathOf(scenario, evidence));
+    expect(rejectionOf(LIST_SCENARIO, CANDIDATE)).toBeNull();
+    expect(rejectionOf({ ...LIST_SCENARIO, transport: 'FORM' }, CANDIDATE)).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+    expect(rejectionOf({ ...LIST_SCENARIO, kind: 'UPDATE' }, CANDIDATE)).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+    expect(rejectionOf(LIST_SCENARIO, { ...CANDIDATE, page: { ...CANDIDATE.page, path: '/admin/other/new' } })).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+    // 一覧の画面の path を渡さなければ（呼ぶ側の古い形）、今のまま拒む。
+    expect(readVerificationTargetRejectionOf(LIST_READ, 'API')).toBe(WRITE_READ_VERIFICATION_PAGE_TARGET);
+  });
+
+  it('makes the API write specification with the list page READ (no value to send, the expectations from the values) (OP-R R1)', () => {
+    // OP-REV6 の I-1: 一覧の画面の期待は、実行のたびに違う値になる欄（ここはメール）と比べる。
+    const spec = writeStartSpecOf({ ...inputsOf(LIST_SCENARIO, LIST_READ, LIST_PATH), uniqueEachRunFieldNames: ['email'] });
+    expect(spec?.readVerification).toEqual({
+      readCheckId: 'rc-list',
+      readCheckRevision: 1,
+      targetPage: { origin: SAMPLE_ORIGIN, path: LIST_PATH },
+      definition: { targetPagePath: LIST_PATH, parameters: {}, expectations: [{ kind: 'TEXT_CONTAINS', text: VALUES.email }] },
+    });
+    expect(validateParentToWorkerMessage(startOf(spec))).toMatchObject({ ok: true });
+  });
+
+  it.each<readonly [string, (write: Record<string, unknown>) => Record<string, unknown>]>([
+    ['another page path that is not a template', (write) => ({ ...write, readVerification: withPage(write, '/admin') })],
+    ['the list page of another create page', (write) => ({ ...write, formPage: { ...(write['formPage'] as object), path: '/admin/other/new' } })],
+    ['the list page without an expectation compared with a generated value', (write) => ({
+      ...write, readVerification: { ...(write['readVerification'] as object), definition: { targetPagePath: LIST_PATH, parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } },
+    })],
+  ])('rejects in the IPC a list page READ with %s (OP-R R1)', (_label, change) => {
+    const spec = writeStartSpecOf({ ...inputsOf(LIST_SCENARIO, LIST_READ, LIST_PATH), uniqueEachRunFieldNames: ['email'] }) as unknown as Record<string, unknown>;
+    expect(validateParentToWorkerMessage(startOf(change(spec)))).toMatchObject({ ok: false });
   });
 });
+
+// OP-REV6 の I-1: 一覧の画面には前の登録が並ぶので、一覧の画面の期待は、実行のたびに違う値になる欄（値の生成の持ち主の判定 `uniqueEachRunFieldNamesOf`。親が渡す）と
+// 比べるときだけ作る。人の名前など、回をまたいで同じになりうる欄だけと比べるなら作らない（渡さなければ作らない）。`{id}` の型の画面は今のまま。
+describe('OP-REV6 I-1: the list page READ compares with a value unique to each run', () => {
+  const NAME_LIST_SCENARIO = apiScenarioOf({ readCheckId: 'rc-list', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }] });
+
+  it('makes no specification when the expectation of the list page compares with a field that is not unique to each run, or when nothing is given', () => {
+    expect(writeStartSpecOf({ ...inputsOf(NAME_LIST_SCENARIO, LIST_READ, LIST_PATH), uniqueEachRunFieldNames: ['email'] })).toBeNull();
+    expect(writeStartSpecOf(inputsOf(LIST_SCENARIO, LIST_READ, LIST_PATH))).toBeNull();
+    expect(writeStartSpecOf({ ...inputsOf(LIST_SCENARIO, LIST_READ, LIST_PATH), uniqueEachRunFieldNames: ['email'] })).not.toBeNull();
+  });
+
+  it('keeps the {id} page template READ as before', () => {
+    expect(writeStartSpecOf(inputsOf(TEMPLATE_SCENARIO, TEMPLATE_READ, TEMPLATE_PATH))).not.toBeNull();
+  });
+});
+
+/** OP-R: 照合の READ の対象の画面の path を替えた写し（定義の path と、対象の画面の path を揃える）。 */
+const withPage = (write: Record<string, unknown>, path: string): Record<string, unknown> => {
+  const read = write['readVerification'] as { readonly targetPage: { readonly origin: string }; readonly definition: Record<string, unknown> };
+  return { ...read, targetPage: { ...read.targetPage, path }, definition: { ...read.definition, targetPagePath: path } };
+};

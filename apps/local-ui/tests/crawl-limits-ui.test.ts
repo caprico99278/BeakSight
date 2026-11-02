@@ -34,6 +34,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -94,7 +95,9 @@ const targetDocument = Object.freeze({
 const targetFile = (): Record<string, Record<string, unknown>> =>
   JSON.parse(readFileSync(`${rootOf().root}/${TARGET_PATH}`, 'utf8')) as Record<string, Record<string, unknown>>;
 
+/** 監査の負荷の欄（PL-1: サイトの画面の詳しい内容の中なので、先に開く）。 */
 const panelOf = async (page: Page): Promise<Locator> => {
+  await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
   const panel = page.getByTestId('profile-crawl-limits');
   await panel.waitFor({ timeout: UI_TIMEOUT_MS });
   return panel;
@@ -227,8 +230,9 @@ describe('T44d: the crawl limits on the profile screen', () => {
 
     // 開始の画面も、新しい値と、変え方の案内を出す。
     const start = await openPage(`/start/${PROFILE_ID}`);
+    // PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 読む量の上限は、たたんだ詳しい内容の中。
     const target = start.getByTestId('start-target');
-    await target.waitFor({ timeout: UI_TIMEOUT_MS });
+    await target.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await target.textContent()).toContain(formatCount(20));
     expect(await start.getByTestId('start-interval').textContent()).toBe(formatDuration(2_000));
     expect(await target.textContent()).toContain(formatElapsedTime(BEFORE.maxRuntimeMs));

@@ -42,6 +42,7 @@ import {
   INCOMPLETE_REASON_NEXT_STEPS,
   REPORT_COMPONENT_TEXT,
   RUN_SUMMARY_TEXT,
+  describeIncompleteReason,
   describeInteractionReason,
   earlierAttemptRecordText,
   ordinalText,
@@ -103,6 +104,15 @@ const sliceBetween = (html: string, startId: string, endId: string | null): stri
 
 const sectionAnchors = sortByDisplayOrder(REPORT_SECTIONS, REPORT_SECTION_CATALOG).map((section) => REPORT_SECTION_CATALOG[section].anchor);
 
+/**
+ * OP-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 14 章、`2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12）: 技術の記録（規則と証拠、理由のコード、
+ * 送り方、事象の一覧、ページの番号とファイル、返事の番号、開いた結果、やり直す前の記録）は、末尾の記録の段に移した。前の本文の確かめは、記録の段で同じ値を
+ * 確かめ、本文には、やさしい語の部分（説明、印、リンク）を確かめる。
+ */
+const recordPartOf = (html: string): string => sliceBetween(html, REPORT_SECTION_CATALOG.RECORD.anchor, null);
+/** 本文の終わり（記録の段の前）までの、ページの節。 */
+const pagesPartOf = (html: string): string => sliceBetween(html, 'pages', REPORT_SECTION_CATALOG.RECORD.anchor);
+
 describe('renderHtmlReport: document', () => {
   it('is a Japanese static document with the single stylesheet and no style attribute or script', () => {
     const html = render(auditRun());
@@ -121,9 +131,10 @@ describe('renderHtmlReport: document', () => {
 });
 
 describe('renderHtmlReport: sections (design 6.1.4)', () => {
-  it('has the six sections in the order of the design, each as a level-2 heading', () => {
+  it('has the seven sections in the order of the design, each as a level-2 heading', () => {
     const html = render(edgeCaseAuditRun());
-    expect(sectionAnchors).toEqual(['summary', 'critical-findings', 'findings-by-category', 'interactions', 'safety', 'pages']);
+    // PL-R（設計書 14 章）: 冒頭はまとめの段、技術の記録（前の「要約」）は末尾の記録の段。
+    expect(sectionAnchors).toEqual(['overview', 'critical-findings', 'findings-by-category', 'interactions', 'safety', 'pages', 'record']);
     const positions = sectionAnchors.map((anchor) => html.indexOf(`<h2 id="${anchor}">`));
     for (const [index, position] of positions.entries()) {
       expect(position, sectionAnchors[index]).toBeGreaterThanOrEqual(0);
@@ -188,7 +199,7 @@ describe('renderHtmlReport: sections (design 6.1.4)', () => {
 describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
   it('shows the Run Status with its Japanese label', () => {
     const html = render(edgeCaseAuditRun());
-    const summary = sliceBetween(html, 'summary', 'critical-findings');
+    const summary = sliceBetween(html, 'record', null);
     expect(summary).toContain('data-value="PARTIAL"');
     expect(summary).toContain(escapeHtml(RUN_STATUS_CATALOG.PARTIAL.label));
   });
@@ -197,13 +208,13 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
   it('shows the BeakSight version and the Playwright version with their labels as before', () => {
     const html = render(auditRun({ run: { toolVersion: '9.8.7', environment: { ...runSummary().environment, playwrightVersion: '6.5.4' } } }));
     const code = (value: string): string => `<code class="${REPORT_CLASS_NAMES.identifier}">${value}</code>`;
-    expect(sliceBetween(html, 'summary', 'critical-findings')).toContain(keyValue('BeakSight の版', code('9.8.7')));
+    expect(sliceBetween(html, 'record', null)).toContain(keyValue('BeakSight の版', code('9.8.7')));
     expect(html).toContain(keyValue('Playwright', code('6.5.4')));
   });
 
   it('shows the page coverage from the view model', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
-    const summary = sliceBetween(renderHtmlReport(viewModel), 'summary', 'critical-findings');
+    const summary = sliceBetween(renderHtmlReport(viewModel), 'record', null);
     const { coverage } = viewModel.summary;
     const labels = RUN_SUMMARY_TEXT.coverage;
     expect(summary).toContain(keyValue(labels.discovered, formatCount(coverage.discovered)));
@@ -215,7 +226,7 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
 
   it('shows the ERROR, WARN, INFO and SAFETY counts with their group, and the group totals', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
-    const summary = sliceBetween(renderHtmlReport(viewModel), 'summary', 'critical-findings');
+    const summary = sliceBetween(renderHtmlReport(viewModel), 'record', null);
     const counts = viewModel.summary.findingCounts;
     expect(counts.bySeverity).toEqual({ ERROR: 1, WARN: 2, INFO: 2, SAFETY: 1 });
     for (const severity of SEVERITIES) {
@@ -238,7 +249,7 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
         coverage: { ...viewModel.summary.coverage, discovered: 777 },
       },
     };
-    const summary = sliceBetween(renderHtmlReport(altered), 'summary', 'critical-findings');
+    const summary = sliceBetween(renderHtmlReport(altered), 'record', null);
     expect(summary).toContain(formatCount(4321));
     expect(summary).toContain(keyValue(HTML_REPORT_TEXT.summary.totalFindings, formatCount(9876)));
     expect(summary).toContain(keyValue(RUN_SUMMARY_TEXT.coverage.discovered, formatCount(777)));
@@ -246,7 +257,7 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
 
   it('shows the limits and the incomplete reasons with their code, description and detail', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
-    const summary = sliceBetween(renderHtmlReport(viewModel), 'summary', 'critical-findings');
+    const summary = sliceBetween(renderHtmlReport(viewModel), 'record', null);
     for (const label of Object.values(HTML_REPORT_TEXT.summary.limits)) {
       expect(summary).toContain(escapeHtml(label));
     }
@@ -279,7 +290,14 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     expect(inner?.nextStep).toBe(INCOMPLETE_REASON_NEXT_STEPS.INNER_SCROLL_CONTAINER_NOT_TRAVERSED);
     expect(reasons.length).toBeGreaterThan(1);
     expect(reasons.every(({ code, nextStep }) => nextStep === INCOMPLETE_REASON_NEXT_STEPS[code])).toBe(true);
-    expect(sliceBetween(renderHtmlReport(viewModel), 'pages', null)).toContain([
+    const html = renderHtmlReport(viewModel);
+    // OP-3: 本文は説明と次にできること、記録の段はコード・説明・次にできること。
+    expect(pagesPartOf(html)).toContain([
+      escapeHtml(inner?.description ?? ''),
+      escapeHtml(HTML_REPORT_TEXT.reasonNextStep(INCOMPLETE_REASON_NEXT_STEPS.INNER_SCROLL_CONTAINER_NOT_TRAVERSED)),
+    ].join(' '));
+    expect(pagesPartOf(html)).not.toContain('INNER_SCROLL_CONTAINER_NOT_TRAVERSED');
+    expect(recordPartOf(html)).toContain([
       renderCode('INNER_SCROLL_CONTAINER_NOT_TRAVERSED').html,
       escapeHtml(inner?.description ?? ''),
       escapeHtml(HTML_REPORT_TEXT.reasonNextStep(INCOMPLETE_REASON_NEXT_STEPS.INNER_SCROLL_CONTAINER_NOT_TRAVERSED)),
@@ -290,21 +308,28 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
     const html = renderHtmlReport(viewModel);
     const categoryPart = sliceBetween(html, 'findings-by-category', 'interactions');
+    // OP-3: Rule の ID と版、Evidence の参照は、記録の段の問題の技術の記録（本文の行へのリンクつき）。
+    const record = sliceBetween(recordPartOf(html), toAnchorId('record', 'findings'), toAnchorId('record', 'interactions'));
     for (const view of viewModel.findings) {
       const { finding } = view;
       expect(categoryPart).toContain(escapeHtml(finding.message));
-      expect(categoryPart).toContain(escapeHtml(finding.ruleId));
+      expect(categoryPart).not.toContain(escapeHtml(finding.ruleId));
+      expect(record).toContain(escapeHtml(finding.ruleId));
+      expect(record).toContain(`href="#${toAnchorId('finding', finding.findingId)}"`);
       for (const reference of view.evidence) {
-        expect(categoryPart).toContain(reference.evidenceId);
+        expect(categoryPart).not.toContain(reference.evidenceId);
+        expect(record).toContain(reference.evidenceId);
         expect(reference.location).not.toBeNull();
-        expect(categoryPart).toContain(`href="${reference.location!.path}"`);
-        expect(categoryPart).toContain(escapeHtml(reference.location!.pointer));
+        expect(record).toContain(`href="${reference.location!.path}"`);
+        expect(record).toContain(escapeHtml(reference.location!.pointer));
       }
       for (const screenshot of view.screenshots) {
         expect(categoryPart).toContain(`href="${screenshot.relativePath}"`);
+        expect(record).toContain(screenshot.evidenceId);
       }
     }
-    expect(categoryPart).toContain(escapeHtml(ruleVersionText(1)));
+    expect(categoryPart).not.toContain(escapeHtml(ruleVersionText(1)));
+    expect(record).toContain(escapeHtml(ruleVersionText(1)));
     expect(categoryPart).toContain(escapeHtml(VIEWPORT_PROFILE_CATALOG.desktop.label));
     // Finding が参照するスクリーンショット（直接と、同じページ・同じビューポート）へのリンクがある。
     expect(categoryPart).toContain('href="pages/PAGE-000001/desktop/viewport.png"');
@@ -321,15 +346,21 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
   it('shows the interactions with the Japanese status and not-verifiable kind, and the reason with its description and escaped detail', () => {
     const html = render(edgeCaseAuditRun());
     const interactions = sliceBetween(html, 'interactions', 'safety');
+    const record = sliceBetween(recordPartOf(html), toAnchorId('record', 'interactions'), toAnchorId('record', 'safety'));
     expect(interactions).toContain(escapeHtml(INTERACTION_STATUS_CATALOG.NOT_VERIFIABLE.label));
     expect(interactions).toContain(escapeHtml(INTERACTION_NOT_VERIFIABLE_KIND_CATALOG.CHECK_NOT_COMPLETED.label));
-    // C18o: 理由は、コード、日本語の説明、詳細で示す。見本の危険な文字列は、理由の詳細（`reasonDetail`）にある（C18n）。
-    expect(interactions).toContain(renderCode('CANDIDATE_REDISCOVERY_INCOMPLETE').html);
+    // C18o: 理由は、コード、日本語の説明、詳細で示す。見本の危険な文字列は、理由の詳細（`reasonDetail`）にある（C18n）。OP-3: 本文は説明だけで、コードと
+    // 詳細は記録の段。
+    expect(interactions).not.toContain('CANDIDATE_REDISCOVERY_INCOMPLETE');
+    expect(record).toContain(renderCode('CANDIDATE_REDISCOVERY_INCOMPLETE').html);
     expect(interactions).toContain(escapeHtml(describeInteractionReason('CANDIDATE_REDISCOVERY_INCOMPLETE')));
-    expect(interactions).toContain(escapeHtml(HOSTILE_TEXT));
+    expect(interactions).not.toContain(escapeHtml(HOSTILE_TEXT));
+    expect(record).toContain(escapeHtml(HOSTILE_TEXT));
     expect(interactions).not.toContain(HOSTILE_STRINGS.scriptTag);
+    expect(record).not.toContain(HOSTILE_STRINGS.scriptTag);
     expect(interactions).toContain(escapeHtml(`メニュー ${HOSTILE_STRINGS.attributeBreak}`));
     expect(interactions).toContain('href="#page-PAGE-000001"');
+    expect(record).toContain('href="#page-PAGE-000001"');
   });
 
   /** Interaction の表の行（`<tr>` の中身）の一覧。 */
@@ -349,8 +380,14 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
   // コード、日本語の説明、詳細の順に示す。詳細のない理由は、コードと説明だけを示す。
   it('shows the reason of each interaction in the reason column the same way as the incomplete reasons of a page (C18o)', () => {
     const columns = HTML_REPORT_TEXT.interactions.columns;
-    expect(columns).toEqual(['ページ', 'ビューポート', '対象', '状態', '確認できなかった区分', '理由', 'Evidence']);
-    const reasonColumn = columns.indexOf('理由');
+    // PL-R（plain UI の設計書 14 章、5 章）: 報告だけの列の見出しを、画面と同じやさしい言葉にした。
+    expect(columns).toEqual(['ページ', '画面の幅', '押したもの', '結果', '確かめられなかったわけ', '理由', '証拠']);
+    // OP-3: 本文の表は、理由を説明だけで出す（`plainColumns`）。コード・説明・詳細の理由と証拠は、記録の段の表（`record.interactionColumns`）。
+    const plainColumns = HTML_REPORT_TEXT.interactions.plainColumns;
+    expect(plainColumns).toEqual(['ページ', '画面の幅', '押したもの', '結果', '確かめられなかったわけ', 'くわしいわけ']);
+    const plainReasonColumn = plainColumns.indexOf('くわしいわけ');
+    const recordColumns = HTML_REPORT_TEXT.record.interactionColumns;
+    const reasonColumn = recordColumns.indexOf('理由');
     const base = edgeCaseAuditRun();
     const withoutDetail = interaction(90, PAGE_1, 'EXECUTION_FAILED', null, { reason: 'CLICK_FAILED', reasonDetail: null });
     // 見本の PAGE-000001 に、詳細のない Interaction の理由と、ページの未完了の理由（比べるため）を加える。
@@ -368,22 +405,32 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     const viewModel = buildReportViewModel(result);
     const html = renderHtmlReport(viewModel);
     const rows = interactionRows(html);
+    const recordPart = sliceBetween(recordPartOf(html), toAnchorId('record', 'interactions'), toAnchorId('record', 'safety'));
+    const recordRows = (recordPart.split('<tbody>')[1]?.split('</table>')[0] ?? '').split('</tr>').filter((row) => row.startsWith('<tr'));
     expect(rows).toHaveLength(viewModel.interactions.items.length);
+    expect(recordRows).toHaveLength(viewModel.interactions.items.length);
     expect(viewModel.interactions.items.some((item) => item.reason.detail === null)).toBe(true);
     expect(viewModel.interactions.items.some((item) => item.reason.detail === HOSTILE_TEXT)).toBe(true);
     for (const [index, item] of viewModel.interactions.items.entries()) {
       const cells = interactionCellsOf(rows[index] ?? '');
-      expect(cells, `${index}`).toHaveLength(columns.length);
+      const recordCells = interactionCellsOf(recordRows[index] ?? '');
+      expect(cells, `${index}`).toHaveLength(plainColumns.length);
+      expect(recordCells, `${index}`).toHaveLength(recordColumns.length);
       const { code, description, detail } = item.reason;
       expect(description, `${index}`).toBe(describeInteractionReason(code));
-      expect(cells[reasonColumn], `${index}`).toBe(
+      expect(cells[plainReasonColumn], `${index}`).toBe(escapeHtml(description));
+      expect(recordCells[reasonColumn], `${index}`).toBe(
         [renderCode(code).html, escapeHtml(description), ...(detail === null ? [] : [renderCode(detail).html])].join(' '),
       );
     }
     // ページの未完了の理由の一覧も、同じ形（コード、説明、詳細を空白でつないだもの）で示す。T44h の判断 (1): ページの理由は、説明の後に次にできることが続く。
+    // OP-3: 本文は説明と次にできること、記録の段がコード・説明・次にできること・詳細。
     const [pageReason] = viewModel.pages[0]?.incompleteReasons ?? [];
     expect(pageReason).toBeDefined();
-    expect(sliceBetween(html, 'pages', null)).toContain(
+    expect(pagesPartOf(html)).toContain(
+      [escapeHtml(pageReason!.description), escapeHtml(HTML_REPORT_TEXT.reasonNextStep(pageReason!.nextStep ?? ''))].join(' '),
+    );
+    expect(recordPartOf(html)).toContain(
       [
         renderCode(pageReason!.code).html,
         escapeHtml(pageReason!.description),
@@ -419,9 +466,12 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     expect(safety).toContain(keyValue(text.excludedInteractionCandidates, formatCount(4)));
     expect(safety).toContain(keyValue(text.invariantViolationCount, formatCount(5)));
     expect(safety).toContain(escapeHtml(text.lowerBoundNote));
-    expect(safety).toContain('POST');
-    expect(safety).toContain('TEST_VIOLATION');
-    expect(safety).toContain(escapeHtml(HOSTILE_TEXT));
+    // OP-3: 送り方ごとの数と、安全の決まりに反したことの記号は、記録の段の安全の技術の記録。
+    const record = sliceBetween(recordPartOf(html), toAnchorId('record', 'safety'), toAnchorId('record', 'pages'));
+    for (const value of ['POST', 'TEST_VIOLATION', escapeHtml(HOSTILE_TEXT)]) {
+      expect(safety, value).not.toContain(value);
+      expect(record, value).toContain(value);
+    }
   });
 
   it('keeps the caption and the column headers of the Safety tables without rows, so that each "なし" says what it is about (R16f)', () => {
@@ -429,7 +479,8 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     // 見本の前提: メソッドごとの遮断の件数も、違反もない。
     expect(Object.keys(viewModel.safety.blockedRequestsByMethod)).toEqual([]);
     expect(viewModel.safety.invariantViolations).toEqual([]);
-    const safety = sliceBetween(renderHtmlReport(viewModel), 'safety', 'pages');
+    // OP-3: 送り方ごとの表と違反の表は、記録の段の安全の技術の記録。
+    const safety = sliceBetween(recordPartOf(renderHtmlReport(viewModel)), toAnchorId('record', 'safety'), toAnchorId('record', 'pages'));
     const text = HTML_REPORT_TEXT.safety;
     const none = escapeHtml(REPORT_COMPONENT_TEXT.none);
     for (const [caption, columns] of [
@@ -450,9 +501,11 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
     const html = renderHtmlReport(viewModel);
     const pages = sliceBetween(html, 'pages', null);
-    for (const pageView of viewModel.pages) {
-      expect(pages).toContain(`<h3 id="page-${pageView.pageId}">`);
-      expect(pages).toContain(`href="${pageView.pageJsonPath}"`);
+    for (const [index, pageView] of viewModel.pages.entries()) {
+      // OP-3: 本文の見出しは何番目のページか（ページの番号とファイルは、記録の段のページの技術の記録）。
+      expect(pages).toContain(`<h3 id="page-${pageView.pageId}">${escapeHtml(HTML_REPORT_TEXT.pages.heading(formatInteger(index + 1)))}</h3>`);
+      expect(pagesPartOf(html)).not.toContain(`href="${pageView.pageJsonPath}"`);
+      expect(recordPartOf(html)).toContain(`href="${pageView.pageJsonPath}"`);
       for (const screenshot of pageView.screenshots) {
         expect(pages).toContain(`href="${screenshot.relativePath}"`);
       }
@@ -471,9 +524,12 @@ describe('renderHtmlReport: contents (plan Task 16 Step 4)', () => {
         pages: [...auditRun().pages, page(PAGE_2, '/skipped.html', 'SKIPPED')],
       }),
     );
-    const skippedPage = sliceBetween(html, `page-${PAGE_2}`, null);
+    const skippedPage = sliceBetween(html, `page-${PAGE_2}`, REPORT_SECTION_CATALOG.RECORD.anchor);
     expect(skippedPage).toContain('data-value="SKIPPED"');
-    expect(skippedPage.match(/MAX_PAGES_REACHED/gu)?.length).toBeGreaterThanOrEqual(3);
+    // OP-3: 本文は理由の説明（ページと、画面の幅ごと）。理由のコードは、記録の段のページの技術の記録。
+    expect(skippedPage).not.toContain('MAX_PAGES_REACHED');
+    expect(skippedPage.split(escapeHtml(describeIncompleteReason('MAX_PAGES_REACHED'))).length - 1).toBeGreaterThanOrEqual(3);
+    expect(sliceBetween(recordPartOf(html), toAnchorId('record', 'pages'), null).match(/MAX_PAGES_REACHED/gu)?.length).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -485,7 +541,7 @@ describe('renderHtmlReport: the site load in the summary (L6)', () => {
     const result = edgeCaseAuditRun();
     return { ...result, run: { ...result.run, load: loadDisplaySample() } };
   };
-  const summaryAnchor = (key: string): string => toAnchorId('summary', key);
+  const summaryAnchor = (key: string): string => toAnchorId('record', key);
   // 小節の終わりは、次の小節（R6 で加えた「実行の記録」）の見出しの前。
   const loadPart = (html: string): string => sliceBetween(html, summaryAnchor('load'), summaryAnchor('executions'));
   const items = HTML_REPORT_TEXT.summary.load;
@@ -497,11 +553,11 @@ describe('renderHtmlReport: the site load in the summary (L6)', () => {
       expect(position).toBeGreaterThanOrEqual(0);
     }
     expect([...positions].sort((left, right) => left - right)).toEqual(positions);
-    const summary = sliceBetween(html, 'summary', 'critical-findings');
+    const summary = sliceBetween(html, 'record', null);
     expect(summary).toContain(`<h3 id="${summaryAnchor('load')}">${escapeHtml(RUN_SUMMARY_TEXT.loadHeading)}</h3>`);
     // 要約の小見出しは、R6 で「実行の記録」を加えて8つ（Run、ページの網羅、指摘の件数、上限、サイトへの負荷、実行の記録、未完了の理由、
-    // 実行の環境）。
-    expect(summary.match(/<h3 /gu)?.length).toBe(8);
+    // 実行の環境）。OP-3: 本文から移した技術の記録の 4 つ（問題、押して確かめた操作、安全、ページ）を足して 12。
+    expect(summary.match(/<h3 /gu)?.length).toBe(12);
   });
 
   it('explains in one paragraph that the values are the requests sent to the site, with the navigation interval', () => {
@@ -574,7 +630,7 @@ describe('renderHtmlReport: the executions in the summary (R6)', () => {
     const result = edgeCaseAuditRun();
     return { ...result, run: { ...result.run, executions } };
   };
-  const summaryAnchor = (key: string): string => toAnchorId('summary', key);
+  const summaryAnchor = (key: string): string => toAnchorId('record', key);
   const executionsPart = (html: string): string => sliceBetween(html, summaryAnchor('executions'), summaryAnchor('reasons'));
   const text = HTML_REPORT_TEXT.summary;
 
@@ -610,7 +666,7 @@ describe('renderHtmlReport: the executions in the summary (R6)', () => {
       expect(position).toBeGreaterThanOrEqual(0);
     }
     expect([...positions].sort((left, right) => left - right)).toEqual(positions);
-    const summary = sliceBetween(html, 'summary', 'critical-findings');
+    const summary = sliceBetween(html, 'record', null);
     expect(summary).toContain(`<h3 id="${summaryAnchor('executions')}">${escapeHtml(text.executionsHeading)}</h3>`);
   });
 
@@ -716,7 +772,8 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
   };
 
   /** Safety の節の、事象の一覧の小見出しから節の終わりまで。 */
-  const eventsPart = (html: string): string => sliceBetween(sliceBetween(html, 'safety', 'pages'), 'safety-events', null);
+  // OP-3: 事象の一覧は、記録の段の安全の技術の記録の中。
+  const eventsPart = (html: string): string => sliceBetween(html, 'safety-events', toAnchorId('record', 'pages'));
 
   /** 事象の表の行（`<tr>` の中身）の一覧。 */
   const eventRows = (html: string): string[] =>
@@ -726,12 +783,13 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     const viewModel = buildReportViewModel(safetyEventsRun());
     const html = renderHtmlReport(viewModel);
     const part = eventsPart(html);
-    expect(sliceBetween(html, 'safety', 'pages')).toContain(
-      `<h3 id="safety-events">${escapeHtml(HTML_REPORT_TEXT.safety.eventsHeading)}</h3>`,
+    expect(recordPartOf(html)).toContain(
+      `<h4 id="safety-events">${escapeHtml(HTML_REPORT_TEXT.safety.eventsHeading)}</h4>`,
     );
     // C18a: 外部スキームへの移動の試みは、遮断したものではなく記録したものなので、見出しは遮断と記録の両方を含む意味にする。
-    expect(HTML_REPORT_TEXT.safety.eventsHeading).toBe('Safety の事象の一覧');
-    expect(HTML_REPORT_TEXT.safety.eventColumns).toEqual(['種類', 'ページ', 'ビューポート', 'メソッド', 'URL', '候補', '理由', 'Evidence']);
+    // PL-R（plain UI の設計書 14 章、5 章）: 報告だけの見出しと列の見出しを、画面と同じやさしい言葉にした（列の並びは変えない）。
+    expect(HTML_REPORT_TEXT.safety.eventsHeading).toBe('安全のために止めたことの一覧');
+    expect(HTML_REPORT_TEXT.safety.eventColumns).toEqual(['種類', 'ページ', '画面の幅', '送り方（メソッド）', 'アドレス（URL）', '押す候補', '理由', '証拠']);
     for (const column of HTML_REPORT_TEXT.safety.eventColumns) {
       expect(part).toContain(`<th scope="col">${escapeHtml(column)}</th>`);
     }
@@ -771,15 +829,15 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     const viewModel = buildReportViewModel(safetyEventsRun());
     const rows = eventRows(renderHtmlReport(viewModel));
     const columns = HTML_REPORT_TEXT.safety.eventColumns;
-    const candidateColumn = columns.indexOf('候補');
-    expect(candidateColumn).toBe(columns.indexOf('URL') + 1);
+    const candidateColumn = columns.indexOf('押す候補');
+    expect(candidateColumn).toBe(columns.indexOf('アドレス（URL）') + 1);
     expect(viewModel.safety.events.some((event) => event.candidateId !== null)).toBe(true);
     expect(viewModel.safety.events.some((event) => event.candidateId === null)).toBe(true);
     for (const [index, event] of viewModel.safety.events.entries()) {
       const cells = cellsOf(rows[index] ?? '');
       expect(cells, `${index}`).toHaveLength(columns.length);
-      const methodCell = cells[columns.indexOf('メソッド')] ?? '';
-      const urlCell = cells[columns.indexOf('URL')] ?? '';
+      const methodCell = cells[columns.indexOf('送り方（メソッド）')] ?? '';
+      const urlCell = cells[columns.indexOf('アドレス（URL）')] ?? '';
       const candidateCell = cells[candidateColumn] ?? '';
       // 値のない欄は、メソッドや URL の欄と同じく「なし」と示す。
       const noneCell = escapeHtml(REPORT_COMPONENT_TEXT.none);
@@ -796,7 +854,7 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     const withoutAnything = viewModel.safety.events.findIndex((event) => event.method === null && event.candidateId === null);
     expect(withoutAnything).toBeGreaterThanOrEqual(0);
     const cells = cellsOf(rows[withoutAnything] ?? '');
-    expect(cells[candidateColumn]).toBe(cells[columns.indexOf('メソッド')]);
+    expect(cells[candidateColumn]).toBe(cells[columns.indexOf('送り方（メソッド）')]);
   });
 
   // T44R2 の M-7: 止めた要求の理由は、今の止め方（読み取りでない送信のほか、上限や、離れた後の上限は GET も止める）ごとに違うので、事象の一覧の理由の欄に、
@@ -881,14 +939,14 @@ describe('renderHtmlReport: the Safety events (design 6.1.10)', () => {
     expect(rows).toHaveLength(viewModel.safety.events.length);
     for (const [index, event] of viewModel.safety.events.entries()) {
       const cells = cellsOf(rows[index] ?? '');
-      const urlCell = cells[columns.indexOf('URL')] ?? '';
+      const urlCell = cells[columns.indexOf('アドレス（URL）')] ?? '';
       expect(event.url, `${index}`).toMatch(/^https?:\/\//u);
       expect(urlCell, `${index}`).toContain(escapeHtml(event.url!));
       expect(urlCell, `${index}`).not.toContain('<a');
       expect(urlCell, `${index}`).not.toContain('href=');
       // ページのアンカーと、Evidence の参照のリンクは残る。
       expect(cells[columns.indexOf('ページ')], `${index}`).toContain('href="#page-PAGE-000001"');
-      expect(cells[columns.indexOf('Evidence')], `${index}`).toContain('href="pages/PAGE-000001/page.json"');
+      expect(cells[columns.indexOf('証拠')], `${index}`).toContain('href="pages/PAGE-000001/page.json"');
       // 行の中のリンクは、ページのアンカーと Evidence の参照の2つだけである。
       expect(rows[index]?.match(/<a\s/gu)?.length, `${index}`).toBe(2);
     }
@@ -925,12 +983,14 @@ describe('renderHtmlReport: the view model is used as it is (design 6.1.10)', ()
         items: [{ ...item!, location: { ...item!.location!, path: 'pages/PAGE-000002/page.json', pointer: '/evidence/99' } }],
       },
     };
-    const interactions = sliceBetween(renderHtmlReport(moved), 'interactions', 'safety');
+    // OP-3: 証拠の参照は、記録の段の押して確かめた操作の技術の記録。
+    const interactionRecordOf = (html: string): string => sliceBetween(html, toAnchorId('record', 'interactions'), toAnchorId('record', 'safety'));
+    const interactions = interactionRecordOf(renderHtmlReport(moved));
     expect(interactions).toContain(renderEvidenceRef(item!.evidenceId, 'pages/PAGE-000002/page.json', '/evidence/99').html);
     expect(interactions).not.toContain(renderEvidenceRef(item!.evidenceId, item!.location!.path, item!.location!.pointer).html);
 
     const unknown: ReportViewModel = { ...moved, interactions: { ...moved.interactions, items: [{ ...item!, location: null }] } };
-    const withoutPlace = sliceBetween(renderHtmlReport(unknown), 'interactions', 'safety');
+    const withoutPlace = interactionRecordOf(renderHtmlReport(unknown));
     expect(withoutPlace).toContain(renderEvidenceRef(item!.evidenceId, null).html);
     expect(withoutPlace).not.toContain(`${renderEvidenceRef(item!.evidenceId, null).html}</a>`);
     expect(withoutPlace).not.toContain('/evidence/99');
@@ -976,9 +1036,16 @@ describe('renderHtmlReport: values that were not observed', () => {
     expect(notObserved).toBe('未観測');
     expect(html).toContain(keyValue(HTML_REPORT_TEXT.summary.finishedAt, notObserved));
     expect(html).toContain(keyValue(HTML_REPORT_TEXT.summary.environment.chromiumVersion, notObserved));
-    // SKIPPED のビューポートは、最終 URL、HTTP ステータス、ナビゲーションの結果を観測していない。
+    // SKIPPED のビューポートは、最終 URL、HTTP ステータス、ナビゲーションの結果を観測していない。OP-3: 本文は最終 URL、記録の段は HTTP ステータスと
+    // ナビゲーションの結果。
     const skippedViewports = sliceBetween(html, `page-viewports-${PAGE_2}`, null).split('</table>')[0] ?? '';
-    expect(skippedViewports.match(/<td>未観測<\/td>/gu)?.length).toBe(VIEWPORT_PROFILES.length * 3);
+    expect(skippedViewports.match(/<td>未観測<\/td>/gu)?.length).toBe(VIEWPORT_PROFILES.length);
+    const recordViewports = sliceBetween(html, toAnchorId('record', 'pages'), null).split('</table>')[1] ?? '';
+    const skippedRecordRows = recordViewports.split('</tr>').filter((row) => row.includes(renderCode(PAGE_2).html));
+    expect(skippedRecordRows).toHaveLength(VIEWPORT_PROFILES.length);
+    for (const row of skippedRecordRows) {
+      expect(row.match(/<td>未観測<\/td>/gu)?.length).toBe(2);
+    }
     expect(html).not.toMatch(/>null</u);
     expect(html).not.toMatch(/<dd><\/dd>|<td><\/td>/u);
   });
@@ -989,9 +1056,12 @@ describe('renderHtmlReport: retries (design 6.1.9)', () => {
     const viewModel = buildReportViewModel(edgeCaseAuditRun());
     const html = renderHtmlReport(viewModel);
     const firstPage = sliceBetween(html, `page-${PAGE_1}`, `page-${PAGE_2}`);
-    const retryHeading = `<h4 id="page-retries-${PAGE_1}">${escapeHtml(HTML_REPORT_TEXT.pages.retriesHeading)}</h4>`;
-    expect(firstPage).toContain(retryHeading);
-    const [beforeRetries, retries] = firstPage.split(retryHeading);
+    // OP-3: やり直す前の記録は、記録の段のページの技術の記録の中（ページの番号の見出し）。本文のページの節には出さない。
+    const retryHeading = `<h4 id="page-retries-${PAGE_1}">${escapeHtml(HTML_REPORT_TEXT.record.retriesCaption(PAGE_1))}</h4>`;
+    expect(firstPage).not.toContain('page-retries-');
+    const record = sliceBetween(html, toAnchorId('record', 'pages'), null);
+    expect(record).toContain(retryHeading);
+    const [beforeRetries, retries] = [firstPage, record.split(retryHeading)[1] ?? ''];
     const [attempt] = viewModel.pages[0]!.retryAttempts;
     expect(attempt).toBeDefined();
     expect(attempt!.screenshots.length).toBeGreaterThan(0);
@@ -1005,7 +1075,7 @@ describe('renderHtmlReport: retries (design 6.1.9)', () => {
     }
     expect(retries).toContain(attempt!.navigationOutcome);
     // 再試行のないページには、再試行の前の記録の小見出しがない。
-    expect(sliceBetween(html, `page-${PAGE_2}`, null)).not.toContain(escapeHtml(HTML_REPORT_TEXT.pages.retriesHeading));
+    expect(html).not.toContain(`page-retries-${PAGE_2}`);
   });
 });
 

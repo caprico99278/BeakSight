@@ -146,6 +146,14 @@ const approvalViewViolationsOf = (path: string, source: ScannedSource): readonly
 
 /** (e) 実行の許可の発行を参照してよい、画面のコードのファイル（書き込みの開始の Server Function。T30g）。 */
 const WRITE_START_FUNCTIONS_FILE = 'apps/local-ui/src/server/write-job-functions.ts';
+/** (f) 承認の前の前提の名前と、定義・公開し直しのファイルと、使ってよい承認の前の画面のファイル（MI-F1）。 */
+const PRE_APPROVAL_PREMISE = 'PRE_APPROVAL_EVALUATION_PREMISE';
+const PRE_APPROVAL_PREMISE_HOMES: readonly string[] = Object.freeze(['src/control/data-rules/field-evaluation.ts', 'src/control/data-rules-view.ts']);
+const PRE_APPROVAL_PREMISE_USERS: readonly string[] = Object.freeze([
+  'apps/local-ui/src/server/data-rule-facts.ts',
+  'apps/local-ui/src/server/scenario-functions.ts',
+  'apps/local-ui/src/server/scenario-autodraft-functions.ts',
+]);
 /** (e) 実行の許可の発行の参照の数（コメントと文字列の中身を除いた本文の識別子）。 */
 const grantIssueReferencesOf = (source: ScannedSource): number => countIdentifier(source.bare, 'issueExecutionGrant');
 
@@ -374,6 +382,18 @@ describe('approval SSOT and boundary (Task 28 design 5, 6)', () => {
     const owner = uiFiles.find((file) => file.path === WRITE_START_FUNCTIONS_FILE);
     expect(owner === undefined ? 0 : grantIssueReferencesOf(owner)).toBeGreaterThan(0);
     expect(uiFiles.filter((file) => file.path !== WRITE_START_FUNCTIONS_FILE && grantIssueReferencesOf(file) > 0).map((file) => file.path)).toEqual([]);
+  });
+
+  // (f)（MI-F1。設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 5）: 承認の前の前提（副作用の確認を「承認のときに確認する」とみなす
+  // `PRE_APPROVAL_EVALUATION_PREMISE`）は、承認の前の画面の 3 つのファイルのほかで使わない（実行の許可の発行・書き込みの開始の判定に入らない）。定義の
+  // ファイルと、画面向けの公開し直しのファイルは数えない。
+  it('(f) only the three pre-approval screen files use the pre-approval evaluation premise (MI-F1)', () => {
+    const users = [...SOURCE_FILES, ...loadLocalUiSourceFiles()]
+      .filter((file) => !PRE_APPROVAL_PREMISE_HOMES.includes(file.path) && countIdentifier(file.bare, PRE_APPROVAL_PREMISE) > 0)
+      .map((file) => file.path)
+      .sort();
+    expect(users).toEqual([...PRE_APPROVAL_PREMISE_USERS].sort());
+    expect(countIdentifier(scanSource(`// ${PRE_APPROVAL_PREMISE}\nconst name = '${PRE_APPROVAL_PREMISE}';`).bare, PRE_APPROVAL_PREMISE)).toBe(0);
   });
 
   it('(d) the screen re-export publishes only names of src/control/approval/, without the TTL day length and the execution paths (T28e)', () => {

@@ -5,7 +5,9 @@ import {
   fullyPercentDecoded,
   isInsideAuditScope,
 } from '../core/audit-exclusion-forms.js';
-import { hitsDangerousTermIn, hitsExcludedPathPrefix } from '../core/audit-exclusion-match.js';
+import { comparableExclusionValues, hitsDangerousTermIn, hitsExcludedPathPrefix } from '../core/audit-exclusion-match.js';
+import { PATH_TEMPLATE_ID_SEGMENT } from '../core/record-id-path-pattern.js';
+import { REDACTED_PATH_SEGMENT } from '../core/url-path-redaction.js';
 import { API_METHOD_OVERRIDE_HEADER_NAMES, API_WRITE_METHODS } from '../core/api-request-shape.js';
 import { headerValueOf } from './http-headers.js';
 import { LOGIN_CREDENTIAL_BLOCK_REASON } from './login-credential-guard.js';
@@ -449,6 +451,11 @@ export interface WriteStagePolicy extends SubmissionStagePolicy {
    * 呼び出しを窓の外で通す（`auditStageVerdict` の `admissible`）。
    */
   readonly apiOrigin?: string | undefined;
+  /**
+   * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 送信の窓を一度でも開いたか（値を入れ始めた後。押した後を含む）。真なら、監査の段の
+   * 送信の扱いの口を使わない（OP-REV3 の C-2。`writeStageAuditSendApplies`）。省略は偽（値を入れる前）。
+   */
+  readonly valuesEntered?: boolean | undefined;
 }
 
 /**
@@ -535,7 +542,10 @@ export interface PassiveRequestPolicyOptions {
   readonly writeStage?: WriteStagePolicy | undefined;
   /** T35b: スクリプトで送るログインの監査の段の口（`AuditStagePolicy`）。 */
   readonly auditStage?: AuditStagePolicy | undefined;
-  /** AS-a: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の口（`AuditSendPolicy`）。ログインの段・書き込みの段の口と一緒なら使わない（fail-closed）。 */
+  /**
+   * AS-a: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の口（`AuditSendPolicy`）。ログインの段の口と一緒なら使わない（fail-closed）。OP-N: 書き込みの段の口と一緒なら、
+   * 書き込みの段の決まり（`writeStageAuditSendApplies`）に当たる読み取りでない要求だけに使う。WebSocket には使わない。
+   */
   readonly auditSend?: AuditSendPolicy | undefined;
 }
 
@@ -557,6 +567,12 @@ export interface AuditSendPolicy {
    * 通さない（今どおり `PASSIVE_WEBSOCKET`。fail-closed）。
    */
   readonly remainingWebSockets?: number | undefined;
+  /**
+   * OP-Q（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.8 の Q1）: 書き込みの作業の中の Passive の Context（送る前の確かめと照合の READ）の印。値は、
+   * その作業の承認した送信の送信先（Origin と path）。ある場合は、書き込みの段の値を入れる前と同じ決まり（`writeStageAuditSendApplies`）を加える（送り先は許可 Origin と
+   * 承認したサービスの Origin だけ、承認した送信先とその下の path は通さない）。WebSocket には使わない。省略は監査の段の決まりのまま。
+   */
+  readonly writeJobEndpoint?: SubmissionEndpoint | undefined;
 }
 
 /** AS-a: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` でも通さない method（大文字と小文字を区別せずに比べる。fail-closed）。 */
@@ -1017,7 +1033,8 @@ function isExcludedOrDangerous(url: string, policy: AuditExclusionPolicy): boole
 /**
  * AS-a（設計書 `2026-10-19-beaksight-audit-send-policy-design.md` 2.2）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の口（`policy.auditSend`）で、今の決まりなら
  * 止める読み取りでない要求を、どう扱うか（口を使わない要求は `null`。呼び出し側が今の決まりで止める）。
- * - 口を使わない（`null`）: 口がない、ログインの段・書き込みの段の口と一緒（fail-closed）、読み取り、method が `DELETE`（大文字と小文字を問わない）、
+ * - 口を使わない（`null`）: 口がない、ログインの段の口と一緒（fail-closed）、書き込みの段の口と一緒で書き込みの段の決まりに当たらない（OP-N。
+ *   `writeStageAuditSendApplies`）、読み取り、method が `DELETE`（大文字と小文字を問わない）、
  *   method の上書きが `DELETE`（AS-c fix round 1 の I-2。`isDeleteMethodOverride`）、文書の
  *   ナビゲーション（main frame と sub frame。フォームの送信を含む）、http(s) の URL でない（読めない URL を含む）、path か query が危険な語
  *   （`auditSend.dangerousTerms`）に当たる、監査の段の除外の口があれば読まないパスか危険な語に当たる（比べ方は監査の段の除外と同じ
@@ -1028,6 +1045,7 @@ function isExcludedOrDangerous(url: string, policy: AuditExclusionPolicy): boole
  */
 function auditSendDecisionOf(
   facts: HttpRequestFacts,
+  allowedOrigins: ReadonlySet<string>,
   policy: PassiveRequestPolicyOptions,
   auditStageBlock?: AuditStageBlockReason,
 ): PassiveRequestDecision | null {
@@ -1035,7 +1053,6 @@ function auditSendDecisionOf(
   if (
     auditSend === undefined
     || policy.authSetup !== undefined
-    || policy.writeStage !== undefined
     || isReadMethod(facts.method)
     || facts.method.toUpperCase() === AUDIT_SEND_BLOCKED_METHOD
     || facts.isNavigationRequest
@@ -1045,6 +1062,11 @@ function auditSendDecisionOf(
     || isAuditSendDangerous(facts.url, policy)
     // AS-c fix round 1（I-2）: method の上書きが `DELETE` の要求も、`DELETE` と同じく通さない。
     || isDeleteMethodOverride(facts.sentContent)
+    // OP-N（N2）: 書き込みの段では、加えて書き込みの段の決まり（`writeStageAuditSendApplies`）を満たす要求だけに使う（本文を読みうるので最後に確かめる）。
+    || (policy.writeStage !== undefined && !writeStageAuditSendApplies(facts, allowedOrigins, policy.writeStage, policy))
+    // OP-Q（Q1）: 書き込みの作業の中の Passive の Context（送る前の確かめと照合の READ）も、同じ決まり（値を入れる前の形）を満たす要求だけに使う。
+    || (auditSend.writeJobEndpoint !== undefined
+      && !writeStageAuditSendApplies(facts, allowedOrigins, { writeEndpoint: auditSend.writeJobEndpoint }, policy))
   ) {
     return null;
   }
@@ -1053,6 +1075,87 @@ function auditSendDecisionOf(
   }
   return { action: 'ALLOW', delivery: 'DIRECT', auditSendAdmission: true };
 }
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N1・N2）: 書き込みの段の口と一緒のときに、監査の段の送信の扱いの口を使ってよい要求か
+ * （`auditSendDecisionOf` のほかの条件に加える。どれかに当たれば使わず、今の書き込みの段の決まりで止める）。
+ * - 送信の窓を一度でも開いた後（値を入れた後と、押した後。`submissionWindowOpen`・`valuesEntered`）: 使わない（N1 を優先。OP-REV3 の C-2: 押した後は、値が
+ *   ヘッダや Cookie や符号化した形でも運べ、照らしきれないので、送信の扱いを当てない。N2 で通すのは、値を入れる前だけ）。
+ * - 送り先が、許可 Origin、口の承認したサービスの Origin、監査の段の口の承認したサービスの Origin のどれでもない: 使わない（書き込みの段は、許可の外へ送らない）。
+ * - 承認した送信の送信先（`writeEndpoint`）の Origin で、その path とその下の path への要求: 使わない（数える書き込みは、承認した 1 件だけ）。OP-REV3（I-1）: path
+ *   は、監査の段の除外の前方一致と同じ部品（`isExcludedOrDangerous`。末尾の `/`、`//`、大文字と小文字、`%XX`、`;` の引数、`.` と `..` を正規化した形のどれか）で
+ *   比べる。読めない URL は当たる（fail-closed）。
+ * OP-Q（4.1.8 の Q1）: 書き込みの作業の中の Passive の Context（送る前の確かめと照合の READ。送信の窓を持たない）も、この判定を使う（送信先は口の印
+ * `writeJobEndpoint`。窓と値の印はない）。
+ */
+function writeStageAuditSendApplies(
+  facts: HttpRequestFacts,
+  allowedOrigins: ReadonlySet<string>,
+  writeStage: Pick<WriteStagePolicy, 'writeEndpoint' | 'submissionWindowOpen' | 'valuesEntered'>,
+  policy: PassiveRequestPolicyOptions,
+): boolean {
+  if (writeStage.submissionWindowOpen === true || writeStage.valuesEntered === true) {
+    return false;
+  }
+  const reachable = new Set([
+    ...allowedOrigins,
+    ...(policy.auditSend?.approvedServiceOrigins ?? []),
+    ...(policy.auditStage?.approvedServiceOrigins ?? []),
+  ]);
+  return hasAllowedOrigin(facts.url, reachable) && !isUnderWriteEndpoint(facts.url, writeStage.writeEndpoint);
+}
+
+/**
+ * OP-REV3（I-1）: URL が、承認した送信の送信先の Origin で、その path かその下の path に当たるか（比べ方は監査の段の除外の前方一致 `isExcludedOrDangerous`。送信先の
+ * Origin か path が空なら、どの URL も当たる。fail-closed）。
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R3。OP-REV5 の C-2）: 送信先の path の型に `{id}`・`[REDACTED]` の区切りがあるときも、区切りごとに
+ * 比べる（`isUnderWriteEndpointShape`。前方一致の比べに加える。どちらかに当たれば当たる）。
+ */
+const isUnderWriteEndpoint = (url: string, endpoint: SubmissionEndpoint): boolean => {
+  if ([endpoint.origin, endpoint.path].includes('')) {
+    return true;
+  }
+  return hasAllowedOrigin(url, new Set([endpoint.origin]))
+    && (isExcludedOrDangerous(url, { excludedPathPrefixes: [endpoint.path], auditPathPrefixes: [], dangerousTerms: [] })
+      || isUnderWriteEndpointShape(url, endpoint.path));
+};
+
+/** OP-R（R3）: 送信先の path の型の、どの 1 区切りにも当たる区切り（`{id}` と伏せ字。比べる形は、監査の段の除外の値と同じ小文字と畳み込みの形）。 */
+const WRITE_ENDPOINT_WILDCARD_SEGMENTS: ReadonlySet<string> = new Set(
+  [PATH_TEMPLATE_ID_SEGMENT, REDACTED_PATH_SEGMENT].flatMap((segment) => comparableExclusionValues(segment)),
+);
+
+/** path の区切り。 */
+const WRITE_ENDPOINT_PATH_SEPARATOR = '/';
+
+/**
+ * OP-R（R3）: URL の path の形（監査の段の除外と同じ正規化の形 `auditExclusionFormsOf` のどれか）が、送信先の path の型に、区切りごとに当たるか（その path とその下の
+ * path）。型の `{id}`・`[REDACTED]` の区切りは、どの 1 区切りにも当たる。ほかの区切りは同じ（最後の区切りは、前方一致の比べと同じく、その文字で始まれば当たる）。
+ * 型の区切りがなければ偽（前方一致の比べだけで決める）。URL を読めない・形を作れないときは当たる（fail-closed）。
+ */
+const isUnderWriteEndpointShape = (url: string, endpointPath: string): boolean => {
+  const shapes = comparableExclusionValues(endpointPath).map((shape) => {
+    const segments = shape.split(WRITE_ENDPOINT_PATH_SEPARATOR);
+    return segments.length > 1 && segments.at(-1) === '' ? segments.slice(0, -1) : segments;
+  }).filter((segments) => segments.some((segment) => WRITE_ENDPOINT_WILDCARD_SEGMENTS.has(segment)));
+  if (shapes.length === 0) {
+    return false;
+  }
+  const forms = auditExclusionFormsOf(url);
+  if (forms === null) {
+    return true;
+  }
+  return forms.lowerPathVariants.some((path) => {
+    const actual = path.split(WRITE_ENDPOINT_PATH_SEPARATOR);
+    return shapes.some((shape) => actual.length >= shape.length && shape.every((segment, index) => {
+      const value = actual[index] ?? '';
+      if (WRITE_ENDPOINT_WILDCARD_SEGMENTS.has(segment)) {
+        return true;
+      }
+      return index === shape.length - 1 ? value.startsWith(segment) : value === segment;
+    }));
+  });
+};
 
 /**
  * AS-c（設計書 5 章の「ユーザーの言葉と選択（AS-c）」の行）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の口で、WebSocket の接続を、どう扱うか（口を使わない
@@ -1069,6 +1172,8 @@ function auditSendWebSocketDecisionOf(facts: WebSocketRequestFacts, policy: Pass
     auditSend?.remainingWebSockets === undefined
     || policy.authSetup !== undefined
     || policy.writeStage !== undefined
+    // OP-Q（Q1）: 書き込みの作業の中の Passive の Context も、WebSocket を通さない。
+    || auditSend.writeJobEndpoint !== undefined
     || !isWebSocketUrl(facts.url)
     || isWithheldServiceOriginRequest(httpEquivalentOfWebSocketUrl(facts.url), policy)
     || isAuditSendDangerous(facts.url, policy)
@@ -1302,7 +1407,7 @@ function classifyStrictPassiveRequest(
     if (verdict.kind !== 'ADMIT') {
       // AS-a: 監査の段の送信の扱いの口があれば、登録していない読み取りでない要求も、その決まりで通す（AS-c から token の更新も通す。サービスの Origin へ
       // 送らない Context の要求は今どおり止める）。
-      return auditSendDecisionOf(facts, policy, verdict.reason)
+      return auditSendDecisionOf(facts, allowedOrigins, policy, verdict.reason)
         ?? { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD', auditStageBlock: verdict.reason };
     }
     // T35R-fix（T35R の M-1）: 登録した読み取りの手続きの呼び出しにも、読まないパスと危険な語を当てる（読む範囲は当てない）。
@@ -1313,7 +1418,7 @@ function classifyStrictPassiveRequest(
   }
   if (!isReadMethod(facts.method)) {
     // AS-a: 監査の段の送信の扱いの口があれば、その決まりで通す（通さない要求は今どおり止める）。
-    return auditSendDecisionOf(facts, policy) ?? { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' };
+    return auditSendDecisionOf(facts, allowedOrigins, policy) ?? { action: 'BLOCK', category: 'REQUEST', reason: 'NON_READ_METHOD' };
   }
   if (
     facts.isNavigationRequest

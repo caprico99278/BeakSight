@@ -25,6 +25,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions, type ServerFunctionJobWaitTiming } from './helpers/server-function-job-wait.ts';
+import { createProfileInStore } from './helpers/profile-store-setup.ts';
 
 /** HTTP の状態。 */
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403 });
@@ -134,7 +135,10 @@ beforeAll(async () => {
       environmentEvidenceRef: 't25e-evidence',
     },
   ]) {
-    expect(await valueOf('createProfileFn', 'POST', { profile: document })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+    expect(document.auth === 'AUTOMATED_LOGIN'
+      ? await createProfileInStore(root.root, document)
+      : await valueOf('createProfileFn', 'POST', { profile: document })).toMatchObject({ ok: true });
   }
   expect(await valueOf('retireProfileFn', 'POST', { profileId: RETIRED_PROFILE, expectedRevision: 1 })).toMatchObject({ ok: true });
 });
@@ -217,15 +221,25 @@ describe('audit job Server Functions: the start screen summary and the rejection
       configError: null,
       // T25e: 公開の監査は、認証の設定を使わない。
       authRequired: false,
+      // MI-C 項目 9: 承認が有効なシナリオの数（公開の監査のプロファイルには、承認したシナリオがない）。
+      approvedScenarioCount: 0,
+      // OP-G（指示書の 5）: 公開の監査には、チェックした画面がない（書き込まない）。
+      writesOnCheckedScreens: false,
+      // OP-G（E3）: 表示の設定の既定は、作業中のブラウザを画面に出す。
+      jobBrowserShown: true,
       authSetup: null,
       authSetupErrors: [],
-      // T26e: 公開の監査には、自動ログインの状態がない。ログインの確かめは、自動ログインのプロファイルだけ。
+      // T26e: 公開の監査には、自動ログインの状態がない。PL-T: ログインの確かめを始められるかの値（loginCheck）は、使う画面がないので返さない。
       nextAllowedAt: null,
       auth: 'NONE',
       autoLogin: null,
-      loginCheck: { blocker: 'AUTH_STRATEGY_NOT_EXECUTABLE', errorCodes: [], authSetupErrors: [], nextAllowedAt: null },
       // FM2d: 公開の監査は、まとめて実行しない（ログインしない）。
       chain: null,
+      // PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 3）: 開始の画面の主のボタンが始めるもの（サーバの 1 か所で決める）。公開の画面だけの
+      // サイトは、まとめて実行の段がないので点検だけ。
+      primaryStart: { kind: 'AUDIT_ONLY', blocker: null, errorCodes: [], authSetupErrors: [], nextAllowedAt: null },
+      // PL-3（4 章の 4）: まだ点検していないので、始め方（続きから・新しく）を選ばせない。
+      resumeChoiceOffered: false,
     });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: 'not-there' })).toBeNull();
   });
@@ -233,6 +247,8 @@ describe('audit job Server Functions: the start screen summary and the rejection
   // T25e（T25d の申し送り 1）: 認証つきの読み取りの監査（`TEST_AUTH_PASSIVE`）は、認証の設定があれば開始できるモードになった。認証の設定が
   // なければ `AUTH_SETUP_MISSING` で拒む。承認した書き込みの監査は、今も `MODE_NOT_EXECUTABLE`。T26d-2 round 1: 自動ログインは方式として実行できる
   // ので、認証の設定がなければ、手動のログインと同じく `AUTH_SETUP_MISSING` で拒む（資格情報などの確かめは、その後にジョブの管理が行う）。
+  // MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 承認した書き込みのモードの監査も始められるようになったので、認証の設定がなければ
+  // `AUTH_SETUP_MISSING`（前は `MODE_NOT_EXECUTABLE`）。
   it('shows why a retired profile, a missing auth setup, a not-yet-executable mode or auth strategy cannot start', async () => {
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: RETIRED_PROFILE })).toMatchObject({ status: 'RETIRED', blocker: 'PROFILE_RETIRED' });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: TEST_MODE_PROFILE })).toMatchObject({
@@ -241,11 +257,13 @@ describe('audit job Server Functions: the start screen summary and the rejection
       authRequired: true,
       authSetup: null,
       authSetupErrors: [],
+      // PL-3（判断 3）: ログインして点検するサイトの主のボタンは、まとめて実行（点検 → 操作さがし → 見るだけの確かめ）。理由は、まとめて実行の確かめのもの。
+      primaryStart: { kind: 'STAGE_CHAIN', blocker: 'AUTH_SETUP_MISSING' },
     });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: WRITE_MODE_PROFILE })).toMatchObject({
       mode: 'TEST_APPROVED_WRITE',
-      blocker: 'MODE_NOT_EXECUTABLE',
-      authRequired: false,
+      blocker: 'AUTH_SETUP_MISSING',
+      authRequired: true,
     });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: AUTOMATED_LOGIN_PROFILE })).toMatchObject({
       mode: 'TEST_AUTH_PASSIVE',
@@ -262,7 +280,8 @@ describe('audit job Server Functions: the start screen summary and the rejection
       [{ profileId: RETIRED_PROFILE, expectedRevision: 2, startNew: true }, 'PROFILE_RETIRED'],
       [{ profileId: SLOW_PROFILE, expectedRevision: 2, startNew: true }, 'PROFILE_REVISION_CONFLICT'],
       [{ profileId: TEST_MODE_PROFILE, expectedRevision: 1, startNew: false }, 'AUTH_SETUP_MISSING'],
-      [{ profileId: WRITE_MODE_PROFILE, expectedRevision: 1, startNew: false }, 'MODE_NOT_EXECUTABLE'],
+      // MI-5: 書き込みのモードの監査も、認証の設定がなければ `AUTH_SETUP_MISSING`（前は `MODE_NOT_EXECUTABLE`）。
+      [{ profileId: WRITE_MODE_PROFILE, expectedRevision: 1, startNew: false }, 'AUTH_SETUP_MISSING'],
       [{ profileId: AUTOMATED_LOGIN_PROFILE, expectedRevision: 1, startNew: true }, 'AUTH_SETUP_MISSING'],
     ];
     for (const [data, reason] of cases) {
@@ -313,6 +332,9 @@ describe('audit job Server Functions: start, list, detail, one at a time, stop',
 
     expect(await valueOf('stopAuditJobFn', 'POST', { jobId, force: true })).toEqual({ ok: false, reason: 'JOB_NOT_ACTIVE' });
     expect(await valueOf('stopAuditJobFn', 'POST', { jobId: 'no-such-job', force: false })).toEqual({ ok: false, reason: 'JOB_NOT_FOUND' });
+    // PL-3（4 章の 4）: 前回の点検が途中で終わった（止めた）ので、始め方を選べる（既定は続きから。画面は詳しい内容に出す）。ほかのサイトは選ばせない。
+    expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: SLOW_PROFILE })).toMatchObject({ resumeChoiceOffered: true });
+    expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: OTHER_PROFILE })).toMatchObject({ resumeChoiceOffered: false });
   });
 
   it('sent only GET and HEAD requests to the fixture site', () => {

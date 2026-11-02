@@ -51,6 +51,8 @@ import { saveAuthSetup } from '../../src/control/store/auth-setup-store.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../src/control/store/database-path.js';
 import { createProfile, getProfile, saveProfileDisplaySettings } from '../../src/control/store/profile-store.js';
+import { AUDIT_SEND_READ_ONLY } from '../../src/core/audit-send-policy.js';
+import { createCredentialStore, type CredentialStore } from '../../src/control/credentials/credential-store.js';
 import { validateWorkerToParentMessage, type WorkerToParentMessage } from '../../src/control/worker-protocol.js';
 import { DISCOVERY_ARTIFACT_FILE_NAME, artifactFilePath } from '../../src/core/artifact-layout.js';
 import { validateArtifact } from '../../src/core/schema-validator.js';
@@ -62,6 +64,7 @@ import { databaseFilePlaces, filesUnder, placesWithMarkers } from './leak-places
 import { descendantsOf, listProcesses } from './process-tree.js';
 import { cliTargetConfig } from './run-harness.js';
 import { buildIntoTemporaryDirectory, type TemporaryBuild } from './temporary-build.js';
+import { TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE } from './test-chromium-args.js';
 import { testLoginWorkerEntrySource } from './test-login-worker-entry.js';
 import { STDIN_CREDENTIALS_EXPRESSION, STDIN_CREDENTIALS_PRELUDE, createRecordingFork } from './worker-fork-support.js';
 import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, writeSiteEditPathOf, writeSiteRecordPathOf, type WriteSite } from './write-site-fixture.js';
@@ -90,11 +93,11 @@ export { READ_METHODS } from './leak-places.js';
 /** 1 分（ms。管理の時計を進めるときの単位）。 */
 export const MINUTE_MS = 60_000;
 
-/** 検証の指定（成功は記録の画面、入力の誤りは `.error`、ID は URL のパスから、照合は一覧の検索）。 */
+/** 検証の指定（PL-6a: 結果は構造の判定、ID は URL のパスの型から、照合は一覧の検索）。 */
 export const WRITE_JOB_VERIFICATION: ScenarioVerification = Object.freeze<ScenarioVerification>({
-  successCondition: { pathPrefix: `${WRITE_SITE_PATHS.create}/`, selector: '.registered' },
-  inputErrorCondition: { pathPrefix: WRITE_SITE_PATHS.create, selector: '.error' },
-  recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${WRITE_SITE_PATHS.create}/{id}` },
+  // PL-6a: 成否の条件の代わりに、結果の判定のしかたの印（form の構造の判定）。ID の取り方は ID の型の一覧。
+  resultJudgement: 'FORM_STRUCTURE',
+  recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
   readVerification: {
     readCheckId: WRITE_JOB_READ_CHECK_ID,
     revision: 1,
@@ -113,6 +116,22 @@ const ENTRY_SOURCE = testLoginWorkerEntrySource({
   loginTimeoutMs: LOGIN_TIMEOUT_MS,
   prelude: STDIN_CREDENTIALS_PRELUDE,
   credentialsExpression: STDIN_CREDENTIALS_EXPRESSION,
+});
+
+/**
+ * OP-2: Run の Browser（とログイン用の Browser）の起動の設定。`CLI` は CLI の起動の設定（既定。上の入口のまま）、`TEST_DEFAULT` はテストの既定の headless shell
+ * （書き込みの安全を 2 つの Chromium で確かめるため）。
+ */
+export type WriteJobRunBrowser = 'CLI' | 'TEST_DEFAULT';
+
+/** OP-2: Run の Browser をテストの既定の headless shell にした入口。 */
+const TEST_DEFAULT_ENTRY_SOURCE = testLoginWorkerEntrySource({
+  distPrefix: './dist/',
+  loginTimeoutMs: LOGIN_TIMEOUT_MS,
+  prelude: STDIN_CREDENTIALS_PRELUDE,
+  credentialsExpression: STDIN_CREDENTIALS_EXPRESSION,
+  loginLaunch: 'TEST_DEFAULT',
+  additionalHooks: `\n  launchRunBrowser: () => ${TEST_DEFAULT_CHROMIUM_LAUNCH_SOURCE},`,
 });
 
 /** シナリオの準備の選択肢。 */
@@ -180,6 +199,11 @@ export interface WriteJobHarness {
   nowText(): string;
   /** ジョブの管理を作り直す（画面のサーバの再起動）。前の管理は閉じる。 */
   recreateManager(): Promise<AuditJobManager>;
+  /**
+   * OP-F（安全のレビューの M-1）: ジョブの管理が資格情報のメタデータを読むたびに呼ぶ受け手（読む前に、呼び出しの stack の文を渡す。null で外す）。親が書き込みの段を
+   * 準備している間に「やめる」を押す場面を、時間に頼らずに作るためのテストの口（読む値は変えない）。
+   */
+  setCredentialMetadataReadHook(hook: ((stack: string) => void) | null): void;
   /** 発見のジョブ（本物のワーカー）を行い、成果物を返す。 */
   discover(): Promise<{ readonly job: AuditJobView; readonly document: DiscoveryDocument }>;
   /** 照合の READ の定義を作る（初めの 1 回だけ。発見の成果物の一覧の検索の候補から）。 */
@@ -227,7 +251,12 @@ export interface WriteJobHarness {
 }
 
 /** 準備をする（一時のビルド、fixture のサイト、管理データ、プロファイルと認証の設定、ジョブの管理）。 */
-export async function startWriteJobHarness(options: { readonly profileId: string; readonly clockOffsetMs?: number }): Promise<WriteJobHarness> {
+export async function startWriteJobHarness(options: {
+  readonly profileId: string;
+  readonly clockOffsetMs?: number;
+  /** OP-2: Run の Browser の起動の設定（省略は `CLI`）。 */
+  readonly runBrowser?: WriteJobRunBrowser;
+}): Promise<WriteJobHarness> {
   const { profileId } = options;
   const targetConfigPath = `local/targets/${profileId}.json`;
   const build: TemporaryBuild = await buildIntoTemporaryDirectory();
@@ -261,7 +290,8 @@ export async function startWriteJobHarness(options: { readonly profileId: string
     environmentEvidenceRef: `evidence/${profileId}/isolation-check-1`,
   }, { resolveContext }).ok).toBe(true);
   // FM-2: テストのジョブのブラウザは今どおり headless（プロファイルの表示の設定を切る。既定は表示）。
-  expect(saveProfileDisplaySettings(database, profileId, { showJobBrowser: false }).ok).toBe(true);
+  // OP-I（I1）: 送信の扱いは今までどおり読み取りだけ（サイトの既定は `PASS_EXCEPT_DELETE` になった。人が詳しい内容で選んだ形）。
+  expect(saveProfileDisplaySettings(database, profileId, { showJobBrowser: false, auditSendPolicy: AUDIT_SEND_READ_ONLY }).ok).toBe(true);
   const setup: AuthSetup = {
     ...FORM_NAVIGATION_SETUP_ITEMS,
     profileId,
@@ -278,7 +308,7 @@ export async function startWriteJobHarness(options: { readonly profileId: string
   };
   expect(saveAuthSetup(database, setup, { resolveContext }).ok).toBe(true);
   const entry = join(build.rootDirectory, `${Date.now()}-${ENTRY_FILE_NAME}`);
-  await writeFile(entry, ENTRY_SOURCE, 'utf8');
+  await writeFile(entry, options.runBrowser === 'TEST_DEFAULT' ? TEST_DEFAULT_ENTRY_SOURCE : ENTRY_SOURCE, 'utf8');
   const fields: [string, string][] = [];
   await site.fillCredentials(async (selector, value) => {
     fields.push([selector, value]);
@@ -296,9 +326,19 @@ export async function startWriteJobHarness(options: { readonly profileId: string
     onReceived: (message) => received.push(message),
     onOutput: (chunk) => { workerOutput += chunk; },
   });
+  let credentialMetadataReadHook: ((stack: string) => void) | null = null;
+  const realCredentialStore = createCredentialStore(directory);
+  const credentialStore: CredentialStore = {
+    ...realCredentialStore,
+    readMetadata: (id) => {
+      credentialMetadataReadHook?.(new Error('credential metadata read').stack ?? '');
+      return realCredentialStore.readMetadata(id);
+    },
+  };
   const managerOf = (): AuditJobManager => createAuditJobManager({
     database,
     repositoryRoot: directory,
+    credentials: { root: directory, store: credentialStore },
     workerPath: join(build.distDirectory, 'worker', 'audit-worker.js'),
     resolveContext: async (path) => (path === targetConfigPath ? { targetConfig: await loadConfig(join(directory, path)) } : undefined),
     forkWorker: recordingFork,
@@ -309,7 +349,8 @@ export async function startWriteJobHarness(options: { readonly profileId: string
   const externalFacts = async (): Promise<ApprovalExternalFacts> => {
     const stored = getProfile(database, profileId);
     const value = stored === null ? null : await approvalExternalFactsOf(stored, {
-      database, repositoryRoot: directory, credentialStore: { readMetadata: () => Promise.resolve(null) },
+      // OP-2: ジョブの管理と同じ資格情報のファイルの部品（点検の中のログインの直後の登録で、自動ログインになったプロファイルの事実もそろえる）。
+      database, repositoryRoot: directory, credentialStore: createCredentialStore(directory),
     });
     if (value === null) {
       throw new Error('the external facts are not available');
@@ -338,6 +379,9 @@ export async function startWriteJobHarness(options: { readonly profileId: string
     return join(directory, OUTPUT_DIRECTORY_NAME, job.runDirectory);
   };
 
+  /** OP-2: 今のプロファイルの改訂（点検の中のログインの直後の登録で進む）。 */
+  const currentProfileRevision = (): number => getProfile(database, profileId)?.profile.revision ?? MIN_PROFILE_REVISION;
+
   // T31g-2: UPDATE のシナリオは、画面と同じく、更新の予定のレコード（`readPlannedUpdateTarget`）を発行に渡す（発行の中で選び直して照らす）。
   const issue = async (scenarioId: string, grantId: string, count = 1): Promise<ExecutionGrantResult> => issueExecutionGrant(database, {
     scenarioId, expectedRevision: readScenario(database, scenarioId)?.revision ?? 0, grantId, jobId: `job-${grantId}`, count,
@@ -345,10 +389,10 @@ export async function startWriteJobHarness(options: { readonly profileId: string
   });
 
   const start = (scenarioId: string, grantId: string): Promise<AuditJobStartResult> =>
-    manager.startWriteCreate({ profileId, expectedRevision: MIN_PROFILE_REVISION, scenarioId, grantId });
+    manager.startWriteCreate({ profileId, expectedRevision: currentProfileRevision(), scenarioId, grantId });
 
   const startUpdate = (scenarioId: string, grantId: string): Promise<AuditJobStartResult> =>
-    manager.startWriteUpdate({ profileId, expectedRevision: MIN_PROFILE_REVISION, scenarioId, grantId });
+    manager.startWriteUpdate({ profileId, expectedRevision: currentProfileRevision(), scenarioId, grantId });
 
   const issueAndStartWith = async (
     scenarioId: string,
@@ -419,13 +463,16 @@ export async function startWriteJobHarness(options: { readonly profileId: string
       clockOffsetMs = value;
     },
     nowText,
+    setCredentialMetadataReadHook: (hook) => {
+      credentialMetadataReadHook = hook;
+    },
     async recreateManager() {
       await manager.close();
       manager = managerOf();
       return manager;
     },
     async discover() {
-      const started = await manager.startDiscovery({ profileId, expectedRevision: MIN_PROFILE_REVISION });
+      const started = await manager.startDiscovery({ profileId, expectedRevision: currentProfileRevision() });
       if (!started.ok) {
         throw new Error(`the discovery job did not start: ${JSON.stringify(started)}`);
       }

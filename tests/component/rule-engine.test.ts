@@ -51,6 +51,7 @@ const fakeRule = (spec: FakeRuleSpec): AuditRule => ({
   version: 1,
   category: 'DOM',
   severity: spec.severity ?? 'WARN',
+  plainMessage: 'テストの指摘です。',
   evaluate: spec.evaluate,
 });
 

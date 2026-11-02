@@ -46,6 +46,7 @@ import { seedWriteResultForTest } from '../../../tests/helpers/write-result-fixt
 import { WRITE_SITE_LOGIN_FIELDS, WRITE_SITE_PATHS, startWriteSite, type WriteSite } from '../../../tests/helpers/write-site-fixture.js';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import { FIRST_REVISION, SCENARIO_TIMEOUT_MS, UI_TIMEOUT_MS, createScenarioMarkerFlow } from './helpers/scenario-marker-flow.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 const PROFILE_ID = 't31i-update';
 const CREATE_SCENARIO_ID = 't31i-create';
@@ -221,7 +222,7 @@ describe('T31i: an UPDATE started on the screen with the real worker, up to the 
         mode: 'TEST_APPROVED_WRITE', auth: 'MANUAL_SESSION', approvedTestOrigins: [siteOf().origin], environmentEvidenceRef: 't31i-evidence',
       },
     })).toMatchObject({ ok: true });
-    expect(await flow.valueOf('saveAuthSetupFn', 'POST', {
+    expect(await saveAuthSetupRequestInStore(flow.rootOf(), {
       setup: {
         ...FORM_NAVIGATION_SETUP_ITEMS, profileId: PROFILE_ID, profileRevision: FIRST_REVISION,
         loginStartUrl: `${siteOf().origin}${WRITE_SITE_PATHS.login}`, loginPostEndpoints: [{ origin: siteOf().origin, path: WRITE_SITE_PATHS.login }],
@@ -313,8 +314,9 @@ describe('T31i: an UPDATE started on the screen with the real worker, up to the 
     // T32g: 本物のワーカーの書き込みの報告は、親の確かめに通り（`VALID`）、結果の画面から開ける。開いた HTML は、成果物の CSP（style の hash）の
     // 下で、報告の見た目のクラス（バッジ）のスタイルが当たる。
     expect(flow.withControlData((database) => readJob(database, jobId)?.writeReportCheck)).toBe('VALID');
-    expect(await page.getByTestId('write-report').getAttribute('data-check')).toBe('VALID');
-    const reportHref = await page.getByTestId('write-report-open').getAttribute('href');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 13）: 配る報告は、要点の主のボタン「結果を見る」で開く（配らない理由の欄は出ない）。
+    expect(await page.getByTestId('write-report').count()).toBe(0);
+    const reportHref = await page.getByTestId('job-summary-panel').getByTestId('write-report-open').getAttribute('href');
     expect(reportHref).toBe(`/artifacts/${jobId}/${ACTION_REPORT_ARTIFACT_FILE_NAME}`);
     const report = await flow.openPage(reportHref ?? '');
     await flow.snapshot(report);

@@ -10,8 +10,13 @@
 //   保存のときに確かめる）。台帳の選択肢は、台帳の結び付きの唯一の判定（`apiUpdateLedgerBindingRejectionOf`）で、画面の型のどれかで結び付くものだけ。
 // - 副作用の確認の 4 項目は、必ず偽で作る（設計書 3A 章の共通の決まり。`UNCONFIRMED_SIDE_EFFECTS`）。上限と期限は契約の既定。
 // - 案の出どころの印は `draft-value-origin.ts`（印は承認に結ばない）。
+// - MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6）: 更新の台帳の選択肢ごとに、照合の READ を台帳の登録のシナリオから埋めるための
+//   値（`apiUpdateLedgerReadVerificationOf`。定義の参照は今の版、期待は台帳の写し）か、埋められない理由を足す。比べる欄は、人が選んだ変える欄で決まる
+//   ので、ここでは決めない。埋め方の唯一の置き場所は、作成の画面の部品 `apps/local-ui/src/components/ScenarioApiFields.tsx` の `apiUpdateReadFillOf`
+//   （MI-C の設計者の判断: 画面のブラウザ側は `approval-view.ts` から型しか読めないので、ここへは移さない）。照合の READ の確かめは、今の保存の口のまま。
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import { pagePathTemplateOptionsOf } from '../../discovery/fingerprint.js';
+import { isReadCheckPageTemplatePath } from '../../discovery/read-check-contracts.js';
 import { submissionProbeKeyFieldsOf, submissionProbeWriteOf, type SubmissionProbeRecord } from '../../discovery/submission-probe-contracts.js';
 import type { ApiJsonValueType } from '../../core/api-request-shape.js';
 import { API_SCENARIO_TRANSPORT } from '../../core/scenario-transport.js';
@@ -26,8 +31,11 @@ import {
   SIDE_EFFECT_CONFIRMATIONS,
   scenarioApiKeyFieldsOfProbe,
   scenarioApiPublicationStateKeysOf,
+  type ReadCheckReference,
   type ScenarioApiSpec,
   type ScenarioKind,
+  type ScenarioReadVerification,
+  type VerificationExpectation,
   type SideEffectConfirmation,
   type SideEffectConfirmations,
 } from './scenario-contracts.js';
@@ -138,6 +146,14 @@ export interface ApiScenarioExistingScenario {
   readonly kind: ScenarioKind;
   /** 発見の根拠の画面の path。 */
   readonly pagePath: string;
+  /** MI-7: 今の版の照合の READ（ない・渡さなければ、更新の照合の READ を台帳から埋めない）。 */
+  readonly readVerification?: ScenarioReadVerification | null;
+}
+
+/** MI-7: 取り消していない READ の確かめの定義 1 件（台帳の照合の READ の定義を使えるかに要るものだけ）。 */
+export interface ApiScenarioReadCheckFact extends ReadCheckReference {
+  /** 画面の path の定義の path（候補の定義は null）。 */
+  readonly targetPagePath: string | null;
 }
 
 /** 案を作る入力。 */
@@ -147,6 +163,8 @@ export interface ApiScenarioFormInput {
   /** 下書きの確かめの文脈（保存と同じ。発見の Run の情報とほかのシナリオの事実）。 */
   readonly context: ScenarioDraftContext;
   readonly scenarios: readonly ApiScenarioExistingScenario[];
+  /** MI-7: 取り消していない READ の確かめの定義（同じプロファイル。省けば、どの台帳の照合の READ も使えない）。 */
+  readonly readChecks?: readonly ApiScenarioReadCheckFact[];
 }
 
 /** 欄に対応する鍵 1 つ（probe の案。送るかを利用者が確かめる）。 */
@@ -168,11 +186,56 @@ export interface ApiScenarioPageKeyProposal {
   readonly rejection: ScenarioDraftRejectionReason | null;
 }
 
+/**
+ * MI-7: 更新の照合の READ を台帳から埋められない理由（閉じた一覧。画面の文言は `messages.ts` の `LOCAL_UI_SCENARIO_TEXT.api.ledgerReadUnavailable`）。
+ * - `LEDGER_READ_VERIFICATION_MISSING`: 台帳の登録のシナリオに照合の READ がない（古い記録など）。
+ * - `LEDGER_READ_CHECK_UNUSABLE`: 台帳の照合の READ の定義を、更新に使えない（取り消した、`{id}` つきの画面の path の定義でない、結び付けがある）。
+ */
+export const API_UPDATE_LEDGER_READ_UNAVAILABLE_REASONS = Object.freeze(['LEDGER_READ_VERIFICATION_MISSING', 'LEDGER_READ_CHECK_UNUSABLE'] as const);
+export type ApiUpdateLedgerReadUnavailableReason = (typeof API_UPDATE_LEDGER_READ_UNAVAILABLE_REASONS)[number];
+
+/** MI-7: 台帳の照合の READ から埋める値（定義の参照は今の版、期待は台帳の写し）か、埋められない理由。 */
+export type ApiUpdateLedgerReadVerification =
+  | {
+    readonly status: 'FROM_LEDGER';
+    readonly readCheckId: string;
+    readonly revision: number;
+    readonly expectations: readonly VerificationExpectation[];
+  }
+  | { readonly status: 'UNAVAILABLE'; readonly reason: ApiUpdateLedgerReadUnavailableReason };
+
 /** 更新の台帳にできる登録のシナリオ 1 件。 */
 export interface ApiScenarioLedgerOption {
   readonly scenarioId: string;
   readonly pagePath: string;
+  /** MI-7: 照合の READ を、この台帳から埋める値か、埋められない理由。 */
+  readonly readVerification: ApiUpdateLedgerReadVerification;
 }
+
+/**
+ * MI-7: 台帳の照合の READ から埋める値。使えるのは、取り消していない `{id}` つきの画面の path の定義で、結び付けのないもの（更新の照合の READ も、
+ * `{id}` に台帳の登録の ID が入る同じ定義を読む）。定義の参照は今の版（作成の画面の選択肢と同じ）。期待は台帳の写し（比べる欄は、画面が変える欄から
+ * 選ぶ）。照合の READ の確かめ（`SCENARIO_API_READ_VERIFICATION_NOT_BOUND`、許可の発行の `READ_VERIFICATION_NOT_VARYING` など）は、保存と発行の今の口。
+ */
+export const apiUpdateLedgerReadVerificationOf = (
+  ledger: ScenarioReadVerification | null | undefined,
+  readChecks: readonly ApiScenarioReadCheckFact[],
+): ApiUpdateLedgerReadVerification => {
+  if (ledger === null || ledger === undefined) {
+    return Object.freeze({ status: 'UNAVAILABLE', reason: 'LEDGER_READ_VERIFICATION_MISSING' });
+  }
+  const definition = readChecks.find(({ readCheckId }) => readCheckId === ledger.readCheckId);
+  if (definition === undefined || definition.targetPagePath === null || !isReadCheckPageTemplatePath(definition.targetPagePath)
+    || ledger.bindings.length > 0) {
+    return Object.freeze({ status: 'UNAVAILABLE', reason: 'LEDGER_READ_CHECK_UNUSABLE' });
+  }
+  return Object.freeze({
+    status: 'FROM_LEDGER',
+    readCheckId: definition.readCheckId,
+    revision: definition.revision,
+    expectations: Object.freeze(ledger.expectations.map((expectation) => Object.freeze({ ...expectation }))),
+  });
+};
 
 /** API の候補の案（probe の型から作る。値は持たない）。 */
 export interface ApiScenarioFormProposal {
@@ -216,6 +279,7 @@ const apiKeysOf = (probe: SubmissionProbeRecord): {
 /** API の候補の案と、候補を作れない理由（下書きの確かめの owner に、保存と同じ文脈で任せる）。 */
 export const apiScenarioFormOf = (input: ApiScenarioFormInput): ApiScenarioFormResult => {
   const { profileId, candidate, context, scenarios } = input;
+  const readChecks = input.readChecks ?? [];
   const probe = candidate.submissionProbe;
   if (probe === undefined || probe.shapeDigest === null) {
     return { form: null, rejection: NOT_API_REASON };
@@ -286,7 +350,9 @@ export const apiScenarioFormOf = (input: ApiScenarioFormInput): ApiScenarioFormR
       ledgerOptions: kind === UPDATE_KIND
         ? scenarios
           .filter((scenario) => scenario.kind === CREATE_KIND && isBoundLedger(scenario.scenarioId))
-          .map(({ scenarioId, pagePath }) => ({ scenarioId, pagePath }))
+          .map(({ scenarioId, pagePath, readVerification }) => ({
+            scenarioId, pagePath, readVerification: apiUpdateLedgerReadVerificationOf(readVerification, readChecks),
+          }))
         : [],
       formPathTemplates: kind === UPDATE_KIND ? formPathTemplates : [],
     },

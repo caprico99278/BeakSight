@@ -4,6 +4,7 @@ import {
   formatBytes,
   formatCount,
   formatDateTime,
+  formatPlainDateTime,
   formatDecimal,
   formatDuration,
   formatElapsedTime,
@@ -98,6 +99,22 @@ describe('formatNotObserved', () => {
     expect(formatNotObserved()).toBe(NOT_OBSERVED_TEXT);
     expect(formatNotObserved()).not.toBe('');
     expect(formatNotObserved()).not.toBe('0');
+  });
+});
+
+// OP-3（設計書 `doc/design/2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12）: ふだんの画面の本文の日時は、年・秒・時間帯の略称を書かない
+// 「10 月 27 日 15:30」の形（詳しい内容と報告の記録は `formatDateTime` のまま）。期待は固定の文字で書く。
+describe('formatPlainDateTime', () => {
+  it('shows the month, the day and the time in Asia/Tokyo without the year, the seconds and JST', () => {
+    expect(formatPlainDateTime('2026-10-27T06:30:10.000Z')).toBe('10 月 27 日 15:30');
+    expect(formatPlainDateTime('2026-12-31T23:59:59.999Z')).toBe('1 月 1 日 8:59');
+    expect(formatPlainDateTime('2026-01-01T15:05:00Z')).toBe('1 月 2 日 0:05');
+    expect(formatPlainDateTime('2026-10-27T06:30:10.000Z')).not.toMatch(/JST|2026|:10$/u);
+  });
+
+  it('shows the not-observed text for null and an unparseable timestamp as it was recorded', () => {
+    expect(formatPlainDateTime(null)).toBe(NOT_OBSERVED_TEXT);
+    expect(formatPlainDateTime('not a date')).toBe('not a date');
   });
 });
 
@@ -208,13 +225,16 @@ describe('formatTimes', () => {
 });
 
 // L7（設計書 4.8）: 経過時間の書式。時間・分・秒で書き、1時間以上では秒を省く。端数は切り捨てる（経過した分だけを示す）。
+// PL-4（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 6 章の自動ログインの回数の決まり。PL-W の持ち越し）: 1 日以上は日と時間で書き、分を省く
+// （24 時間ちょうどは「1日」。前は「24時間」）。
 describe('formatElapsedTime', () => {
   const SECOND_MS = 1000;
   const MINUTE_MS = 60 * SECOND_MS;
   const HOUR_MS = 60 * MINUTE_MS;
+  const DAY_MS = 24 * HOUR_MS;
 
-  it('uses the units of hours, minutes and seconds from the message catalog', () => {
-    expect(FORMAT_UNIT_TEXT).toMatchObject({ hours: '時間', minutes: '分', seconds: '秒' });
+  it('uses the units of days, hours, minutes and seconds from the message catalog', () => {
+    expect(FORMAT_UNIT_TEXT).toMatchObject({ days: '日', hours: '時間', minutes: '分', seconds: '秒' });
   });
 
   it('shows less than one minute in whole seconds, cutting off the fraction', () => {
@@ -237,7 +257,15 @@ describe('formatElapsedTime', () => {
     expect(formatElapsedTime(HOUR_MS + 59 * SECOND_MS)).toBe('1時間');
     expect(formatElapsedTime(HOUR_MS + 5 * MINUTE_MS)).toBe('1時間5分');
     expect(formatElapsedTime(HOUR_MS + 5 * MINUTE_MS + 30 * SECOND_MS)).toBe('1時間5分');
-    expect(formatElapsedTime(25 * HOUR_MS + 59 * MINUTE_MS)).toBe('25時間59分');
+    expect(formatElapsedTime(DAY_MS - 1)).toBe('23時間59分');
+  });
+
+  it('shows one day or more in days and hours, without minutes and without zero hours', () => {
+    expect(formatElapsedTime(DAY_MS)).toBe('1日');
+    expect(formatElapsedTime(DAY_MS + 59 * MINUTE_MS)).toBe('1日');
+    expect(formatElapsedTime(25 * HOUR_MS + 59 * MINUTE_MS)).toBe('1日1時間');
+    expect(formatElapsedTime(2 * DAY_MS)).toBe('2日');
+    expect(formatElapsedTime(2 * DAY_MS + 3 * HOUR_MS)).toBe('2日3時間');
   });
 
   it('keeps formatDuration as it was', () => {

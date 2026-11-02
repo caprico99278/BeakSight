@@ -110,11 +110,14 @@ describe('AS-a: the audit send policy of the request policy (classifyPassiveRequ
       .toEqual({ action: 'BLOCK', category: 'REQUEST', reason: 'AUDIT_SEND_OVER_LIMIT' });
   });
 
-  it('does not use the policy together with the login stage or the write stage (fail-closed)', () => {
+  // OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 書き込みの段の口と一緒のときは、値を入れる前（送信の窓の外）にだけ使う（窓の中は
+  // 今どおり止める）。決まりの全体は `request-policy-write-stage-audit-send.test.ts`。ログインの段の口と一緒なら、今どおり使わない。
+  it('does not use the policy together with the login stage, nor inside the submission window of the write stage (fail-closed)', () => {
     const authSetup = { loginPostEndpoints: [{ origin: APP_ORIGIN, path: '/login' }], remainingPosts: 1 };
     expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), authSetup })).toEqual(NON_READ);
-    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1 };
+    const writeStage = { writeEndpoint: { origin: APP_ORIGIN, path: '/members' }, remainingPosts: 1, submissionWindowOpen: true };
     expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), writeStage })).toEqual(NON_READ);
+    expect(decide(facts('POST', `${APP_ORIGIN}/api/save`), { auditSend: auditSend(), writeStage: { ...writeStage, submissionWindowOpen: false } })).toEqual(PASSED);
   });
 
   describe('together with the audit stage of a script login audit', () => {

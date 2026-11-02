@@ -18,6 +18,8 @@
  *   例外は 2 つ: `auth-setup-errors.ts`（ブラウザと共用の純粋な関数。たどった先も含めて `node:` の部品を読み込まないことを確かめる）と、
  *   `artifact-files.ts` の成果物の Server Route の受け手（`routes/artifacts/$jobId/$.tsx` のサーバの受け手 `server: { … }` の中だけで使い、
  *   ほかのブラウザ側のコードは import しないことを確かめる）。import の文の解析と値の種類の判定は近似（`export { … }` の一覧は数える）。
+ *   CC-116（PL-TD。PL-2 の発見）: 関数でない公開の値も、決まった値（文字・数・真偽と、それを凍結した一覧や物）だけにする。ほかの名前（import した
+ *   部品など）や呼び出しを使う値は、ブラウザの組み立てで値が残ると、その部品もブラウザに入るため（決まった値でない一覧は core の純粋なファイルに置く）。
  * - (j)（T28e。Task 28 の設計書 4.6）: 画面のコード（`apps/local-ui/` の中の `tests/` 以外）は、`src/control/approval/` を直接 import しない
  *   （型だけの import を含む）。画面が使う型と閉じた一覧と読み出し・書き込みの口は、`src/control/approval-view.ts` から読む。
  * - (k)（T29e。Task 29 の設計書 4.4）: 画面のコード（`apps/local-ui/` の中の `tests/` 以外）は、`src/control/data-rules/` を直接 import しない
@@ -173,6 +175,33 @@ const findPlainFunctionExports = (source: ScannedSource): readonly string[] => [
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0 && !/^type\s/u.test(entry))),
 ];
+
+/**
+ * (i) の CC-116（PL-TD。PL-2 の発見）: 決まった値の書き出しを作る語（`bare` の上で消す）。文字（中身を空にした引用符）、数、真偽と `null`、凍結
+ * （`Object.freeze`）、`as const`、物の鍵（`key:`）、括弧と区切り。消して何かが残る書き出しは、ほかの名前（import した部品など）か呼び出しを使う。
+ */
+const FIXED_LITERAL_PARTS = /Object\.freeze|\bas\s+const\b|\b(?:true|false|null)\b|\b\d[\d_]*(?:\.\d+)?\b|''|""|``|[\w$]+\s*:|[\s()[\]{},-]/gu;
+
+/**
+ * `bare` の `start` から、書き出しの終わり（最初の `;`。なければ本文の終わり）までの文。`bare` は文字列の中身とコメントを除くので、決まった値の
+ * 書き出しの中に `;` は現れない（関数の本文の `;` で早く切れても、関数は先に (i) の関数の検査が見る）。
+ */
+const initializerTextOf = (bare: string, start: number): string => {
+  const end = bare.indexOf(';', start);
+  return bare.slice(start, end < 0 ? undefined : end);
+};
+
+/**
+ * (i) の CC-116: 公開する値（関数でなく、Server Function でも `createServerOnlyFn` で包んだものでもない値）のうち、決まった値（文字・数・真偽と、それを
+ * 凍結した一覧や物）でないものの名前（近似）。ほかの名前（import した部品など）や呼び出しを使う値は、ブラウザの組み立てで値が残ると、その部品も
+ * ブラウザに入る（PL-2 で、Server Function のファイルの公開から資格情報の部品がブラウザに入った）。決まった値でない一覧は、core の純粋なファイルに置く。
+ */
+const findNonLiteralValueExports = (source: ScannedSource): readonly string[] => [...source.bare.matchAll(EXPORTED_VARIABLE)]
+  .filter((match) => {
+    const value = initializerTextOf(source.bare, match.index + match[0].length);
+    return !SERVER_ONLY_WRAPPER.test(value) && !FUNCTION_VALUE_START.test(value) && value.replace(FIXED_LITERAL_PARTS, '') !== '';
+  })
+  .map((match) => match[1] ?? '');
 
 /** (i): ブラウザ側のコードが、値を import する `server/` のファイルと、その import 元（型だけの import は数えない）。 */
 const findServerFilesImportedByBrowser = (
@@ -356,6 +385,35 @@ describe('Local UI boundary detectors', () => {
     expect(findUsesOutsideServerHandlers(route('component: () => serveJobArtifact'), ['serveJobArtifact'])).toHaveLength(1);
   });
 
+  it('(i) detects exported values of a server file that are not fixed literals, which keep the imported server parts in the browser bundle (CC-116)', () => {
+    // 違反の例（import した部品や関数の呼び出しを使う値。ブラウザの組み立てで値が残ると、その部品もブラウザに入る）。
+    expect(findNonLiteralValueExports(scanSource([
+      "export const REASONS = Object.freeze([...STORE_REASONS, 'LOCAL'] as const);",
+      'export const LIMIT = MAX_PAGES;',
+      'export const STORE = openStore();',
+      'export const TEXT = Object.freeze({ heading: HEADING_TEXT });',
+      'export const SHAPE = `${prefix}-x`;',
+    ].join('\n')))).toEqual(['REASONS', 'LIMIT', 'STORE', 'TEXT', 'SHAPE']);
+    // 違反でない例（文字・数・真偽の決まった値と、その凍結した一覧。関数は (i) の関数の検査が見る。Server Function とサーバだけの関数は包みが消す）。
+    expect(findNonLiteralValueExports(scanSource([
+      "export const STATUS = Object.freeze(['A', 'B'] as const);",
+      'export const MULTI = Object.freeze([',
+      "  'A',",
+      "  // 注: コメントは見ない。",
+      "  'B',",
+      '] as const);',
+      "export const REASON = 'X';",
+      'export const COUNT = 3;',
+      'export const LARGE = 90_000;',
+      'export const FLAG = false;',
+      "export const PAIRS = Object.freeze([Object.freeze({ key: 'A', size: 1 })] as const);",
+      "export const getThingFn = createServerFn({ method: 'GET' }).handler(() => STORE);",
+      'export const deps = createServerOnlyFn((): Deps => ({ store: store() }));',
+      'export const plain = (): number => LIMIT;',
+      'export type View = { readonly ok: boolean };',
+    ].join('\n')))).toEqual([]);
+  });
+
   it('(j) detects direct imports of src/control/approval/ from the UI code, and allows the screen re-export (T28e)', () => {
     const path = 'apps/local-ui/src/server/scenario-functions.ts';
     for (const line of [
@@ -508,6 +566,11 @@ describe('Local UI boundary (Task 23 design 4.2, 4.4)', () => {
         .filter((name) => !(path === ARTIFACT_FILES_PATH && ARTIFACT_ROUTE_HANDLERS.includes(name)))
         .map((name) => `${path}: ${name}`));
     expect(violations).toEqual([]);
+    // CC-116（PL-TD）: 公開する関数でない値も、決まった値だけ（ほかの名前や呼び出しを使う値は、その部品をブラウザに引き込む）。
+    const valueViolations = [...imported.keys()]
+      .filter((path) => path !== SHARED_PURE_SERVER_FILE)
+      .flatMap((path) => findNonLiteralValueExports(files.get(path) ?? scanSource('')).map((name) => `${path}: ${name}`));
+    expect(valueViolations).toEqual([]);
     // 例外 1: ブラウザと共用の純粋な関数のファイルは、たどった先も含めて Node の部品を読み込まない。
     expect(findNodeModuleChains(files, SHARED_PURE_SERVER_FILE)).toEqual([]);
     // 例外 2: 成果物の受け手は、成果物の route のサーバの受け手の中だけで使う（ほかのブラウザ側のコードは import しない）。

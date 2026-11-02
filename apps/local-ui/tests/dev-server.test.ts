@@ -10,7 +10,7 @@ import { request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
 import type { Browser } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { LOCAL_UI_TEXT } from '../../../src/presentation/messages.js';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_TEXT } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import {
   REPO_ROOT,
@@ -252,9 +252,10 @@ describe('dev server: listening and the guard', () => {
       await page.goto(tokenUrl.href, { waitUntil: 'networkidle', timeout: PAGE_TIMEOUT_MS });
       expect(page.url()).toBe(`${origin}/`);
       await page.getByTestId('profile-list-empty').waitFor({ timeout: PAGE_TIMEOUT_MS });
-      // hydrate した後の画面の移動（loader の Server Function の GET を通る）。
-      await page.getByRole('link', { name: LOCAL_UI_TEXT.pages.environment }).click();
-      await page.getByTestId('environment-status').waitFor({ timeout: PAGE_TIMEOUT_MS });
+      // hydrate した後の画面の移動（loader の Server Function の GET を通る）。PL-V（設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 14）: 環境の状態は
+      // 問題があるときだけメニューに出るので、いつもある「実行履歴」のメニューで移る（意図した期待の変更）。
+      await page.getByRole('navigation', { name: LOCAL_UI_TEXT.navigationLabel }).getByRole('link', { name: LOCAL_UI_AUDIT_TEXT.pages.jobs }).click();
+      await page.getByTestId('job-list-empty').waitFor({ timeout: PAGE_TIMEOUT_MS });
       // 記録がなければ（init script が動かなかった文書）誤りにする。
       expect(await cspViolationsOf(page, true)).toEqual([]);
       expect(consoleErrors).toEqual([]);

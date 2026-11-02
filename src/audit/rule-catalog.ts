@@ -13,6 +13,22 @@ import { TECHNICAL_RULES } from './technical-rules.js';
 export type CatalogRuleIdentity = Pick<AuditRule, 'ruleId' | 'ruleIdPrefix' | 'version'>;
 
 /**
+ * Finding（下書き）の ruleId が、その Rule のものか（`AuditRule` の ruleId の決まり）。`ruleIdPrefix` を持たない Rule は ruleId が一致するもの、持つ Rule は
+ * ruleId がその接頭辞で始まり、かつ接頭辞より長いもの。Rule Engine の下書きの検査と、Finding の ruleId から Rule の定義を引く処理（`ruleOfFindingRuleId`）が使う。
+ */
+export const isFindingRuleIdOf = (rule: Pick<CatalogRuleIdentity, 'ruleId' | 'ruleIdPrefix'>, ruleId: string): boolean => {
+  const prefix = rule.ruleIdPrefix;
+  return prefix === undefined ? ruleId === rule.ruleId : ruleId.startsWith(prefix) && ruleId.length > prefix.length;
+};
+
+/**
+ * OP-R2: Finding の ruleId を持つ Rule の定義（`freezeCatalog` で検査した一覧から。どの Rule のものでもなければ `undefined`）。検査した一覧では、ruleId と接頭辞が
+ * 重ならないので、当たる Rule は高々 1 つである。
+ */
+export const ruleOfFindingRuleId = <TRule extends CatalogRuleIdentity>(rules: readonly TRule[], ruleId: string): TRule | undefined =>
+  rules.find((rule) => isFindingRuleIdOf(rule, ruleId));
+
+/**
  * Rule の一覧を検査し、凍結した一覧を登録の順のまま返す。登録先ではなく、検査と凍結だけを行う。
  * page rule の一覧（`RULE_CATALOG`）と Cross-page rule の一覧（`CROSS_PAGE_RULES`）が、同じこの検査を使う。
  * - ruleId が空でない文字列でない場合は `TypeError` を投げる。
@@ -81,3 +97,9 @@ export const RULE_CATALOG: readonly AuditRule[] = freezeCatalog([
   ...PERFORMANCE_RULES,
   ...SAFETY_RULES,
 ]);
+
+/**
+ * OP-R2: Finding の ruleId を持つ page rule の、やさしい文（`AuditRule.plainMessage`）。どの page rule のものでもなければ `null`。Rule を評価しない。
+ * 報告は、Cross-page rule とあわせて引く `rulePlainMessageOf`（`./cross-page-rules.ts`）を使う。
+ */
+export const pageRulePlainMessageOf = (ruleId: string): string | null => ruleOfFindingRuleId(RULE_CATALOG, ruleId)?.plainMessage ?? null;

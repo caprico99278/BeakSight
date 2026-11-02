@@ -5,6 +5,9 @@
 // - 承認に縛った候補の 2 つの digest と、照合の READ の対象の識別の digest は、本物の発見の入口（`readCandidatePage`）で読んだ候補から取る。
 // - 終わりまでの流れ: 成功 → `VERIFIED`（ID あり、READ 一致）、入力の誤り・429 → `FAILED`、5xx・どれにも当たらない・2 つに当たる・307 → `UNKNOWN`、
 //   ID が取れない・形の外 → `PARTIAL`、READ の不一致 → `UNKNOWN`（`actionOutcomeOf` のとおり）。
+//   PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: 判定は構造の判定 (b2)。入力の誤りは、4xx か、送った値を保った同じフォームがもう一度出た
+//   ときだけ（form のない誤りの画面は判定できない）。答え合わせの READ が一致すれば成功の側（2 つの条件に当たった画面も）。送る前に答え合わせの READ を
+//   読み、値がもう見えている・読めないときは送らない。
 // - 送らない: 画面の digest の不一致、確かめ直しの拒否・時間切れ、ページの JS が送信の前に欄を足す・値を変える・form を差し替える・送信の先を新しい
 //   窓にする（サーバの POST の記録で数え、全部の回の後に 2 秒待って数え直す）。
 // - `action-run.json` がスキーマに合い、秘密の目印（セッションの値、CSRF のトークン、readonly の値）を含まない。送信の報告は 1 回で、成果物と同じ。
@@ -66,8 +69,11 @@ const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
 const NAME_VALUE = '山田 太郎';
 const EMAIL_VALUE = 'sample0001@example.invalid';
 const ALLOWED: WorkerWriteRecheckOutcome = Object.freeze({ allowed: true });
-/** T30R-fix-1（DEF-103）: 押す前の最後の待ちの読み込みの番号（画面の確かめ 0、書き込みの画面 1、押す前 2）。 */
-const PRE_CLICK_NAVIGATION_INDEX = 2;
+/**
+ * T30R-fix-1（DEF-103）: 押す前の最後の待ちの読み込みの番号（画面の確かめ 0、書き込みの画面 1、押す前 2）。PL-6a: 送る前の答え合わせの READ（対象の画面と
+ * READ の URL）を、画面の確かめの後に足した（画面の確かめ 0、答え合わせ 1・2、書き込みの画面 3、押す前 4）。
+ */
+const PRE_CLICK_NAVIGATION_INDEX = 4;
 /**
  * T30R-fix-1（DEF-103）: 確かめ直しの答えから POST が届くまでの上限（ms）。間には、押す直前の form の確かめ直し（isolated world で読む）、押す操作、
  * Guard の照合、送り手の接続が入る（測った値は 70〜280ms 程度）。待ちと読み込み（前の作りでは、書き込みの画面の読み込みと 2 回の間隔の待ち）を
@@ -159,9 +165,17 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
   /** 書き込みの画面（既定の画面か、DEF-098 の任意の欄のある画面）。 */
   type WriteForm = 'default' | 'optional';
 
-  /** 生成した名前（回ごとに別の値。照合の READ の行が、ほかの回の登録と混ざらない）。 */
-  const nameOf = (mode: WriteSiteMode, form: WriteForm = 'default'): string =>
-    (form === 'default' ? `${NAME_VALUE} ${mode}` : `${NAME_VALUE} ${mode} ${form}`);
+  /**
+   * 生成した名前（回ごとに別の値。照合の READ の行が、ほかの回の登録と混ざらない）。PL-6a: 送る前の答え合わせの READ が、前の回の登録の値を見つけて送らずに
+   * 止めないように、回の番号（3 桁。ほかの回の名前を含まない）で作る。形の名前は入れない（`js-enable-disabled` の語が、READ の送る値の危険な語に当たり、
+   * 答え合わせを読まずに止めるため）。
+   */
+  let runSequence = 0;
+  const nameOf = (form: WriteForm = 'default'): string => {
+    runSequence += 1;
+    const run = `r${String(runSequence).padStart(3, '0')}`;
+    return form === 'default' ? `${NAME_VALUE} ${run}` : `${NAME_VALUE} ${form} ${run}`;
+  };
 
   const writeSpecOf = (name: string, form: WriteForm = 'default', candidateOverride?: DiscoveryCandidate): WorkerStartWrite => {
     const candidate = candidateOverride ?? (form === 'default' ? formCandidate : optionalCandidate);
@@ -183,9 +197,8 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
       // DEF-098: 任意の欄のある画面は、名前だけを送る欄に選ぶ。
       values: form === 'default' ? { name, email: EMAIL_VALUE, newsletter: null } : { name },
       verification: {
-        successCondition: { pathPrefix: `${WRITE_SITE_PATHS.create}/`, selector: '.registered' },
-        inputErrorCondition: { pathPrefix: WRITE_SITE_PATHS.create, selector: '.error' },
-        recordId: { source: 'URL_PATH_PATTERN', pathPattern: `${WRITE_SITE_PATHS.create}/{id}` },
+        resultJudgement: 'FORM_STRUCTURE',
+        recordId: { source: 'URL_PATH_PATTERNS', pathPatterns: [`${WRITE_SITE_PATHS.create}/{id}`] },
       },
       readVerification: {
         readCheckId: 'rc-verify',
@@ -199,6 +212,8 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
   };
 
   interface Run {
+    /** PL-6a: この回の生成した名前（照合の READ の検索の値）。 */
+    readonly name: string;
     readonly outcome: WriteCreateRunOutcome;
     readonly document: ActionRunDocument;
     /** T32e: 書き込みの報告の 2 つの JSON（スキーマ・目印・`action-run.json` との一致・承認の要約を確かめた後）。 */
@@ -218,7 +233,15 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
     /** 送り手が fixture の証明書を信頼するか（https だけ意味がある。偽なら製品の確かめだけ）。 */
     trusted = true,
     /** T30R-fix-1（DEF-103）: 読み込みの開始（pacer の待ちの後。0 から数える）ごとに呼ぶ口と、止める印。 */
-    hooks: { readonly onNavigation?: (index: number) => void; readonly stop?: AbortController; readonly candidate?: DiscoveryCandidate } = {},
+    hooks: {
+      readonly onNavigation?: (index: number) => void;
+      readonly stop?: AbortController;
+      readonly candidate?: DiscoveryCandidate;
+      /** PL-6a: 生成した名前を使う前に呼ぶ口（送る前の答え合わせの READ に見える会員を、テストが先に足す）。 */
+      readonly beforeRun?: (name: string) => void;
+      /** PL-5 の 9 の (4): 書き込みの指定を変える口（ID の取り方を null にする）。 */
+      readonly writeOverride?: (write: WorkerStartWrite) => WorkerStartWrite;
+    } = {},
   ): Promise<Run> => {
     site.setMode(mode);
     const config = configFor();
@@ -237,7 +260,10 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
     }, () => {
       sents.push(Date.now());
     });
-    const write = writeSpecOf(nameOf(mode, form), form, hooks.candidate);
+    const name = nameOf(form);
+    hooks.beforeRun?.(name);
+    const base = writeSpecOf(name, form, hooks.candidate);
+    const write = hooks.writeOverride === undefined ? base : hooks.writeOverride(base);
     const outcome = await executeWriteCreateRun({
       config,
       jobId: `job-${mode}`,
@@ -286,7 +312,7 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
         expect(start - sent, `interval from a sent document before navigation ${index}`).toBeGreaterThanOrEqual(NAVIGATION_INTERVAL_MS);
       }
     }
-    return { outcome, document, report, reports, rechecks, starts, recheckResolvedAt };
+    return { name, outcome, document, report, reports, rechecks, starts, recheckResolvedAt };
   };
 
   it('sends the approved POST once, judges SUCCESS, takes the record id, verifies it by the READ, and writes VERIFIED', async () => {
@@ -295,17 +321,18 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
     expect(run.document).toMatchObject({
       submission: 'SENT', blockReason: null, httpStatus: 200, responseJudgement: 'SUCCESS', recordId: String(1001),
       readVerification: { readCheckId: 'rc-verify', readCheckRevision: 1, result: 'MATCHED' }, reservationState: 'COMMITTED',
-      result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED', submittedValues: { name: nameOf('success'), email: EMAIL_VALUE },
+      result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED', submittedValues: { name: run.name, email: EMAIL_VALUE },
     });
     expect(run.outcome).toMatchObject({ runStatus: 'COMPLETE', result: 'VERIFIED' });
     expect(run.rechecks).toBe(1);
     const body = new URLSearchParams(site.postBodies.at(-1) ?? '');
-    expect(body.get('name')).toBe(nameOf('success'));
+    expect(body.get('name')).toBe(run.name);
     expect(body.get('email')).toBe(EMAIL_VALUE);
     expect(body.has('newsletter')).toBe(false);
     expect(body.get('csrf_token')).toBe(site.csrfMarker);
-    // 読み込み: 画面の確かめ、書き込みの画面、押す、照合の READ の対象の画面と READ の URL（5 回。読み込み直しはしない）。
-    expect(run.starts).toHaveLength(5);
+    // 読み込み: 画面の確かめ、送る前の答え合わせの READ の対象の画面と READ の URL（PL-6a）、書き込みの画面、押す、照合の READ の対象の画面と READ の URL
+    // （7 回。読み込み直しはしない）。
+    expect(run.starts).toHaveLength(7);
     // T32e: 書き込みの報告の証拠（送る前の確かめ、送信先、判定の時刻、照合の READ の証拠の全体、Guard の数の要約）。
     const { evidence } = run.report;
     expect(evidence).toMatchObject({
@@ -323,21 +350,60 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
 
   if (!tls) {
     // http の回: すべての結果の種類と、送らない回（https の回は、下の DEF-099 fix の回だけ）。
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1。構造の判定 (b2)）: 成否は人が入れた条件ではなく、答え合わせの READ と、送った値を保った同じ
+    // フォームの形と、URL の ID の型（数字・UUID の形の区切りだけ）で決める。form のない誤りの画面（`input-error`）は判定できない（入力の誤りと言わない）。
+    // 登録した後の、ID のない画面（`no-condition`）と、条件が 2 つ当たった画面（`both-conditions`）は、答え合わせが一致するので成功の側。ID の形でない区切り
+    // （`a.b`）は ID にしない。同じ form が送った値を保って出たら（200・422・後から JS で描く）入力の誤り、値を消したら判定できない。
+    const READ_NOT_MATCHED = { readCheckId: 'rc-verify', readCheckRevision: 1, result: 'NOT_MATCHED' } as const;
     it.each<[WriteSiteMode, Partial<ActionRunDocument>]>([
-      ['input-error', { responseJudgement: 'INPUT_ERROR', result: 'FAILED', reason: 'INPUT_ERROR', reservationState: 'COMMITTED' }],
-      ['rate-limited', { httpStatus: 429, responseJudgement: 'RATE_LIMITED', result: 'FAILED', reason: 'RATE_LIMITED' }],
-      ['server-error', { httpStatus: 500, responseJudgement: 'SERVER_ERROR', result: 'UNKNOWN', reason: 'SERVER_ERROR' }],
-      ['no-condition', { responseJudgement: 'NO_CONDITION_MATCHED', result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED' }],
-      ['both-conditions', { responseJudgement: 'MULTIPLE_CONDITIONS_MATCHED', result: 'UNKNOWN', reason: 'MULTIPLE_CONDITIONS_MATCHED' }],
+      ['input-error', { responseJudgement: 'NO_CONDITION_MATCHED', readVerification: READ_NOT_MATCHED, result: 'UNKNOWN', reason: 'NO_CONDITION_MATCHED' }],
+      ['rate-limited', { httpStatus: 429, responseJudgement: 'RATE_LIMITED', readVerification: null, result: 'FAILED', reason: 'RATE_LIMITED' }],
+      ['server-error', { httpStatus: 500, responseJudgement: 'SERVER_ERROR', readVerification: null, result: 'UNKNOWN', reason: 'SERVER_ERROR' }],
+      ['no-condition', { responseJudgement: 'SUCCESS', recordId: null, result: 'PARTIAL', reason: 'RECORD_ID_NOT_FOUND' }],
+      ['both-conditions', { responseJudgement: 'SUCCESS', recordId: expect.stringMatching(/^[0-9]+$/u) as string, result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED' }],
       ['no-record-id', { responseJudgement: 'SUCCESS', recordId: null, result: 'PARTIAL', reason: 'RECORD_ID_NOT_FOUND' }],
-      ['unsafe-record-id', { responseJudgement: 'SUCCESS', recordId: 'a.b', result: 'PARTIAL', reason: 'RECORD_ID_UNSAFE' }],
-      ['read-mismatch', { responseJudgement: 'SUCCESS', readVerification: { readCheckId: 'rc-verify', readCheckRevision: 1, result: 'NOT_MATCHED' },
-        result: 'UNKNOWN', reason: 'READ_VERIFICATION_NOT_MATCHED' }],
-      ['repost-307', { httpStatus: 307, responseJudgement: 'REPOST_REDIRECT', result: 'UNKNOWN', reason: 'REPOST_REDIRECT' }],
+      ['unsafe-record-id', { responseJudgement: 'SUCCESS', recordId: null, result: 'PARTIAL', reason: 'RECORD_ID_NOT_FOUND' }],
+      ['read-mismatch', { responseJudgement: 'SUCCESS', readVerification: READ_NOT_MATCHED, result: 'UNKNOWN', reason: 'READ_VERIFICATION_NOT_MATCHED' }],
+      ['repost-307', { httpStatus: 307, responseJudgement: 'REPOST_REDIRECT', readVerification: null, result: 'UNKNOWN', reason: 'REPOST_REDIRECT' }],
+      ['input-error-form', { httpStatus: 200, responseJudgement: 'INPUT_ERROR', recordId: null, readVerification: READ_NOT_MATCHED, result: 'FAILED',
+        reason: 'INPUT_ERROR' }],
+      ['input-error-form-422', { httpStatus: 422, responseJudgement: 'INPUT_ERROR', readVerification: null, result: 'FAILED', reason: 'INPUT_ERROR' }],
+      ['input-error-form-cleared', { httpStatus: 200, responseJudgement: 'NO_CONDITION_MATCHED', readVerification: READ_NOT_MATCHED, result: 'UNKNOWN',
+        reason: 'NO_CONDITION_MATCHED' }],
+      ['input-error-form-js', { httpStatus: 200, responseJudgement: 'INPUT_ERROR', readVerification: READ_NOT_MATCHED, result: 'FAILED',
+        reason: 'INPUT_ERROR' }],
     ])('judges the %s response after sending once', async (mode, expected) => {
+      const membersBefore = site.members;
       const run = await runWrite(mode);
       expectedPosts += 1;
       expect(run.document).toMatchObject({ submission: 'SENT', blockReason: null, reservationState: 'COMMITTED', ...expected });
+      // 入力の誤りと判定した回は、サイトが登録していない（誤って失敗にしない）。
+      if (run.document.result === 'FAILED') {
+        expect(site.members).toBe(membersBefore);
+      }
+    }, TEST_TIMEOUT_MS);
+
+    // PL-6a（設計書 8.1 の「事前の確かめ」）: 送る前に、同じ値で答え合わせの READ を 1 回読む。値がもう見えていれば（同じ名前の会員がもういる）、送らずに
+    // 止める（`VALUE_ALREADY_PRESENT`）。一覧を読めなければ、送った後の照合もできないので送らない（`VERIFICATION_READ_UNAVAILABLE`）。どちらも POST は 0 件で、
+    // 予約は返す。読み込みは、画面の確かめと答え合わせの 2 回（読み込み直しはしない）。
+    it.each<[string, WriteSiteMode, boolean, 'VALUE_ALREADY_PRESENT' | 'VERIFICATION_READ_UNAVAILABLE', number]>([
+      ['the value is already on the site', 'success', true, 'VALUE_ALREADY_PRESENT', 3],
+      ['the READ page is unavailable', 'list-unavailable', false, 'VERIFICATION_READ_UNAVAILABLE', 2],
+    ])('does not send when %s before sending, and writes BLOCKED', async (_label, mode, present, precheckDetail, navigations) => {
+      const before = site.postBodies.length;
+      const run = await runWrite(mode, undefined, 'default', true, { beforeRun: (name) => {
+        if (present) {
+          site.addMember(name);
+        }
+      } });
+      expect(site.postBodies.length - before).toBe(0);
+      expect(run.rechecks).toBe(0);
+      expect(run.document).toMatchObject({
+        submission: 'NOT_SENT', blockReason: 'PRECHECK_FAILED', precheckDetail, httpStatus: null, readVerification: null, reservationState: 'RELEASED',
+        result: 'BLOCKED', reason: 'PRECHECK_FAILED',
+      });
+      expect(run.report.evidence).toMatchObject({ precheck: { candidateDigestMatched: true, blockReason: 'PRECHECK_FAILED' }, guard: null });
+      expect(run.starts).toHaveLength(navigations);
     }, TEST_TIMEOUT_MS);
 
     it.each<[string, WriteSiteMode, (() => Promise<WorkerWriteRecheckOutcome>) | undefined, 'PRECHECK_FAILED' | 'PAYLOAD_MISMATCH']>([
@@ -364,9 +430,17 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
         // 画面の候補の digest が承認と違う: 書き込みの段に入らない（Guard の要約はない）。
         expect(evidence.precheck.candidateDigestMatched).toBe(false);
         expect(evidence.guard).toBeNull();
+        // OP-L（L1）: どこが違ったかを、値を含まない形で残す（欄が増えたので、承認の識別と同じ候補が画面にない）。
+        expect(evidence.precheck.candidateMismatch).toEqual({ reason: 'IDENTITY_NOT_FOUND', pageCandidateCount: expect.any(Number), sameIdentityCount: 0, fieldPosition: null });
       } else {
         expect(evidence.precheck.candidateDigestMatched).toBe(true);
         expect(evidence.guard).not.toBeNull();
+      }
+      if (mode === 'js-replace') {
+        // OP-O（O1）: 値を入れる間に form が入れ替わった。段と理由を、値を含まない形で残す（form の欄の位置は分からない）。
+        expect(evidence.precheck.inputFailure).toEqual({
+          stage: 'FILL', reason: 'FORM_CHANGED', fieldPosition: null, fieldType: null, fieldAttributes: null, valueChange: null,
+        });
       }
       if (blockReason === 'PAYLOAD_MISMATCH') {
         expect(Object.values(evidence.guard?.blockedByPayloadReason ?? {}).some((count) => count > 0)).toBe(true);
@@ -389,6 +463,19 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
 
     // T40R-fix-A2（Task 40 の設計書 7 章の「T40R-fix-A・B の報告」）: 成功の条件に当たる画面が書き込みの画面（`/members/new`）のままで、その path が ID の
     // 型（`/members/{id}`）に当たる。押す前の画面から同じ取り方で取れた値（`new`）は ID として使わない（`RECORD_ID_NOT_FOUND`。成功と偽らない）。
+    // PL-5 の 9 の (4)（設計書 8.1 の「登録の ID の取り方」の行）: 下書きが ID の取り方を決められなかった（null）書き込みの指定は、送った後の URL に ID が
+    // あっても取らず、答え合わせが一致しても ID なしの `PARTIAL`（`RECORD_ID_NOT_FOUND`。`VERIFIED` と言わない）。送るのは 1 回。
+    it('takes no record id when the way to take it is null, and writes PARTIAL (RECORD_ID_NOT_FOUND) after the READ verification matched', async () => {
+      const run = await runWrite('success', undefined, 'default', true, {
+        writeOverride: (write) => ({ ...write, verification: { ...write.verification, recordId: null } }),
+      });
+      expectedPosts += 1;
+      expect(run.document).toMatchObject({
+        submission: 'SENT', blockReason: null, responseJudgement: 'SUCCESS', recordId: null, reservationState: 'COMMITTED',
+        readVerification: { readCheckId: 'rc-verify', readCheckRevision: 1, result: 'MATCHED' }, result: 'PARTIAL', reason: 'RECORD_ID_NOT_FOUND',
+      });
+    }, TEST_TIMEOUT_MS);
+
     it('does not take the value that the form page itself gives by the record id pattern before the click, and writes PARTIAL', async () => {
       const run = await runWrite('stay-on-form');
       expectedPosts += 1;
@@ -403,11 +490,11 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
       expectedPosts += 1;
       expect(run.document).toMatchObject({
         submission: 'SENT', blockReason: null, responseJudgement: 'SUCCESS', result: 'VERIFIED', reason: 'READ_VERIFICATION_MATCHED',
-        reservationState: 'COMMITTED', submittedValues: { name: nameOf('success', 'optional') },
+        reservationState: 'COMMITTED', submittedValues: { name: run.name },
       });
       const body = new URLSearchParams(site.postBodies.at(-1) ?? '');
       expect([...body.keys()]).toEqual(['csrf_token', 'name', 'nickname', 'memo', 'notify', 'serial']);
-      expect(body.get('name')).toBe(nameOf('success', 'optional'));
+      expect(body.get('name')).toBe(run.name);
       expect([body.get('nickname'), body.get('memo')]).toEqual(['', '']);
       expect(body.getAll('notify')).toEqual(['0']);
     }, TEST_TIMEOUT_MS);
@@ -534,7 +621,8 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
         submission: 'SENT', blockReason: null, httpStatus: 303, responseJudgement: 'RESPONSE_NOT_DELIVERED', recordId: null, readVerification: null,
         result: 'UNKNOWN', reason: 'RESPONSE_NOT_DELIVERED',
       });
-      expect(run.starts).toHaveLength(3);
+      // 画面の確かめ、送る前の答え合わせの 2 回（PL-6a）、書き込みの画面、押す（判定しないので、照合の READ はない）。
+      expect(run.starts).toHaveLength(5);
     }, TEST_TIMEOUT_MS);
   }
 
@@ -568,6 +656,8 @@ describe.each(CASES)('T30f: the write job flow (%s)', (_name, launch, tls) => {
     // http: 成功・結果の種類・任意の欄の 11 件と、DEF-103 の窓の 1 件、M-b の 1 件、接続が切れる回の 1 件。https: 成功と、接続が切れる回。
     // T31R-fix-1（C-1）: CSRF の hidden を書き換えた回の 1 件を足した。
     // T40R-fix-A2: http の回に、書き込みの画面に戻る形の 1 回を足した（15 から 16）。
-    expect(expectedPosts).toBe(tls ? 2 : 16);
+    // PL-6a: 同じ form を返す誤りの 4 つの形を足した（16 から 20。送る前の答え合わせで止めた 2 回は送らない）。
+    // PL-5 の 9 の (4): ID の取り方が null の書き込みの指定の 1 回を足した（20 から 21）。
+    expect(expectedPosts).toBe(tls ? 2 : 21);
   }, TEST_TIMEOUT_MS);
 });

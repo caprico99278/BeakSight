@@ -4,6 +4,8 @@
  *   その欄に出る。保存すると、プロファイルの項目になる。
  * - 認証の設定の画面: ログインの送り方でスクリプトの送信を選ぶと、フォームの送信先の欄が消え、token の送信先（Origin は承認したサービスの Origin から
  *   選ぶ）・必須の query の組・ログインに伴う送信の一覧・成功のローカル ストレージの鍵の形の欄が出る。保存すると版 3 の設定になり、読み直すと同じ値。
+ *   PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8）: token の送信先・必須の query・ログインに伴う送信は、設定がないときも読むだけ
+ *   （手で入れない。観察が入れる）。入口の確かめの案がないときの既定の送り方は、送信先のない形（スクリプトの送信）。
  * - 誤りは、検証の owner の位置で欄と行に出る（要る項目の欠け、承認していないサービスの Origin、必須の query、送信先の重なり、鍵の形、フォームの送信の
  *   送信先の欠け）。
  * - LG-3b（2026-10-24 のテストの組の設計 3.7.2）: 版 2 の設定は保存できない（版 3 だけ。前の版の知らせと、版 2 のまま保存する道は捨てた）。
@@ -28,9 +30,10 @@ import { createStartingJob, recordAuthState, recordEnded, type AuditJobLoginStag
 import { closeControlDatabase, openControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
 import { WORKER_LOGIN_CREDENTIAL_BLOCK_REASON, WORKER_SCRIPT_LOGIN_BLOCK_REASONS } from '../../../src/control/worker-protocol.js';
+import { GENERATED_TARGET_CRAWL_LIMITS } from '../../../src/config/target-config-draft.js';
 import { REDACTED_PATH_SEGMENT } from '../../../src/core/url-path-redaction.js';
 import { formatCount, formatTimes } from '../../../src/presentation/format.js';
-import { LOGIN_TRANSPORT_CATALOG } from '../../../src/presentation/catalog.js';
+import { LOGIN_TRANSPORT_CATALOG, REQUEST_RESOURCE_TYPE_LABELS } from '../../../src/presentation/catalog.js';
 import {
   AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
   LOCAL_UI_AUTH_TEXT,
@@ -45,6 +48,7 @@ import {
 } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { databaseFilePlaces, placesWithMarkers } from '../../../tests/helpers/leak-places.js';
+import { REMOVED_ADD_BUTTON_LABELS, openAuthSetupAdvancedSettings, openProfileAuthSetupAdvancedSettings } from './helpers/auth-setup-page.ts';
 import { writeAuthTargetConfig } from './helpers/auth-worker.ts';
 import {
   createTemporaryUiRoot,
@@ -56,9 +60,11 @@ import {
   type StartedServer,
   type TemporaryUiRoot,
 } from './helpers/local-server.ts';
-import { chooseExistingTargetConfig } from './helpers/profile-form.ts';
+import { openProfileAdvancedSettings } from './helpers/profile-form.ts';
+import { createProfileInStore, updateProfileInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -73,6 +79,8 @@ const SCRIPT_PROFILE = 't34d-script';
 const LEGACY_PROFILE = 't34d-legacy';
 const JOB_PROFILE = 't34e-job';
 const AUTO_PROFILE = 't36a-auto';
+/** MI-F5: 版 3 の誤りの表示を、欄を手で入れられる新しい設定で確かめるプロファイル（認証の設定を保存しない）。 */
+const ERRORS_PROFILE = 't34d-errors';
 const JOB_ID = 'job-t34e-login-stage';
 const JOB_CREATED_AT = '20261016010000';
 const JOB_ENDED_AT = '20261016011000';
@@ -153,6 +161,7 @@ const rowLabel = (line: number, label: string): string => `${authText.lineText(S
 /** 認証の設定の画面を開き、フォームが出るまで待つ。 */
 const openAuthSetup = async (profileId: string): Promise<Page> => {
   const page = await openPage(`/auth-setup/${profileId}`);
+  await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
   await page.getByTestId('auth-setup-form').waitFor({ timeout: UI_TIMEOUT_MS });
   return page;
 };
@@ -196,6 +205,7 @@ beforeAll(async () => {
   writeAuthTargetConfig(root.root, LEGACY_PROFILE, TEST_ORIGIN, ADMIN_PATH, MAX_PAGES);
   writeAuthTargetConfig(root.root, JOB_PROFILE, TEST_ORIGIN, ADMIN_PATH, MAX_PAGES);
   writeAuthTargetConfig(root.root, AUTO_PROFILE, TEST_ORIGIN, ADMIN_PATH, MAX_PAGES);
+  writeAuthTargetConfig(root.root, ERRORS_PROFILE, TEST_ORIGIN, ADMIN_PATH, MAX_PAGES);
   ids = readServerFunctionIds(`${root.root}/apps/local-ui/dist/server/server.js`);
   browser = await launchHeadlessChromium();
   server = await startLauncher(root, await findFreePort());
@@ -218,144 +228,214 @@ afterAll(async () => {
   root?.remove();
 });
 
+// MI-1（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.2・4.9。T34d の欄の手順を 4.2 の形に直した）: 承認したサービスの Origin は、
+// 利用者が知りえないので画面から足さない（手動のログインの観察だけが足す）。作成の画面には欄を出さず（詳しい設定の中にも）、プロファイルの詳細の編集
+// （詳しい設定）では、読むだけの一覧と「消す」だけにする。監査の対象の Origin が入っているときの拒否の文は、4.9 の形で一覧に出す。
 describe('T34d: the approved service origins on the profile screen', () => {
-  it('shows the field only for the two test modes, puts its errors on it, and saves the origins', async () => {
-    const page = await openPage('/profiles/new');
-    await field(page, profileText.profileId).fill(SCRIPT_PROFILE);
-    // T43b: 作成の画面の既定は「開始の URL から新しく作る」。この流れは、すでにある設定のファイルを選ぶ。
-    await chooseExistingTargetConfig(page, `config/targets/${SCRIPT_PROFILE}.json`, UI_TIMEOUT_MS);
-    await page.getByText(profileText.configOk).waitFor({ timeout: UI_TIMEOUT_MS });
-    // 公開の監査のモード（既定）では、欄がない。
-    expect(await field(page, scriptText.profile.approvedServiceOrigins).count()).toBe(0);
-    await field(page, profileText.environment).selectOption('TEST');
-    await field(page, profileText.mode).selectOption('TEST_AUTH_PASSIVE');
-    await field(page, profileText.auth).selectOption('MANUAL_SESSION');
-    await field(page, profileText.approvedTestOrigins).fill(TEST_ORIGIN);
-    await field(page, profileText.environmentEvidenceRef).fill(`${SCRIPT_PROFILE}-evidence`);
-    const services = field(page, scriptText.profile.approvedServiceOrigins);
-    await services.waitFor({ timeout: UI_TIMEOUT_MS });
-
-    // 形の誤りと、テスト環境の Origin との重なりは、欄に出る。
-    for (const [value, code] of [
-      ['ftp://service.example.invalid', 'PROFILE_SERVICE_ORIGIN_INVALID'],
-      [TEST_ORIGIN, 'PROFILE_SERVICE_ORIGIN_INSIDE_TARGET'],
-    ] as const) {
-      await services.fill(value);
-      await page.getByRole('button', { name: profileText.save }).click();
-      await expect.poll(() => services.getAttribute('aria-invalid'), { timeout: UI_TIMEOUT_MS }).toBe('true');
-      await expectFieldError(page, scriptText.profile.approvedServiceOrigins, PROFILE_VALIDATION_ERROR_DESCRIPTIONS[code]);
+  it('has no field on the creation screen, lists the origins read-only with "remove" on the edit screen, and saves the removal', async () => {
+    const configPath = `config/targets/${SCRIPT_PROFILE}.json`;
+    const thirdServiceOrigin = 'https://third-service.example.invalid';
+    // 作成の画面: どの使い方でも、承認したサービスの Origin の欄はない。PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 6 章の 1）: 作成の画面の見える
+    // 入力は開始のアドレス・使い方・保存だけで、たたんだ詳しい設定（前は監査モードを選んで確かめた）もない。
+    const create = await openPage('/profiles/new');
+    await field(create, profileText.startUrl).waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await create.locator('main details').count()).toBe(0);
+    for (const usage of [profileText.usageTestAuth, profileText.usagePublic]) {
+      await field(create, usage).check();
+      expect(await create.locator('[name="approvedServiceOrigins"]').count(), usage).toBe(0);
+      expect(await create.getByText(scriptText.profile.approvedServiceOrigins).count(), usage).toBe(0);
     }
-    await screenshot(page, 'd01-profile-service-origin-error');
-    await services.fill(`${SERVICE_ORIGIN}\n${OTHER_SERVICE_ORIGIN}`);
+    // プロファイルは Server Function で作る（作成の画面でテスト環境を保存すると、入口の確かめが TEST_ORIGIN へ接続するため。作成の画面の保存は
+    // `start-url-onboarding-ui.test.ts`）。手動のログインの観察の代わりに、承認したサービスの Origin を Server Function で足す（テストだけの操作）。
+    expect(await valueOf('createProfileFn', 'POST', { profile: profileDocumentOf(SCRIPT_PROFILE, configPath, 1, []) })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 1）: 画面の編集の口は承認したサービスの Origin を足さないので、テストの準備は保存の部品で直接更新する。
+    expect(await updateProfileInStore(rootOf().root, profileDocumentOf(SCRIPT_PROFILE, configPath, 2, [SERVICE_ORIGIN, OTHER_SERVICE_ORIGIN, thirdServiceOrigin]), 1))
+      .toMatchObject({ ok: true });
+
+    // 編集（詳しい設定の中）: 読むだけの一覧と「消す」。足す欄はない。
+    const page = await openPage(`/profiles/${SCRIPT_PROFILE}`);
+    await openProfileAdvancedSettings(page, UI_TIMEOUT_MS);
+    const list = page.getByTestId('profile-service-origins');
+    await list.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await list.locator('code').allTextContents()).toEqual([SERVICE_ORIGIN, OTHER_SERVICE_ORIGIN, thirdServiceOrigin]);
+    expect(await list.locator('input, textarea, select').count()).toBe(0);
+    expect(await page.locator('[name="approvedServiceOrigins"]').count()).toBe(0);
+    expect(await list.textContent()).toContain(scriptText.profile.approvedServiceOriginsHint);
+    await screenshot(page, 'd01-profile-service-origins-list');
+    await list.getByRole('button', { name: scriptText.profile.removeServiceOriginLabel(thirdServiceOrigin) }).click();
+    await expect.poll(() => list.locator('code').allTextContents(), { timeout: UI_TIMEOUT_MS }).toEqual([SERVICE_ORIGIN, OTHER_SERVICE_ORIGIN]);
     await page.getByRole('button', { name: profileText.save }).click();
-    await page.getByText(profileText.created).waitFor({ timeout: UI_TIMEOUT_MS });
-    const detail = await valueOf<{ profile: { approvedServiceOrigins?: readonly string[] } }>('getProfileFn', 'GET', { profileId: SCRIPT_PROFILE });
-    expect(detail.profile.approvedServiceOrigins).toEqual([SERVICE_ORIGIN, OTHER_SERVICE_ORIGIN]);
-    // 読み直すと、同じ値（1 行に 1 つ）。
+    await page.getByText(profileText.updated).waitFor({ timeout: UI_TIMEOUT_MS });
+    const detail = await valueOf<{ profile: { revision: number; approvedServiceOrigins?: readonly string[] } }>(
+      'getProfileFn', 'GET', { profileId: SCRIPT_PROFILE },
+    );
+    expect(detail.profile).toMatchObject({ revision: 3, approvedServiceOrigins: [SERVICE_ORIGIN, OTHER_SERVICE_ORIGIN] });
+
+    // 監査の対象の Origin（設定のファイルの allowedOrigins）に入るサービスの Origin は拒み、4.9 の形の文を一覧に出す（ここでは、サービスの Origin を
+    // 監査の対象に含む設定のファイルへ切り替えて、重なりを作る。loopback でない Origin なので、読み込みの間隔は作るファイルの控えめな値にする）。
+    writeAuthTargetConfig(rootOf().root, 't34d-service-site', SERVICE_ORIGIN, ADMIN_PATH, MAX_PAGES, GENERATED_TARGET_CRAWL_LIMITS.minNavigationIntervalMs);
     const reopened = await openPage(`/profiles/${SCRIPT_PROFILE}`);
-    expect(await field(reopened, scriptText.profile.approvedServiceOrigins).inputValue()).toBe(`${SERVICE_ORIGIN}\n${OTHER_SERVICE_ORIGIN}`);
-    await screenshot(reopened, 'd02-profile-service-origins');
+    await openProfileAdvancedSettings(reopened, UI_TIMEOUT_MS);
+    await field(reopened, profileText.targetConfigPath).selectOption('config/targets/t34d-service-site.json');
+    await reopened.getByRole('button', { name: profileText.save }).click();
+    const reopenedList = reopened.getByTestId('profile-service-origins');
+    await reopenedList.locator('.field-error').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await reopenedList.locator('.field-error').textContent())
+      .toContain(PROFILE_VALIDATION_ERROR_DESCRIPTIONS.PROFILE_SERVICE_ORIGIN_INSIDE_TARGET);
+    expect(PROFILE_VALIDATION_ERROR_DESCRIPTIONS.PROFILE_SERVICE_ORIGIN_INSIDE_TARGET)
+      .toContain('手でログインすると、ログインの先のサイトのアドレスが自動で入ります');
+    await screenshot(reopened, 'd02-profile-service-origin-error');
+    expect((await valueOf<{ profile: { revision: number } }>('getProfileFn', 'GET', { profileId: SCRIPT_PROFILE })).profile.revision).toBe(3);
   }, SCENARIO_TIMEOUT_MS);
 });
 
 describe('T34d: the version 3 auth setup screen (the script login)', () => {
-  it('saves a script login setup as version 3, and shows the same values after reopening', async () => {
+  // MI-F5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 6・7。T34d の手で入れる手順を直した）: ログインの送信先（token の送信先、必須の
+  // query、ログインに伴う送信）は、入口の確かめと手動のログインの観察からだけ入る。認証の設定がまだない画面でスクリプトの送信の欄を出し、手で入れた送信先の最初の
+  // 保存は拒む。観察の後の形の設定（テストの準備。保存の部品で直接）は、読み直すと送信先を読むだけで出し、送信先でない欄（成功の鍵）は入力の欄のまま。
+  // PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8。MI 4.7.1 の 6 の持ち越し。この場面の手で入れる手順を直した）: 入口の確かめの案がない
+  // ときの既定の送り方は、送信先のない形（スクリプトの送信）。token の送信先・必須の query・ログインに伴う送信は、設定がないときも入力の欄を出さず、読むだけで出す。
+  // 手で入れた送信先の最初の保存の拒否は、画面の保存の Server Function へ、前に欄で入れていた値を直接送って確かめる。
+  it('shows the script login fields for a new setup, rejects the destination typed by hand, and shows the observed setup read-only after reopening', async () => {
     const page = await openAuthSetup(SCRIPT_PROFILE);
-    expect(await page.getByTestId('auth-setup-service-origins').textContent()).toContain(SERVICE_ORIGIN);
-    // 既定はフォームの送信（今の欄）。スクリプトの送信を選ぶと、フォームの送信先の欄が消え、スクリプトの欄が出る。
-    expect(await field(page, authText.loginPostEndpoints).count()).toBe(1);
-    expect(await page.getByTestId('auth-setup-script').count()).toBe(0);
-    await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).check();
+    // PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章・3 章の 2。前はサイトの値の表に承認したサービスの Origin の一覧を出していた）: Origin の一覧は
+    // 画面に出さない（プロファイルの値で確かめる）。
+    expect(await page.getByTestId('auth-setup-service-origins').count()).toBe(0);
+    expect((await authSetupPageOf(SCRIPT_PROFILE)).profile.approvedServiceOrigins).toContain(SERVICE_ORIGIN);
+    // 既定はスクリプトの送信（送信先のない形）。フォームの送信先の欄はなく、スクリプトの欄が出る。
+    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
     await page.getByTestId('auth-setup-script').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await field(page, authText.loginPostEndpoints).count()).toBe(0);
-    expect(await page.getByTestId('auth-setup-script-method').textContent()).toContain(scriptText.setup.methodFixedValue);
+    // PL-4（同 3 章の 3。前は送信の method の固定と、token の送信先・必須の query・ログインに伴う送信を読むだけの値で出していた）: どれも出さない（直せない
+    // 欄を見せない。入るのは手動のログインの観察からだけ）。入力の欄も、足すボタンもない。
+    expect(await page.getByTestId('auth-setup-script-method').count()).toBe(0);
+    for (const name of ['scriptOrigin', 'scriptPath', 'requiredQueryName0', 'sideRequestOrigin0']) {
+      expect(await page.locator(`[name="${name}"]`).count(), name).toBe(0);
+    }
+    // OP-DEF の 5: 足すボタンの文言はカタログから消した（使い先がない）。前の名前のボタンが出ないことは、今も確かめる。
+    for (const label of REMOVED_ADD_BUTTON_LABELS) {
+      expect(await page.getByRole('button', { name: label }).count(), label).toBe(0);
+    }
+    for (const testId of ['auth-setup-destination-script-origin', 'auth-setup-destination-script-path', 'auth-setup-destination-required-query',
+      'auth-setup-destination-side-requests']) {
+      expect(await page.getByTestId(testId).count(), testId).toBe(0);
+    }
+    // 送信先でない欄（成功の鍵）は、入力の欄のまま。
+    expect(await field(page, scriptText.setup.storageOrigin).count()).toBe(1);
+    await screenshot(page, 'd03-auth-setup-script-new');
 
-    await field(page, authText.loginStartUrl).fill(`${TEST_ORIGIN}/login`);
-    await field(page, authText.successPathPrefix).fill(ADMIN_PATH);
-    await field(page, authText.excludedPaths).fill(LOGOUT_PATH);
-    await field(page, scriptText.setup.scriptOrigin).selectOption(SERVICE_ORIGIN);
-    await field(page, scriptText.setup.scriptPath).fill(TOKEN_PATH);
-    await page.getByRole('button', { name: scriptText.setup.addQuery }).click();
-    await field(page, rowLabel(1, scriptText.setup.queryName)).fill('grant_type');
-    await field(page, rowLabel(1, scriptText.setup.queryValue)).fill('password');
-    await page.getByRole('button', { name: scriptText.setup.addSideRequest }).click();
-    await field(page, rowLabel(1, scriptText.setup.sideOrigin)).selectOption(SERVICE_ORIGIN);
-    await field(page, rowLabel(1, scriptText.setup.sidePath)).fill(SIDE_PATH);
-    await field(page, rowLabel(1, scriptText.setup.sideMaxPerLoginStage)).selectOption(String(SIDE_COUNT));
-    await field(page, scriptText.setup.storageOrigin).selectOption(TEST_ORIGIN);
-    await field(page, scriptText.setup.storagePrefix).fill('app-');
-    await field(page, scriptText.setup.storageSuffix).fill('-auth-token');
-    await screenshot(page, 'd03-auth-setup-script-filled');
-    await saveSetup(page);
-    await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
-
-    const stored = (await authSetupPageOf(SCRIPT_PROFILE)).stored?.setup;
-    expect(stored).toMatchObject({
+    // 手で入れた送信先（前は欄で入れた値）の最初の保存は、画面の保存の Server Function でも拒む（入口の確かめの案がないので、送信先のない形だけを受ける）。
+    const revision = (await authSetupPageOf(SCRIPT_PROFILE)).profile.revision;
+    const observed = {
       schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
-      loginTransport: 'SCRIPT_REQUEST',
+      profileId: SCRIPT_PROFILE,
+      profileRevision: revision,
+      loginStartUrl: `${TEST_ORIGIN}/login`,
       loginPostEndpoints: [],
+      successCondition: { pathPrefix: ADMIN_PATH, selector: null },
+      sessionLostCondition: { pathPrefix: null },
+      excludedPaths: [LOGOUT_PATH],
+      auditPathPrefixes: [],
+      maxLoginAttempts: 1,
+      allowedIdpOrigins: [],
+      automatedLogin: null,
+      loginTransport: 'SCRIPT_REQUEST',
       scriptLogin: { origin: SERVICE_ORIGIN, path: TOKEN_PATH, requiredQuery: [{ name: 'grant_type', value: 'password' }] },
       loginSideRequests: [{ origin: SERVICE_ORIGIN, path: SIDE_PATH, method: 'POST', maxPerLoginStage: SIDE_COUNT }],
       successStorageKey: { origin: TEST_ORIGIN, prefix: 'app-', suffix: '-auth-token' },
-      successCondition: { pathPrefix: ADMIN_PATH, selector: null },
-    });
+    };
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: observed })).toMatchObject({ ok: false, reason: 'CREDENTIAL_DESTINATION_OBSERVED_ONLY' });
+    expect((await authSetupPageOf(SCRIPT_PROFILE)).stored).toBeNull();
+
+    // テストの準備: 手動のログインの観察の後の形の設定を、保存の部品で直接保存する。
+    expect(await saveAuthSetupRequestInStore(root, { setup: observed })).toMatchObject({ ok: true });
 
     const reopened = await openAuthSetup(SCRIPT_PROFILE);
-    expect(await reopened.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
-    expect(await field(reopened, scriptText.setup.scriptOrigin).inputValue()).toBe(SERVICE_ORIGIN);
-    expect(await field(reopened, scriptText.setup.scriptPath).inputValue()).toBe(TOKEN_PATH);
-    expect(await field(reopened, rowLabel(1, scriptText.setup.queryName)).inputValue()).toBe('grant_type');
-    expect(await field(reopened, rowLabel(1, scriptText.setup.queryValue)).inputValue()).toBe('password');
-    expect(await field(reopened, rowLabel(1, scriptText.setup.sideOrigin)).inputValue()).toBe(SERVICE_ORIGIN);
-    expect(await field(reopened, rowLabel(1, scriptText.setup.sidePath)).inputValue()).toBe(SIDE_PATH);
-    expect(await field(reopened, rowLabel(1, scriptText.setup.sideMaxPerLoginStage)).inputValue()).toBe(String(SIDE_COUNT));
+    // PL-4（同 3 章の 3。前は送り方と送信先を読むだけの値で出していた）: 変えられない送り方と送信先は出さない。値は、下の保存の後の設定が観察の値のままで
+    // あることで確かめる。
+    expect(await reopened.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).count()).toBe(0);
+    expect(await reopened.locator('main [data-testid^="auth-setup-destination-"]:not([data-testid="auth-setup-destination-locked"])').count()).toBe(0);
+    expect(await reopened.getByRole('main').innerText()).not.toContain(TOKEN_PATH);
     expect(await field(reopened, scriptText.setup.storageOrigin).inputValue()).toBe(TEST_ORIGIN);
     expect(await field(reopened, scriptText.setup.storagePrefix).inputValue()).toBe('app-');
     expect(await field(reopened, scriptText.setup.storageSuffix).inputValue()).toBe('-auth-token');
+    // 送信先でない欄の保存は受け、保存した設定は版 3 のスクリプトの送信のまま。
+    await saveSetup(reopened);
+    await reopened.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect((await authSetupPageOf(SCRIPT_PROFILE)).stored?.setup).toEqual(observed);
     await screenshot(reopened, 'd04-auth-setup-script-reopened');
   }, SCENARIO_TIMEOUT_MS);
 
+  // MI-F5: 版 3 の誤りの表示は、欄を手で入れられる新しい設定（認証の設定のない別のプロファイル）で確かめる。検証の誤りは、送信先の確かめより先に返る。
+  // PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8）: 必須の query とログインに伴う送信は、画面で手で入れなくなった（読むだけ）。その行の
+  // 誤り（名前の空、token の送信先との重なり）の位置は、画面の保存の Server Function へ直接送って、検証の owner が返す項目と行で確かめる。
   it('puts the version 3 errors on their fields and lines, and saves nothing', async () => {
-    const before = (await authSetupPageOf(SCRIPT_PROFILE)).stored?.updatedAt;
-    const page = await openAuthSetup(SCRIPT_PROFILE);
-    // 必須の query の名前が空、ログインに伴う送信が token の送信先と同じ、鍵の接頭辞と接尾辞が空。
-    await field(page, rowLabel(1, scriptText.setup.queryName)).fill(' ');
-    await field(page, rowLabel(1, scriptText.setup.sidePath)).fill(TOKEN_PATH);
-    await field(page, scriptText.setup.storagePrefix).fill('');
-    await field(page, scriptText.setup.storageSuffix).fill('');
-    await saveSetup(page);
-    expect(await page.getByTestId('auth-setup-rejection').getAttribute('data-reason')).toBe('AUTH_SETUP_INVALID');
-    await expectGroupError(page, 'auth-setup-required-query',
-      `${authText.lineText('1')}: ${AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_REQUIRED_QUERY_INVALID}`);
-    await expectGroupError(page, 'auth-setup-side-requests',
-      `${authText.lineText('1')}: ${AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_LOGIN_SIDE_REQUEST_DUPLICATED}`);
-    await expectFieldError(page, scriptText.setup.storageOrigin, AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_STORAGE_KEY_INVALID);
-    await screenshot(page, 'd05-auth-setup-script-errors');
+    const configPath = `config/targets/${ERRORS_PROFILE}.json`;
+    expect(await createProfileInStore(rootOf().root, profileDocumentOf(ERRORS_PROFILE, configPath, 1, [SERVICE_ORIGIN]))).toMatchObject({ ok: true });
+    const fillScript = async (page: Page): Promise<void> => {
+      // PL-S: 入口の確かめの案がないので、既定がスクリプトの送信（送信先のない形）。
+      expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
+      await page.getByTestId('auth-setup-script').waitFor({ timeout: UI_TIMEOUT_MS });
+      await field(page, authText.loginStartUrl).fill(`${TEST_ORIGIN}/login`);
+      await field(page, authText.successPathPrefix).fill(ADMIN_PATH);
+      await field(page, authText.excludedPaths).fill(LOGOUT_PATH);
+    };
+    // 必須の query の名前が空、ログインに伴う送信が token の送信先と同じ（画面の保存の Server Function へ直接。何も保存しない）。
+    const revision = (await authSetupPageOf(ERRORS_PROFILE)).profile.revision;
+    expect(await valueOf('saveAuthSetupFn', 'POST', {
+      setup: {
+        schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+        profileId: ERRORS_PROFILE,
+        profileRevision: revision,
+        loginStartUrl: `${TEST_ORIGIN}/login`,
+        loginPostEndpoints: [],
+        successCondition: { pathPrefix: ADMIN_PATH, selector: null },
+        sessionLostCondition: { pathPrefix: null },
+        excludedPaths: [LOGOUT_PATH],
+        auditPathPrefixes: [],
+        maxLoginAttempts: 1,
+        allowedIdpOrigins: [],
+        automatedLogin: null,
+        loginTransport: 'SCRIPT_REQUEST',
+        scriptLogin: { origin: SERVICE_ORIGIN, path: TOKEN_PATH, requiredQuery: [{ name: ' ', value: 'password' }] },
+        loginSideRequests: [{ origin: SERVICE_ORIGIN, path: TOKEN_PATH, method: 'POST', maxPerLoginStage: 1 }],
+        successStorageKey: { origin: TEST_ORIGIN, prefix: 'app-', suffix: '-auth-token' },
+      },
+    })).toMatchObject({
+      ok: false,
+      reason: 'AUTH_SETUP_INVALID',
+      errors: expect.arrayContaining([
+        expect.objectContaining({ code: 'AUTH_SETUP_REQUIRED_QUERY_INVALID', field: 'requiredQuery', line: 1 }),
+        expect.objectContaining({ code: 'AUTH_SETUP_LOGIN_SIDE_REQUEST_DUPLICATED', field: 'loginSideRequests', line: 1 }),
+      ]),
+    });
+    expect((await authSetupPageOf(ERRORS_PROFILE)).stored).toBeNull();
 
-    // T44e（Task 44 の設計書 P2-8）: 手動のログインのプロファイルでは、token の送信先を空にしても、要る項目の欠けにならない（手動のログインの後に自動で
-    // 登録される。自動ログインのプロファイルは今どおり欠けにする: `tests/unit/control-auth-setup-v3.test.ts`）。ここでは鍵の誤りも入れて、保存させない。
-    const second = await openAuthSetup(SCRIPT_PROFILE);
-    await field(second, scriptText.setup.scriptOrigin).selectOption('');
-    await field(second, scriptText.setup.scriptPath).fill('');
-    await second.getByRole('button', { name: rowLabel(1, scriptText.setup.removeQuery) }).click();
-    await field(second, scriptText.setup.storagePrefix).fill('');
-    await field(second, scriptText.setup.storageSuffix).fill('');
+    // T44e（Task 44 の設計書 P2-8）: 手動のログインのプロファイルでは、token の送信先が空でも、要る項目の欠けにならない（手動のログインの後に自動で
+    // 登録される。自動ログインのプロファイルは今どおり欠けにする: `tests/unit/control-auth-setup-v3.test.ts`）。ここでは鍵の誤り（接頭辞と接尾辞が空）を入れて、
+    // 保存させない。
+    const second = await openAuthSetup(ERRORS_PROFILE);
+    await fillScript(second);
+    await field(second, scriptText.setup.storageOrigin).selectOption(TEST_ORIGIN);
     await saveSetup(second);
     expect(await second.getByTestId('auth-setup-rejection').getAttribute('data-reason')).toBe('AUTH_SETUP_INVALID');
     await expectFieldError(second, scriptText.setup.storageOrigin, AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_STORAGE_KEY_INVALID);
-    expect(await field(second, scriptText.setup.scriptOrigin).getAttribute('aria-invalid')).toBe('false');
     expect(await second.getByText(AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_SCRIPT_LOGIN_REQUIRED).count()).toBe(0);
+    await screenshot(second, 'd05-auth-setup-script-errors');
 
-    // フォームの送信に戻して送信先を空にすると、版 3 のフォームの送信の送信先の欠け（送信先の欄）。
-    const third = await openAuthSetup(SCRIPT_PROFILE);
+    // フォームの送信を選び、送信先を空のまま保存すると、版 3 のフォームの送信の送信先の欠け（送信先の欄）。
+    const third = await openAuthSetup(ERRORS_PROFILE);
     await third.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.FORM_NAVIGATION.label }).check();
     expect(await third.getByTestId('auth-setup-script').count()).toBe(0);
+    await field(third, authText.loginStartUrl).fill(`${TEST_ORIGIN}/login`);
+    await field(third, authText.successPathPrefix).fill(ADMIN_PATH);
     await field(third, authText.loginPostEndpoints).fill('');
     await saveSetup(third);
     await expectFieldError(third, authText.loginPostEndpoints, AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_LOGIN_POST_ENDPOINTS_REQUIRED);
-    expect((await authSetupPageOf(SCRIPT_PROFILE)).stored?.updatedAt).toBe(before);
+    expect((await authSetupPageOf(ERRORS_PROFILE)).stored).toBeNull();
   }, SCENARIO_TIMEOUT_MS);
 
+  // MI-F5: 送信先は読むだけなので、承認から外れた Origin の設定は、画面では選び直さない（誤りの文を出して保存しない）。直すのは観察（ここではテストの準備）。
   it('shows the saved origin that the profile no longer approves, and puts SERVICE_ORIGIN_NOT_APPROVED on it', async () => {
     const page = await authSetupPageOf(SCRIPT_PROFILE);
     const detail = await valueOf<{ profile: { targetConfigPath: string } }>('getProfileFn', 'GET', { profileId: SCRIPT_PROFILE });
@@ -365,14 +445,23 @@ describe('T34d: the version 3 auth setup screen (the script login)', () => {
       expectedRevision: page.profile.revision,
     })).toMatchObject({ ok: true });
     const screen = await openAuthSetup(SCRIPT_PROFILE);
-    expect(await field(screen, scriptText.setup.scriptOrigin).inputValue()).toBe(SERVICE_ORIGIN);
-    await field(screen, rowLabel(1, scriptText.setup.sideOrigin)).selectOption(OTHER_SERVICE_ORIGIN);
+    // PL-4: token の送信先は出さない（欄がないので、保存の誤りはフォームの上の知らせに、項目の名前つきで出す）。
+    expect(await screen.getByTestId('auth-setup-destination-script-origin').count()).toBe(0);
     await saveSetup(screen);
-    await expectFieldError(screen, scriptText.setup.scriptOrigin, AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_SERVICE_ORIGIN_NOT_APPROVED);
-    // 承認している Origin を選び直すと、保存できる。
-    await field(screen, scriptText.setup.scriptOrigin).selectOption(OTHER_SERVICE_ORIGIN);
-    await saveSetup(screen);
-    await screen.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await screen.getByTestId('auth-setup-rejection').getAttribute('data-reason')).toBe('AUTH_SETUP_INVALID');
+    const rejectionNotice = await screen.locator('.notice', { has: screen.getByTestId('auth-setup-rejection') }).textContent();
+    expect(rejectionNotice).toContain(`${scriptText.setup.scriptOrigin}: `);
+    expect(rejectionNotice).toContain(AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_SERVICE_ORIGIN_NOT_APPROVED);
+    // テストの準備: 手動のログインで観察し直した形（承認している Origin への送信先）を、保存の部品で直接保存する。
+    const current = (await authSetupPageOf(SCRIPT_PROFILE));
+    expect(await saveAuthSetupRequestInStore(root, {
+      setup: {
+        ...current.stored?.setup,
+        profileRevision: current.profile.revision,
+        scriptLogin: { origin: OTHER_SERVICE_ORIGIN, path: TOKEN_PATH, requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+        loginSideRequests: [{ origin: OTHER_SERVICE_ORIGIN, path: SIDE_PATH, method: 'POST', maxPerLoginStage: SIDE_COUNT }],
+      },
+    })).toMatchObject({ ok: true });
     expect((await authSetupPageOf(SCRIPT_PROFILE)).stored?.setup).toMatchObject({ scriptLogin: { origin: OTHER_SERVICE_ORIGIN } });
   }, SCENARIO_TIMEOUT_MS);
 
@@ -396,24 +485,27 @@ describe('T34d: the version 3 auth setup screen (the script login)', () => {
     };
     expect(await valueOf('saveAuthSetupFn', 'POST', { setup: legacy })).toMatchObject({ ok: false });
     expect((await authSetupPageOf(LEGACY_PROFILE)).stored).toBeNull();
-    // 同じ項目の版 3（フォームの送信）は保存でき、画面はフォームの送信のまま開く。
+    // 同じ項目の版 3（フォームの送信）は保存でき（テストの準備。送信先は観察から入る）、画面はフォームの送信のまま開く（送信先は読むだけ）。
     const current = { ...legacy, schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3, loginTransport: 'FORM_NAVIGATION', scriptLogin: null, loginSideRequests: [], successStorageKey: null };
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: current })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: current })).toMatchObject({ ok: true });
     const page = await openAuthSetup(LEGACY_PROFILE);
-    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.FORM_NAVIGATION.label }).isChecked()).toBe(true);
-    expect(await field(page, authText.loginPostEndpoints).inputValue()).toBe(`${TEST_ORIGIN}/login`);
+    // PL-4: 送り方とフォームの送信先は出さない（保存の後の設定が、そのままであることで確かめる）。
+    expect(await page.getByTestId('auth-setup-destination-transport').count()).toBe(0);
+    expect(await page.getByTestId('auth-setup-destination-post-endpoints').count()).toBe(0);
+    expect(await field(page, authText.loginPostEndpoints).count()).toBe(0);
     await saveSetup(page);
     await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
     expect((await authSetupPageOf(LEGACY_PROFILE)).stored?.setup).toEqual(current);
   }, SCENARIO_TIMEOUT_MS);
 
+  // MI-F5: 必須の query は画面で手で入れないので、秘密に見える名前の query は、画面の保存の Server Function へ直接送って確かめる（検証が先に拒む）。
   it('rejects a secret-like query name, and the value is in no Server Function response nor in the control data', async () => {
+    const stored = await authSetupPageOf(SCRIPT_PROFILE);
+    const setup = stored.stored?.setup ?? {};
+    expect(await valueOf('saveAuthSetupFn', 'POST', {
+      setup: { ...setup, scriptLogin: { origin: OTHER_SERVICE_ORIGIN, path: TOKEN_PATH, requiredQuery: [{ name: 'client_secret', value: SECRET_MARKER }] } },
+    })).toMatchObject({ ok: false, reason: 'AUTH_SETUP_INVALID', errors: expect.arrayContaining([{ code: 'AUTH_SETUP_SECRET_LIKE_VALUE', field: 'requiredQuery', line: 1 }]) });
     const page = await openAuthSetup(SCRIPT_PROFILE);
-    await field(page, rowLabel(1, scriptText.setup.queryName)).fill('client_secret');
-    await field(page, rowLabel(1, scriptText.setup.queryValue)).fill(SECRET_MARKER);
-    await saveSetup(page);
-    await expectGroupError(page, 'auth-setup-required-query',
-      `${authText.lineText('1')}: ${AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_SECRET_LIKE_VALUE}`);
     await authSetupPageOf(SCRIPT_PROFILE);
     await expect.poll(() => responseBodies.length, { timeout: UI_TIMEOUT_MS }).toBeGreaterThan(0);
     expect(responseBodies.filter((body) => body.includes(SECRET_MARKER))).toEqual([]);
@@ -426,7 +518,8 @@ describe('T34d: the version 3 auth setup screen (the script login)', () => {
 describe('T34e: the requests blocked in the login stage on the job detail', () => {
   it('shows the table of the blocked requests, the counts, the hidden path, the unlisted requests and the guidance', async () => {
     const configPath = `config/targets/${JOB_PROFILE}.json`;
-    expect(await valueOf('createProfileFn', 'POST', { profile: profileDocumentOf(JOB_PROFILE, configPath, 1, [SERVICE_ORIGIN]) })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 1）: 承認したサービスの Origin は、画面の作成の口では受けない。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(rootOf().root, profileDocumentOf(JOB_PROFILE, configPath, 1, [SERVICE_ORIGIN]))).toMatchObject({ ok: true });
     const summary: AuditJobLoginStageSummary = {
       scriptLogin: {
         tokenRequestsAllowed: 1,
@@ -460,6 +553,8 @@ describe('T34e: the requests blocked in the login stage on the job detail', () =
     }
 
     const page = await openPage(`/jobs/${JOB_ID}`);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: ログインの段の記録は、たたんだ詳しい内容の中。開いてから確かめる。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const panel = page.getByTestId('job-login-stage');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     const text = LOCAL_UI_LOGIN_STAGE_TEXT;
@@ -475,13 +570,13 @@ describe('T34e: the requests blocked in the login stage on the job detail', () =
     const rows = await table.locator('tbody tr').evaluateAll((elements) =>
       elements.map((element) => [...element.querySelectorAll('td')].map((cell) => cell.textContent ?? '')));
     expect(rows).toEqual([
-      [SERVICE_ORIGIN, '/rest/v1/rpc/log_login', 'fetch', LOGIN_STAGE_BLOCK_REASON_LABELS.UNREGISTERED_NON_READ, formatTimes(3),
+      [SERVICE_ORIGIN, '/rest/v1/rpc/log_login', REQUEST_RESOURCE_TYPE_LABELS.fetch, LOGIN_STAGE_BLOCK_REASON_LABELS.UNREGISTERED_NON_READ, formatTimes(3),
         // FM-1（意図して直した期待。手動の操作を減らす設計書 2.1）: 「登録する」はその場で保存するボタンになり、下書きのリンクは「認証の設定の画面で直す」。
         observedText.noQuery, `${observedText.register}${observedText.registerSideRequest}${LOCAL_UI_LOGIN_STAGE_REGISTER_TEXT.editDraft}`],
-      [SERVICE_ORIGIN, TOKEN_PATH, 'fetch', LOGIN_STAGE_BLOCK_REASON_LABELS.TOKEN_REQUEST_QUERY_MISMATCH, formatTimes(1),
+      [SERVICE_ORIGIN, TOKEN_PATH, REQUEST_RESOURCE_TYPE_LABELS.fetch, LOGIN_STAGE_BLOCK_REASON_LABELS.TOKEN_REQUEST_QUERY_MISMATCH, formatTimes(1),
         observedText.noQuery, observedText.manualAlreadyRegistered],
       // 値に見える区切りを伏せた path は、伏せた旨を添える（登録の案は作らない）。
-      [SERVICE_ORIGIN, `/session/${REDACTED_PATH_SEGMENT}${text.redactedPathNote}`, 'document', LOGIN_STAGE_BLOCK_REASON_LABELS.UNREGISTERED_NON_READ,
+      [SERVICE_ORIGIN, `/session/${REDACTED_PATH_SEGMENT}${text.redactedPathNote}`, REQUEST_RESOURCE_TYPE_LABELS.document, LOGIN_STAGE_BLOCK_REASON_LABELS.UNREGISTERED_NON_READ,
         formatTimes(1), observedText.noQuery, observedText.manualRedactedPath],
     ]);
     expect(await panel.getByTestId('job-login-stage-unlisted').textContent()).toBe(text.unlisted(formatCount(1)));
@@ -555,10 +650,11 @@ describe('T35d: the audit stage items of the script login setup', () => {
     expect((await authSetupPageOf(SCRIPT_PROFILE)).stored?.updatedAt).toBe(before);
   }, SCENARIO_TIMEOUT_MS);
 
+  // MI-F5: 認証の設定があるときは送り方を読むだけなので、フォームの送信の設定のプロファイル（版 2 の場面の後）で確かめる。
   it('does not show the audit stage items for the form navigation', async () => {
-    const page = await openAuthSetup(SCRIPT_PROFILE);
-    await page.getByTestId('auth-setup-audit-reads').waitFor({ timeout: UI_TIMEOUT_MS });
-    await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.FORM_NAVIGATION.label }).check();
+    const page = await openAuthSetup(LEGACY_PROFILE);
+    // PL-4: 送り方は出さない（フォームの送信の設定であることは、保存した設定で確かめる）。
+    expect((await authSetupPageOf(LEGACY_PROFILE)).stored?.setup).toMatchObject({ loginTransport: 'FORM_NAVIGATION' });
     expect(await page.getByTestId('auth-setup-audit-reads').count()).toBe(0);
     expect(await field(page, auditText.perMinute).count()).toBe(0);
     expect(await field(page, auditText.perRun).count()).toBe(0);
@@ -568,24 +664,24 @@ describe('T35d: the audit stage items of the script login setup', () => {
 describe('T36a: the login transport of an automated login profile', () => {
   it('lets an automated login profile choose the script login, and saves it as version 3 with the automated login settings', async () => {
     const configPath = `config/targets/${AUTO_PROFILE}.json`;
-    const profile = { ...profileDocumentOf(AUTO_PROFILE, configPath, 1, [SERVICE_ORIGIN]), auth: 'AUTOMATED_LOGIN' };
-    expect(await valueOf('createProfileFn', 'POST', { profile })).toMatchObject({ ok: true });
+    // MI-C2 項目 16・MI-F1（設計書 4.7.1 の 1・2）: 承認したサービスの Origin つきのプロファイルと、自動ログインのプロファイルは、画面の作成・編集の口では
+    // 作れない（Origin は手動のログインの観察が足し、自動ログインへは切り替えだけで入る）。テストの準備は、手動のログインのプロファイルを保存の部品で作り
+    // （承認したサービスの Origin は、手動のログインの観察の代わりにテストが入れる）、保存の部品で自動ログインに更新する（Origin は足さない）。
+    expect(await createProfileInStore(rootOf().root, profileDocumentOf(AUTO_PROFILE, configPath, 1, [SERVICE_ORIGIN]))).toMatchObject({ ok: true });
+    const profile = { ...profileDocumentOf(AUTO_PROFILE, configPath, 2, [SERVICE_ORIGIN]), auth: 'AUTOMATED_LOGIN' };
+    expect(await updateProfileInStore(rootOf().root, profile, 1)).toMatchObject({ ok: true });
     const page = await openAuthSetup(AUTO_PROFILE);
-    // 自動ログインの欄と、ログインの送り方の欄の両方がある（既定はフォームの送信）。
+    // 自動ログインの欄と、ログインの送り方の欄の両方がある。PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8）: 入口の確かめの案がないので、
+    // 既定はスクリプトの送信（送信先のない形）。token の送信先と必須の query は、読むだけ（手で入れない）。
     await page.getByTestId('auth-setup-automated').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('auth-setup-transport').count()).toBe(1);
-    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.FORM_NAVIGATION.label }).isChecked()).toBe(true);
-    await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).check();
+    expect(await page.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
     await page.getByTestId('auth-setup-script').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await field(page, authText.loginPostEndpoints).count()).toBe(0);
+    expect(await page.locator('[name="scriptOrigin"], [name="scriptPath"]').count()).toBe(0);
 
     await field(page, authText.loginStartUrl).fill(`${TEST_ORIGIN}/login`);
     await field(page, authText.successPathPrefix).fill(ADMIN_PATH);
-    await field(page, scriptText.setup.scriptOrigin).selectOption(SERVICE_ORIGIN);
-    await field(page, scriptText.setup.scriptPath).fill(TOKEN_PATH);
-    await page.getByRole('button', { name: scriptText.setup.addQuery }).click();
-    await field(page, rowLabel(1, scriptText.setup.queryName)).fill('grant_type');
-    await field(page, rowLabel(1, scriptText.setup.queryValue)).fill('password');
     await field(page, scriptText.setup.storageOrigin).selectOption(TEST_ORIGIN);
     await field(page, scriptText.setup.storagePrefix).fill('app-');
     await field(page, scriptText.setup.storageSuffix).fill('-auth-token');
@@ -593,8 +689,39 @@ describe('T36a: the login transport of an automated login profile', () => {
     await field(page, authText.passwordSelector).fill('#password');
     await field(page, authText.submitSelector).fill('#login');
     await screenshot(page, 'e02-auth-setup-automated-script');
+    // 設定のない自動ログインのプロファイル（MI より前の形）の画面の最初の保存は、自動ログインに要る token の送信先がないので、検証が拒む（何も保存しない。
+    // token の送信先は観察からだけ入る）。
     await saveSetup(page);
-    await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await page.getByTestId('auth-setup-rejection').getAttribute('data-reason')).toBe('AUTH_SETUP_INVALID');
+    expect(await page.getByText(AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS.AUTH_SETUP_SCRIPT_LOGIN_REQUIRED).count()).toBeGreaterThan(0);
+    expect((await authSetupPageOf(AUTO_PROFILE)).stored).toBeNull();
+
+    // テストの準備: 切り替えの後の形の設定（自動ログインの設定を持つ版 3 のスクリプトの送信）を、保存の部品で直接保存する。
+    const observed = {
+      schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
+      profileId: AUTO_PROFILE,
+      profileRevision: 2,
+      loginStartUrl: `${TEST_ORIGIN}/login`,
+      loginPostEndpoints: [],
+      successCondition: { pathPrefix: ADMIN_PATH, selector: null },
+      sessionLostCondition: { pathPrefix: null },
+      excludedPaths: [],
+      auditPathPrefixes: [],
+      maxLoginAttempts: 1,
+      allowedIdpOrigins: [],
+      automatedLogin: {
+        usernameSelector: '#email', passwordSelector: '#password', submitSelector: '#login',
+        failureConditions: { invalidCredentials: null, accountLocked: null, mfaRequired: null, credentialExpired: null },
+      },
+      loginTransport: 'SCRIPT_REQUEST',
+      scriptLogin: { origin: SERVICE_ORIGIN, path: TOKEN_PATH, requiredQuery: [{ name: 'grant_type', value: 'password' }] },
+      loginSideRequests: [],
+      successStorageKey: { origin: TEST_ORIGIN, prefix: 'app-', suffix: '-auth-token' },
+    };
+    // MI-F5（設計書 4.7.1 の 6）: 手で入れた送信先（前は欄で入れた値）の最初の保存は、画面の保存の Server Function でも拒む（設定のない自動ログインのプロファイルを含む）。
+    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: observed })).toMatchObject({ ok: false, reason: 'CREDENTIAL_DESTINATION_OBSERVED_ONLY' });
+    expect((await authSetupPageOf(AUTO_PROFILE)).stored).toBeNull();
+    expect(await saveAuthSetupRequestInStore(root, { setup: observed })).toMatchObject({ ok: true });
 
     expect((await authSetupPageOf(AUTO_PROFILE)).stored?.setup).toMatchObject({
       schemaVersion: AUTH_SETUP_SCHEMA_VERSION_3,
@@ -606,6 +733,9 @@ describe('T36a: the login transport of an automated login profile', () => {
       automatedLogin: { usernameSelector: '#email', passwordSelector: '#password', submitSelector: '#login' },
     });
     const reopened = await openAuthSetup(AUTO_PROFILE);
-    expect(await reopened.getByRole('radio', { name: LOGIN_TRANSPORT_CATALOG.SCRIPT_REQUEST.label }).isChecked()).toBe(true);
+    // MI-F5・PL-4: 認証の設定があるときは、送り方と自動ログインのセレクタも変えられないので出さない（値は上の保存した設定で確かめた）。
+    expect(await reopened.getByTestId('auth-setup-destination-transport').count()).toBe(0);
+    expect(await reopened.getByTestId('auth-setup-destination-password-selector').count()).toBe(0);
+    expect(await reopened.locator('input[name="passwordSelector"]').count()).toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 });

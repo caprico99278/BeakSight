@@ -115,13 +115,21 @@ async function waitForPost(since: number): Promise<void> {
 /**
  * T30R-fix-1（DEF-103）: 書き込みの段の書き込みの画面の GET（`since` から 2 件目の書き込みの画面の GET。1 件目は画面の確かめ）が届くまで待つ。
  */
-async function waitForWriteStageFormGet(since: number): Promise<void> {
-  const deadline = Date.now() + POST_WAIT_LIMIT_MS;
+async function waitForWriteStageFormGet(since: number, jobId: string): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + POST_WAIT_LIMIT_MS;
   const formGets = (): number => harness.site.requests.slice(since)
     .filter(({ method, path }) => method === 'GET' && path === WRITE_SITE_PATHS.form).length;
   while (formGets() < WRITE_STAGE_FORM_GET_ORDINAL) {
     if (Date.now() > deadline) {
-      throw new Error('the form GET of the write stage did not arrive');
+      // DEF-183: 待ちの超過の回の記録（届いた要求の method と path、ジョブの状態、待った時間）。値は出さない。
+      const job = harness.manager.getAuditJob(jobId);
+      throw new Error(`the form GET of the write stage did not arrive: ${JSON.stringify({
+        waitedMs: Date.now() - startedAt,
+        formGets: formGets(),
+        requests: harness.site.requests.slice(since).map(({ method, path }) => `${method} ${path}`),
+        job: job === null ? null : { state: job.state, failureReason: job.failureReason, endKind: job.endKind },
+      })}`);
     }
     await wait(WAIT_POLL_MS);
   }
@@ -315,7 +323,13 @@ describe('T30h-1: the G30 conditions end to end with the real worker', () => {
       at: harness.nowText(),
     }).ok).toBe(true);
     const recheckJob = await harness.waitForEnd(recheck.jobId);
-    expect(recheckJob).toMatchObject({ state: 'FAILED', failureReason: 'WRITE_GRANT_REJECTED' });
+    // DEF-183: 失敗の回の記録（届いた POST の数、確かめ直しの往復の数、書き込みの結果）。
+    expect(recheckJob, JSON.stringify({
+      posts: harness.createPosts(recheck.since).length,
+      rechecks: harness.workerMessages().filter((message) => message.type === 'WRITE_RECHECK_REQUEST').length,
+      writeResult: (({ submission, result, reservationState, blockReason }) => ({ submission, result, reservationState, blockReason }))(
+        readWriteResult(harness.database, recheck.jobId) ?? { submission: null, result: null, reservationState: null, blockReason: null }),
+    })).toMatchObject({ state: 'FAILED', failureReason: 'WRITE_GRANT_REJECTED' });
     expect(readWriteResult(harness.database, recheck.jobId)).toMatchObject({ submission: 'NOT_SENT', result: 'BLOCKED', reservationState: 'RELEASED' });
     expect(harness.workerMessages().filter((message) => message.type === 'WRITE_RECHECK_REQUEST').length).toBeGreaterThan(0);
     expect(harness.createPosts(recheck.since)).toEqual([]);
@@ -330,7 +344,7 @@ describe('T30h-1: the G30 conditions end to end with the real worker', () => {
     for (const [scenario, grantId, stop] of [[S.lateStop, 'g-late-stop', true], [S.lateRecheck, 'g-late-recheck', false]] as const) {
       advance();
       const started = await harness.issueAndStart(scenario.scenarioId, grantId);
-      await waitForWriteStageFormGet(started.since);
+      await waitForWriteStageFormGet(started.since, started.jobId);
       expect(revokeScenarioApproval(harness.database, {
         scenarioId: scenario.scenarioId, expectedRevision: readScenario(harness.database, scenario.scenarioId)?.revision ?? 0,
         receiptId: `revoke-${grantId}`, at: harness.nowText(),

@@ -3,7 +3,8 @@
 // 管理データでの部品の振る舞いをまとめた（前の版からの上げと前の版の文の固定は捨てた。CHECK の値の一覧が名前つきの一覧と等しいことは
 // `control-store-base-schema.test.ts`）。
 // - 承認に結ばれるプロファイルの文書と改訂とは別に持ち、切り替えてもプロファイルの改訂を変えない。行がなければ既定（ジョブのブラウザを表示する・
-//   監査の段は読み取りだけ）。
+//   監査の段は削除のほかを通す。OP-I の I1。設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.5）。
+// - OP-I: 表示だけの保存で行を作るときも、扱いは列の既定（`READ_ONLY`）に頼らず、サイトの既定（`PASS_EXCEPT_DELETE`）を明示して書く。
 // - 監査の段の送信の扱いの列（`audit_send_policy`）は、`AUDIT_SEND_POLICIES` の値だけ。保存の口は、扱いを渡さなければ今の値を変えない。
 // 一時のフォルダだけを使い、終わったら消す。
 import { DatabaseSync } from 'node:sqlite';
@@ -41,12 +42,12 @@ describe('Control store: the display settings of a profile', () => {
   it('reads the default (show the job browser) without a row, saves and reads it, and does not change the profile revision', () => {
     withDatabase((database) => {
       expect(createProfile(database, publicProfile(PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
-      const readOnly = { auditSendPolicy: 'READ_ONLY' } as const;
-      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, ...readOnly });
-      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false })).toEqual({ ok: true, settings: { showJobBrowser: false, ...readOnly } });
-      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: false, ...readOnly });
-      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: true })).toEqual({ ok: true, settings: { showJobBrowser: true, ...readOnly } });
-      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, ...readOnly });
+      const siteDefault = { auditSendPolicy: 'PASS_EXCEPT_DELETE' } as const;
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, ...siteDefault });
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false })).toEqual({ ok: true, settings: { showJobBrowser: false, ...siteDefault } });
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: false, ...siteDefault });
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: true })).toEqual({ ok: true, settings: { showJobBrowser: true, ...siteDefault } });
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, ...siteDefault });
       const stored = getProfile(database, PROFILE_ID);
       expect(stored?.profile.revision).toBe(MIN_PROFILE_REVISION);
       const revisions = new DatabaseSync(workspace.databasePath(), { timeout: RAW_TIMEOUT_MS, readOnly: true });
@@ -63,7 +64,7 @@ describe('Control store: the display settings of a profile', () => {
       expect(saveProfileDisplaySettings(database, 'no-such-profile', { showJobBrowser: false })).toEqual({ ok: false, reason: 'PROFILE_NOT_FOUND' });
       expect(createProfile(database, publicProfile(PROFILE_ID, MIN_PROFILE_REVISION), { resolveContext: resolveTestContext }).ok).toBe(true);
       expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: 'no' as unknown as boolean })).toEqual({ ok: false, reason: 'SETTINGS_INVALID' });
-      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, auditSendPolicy: 'READ_ONLY' });
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
     });
   });
 });
@@ -82,14 +83,20 @@ describe('Control store: the audit send policy of a profile', () => {
     });
   });
 
-  it('reads READ_ONLY without a row, saves and reads it back, keeps it when only the display is saved, and rejects another value', () => {
+  it('reads PASS_EXCEPT_DELETE without a row, writes it explicitly when only the display is saved, keeps a stored value, and rejects another value', () => {
     workspace.latestConnection([PROFILE_ID]).close();
     withDatabase((database) => {
-      expect(DEFAULT_PROFILE_DISPLAY_SETTINGS).toEqual({ showJobBrowser: true, auditSendPolicy: 'READ_ONLY' });
-      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, auditSendPolicy: 'READ_ONLY' });
-      // 表示だけを保存した行も、扱いは読み取りだけ。
+      // OP-I（I1）: サイトの既定は、削除のほかを通す。
+      expect(DEFAULT_PROFILE_DISPLAY_SETTINGS).toEqual({ showJobBrowser: true, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+      expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: true, auditSendPolicy: 'PASS_EXCEPT_DELETE' });
+      // 表示だけを保存して作った行も、扱いはサイトの既定（列の既定の `READ_ONLY` にしない）。
       expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false }))
+        .toEqual({ ok: true, settings: { showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' } });
+      // 人が選んだ読み取りだけは、その後の表示だけの保存で変わらない。
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'READ_ONLY' }))
         .toEqual({ ok: true, settings: { showJobBrowser: false, auditSendPolicy: 'READ_ONLY' } });
+      expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: true }))
+        .toEqual({ ok: true, settings: { showJobBrowser: true, auditSendPolicy: 'READ_ONLY' } });
       expect(saveProfileDisplaySettings(database, PROFILE_ID, { showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' }))
         .toEqual({ ok: true, settings: { showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' } });
       expect(readProfileDisplaySettings(database, PROFILE_ID)).toEqual({ showJobBrowser: false, auditSendPolicy: 'PASS_EXCEPT_DELETE' });

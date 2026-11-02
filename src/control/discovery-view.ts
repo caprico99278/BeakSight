@@ -41,6 +41,8 @@ export {
   DISCOVERY_END_REASONS,
   DISCOVERY_UNREAD_REASONS,
   discoveryCandidatesOf,
+  // OP-2 の修正の 1 回目（判断 2）: 一覧の行の名前（読んだ画面の見出し → 題）。
+  discoveryPageScreenNameOf,
   discoverySummaryOf,
   mergeDiscoveryCandidates,
 } from '../discovery/discovery-result.js';

@@ -1,10 +1,24 @@
 {
   "$id": "urn:beaksight:schema:control:ui-profile-create:1",
-  "description": "Local UI Server Function input: create a profile. The profile document itself is validated by validateSiteProfile. T43b: with newTargetSite, the server first creates local/targets/<profileId>.json (checked by src/config/target-config-draft.ts and validateConfig) and the profile points to it.",
+  "description": "Local UI Server Function input: create a profile. The profile document itself is validated by validateSiteProfile. T43b: with newTargetSite, the server first creates local/targets/<profileId>.json (checked by src/config/target-config-draft.ts and validateConfig) and the profile points to it. MI-C: targetChoice says explicitly how the target configuration is chosen. AUTO: the server uses the one existing file whose site.allowedOrigins has the origin of newTargetSite.startUrl and whose site.startUrl is the same URL after the crawl normalization; it stops when the files of that origin start elsewhere or when two or more match, and creates a new file when no file has that origin. NEW: the server always creates a new file from newTargetSite. EXISTING (also when targetChoice is left out): the profile uses profile.targetConfigPath, and newTargetSite is not accepted. profile.targetConfigPath is not read for AUTO and NEW. When profile has no profileId, approvedTestOrigins or environmentEvidenceRef, the server decides it (the name from the start URL, the test origins from the allowed origins of the file, the unverified isolation reference of the saving day).",
   "type": "object",
   "additionalProperties": false,
   "required": ["profile"],
+  "oneOf": [
+    {
+      "required": ["targetChoice", "newTargetSite"],
+      "properties": { "targetChoice": { "const": "AUTO" }, "newTargetSite": true }
+    },
+    {
+      "required": ["targetChoice", "newTargetSite"],
+      "properties": { "targetChoice": { "const": "NEW" }, "newTargetSite": true }
+    },
+    {
+      "properties": { "targetChoice": { "const": "EXISTING" }, "newTargetSite": false }
+    }
+  ],
   "properties": {
+    "targetChoice": { "type": "string" },
     "profile": { "type": "object" },
     "newTargetSite": {
       "type": "object",

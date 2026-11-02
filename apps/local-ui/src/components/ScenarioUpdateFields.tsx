@@ -51,6 +51,14 @@ const unboundTemplatesOf = (view: ScenarioUpdateFormView, ledgerId: string): Rea
 const ROLE_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set(['SCENARIO_UPDATE_NO_CHANGED_FIELD']);
 /** UPDATE の指定の入力の近くに出す、欄に結び付かない誤り（フォームの上のお知らせには出さない）。 */
 export const UPDATE_PLACED_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set([...LEDGER_REASONS, ...TEMPLATE_REASONS, ...ROLE_REASONS]);
+/** OP-3: 詳しい内容に置いた欄（作ったデータの一覧とアドレスの形）の誤り（拒まれたら、詳しい内容を開く）。 */
+export const UPDATE_DETAILS_REASONS: ReadonlySet<ScenarioDraftRejectionReason> = new Set([...LEDGER_REASONS, ...TEMPLATE_REASONS]);
+
+/**
+ * OP-3（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D12、`2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 欄の置き場所。`MAIN` は要点の中の
+ * 欄の役割（変える・保つ）だけ。`DETAILS` は詳しい内容の中の、作ったデータの一覧、アドレスの形（データの ID の区切り）、役割のない欄の名前。
+ */
+export type ScenarioUpdateFieldsPart = 'MAIN' | 'DETAILS';
 
 /** メールアドレスと電話番号の欄の型（既定で保つことを、欄の近くで知らせる。ユーザーの判断 3。PRE42-CC 組 UI-K2: 一覧は core から読む）。 */
 const CONTACT_FIELD_TYPES: ReadonlySet<CandidateFieldType> = new Set(CONTACT_CANDIDATE_FIELD_TYPES);
@@ -127,7 +135,8 @@ export const updateDraftOf = (
 const descriptionsOf = (errors: readonly ScenarioErrorView[]): readonly string[] =>
   [...new Set(errors.map((error) => SCENARIO_DRAFT_REJECTION_DESCRIPTIONS[error.code].description))];
 
-export function ScenarioUpdateFields({ candidate, view, state, onChange, errors, describeField }: Readonly<{
+export function ScenarioUpdateFields({ part, candidate, view, state, onChange, errors, describeField }: Readonly<{
+  part: ScenarioUpdateFieldsPart;
   candidate: ScenarioCandidateView;
   view: ScenarioUpdateFormView;
   state: ScenarioUpdateState;
@@ -152,9 +161,47 @@ export function ScenarioUpdateFields({ candidate, view, state, onChange, errors,
     changeNames: change ? [...state.changeNames.filter((current) => current !== name), name] : state.changeNames.filter((current) => current !== name),
   });
 
+  if (part === 'MAIN') {
+    return (
+      <fieldset className="field-group" data-testid="scenario-update">
+        <legend className="field-group-heading">{text.heading}</legend>
+        <fieldset className="field-group" data-testid="scenario-update-roles">
+          <legend className="field-group-heading">{text.rolesHeading}</legend>
+          <p className="field-hint">{text.rolesNote}</p>
+          {roleErrors.length === 0 ? null : <p className="field-error" data-testid="scenario-update-roles-errors">{roleErrors.join(' ')}</p>}
+          {roleFields.map((field) => {
+            const change = state.changeNames.includes(field.name);
+            const fieldErrors = descriptionsOf(errors.filter((error) => error.fieldName === field.name));
+            return (
+              <fieldset key={field.name} className="field" data-testid="scenario-update-role" data-field-name={field.name}
+                data-role={change ? 'CHANGE' : 'KEEP'} data-rejection={field.rejection ?? ''}>
+                <legend><code>{field.name}</code></legend>
+                <span className="field-hint">{describeField(field)}</span>
+                <label className="choice">
+                  <input type="radio" name={`role-${field.name}`} value="CHANGE" checked={change} disabled={field.rejection !== null}
+                    aria-invalid={fieldErrors.length > 0} onChange={() => setRole(field.name, true)} />
+                  <span>{text.roleChange}</span>
+                </label>
+                <label className="choice">
+                  <input type="radio" name={`role-${field.name}`} value="KEEP" checked={!change} aria-invalid={fieldErrors.length > 0}
+                    onChange={() => setRole(field.name, false)} />
+                  <span>{text.roleKeep}</span>
+                </label>
+                {field.rejection === null ? null : (
+                  <span className="field-hint" data-testid="scenario-update-role-blocked">{SCENARIO_DRAFT_REJECTION_DESCRIPTIONS[field.rejection].description}</span>
+                )}
+                {CONTACT_FIELD_TYPES.has(field.type) ? <span className="field-hint" data-testid="scenario-update-contact-hint">{text.contactFieldHint}</span> : null}
+                {fieldErrors.length === 0 ? null : <span className="field-error">{fieldErrors.join(' ')}</span>}
+              </fieldset>
+            );
+          })}
+        </fieldset>
+      </fieldset>
+    );
+  }
+
   return (
-    <fieldset className="field-group" data-testid="scenario-update">
-      <legend className="field-group-heading">{text.heading}</legend>
+    <div className="field-group" data-testid="scenario-update-details">
       <p className="field-hint">{text.note}</p>
 
       {view.ledgerOptions.length === 0 ? <p data-testid="scenario-update-no-ledger">{text.noLedger}</p> : null}
@@ -209,38 +256,6 @@ export function ScenarioUpdateFields({ candidate, view, state, onChange, errors,
         )}
       </fieldset>
 
-      <fieldset className="field-group" data-testid="scenario-update-roles">
-        <legend className="field-group-heading">{text.rolesHeading}</legend>
-        <p className="field-hint">{text.rolesNote}</p>
-        {roleErrors.length === 0 ? null : <p className="field-error" data-testid="scenario-update-roles-errors">{roleErrors.join(' ')}</p>}
-        {roleFields.map((field) => {
-          const change = state.changeNames.includes(field.name);
-          const fieldErrors = descriptionsOf(errors.filter((error) => error.fieldName === field.name));
-          return (
-            <fieldset key={field.name} className="field" data-testid="scenario-update-role" data-field-name={field.name}
-              data-role={change ? 'CHANGE' : 'KEEP'} data-rejection={field.rejection ?? ''}>
-              <legend><code>{field.name}</code></legend>
-              <span className="field-hint">{describeField(field)}</span>
-              <label className="choice">
-                <input type="radio" name={`role-${field.name}`} value="CHANGE" checked={change} disabled={field.rejection !== null}
-                  aria-invalid={fieldErrors.length > 0} onChange={() => setRole(field.name, true)} />
-                <span>{text.roleChange}</span>
-              </label>
-              <label className="choice">
-                <input type="radio" name={`role-${field.name}`} value="KEEP" checked={!change} aria-invalid={fieldErrors.length > 0}
-                  onChange={() => setRole(field.name, false)} />
-                <span>{text.roleKeep}</span>
-              </label>
-              {field.rejection === null ? null : (
-                <span className="field-hint" data-testid="scenario-update-role-blocked">{SCENARIO_DRAFT_REJECTION_DESCRIPTIONS[field.rejection].description}</span>
-              )}
-              {CONTACT_FIELD_TYPES.has(field.type) ? <span className="field-hint" data-testid="scenario-update-contact-hint">{text.contactFieldHint}</span> : null}
-              {fieldErrors.length === 0 ? null : <span className="field-error">{fieldErrors.join(' ')}</span>}
-            </fieldset>
-          );
-        })}
-      </fieldset>
-
       <div className="field-group" data-testid="scenario-update-other-fields">
         <h3 className="field-group-heading">{text.otherFieldsHeading}</h3>
         <p className="field-hint">{text.otherFieldsNote}</p>
@@ -254,6 +269,6 @@ export function ScenarioUpdateFields({ candidate, view, state, onChange, errors,
           </ul>
         )}
       </div>
-    </fieldset>
+    </div>
   );
 }

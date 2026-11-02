@@ -63,7 +63,7 @@ export const verifiedCreateDocuments = (): ActionReportDocuments => {
       attempt: 0,
     },
     submittedValues: { name: 'サンプル 太郎', email: 'sample0001@example.invalid' },
-    resultConditions: { successCondition: { pathPrefix: '/members/', selector: '.registered' }, inputErrorCondition: { pathPrefix: '/members/new', selector: null } },
+    resultJudgement: 'FORM_STRUCTURE',
     submission: 'SENT',
     blockReason: null,
     httpStatus: 200,
@@ -237,7 +237,7 @@ export const verifiedApiCreateDocuments = (): ActionReportDocuments => {
   const base = verifiedCreateDocuments();
   const api = sampleApiSummary();
   return {
-    actionRun: { ...base.actionRun, resultConditions: null, httpStatus: 201, transport: 'API', api },
+    actionRun: { ...base.actionRun, resultJudgement: null, httpStatus: 201, transport: 'API', api },
     evidence: {
       ...base.evidence,
       submission: { ...base.evidence.submission, actionPath: SAMPLE_API_PATH },
@@ -254,7 +254,7 @@ export const blockedApiDocuments = (): ActionReportDocuments => {
   const base = blockedDocuments();
   const api = sampleApiSummary({ pageKeyValues: null });
   return {
-    actionRun: { ...base.actionRun, resultConditions: null, transport: 'API', api },
+    actionRun: { ...base.actionRun, resultJudgement: null, transport: 'API', api },
     evidence: { ...base.evidence, transport: 'API', api },
     approvalSummary: base.approvalSummary,
   };
@@ -268,7 +268,7 @@ export const verifiedApiUpdateDocuments = (): ActionReportDocuments => {
   const base = verifiedUpdateDocuments();
   const api = sampleApiSummary({ method: 'PATCH', keyNames: ['name'], recordIdKey: null, pageKeyValues: {} });
   return {
-    actionRun: { ...base.actionRun, resultConditions: null, transport: 'API', api },
+    actionRun: { ...base.actionRun, resultJudgement: null, transport: 'API', api },
     evidence: {
       ...base.evidence,
       submission: { ...base.evidence.submission, actionPath: SAMPLE_API_PATH },

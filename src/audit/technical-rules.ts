@@ -16,7 +16,7 @@ import type { FindingFingerprintIdentityField } from '../core/ids.js';
 import { compareCodeUnits, normalizeWhitespace } from '../core/text.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import { listText } from '../presentation/messages.js';
-import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
+import type { AuditRule, FindingDraft, PageRuleInput, RulePlainMessageOwner } from './rule.js';
 import {
   CLIENT_ERROR_HTTP_STATUS_RANGE,
   SERVER_ERROR_HTTP_STATUS_RANGE,
@@ -60,7 +60,7 @@ interface Detection {
   readonly identityFields: readonly FindingFingerprintIdentityField[];
 }
 
-interface TechnicalRuleSpec {
+interface TechnicalRuleSpec extends RulePlainMessageOwner {
   readonly ruleId: string;
   readonly category: FindingCategory;
   readonly severity: Severity;
@@ -72,6 +72,7 @@ const defineRule = (spec: TechnicalRuleSpec): AuditRule => ({
   version: INITIAL_RULE_VERSION,
   category: spec.category,
   severity: spec.severity,
+  plainMessage: spec.plainMessage,
   evaluate: (input: PageRuleInput): readonly FindingDraft[] =>
     spec.detect(input).map((detection): FindingDraft => ({
       ruleId: spec.ruleId,
@@ -142,6 +143,7 @@ const HTTP_4XX = defineRule({
   ruleId: 'HTTP_4XX',
   category: 'HTTP',
   severity: 'ERROR',
+  plainMessage: 'このページを開くと、ページが見つからないなどの知らせが出て、中身が表示されません。',
   detect: (input) => detectMainFrameStatus(input, CLIENT_ERROR_HTTP_STATUS_RANGE),
 });
 
@@ -149,6 +151,7 @@ const HTTP_5XX = defineRule({
   ruleId: 'HTTP_5XX',
   category: 'HTTP',
   severity: 'ERROR',
+  plainMessage: 'このページを開くと、サイトの側の不具合で、中身が表示されません。',
   detect: (input) => detectMainFrameStatus(input, SERVER_ERROR_HTTP_STATUS_RANGE),
 });
 
@@ -196,6 +199,7 @@ const REDIRECT_LOOP = defineRule({
   ruleId: 'REDIRECT_LOOP',
   category: 'HTTP',
   severity: 'ERROR',
+  plainMessage: 'このページを開くと、別のページへの移動がぐるぐる繰り返され、いつまでも表示されません。',
   detect: (input) => {
     const groups = new DetectionGroups<Readonly<{ firstUrl: string; length: number }>>();
     for (const record of evidenceOfType(input, 'network')) {
@@ -220,6 +224,7 @@ const EMPTY_HTTP_RESPONSE = defineRule({
   ruleId: 'EMPTY_HTTP_RESPONSE',
   category: 'HTTP',
   severity: 'ERROR',
+  plainMessage: 'このページを開いても、中身が空のまま届き、何も表示されません。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'network')) {
@@ -262,6 +267,7 @@ const INVALID_INTERNAL_URL = defineRule({
   ruleId: 'INVALID_INTERNAL_URL',
   category: 'LINK',
   severity: 'WARN',
+  plainMessage: '行き先の書き方が正しくないリンクがあります。押しても、目当てのページへ移れないことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'link')) {
@@ -283,6 +289,7 @@ const UNSUPPORTED_URL_SCHEME = defineRule({
   ruleId: 'UNSUPPORTED_URL_SCHEME',
   category: 'LINK',
   severity: 'INFO',
+  plainMessage: 'ふつうのページではないもの（ほかのアプリなど）を開くリンクがあります。見る人の環境によっては、押しても何も起きないことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'link')) {
@@ -338,6 +345,7 @@ const RESOURCE_4XX = defineRule({
   ruleId: 'RESOURCE_4XX',
   category: 'RESOURCE',
   severity: 'ERROR',
+  plainMessage: 'ページの中で使う部品（画像や見た目の設定など）の一部が見つかりません。ページが正しく表示されないことがあります。',
   detect: (input) => detectResourceStatus(input, CLIENT_ERROR_HTTP_STATUS_RANGE),
 });
 
@@ -345,6 +353,7 @@ const RESOURCE_5XX = defineRule({
   ruleId: 'RESOURCE_5XX',
   category: 'RESOURCE',
   severity: 'ERROR',
+  plainMessage: 'ページの中で使う部品の一部が、サイトの側の不具合で届きません。ページが正しく表示されないことがあります。',
   detect: (input) => detectResourceStatus(input, SERVER_ERROR_HTTP_STATUS_RANGE),
 });
 
@@ -368,6 +377,7 @@ const SCRIPT_LOAD_FAILED = defineRule({
   ruleId: 'SCRIPT_LOAD_FAILED',
   category: 'RESOURCE',
   severity: 'ERROR',
+  plainMessage: 'ページの動きを作るプログラムを読み込めませんでした。ボタンなどが動かないことがあります。',
   detect: (input) => detectLoadFailures(input, SCRIPT_RESOURCE_TYPE, 'script'),
 });
 
@@ -375,6 +385,7 @@ const STYLESHEET_LOAD_FAILED = defineRule({
   ruleId: 'STYLESHEET_LOAD_FAILED',
   category: 'RESOURCE',
   severity: 'ERROR',
+  plainMessage: 'ページの見た目を整える設定を読み込めませんでした。文字や配置がくずれて見えることがあります。',
   detect: (input) => detectLoadFailures(input, STYLESHEET_RESOURCE_TYPE, 'stylesheet'),
 });
 
@@ -382,6 +393,7 @@ const IMAGE_LOAD_FAILED = defineRule({
   ruleId: 'IMAGE_LOAD_FAILED',
   category: 'RESOURCE',
   severity: 'ERROR',
+  plainMessage: '読み込めない画像があります。見る人には、その画像が表示されません。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'network')) {
@@ -423,6 +435,7 @@ const PAGE_ERROR = defineRule({
   ruleId: 'PAGE_ERROR',
   category: 'JAVASCRIPT',
   severity: 'ERROR',
+  plainMessage: 'ページのプログラムが、途中で止まりました。ボタンや表示の一部が動かないことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<Readonly<{ name: string; message: string; stack: string }>>();
     for (const record of evidenceOfType(input, 'console')) {
@@ -472,6 +485,7 @@ const MISSING_TITLE = defineRule({
   ruleId: 'MISSING_TITLE',
   category: 'DOM',
   severity: 'WARN',
+  plainMessage: 'ページの題名がありません。ブラウザーのタブや検索の結果に、何のページかが出ません。',
   detect: (input) => detectPerDom(input, (dom) => (dom.title === null ? '<title> 要素がありません。' : null)),
 });
 
@@ -479,6 +493,7 @@ const EMPTY_TITLE = defineRule({
   ruleId: 'EMPTY_TITLE',
   category: 'DOM',
   severity: 'WARN',
+  plainMessage: 'ページの題名が空です。ブラウザーのタブや検索の結果に、何のページかが出ません。',
   detect: (input) => detectPerDom(input, (dom) => (
     dom.title !== null && isBlank(dom.title) ? '<title> 要素の内容が、空か空白だけです。' : null
   )),
@@ -488,6 +503,7 @@ const MISSING_HTML_LANG = defineRule({
   ruleId: 'MISSING_HTML_LANG',
   category: 'DOM',
   severity: 'WARN',
+  plainMessage: 'ページの言語の指定がないため、読み上げのソフトが正しく読めないことがあります。',
   detect: (input) => detectPerDom(input, (dom) => {
     if (dom.lang === null) {
       return '<html> 要素に lang 属性がありません。';
@@ -501,6 +517,7 @@ const EMPTY_VISIBLE_CONTENT = defineRule({
   ruleId: 'EMPTY_VISIBLE_CONTENT',
   category: 'DOM',
   severity: 'ERROR',
+  plainMessage: 'ページに、読める文字が何もありません。見る人には、何もないページに見えることがあります。',
   detect: (input) => detectPerDom(input, (dom) => (
     !dom.visibleText.nodeLimitReached && isBlank(dom.visibleText.text)
       ? 'ページの body に、可視のテキストがありません（テキストの走査は、ノード数の上限に達する前に終わっています）。'
@@ -512,6 +529,7 @@ const DUPLICATE_ELEMENT_ID = defineRule({
   ruleId: 'DUPLICATE_ELEMENT_ID',
   category: 'DOM',
   severity: 'WARN',
+  plainMessage: 'ページの中で、部品につける名前が重なっています。読み上げのソフトやページの動きが、ちがう部品を指してしまうことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<number>();
     for (const record of evidenceOfType(input, 'dom')) {
@@ -534,6 +552,7 @@ const INVALID_CANONICAL_URL = defineRule({
   ruleId: 'INVALID_CANONICAL_URL',
   category: 'DOM',
   severity: 'WARN',
+  plainMessage: 'このページが検索のサイトに伝える、代表のページの書き方が正しくありません。検索の結果に、正しく出ないことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'dom')) {
@@ -562,6 +581,7 @@ const FORM_WITHOUT_ACTION = defineRule({
   ruleId: 'FORM_WITHOUT_ACTION',
   category: 'FORM',
   severity: 'INFO',
+  plainMessage: '入力の欄のまとまりに、送り先の指定がありません。送るボタンを押しても、思ったとおりに送られないことがあります。',
   detect: (input) => {
     const groups = new DetectionGroups<string>();
     for (const record of evidenceOfType(input, 'dom')) {
@@ -592,6 +612,7 @@ const UNLABELED_REQUIRED_CONTROL = defineRule({
   ruleId: 'UNLABELED_REQUIRED_CONTROL',
   category: 'FORM',
   severity: 'WARN',
+  plainMessage: '必ず入れる入力の欄に、何を入れるかの名前がついていません。読み上げのソフトを使う人には、何を入れる欄かが分かりません。',
   detect: (input) => {
     const groups = new DetectionGroups<Readonly<{ location: string; type: string; name: string }>>();
     const addFields = (

@@ -15,7 +15,7 @@
 import { MAX_URL_LENGTH } from '../core/limits.js';
 import { hasUrlFragment } from '../core/url-fragment.js';
 import { isWindowsReservedDeviceName } from '../core/windows-reserved-names.js';
-import { canonicalHttpOriginOf, hasUrlCredentials, isHttpProtocol, isOriginInAllowedOrigins } from '../crawl/normalize-url.js';
+import { canonicalHttpOriginOf, hasUrlCredentials, isHttpProtocol, isOriginInAllowedOrigins, normalizeUrl } from '../crawl/normalize-url.js';
 import { DEFAULT_CONFIG } from './defaults.js';
 import type { AuditConfig } from './types.js';
 
@@ -173,6 +173,19 @@ export const startUrlHostnameOf = (raw: string): string | undefined => acceptedS
 
 /** 開始の URL の path（認証の設定の監査の path と成功の画面の path の案）。受けない開始の URL では `undefined`。 */
 export const startUrlPathOf = (raw: string): string | undefined => acceptedStartUrlOf(raw)?.pathname;
+
+/**
+ * MI-C（MI-1 の報告。設計者の判断）: 設定のファイルの開始の URL が、入れた開始の URL `raw` と同じか。比べる形は、監査の開始が開始の URL を読むときと同じ
+ * 正規化（`normalizeUrl` と、そのファイルの `crawl.allowedQueryParameters`。`run-coordinator.ts`・`entry-check-run.ts` と同じ呼び方）。入れた値の前後の
+ * 空白は除く（貼り付けの空白）。どちらかが正規化できなければ、同じとしない。画面のサーバの作成の自動の選び方（既にあるファイルを使うか）が使う。
+ */
+export const startsAtSameUrl = (config: Pick<AuditConfig, 'site'> & { readonly crawl: Pick<AuditConfig['crawl'], 'allowedQueryParameters'> }, raw: string): boolean => {
+  const allowedQueryParameters: ReadonlySet<string> = new Set(config.crawl.allowedQueryParameters);
+  const fileStart = normalizeUrl(config.site.startUrl, config.site.startUrl, allowedQueryParameters);
+  const entered = trimmedOf(raw);
+  const enteredStart = normalizeUrl(entered, entered, allowedQueryParameters);
+  return fileStart.ok && enteredStart.ok && fileStart.url === enteredStart.url;
+};
 
 /** 許可 Origin の誤り（受けるなら `null`）。値は 1 つずつ、http(s) の Origin の正規の形でなければならない。 */
 export const allowedOriginsProblemOf = (origins: readonly string[], startUrl: string): TargetSiteProblem | null => {

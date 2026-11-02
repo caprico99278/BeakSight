@@ -25,14 +25,19 @@ import { missingVerificationItemsOf } from '../approval/scenario-policy.js';
 import {
   API_SCENARIO_TRANSPORT,
   UPDATE_SCENARIO_KIND,
+  isFormRecordIdSpec,
   scenarioTransportOf,
   type ScenarioRevision,
   type ScenarioTransport,
   type VerificationExpectation,
 } from '../approval/scenario-contracts.js';
 import type { SeedRecord } from '../data-rules/scenario-data.js';
+import { isListPageReadTarget } from '../data-rules/varying-values.js';
+import { CREATE_SCENARIO_KIND } from '../../core/scenario-kind.js';
 import type { CandidateLocation, DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
 import {
+  hasGeneratedValueExpectation,
+  readListPagePathOf,
   isReadCheckPageTemplatePath,
   readCheckTargetKindOf,
   type ReadCheckDefinition,
@@ -79,6 +84,11 @@ export interface WriteStartInputs {
    * 保つ鍵ごとの最後に分かっている値（`knownKeptValuesOf`。T41R3-fix-B）を求める。省けば履歴なし（一覧は空）。
    */
   readonly ledgerWrites?: readonly RecordValueWrite[];
+  /**
+   * OP-REV6 の I-1（設計書 4.1.9 の R1）: 実行のたびに違う値になる欄の名前（値の生成の持ち主の判定 `uniqueEachRunFieldNamesOf`。親が入力の規則から求める）。一覧の
+   * 画面の照合の READ は、この欄と比べる期待があるときだけ作る（一覧には前の登録が並ぶため）。省けば空（一覧の画面の指定は作らない）。
+   */
+  readonly uniqueEachRunFieldNames?: readonly string[];
 }
 
 /** 照合の READ の定義を使えない理由（T37d。設計者の判断 5。閉じた一覧。開始を拒む理由 `AUDIT_JOB_START_REJECTION_REASONS` の一部）。 */
@@ -93,13 +103,30 @@ export const WRITE_READ_VERIFICATION_PAGE_TARGET = 'WRITE_READ_VERIFICATION_PAGE
 export const readVerificationTargetRejectionOf = (
   readCheck: Pick<ReadCheckView, 'definition'>,
   transport: ScenarioTransport,
+  apiCreateListPagePath: string | null = null,
 ): typeof WRITE_READ_VERIFICATION_PAGE_TARGET | null => {
   const { definition } = readCheck;
   if (readCheckTargetKindOf(definition) !== 'PAGE') {
     return null;
   }
-  return transport === API_SCENARIO_TRANSPORT && isReadCheckPageTemplatePath(definition.targetPagePath ?? '') ? null : WRITE_READ_VERIFICATION_PAGE_TARGET;
+  return transport === API_SCENARIO_TRANSPORT && isApiVerificationPagePath(definition.targetPagePath ?? '', apiCreateListPagePath)
+    ? null
+    : WRITE_READ_VERIFICATION_PAGE_TARGET;
 };
+
+/**
+ * OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録のシナリオの、照合の READ に使える一覧の画面の
+ * path（登録の画面の 1 つ上。唯一の判定 `readListPagePathOf`）。API の登録でない・決められないときは null（一覧の画面の定義は使わない）。
+ */
+export const apiCreateReadListPagePathOf = (
+  scenario: Pick<ScenarioRevision, 'kind' | 'transport'>,
+  evidence: Pick<DiscoveryCandidate, 'page'>,
+): string | null =>
+  (scenarioTransportOf(scenario) === API_SCENARIO_TRANSPORT && scenario.kind === CREATE_SCENARIO_KIND ? readListPagePathOf(evidence.page.path) : null);
+
+/** API のシナリオの照合の READ に使える画面の path か（`{id}` の型か、OP-R: API の登録の一覧の画面）。 */
+const isApiVerificationPagePath = (path: string, apiCreateListPagePath: string | null): boolean =>
+  isReadCheckPageTemplatePath(path) || (apiCreateListPagePath !== null && path === apiCreateListPagePath);
 
 /** 生成した値（送らない値と、ない値は null）。 */
 const valueOf = (values: Readonly<Record<string, string | null>>, fieldName: string): string | null =>
@@ -129,7 +156,7 @@ const expectationOf = (expectation: VerificationExpectation, values: Readonly<Re
  */
 export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | WorkerStartApiWrite | null => {
   const { scenario, evidence, readCheck, values } = inputs;
-  const { successCondition, inputErrorCondition, recordId, readVerification } = scenario.verification;
+  const { resultJudgement, recordId, readVerification } = scenario.verification;
   const targetRecordId = inputs.targetRecordId ?? null;
   const transport = scenarioTransportOf(scenario);
   // T41b: 対象の ID を持つのは、form の UPDATE の指定を持つ版と、API の更新（台帳の参照は API の指定）。
@@ -155,10 +182,18 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
   // T37d（設計者の判断 5）: 画面の path の定義は、書き込みの照合に使わない（作らない。呼び出し側は開始の前に `readVerificationTargetRejectionOf` で拒む）。
   // T40a: API のシナリオに限って、`{id}` の型の画面の path の定義を使う（送る値なし。`{id}` はワーカーが取った登録の ID）。
   const { targetIdentityDigest, targetPagePath } = readCheck.definition;
+  // OP-R（R1）: API の登録は、登録の画面の 1 つ上の一覧の画面の定義も使う（送る値なし。読むのはワーカーが GET 1 回）。
   const target = targetIdentityDigest !== undefined
     ? { targetIdentityDigest }
-    : transport === API_SCENARIO_TRANSPORT && targetPagePath !== undefined && isReadCheckPageTemplatePath(targetPagePath) ? { targetPagePath } : null;
+    : transport === API_SCENARIO_TRANSPORT && targetPagePath !== undefined
+      && isApiVerificationPagePath(targetPagePath, apiCreateReadListPagePathOf(scenario, evidence)) ? { targetPagePath } : null;
   if (target === null) {
+    return null;
+  }
+  // OP-REV6 の I-1: 一覧の画面は、実行のたびに違う値になる欄と比べる期待があるときだけ（判定は許可の発行と同じ部品の述語）。
+  const unique = new Set(inputs.uniqueEachRunFieldNames ?? []);
+  if (isListPageReadTarget(targetPagePath) && targetIdentityDigest === undefined
+    && !hasGeneratedValueExpectation(readVerification.expectations, (expectation) => 'fieldName' in expectation && unique.has(expectation.fieldName))) {
     return null;
   }
   const bound: WorkerStartReadCheck = {
@@ -201,8 +236,9 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
       submitterIdentityDigest: scenario.candidate.identityDigest,
       api,
       values: { ...values },
-      // T40a-fix: 成否の条件と入力の誤りの条件は使わない（null）。ID の取り方は検証の指定のもの（API の `recordId` があれば null でもよい）。
-      verification: { successCondition: null, inputErrorCondition: null, recordId },
+      // T40a-fix: 結果は応答の状態で決める（PL-6a: 結果の判定のしかたの印は null）。ID の取り方は検証の指定のもの（API の `recordId` があれば null でもよい。
+      // form の ID の型の一覧は、API のシナリオの下書きの確かめが拒むので持たない。型のために確かめ直す）。
+      verification: { resultJudgement: null, recordId: isFormRecordIdSpec(recordId) ? null : recordId },
       readVerification: bound,
       approvalFacts: inputs.approvalFacts,
       // T41R2-fix-B・T41R3-fix-B（Task 41 の設計書 8 章の「T41R3」の C-3、ユーザーの判断「API の更新だけ台帳と比べる」）: 保つ鍵ごとの、台帳の値の履歴で
@@ -215,9 +251,11 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
       }),
     };
   }
-  // T38b: form の要求の形がないシナリオは、form の書き込みの指定を作らない。form は 4 項目がそろっている（上の判定。型のために確かめ直す）。
+  // T38b: form の要求の形がないシナリオは、form の書き込みの指定を作らない。form は 3 項目がそろっている（上の判定。型のために確かめ直す）。PL-6a: form の
+  // ID の取り方は ID の型の一覧だけ（前の文書の取り方は、結果の判定のしかたの印がないので上の判定で止まる）。PL-5 の 9 の (4)（設計書 8.1）: 決められなかった
+  // ID の取り方（null）は、そのまま null で載せる（ワーカーは ID を取らず、結果は ID なしの `PARTIAL`）。
   const { request } = scenario;
-  if (request === null || successCondition === null || inputErrorCondition === null || recordId === null) {
+  if (request === null || resultJudgement === null || (recordId !== null && !isFormRecordIdSpec(recordId))) {
     return null;
   }
   const common = {
@@ -229,7 +267,7 @@ export const writeStartSpecOf = (inputs: WriteStartInputs): WorkerStartWrite | W
     candidate: { identityDigest: scenario.candidate.identityDigest, ruleDigest: scenario.candidate.ruleDigest },
     candidateFields: evidence.fields.map(({ name, type, readonly, hidden, disabled }) => ({ name, type, readonly, hidden, disabled })),
     values: { ...values },
-    verification: { successCondition, inputErrorCondition, recordId },
+    verification: { resultJudgement, recordId },
     readVerification: bound,
     approvalFacts: inputs.approvalFacts,
   };

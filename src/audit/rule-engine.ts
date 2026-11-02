@@ -19,7 +19,7 @@ import { deepFreeze } from '../core/immutable.js';
 import { MAX_ERROR_MESSAGE_LENGTH } from '../core/limits.js';
 import { compareCodeUnits } from '../core/text.js';
 import type { AuditRule, FindingDraft, PageRuleInput } from './rule.js';
-import { RULE_CATALOG, freezeCatalog } from './rule-catalog.js';
+import { RULE_CATALOG, freezeCatalog, isFindingRuleIdOf } from './rule-catalog.js';
 import { distinctSorted } from './rule-helpers.js';
 
 /**
@@ -234,16 +234,13 @@ const includes = <T extends string>(values: readonly T[], value: unknown): value
 
 /** 下書きの ruleId が、返した Rule の ruleId の決まり（`AuditRule` の説明）に合うことを検査する。 */
 const assertDraftRuleIdBelongsToOwner = (ruleId: string, owner: FindingDraftOwner): void => {
-  const prefix = owner.ruleIdPrefix;
-  if (prefix === undefined) {
-    if (ruleId !== owner.ruleId) {
-      throw new Error(`finding draft rule id ${ruleId} does not match the rule id ${owner.ruleId}`);
-    }
+  if (isFindingRuleIdOf(owner, ruleId)) {
     return;
   }
-  if (!ruleId.startsWith(prefix) || ruleId.length <= prefix.length) {
-    throw new Error(`finding draft rule id ${ruleId} must start with and be longer than the rule id prefix ${prefix}`);
-  }
+  const prefix = owner.ruleIdPrefix;
+  throw new Error(prefix === undefined
+    ? `finding draft rule id ${ruleId} does not match the rule id ${owner.ruleId}`
+    : `finding draft rule id ${ruleId} must start with and be longer than the rule id prefix ${prefix}`);
 };
 
 /**

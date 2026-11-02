@@ -214,6 +214,7 @@ describe('the kinds of Safety events (design 6.1.10)', () => {
 // R6（中断した Run の再開の設計書 4.8 の「表示」）: 実行（起動）の終わり方の表示カタログ。HTML レポートの「実行の記録」の表は、
 // このカタログのラベル、説明、色のトーンで示す。新しい終わり方は、core の一覧とこのカタログに加えるだけで表示される。
 describe('the end reasons of a run execution (resumable run design 4.8)', () => {
+  // PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 5 章）: 画面と共有の説明を、画面の言葉（監査 → 点検 など）にそろえた。
   it('gives every end reason its Japanese label and description, in the order of the design', () => {
     expect(RUN_EXECUTION_END_REASON_CATALOG).toEqual({
       COMPLETED: { label: '最後まで実行', order: 1, tone: 'positive', description: '最後の処理まで行いました。' },
@@ -221,7 +222,7 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         label: '実行時間の上限で停止',
         order: 2,
         tone: 'caution',
-        description: '1回の起動の実行時間の上限に達したため、残りのページを監査せずに止めました。',
+        description: '1 回の点検で使える時間の上限に届いたため、残りのページは点検せずに止めました。',
       },
       STOPPED_BY_SIGNAL: {
         label: '中断の指示で停止',
@@ -233,14 +234,14 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         label: '安全のため停止',
         order: 4,
         tone: 'shield',
-        description: '安全の不変条件の違反を検出したため、それより後の監査を始めませんでした。',
+        description: '安全の決まりに反することを見つけたため、それより後の点検を始めませんでした。',
       },
       // SU1（サイトが応答しないときに Run を止める設計書 3.4）: サイトの不調で止まった。core の一覧の並び（違反で止まった後）に合わせる。
       STOPPED_BY_SITE_UNAVAILABLE: {
         label: 'サイトの不調で停止',
         order: 5,
         tone: 'caution',
-        description: 'サイトが応答しない（時間切れ、接続の失敗、503 などの応答）ため、残りのページを監査せずに止めました。',
+        description: 'サイトが応答しない（時間切れ、つながらない、混み合っているという返事など）ため、残りのページは点検せずに止めました。',
       },
       INTERRUPTED_ABNORMALLY: {
         label: '途中で終了',
@@ -254,14 +255,14 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
         label: 'ログインの切れで停止',
         order: 7,
         tone: 'caution',
-        description: 'ログインの状態が切れた（ログインの画面に移った）ため、そのページを監査せず、残りのページも監査せずに止めました。',
+        description: 'ログインが切れた（ログインの画面に移った）ため、そのページも残りのページも点検せずに止めました。',
       },
       // T35c（Task 35 の設計書 3.4）: 承認したサービスの Origin への要求の上限に届いて止まった。core の一覧の並び（最後）に合わせる。
       STOPPED_BY_SERVICE_REQUEST_LIMIT: {
-        label: 'API の要求の上限で停止',
+        label: '外のサイトへの通信の上限で停止',
         order: 8,
         tone: 'caution',
-        description: '承認したサービスの Origin（API など）への要求の上限に届いたため、残りのページを監査せずに止めました。1 分あたりの上限なら、再開すると続きを監査します。Run の全体の上限に届いたときは、再開してもすぐに止まります。',
+        description: 'ログインのときに通ってよい外のサイトへの通信の上限に届いたため、残りのページは点検せずに止めました。1 分あたりの上限なら、続きから再開すると残りを点検します。1 回の点検の全体の上限に届いたときは、再開してもすぐに止まります。',
       },
     });
     expect(sortByDisplayOrder(RUN_EXECUTION_END_REASONS, RUN_EXECUTION_END_REASON_CATALOG)).toEqual([...RUN_EXECUTION_END_REASONS]);
@@ -283,13 +284,15 @@ describe('the end reasons of a run execution (resumable run design 4.8)', () => 
 
 describe('report sections', () => {
   it('lists the report sections in the order of the design (6.1.4)', () => {
+    // PL-R（plain-ui の設計書 14 章）: 冒頭はまとめ、技術の記録は末尾。
     expect(sortByDisplayOrder(REPORT_SECTIONS, REPORT_SECTION_CATALOG)).toEqual([
-      'SUMMARY',
+      'OVERVIEW',
       'CRITICAL_FINDINGS',
       'CATEGORY_FINDINGS',
       'INTERACTIONS',
       'SAFETY',
       'PAGES',
+      'RECORD',
     ]);
   });
 
@@ -318,7 +321,8 @@ describe('report sections', () => {
     expect(FINDING_CATEGORY_CATALOG.RESOURCE.section).toBe('NETWORK');
     expect(FINDING_CATEGORY_CATALOG.JAVASCRIPT.section).toBe('JAVASCRIPT');
     expect(FINDING_CATEGORY_CATALOG.LINK.section).toBe('LINKS');
-    expect(REPORT_CATEGORY_SECTION_CATALOG.NETWORK.label).toBe('ネットワーク');
+    // PL-R（plain UI の設計書 14 章、5 章）: 報告だけの節の名前を、やさしい言葉に元の語を添える形にした。
+    expect(REPORT_CATEGORY_SECTION_CATALOG.NETWORK.label).toBe('通信（ネットワーク）');
     expect(REPORT_CATEGORY_SECTION_CATALOG.LINKS.label).toBe('リンク');
     expect(findingCategoriesInSection('NETWORK')).toEqual(['HTTP', 'RESOURCE']);
   });

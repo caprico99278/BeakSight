@@ -6,6 +6,10 @@
  * - 認証の設定の画面の自動ログインの欄（回数は 1 に固定の表示、条件の重なりの誤りを項目に出す）。
  * - ログインの確かめ（`LOGIN_CHECK`）: 始められない理由（`CREDENTIAL_MISSING`、`AUTO_LOGIN_HELD`、`AUTO_LOGIN_RATE_LIMITED` と次に始められる日時、
  *   `AUTH_STRATEGY_NOT_EXECUTABLE`）、止めた状態と解除（確かめのダイアログ）、成功と失敗の結果の表示（ジョブの種類、結果、送信、人がすること）。
+ *   PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 1、3 章の 1、6 章の最後）: ログインの確かめの画面は、止めた自動ログインを再開する入口として
+ *   要点のパネル（なぜ止まったか、確かめること、主のボタン「確かめたので再開する」）＋詳しい内容 1 つの形にした。ログインだけを試すボタンはなくした（点検の
+ *   最初の自動ログインで兼ねる）。ログインの確かめのジョブは、開始の Server Function（`startLoginCheckFn`）で始めて確かめる。始められない理由は、開始の
+ *   画面の要点に出る。
  * - 監査の開始の画面の自動ログインの案内と上限の状態、環境の状態の画面の暗号化の状態。
  * - 手動のログインのプロファイルでは、資格情報の画面を出さず、直接の要求を拒む。CSRF（cross-site の POST は 403）、スキーマに合わない入力は 400。
  * - 値を出さない: 目印の値（ユーザー名とパスワード）が、ページの HTML（すべての画面）、Server Function の応答（成功と誤り）、画面のサーバの標準出力と
@@ -35,7 +39,8 @@ import {
 import { CONTROL_DATA_DIRECTORY_NAME } from '../../../src/control/store/database-path.js';
 import { temporaryPathFor } from '../../../src/core/temporary-file-name.js';
 import { AUTOMATED_LOGIN_RESULT_CATALOG, CREDENTIAL_ENVIRONMENT_CATALOG } from '../../../src/presentation/catalog.js';
-import { formatCount, formatInteger, formatTimes } from '../../../src/presentation/format.js';
+import { formatCount, formatElapsedTime, formatInteger, formatTimes } from '../../../src/presentation/format.js';
+import { AUTO_LOGIN_DAILY_MAX_ATTEMPTS, AUTO_LOGIN_DAILY_WINDOW_MS, AUTO_LOGIN_MIN_INTERVAL_MS } from '../../../src/control/job/auto-login-limits.js';
 import {
   AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS,
   AUTH_SETUP_VALIDATION_ERROR_DESCRIPTIONS,
@@ -58,8 +63,10 @@ import {
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
 import { nonReadRequestsOf } from '../../../tests/helpers/leak-places.js';
 import { descendantsOf, listProcesses, waitUntilExited, type ProcessIdentity } from '../../../tests/helpers/process-tree.js';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { openAuthSetupAdvancedSettings } from './helpers/auth-setup-page.ts';
 import { MANUAL_LOGIN_STAGE_RECORD, WORKER_RECORD_FILES, installTestAutomatedLoginWorkerEntry } from './helpers/auth-worker.ts';
-import { nextStepStatesOf } from './helpers/next-steps.ts';
+import { profileStageOf } from './helpers/next-steps.ts';
 import {
   createTemporaryUiRoot,
   findFreePort,
@@ -74,7 +81,9 @@ import {
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { filesUnder, leakedPlaces } from './helpers/secret-markers.ts';
+import { createProfileInStore, saveProfileAndAuthSetupInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { axeViolationsOf, primaryButtonLabelsInMain } from './helpers/screen-shape.ts';
 
 const IS_WINDOWS = process.platform === 'win32';
 const SKIP_REASON = 'the credential screen saves with the real DPAPI, which exists only on Windows';
@@ -271,17 +280,20 @@ const waitForJobEnd = async (jobId: string): Promise<JobDetail> => {
   );
 };
 
-/** ログインの確かめの画面から、ログインの確かめを始め（キーボードだけ）、ジョブの画面に移る。ジョブの ID を返す。 */
-const startLoginCheckFromPage = async (page: Page): Promise<string> => {
-  await tabTo(page, page.getByTestId('login-check-start'));
-  await page.keyboard.press('Enter');
-  await page.waitForURL(/\/jobs\/[a-z0-9-]+$/u, { timeout: UI_TIMEOUT_MS });
-  return new URL(page.url()).pathname.split('/').at(-1) ?? '';
+/**
+ * ログインの確かめのジョブ（`LOGIN_CHECK`）を始め、ジョブの画面を開く。ジョブの ID と画面を返す。PL-3（設計書 2 章の判断 1）: ログインの確かめの画面の
+ * ログインだけを試すボタンはなくした（点検の最初の自動ログインで兼ねる）ので、ジョブは開始の Server Function で始める。
+ */
+const startLoginCheckJob = async (profileId: string): Promise<{ readonly jobId: string; readonly page: Page }> => {
+  const startResult = await valueOf<{ ok: boolean; jobId: string }>('startLoginCheckFn', 'POST', { profileId, expectedRevision: FIRST_REVISION });
+  expect(startResult.ok).toBe(true);
+  return { jobId: startResult.jobId, page: await openPage(`/jobs/${startResult.jobId}`) };
 };
 
 /** ジョブの画面で、結果が出るまで待つ（画面は終わるまで読み直す）。 */
 const waitForResultOnPage = async (page: Page, result: string): Promise<void> => {
-  await page.locator(`[data-testid="job-auto-login-result"][data-result="${result}"]`).waitFor({ timeout: JOB_TIMEOUT_MS });
+  // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 成功した自動ログインの結果は、たたんだ詳しい内容の中（失敗はふだんの画面）。
+  await page.locator(`[data-testid="job-auto-login-result"][data-result="${result}"]`).waitFor({ state: 'attached', timeout: JOB_TIMEOUT_MS });
   await page.locator('[data-testid="job-state"]:not([data-state="STARTING"]):not([data-state="RUNNING"]):not([data-state="STOPPING"])')
     .waitFor({ timeout: JOB_TIMEOUT_MS });
   await snapshot(page);
@@ -293,6 +305,13 @@ const field = (page: Page, label: string): Locator => page.getByLabel(label, { e
 
 /** 資格情報の画面の、保存の拒否の理由。 */
 const rejectionReason = (page: Page): Promise<string | null> => page.getByTestId('credential-rejection').getAttribute('data-reason');
+/** PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: ID とパスワードの画面の、閉じた詳しい内容（変える・削除）を開く。 */
+const openCredentialDetails = (page: Page): Promise<void> => openAdvancedSettings(page, 'credential-advanced-settings', UI_TIMEOUT_MS);
+/** PL-4（同 3 章の 2）: 最後の変更の種類と、ログインの Origin が合うか（画面には出さないので、画面の値の Server Function で読む）。 */
+const credentialFactsOf = async (profileId: string): Promise<{ readonly kind: string | null; readonly originMatches: boolean | null }> => {
+  const value = await valueOf<{ credential: { lastChangeKind: string } | null; originMatches: boolean | null }>('getCredentialPageFn', 'GET', { profileId });
+  return { kind: value.credential?.lastChangeKind ?? null, originMatches: value.originMatches };
+};
 
 /** fixture に届いた、GET と HEAD 以外の要求（`<method> <path>`）。 */
 const nonReadRequests = (): readonly string[] => nonReadRequestsOf(site().requests);
@@ -313,11 +332,12 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     const exchange = await rawRequest(server.port, `${server.tokenUrl.pathname}${server.tokenUrl.search}`);
     cookie = parseSetCookie(exchange.headers['set-cookie'])?.pair ?? '';
     for (const profileId of [MAIN_PROFILE, INVALID_PROFILE, SLOW_PROFILE]) {
-      expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(profileId, 'AUTOMATED_LOGIN') })).toMatchObject({ ok: true });
+      // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+      expect(await createProfileInStore(rootOf(), profileDocument(profileId, 'AUTOMATED_LOGIN'))).toMatchObject({ ok: true });
     }
     expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(MANUAL_PROFILE, 'MANUAL_SESSION') })).toMatchObject({ ok: true });
     for (const [profileId, outcome] of [[INVALID_PROFILE, 'success'], [SLOW_PROFILE, 'slow']] as const) {
-      expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(profileId, outcome) })).toMatchObject({ ok: true });
+      expect(await saveAuthSetupRequestInStore(root, { setup: automatedSetupOf(profileId, outcome) })).toMatchObject({ ok: true });
     }
   }, SCENARIO_TIMEOUT_MS);
 
@@ -334,22 +354,28 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     root?.remove();
   }, SCENARIO_TIMEOUT_MS);
 
-  it('shows the encryption state on the environment page, and the login check only for the automated login profiles', async () => {
+  it('shows the encryption state on the environment page, and no login check in the list (decision 1)', async () => {
     const environment = await openPage('/environment');
     const protection = environment.getByTestId('environment-credential-protection');
     expect(await protection.getAttribute('data-state')).toBe('AVAILABLE');
     expect(await protection.textContent()).toBe(CREDENTIAL_ENVIRONMENT_CATALOG.AVAILABLE.label);
     await screenshot(environment, '01-environment');
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 1、4 章の 7）: ログインの確かめは流れから外したので、一覧の行に入口を出さない（前は自動
+    // ログインの行に「ログインを確かめる」があった）。行のボタンは「続ける」だけ。
     const list = await openPage('/');
-    for (const profileId of [MAIN_PROFILE, INVALID_PROFILE, SLOW_PROFILE]) {
-      expect(await list.locator(`tr[data-profile-id="${profileId}"]`).getByRole('link', { name: checkText.profileList.loginCheck }).count()).toBe(1);
+    for (const profileId of [MAIN_PROFILE, INVALID_PROFILE, SLOW_PROFILE, MANUAL_PROFILE]) {
+      const row = list.locator(`tr[data-profile-id="${profileId}"]`);
+      await row.waitFor({ timeout: UI_TIMEOUT_MS });
+      // PL-T: 前の「ログインを確かめる」の語は消した。今の入口の語（自動ログインの再開の画面）でも、一覧の行に出ないこと。
+      expect(await row.getByRole('link', { name: LOCAL_UI_AUTH_TEXT.start.openLoginCheck }).count(), profileId).toBe(0);
+      expect(await row.locator('a[href*="/login-check/"]').count(), profileId).toBe(0);
     }
-    expect(await list.locator(`tr[data-profile-id="${MANUAL_PROFILE}"]`).getByRole('link', { name: checkText.profileList.loginCheck }).count())
-      .toBe(0);
   }, SCENARIO_TIMEOUT_MS);
 
   it('saves the automated login fields of the auth setup, shows the fixed number of attempts, and puts an ambiguity error on its field', async () => {
     const page = await openPage(`/auth-setup/${MAIN_PROFILE}`);
+    // MI-3（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）: 認証の設定の画面の欄は、たたんだ「詳しい設定」の中。開いてから使う。
+    await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
     const setupText = LOCAL_UI_AUTH_TEXT.setup;
     expect(await page.getByTestId('auth-setup-automated').count()).toBe(1);
     expect(await page.locator('select[name="maxLoginAttempts"]').count()).toBe(0);
@@ -358,6 +384,10 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await page.getByTestId('auth-setup-no-secret').textContent()).toBe(setupText.noSecretBodyAutomated);
     const setup = automatedSetupOf(MAIN_PROFILE, 'success');
     const names = setupText.failureConditionNames;
+    // PL-S（設計書 `2026-10-26-beaksight-plain-ui-design.md` 10 章の PL-S の 8 (b)）: 入口の確かめの案がないときの既定の送り方は、送信先のない形（スクリプトの送信）に
+    // なった。この場面はフォームの送信の自動ログインの欄を確かめるので、先にフォームの送信を選ぶ。
+    expect(await page.locator('input[name="loginTransport"][value="SCRIPT_REQUEST"]').isChecked()).toBe(true);
+    await page.locator('input[name="loginTransport"][value="FORM_NAVIGATION"]').check();
     await field(page, setupText.loginStartUrl).fill(String(setup['loginStartUrl']));
     await field(page, setupText.loginPostEndpoints).fill(`${site().originA}${site().authPath('success')}`);
     await field(page, setupText.successPathPrefix).fill(AUTOMATED_LOGIN_FIXTURE_CONDITIONS.success.pathPrefix);
@@ -379,6 +409,33 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await screenshot(page, '02-auth-setup-automated-error');
     await field(page, setupText.failurePathPrefixLabel(names.accountLocked)).fill(AUTOMATED_LOGIN_FIXTURE_CONDITIONS.accountLocked.pathPrefix);
     await field(page, setupText.failureSelectorLabel(names.accountLocked)).fill(AUTOMATED_LOGIN_FIXTURE_CONDITIONS.accountLocked.selector);
+    // MI-F5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7.1 の 6）: 送信先（フォームの送信先、自動ログインのセレクタ）を手で入れた最初の保存は
+    // 拒む（入口の確かめの案がない、設定のない自動ログインのプロファイル。MI より前の形）。
+    await page.getByRole('button', { name: setupText.save }).click();
+    await page.locator('[data-testid="auth-setup-rejection"][data-reason="CREDENTIAL_DESTINATION_OBSERVED_ONLY"]').waitFor({ timeout: UI_TIMEOUT_MS });
+    // テストの準備: 切り替えの後の形の設定を、保存の部品で直接保存する（失敗の条件は、上で直した値と同じ）。
+    const observed = automatedSetupOf(MAIN_PROFILE, 'success');
+    expect(await saveAuthSetupRequestInStore(root, {
+      setup: {
+        ...observed,
+        automatedLogin: {
+          ...(observed['automatedLogin'] as Record<string, unknown>),
+          failureConditions: {
+            invalidCredentials: AUTOMATED_LOGIN_FIXTURE_CONDITIONS.invalidCredentials,
+            accountLocked: AUTOMATED_LOGIN_FIXTURE_CONDITIONS.accountLocked,
+            mfaRequired: null,
+            credentialExpired: null,
+          },
+        },
+      },
+    })).toMatchObject({ ok: true });
+    // 送信先でない欄（ここでは何も変えない）の保存は受ける。認証の設定があるときは、送信先とセレクタは読むだけ。
+    await page.reload();
+    await openAuthSetupAdvancedSettings(page, UI_TIMEOUT_MS);
+    // PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 3。前は読むだけの値で出していた）: 変えられない送信先とセレクタは出さない（値は下の保存の後の
+    // 設定で確かめる）。
+    expect(await page.getByTestId('auth-setup-destination-username-selector').count()).toBe(0);
+    expect(await page.locator('input[name="usernameSelector"]').count()).toBe(0);
     await page.getByRole('button', { name: setupText.save }).click();
     await page.getByTestId('auth-setup-saved').waitFor({ timeout: UI_TIMEOUT_MS });
     await snapshot(page);
@@ -403,24 +460,33 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     });
   }, SCENARIO_TIMEOUT_MS);
 
-  it('shows CREDENTIAL_MISSING on the login check screen and the automated guidance on the start screen, without a start button', async () => {
+  it('shows the not-held summary on the login check screen, and CREDENTIAL_MISSING with the automated guidance on the start screen, without a start button', async () => {
+    // PL-3（3 章の 1、6 章の最後）: 止めていないときの要点と、主のボタン「点検を始める」（開始の画面へ）。ログインだけを試すボタンはない。
     const check = await openPage(`/login-check/${MAIN_PROFILE}`);
-    expect(await check.getByTestId('login-check-guidance').textContent()).toBe(checkText.guidance);
-    expect(await check.getByTestId('start-reason').getAttribute('data-reason')).toBe('CREDENTIAL_MISSING');
+    expect(await check.getByTestId('login-check-summary').getAttribute('data-state')).toBe('notHeld');
+    expect(await check.getByTestId('login-check-not-held').textContent()).toBe(checkText.summary.notHeld);
     expect(await check.getByTestId('login-check-start').count()).toBe(0);
-    expect(await check.getByTestId('start-open-credentials').count()).toBe(1);
-    await screenshot(check, '03-login-check-credential-missing');
+    expect(await primaryButtonLabelsInMain(check)).toEqual([LOCAL_UI_AUDIT_TEXT.start.submit]);
+    expect(await check.getByTestId('login-check-open-start').getAttribute('href')).toBe(`/start/${MAIN_PROFILE}`);
+    expect(await axeViolationsOf(check)).toEqual([]);
+    await screenshot(check, '03-login-check-not-held');
+    // 始められない理由（ID とパスワードがない）と直す道は、開始の画面の要点に出る。
     const start = await openPage(`/start/${MAIN_PROFILE}`);
-    expect(await start.getByTestId('start-login-guidance').textContent()).toBe(LOCAL_UI_AUTH_TEXT.start.automatedGuidance);
+    // OP-G（設計書 4.1.4 の E3）: 表示の設定の既定は、作業中のブラウザを画面に出す。案内の文は、それに合わせる。
+    expect(await start.getByTestId('start-login-guidance').textContent()).toBe(LOCAL_UI_AUTH_TEXT.start.automatedGuidanceBrowserShown);
     expect(await start.getByTestId('start-auto-login-limit').getAttribute('data-state')).toBe('ready');
     expect(await start.getByTestId('start-reason').getAttribute('data-reason')).toBe('CREDENTIAL_MISSING');
+    expect(await start.getByTestId('start-open-credentials').count()).toBe(1);
     expect(await start.getByRole('button', { name: LOCAL_UI_AUDIT_TEXT.start.submit }).count()).toBe(0);
     await screenshot(start, '04-start-automated');
   }, SCENARIO_TIMEOUT_MS);
 
   it('registers the credential with the keyboard only, after rejecting a mismatched password, and never shows the values', async () => {
     const profile = await openPage(`/profiles/${MAIN_PROFILE}`);
-    await tabTo(profile, profile.getByTestId('profile-credentials').getByRole('link', { name: credentialText.profileDetail.open }));
+    // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: ID とパスワードがまだないので、サイトの画面の要点の主のボタンは「ID とパスワードの画面を
+    // 開く」（前は資格情報の欄のリンク）。
+    expect(await profileStageOf(profile, UI_TIMEOUT_MS)).toBe('CREDENTIAL_FIX');
+    await tabTo(profile, profile.getByTestId('profile-summary').getByRole('link', { name: credentialText.profileDetail.open }));
     await profile.keyboard.press('Enter');
     await profile.waitForURL(new RegExp(`/credentials/${MAIN_PROFILE}$`, 'u'), { timeout: UI_TIMEOUT_MS });
     const page = profile;
@@ -428,7 +494,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await snapshot(page);
     expect(await page.getByTestId('credential-test-account-only').textContent()).toBe(credentialText.testAccountOnlyBody);
     expect(await page.getByTestId('credential-saved').getAttribute('data-saved')).toBe('no');
-    expect(await page.getByTestId('credential-protection').getAttribute('data-state')).toBe('AVAILABLE');
+    // PL-4（設計書 3 章の 2）: 暗号化の行は出さない（使えないときだけ、知らせを出す）。
+    expect(await page.getByTestId('credential-protection').count()).toBe(0);
+    expect(await page.getByTestId('credential-unavailable').count()).toBe(0);
     const username = field(page, credentialText.username);
     const password = field(page, credentialText.password);
     const confirmation = field(page, credentialText.passwordConfirmation);
@@ -477,30 +545,36 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await page.getByTestId('credential-done').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('credential-done').getAttribute('data-notice')).toBe('registered');
     expect(await page.getByTestId('credential-saved').getAttribute('data-saved')).toBe('yes');
-    expect(await page.getByTestId('credential-last-change').getAttribute('data-kind')).toBe('CREATED');
-    expect(await page.getByTestId('credential-origin-state').getAttribute('data-state')).toBe('ok');
-    expect(await page.getByTestId('credential-hold').getAttribute('data-held')).toBe('no');
+    // PL-4（設計書 3 章の 2）: 最後の変更の種類・ログインの Origin の一致は画面に出さない（記録は画面の値にある）。止めていないときは、停止の行を出さない。
+    expect(await credentialFactsOf(MAIN_PROFILE)).toEqual({ kind: 'CREATED', originMatches: true });
+    expect(await page.getByTestId('credential-hold').count()).toBe(0);
     // 止めていないときは、変更の画面に停止の解除の選択を出さない。
     expect(await page.locator('input[name="clearHold"]').count()).toBe(0);
-    // T43a: 登録の後に、次の手順（ログインの確かめ）と「次にすること」へのリンク。
-    const nextLinks = page.getByTestId('next-step-links');
-    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.actions.LOGIN_CHECK }).getAttribute('href'))
-      .toBe(`/login-check/${MAIN_PROFILE}`);
-    expect(await nextLinks.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.after.openOverview }).getAttribute('href'))
-      .toBe(`/profiles/${MAIN_PROFILE}#next-steps`);
+    // T43a: 登録の後に、次の手順と「次にすること」へのリンク。PL-1（判断 1。前はログインの確かめ）: 次の手順は「点検を始める」（点検の最初の自動ログインが、
+    // ログインの確かめを兼ねる）。ログインの確かめの画面への入口は出さない。
+    // PL-4（設計書 3 章の 1・3。前は次の手順のリンクの区画と「次にすること」へのリンク）: 登録の後は、要点の主のボタン「点検を始める」だけ（行き先の重なりを出さない）。
+    expect(await page.getByTestId('next-step-links').count()).toBe(0);
+    expect(await primaryButtonLabelsInMain(page)).toEqual([LOCAL_UI_NEXT_STEP_TEXT.actions.AUDIT_START]);
+    expect(await page.getByTestId('credential-summary').getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.actions.AUDIT_START }).getAttribute('href'))
+      .toBe(`/start/${MAIN_PROFILE}`);
+    expect(await page.locator(`main a[href="/login-check/${MAIN_PROFILE}"]`).count()).toBe(0);
     await snapshot(page);
     await screenshot(page, '07-credentials-registered');
   }, SCENARIO_TIMEOUT_MS);
 
   it('checks the login (LOGIN_CHECK): the success result, the job kind, then AUTO_LOGIN_RATE_LIMITED with the next allowed time', async () => {
-    const list = await openPage('/');
-    await tabTo(list, list.locator(`tr[data-profile-id="${MAIN_PROFILE}"]`).getByRole('link', { name: checkText.profileList.loginCheck }));
-    await list.keyboard.press('Enter');
-    await list.waitForURL(new RegExp(`/login-check/${MAIN_PROFILE}$`, 'u'), { timeout: UI_TIMEOUT_MS });
-    await list.getByTestId('login-check-start').waitFor({ timeout: UI_TIMEOUT_MS });
-    await screenshot(list, '08-login-check-ready');
+    // PL-1（判断 1。前は一覧の行の「ログインを確かめる」から開いた）: 一覧の行は「続ける」だけで、ログインの確かめの画面へは行かない。画面は、止めた自動ログインを
+    // 解く入口として残るので、直接開く。
+    const rows = await openPage('/');
+    const row = rows.locator(`tr[data-profile-id="${MAIN_PROFILE}"]`);
+    await row.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await row.locator('a[href*="/login-check/"]').count()).toBe(0);
+    const check = await openPage(`/login-check/${MAIN_PROFILE}`);
+    await check.getByTestId('login-check-not-held').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await check.getByTestId('login-check-start').count()).toBe(0);
+    await screenshot(check, '08-login-check-not-held');
     const postsBefore = nonReadRequests().length;
-    const jobId = await startLoginCheckFromPage(list);
+    const { jobId, page: list } = await startLoginCheckJob(MAIN_PROFILE);
     await waitForResultOnPage(list, 'SUCCEEDED');
     expect(await list.getByTestId('job-kind').getAttribute('data-kind')).toBe('LOGIN_CHECK');
     expect(await list.getByTestId('job-auto-login-submitted').getAttribute('data-submitted')).toBe('YES');
@@ -516,17 +590,22 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await waitForJobEnd(jobId)).toMatchObject({ jobKind: 'LOGIN_CHECK', autoLogin: { result: 'SUCCEEDED', submitted: 'YES' } });
     // 送ったのは、ログインの POST の 1 回だけ。
     expect(nonReadRequests().slice(postsBefore)).toEqual([`POST ${site().authPath('success')}`]);
-    // T43a: プロファイルの「次にすること」では、認証の設定・資格情報・ログインの確かめが済み。
+    // PL-1（4 章の 7）: 自動ログインをしたばかりなので、サイトの画面は自動ログインの間隔の中。主のボタンを出さず、要点に始められる時刻を出す。
     const detail = await openPage(`/profiles/${MAIN_PROFILE}`);
-    expect(await nextStepStatesOf(detail, UI_TIMEOUT_MS)).toEqual(['DONE', 'DONE', 'DONE', 'NEEDED']);
+    expect(await profileStageOf(detail, UI_TIMEOUT_MS)).toBe('AUTO_LOGIN_WAIT');
+    expect(await detail.getByTestId('profile-summary').locator('[data-action]').count()).toBe(0);
+    expect(await detail.getByTestId('profile-next-allowed-at').getAttribute('data-next-allowed-at')).not.toBe('');
 
+    // PL-3: ログインの確かめの画面は止めていないので、要点は「止まっていません」。間隔の理由と次に始められる日時は、開始の画面の要点に出る（主のボタンは出さない）。
     const again = await openPage(`/login-check/${MAIN_PROFILE}`);
-    expect(await again.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_RATE_LIMITED');
-    expect(await again.getByTestId('start-next-allowed-at').count()).toBe(1);
+    expect(await again.getByTestId('login-check-summary').getAttribute('data-state')).toBe('notHeld');
     expect(await again.getByTestId('login-check-start').count()).toBe(0);
-    await screenshot(again, '10-login-check-rate-limited');
+    await screenshot(again, '10-login-check-not-held-after-check');
     const start = await openPage(`/start/${MAIN_PROFILE}`);
     expect(await start.getByTestId('start-auto-login-limit').getAttribute('data-state')).toBe('waiting');
+    expect(await start.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_RATE_LIMITED');
+    expect(await start.getByTestId('start-next-allowed-at').count()).toBe(1);
+    expect(await start.getByTestId('start-submit').count()).toBe(0);
     // 直接の開始の要求も、ジョブの管理が上限で拒み、次に始められる日時を返す。
     const rejected = await valueOf<{ ok: boolean; reason: string; nextAllowedAt: string }>(
       'startLoginCheckFn', 'POST', { profileId: MAIN_PROFILE, expectedRevision: FIRST_REVISION },
@@ -539,8 +618,7 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await valueOf('registerCredentialFn', 'POST', {
       profileId: INVALID_PROFILE, username: USER_OK, password: PASS_WRONG, passwordConfirmation: PASS_WRONG,
     })).toMatchObject({ ok: true, credential: { lastChangeKind: 'CREATED' } });
-    const check = await openPage(`/login-check/${INVALID_PROFILE}`);
-    const jobId = await startLoginCheckFromPage(check);
+    const { jobId, page: check } = await startLoginCheckJob(INVALID_PROFILE);
     await waitForResultOnPage(check, 'INVALID_CREDENTIALS');
     expect(await check.getByTestId('job-failure').getAttribute('data-reason')).toBe('INVALID_CREDENTIALS');
     expect(await check.getByText(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.INVALID_CREDENTIALS.action).count()).toBe(1);
@@ -549,12 +627,30 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
 
     const held = await openPage(`/login-check/${INVALID_PROFILE}`);
     expect(await held.getByTestId('login-check-hold').getAttribute('data-reason')).toBe('INVALID_CREDENTIALS');
-    expect(await held.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_HELD');
+    // PL-3（3 章の 1）: 要点に、なぜ止まったか（止めた理由）と確かめること（人がすること）、主のボタン「確かめたので再開する」1 つ。
+    expect(await held.getByTestId('login-check-summary').getAttribute('data-state')).toBe('held');
+    expect(await held.getByTestId('login-check-hold').textContent()).toContain(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.INVALID_CREDENTIALS.action);
+    expect(await primaryButtonLabelsInMain(held)).toEqual([checkText.hold.clear]);
     expect(await held.getByTestId('login-check-start').count()).toBe(0);
+    // 回数の決まり（PL-4 の「5分に 1回、1日 10回まで」の形の文。名前つきの定数から作る）は、詳しい内容の中。
+    expect(await held.getByTestId('login-check-limit-note').textContent()).toBe(checkText.limitNote(
+      formatElapsedTime(AUTO_LOGIN_MIN_INTERVAL_MS),
+      formatElapsedTime(AUTO_LOGIN_DAILY_WINDOW_MS),
+      formatTimes(AUTO_LOGIN_DAILY_MAX_ATTEMPTS),
+    ));
+    expect(await held.getByTestId('login-check-limit-note').isVisible()).toBe(false);
+    expect(await axeViolationsOf(held)).toEqual([]);
     await screenshot(held, '12-login-check-held');
+    // 開始の画面は、止めている理由と、再開の画面への入口（二次の見た目）を要点に出す。
+    const heldStart = await openPage(`/start/${INVALID_PROFILE}`);
+    expect(await heldStart.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_HELD');
+    expect(await heldStart.getByTestId('start-open-login-check').getAttribute('href')).toBe(`/login-check/${INVALID_PROFILE}`);
+    expect(await primaryButtonLabelsInMain(heldStart)).toEqual([]);
 
     const page = await openPage(`/credentials/${INVALID_PROFILE}`);
     expect(await page.getByTestId('credential-hold').getAttribute('data-held')).toBe('yes');
+    // PL-4: 変える欄は、閉じた詳しい内容の中。
+    await openCredentialDetails(page);
     await page.getByLabel(credentialText.change.changePassword).check();
     await field(page, credentialText.change.newPassword).fill(PASS_OK);
     await field(page, credentialText.change.newPasswordConfirmation).fill(PASS_OK);
@@ -563,14 +659,15 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await page.getByTestId('credential-done').first().waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('credential-done').first().getAttribute('data-notice')).toBe('changedAndHoldCleared');
     expect(await page.getByText(credentialText.clearHold.done).count()).toBe(1);
-    expect(await page.getByTestId('credential-last-change').getAttribute('data-kind')).toBe('PASSWORD_CHANGED');
-    expect(await page.getByTestId('credential-hold').getAttribute('data-held')).toBe('no');
+    expect((await credentialFactsOf(INVALID_PROFILE)).kind).toBe('PASSWORD_CHANGED');
+    expect(await page.getByTestId('credential-hold').count()).toBe(0);
     await snapshot(page);
     await screenshot(page, '13-credentials-changed-and-hold-cleared');
     const after = await openPage(`/login-check/${INVALID_PROFILE}`);
-    // 解いても、自動ログインどうしの最小の間隔は守る。
     expect(await after.getByTestId('login-check-hold').count()).toBe(0);
-    expect(await after.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_RATE_LIMITED');
+    // 解いても、自動ログインどうしの最小の間隔は守る（PL-3: 理由は開始の画面の要点に出る）。
+    const afterStart = await openPage(`/start/${INVALID_PROFILE}`);
+    expect(await afterStart.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTO_LOGIN_RATE_LIMITED');
   }, SCENARIO_TIMEOUT_MS);
 
   it('refuses to change or delete the credential while a job of the profile runs (CREDENTIAL_IN_USE), then clears the hold with the dialog', async () => {
@@ -586,6 +683,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
 
     const page = await openPage(`/credentials/${SLOW_PROFILE}`);
     expect(await page.getByTestId('credential-in-use').count()).toBe(1);
+    // PL-4: 作業が動いている間は、要点の主のボタンを出さない。変える欄は、閉じた詳しい内容の中（送るとサーバが拒む）。
+    expect(await primaryButtonLabelsInMain(page)).toEqual([]);
+    await openCredentialDetails(page);
     await page.getByLabel(credentialText.change.changeUsername).check();
     await field(page, credentialText.change.newUsername).fill(USER_OTHER);
     await page.getByTestId('credential-change-submit').click();
@@ -612,23 +712,38 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     const dialog = check.getByRole('dialog', { name: checkText.hold.dialogTitle });
     await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
     await screenshot(check, '15-login-check-clear-hold-dialog');
-    // 開いたときは「やめる」にフォーカスがある。Tab で「再び許す」へ移って押す。
+    // 開いたときは「やめる」にフォーカスがある。Tab で「再開する」へ移って押す。
     await check.keyboard.press('Tab');
     await check.keyboard.press('Enter');
     await check.getByTestId('login-check-hold-notice').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await check.getByTestId('login-check-hold-notice').getAttribute('data-notice')).toBe('cleared');
     await expect.poll(() => check.getByTestId('login-check-hold').count(), { timeout: UI_TIMEOUT_MS, interval: POLL_MS }).toBe(0);
+    // PL-3: 解いた後の主のボタンは「点検を始める」（点検の最初の自動ログインが、ログインの確かめを兼ねる）。
+    expect(await primaryButtonLabelsInMain(check)).toEqual([LOCAL_UI_AUDIT_TEXT.start.submit]);
     await snapshot(check);
     await screenshot(check, '16-login-check-hold-cleared');
   }, SCENARIO_TIMEOUT_MS);
 
   it('asks to replace both values when the login origin changed, replaces them, and deletes the credential after the dialog', async () => {
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(MAIN_PROFILE, 'success', site().originB) })).toMatchObject({ ok: true });
-    // T43a: 資格情報のログインの Origin が今の認証の設定と違う（開始の確かめの `CREDENTIAL_STALE`）ので、「次にすること」の資格情報は「古い（直す）」。
+    // MI-F1（設計書 4.7.1 の 3）: 自動ログインのプロファイルのままでは、ログインの画面の URL（ログインの Origin）を変えられない（画面の保存は拒む）。手動の
+    // ログインへ戻し（画面の編集の口）、切り替えと同じ形の、手動から自動へのまとめて保存（テストの準備。保存の部品）で、ログインの Origin を変える。
+    expect(await saveAuthSetupRequestInStore(root, { setup: automatedSetupOf(MAIN_PROFILE, 'success', site().originB) }))
+      .toMatchObject({ ok: false, reason: 'CREDENTIAL_DESTINATION_LOCKED' });
+    const current = await valueOf<{ profile: Record<string, unknown> & { revision: number } }>('getProfileFn', 'GET', { profileId: MAIN_PROFILE });
+    expect(await valueOf('updateProfileFn', 'POST', {
+      profile: { ...current.profile, revision: current.profile.revision + 1, auth: 'MANUAL_SESSION' }, expectedRevision: current.profile.revision,
+    })).toMatchObject({ ok: true });
+    const back = current.profile.revision + 2;
+    expect(await saveProfileAndAuthSetupInStore(rootOf(), { ...current.profile, revision: back }, back - 1, {
+      ...automatedSetupOf(MAIN_PROFILE, 'success', site().originB), profileRevision: back,
+    })).toMatchObject({ ok: true });
+    // T43a: 資格情報のログインの Origin が今の認証の設定と違う（開始の確かめの `CREDENTIAL_STALE`）ので、サイトの画面の段は ID とパスワードを入れ直す（PL-1）。
     const detail = await openPage(`/profiles/${MAIN_PROFILE}`);
-    expect((await nextStepStatesOf(detail, UI_TIMEOUT_MS))[1]).toBe('STALE');
+    expect(await profileStageOf(detail, UI_TIMEOUT_MS)).toBe('CREDENTIAL_FIX');
+    expect(await detail.getByTestId('profile-stage-reason').getAttribute('data-reason')).toBe('CREDENTIAL_STALE');
     const page = await openPage(`/credentials/${MAIN_PROFILE}`);
-    expect(await page.getByTestId('credential-origin-state').getAttribute('data-state')).toBe('stale');
+    // PL-4（設計書 3 章の 2）: 一致の行は出さない（入れ直しの文と欄だけ）。
+    expect((await credentialFactsOf(MAIN_PROFILE)).originMatches).toBe(false);
     expect(await page.getByTestId('credential-replace-needed').count()).toBe(1);
     expect(await page.getByTestId('credential-change-form').count()).toBe(0);
     await screenshot(page, '17-credentials-replace-needed');
@@ -638,10 +753,11 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     await page.getByTestId('credential-replace-submit').click();
     await page.getByTestId('credential-done').first().waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('credential-done').first().getAttribute('data-notice')).toBe('replaced');
-    expect(await page.getByTestId('credential-last-change').getAttribute('data-kind')).toBe('BOTH_CHANGED');
-    expect(await page.getByTestId('credential-origin-state').getAttribute('data-state')).toBe('ok');
+    expect(await credentialFactsOf(MAIN_PROFILE)).toEqual({ kind: 'BOTH_CHANGED', originMatches: true });
     await snapshot(page);
 
+    // PL-4: 削除は、閉じた詳しい内容の中。
+    await openCredentialDetails(page);
     await tabTo(page, page.getByTestId('credential-remove'));
     await page.keyboard.press('Enter');
     await page.getByRole('dialog', { name: credentialText.remove.title }).waitFor({ timeout: UI_TIMEOUT_MS });
@@ -654,17 +770,42 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await page.getByTestId('credential-saved').getAttribute('data-saved')).toBe('no');
     await snapshot(page);
     await screenshot(page, '19-credentials-removed');
-    const check = await openPage(`/login-check/${MAIN_PROFILE}`);
-    expect(await check.getByTestId('start-reason').getAttribute('data-reason')).toBe('CREDENTIAL_MISSING');
+    // PL-3: 始められない理由は、開始の画面の要点に出る（ログインの確かめの画面には出さない）。
+    const start = await openPage(`/start/${MAIN_PROFILE}`);
+    expect(await start.getByTestId('start-reason').getAttribute('data-reason')).toBe('CREDENTIAL_MISSING');
+  }, SCENARIO_TIMEOUT_MS);
+
+  // MI-C2 項目 19（MI-1 の発見事項 1 と同じ形）: ルータは根の生の search も子へ渡すので、閉じた一覧にない値では知らせの枠を出さない（認証の設定の画面の
+  // `saved`、資格情報の画面の `done`、ログインの確かめの画面の `hold`）。一覧の値なら出す。
+  it('shows no notice for a search value outside the closed list on the auth setup, credential and login check screens', async () => {
+    for (const [path, testId, known] of [
+      [`/auth-setup/${MAIN_PROFILE}`, 'auth-setup-saved', 'saved=saved'],
+      [`/credentials/${MAIN_PROFILE}`, 'credential-done', 'done=registered'],
+      [`/login-check/${MAIN_PROFILE}`, 'login-check-hold-notice', 'hold=notHeld'],
+    ] as const) {
+      const [name] = known.split('=');
+      const unknown = await openPage(`${path}?${name}=foo`);
+      await unknown.locator('h1.page-title').waitFor({ timeout: UI_TIMEOUT_MS });
+      expect(await unknown.getByTestId(testId).count(), path).toBe(0);
+      const shown = await openPage(`${path}?${known}`);
+      await shown.getByTestId(testId).first().waitFor({ timeout: UI_TIMEOUT_MS });
+    }
   }, SCENARIO_TIMEOUT_MS);
 
   it('does not show the credential screen for a manual login profile, and rejects its direct requests', async () => {
     const page = await openPage(`/credentials/${MANUAL_PROFILE}`);
     expect(await page.getByTestId('credential-not-eligible').count()).toBe(1);
+    // PL-4（作業記録 UX-1 の画面 C の S4）: ログインの設定のない手でログインするサイトは、先に手でログインする点検へ（主のボタン「点検を始める」）。
+    expect(await page.getByTestId('credential-not-eligible').getAttribute('data-kind')).toBe('MANUAL');
+    expect(await primaryButtonLabelsInMain(page)).toEqual([LOCAL_UI_NEXT_STEP_TEXT.actions.AUDIT_START]);
     expect(await page.locator('input[type="password"]').count()).toBe(0);
     expect(await page.locator('form').count()).toBe(0);
     const detail = await openPage(`/profiles/${MANUAL_PROFILE}`);
-    expect(await detail.getByTestId('profile-credentials').count()).toBe(0);
+    await detail.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D5。前は、手でログインするサイトには入口を出さなかった）: ID とパスワードの画面は、
+    // 詳しい内容の中の直す道としてだけ出す（要点には出さない）。
+    expect(await detail.getByTestId('profile-summary').locator('[data-action="CREDENTIAL"]').count()).toBe(0);
+    expect(await detail.getByTestId('profile-edit-advanced-settings').locator('[data-action="CREDENTIAL"]').count()).toBe(1);
     const rejected = { ok: false, reason: 'CREDENTIAL_NOT_ELIGIBLE', field: null };
     expect(await valueOf('registerCredentialFn', 'POST', {
       profileId: MANUAL_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK,
@@ -673,9 +814,12 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(await valueOf('removeCredentialFn', 'POST', { profileId: MANUAL_PROFILE }))
       .toEqual({ ok: false, reason: 'CREDENTIAL_MISSING', field: null });
     expect(await valueOf('clearAutoLoginHoldFn', 'POST', { profileId: MANUAL_PROFILE })).toEqual(rejected);
+    // PL-3: 自動ログインを使わないサイトでは、ログインの確かめの画面ですることはない（主のボタンも出さない）。
     const check = await openPage(`/login-check/${MANUAL_PROFILE}`);
-    expect(await check.getByTestId('start-reason').getAttribute('data-reason')).toBe('AUTH_STRATEGY_NOT_EXECUTABLE');
+    expect(await check.getByTestId('login-check-summary').getAttribute('data-state')).toBe('notAutomated');
+    expect(await check.getByTestId('login-check-not-automated').textContent()).toBe(checkText.summary.notAutomated);
     expect(await check.getByTestId('login-check-start').count()).toBe(0);
+    expect(await primaryButtonLabelsInMain(check)).toEqual([]);
     expect(await valueOf('startLoginCheckFn', 'POST', { profileId: MANUAL_PROFILE, expectedRevision: FIRST_REVISION }))
       .toMatchObject({ ok: false, reason: 'AUTH_STRATEGY_NOT_EXECUTABLE' });
   }, SCENARIO_TIMEOUT_MS);
@@ -685,6 +829,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
   it('T26g-2: retiring removes the saved credential, and keeps the retirement with a guidance when a running job prevents the removal', async () => {
     const credentialPath = (profileId: string): string => credentialFilePathFor(resolveCredentialDirectory(rootOf()), profileId);
     const retireWithKeyboard = async (page: Page): Promise<void> => {
+      // PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1、4 章の 1）: 取り消しは、サイトの画面の詳しい内容の中（キーボードで見出しを開く）。
+      await tabTo(page, page.getByTestId('profile-edit-advanced-settings').locator('summary'));
+      await page.keyboard.press('Enter');
       await tabTo(page, page.getByRole('button', { name: LOCAL_UI_TEXT.retireDialog.open }));
       await page.keyboard.press('Enter');
       const dialog = page.getByRole('dialog', { name: LOCAL_UI_TEXT.retireDialog.title });
@@ -696,8 +843,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
       await snapshot(page);
     };
     for (const [profileId, outcome] of [[RETIRE_PROFILE, 'success'], [RETIRE_RUNNING_PROFILE, 'slow']] as const) {
-      expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(profileId, 'AUTOMATED_LOGIN') })).toMatchObject({ ok: true });
-      expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(profileId, outcome) })).toMatchObject({ ok: true });
+      // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+      expect(await createProfileInStore(rootOf(), profileDocument(profileId, 'AUTOMATED_LOGIN'))).toMatchObject({ ok: true });
+      expect(await saveAuthSetupRequestInStore(root, { setup: automatedSetupOf(profileId, outcome) })).toMatchObject({ ok: true });
       expect(await valueOf('registerCredentialFn', 'POST', {
         profileId, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK,
       })).toMatchObject({ ok: true });
@@ -745,8 +893,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
   // T26g-2 round 1（設計者の判断 (3)）: 自動ログインでなくなったプロファイルに残った資格情報は、資格情報の画面で削除の操作だけを出し、消せる。
   it('T26g-2: shows only the removal for a credential left on a profile that is no longer an automated login profile, and removes it', async () => {
     const credentialPath = credentialFilePathFor(resolveCredentialDirectory(rootOf()), LEFTOVER_PROFILE);
-    expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(LEFTOVER_PROFILE, 'AUTOMATED_LOGIN') })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(LEFTOVER_PROFILE, 'success') })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(rootOf(), profileDocument(LEFTOVER_PROFILE, 'AUTOMATED_LOGIN'))).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: automatedSetupOf(LEFTOVER_PROFILE, 'success') })).toMatchObject({ ok: true });
     expect(await valueOf('registerCredentialFn', 'POST', {
       profileId: LEFTOVER_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK,
     })).toMatchObject({ ok: true });
@@ -757,7 +906,8 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     expect(existsSync(credentialPath)).toBe(true);
 
     const page = await openPage(`/credentials/${LEFTOVER_PROFILE}`);
-    expect(await page.getByTestId('credential-not-eligible').count()).toBe(1);
+    // PL-4: 残ったファイルがあるときは、削除だけ（前は「使いません」の文も出していた）。
+    expect(await page.getByTestId('credential-not-eligible').count()).toBe(0);
     expect(await page.getByTestId('credential-leftover').textContent()).toBe(credentialText.leftoverNotEligible);
     expect(await page.getByTestId('credential-remove').count()).toBe(1);
     expect(await page.locator('input[type="password"]').count()).toBe(0);
@@ -787,8 +937,9 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     const plain = await openPage(`/profiles/${MANUAL_PROFILE}`);
     expect(await plain.getByTestId('profile-credential-leftover').count()).toBe(0);
 
-    expect(await valueOf('createProfileFn', 'POST', { profile: profileDocument(LEFTOVER_LINK_PROFILE, 'AUTOMATED_LOGIN') })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: automatedSetupOf(LEFTOVER_LINK_PROFILE, 'success') })).toMatchObject({ ok: true });
+    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(rootOf(), profileDocument(LEFTOVER_LINK_PROFILE, 'AUTOMATED_LOGIN'))).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: automatedSetupOf(LEFTOVER_LINK_PROFILE, 'success') })).toMatchObject({ ok: true });
     expect(await valueOf('registerCredentialFn', 'POST', {
       profileId: LEFTOVER_LINK_PROFILE, username: USER_OK, password: PASS_OK, passwordConfirmation: PASS_OK,
     })).toMatchObject({ ok: true });
@@ -798,7 +949,10 @@ describe.skipIf(!IS_WINDOWS)(`T26e: the automated login screens${IS_WINDOWS ? ''
     })).toMatchObject({ ok: true });
 
     const page = await openPage(`/profiles/${LEFTOVER_LINK_PROFILE}`);
-    expect(await page.getByTestId('profile-credentials').count()).toBe(0);
+    await page.getByTestId('profile-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+    // OP-1（D5）: 手でログインするサイトの ID とパスワードの画面の入口は、詳しい内容の中だけ（要点には出さない）。
+    expect(await page.getByTestId('profile-summary').locator('[data-action="CREDENTIAL"]').count()).toBe(0);
+    expect(await page.getByTestId('profile-edit-advanced-settings').locator('[data-action="CREDENTIAL"]').count()).toBe(1);
     expect(await page.getByTestId('profile-credential-leftover').textContent()).toContain(credentialText.profileDetail.leftover);
     await screenshot(page, '24-profile-credential-leftover');
     await tabTo(page, page.getByTestId('profile-credential-leftover').getByRole('link', { name: credentialText.profileDetail.open }));
@@ -932,20 +1086,19 @@ describe('T26e: on a platform that is not Windows (the server judges it), and th
       crawl: { minNavigationIntervalMs: 0, maxPages: 1 },
       output: { directory: 't26e-output-linux' },
     }, null, 2)}\n`, 'utf8');
-    expect(await linuxCall('createProfileFn', 'POST', {
-      profile: {
-        schemaVersion: 'beaksight-profile/1',
-        profileId: LINUX_PROFILE,
-        revision: FIRST_REVISION,
-        targetConfigPath: config,
-        environment: 'TEST',
-        mode: 'TEST_AUTH_PASSIVE',
-        auth: 'AUTOMATED_LOGIN',
-        approvedTestOrigins: ['http://127.0.0.1:9'],
-        environmentEvidenceRef: 't26e-evidence',
-      },
+    // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+    expect(await createProfileInStore(linuxRoot.root, {
+      schemaVersion: 'beaksight-profile/1',
+      profileId: LINUX_PROFILE,
+      revision: FIRST_REVISION,
+      targetConfigPath: config,
+      environment: 'TEST',
+      mode: 'TEST_AUTH_PASSIVE',
+      auth: 'AUTOMATED_LOGIN',
+      approvedTestOrigins: ['http://127.0.0.1:9'],
+      environmentEvidenceRef: 't26e-evidence',
     })).toMatchObject({ ok: true });
-    expect(await linuxCall('saveAuthSetupFn', 'POST', {
+    expect(await saveAuthSetupRequestInStore(linuxRoot, {
       setup: {
         ...FORM_NAVIGATION_SETUP_ITEMS,
         profileId: LINUX_PROFILE,
@@ -981,7 +1134,8 @@ describe('T26e: on a platform that is not Windows (the server judges it), and th
       await page.goto(`${linuxServer.origin}/credentials/${LINUX_PROFILE}`, { waitUntil: 'networkidle' });
       expect(await page.getByTestId('credential-unavailable').getAttribute('data-state')).toBe('NOT_WINDOWS');
       expect(await page.getByTestId('credential-unavailable').textContent()).toBe(CREDENTIAL_ENVIRONMENT_CATALOG.NOT_WINDOWS.description);
-      expect(await page.getByTestId('credential-protection').getAttribute('data-state')).toBe('NOT_WINDOWS');
+      // PL-4（設計書 3 章の 2）: 暗号化の行は出さない（上の知らせだけ）。
+      expect(await page.getByTestId('credential-protection').count()).toBe(0);
       expect(await page.getByTestId('credential-register-form').count()).toBe(0);
       expect(await page.locator('input[type="password"]').count()).toBe(0);
       expect(leaks(await page.content())).toBe(false);

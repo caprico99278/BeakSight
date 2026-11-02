@@ -26,6 +26,10 @@ import { createServiceRequestBudget } from '../../src/crawl/service-request-budg
 import { AuditStageMonitor, WriteStageMonitor } from '../../src/safety/passive-request-guard.js';
 import { SafetyLedger } from '../../src/safety/safety-ledger.js';
 import { API_WRITE_INPUT_REASON_DESCRIPTIONS } from '../../src/presentation/messages.js';
+import { createDataSeed, createDeterministicStream } from '../../src/control/data-rules/deterministic-stream.js';
+import { generateGenericValue } from '../../src/control/data-rules/generic-values.js';
+import { createSha256Fingerprint } from '../../src/core/ids.js';
+import type { CandidateField } from '../../src/discovery/candidate-contracts.js';
 import { closeTestContexts, launchCliChromium, launchHeadlessChromium } from '../helpers/chromium.js';
 import { READ_METHODS } from '../helpers/leak-places.js';
 import { fastRunConfig } from '../helpers/run-harness.js';
@@ -34,6 +38,7 @@ import {
   SPA_AUTH_STORAGE_KEY,
   SPA_BACKEND_PATHS,
   SPA_FORMLESS_MEMBER_BOX,
+  SPA_NUMBER_FIELD,
   spaMemberEditPathOf,
   startSpaAuthSite,
   type SpaAuthSite,
@@ -229,11 +234,166 @@ describe.each(LAUNCHERS)('T39d: the input and the press of the API write with %s
     expect(ledger().invariantViolations).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  // OP-O（O1・O2）: 本物のテスト環境の SPA（React などで作られているとみられる）の、値を入れるときの振る舞い。送る中身と回数は変えない（値の入れ方だけ）。
+  // 失敗したときは、段・理由・欄の位置・欄の種類・属性の有無・値の変わり方の区分を返す（値と、値の長さは返さない）。
+  const SPA_READY = `#${SPA_FORMLESS_MEMBER_BOX}[data-state="ready"]`;
+  /** 確かめ・入力・押下を順に行い、失敗の細目もそのまま返す。 */
+  const runDetailed = async (page: Page, monitor: WriteStageMonitor, spec: ApiWriteInputSpec) => {
+    const inspected = await inspectApiWriteInput(page, spec);
+    if (!inspected.ok) return { stage: 'inspect', result: inspected } as const;
+    const filled = await fillApiWriteInput(page, inspected.input, monitor);
+    if (!filled.ok) return { stage: 'fill', result: filled } as const;
+    const submitted = await submitApiWriteInput(page, inspected.input);
+    if (!submitted.ok) return { stage: 'submit', result: submitted } as const;
+    await wait(QUIET_WAIT_MS);
+    return { stage: 'submitted', result: submitted } as const;
+  };
+
+  it.each([
+    ['rerenders the fields at the first input (O2 a)', 'rerenderOnFirstInput'],
+    ['reverts the first input of each field (O2 c)', 'revertOnFirstInput'],
+  ] as const)('fills again within the limit when the SPA %s, then presses once', async (_label, quirk) => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY, (target) => {
+      target.setMemberInputQuirk(quirk);
+      return SPA_APP_PATHS.memberNew;
+    });
+    const outcome = await runDetailed(page, monitor, await specOf(page));
+    expect(outcome).toEqual({ stage: 'submitted', result: { ok: true } });
+    expect(await page.inputValue('#name')).toBe(VALUES.name);
+    expect(await page.inputValue('#member-email')).toBe(VALUES.email);
+    expect(await page.inputValue('#note')).toBe(VALUES.note);
+    // 押したのは 1 回（Guard が止めた会員の表への要求が 1 つ）。
+    expect(blockedMemberWrites(ledger(), site)).toHaveLength(1);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it.each([
+    ['rerenders the fields at every input', 'rerenderOnEveryInput', { reason: 'ELEMENT_CHANGED', fieldIndex: 1, field: { type: 'email', attributes: [] } }],
+    ['clears every input', 'clearOnEveryInput', { reason: 'VALUE_CHANGED', fieldIndex: 0, field: { type: 'text', attributes: [] }, valueChange: 'EMPTIED' }],
+  ] as const)('stops without pressing when the SPA %s, and tells the stage, the reason and the field facts without values (O1)', async (_label, quirk, detail) => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY, (target) => {
+      target.setMemberInputQuirk(quirk);
+      return SPA_APP_PATHS.memberNew;
+    });
+    const outcome = await runDetailed(page, monitor, await specOf(page));
+    expect(outcome).toEqual({ stage: 'fill', result: { ok: false, ...detail } });
+    expect(JSON.stringify(outcome)).not.toContain(VALUES.name);
+    await wait(QUIET_WAIT_MS);
+    expect(blockedMemberWrites(ledger(), site)).toEqual([]);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('keeps a generated number value that the page formats, and tells the number form change of another value (O2 b, O1)', async () => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY, (target) => {
+      target.setMemberInputQuirk('numberField');
+      return SPA_APP_PATHS.memberNew;
+    });
+    const numberField: CandidateField = {
+      name: SPA_NUMBER_FIELD.name, tag: 'input', type: 'number', required: false, readonly: false, disabled: false, hidden: false,
+      constraints: { pattern: null, min: SPA_NUMBER_FIELD.min, max: SPA_NUMBER_FIELD.max, step: SPA_NUMBER_FIELD.step, minlength: null, maxlength: null, autocomplete: null },
+      options: null, omittedOptionCount: 0, hasValue: false,
+    };
+    const stream = createDeterministicStream(createDataSeed({
+      profileId: 'PROFILE-O', scenarioId: 'SCENARIO-O', scenarioRevision: 1, ruleSetDigest: createSha256Fingerprint('rule-set'), executionGrantId: 'GRANT-O',
+    }), 'field:number');
+    const generated = generateGenericValue(numberField, stream, { baseDate: '2026-10-29' });
+    if (!generated.ok) throw new Error('the number value was not generated');
+    const base = await specOf(page);
+    const withNumber = (value: string): ApiWriteInputSpec => ({ ...base, fields: [...base.fields, { field: { kind: 'NAME', name: SPA_NUMBER_FIELD.name }, value }] });
+    // 前に 0 のある値は、画面が数の形に整えるので、入れた値と違う（値の変わり方は NUMBER_FORMAT。押さない）。
+    expect(await runDetailed(page, monitor, withNumber(`0${generated.value}`))).toEqual({
+      stage: 'fill', result: { ok: false, reason: 'VALUE_CHANGED', fieldIndex: 3, field: { type: 'number', attributes: ['min', 'max', 'step'] }, valueChange: 'NUMBER_FORMAT' },
+    });
+    expect(blockedMemberWrites(ledger(), site)).toEqual([]);
+    // 値の生成の部品が作った値は、画面が整えても変わらない（押せる）。
+    expect(await runDetailed(page, monitor, withNumber(generated.value))).toEqual({ stage: 'submitted', result: { ok: true } });
+    expect(await page.inputValue(`#${SPA_NUMBER_FIELD.id}`)).toBe(generated.value);
+    expect(blockedMemberWrites(ledger(), site)).toHaveLength(1);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  // OP-P（P1・P2。本物のテスト環境の形）: 値を入れ終えた後、押す前に、SPA が保存のボタンか欄を作り直す（React の再描画）。押す直前に、上限の中で 1 回だけ、
+  // 同じ指定（送信の要素は承認の識別の digest でちょうど 1 つ）で今の画面から探し直し、今の要素の値を読み直してから押す（押すのは 1 回だけ）。
+  /** 確かめて値を入れた後、作り直された要素（`selector` の、値を入れる前の要素）が外れるのを待ってから押す。 */
+  const runAfterRerender = async (page: Page, monitor: WriteStageMonitor, spec: ApiWriteInputSpec, selector: string) => {
+    const before = await page.$(selector);
+    if (before === null) throw new Error('the element is not on the screen');
+    const inspected = await inspectApiWriteInput(page, spec);
+    if (!inspected.ok) return { stage: 'inspect', result: inspected } as const;
+    const filled = await fillApiWriteInput(page, inspected.input, monitor);
+    if (!filled.ok) return { stage: 'fill', result: filled } as const;
+    await page.waitForFunction((element) => !element.isConnected, before, { timeout: UI_TIMEOUT_MS });
+    const submitted = await submitApiWriteInput(page, inspected.input);
+    if (!submitted.ok) return { stage: 'submit', result: submitted } as const;
+    await wait(QUIET_WAIT_MS);
+    return { stage: 'submitted', result: submitted } as const;
+  };
+
+  it.each([
+    ['rebuilds the save button (P1)', 'rerenderSaveAfterFill', '#save'],
+    ['rebuilds the fields keeping the values (P2)', 'rerenderFieldsAfterFill', '#name'],
+  ] as const)('finds the current elements once and presses once when the SPA %s after the values were filled', async (_label, quirk, selector) => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY, (target) => {
+      target.setMemberInputQuirk(quirk);
+      return SPA_APP_PATHS.memberNew;
+    });
+    const outcome = await runAfterRerender(page, monitor, await specOf(page), selector);
+    expect(outcome).toEqual({ stage: 'submitted', result: { ok: true } });
+    expect(await page.inputValue('#name')).toBe(VALUES.name);
+    expect(await page.inputValue('#member-email')).toBe(VALUES.email);
+    expect(await page.inputValue('#note')).toBe(VALUES.note);
+    // 押したのは 1 回（Guard が止めた会員の表への要求が 1 つ）。
+    expect(blockedMemberWrites(ledger(), site)).toHaveLength(1);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('reads the values of the current fields, not of the detached ones, and does not press when the rebuild emptied them (P2)', async () => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY, (target) => {
+      target.setMemberInputQuirk('resetFieldsAfterFill');
+      return SPA_APP_PATHS.memberNew;
+    });
+    const outcome = await runAfterRerender(page, monitor, await specOf(page), '#name');
+    expect(outcome).toEqual({
+      stage: 'submit', result: { ok: false, reason: 'VALUE_CHANGED', clickAttempted: false, fieldIndex: 0, field: { type: 'text', attributes: [] }, valueChange: 'EMPTIED' },
+    });
+    expect(JSON.stringify(outcome)).not.toContain(VALUES.name);
+    await wait(QUIET_WAIT_MS);
+    expect(blockedMemberWrites(ledger(), site)).toEqual([]);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  it('does not press a rebuilt save button that is not the approved submitter (P1)', async () => {
+    const { site, page, monitor, ledger } = await openCreateScreen({ memberScreenLayout: 'formless' }, SPA_READY);
+    const spec = await specOf(page);
+    const inspected = await inspectApiWriteInput(page, spec);
+    if (!inspected.ok) throw new Error('the inspection failed');
+    expect(await fillApiWriteInput(page, inspected.input, monitor)).toEqual({ ok: true });
+    // 保存のボタンを、語の違うボタン（承認の識別の digest に当たらない）に作り直す。
+    await page.evaluate(() => {
+      const save = document.getElementById('save');
+      if (save === null) throw new Error('no save button');
+      const copy = save.cloneNode(true) as HTMLElement;
+      copy.textContent = '削除';
+      save.replaceWith(copy);
+    });
+    expect(await submitApiWriteInput(page, inspected.input)).toEqual({ ok: false, reason: 'SUBMITTER_NOT_FOUND', clickAttempted: false });
+    await wait(QUIET_WAIT_MS);
+    expect(blockedMemberWrites(ledger(), site)).toEqual([]);
+    expect(await reachedNonReads(site)).toEqual([]);
+    expect(ledger().invariantViolations).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
   it('stops a spec whose field or submitter is not on the screen', async () => {
     const { site, page } = await openCreateScreen({ memberScreenLayout: 'formless' }, `#${SPA_FORMLESS_MEMBER_BOX}[data-state="ready"]`);
     const spec = await specOf(page);
+    // OP-L（L1）: 欄の確かめで外れたときは、外れた欄の位置（指定の順の 0 から）も返す（値は返さない）。
     expect(await inspectApiWriteInput(page, { ...spec, fields: [{ field: { kind: 'NAME', name: 'missing' }, value: 'x' }] }))
-      .toEqual({ ok: false, reason: 'FIELD_NOT_FOUND' });
+      .toEqual({ ok: false, reason: 'FIELD_NOT_FOUND', fieldIndex: 0 });
     expect(await inspectApiWriteInput(page, { ...spec, submitterIdentityDigest: `sha256:${'0'.repeat(64)}` }))
       .toEqual({ ok: false, reason: 'SUBMITTER_NOT_FOUND' });
     expect(await inspectApiWriteInput(page, { ...spec, fields: [] })).toEqual({ ok: false, reason: 'SPEC_INVALID' });

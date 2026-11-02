@@ -21,7 +21,7 @@ import {
 import { AUDIT_JOB_IPC_DRAIN_WAIT_MS } from '../../src/control/job/job-records.js';
 import type { AuditJobView } from '../../src/control/job/job-store.js';
 import type { ProfileValidationContext } from '../../src/control/profile-policy.js';
-import { WORKER_PROTOCOL_VERSION } from '../../src/control/worker-protocol.js';
+import { WORKER_LOGIN_REGISTRATION_TIMEOUT_MS, WORKER_PROTOCOL_VERSION } from '../../src/control/worker-protocol.js';
 import { isProcessRunning } from '../../src/core/process-lock.js';
 import type { FakeWorker, FakeWorkerValues } from './fake-audit-worker.js';
 
@@ -40,6 +40,8 @@ export const CONTROL_JOB_TEST_TIMING: AuditJobTiming = Object.freeze({
   instanceHeartbeatIntervalMs: 1_000,
   unownedWorkerStaleAfterMs: 1_500,
   lockLostKillAfterMs: 1_000,
+  // OP-F（I-1）: 許しの後に `CREDENTIAL_SAVED` を待つ上限（本番の値。上限を過ぎる場面のテストは写しで短くする）。
+  loginRegistrationTimeoutMs: WORKER_LOGIN_REGISTRATION_TIMEOUT_MS,
 });
 
 /** 偽のワーカーの合図の間隔（ms。見張りの時間より十分に短い）。 */

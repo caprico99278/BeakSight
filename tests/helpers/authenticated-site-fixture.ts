@@ -59,6 +59,13 @@ export const AUTH_SITE_PATHS = Object.freeze({
    * （ログインの段の許可が監査の段に引き継がれないことの確かめ）。
    */
   adminRelogin: '/admin/relogin',
+  /**
+   * MI-F2（`adminScriptSends`）: 読み込みの後で、ページのスクリプトが、管理画面の下の受け口へ fetch の POST（`adminFetchSink`）と
+   * `navigator.sendBeacon`（`adminBeaconSink`）を送ろうとする管理画面（監査の段の Guard が、スクリプトの送信も止めることの確かめ）。
+   */
+  adminScriptSends: '/admin/script-sends',
+  adminFetchSink: '/admin/api/save',
+  adminBeaconSink: '/admin/api/beacon',
   otherPixel: '/pixel',
   otherFrame: '/frame',
   otherExternal: '/external',
@@ -117,6 +124,12 @@ export interface AuthenticatedSiteOptions {
    */
   readonly adminReloginForm?: boolean;
   /**
+   * MI-F2: 管理画面（`/admin`）の先頭から、`AUTH_SITE_PATHS.adminScriptSends` へリンクする。その画面は、読み込みの後（`load` の事象の後）で、
+   * fetch の POST（`AUTH_SITE_PATHS.adminFetchSink`）と `navigator.sendBeacon`（`AUTH_SITE_PATHS.adminBeaconSink`）を送ろうとする。本文は資格情報を
+   * 持たない（`AUTH_SITE_SCRIPT_SEND_BODY`）。指定がなければ、画面もリンクもない（今のまま）。
+   */
+  readonly adminScriptSends?: boolean;
+  /**
    * DEF-139（設計書 `2026-10-20-beaksight-login-state-carryover-design.md` 3 章の 1）: `loginForm` と一緒に使う。ログインの POST の後の画面
    * （`/admin?login=1`。`AUTH_SITE_INDEXED_DB.landingQuery`）が、IndexedDB（`AUTH_SITE_INDEXED_DB`）に秘密の目印を書き、書き終えてから成功の画面の
    * 要素（`#admin-ok`）を出す。2 ページ目（`AUTH_SITE_PATHS.adminSecond`）は、読み込みの後に IndexedDB を読み、その記録がなければ、ログインの画面
@@ -148,6 +161,9 @@ const INDEXED_DB_GATE_WAIT_MS = 1_000;
 
 /** T32i（`adminReloginForm`）: 監査の段の画面が送ろうとするフォームの欄の値（資格情報ではない、固定の目印）。 */
 export const AUTH_SITE_RELOGIN_FIELD_VALUE = 'relogin-attempt';
+
+/** MI-F2（`adminScriptSends`）: 監査の段の画面のスクリプトが送ろうとする本文（資格情報ではない、固定の目印）。 */
+export const AUTH_SITE_SCRIPT_SEND_BODY = 'script-send-attempt';
 
 export interface AuthenticatedSite {
   readonly originA: string;
@@ -271,8 +287,16 @@ export async function startAuthenticatedSite(options: AuthenticatedSiteOptions =
         + `<form id="relogin-form" method="post" action="${p.login}"><input name="user" value="${AUTH_SITE_RELOGIN_FIELD_VALUE}"></form>`
         + '<script>addEventListener("load", () => { setTimeout(() => document.getElementById("relogin-form").submit(), 0); });</script>';
     }
+    if (options.adminScriptSends === true && path === p.adminScriptSends) {
+      return '<h1 id="admin-ok">SCRIPT-SENDS</h1>'
+        + '<script>addEventListener("load", () => { setTimeout(() => {'
+        + `fetch(${JSON.stringify(p.adminFetchSink)}, { method: "POST", body: ${JSON.stringify(AUTH_SITE_SCRIPT_SEND_BODY)} }).catch(() => undefined);`
+        + `navigator.sendBeacon(${JSON.stringify(p.adminBeaconSink)}, ${JSON.stringify(AUTH_SITE_SCRIPT_SEND_BODY)});`
+        + '}, 0); });</script>';
+    }
     return `<h1 id="admin-ok">ADMIN</h1>${tokenLinksHtml()}<ul>`
       + (options.adminReloginForm === true ? `<li><a href="${p.adminRelogin}">relogin</a></li>` : '')
+      + (options.adminScriptSends === true ? `<li><a href="${p.adminScriptSends}">script-sends</a></li>` : '')
       + `<li><a href="${p.adminSecond}">second</a></li>`
       + `<li><a href="${p.adminFrames}">frames</a></li>`
       + `<li><a href="${p.adminLogout}">logout</a></li>`

@@ -14,12 +14,14 @@ const SILENCE_LIMIT_MS = 120_000;
 const monitorOf = (jobs = { count: 0 }) => {
   let now = 0;
   let idle = 0;
+  const causes: string[] = [];
   const monitor = createPresenceMonitor({
     closedGraceMs: CLOSED_GRACE_MS,
     silenceLimitMs: SILENCE_LIMIT_MS,
     runningJobCount: () => jobs.count,
-    onIdle: () => {
+    onIdle: (cause) => {
       idle += 1;
+      causes.push(cause);
     },
     now: () => now,
   });
@@ -30,6 +32,7 @@ const monitorOf = (jobs = { count: 0 }) => {
       monitor.check();
     },
     idle: (): number => idle,
+    causes: (): readonly string[] => causes,
   };
 };
 
@@ -100,6 +103,25 @@ describe('UI-close: when the local UI server stops after the page is closed', ()
     back.monitor.alive('page-b');
     back.at(CLOSED_GRACE_MS * 3);
     expect(back.idle()).toBe(0);
+  });
+
+  // OP-P（P3）: 止めた理由（閉じた知らせの後か、知らせの途絶えか）を渡す（終わりの記録に、理由のコードだけを残すため）。
+  it('tells whether it stopped after the closed notice or after the silence (OP-P)', () => {
+    const closed = monitorOf();
+    closed.monitor.alive('page-a');
+    closed.monitor.closed('page-a');
+    closed.at(CLOSED_GRACE_MS);
+    expect(closed.causes()).toEqual(['CLOSED']);
+
+    // ジョブの間に知らせが途絶えた（隠れたタブの凍結など）ページは、ジョブが終わったときに、途絶えの理由で止める。
+    const jobs = { count: 1 };
+    const silent = monitorOf(jobs);
+    silent.monitor.alive('page-a');
+    silent.at(SILENCE_LIMIT_MS * 2);
+    expect(silent.causes()).toEqual([]);
+    jobs.count = 0;
+    silent.at(SILENCE_LIMIT_MS * 2 + 1);
+    expect(silent.causes()).toEqual(['SILENT']);
   });
 
   it('does not count a closed notice of a page that never sent the alive notice', () => {

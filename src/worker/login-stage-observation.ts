@@ -40,6 +40,7 @@ import {
 } from '../discovery/login-observation.js';
 import { countReadingOf, countSelectorsInPage } from '../discovery/selector-count.js';
 import { readLoginFormFields } from './entry-check-page.js';
+import { loginStageLocator, waitForLoginFields } from './login-stage-checks.js';
 
 /** 読む鍵の名前の数の上限（超えた名前は読まない。差分は読んだ名前の中で求める）。 */
 export const MAX_READ_STORAGE_KEY_NAMES = 200;
@@ -249,10 +250,15 @@ export const withoutCredentialProposals = (
  * FM2e: ログインの 3 つの欄の CSS の案（入口の確かめと同じ検出の部品。各欄の候補がちょうど 1 つのときだけ。どの欄にも案がなければ `null`）。欄の値は
  * 読まない。読めなければ `null`。
  */
+/** OP-K（K3）: 手でのログインの観察の始めに、見えるのを待つ欄（パスワードの欄。欄の検出の部品と同じ形）。 */
+const PASSWORD_FIELD_SELECTOR = 'input[type="password"]';
+
 const loginFieldProposalsOf = async (page: Page): Promise<WorkerLoginFieldProposals | null> => {
   if (page.isClosed()) {
     return null;
   }
+  // OP-K（K3）: 欄が後から描かれる SPA のために、パスワードの欄が見えるまで、自動ログインの段と同じ部品で待つ（数えるだけ。上限は 1 段の上限）。
+  await waitForLoginFields([loginStageLocator(page, PASSWORD_FIELD_SELECTOR)]);
   const reading = await readLoginFormFields(page);
   if (reading === null) {
     return null;

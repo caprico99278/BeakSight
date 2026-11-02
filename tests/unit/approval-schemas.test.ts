@@ -20,6 +20,7 @@ import {
   MIN_APPROVAL_TTL_DAYS,
   MIN_SCENARIO_LIMIT,
   MIN_SCENARIO_REVISION,
+  MAX_FORM_RECORD_ID_PATTERNS,
   MAX_RECORD_ID_PATH_PATTERN_LENGTH,
   MAX_RESULT_CONDITION_PATH_LENGTH,
   MAX_VERIFICATION_BINDINGS,
@@ -28,6 +29,7 @@ import {
   MAX_VERIFICATION_SELECTOR_LENGTH,
   MIN_VERIFICATION_ROW_COUNT,
   RECORD_ID_SOURCES,
+  RETIRED_SCENARIO_VERIFICATION_ITEMS,
   SCENARIO_FORM_METHOD,
   SCENARIO_ID_PATTERN,
   SCENARIO_SCHEMA_VERSION,
@@ -115,14 +117,18 @@ describe('scenario and approval receipt schemas (T28a)', () => {
   it('matches the verification spec shapes and limits with the named constants (T30a)', () => {
     expect(scenarioSchema.required).toContain('verification');
     const verification = scenarioDefs.verification;
-    expect(verification?.required).toEqual(SCENARIO_VERIFICATION_ITEMS);
-    expect(Object.keys(verification?.properties ?? {})).toEqual(SCENARIO_VERIFICATION_ITEMS);
+    // PL-6a（設計者の判断 (c)）: 結果の判定のしかたの印は、前に保存した文書が持たないので必須にしない（読むときに null）。前の文書の成否の条件の項目は、
+    // 受けて捨てるために残す（書く前の確かめが拒む）。
+    expect(verification?.required).toEqual(SCENARIO_VERIFICATION_ITEMS.filter((item) => item !== 'resultJudgement'));
+    expect(Object.keys(verification?.properties ?? {})).toEqual(['resultJudgement', ...RETIRED_SCENARIO_VERIFICATION_ITEMS, 'recordId', 'readVerification']);
     const condition = scenarioDefs.resultCondition;
     expect(prop(condition, 'pathPrefix').maxLength).toBe(MAX_RESULT_CONDITION_PATH_LENGTH);
     expect((prop(condition, 'selector').anyOf ?? [])[0]?.maxLength).toBe(MAX_VERIFICATION_SELECTOR_LENGTH);
-    const sources = (scenarioDefs.recordId?.oneOf ?? []).map((branch) => prop(branch, 'source').const);
+    // PL-6a: API の画面の取り方（型・要素）と、form の ID の型の一覧。
+    const sources = [...(scenarioDefs.pageRecordId?.oneOf ?? []), scenarioDefs.formRecordId].map((branch) => prop(branch, 'source').const);
     expect(sources).toEqual(RECORD_ID_SOURCES);
-    const [pathBranch, elementBranch] = scenarioDefs.recordId?.oneOf ?? [];
+    expect(prop(scenarioDefs.formRecordId, 'pathPatterns').maxItems).toBe(MAX_FORM_RECORD_ID_PATTERNS);
+    const [pathBranch, elementBranch] = scenarioDefs.pageRecordId?.oneOf ?? [];
     expect(prop(pathBranch, 'pathPattern').maxLength).toBe(MAX_RECORD_ID_PATH_PATTERN_LENGTH);
     expect(prop(elementBranch, 'selector').maxLength).toBe(MAX_VERIFICATION_SELECTOR_LENGTH);
     const read = scenarioDefs.readVerification;
@@ -197,7 +203,7 @@ describe('scenario and approval receipt schemas (T28a)', () => {
     // T30a: 検証の指定。
     ['no verification spec', (({ verification: _omitted, ...rest }) => rest)(sampleScenario())],
     ['a null verification spec', { ...sampleScenario(), verification: null }],
-    ['a missing verification item', { ...sampleScenario(), verification: { successCondition: null, inputErrorCondition: null, recordId: null } }],
+    ['a missing verification item', { ...sampleScenario(), verification: { resultJudgement: null, recordId: null } }],
     ['a condition with a status code', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, successCondition: { pathPrefix: '/a', selector: null, status: 200 } } }],
     ['an unknown record id source', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, recordId: { source: 'QUERY', name: 'id' } } }],
     ['an element source with a path pattern', { ...sampleScenario(), verification: { ...FULL_VERIFICATION, recordId: { source: 'ELEMENT', pathPattern: '/{id}' } } }],

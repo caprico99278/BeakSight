@@ -189,6 +189,24 @@ describe.skipIf(!IS_WINDOWS)('T26a: real DPAPI and icacls (Windows only; skipped
     expect(file.rules).toContainEqual({ sid: folder.user, type: 'Allow', rights: FULL_CONTROL, inheritance: NO_INHERITANCE_FLAGS, inherited: true });
   }, TEST_TIMEOUT_MS);
 
+  it('OP-L L2: restricts a new folder under a root whose inherited rules hold generic rights (like a repository folder), and saves', async () => {
+    // リポジトリのフォルダのような、継承の多い ACL を一時の根に付ける。Authenticated Users の、中へだけ受け継ぐ汎用の権限（GR,GE）は、
+    // .NET の FileSystemRights を [int] にすると負の数になる（本物のテスト環境の PC の継承の ACL にあった形）。
+    const root = temporaryRoot();
+    execFileSync('C:\\Windows\\System32\\icacls.exe', [root, '/grant', '*S-1-5-11:(OI)(CI)(IO)(GR,GE)', '/grant', '*S-1-5-11:(M)'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    expect(readAcl(root).rules.some((rule) => rule.rights < 0)).toBe(true);
+    const store = createCredentialStore(root);
+    const metadata = await store.register({ profileId: PROFILE_ID, loginOrigin: ORIGIN, username: marker(), password: marker() });
+    expect(metadata.credentialRevision).toBe(1);
+    const folder = readAcl(store.directory);
+    expect(folder.protectedRules).toBe(true);
+    expect(folder.rules).toEqual([{ sid: folder.user, type: 'Allow', rights: FULL_CONTROL, inheritance: CONTAINER_AND_OBJECT_INHERIT, inherited: false }]);
+    expect(await store.remove(PROFILE_ID)).toBe(true);
+  }, TEST_TIMEOUT_MS);
+
   it('cannot decrypt with another entropy: another profile, swapped fields, another origin', async () => {
     const protector = createDpapiCredentialProtector();
     const value = marker();

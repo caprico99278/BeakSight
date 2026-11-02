@@ -12,6 +12,7 @@ import {
   MAX_SUBMITTED_VALUE_LENGTH,
   type ActionEvidenceDocument,
   type ActionGuardSummary,
+  type ActionGuardUnexpectedRequest,
 } from '../../src/control/actions/action-contracts.js';
 import { MAX_RECORD_ID_LENGTH, MAX_SCENARIO_FIELD_NAMES, SCENARIO_ID_PATTERN } from '../../src/control/approval/scenario-contracts.js';
 import { PROFILE_ID_PATTERN } from '../../src/control/contracts.js';
@@ -21,6 +22,7 @@ import { MAX_READ_EVIDENCE_OBSERVED_TEXT_LENGTH } from '../../src/discovery/read
 import type { WriteStageMonitorSnapshot } from '../../src/safety/passive-request-guard.js';
 import { SUBMISSION_STAGE_BLOCK_REASONS } from '../../src/safety/request-policy.js';
 import { WRITE_PAYLOAD_BLOCK_REASONS } from '../../src/safety/write-payload-policy.js';
+import { MAX_WRITE_STAGE_UNEXPECTED_REQUESTS } from '../../src/safety/write-stage-unexpected-requests.js';
 import {
   blockedDocuments,
   sampleExecutedRead,
@@ -78,6 +80,12 @@ const verifiedUpdate = (overrides: Partial<ActionEvidenceDocument> = {}): Action
   ...overrides,
 });
 
+/** OP-M: 止めた、承認した送信のほかの要求の一覧の 1 行の見本（値・Origin を持たない）。 */
+const UNEXPECTED_REQUEST_ROW: ActionGuardUnexpectedRequest = Object.freeze({
+  method: 'POST', destination: 'APPROVED_SERVICE_ORIGIN', pathShape: '/rest/v1/rpc/check_email', resourceType: 'fetch', timing: 'AFTER_FILL',
+  reason: 'NON_READ_METHOD', markerInBody: true, bodyKind: 'OBJECT', count: 1,
+});
+
 /** 秘密を持つ項目に見える名前の語（共通の語に、ロックの版を足した）。 */
 const EVIDENCE_SECRET_PROPERTY_WORDS: readonly string[] = [...SECRET_PROPERTY_WORDS, 'lock_version', 'lockversion'];
 
@@ -131,10 +139,20 @@ describe('action-evidence.json schema (T32c)', () => {
     const guard = defs.guardSummary ?? {};
     expect(guard.additionalProperties).toBe(false);
     expect(Object.keys(guard.properties ?? {}).sort()).toEqual([
-      'blockedByOtherRulesInWindow', 'blockedByPayloadReason', 'blockedByReason', 'documentCharsetRead', 'responseDeliveryCanceled', 'submissionWindowOpen',
+      'blockedByOtherRulesInWindow', 'blockedByPayloadReason', 'blockedByReason', 'documentCharsetRead', 'passedRequests', 'passedRequestsUnlisted',
+      'responseDeliveryCanceled', 'submissionWindowOpen', 'unexpectedRequests', 'unexpectedRequestsUnlisted',
     ]);
-    expect([...(guard.required ?? [])].sort()).toEqual(Object.keys(guard.properties ?? {}).sort());
+    // OP-M: 止めた、承認した送信のほかの要求の一覧（1 つの配列）と一覧に入れなかった数だけが任意の項目（あったときだけ。版は上げない）。ほかはすべて必須。
+    // OP-N（設計書 4.1.7 の N2）: 送信の扱いで通した要求の一覧（同じ形）と一覧に入れなかった数も、任意の項目（あったときだけ。版は上げない）。
+    const optional = new Set(['unexpectedRequests', 'unexpectedRequestsUnlisted', 'passedRequests', 'passedRequestsUnlisted']);
+    expect([...(guard.required ?? [])].sort()).toEqual(Object.keys(guard.properties ?? {}).filter((name) => !optional.has(name)).sort());
     expect(typeof guardSummaryOf).toBe('function');
+  });
+
+  it('caps the list of the requests other than the approved send at the named limit of the guard (OP-M)', () => {
+    const requests = (defs.unexpectedRequests ?? {}) as JsonSchema & { readonly type?: unknown; readonly maxItems?: number };
+    expect(requests.type).toBe('array');
+    expect(requests.maxItems).toBe(MAX_WRITE_STAGE_UNEXPECTED_REQUESTS);
   });
 
   it('has no property for a credential, a cookie, a CSRF token, a hidden value, a lock version or an authenticated state', () => {
@@ -189,6 +207,11 @@ describe('action-evidence.json schema (T32c)', () => {
     })],
     ['a blocked UPDATE', blockedCreate({ kind: 'UPDATE', update: { targetRecordId: 'rec_42-a', updateEvidence: null } })],
     ['a guard summary without every reason key', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: {}, blockedByPayloadReason: {} } })],
+    // OP-M: 止めた、承認した送信のほかの要求の一覧（任意。値・Origin を持たない）。
+    ['a blocked run with the requests other than the approved send', blockedCreate({
+      reason: 'PRECHECK_FAILED', precheck: { candidateDigestMatched: true, blockReason: 'PRECHECK_FAILED' },
+      guard: { ...quietGuard(), unexpectedRequests: [UNEXPECTED_REQUEST_ROW], unexpectedRequestsUnlisted: 2 },
+    })],
   ])('accepts %s', async (_label, document) => {
     expect(await validateArtifact('action-evidence', document)).toEqual({ ok: true });
   });
@@ -206,6 +229,18 @@ describe('action-evidence.json schema (T32c)', () => {
     ['a guard summary with an unknown stage reason', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: { SOMETHING_ELSE: 1 } } })],
     ['a guard summary with a negative count', verifiedCreate({ guard: { ...quietGuard(), blockedByOtherRulesInWindow: -1 } })],
     ['a guard summary with a fractional count', verifiedCreate({ guard: { ...quietGuard(), blockedByReason: { SUBMISSION_WINDOW: 0.5 } } })],
+    // OP-M: 一覧の行は、閉じた一覧の区分と時点だけで、Origin や本文を持たない。上限より多い行、0 回の行も受けない。
+    ['an unexpected request with an origin', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, origin: 'https://outside.example.invalid' } as never] } })],
+    ['an unexpected request with a body', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, body: '{}' } as never] } })],
+    ['an unexpected request with an unknown destination', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, destination: 'https://outside.example.invalid' }] } })],
+    ['an unexpected request with an unknown timing', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, timing: 'LATER' }] } })],
+    ['an unexpected request with a reason that is not a code', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, reason: 'blocked because of x' }] } })],
+    ['an unexpected request counted zero times', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: [{ ...UNEXPECTED_REQUEST_ROW, count: 0 }] } })],
+    ['an unlisted count of zero (written only when some were not listed)', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequestsUnlisted: 0 } })],
+    ['the list as an object instead of one array', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests: { requests: [UNEXPECTED_REQUEST_ROW] } as never } })],
+    ['more unexpected requests than the limit', verifiedCreate({ guard: { ...quietGuard(), unexpectedRequests:
+      Array.from({ length: MAX_WRITE_STAGE_UNEXPECTED_REQUESTS + 1 }, (_, index) => ({ ...UNEXPECTED_REQUEST_ROW, pathShape: `/p${String(index)}` })),
+    } })],
     ['a missing result', (({ result: _omitted, ...rest }) => rest)(verifiedCreate())],
     ['a missing human value mark', (({ containsHumanEnteredValues: _omitted, ...rest }) => rest)(verifiedCreate())],
     ['an unknown result', verifiedCreate({ result: 'COMPLETE' as never })],

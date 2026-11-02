@@ -92,10 +92,12 @@ describe('T40a: START of an API write job (the accepted shapes)', () => {
     expect(errorsOf(withApiWrite({ api: api({ recordId: null }) }))).toEqual([]);
   });
 
-  // T40a-fix: API の書き込みの指定の成否の条件と入力の誤りの条件は null。ID の取り方は、API の `recordId` か検証の指定の `recordId` のどちらかがあればよい。
-  it('accepts the two conditions as null, and a record id taken by either the response body key or the verification spec', () => {
+  // T40a-fix: API の書き込みの指定の結果の判定のしかたの印は null（PL-6a: 成否の条件はもうない）。ID の取り方は、API の `recordId` か検証の指定の `recordId` の
+  // どちらかがあればよい。
+  it('accepts the result judgement as null, and a record id taken by either the response body key or the verification spec', () => {
     const verification = apiWrite()['verification'] as Record<string, unknown>;
-    expect(verification).toMatchObject({ successCondition: null, inputErrorCondition: null });
+    expect(verification).toMatchObject({ resultJudgement: null });
+    expect(errorsOf(withApiWrite({ verification: { ...verification, resultJudgement: 'FORM_STRUCTURE' } })).length).toBeGreaterThan(0);
     expect(errorsOf(withApiWrite({ verification: { ...verification, recordId: null } }))).toEqual([]);
     expect(errorsOf(withApiWrite({ api: api({ recordId: null }) }))).toEqual([]);
   });
@@ -156,9 +158,10 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
     ['a form page origin that is not canonical', { formPage: { origin: 'HTTP://127.0.0.1:4173', path: '/admin/members/new' } }],
     ['a form page with a template mark', { formPage: { origin: ORIGIN, path: '/admin/members/{id}/edit' } }],
     // 照合の READ（型でない画面の path は拒む。型の対象の画面は定義の型と同じ）。
+    // OP-R（設計書 4.1.9 の R1）: 登録の画面の 1 つ上（`/admin/members`）は一覧の画面として受けるようになったので、型でない画面の path の見本は、ほかの画面（`/admin`）にした。
     ['a verification READ of a page path that is not a template', { readVerification: {
-      readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: ORIGIN, path: '/admin/members' },
-      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
+      readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: ORIGIN, path: '/admin' },
+      definition: { targetPagePath: '/admin', parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
     ['a template READ whose target page is another path', { readVerification: {
       readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: ORIGIN, path: '/admin/members/1/edit' },
       definition: { targetPagePath: SAMPLE_API_READ_TEMPLATE_PATH, parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } }],
@@ -199,9 +202,10 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
     ['a key that is also a page key', { api: api({ pageKeys: [{ key: 'name', type: 'string' }] }) }, '/write/api/keyFields must have one or more keys'],
     ['a submitter digest of another element', { submitterIdentityDigest: OTHER_DIGEST }, '/write/submitterIdentityDigest'],
     ['a form page with a template mark', { formPage: { origin: ORIGIN, path: '/admin/members/{id}/edit' } }, '/write/formPage'],
+    // OP-R（設計書 4.1.9 の R1）: 登録の画面の 1 つ上（`/admin/members`）は一覧の画面として受けるようになったので、型でない画面の path の見本は、ほかの画面（`/admin`）にした。
     ['a verification READ of a page path that is not a template', { readVerification: {
-      readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: ORIGIN, path: '/admin/members' },
-      definition: { targetPagePath: '/admin/members', parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } },
+      readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: ORIGIN, path: '/admin' },
+      definition: { targetPagePath: '/admin', parameters: {}, expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } } },
     '/write/readVerification/definition must target a READ candidate or a page path template'],
     ['a template READ of another origin', { readVerification: {
       readCheckId: 'rc-page', readCheckRevision: 1, targetPage: { origin: SAMPLE_API_ORIGIN, path: SAMPLE_API_READ_TEMPLATE_PATH },
@@ -252,7 +256,7 @@ describe('T40a: START of an API write job (the rejected shapes)', () => {
     // T40R2-fix（使える度合い）: 書き込みの画面に当たる ID の型も受ける（保存と同じく拒まない。注意は画面に出す。ワーカーは押す前の値と比べる）。
     for (const recordId of [{ source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}/edit' }, { source: 'ELEMENT', selector: '#member-id' },
       { source: 'URL_PATH_PATTERN', pathPattern: '/admin/members/{id}' }]) {
-      expect(errorsOf(withApiWrite({ verification: { successCondition: null, inputErrorCondition: null, recordId } }))).toEqual([]);
+      expect(errorsOf(withApiWrite({ verification: { resultJudgement: null, recordId } }))).toEqual([]);
     }
   });
 
@@ -285,14 +289,13 @@ describe('T40a: the schema and the contract of the API write specification', () 
     expect(propertyNamesWithWords(startApiWrite, secretWords)).toEqual([]);
   });
 
-  it('has only null for the two conditions of the API verification spec, and the record id of the scenario schema or null (T40a-fix)', () => {
+  it('has only null for the result judgement of the API verification spec, and the page record id of the scenario schema or null (T40a-fix, PL-6a)', () => {
     const verification = ((SCHEMA.$defs['startApiWrite'] ?? {})['properties'] as Record<string, Record<string, unknown>>)['verification'] ?? {};
     expect(verification['additionalProperties']).toBe(false);
-    expect([...(verification['required'] as string[])].sort()).toEqual(['inputErrorCondition', 'recordId', 'successCondition']);
+    expect([...(verification['required'] as string[])].sort()).toEqual(['recordId', 'resultJudgement']);
     expect(verification['properties']).toEqual({
-      successCondition: { type: 'null' },
-      inputErrorCondition: { type: 'null' },
-      recordId: { anyOf: [{ $ref: 'urn:beaksight:schema:control:scenario:1#/$defs/recordId' }, { type: 'null' }] },
+      resultJudgement: { type: 'null' },
+      recordId: { anyOf: [{ $ref: 'urn:beaksight:schema:control:scenario:1#/$defs/pageRecordId' }, { type: 'null' }] },
     });
   });
 

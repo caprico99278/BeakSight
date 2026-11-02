@@ -53,7 +53,8 @@ const DIGEST_FACTS: ApprovalDigestFacts = Object.freeze({ profileRevision: 4, au
 
 /** 寄せる前（PRE42-CC の組 2 の前）のコードで求めた値。 */
 const KEY_FIELDS_DIGEST_BEFORE = 'sha256:10b44edc134dddf381bceddd75f54c0a60d1c6210407f7f11a921a24682021f0';
-const APPROVAL_DIGEST_BEFORE = 'sha256:1e0d8aaddb89088549503c3897860d0bb9274a65761a9140430c051825591639';
+// PL-6a: 承認の digest の印を v5 に上げた（検証の指定の項目を置き換えた）ので、値を求め直した（API の項目の値は変わらない。下の項目ごとの値で確かめる）。
+const APPROVAL_DIGEST_BEFORE = 'sha256:5c57fc25b5b93706d15ff786e3b233e3b74bc264dbe810609863d0742e75af80';
 
 describe('CC-102: the one owner of the field identity of the API scenario', () => {
   it('keeps the closed list in the core and the scenario contract re-exports the same frozen list', () => {

@@ -49,6 +49,10 @@
 //   - テンプレートの既定を保存した規則の集まり（`templateDefaultsSaved`。fix round 1）は、保存した関係と一意にする欄の組だけを使う（既定を足さない）。
 //   - 推した規則の写し（`inferredFieldRulesOf`）: 規則の集まりの自動の作成（`rule-set-inference.ts`）が使う。同じ段 1 の判定で推した規則（業務テンプレートと
 //     汎用の規則）だけを返す（推しは副作用の確認に依らない。確認が済むまでメール・電話の欄を止めるのは、保存した規則の判定でも同じ）。
+// - MI-6（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.6、ユーザーの判断 2）: 副作用の確認は承認のダイアログの 1 回にまとめた。判定の
+//   前提（`EvaluationPremise`）に「承認のときに確認する」（`EXTERNAL_NOTIFICATION_AT_APPROVAL`）を渡すと、版に `NO_EXTERNAL_NOTIFICATION` がなくても、
+//   メール・電話の欄を確認済みとして判定し、その欄に印（`confirmationAtApproval`）を付ける。承認の前の画面（入力の規則、シナリオの詳細と一覧）だけが渡す。
+//   前提を渡さない判定（承認、実行の許可の発行、書き込みのワーカー、生成）は、今どおり版の確認の値だけを見る（確認のない版では書き込みを始めない）。
 // - 呼び出し側の誤り（規則の集まりが別のシナリオ、候補の識別の digest がシナリオと違う、API のシナリオが API の指定を持たない）は `RangeError`。
 import {
   API_SCENARIO_TRANSPORT,
@@ -130,6 +134,7 @@ import {
   ruleBaseDateWindowOf,
   ruleDigitCountOf,
   syntheticEmailAddressOf,
+  syntheticTextOf,
   templateDefaultsSavedOf,
   syntheticPhoneFormatOf,
   syntheticPhoneNumberOf,
@@ -167,6 +172,25 @@ export const evaluationApiSpecOf = (scenario: Pick<EvaluationScenario, 'transpor
 const keepFieldNamesOf = (scenario: EvaluationScenario): readonly string[] =>
   (scenario.kind === 'UPDATE' ? scenario.update?.keepFieldNames ?? [] : []);
 
+/**
+ * MI-6: 外部への通知がないことの確認の前提。`SCENARIO` は版の確認の値だけ（既定）、`EXTERNAL_NOTIFICATION_AT_APPROVAL` は承認のダイアログで確認する前提
+ * （承認の前の画面の表示だけ）。
+ */
+export const EXTERNAL_NOTIFICATION_AT_APPROVAL = 'AT_APPROVAL';
+export const EXTERNAL_NOTIFICATION_BY_SCENARIO = 'SCENARIO';
+export type ExternalNotificationPremise = typeof EXTERNAL_NOTIFICATION_AT_APPROVAL | typeof EXTERNAL_NOTIFICATION_BY_SCENARIO;
+
+/** MI-6: 判定の前提（省けば、版の確認の値だけを見る）。 */
+export interface EvaluationPremise {
+  readonly notificationConfirmation?: ExternalNotificationPremise;
+}
+
+/**
+ * MI-C2 項目 18: 承認の前の画面の判定の前提（外部への通知がないことは、承認のダイアログで確認する）。入力の規則の事実（`data-rule-facts.ts`）、シナリオの
+ * 詳細の推測の項目の求め直し、自動の下書きの推しが使う唯一の定数（同じ形を書き写さない）。承認・実行の許可の発行・書き込みのワーカー・生成は渡さない。
+ */
+export const PRE_APPROVAL_EVALUATION_PREMISE: EvaluationPremise = Object.freeze({ notificationConfirmation: EXTERNAL_NOTIFICATION_AT_APPROVAL });
+
 /** 判定が見る規則の集まりの項目（FM2c: 保存の前の中身も判定できるように、id・版・時刻は見ない）。 */
 export type EvaluationRuleSet = Pick<RuleSetRevision, 'scenarioId' | 'fieldRules' | 'relations' | 'uniqueKeyFieldNames' | 'templateDefaultsSaved'>;
 
@@ -188,6 +212,11 @@ export interface FieldEvaluation {
   /** 当てた規則（人の規則か、推した規則。決まらなければ null）。 */
   readonly rule: FieldRule | null;
   readonly externalDeliveryKinds: readonly ExternalDeliveryKind[];
+  /**
+   * MI-6: 「承認のときに確認する」前提で作れる欄にした、メール・電話の欄の印（前提を渡し、版に `NO_EXTERNAL_NOTIFICATION` がなく、前提がなければ
+   * `EXTERNAL_DELIVERY_BLOCKED` だった欄だけ `true`。ほかは持たない）。
+   */
+  readonly confirmationAtApproval?: true;
 }
 
 /** 規則の集まりの判定。 */
@@ -219,6 +248,8 @@ export type FieldPlan =
   | { readonly kind: 'PHONE'; readonly format: SyntheticPhoneFormat; readonly issueOf: TextConstraintCheck }
   /** FM2c: 番号・コード（`digits` 桁の数字。欄の pattern の桁数）。 */
   | { readonly kind: 'DIGIT_CODE'; readonly digits: number; readonly issueOf: TextConstraintCheck }
+  /** OP-2: 作り物の文字（`syntheticTextOf`。欄の制約に合わなければ作り直す）。 */
+  | { readonly kind: 'GENERIC_TEXT'; readonly issueOf: TextConstraintCheck }
   | {
     readonly kind: 'DERIVED_TOTAL';
     readonly field: CandidateField;
@@ -248,7 +279,7 @@ const conflict = (detail: Extract<RuleProblem, { code: 'RULE_CONFLICT' }>['detai
 const BLOCKED: RuleProblem = { code: 'EXTERNAL_DELIVERY_BLOCKED', detail: 'EXTERNAL_NOTIFICATION_UNCONFIRMED' };
 
 const TEXT_INPUT_TYPES: readonly CandidateFieldType[] = Object.freeze(['text', 'search']);
-const GENERIC_KINDS: readonly SemanticKind[] = Object.freeze(['GENERIC_NUMBER', 'GENERIC_DATETIME', 'GENERIC_CHOICE', 'GENERIC_COLOR']);
+const GENERIC_KINDS: readonly SemanticKind[] = Object.freeze(['GENERIC_NUMBER', 'GENERIC_DATETIME', 'GENERIC_CHOICE', 'GENERIC_COLOR', 'GENERIC_TEXT']);
 const CONTACT_KINDS: readonly SemanticKind[] = Object.freeze(['EMAIL', 'PHONE']);
 const FREE_RULE_KINDS: readonly SemanticKind[] = Object.freeze(['FIXED_LIST', 'OUT_OF_TEMPLATE']);
 const UNIT_PRICE_KINDS: readonly SemanticKind[] = Object.freeze(['UNIT_PRICE', 'GENERIC_NUMBER']);
@@ -405,8 +436,8 @@ const formTargetOf = (candidate: DiscoveryCandidate, name: string): SendTarget =
   };
 };
 
-/** 制約のない欄の制約（probe は欄の制約を残さない。T38e）。 */
-const NO_FIELD_CONSTRAINTS: CandidateFieldConstraints = Object.freeze(
+/** 制約のない欄の制約（probe は欄の制約を残さない。T38e。OP-2: 規則 F が API の鍵の欄を作るのにも使う）。 */
+export const NO_FIELD_CONSTRAINTS: CandidateFieldConstraints = Object.freeze(
   Object.fromEntries(FIELD_CONSTRAINT_NAMES.map((name) => [name, null])) as CandidateFieldConstraints,
 );
 
@@ -718,6 +749,12 @@ const planOf = (field: CandidateField, rule: FieldRule, source: RuleSource, deri
     const format = SYNTHETIC_PHONE_FORMATS.find((candidate) => check(syntheticPhoneNumberOf(candidate, 0)) === null);
     return format === undefined ? unplanned(needs('PHONE_FORMAT_UNSUPPORTED')) : planned({ kind: 'PHONE', format, issueOf: check });
   }
+  if (kind === 'GENERIC_TEXT') {
+    // OP-2: 作り物の文字（欄の長さ・形の制約に、見本の値が合わなければ作らない）。
+    const check = textConstraintCheckOf(field.constraints);
+    const detail = unsatisfiedDetailOf([syntheticTextOf(0)], check);
+    return detail === null ? planned({ kind: 'GENERIC_TEXT', issueOf: check }) : unplanned(needs(detail));
+  }
   if (kind === 'DIGIT_CODE') {
     // FM2c: 欄の pattern の桁数の数字（pattern が数字だけの固定の桁数でなければ作らない）。fix round 1: 保存した規則の桁の数があれば、それを使い
     // （API の鍵の欄。欄の制約に合うかは下で確かめる）。
@@ -898,6 +935,8 @@ interface Working {
   source: RuleSource | null;
   plan: FieldPlan | null;
   readonly external: readonly ExternalDeliveryKind[];
+  /** MI-6: 「承認のときに確認する」前提で作れる欄にしたか。 */
+  readonly atApproval: boolean;
 }
 
 /** 送る欄の名前（重なりを除き、UTF-16 のコード単位の順）。 */
@@ -915,7 +954,7 @@ const assertTargetCandidate = (scenario: EvaluationScenario, candidate: Discover
 };
 
 /** 推した規則を作るときの推しの選び（FM2R fix round 1。I-3。判定のたびの推しは既定の選びのまま）。 */
-const SAVED_RULE_INFERENCE: InferenceOptions = Object.freeze({ digitCode: true });
+const SAVED_RULE_INFERENCE: InferenceOptions = Object.freeze({ digitCode: true, genericText: true });
 
 /** 推した規則 1 件と、その規則を当てる欄（FM2c。規則の集まりの自動の作成が使う）。 */
 export interface InferredFieldRule {
@@ -951,13 +990,14 @@ export const inferredFieldRulesOf = (scenario: EvaluationScenario, candidate: Di
 
 /**
  * 判定と、値の作り方を求める（純粋。入力を変えない）。FM2c: 基準日（実行の許可の発行日。Asia/Tokyo の `YYYY-MM-DD`）は、保存した規則の基準日からの
- * 幅の値の範囲に使う（生成が渡す。渡さなければ参照の日 `EVALUATION_REFERENCE_BASE_DATE`）。
+ * 幅の値の範囲に使う（生成が渡す。渡さなければ参照の日 `EVALUATION_REFERENCE_BASE_DATE`）。MI-6: 前提（`premise`）は承認の前の画面だけが渡す。
  */
 export const planRuleSet = (
   ruleSet: EvaluationRuleSet,
   scenario: EvaluationScenario,
   candidate: DiscoveryCandidate,
   baseDate: string = EVALUATION_REFERENCE_BASE_DATE,
+  premise: EvaluationPremise = {},
 ): RuleSetPlan => {
   if (ruleSet.scenarioId !== scenario.scenarioId) {
     throw new RangeError('the rule set belongs to another scenario');
@@ -965,6 +1005,8 @@ export const planRuleSet = (
   assertTargetCandidate(scenario, candidate);
   const api = evaluationApiSpecOf(scenario);
   const confirmed = scenario.sideEffectConfirmations.NO_EXTERNAL_NOTIFICATION;
+  // MI-6: 承認のときに確認する前提なら、版に確認がなくても、止めた欄だけを確認済みとして判定し直す（印を付ける）。
+  const atApproval = !confirmed && premise.notificationConfirmation === EXTERNAL_NOTIFICATION_AT_APPROVAL;
   const humanRules = new Map(ruleSet.fieldRules.map((rule) => [rule.fieldName, rule]));
   const selected = selectedFieldNamesOf(scenario);
 
@@ -972,7 +1014,10 @@ export const planRuleSet = (
   const working: Working[] = selected.map((fieldName) => {
     const target = sendTargetOf(candidate, api, fieldName);
     const decision = decideRule(fieldName, target, humanRules.get(fieldName), confirmed);
-    return { fieldName, jsonType: target.jsonType, ...decision };
+    if (atApproval && decision.problem === BLOCKED) {
+      return { fieldName, jsonType: target.jsonType, ...decideRule(fieldName, target, humanRules.get(fieldName), true), atApproval: true };
+    }
+    return { fieldName, jsonType: target.jsonType, ...decision, atApproval: false };
   });
   const decided = working.filter((item) => item.problem === null && item.rule !== null);
   const rules = new Map(decided.map((item) => [item.fieldName, item.rule as FieldRule]));
@@ -1067,6 +1112,7 @@ export const planRuleSet = (
       source: item.source,
       rule: item.rule,
       externalDeliveryKinds: item.external,
+      ...(item.atApproval ? { confirmationAtApproval: true as const } : {}),
     }) satisfies FieldEvaluation),
     ...unselectedRequired.map((fieldName) => ({
       fieldName,
@@ -1110,6 +1156,10 @@ export const planRuleSet = (
   });
 };
 
-/** 規則の集まりを、シナリオと対象の候補に照らして判定する（純粋。入力を変えない。凍結）。 */
-export const evaluateRuleSet = (ruleSet: EvaluationRuleSet, scenario: EvaluationScenario, candidate: DiscoveryCandidate): RuleSetEvaluation =>
-  planRuleSet(ruleSet, scenario, candidate).evaluation;
+/** 規則の集まりを、シナリオと対象の候補に照らして判定する（純粋。入力を変えない。凍結）。MI-6: 前提は承認の前の画面だけが渡す。 */
+export const evaluateRuleSet = (
+  ruleSet: EvaluationRuleSet,
+  scenario: EvaluationScenario,
+  candidate: DiscoveryCandidate,
+  premise: EvaluationPremise = {},
+): RuleSetEvaluation => planRuleSet(ruleSet, scenario, candidate, EVALUATION_REFERENCE_BASE_DATE, premise).evaluation;

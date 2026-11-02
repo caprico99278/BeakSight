@@ -934,6 +934,10 @@ const profileBindingErrorsOf = (
   return errors;
 };
 
+/** OP-1: 成功の条件が空か（path が空で、セレクタもない。この条件は、ログインの段で成功にしない）。 */
+export const isEmptySuccessCondition = (setup: Pick<AuthSetup, 'successCondition'>): boolean =>
+  setup.successCondition.pathPrefix.length === 0 && setup.successCondition.selector === null;
+
 /** 値の規則の誤り（すべて）。 */
 const ruleErrorsOf = (
   setup: AuthSetup,
@@ -944,14 +948,17 @@ const ruleErrorsOf = (
   const approved = stringsOf(ownFieldOf(profileSide.copy, 'approvedTestOrigins'));
   // T34a: 承認したサービスの Origin（項目がなければ空）。版 3 のスクリプトの送信先とログインに伴う送信が使う。
   const services = stringsOf(ownFieldOf(profileSide.copy, 'approvedServiceOrigins'));
+  // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D3。DEF-181）: 手動のログインのプロファイルだけ、成功の条件を空（path もセレクタもない）にして
+  // よい（手でのログインの後に、観察した成功の画面の path が埋める。空の条件は、ログインの段で成功にしない）。
+  const deferredSuccess = ownFieldOf(profileSide.copy, 'auth') === MANUAL_STRATEGY && isEmptySuccessCondition(setup);
   const errors: AuthSetupValidationError[] = [
     ...profileSide.errors,
     ...profileBindingErrorsOf(setup, profileSide.copy, context),
     ...loginStartUrlErrorsOf(setup.loginStartUrl, approved),
     ...endpointErrorsOf(setup, approved),
-    ...pathErrorsOf(SUCCESS_PATH_PREFIX_LOCATION, setup.successCondition.pathPrefix),
+    ...(deferredSuccess ? [] : pathErrorsOf(SUCCESS_PATH_PREFIX_LOCATION, setup.successCondition.pathPrefix)),
     ...optionalSelectorErrorsOf(SUCCESS_SELECTOR_LOCATION, setup.successCondition.selector),
-    ...successAmbiguityErrorsOf(setup),
+    ...(deferredSuccess ? [] : successAmbiguityErrorsOf(setup)),
     ...strategyErrorsOf(setup, profileSide.copy),
     ...(setup.automatedLogin === null ? [] : automatedLoginContentErrorsOf(setup, setup.automatedLogin)),
     ...(setup.sessionLostCondition.pathPrefix === null

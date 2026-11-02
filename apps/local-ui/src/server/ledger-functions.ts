@@ -38,6 +38,8 @@ export interface LedgerEntryView {
   readonly readVerification: ReadCheckResult | null;
   readonly reservationState: SettledReservationState | null;
   readonly recordedAt: string;
+  /** PL-5（設計書 3 章の 1）: 行の「何を作ったか」の、書き込みの手順が操作を見つけた画面のアドレスの後ろ（書き込みの手順が読めなければ null）。 */
+  readonly pagePath: string | null;
   /** その ID への UPDATE の回数と、最後の 1 回の結果（締める前は null）とジョブ。 */
   readonly updates: {
     readonly count: number;
@@ -70,7 +72,7 @@ interface ProfileKeyRequest {
   readonly profileId: string;
 }
 
-const entryOf = (entry: AuditedDataLedgerEntry): LedgerEntryView => ({
+const entryOf = (entry: AuditedDataLedgerEntry, pagePaths: ReadonlyMap<string, string>): LedgerEntryView => ({
   jobId: entry.jobId,
   runId: entry.runId,
   scenarioId: entry.scenarioId,
@@ -82,6 +84,7 @@ const entryOf = (entry: AuditedDataLedgerEntry): LedgerEntryView => ({
   readVerification: entry.readVerification,
   reservationState: entry.reservationState,
   recordedAt: isoTimestampOf(entry.recordedAt),
+  pagePath: pagePaths.get(entry.scenarioId) ?? null,
   updates: {
     count: entry.updates.count,
     lastResult: entry.updates.last?.result ?? null,
@@ -102,11 +105,13 @@ export const auditedDataLedgerPageFn = createServerFn({ method: 'GET' })
       return { profile, eligible: false, entries: [], scenarios: [] };
     }
     const now = new Date();
+    const scenarios = listScenarios(localUiStore(), stored.profile.profileId);
+    const pagePaths = new Map(scenarios.map((scenario) => [scenario.scenarioId, scenario.evidence.page.path]));
     return {
       profile,
       eligible: true,
-      entries: readAuditedDataLedger(localUiStore(), stored.profile.profileId).map(entryOf),
-      scenarios: listScenarios(localUiStore(), stored.profile.profileId).map((scenario) => ({
+      entries: readAuditedDataLedger(localUiStore(), stored.profile.profileId).map((entry) => entryOf(entry, pagePaths)),
+      scenarios: scenarios.map((scenario) => ({
         scenarioId: scenario.scenarioId,
         kind: scenario.current.kind,
         revision: scenario.revision,

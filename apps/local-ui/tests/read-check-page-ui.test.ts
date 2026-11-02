@@ -43,6 +43,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 /** 画面の操作を待つ上限（ms）。 */
 const UI_TIMEOUT_MS = 15_000;
@@ -190,6 +191,15 @@ afterAll(async () => {
 });
 
 describe('T37d: the READ check definitions of a page path on the local UI', () => {
+  // MI-C2 項目 19: ルータは根の生の search も子へ渡すので、閉じた一覧にない知らせの値では、知らせの枠を出さない。一覧の値なら出す。
+  it('shows no notice for a search value outside the closed list', async () => {
+    const unknown = await openPage(`/read-checks/${PROFILE_ID}?notice=foo`);
+    await unknown.locator('h1.page-title').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await unknown.getByTestId('read-check-notice').count()).toBe(0);
+    const shown = await openPage(`/read-checks/${PROFILE_ID}?notice=removed`);
+    await shown.getByTestId('read-check-notice').waitFor({ timeout: UI_TIMEOUT_MS });
+  });
+
   it('chooses between reading a candidate and reading a page, and offers only the input without a discovery result', async () => {
     const page = await openPage(`/read-checks/${PROFILE_ID}/new`);
     const kinds = page.getByTestId('read-check-target-kind');
@@ -245,6 +255,35 @@ describe('T37d: the READ check definitions of a page path on the local UI', () =
     expect(await page.getByTestId('read-check-create-page').count()).toBe(1);
   }, SCENARIO_TIMEOUT_MS);
 
+  // MI-7（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.8）: 対象の種類は来たリンクで決め、radio を出さない（リンクなしのときだけ出す）。画面の
+  // path は、直近の発見の結果の先頭を既定にする。期待の既定（最初の期待の種類）は変えない。
+  it('decides the target kind by the link without the radio, and chooses the first page path by default', async () => {
+    const fromPage = await openPage(`/read-checks/${PROFILE_ID}/new?target=PAGE`);
+    const choice = fromPage.getByTestId('read-check-page-path-choice');
+    await choice.waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await fromPage.getByTestId('read-check-target-kind').count()).toBe(0);
+    expect(await choice.inputValue()).toBe(ADMIN_PATH);
+    expect(await fromPage.getByTestId('read-check-page-path').inputValue()).toBe(ADMIN_PATH);
+    const defaultKind = await fromPage.locator('select[name$="-kind"]').inputValue();
+    await screenshot(fromPage, 'mi7-read-check-from-page');
+
+    // 候補から来た（候補の識別の digest つき）: 種類は候補（画面の path の欄は出さない）。
+    const fromCandidate = await openPage(`/read-checks/${PROFILE_ID}/new?candidate=${encodeURIComponent(`sha256:${'0'.repeat(64)}`)}`);
+    await fromCandidate.getByTestId('read-check-candidate-missing').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await fromCandidate.getByTestId('read-check-target-kind').count()).toBe(0);
+    expect(await fromCandidate.getByTestId('read-check-page').count()).toBe(0);
+
+    // リンクなし: radio を出し、選んでも radio を出したまま（画面の path の既定も先頭）。
+    const plain = await openPage(`/read-checks/${PROFILE_ID}/new`);
+    await plain.getByTestId('read-check-target-kind').waitFor({ timeout: UI_TIMEOUT_MS });
+    await plain.locator('input[data-target-kind="PAGE"]').check();
+    await plain.getByTestId('read-check-page-path-choice').waitFor({ timeout: UI_TIMEOUT_MS });
+    expect(await plain.getByTestId('read-check-target-kind').count()).toBe(1);
+    expect(await plain.getByTestId('read-check-page-path-choice').inputValue()).toBe(ADMIN_PATH);
+    // 期待の既定（最初の期待の種類）は、リンクで来たときと同じ（変えていない）。
+    expect(await plain.locator('select[name$="-kind"]').inputValue()).toBe(defaultKind);
+  }, SCENARIO_TIMEOUT_MS);
+
   it('shows the target kind, the page path and the detail of UNDETERMINED in the results', async () => {
     const view = await valueOf<{ definitions: readonly { readCheckId: string; revision: number }[] }>('readCheckPageFn', 'GET', { profileId: PROFILE_ID });
     const [definition] = view.definitions;
@@ -269,7 +308,7 @@ describe('T37d: the READ check definitions of a page path on the local UI', () =
     });
     const page = await openPage(`/read-checks/${PROFILE_ID}`);
     const result = page.locator(`[data-testid="read-check-result"][data-read-check-id="${definition.readCheckId}"]`);
-    await result.waitFor({ timeout: UI_TIMEOUT_MS });
+    await result.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await result.getAttribute('data-target-kind')).toBe('PAGE');
     expect(await result.getAttribute('data-detail')).toBe('SERVICE_READ_REFUSED');
     expect(await result.locator('th code').textContent()).toBe(DETAIL_PATH);
@@ -309,7 +348,7 @@ describe('T37d: the READ check definitions of a page path on the local UI', () =
     });
     const readPage = await openPage(`/read-checks/${PROFILE_ID}`);
     const job = readPage.locator(`[data-testid="read-check-job"][data-job-id="${readJobId}"]`);
-    await job.waitFor({ timeout: UI_TIMEOUT_MS });
+    await job.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     const endReason = job.getByTestId('read-check-end-reason');
     expect(await endReason.getAttribute('data-reason')).toBe('SITE_UNAVAILABLE');
     expect(await endReason.textContent()).toContain(READ_CHECK_END_REASON_CATALOG.SITE_UNAVAILABLE.label);
@@ -344,6 +383,8 @@ describe('T37d: the READ check definitions of a page path on the local UI', () =
 
     // ジョブの画面: 確かめ直しを待っていることの知らせ（監査と同じ文）。
     const jobPage = await openPage(`/jobs/${discoveryJobId}`);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 終わった作業の最後の知らせは、たたんだ詳しい内容の中。
+    await openAdvancedSettings(jobPage, 'job-details', UI_TIMEOUT_MS);
     const notice = jobPage.getByTestId('job-notice');
     await notice.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await notice.textContent()).toBe(siteUnavailableRecheckText(NOTICE.url, formatDuration(NOTICE.delayMs), NOTICE.attempt, NOTICE.maxAttempts));
@@ -370,7 +411,7 @@ describe('T37d: the READ check definitions of a page path on the local UI', () =
     });
     const readPage = await openPage(`/read-checks/${PROFILE_ID}`);
     const job = readPage.locator(`[data-testid="read-check-job"][data-job-id="${jobId}"]`);
-    await job.waitFor({ timeout: UI_TIMEOUT_MS });
+    await job.waitFor({ state: 'attached', timeout: UI_TIMEOUT_MS });
     expect(await job.getByTestId('read-check-end-reason').getAttribute('data-reason')).toBe('MAX_RUNTIME_REACHED');
     expect(await job.getByTestId('read-check-end-reason').textContent()).toContain(READ_CHECK_END_REASON_CATALOG.MAX_RUNTIME_REACHED.description);
     expect(await job.getByTestId('read-check-end-reason-next').textContent()).toBe(LOCAL_UI_JOB_NEXT_STEPS.readCheckEndReasons.MAX_RUNTIME_REACHED);

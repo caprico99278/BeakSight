@@ -24,6 +24,7 @@ import {
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../helpers/auth-setup-samples.js';
 import {type AuthSetup } from '../../src/control/auth/auth-setup-contracts.js';
 import { MIN_PROFILE_REVISION } from '../../src/control/contracts.js';
+import { readAuditedDataLedger } from '../../src/control/actions/write-result-facts.js';
 import { saveRuleSetAndAttach } from '../../src/control/data-rules/rule-store.js';
 import type { AuditJobManager } from '../../src/control/job/audit-job-manager.js';
 import { discoveryIndexEntryOf, recordDiscoveryCandidates } from '../../src/control/job/discovery-index-store.js';
@@ -171,7 +172,7 @@ const draftOf = (candidate: DiscoveryCandidate, fieldNames: readonly string[], a
   limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
   approvalTtlDays: 30,
   verification: {
-    successCondition: null, inputErrorCondition: null, recordId: null,
+    resultJudgement: null, recordId: null,
     readVerification: { readCheckId: READ_CHECK_ID, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: expectedField }] },
   },
   api: { shapeDigest: candidate.submissionProbe?.shapeDigest ?? '', pageKeys: [], filterName: null, recordId: null, ledger: null, ...api },
@@ -307,7 +308,7 @@ describe('T41b: an API UPDATE from the grant to the START', () => {
           targetRecordId: REGISTERED_IDS[1],
           knownKeptValues: [{ key: 'email', value: 'sample0001@example.invalid' }, { key: 'score', value: '1' }],
         },
-        verification: { successCondition: null, inputErrorCondition: null, recordId: null },
+        verification: { resultJudgement: null, recordId: null },
         readVerification: { definition: { targetPagePath: TEMPLATE_PATH } },
       },
     });
@@ -347,5 +348,23 @@ describe('T41b: an API UPDATE from the grant to the START', () => {
       scenarioId: UPDATE_ID, expectedRevision: revisionOf(UPDATE_ID), grantId: 'grant-u2', jobId: 'job-u2', count: 1, external: facts, at: ISSUE_AT,
       expectedTargetRecordId: REGISTERED_IDS[1],
     })).toMatchObject({ ok: false, reason: 'SCENARIO_API_FILTER_NOT_BOUND_TO_LEDGER_ID' });
+  });
+  // OP-H（撮影 UI-W4 の不具合 1）: API の UPDATE の書き込みの後も、作ったデータの一覧（台帳）が読める。API の UPDATE の台帳の参照は `api.ledger`
+  // （唯一の決まり `updateLedgerScenarioIdOf`）。更新は、台帳の登録の同じ ID の行にだけ数える。
+  it('reads the audited data ledger after an API UPDATE write, counting it on the registration of its ledger', () => {
+    seedWriteResultForTest(database, {
+      profileId: PROFILE_ID, scenarioId: UPDATE_ID, scenarioRevision: revisionOf(UPDATE_ID), grantId: 'grant-u3', jobId: 'job-u3',
+      external: facts, at: ISSUE_AT, submittedValues: { name: '更新一郎' }, expectedTargetRecordId: REGISTERED_IDS[1],
+      report: {
+        submission: 'SENT', blockReason: null, httpStatus: 200, responseJudgement: 'SUCCESS', recordId: REGISTERED_IDS[1], readVerification: 'MATCHED',
+        submittedAt: ISSUE_AT,
+        updateEvidence: { fields: [{ fieldName: 'name', role: 'CHANGED', previousValue: '登録 1', newValue: '更新一郎', matched: true }] },
+      },
+    });
+    const ledger = readAuditedDataLedger(database, PROFILE_ID);
+    expect(ledger.map(({ jobId, recordId, updates }) => [jobId, recordId, updates.count, updates.last?.jobId ?? null])).toEqual([
+      ['job-c1', REGISTERED_IDS[1], 1, 'job-u3'],
+      ['job-c0', REGISTERED_IDS[0], 0, null],
+    ]);
   });
 });

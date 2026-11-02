@@ -94,8 +94,10 @@ import {
   type SearchedPlace,
 } from './helpers/secret-markers.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
-import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
+import { waitForJobViaServerFunctions, waitForNoActiveJobViaServerFunctions, type ServerFunctionJobRow } from './helpers/server-function-job-wait.ts';
+import { createProfileInStore, saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 const IS_WINDOWS = process.platform === 'win32';
 const SKIP_REASON = 'the automated login and the credential screen save with the real DPAPI, which exists only on Windows';
@@ -326,9 +328,13 @@ const registerOnPage = async (profileId: string, username: string, password: str
     (count === 0 ? null : page.getByTestId('credential-rejection').getAttribute('data-reason')));
 };
 
-/** 資格情報の画面で、ユーザー名だけか、パスワードだけを変える。最後の変更の種類を返す。 */
+/**
+ * 資格情報の画面で、ユーザー名だけか、パスワードだけを変える。最後の変更の種類を返す。PL-4（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 変える欄は
+ * 閉じた詳しい内容の中なので開く。最後の変更の種類は画面に出さないので、画面の値の Server Function で読む。
+ */
 const changeOnPage = async (profileId: string, kind: 'username' | 'password', value: string): Promise<string | null> => {
   const page = await openPage(`/credentials/${profileId}`);
+  await openAdvancedSettings(page, 'credential-advanced-settings', UI_TIMEOUT_MS);
   await page.getByTestId('credential-change-form').waitFor({ timeout: UI_TIMEOUT_MS });
   if (kind === 'username') {
     await page.getByLabel(credentialText.change.changeUsername).check();
@@ -341,12 +347,13 @@ const changeOnPage = async (profileId: string, kind: 'username' | 'password', va
   await page.getByTestId('credential-change-submit').click();
   await waitForCredentialOutcome(page);
   expect(await page.getByTestId('credential-rejection').count()).toBe(0);
-  return page.getByTestId('credential-last-change').getAttribute('data-kind');
+  return (await valueOf<{ credential: { lastChangeKind: string } | null }>('getCredentialPageFn', 'GET', { profileId })).credential?.lastChangeKind ?? null;
 };
 
-/** 資格情報の画面で、確かめのダイアログの後に削除する。 */
+/** 資格情報の画面で、確かめのダイアログの後に削除する（PL-4: 削除は閉じた詳しい内容の中なので開く）。 */
 const removeOnPage = async (profileId: string): Promise<void> => {
   const page = await openPage(`/credentials/${profileId}`);
+  await openAdvancedSettings(page, 'credential-advanced-settings', UI_TIMEOUT_MS);
   await page.getByTestId('credential-remove').click();
   const dialog = page.getByRole('dialog', { name: credentialText.remove.title });
   await dialog.waitFor({ timeout: UI_TIMEOUT_MS });
@@ -395,24 +402,36 @@ const jobIdOf = async (page: Page): Promise<string> => {
 };
 
 /** ジョブの画面で、終わった状態が出るまで待って、HTML を集める。 */
-const snapshotEndedJob = async (page: Page): Promise<void> => {
+const snapshotEndedJob = async (page: Page, jobId: string): Promise<void> => {
+  // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 5）: 見ていた点検が成功で終わると、サイトの詳細へ自動で移る。終わった作業の画面を開き直して
+  // から記録する（開き直した画面は移らない）。
+  await page.goto(new URL(`/jobs/${jobId}`, page.url()).href);
   await page.locator('[data-testid="job-state"]:not([data-state="STARTING"]):not([data-state="RUNNING"]):not([data-state="STOPPING"])')
     .waitFor({ timeout: JOB_TIMEOUT_MS });
   await snapshot(page);
 };
 
-/** ログインの確かめの画面から、ログインの確かめを始める。ジョブの画面とジョブの ID を返す。 */
+/**
+ * ログインの確かめを始め、ジョブの画面を開く。ジョブの画面とジョブの ID を返す。PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 1、6 章の
+ * 最後）: ログインの確かめの画面のログインだけを試すボタンはなくした（点検の最初の自動ログインで兼ねる）ので、ジョブは開始の Server Function で始める。
+ * ログインの確かめの画面（止めた自動ログインを再開する入口）は開いて、HTML を集める。
+ */
 const startLoginCheckOnPage = async (profileId: string): Promise<{ readonly page: Page; readonly jobId: string }> => {
-  const page = await openPage(`/login-check/${profileId}`);
-  await page.getByTestId('login-check-start').click();
-  return { page, jobId: await jobIdOf(page) };
+  const check = await openPage(`/login-check/${profileId}`);
+  await check.getByTestId('login-check-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+  await snapshot(check);
+  const { revision } = await valueOf<{ revision: number }>('auditStartSummaryFn', 'GET', { profileId });
+  const started = await valueOf<{ ok: boolean; jobId: string }>('startLoginCheckFn', 'POST', { profileId, expectedRevision: revision });
+  expect(started.ok).toBe(true);
+  jobIds.push(started.jobId);
+  return { page: await openPage(`/jobs/${started.jobId}`), jobId: started.jobId };
 };
 
 /** ログインの確かめを始めて、終わるまで待つ。 */
 const loginCheckOnPage = async (profileId: string): Promise<JobDetail> => {
   const { page, jobId } = await startLoginCheckOnPage(profileId);
   const job = await waitForJobEnd(jobId);
-  await snapshotEndedJob(page);
+  await snapshotEndedJob(page, jobId);
   return job;
 };
 
@@ -420,11 +439,23 @@ const loginCheckOnPage = async (profileId: string): Promise<JobDetail> => {
 const auditOnPage = async (profileId: string, startNew: boolean): Promise<JobDetail> => {
   const page = await openPage(`/start/${profileId}`);
   await page.getByTestId('start-login').waitFor({ timeout: UI_TIMEOUT_MS });
-  await page.getByRole('radio', { name: startNew ? auditText.start.startNew : auditText.start.resume }).check();
+  // PL-3（設計書 4 章の 4）: 始め方の選択は、前回の点検が最後まで終わらなかったときだけ、たたんだ詳しい内容に出る（既定は続きから）。
+  if (await page.locator('input[name="start-mode"]').count() > 0) {
+    await openAdvancedSettings(page, 'start-advanced-settings', UI_TIMEOUT_MS);
+    await page.getByRole('radio', { name: startNew ? auditText.start.startNew : auditText.start.resume }).check();
+  } else {
+    expect(startNew).toBe(true);
+  }
   await page.getByRole('button', { name: auditText.start.submit }).click();
   const jobId = await jobIdOf(page);
   const job = await waitForJobEnd(jobId);
-  await snapshotEndedJob(page);
+  // PL-3（判断 3）: 「点検を始める」は、まとめて実行を始める。残りのステップも終わるまで待つ（ログインは最初の段の 1 回だけ）。
+  await waitForNoActiveJobViaServerFunctions(
+    () => valueOf<readonly ServerFunctionJobRow[]>('listAuditJobsFn', 'GET'),
+    profileId,
+    { limitMs: JOB_TIMEOUT_MS, stepMs: POLL_MS },
+  );
+  await snapshotEndedJob(page, jobId);
   return job;
 };
 
@@ -433,10 +464,11 @@ const passMinimumInterval = (profileId: string): void => {
   expect(shiftAutoLoginAttemptsBack(databasePath(), profileId, AUTO_LOGIN_MIN_INTERVAL_MS)).toBeGreaterThan(0);
 };
 
-/** 自動ログインを止めているか（資格情報の画面の値）。 */
+/** 自動ログインを止めているか（資格情報の画面の値。PL-4: 止めていないときは、停止の行を出さない）。 */
 const isHeld = async (profileId: string): Promise<boolean> => {
   const page = await openPage(`/credentials/${profileId}`);
-  return (await page.getByTestId('credential-hold').getAttribute('data-held')) === 'yes';
+  await page.getByTestId('credential-summary').waitFor({ timeout: UI_TIMEOUT_MS });
+  return (await page.locator('[data-testid="credential-hold"][data-held="yes"]').count()) > 0;
 };
 
 /** fixture の自動ログインの認証の設定。 */
@@ -494,20 +526,19 @@ const siteSetupOf = (profileId: string, site: AuthenticatedSite): Record<string,
 /** 自動ログインのプロファイルと認証の設定を作る（ターゲット設定は、監査の対象の Origin だけを許す）。 */
 const prepareProfile = async (profileId: string, origin: string, startPath: string, setup: Record<string, unknown>): Promise<void> => {
   const targetConfigPath = writeAuthTargetConfig(rootOf(), profileId, origin, startPath, MAX_PAGES);
-  expect(await valueOf('createProfileFn', 'POST', {
-    profile: {
-      schemaVersion: 'beaksight-profile/1',
-      profileId,
-      revision: FIRST_REVISION,
-      targetConfigPath,
-      environment: 'TEST',
-      mode: 'TEST_AUTH_PASSIVE',
-      auth: 'AUTOMATED_LOGIN',
-      approvedTestOrigins: [origin],
-      environmentEvidenceRef: 't26f-evidence',
-    },
+  // MI-F1（設計書 4.7.1 の 2）: 自動ログインのプロファイルは、画面の作成の口では作れない（切り替えだけで入る）。テストの準備は、保存の部品で直接作る。
+  expect(await createProfileInStore(rootOf(), {
+    schemaVersion: 'beaksight-profile/1',
+    profileId,
+    revision: FIRST_REVISION,
+    targetConfigPath,
+    environment: 'TEST',
+    mode: 'TEST_AUTH_PASSIVE',
+    auth: 'AUTOMATED_LOGIN',
+    approvedTestOrigins: [origin],
+    environmentEvidenceRef: 't26f-evidence',
   })).toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', { setup })).toMatchObject({ ok: true });
+  expect(await saveAuthSetupRequestInStore(root, { setup })).toMatchObject({ ok: true });
 };
 
 /** 認証つきの fixture のサイトの正しい資格情報（値はテストの process の中だけ。目印として覚える）。 */
@@ -814,7 +845,7 @@ describe.skipIf(!IS_WINDOWS)(`T26f: no credential marker anywhere in the automat
     expect(workerPid).toBeGreaterThan(0);
     process.kill(workerPid);
     const job = await waitForJobEnd(jobId);
-    await snapshotEndedJob(page);
+    await snapshotEndedJob(page, jobId);
     expect(job).toMatchObject({ jobKind: 'LOGIN_CHECK', state: 'INTERRUPTED', autoLogin: { result: 'AUTH_RESULT_UNKNOWN', submitted: 'UNKNOWN' } });
     expect(await isHeld(CRASH_PROFILE)).toBe(true);
     await expectNoMarkerAnywhere('worker died');

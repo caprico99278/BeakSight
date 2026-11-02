@@ -129,6 +129,29 @@ describe('generic rules: number and range', () => {
     expect([...sampleValues(fieldOf('number', { min: '3', max: '3' }))]).toEqual(['3']);
     expect([...sampleValues(fieldOf('number', { min: '1', max: '1.5', step: '1' }))]).toEqual(['1']);
   });
+
+  // OP-O（O2 の (b)）: 数の欄に入れた値は、画面が数として形を整えても（先頭の 0 を落とす、小数を整える、指数の表記にする）変わらない形にする（ブラウザと
+  // ページの JS の数の形 `String(Number(value))` と同じ）。min・max・step に合う値で、その形で表せない値を含む空間は作らない（人の規則が要る）。
+  const keepsNumberForm = (value: string): boolean => String(Number(value)) === value;
+
+  it('produces only values whose form the page keeps when it formats the number (OP-O O2 b)', () => {
+    for (const constraints of [
+      { min: '1', max: '100' }, { min: '-5', max: '5', step: '0.25' }, { min: '0.001', max: '0.01', step: '0.001' }, { min: '00', max: '012', step: '03' },
+      { min: '1.50', max: '3.00', step: '0.50' }, { min: '9007199254740000', max: '9007199254740991' },
+    ]) {
+      for (const value of sampleValues(fieldOf('number', constraints))) {
+        expect(keepsNumberForm(value), `${JSON.stringify(constraints)} -> ${value}`).toBe(true);
+      }
+    }
+  });
+
+  it.each([
+    ['values below 1e-6, which the page writes with an exponent', { min: '0', max: '0.0000003', step: '0.0000001' }],
+    ['integers beyond the safe integers, which the page rounds', { min: '9007199254740993', max: '9007199254740995' }],
+    ['decimals with more than 15 significant digits, which the page rounds', { min: '1234567890.123456', max: '1234567890.123457', step: '0.000001' }],
+  ])('does not make %s (CONSTRAINT_UNSUPPORTED; OP-O O2 b)', (_label, constraints) => {
+    expect(reasonOf(fieldOf('number', constraints))).toBe('CONSTRAINT_UNSUPPORTED');
+  });
 });
 
 describe('generic rules: date and time types', () => {

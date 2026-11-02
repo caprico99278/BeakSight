@@ -39,10 +39,24 @@ import {
   formatInteger,
   formatNotObserved,
 } from '../../src/presentation/format.js';
-import { findModuleSpecifiers, loadSourceFiles, scanSource, type ScannedSource, type SourceFile } from './source-scan.js';
+import {
+  findModuleSpecifiers,
+  loadSourceFiles,
+  readLfFilesUnder,
+  scanSource,
+  type ScannedSource,
+  type SourceFile,
+  type UnscannedFile,
+} from './source-scan.js';
 
 /** `src/**` の TypeScript のファイル（1回だけ列挙して読み込み、走査したもの）。 */
 const SOURCE_FILES: readonly SourceFile[] = loadSourceFiles();
+
+/** PL-2（PL-V の発見事項）: 画面のサーバの CSS のフォルダと、色の値を定義する唯一のファイル（トークン）。 */
+const LOCAL_UI_STYLE_DIRECTORY = 'apps/local-ui/src/styles';
+const LOCAL_UI_TOKEN_FILE = `${LOCAL_UI_STYLE_DIRECTORY}/tokens.css`;
+/** 画面のサーバの CSS（1回だけ列挙して読み込んだもの）。 */
+const LOCAL_UI_STYLE_FILES: readonly UnscannedFile[] = readLfFilesUnder(LOCAL_UI_STYLE_DIRECTORY, /\.css$/u);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 検出の関数（近似。誤検知は、除外の一覧に理由を付けて加える）
@@ -449,6 +463,19 @@ describe('UI Gate', () => {
     const violations = SOURCE_FILES.filter((file) => !UI02_EXCLUDED_FILES.has(file.path)).flatMap((file) =>
       findColorValues(file.content).map((line) => `${file.path}:${line}`),
     );
+    expect(violations).toEqual([]);
+  });
+
+  // PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 13 章。PL-V の発見事項）: 画面のサーバの CSS の色の値（`#16進数`、`rgb(`、`hsl(`）は、
+  // トークンのファイル（`tokens.css`）だけに書く。ほかの CSS は `var(--…)` で読む。
+  it('GATE-UI02 (local UI): colour values of the local UI styles are written only in tokens.css', () => {
+    const token = LOCAL_UI_STYLE_FILES.find((file) => file.path === LOCAL_UI_TOKEN_FILE);
+    expect(token, LOCAL_UI_TOKEN_FILE).toBeDefined();
+    // 検出が CSS の色の値に当たる（トークンのファイルには色の値がある）。
+    expect(findColorValues(token?.content ?? '').length).toBeGreaterThan(0);
+    const others = LOCAL_UI_STYLE_FILES.filter((file) => file.path !== LOCAL_UI_TOKEN_FILE);
+    expect(others.length).toBeGreaterThan(0);
+    const violations = others.flatMap((file) => findColorValues(file.content).map((line) => `${file.path}:${line}`));
     expect(violations).toEqual([]);
   });
 

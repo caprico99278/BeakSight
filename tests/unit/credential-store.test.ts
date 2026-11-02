@@ -95,6 +95,8 @@ interface AclState {
   restricted: boolean;
   /** 権限の読み取りの応答（`null` なら、icacls の前後で既定の応答）。 */
   inspectLines: readonly string[] | null;
+  /** icacls の前の応答（`null` なら `INHERITED_ACL_LINES`。OP-L L2）。 */
+  unrestrictedLines: readonly string[] | null;
   inspectExitCode: number;
   icaclsExitCode: number;
 }
@@ -134,7 +136,7 @@ const createFakeCredentialSpawner = (state: AclState) => {
         setImmediate(() => child.emit('close', state.icaclsExitCode, null));
         return;
       }
-      const lines = state.inspectLines ?? (state.restricted ? SAFE_ACL_LINES : INHERITED_ACL_LINES);
+      const lines = state.inspectLines ?? (state.restricted ? SAFE_ACL_LINES : state.unrestrictedLines ?? INHERITED_ACL_LINES);
       child.stdout.end(lines.join('\n'));
       child.stdout.once('end', () => setImmediate(() => child.emit('close', state.inspectExitCode, null)));
       child.stdout.resume();
@@ -184,7 +186,7 @@ interface Harness {
 const harness = (overrides: Partial<CredentialStoreDependencies> & { readonly protectorFails?: boolean } = {}): Harness => {
   const root = mkdtempSync(join(tmpdir(), 'beaksight-t26a-'));
   temporaryRoots.push(root);
-  const acl: AclState = { restricted: false, inspectLines: null, inspectExitCode: 0, icaclsExitCode: 0 };
+  const acl: AclState = { restricted: false, inspectLines: null, unrestrictedLines: null, inspectExitCode: 0, icaclsExitCode: 0 };
   const fakeSpawner = createFakeCredentialSpawner(acl);
   const fakeProtector = createFakeCredentialProtector({ fail: overrides.protectorFails === true });
   let now = new Date(Date.UTC(2026, 9, 10, 1, 2, 3));
@@ -438,15 +440,52 @@ describe('T26a: register', () => {
   });
 
   it('does not write when the permission check fails or icacls fails (CREDENTIAL_STORAGE_UNSAFE)', async () => {
+    // OP-L L2: 新しく作ったフォルダを絞れなかったら、作ったフォルダ（空）を消す（絞れていないフォルダを残さない）。
     const failingInspect = harness();
     failingInspect.acl.inspectExitCode = CREDENTIAL_SCRIPT_FAILURE_EXIT_CODE;
     expect((await caughtStoreError(register(failingInspect))).code).toBe('CREDENTIAL_STORAGE_UNSAFE');
-    expect(readdirSync(failingInspect.directory)).toEqual([]);
+    expect(existsSync(failingInspect.directory)).toBe(false);
 
     const failingIcacls = harness();
     failingIcacls.acl.icaclsExitCode = 5;
     expect((await caughtStoreError(register(failingIcacls))).code).toBe('CREDENTIAL_STORAGE_UNSAFE');
-    expect(readdirSync(failingIcacls.directory)).toEqual([]);
+    expect(existsSync(failingIcacls.directory)).toBe(false);
+  });
+
+  it('OP-L L2: removes a new folder whose permission is still unsafe after icacls, and keeps an existing unsafe folder', async () => {
+    const stillUnsafe = harness();
+    stillUnsafe.acl.inspectLines = INHERITED_ACL_LINES;
+    expect((await caughtStoreError(register(stillUnsafe))).code).toBe('CREDENTIAL_STORAGE_UNSAFE');
+    expect(icaclsSpawns(stillUnsafe)).toHaveLength(1);
+    expect(existsSync(stillUnsafe.directory)).toBe(false);
+
+    // 前からあるフォルダは消さない（作ったのは BeakSight でない）。
+    const existing = harness();
+    mkdirSync(existing.directory, { recursive: true });
+    existing.acl.inspectLines = INHERITED_ACL_LINES;
+    expect((await caughtStoreError(register(existing))).code).toBe('CREDENTIAL_STORAGE_UNSAFE');
+    expect(readdirSync(existing.directory)).toEqual([]);
+  });
+
+  it('OP-L L2: reads a generic-rights rule (a negative 32-bit value from [int]) in the inherited rules, and restricts the new folder', async () => {
+    const h = harness();
+    // リポジトリのフォルダの継承の ACL の形（Authenticated Users の、中へだけ受け継ぐ汎用の権限）。
+    h.acl.unrestrictedLines = [...INHERITED_ACL_LINES, 'RULE S-1-5-11 Allow 1245631 0 0 True', 'RULE S-1-5-11 Allow -536805376 3 2 True'];
+    await register(h);
+    expect(icaclsSpawns(h).map((record) => record.args)).toEqual([[h.directory, '/inheritance:r', '/grant:r', `*${USER_SID}:(OI)(CI)F`]]);
+    expect(readdirSync(h.directory).some((name) => name.endsWith(CREDENTIAL_FILE_SUFFIX))).toBe(true);
+  });
+
+  it.each([
+    ['another account with generic rights', ['USER S', 'OWNER S', 'PROTECTED True', `RULE S Allow ${FULL_CONTROL} 3 0 False`, `RULE ${OTHER_SID} Allow -1610612736 3 0 False`]],
+    ['the current user with generic rights only', ['USER S', 'OWNER S', 'PROTECTED True', 'RULE S Allow -1610612736 3 0 False']],
+    ['a value outside 32 bits', ['USER S', 'OWNER S', 'PROTECTED True', `RULE S Allow ${FULL_CONTROL} 3 0 False`, 'RULE S Allow -2147483649 3 0 False']],
+  ] as const)('OP-L L2: still refuses an unsafe folder with generic or malformed rights: %s', async (_name, lines) => {
+    const h = harness();
+    mkdirSync(h.directory, { recursive: true });
+    h.acl.inspectLines = lines.map((line) => line.split(' ').map((token) => (token === 'S' ? USER_SID : token)).join(' '));
+    expect((await caughtStoreError(register(h))).code).toBe('CREDENTIAL_STORAGE_UNSAFE');
+    expect(readdirSync(h.directory)).toEqual([]);
   });
 
   it('refuses a folder that is a symbolic link or not a folder (CREDENTIAL_STORAGE_UNSAFE)', async () => {
@@ -644,7 +683,7 @@ describe('T26a: replace all and partial changes', () => {
     const before = rawStored(h);
     const failing = createCredentialStoreWith(h.root, {
       protector: createFakeCredentialProtector({ fail: true }).protector,
-      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
+      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, unrestrictedLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
       now: () => later,
       platform: 'win32',
       renameFile: async () => undefined,
@@ -680,7 +719,7 @@ describe('T26a: replacement through a temporary file and rename', () => {
       const waits: number[] = [];
       const store = createCredentialStoreWith(h.root, {
         protector: h.fakeProtector.protector,
-        spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
+        spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, unrestrictedLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
         now: () => new Date(),
         platform: 'win32',
         renameFile: rename.renameFile,
@@ -706,7 +745,7 @@ describe('T26a: replacement through a temporary file and rename', () => {
     const rename = failingRename('ENOENT', Number.POSITIVE_INFINITY);
     const store = createCredentialStoreWith(h.root, {
       protector: h.fakeProtector.protector,
-      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
+      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, unrestrictedLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
       now: () => new Date(),
       platform: 'win32',
       renameFile: rename.renameFile,
@@ -724,7 +763,7 @@ describe('T26a: replacement through a temporary file and rename', () => {
     const rename = failingRename('EBUSY', 2);
     const store = createCredentialStoreWith(h.root, {
       protector: h.fakeProtector.protector,
-      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
+      spawnProcess: createFakeCredentialSpawner({ restricted: true, inspectLines: null, unrestrictedLines: null, inspectExitCode: 0, icaclsExitCode: 0 }).spawner,
       now: () => new Date(),
       platform: 'win32',
       renameFile: rename.renameFile,

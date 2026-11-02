@@ -18,7 +18,9 @@ import { formatCount } from '../../../src/presentation/format.js';
 import {
   INCOMPLETE_REASON_DESCRIPTIONS,
   INCOMPLETE_REASON_NEXT_STEPS,
+  LOCAL_UI_JOB_SUMMARY_TEXT,
   LOCAL_UI_PAGE_INCOMPLETE_REASON_TEXT,
+  LOCAL_UI_TEXT,
 } from '../../../src/presentation/messages.js';
 import { runSummary } from '../../../tests/helpers/audit-run-fixture.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
@@ -35,6 +37,7 @@ import {
 } from './helpers/local-server.ts';
 import { callServerFunction, readServerFunctionIds } from './helpers/server-functions.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -130,14 +133,20 @@ afterAll(async () => {
 describe('T44c: the page incomplete reasons of an audit job', () => {
   it('shows the number of the pages for each reason with its description and the next step (the same text as the report)', async () => {
     const page = await openPage('/jobs/job-t44c-reasons');
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1・2）: 要点には「確かめきれなかった所があります」の 1 行だけを出し、理由ごとのページ数は、
+    // たたんだ詳しい内容の中。開いてから確かめる。
+    expect(await page.getByTestId('job-summary-panel').getByTestId('job-incomplete').textContent())
+      .toBe(LOCAL_UI_JOB_SUMMARY_TEXT.incomplete(LOCAL_UI_TEXT.advancedSettings.summary));
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const panel = page.getByTestId('job-page-incomplete-reasons');
     await panel.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await panel.getByRole('heading', { name: text.heading }).count()).toBe(1);
     const rows = await panel.getByTestId('job-page-incomplete-reason-list').evaluate((table) =>
       [...table.querySelectorAll('tbody tr')].map((row) => [row.getAttribute('data-code') ?? '', ...[...row.querySelectorAll('td')].map((cell) => cell.textContent ?? '')]));
+    // PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2・4）: 理由のコードは画面に出さない（行の data-code にだけ残る）。
     expect(rows).toEqual([
-      ['COLLECTOR_INCOMPLETE', `${INCOMPLETE_REASON_DESCRIPTIONS.COLLECTOR_INCOMPLETE} COLLECTOR_INCOMPLETE`, formatCount(2), INCOMPLETE_REASON_NEXT_STEPS.COLLECTOR_INCOMPLETE],
-      [INNER_SCROLL, `${INCOMPLETE_REASON_DESCRIPTIONS[INNER_SCROLL]} ${INNER_SCROLL}`, formatCount(9), INCOMPLETE_REASON_NEXT_STEPS[INNER_SCROLL]],
+      ['COLLECTOR_INCOMPLETE', INCOMPLETE_REASON_DESCRIPTIONS.COLLECTOR_INCOMPLETE, formatCount(2), INCOMPLETE_REASON_NEXT_STEPS.COLLECTOR_INCOMPLETE],
+      [INNER_SCROLL, INCOMPLETE_REASON_DESCRIPTIONS[INNER_SCROLL], formatCount(9), INCOMPLETE_REASON_NEXT_STEPS[INNER_SCROLL]],
     ]);
     // 画面のサーバが返す値も、数と理由のコードだけ。
     const detail = await valueOf<{ pageIncompleteReasons: unknown }>('getAuditJobFn', 'GET', { jobId: 'job-t44c-reasons' });
@@ -148,6 +157,7 @@ describe('T44c: the page incomplete reasons of an audit job', () => {
     const page = await openPage('/jobs/job-t44c-no-reasons');
     await page.getByTestId('job-run-status').waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await page.getByTestId('job-page-incomplete-reasons').count()).toBe(0);
+    expect(await page.getByTestId('job-incomplete').count()).toBe(0);
     expect((await valueOf<{ pageIncompleteReasons: unknown }>('getAuditJobFn', 'GET', { jobId: 'job-t44c-no-reasons' })).pageIncompleteReasons).toBeNull();
   }, SCENARIO_TIMEOUT_MS);
 });

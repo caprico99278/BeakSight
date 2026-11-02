@@ -114,7 +114,6 @@ describe('scenario contracts and defaults (T28a)', () => {
       'SCENARIO_READ_CHECK_CANCELED',
       'SCENARIO_READ_CHECK_REVISION_MISMATCH',
       // T30a: 検証の指定（2 つの結果の条件の重なり（fix round 1）、照合の READ の結び付けと期待の欄）。
-      'SCENARIO_VERIFICATION_CONDITIONS_AMBIGUOUS',
       'SCENARIO_VERIFICATION_PARAMETER_UNKNOWN',
       'SCENARIO_VERIFICATION_FIELD_NOT_SENT',
       'SCENARIO_LIMIT_ABOVE_DEFAULT',
@@ -171,7 +170,8 @@ describe('scenario draft validation (T28a)', () => {
         limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
         approvalTtlDays: 30,
         // T30a: 下書きに検証の指定がなければ、すべて未指定（形の確かめは `scenario-verification-spec.test.ts`）。
-        verification: UNSPECIFIED_VERIFICATION,
+        // PL-6a: 結果の判定のしかたの印は、下書きの確かめが送り方から付ける（form は構造の判定）。ほかの項目は未指定。
+        verification: { ...UNSPECIFIED_VERIFICATION, resultJudgement: 'FORM_STRUCTURE' },
         // T31b: CREATE は UPDATE の指定を持たない（UPDATE の指定の確かめは `scenario-update-spec.test.ts`）。
         update: null,
       },

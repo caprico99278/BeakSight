@@ -302,8 +302,7 @@ const prepareApprovedApiScenario = async (): Promise<void> => {
       limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
       approvalTtlDays: 30,
       verification: {
-        successCondition: null,
-        inputErrorCondition: null,
+        resultJudgement: null,
         recordId: null,
         readVerification: { readCheckId: READ_CHECK_ID, revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
       },
@@ -401,11 +400,11 @@ describe('T40c: the parent reads and settles the action-run.json of an API write
       api: { ...actionApiSummaryOf(scenarioApi(), HANDOFF.pageKeyValues), keyNames: ['email', 'name'] },
     })],
     ['the FORM transport', (jobId, grantId) => apiActionRunOf(jobId, grantId, {
-      transport: 'FORM', api: null, resultConditions: { successCondition: { pathPrefix: '/', selector: null }, inputErrorCondition: { pathPrefix: '/', selector: null } },
+      transport: 'FORM', api: null, resultJudgement: 'FORM_STRUCTURE',
     })],
     ['the version 1.0 (no transport)', (jobId, grantId) => {
       const { transport: _transport, api: _api, ...run } = apiActionRunOf(jobId, grantId, {
-        resultConditions: { successCondition: { pathPrefix: '/', selector: null }, inputErrorCondition: { pathPrefix: '/', selector: null } },
+        resultJudgement: 'FORM_STRUCTURE',
       });
       return { ...run, schemaVersion: 'action-run-schema/1.0' };
     }],

@@ -224,6 +224,20 @@ export interface FakeWorkerValues {
     readonly reasonCodes?: readonly (readonly string[])[];
     readonly holdStage?: number;
     readonly finishDelayMs?: number;
+    /**
+     * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1）: `START` の `loginRegistration` があるときの、値の受け取りのふり。`carriedBy` があれば
+     * 「受け取った」と知らせ、親の `CREDENTIAL_SAVE_ALLOWED` を受けたら、`credentialMarkerPath` に目印のファイルを書いて（資格情報のファイルを書いたふり。値は
+     * 書かない）、`saved` の値（省略は真。偽のときは理由のコード `CREDENTIAL_STORAGE_UNSAFE`）で `CREDENTIAL_SAVED` を送る。`LOGIN_REGISTERED`・`LOGIN_REGISTRATION_SKIPPED` を受けたら、最初の段を始める。
+     * OP-F（安全のレビューの I-1）: `exitAfterWriting` なら、目印を書いた直後に `CREDENTIAL_SAVED` を送らずに終わる（落ちたふり）。`savedDelayMs` なら、目印を
+     * 書いてから、その時間だけ待って `CREDENTIAL_SAVED` を送る（親の待つ上限を過ぎるふり）。
+     */
+    readonly capture?: {
+      readonly carriedBy: { readonly origin: string; readonly path: string } | null;
+      readonly credentialMarkerPath: string;
+      readonly saved?: boolean;
+      readonly exitAfterWriting?: boolean;
+      readonly savedDelayMs?: number;
+    };
   };
 }
 
@@ -312,7 +326,7 @@ const writeReadEvidence = (jobId, readChecks, runId) => {
     : readCheck.summary;
 };
 // FM2d: まとめて実行（chain）。段ごとに RUN_STARTED と FINISHED（理由のコードつき）を送り、途中の段の後は NEXT_STAGE・CHAIN_END を待つ。
-const chainState = { stages: [], index: 0, exitCode: 0, holding: null };
+const chainState = { stages: [], index: 0, exitCode: 0, holding: null, firstStage: null };
 const chainFinish = (kind, jobId, readChecks, runId, runStatus, codes) => {
   const exitCode = runStatus === 'COMPLETE' ? VALUES.exitCodes.complete : VALUES.exitCodes.partial;
   chainState.exitCode = exitCode;
@@ -461,8 +475,18 @@ process.on('message', (message) => {
     if (MODE === 'chain') {
       // FM2d: まとめて実行の最初の段（ログインの段の知らせは 1 回だけ）。
       chainState.stages = message.chain.stages;
-      send({ ...authState('AUTHENTICATED'), ...(VALUES.loginStage ?? {}) });
-      chainRun(message.chain.stages[0], message.jobId, undefined);
+      // OP-1: ログインの直後の登録を待つときは、値のない受け取りのメタデータも載せ、親の返事を待ってから最初の段を始める。
+      const registration = message.authentication?.loginRegistration;
+      const carriedBy = registration?.credentialRoot ? (VALUES.chain.capture?.carriedBy ?? null) : null;
+      send({
+        ...authState('AUTHENTICATED'), ...(VALUES.loginStage ?? {}),
+        ...(registration === undefined ? {} : { credentialCapture: { captured: carriedBy !== null, carriedBy } }),
+      });
+      if (registration === undefined) {
+        chainRun(message.chain.stages[0], message.jobId, undefined);
+      } else {
+        chainState.firstStage = { kind: message.chain.stages[0], jobId: message.jobId };
+      }
       return;
     }
     if (MODE === 'read-check') {
@@ -612,6 +636,30 @@ process.on('message', (message) => {
   if (message && message.type === 'LOGIN_CONFIRMED' && MODE === 'auth-manual-confirm') {
     send({ protocol: P, type: 'AUTH_STATE', state: 'AUTHENTICATED', sessionLostUrl: null, ...(VALUES.loginStage ?? {}) });
     send(runStarted);
+    return;
+  }
+  if (message && MODE === 'chain' && message.type === 'CREDENTIAL_SAVE_ALLOWED') {
+    const capture = VALUES.chain.capture;
+    const saved = capture?.saved !== false;
+    if (saved && capture !== undefined) {
+      writeFileSync(capture.credentialMarkerPath, 'written', 'utf8');
+    }
+    if (capture?.exitAfterWriting === true) {
+      process.exit(1);
+    }
+    // OP-L（L2）: 書けなかったふりのときは、資格情報の場所が安全でない理由のコードを送る。
+    const sendSaved = () => send({ protocol: P, type: 'CREDENTIAL_SAVED', saved, credentialRevision: saved ? 1 : null, failureCode: saved ? null : 'CREDENTIAL_STORAGE_UNSAFE' });
+    if (capture?.savedDelayMs !== undefined) {
+      setTimeout(sendSaved, capture.savedDelayMs);
+    } else {
+      sendSaved();
+    }
+    return;
+  }
+  if (message && MODE === 'chain' && (message.type === 'LOGIN_REGISTERED' || message.type === 'LOGIN_REGISTRATION_SKIPPED') && chainState.firstStage) {
+    const first = chainState.firstStage;
+    chainState.firstStage = null;
+    chainRun(first.kind, first.jobId, undefined);
     return;
   }
   if (message && MODE === 'chain' && message.type === 'NEXT_STAGE') {

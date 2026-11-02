@@ -24,6 +24,9 @@
 //     path から ID の区切りを選んで型を作るための口（ID の形の判定は呼び出し側が渡す）。
 // - T41a（Task 41 の設計書 3.1）: form のない候補の、画面の path の最後の ID を `{id}` にした識別の digest（`pagePathTemplatedIdentityDigestOf`。別の印
 //   `CANDIDATE_PAGE_TEMPLATE_IDENTITY_DIGEST_FORMAT`）。索引の型にした digest の一覧の列を、印で分けて共用する（管理データの版は 14 のまま）。
+// - PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の 4）: フォームの形の鍵（`formShapeKeyOf`。別の印 `CANDIDATE_FORM_SHAPE_KEY_FORMAT`）。
+//   識別の digest の並びから画面の Origin と path を除いた形。書き込みのワーカーが、送った後の画面に同じフォームがもう一度出たかを比べる。今の識別の
+//   digest（版 2）は変えない。
 // 純粋な関数だけのファイル。Playwright、ブラウザ、`node:fs`、`src/control/`、監査エンジンを import しない
 // （`tests/architecture/discovery-boundary.test.ts`）。
 import { lastRecordIdLikePathSegmentIndexOf } from '../core/api-request-shape.js';
@@ -51,6 +54,9 @@ export const CANDIDATE_RULE_DIGEST_FORMAT = 'beaksight-candidate-rules/1';
 
 /** 型にした識別の digest の入力の形の印（版つき。T31b）。 */
 export const CANDIDATE_TEMPLATE_IDENTITY_DIGEST_FORMAT = 'beaksight-candidate-template-identity/1';
+
+/** フォームの形の鍵の入力の形の印（版つき。PL-6a）。 */
+export const CANDIDATE_FORM_SHAPE_KEY_FORMAT = 'beaksight-candidate-form-shape/1';
 
 /**
  * path の型の中の、レコードの ID の区切りの印（型にちょうど 1 つ。path の 1 つの区切りの全体。T31b）。T40R2-fix: 定義は core の
@@ -121,6 +127,18 @@ export const computeCandidateDigests = (candidate: DiscoveredCandidate): Candida
     identityDigest: createSha256Fingerprint(identityInput),
     ruleDigest: createSha256Fingerprint(ruleInput),
   });
+};
+
+/**
+ * PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の 4）: フォームの形の鍵（純粋）。送った後の画面に、送ったフォームと同じフォームがもう一度
+ * 出たか（入力の誤りの再表示か）を、書き込みのワーカーが比べる唯一の鍵。識別の digest の並びのうち、画面の Origin と path を除いたもの（候補の種類、
+ * method と `_method` の上書き、送信先の Origin と path と query の名前、名前のある欄の `name`・`tag`・`type`、送信ボタンの語）の SHA-256。画面の path
+ * （送った後は送信先や一覧の path に出る）と、欄の値（CSRF の token などの hidden の値、値があるか）を含めない。今の識別の digest（版 2）とは別の印の、
+ * 別の鍵（識別の digest は変えない）。
+ */
+export const formShapeKeyOf = (candidate: DiscoveredCandidate): string => {
+  const [, , ...shapeItems] = identityItemsOf(candidate, '', candidate.action?.path ?? null);
+  return createSha256Fingerprint(JSON.stringify([CANDIDATE_FORM_SHAPE_KEY_FORMAT, ...shapeItems]));
 };
 
 // ---------------------------------------------------------------------------------------------------------------

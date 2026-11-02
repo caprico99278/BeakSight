@@ -12,7 +12,7 @@ import type { NormalizedHttpUrlEvidence } from '../core/evidence-types.js';
 import { isNonNegativeSafeInteger } from '../core/guards.js';
 import { isPageId } from '../core/ids.js';
 import { deepFreeze } from '../core/immutable.js';
-import { CrawlQueue } from '../crawl/crawl-queue.js';
+import { CrawlQueue, type CrawlEnqueueOptions } from '../crawl/crawl-queue.js';
 import { normalizeUrl } from '../crawl/normalize-url.js';
 import type { IdAllocator } from './id-allocator.js';
 import { SITE_UNAVAILABLE_SKIP_REASON } from './site-availability.js';
@@ -224,8 +224,10 @@ export class CrawlFrontier {
    * URL を深さ `depth` で発見する。初めての URL なら、ページの ID を採番し、深さが上限以内ならキューに入れる（`QUEUED`）。
    * 上限を超えるなら `SKIPPED`（`MAX_DEPTH_REACHED`）にする。すでに発見していた URL は、何もしない（`KNOWN`）。
    * BFS では、先に発見した深さが最も浅いので、後から浅い深さで発見し直すことはない。
+   * OP-I（I2）: `options.preferred` の URL は、待ち行列で印のない URL より先に読む（操作さがしの段だけが渡す。点検の段の Run Coordinator は渡さず、今までどおり
+   * BFS の順）。ページの ID・深さの上限・重複の排除は変えない。印のある URL は、深さの浅い印のない URL より先に読むことがある。
    */
-  discover(url: NormalizedHttpUrlEvidence, depth: number): CrawlDiscovery {
+  discover(url: NormalizedHttpUrlEvidence, depth: number, options: CrawlEnqueueOptions = {}): CrawlDiscovery {
     if (!isNonNegativeSafeInteger(depth)) {
       throw new RangeError('crawl depth must be a non-negative safe integer');
     }
@@ -239,7 +241,7 @@ export class CrawlFrontier {
       entry.skipReason = MAX_DEPTH_REACHED_REASON;
       return 'SKIPPED';
     }
-    if (!this.#queue.enqueue({ url, depth })) {
+    if (!this.#queue.enqueue({ url, depth }, options)) {
       throw new Error(`crawl queue rejected a newly discovered URL: ${url}`);
     }
     entry.state = 'QUEUED';

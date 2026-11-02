@@ -24,11 +24,17 @@ export interface PresenceMonitorOptions {
   readonly silenceLimitMs: number;
   /** 動いている監査のジョブの数。 */
   readonly runningJobCount: () => number;
-  /** 止める決まりがそろったとき（1 回だけ）。 */
-  readonly onIdle: () => void;
+  /**
+   * 止める決まりがそろったとき（1 回だけ）。OP-P: 理由（`CLOSED`: 最後のページの閉じた知らせの後、`SILENT`: 知らせの途絶えの後。隠れたタブの凍結など）を
+   * 渡す。
+   */
+  readonly onIdle: (cause: PresenceIdleCause) => void;
   /** 今の時刻（ms。既定は `Date.now`。テストは注入する）。 */
   readonly now?: () => number;
 }
+
+/** OP-P: 止める決まりがそろった理由（閉じた知らせの後か、知らせの途絶えの後か）。 */
+export type PresenceIdleCause = 'CLOSED' | 'SILENT';
 
 /** 判定の部品。 */
 export interface PresenceMonitor {
@@ -47,7 +53,7 @@ export const createPresenceMonitor = (options: PresenceMonitorOptions): Presence
   let seen = false;
   let stopped = false;
   /** 開いているページがなくなった時刻と、そこから止めるまでの猶予（ページがあるときは `null`）。 */
-  let empty: { readonly since: number; readonly graceMs: number } | null = null;
+  let empty: { readonly since: number; readonly graceMs: number; readonly cause: PresenceIdleCause } | null = null;
 
   const expireSilentPages = (at: number): void => {
     for (const [pageId, lastAliveAt] of pages) {
@@ -55,7 +61,7 @@ export const createPresenceMonitor = (options: PresenceMonitorOptions): Presence
         pages.delete(pageId);
         if (pages.size === 0) {
           // 途絶えの上限で、すでに待った。猶予は足さない。
-          empty = { since: at, graceMs: 0 };
+          empty = { since: at, graceMs: 0, cause: 'SILENT' };
         }
       }
     }
@@ -72,7 +78,7 @@ export const createPresenceMonitor = (options: PresenceMonitorOptions): Presence
         return;
       }
       if (pages.size === 0) {
-        empty = { since: now(), graceMs: options.closedGraceMs };
+        empty = { since: now(), graceMs: options.closedGraceMs, cause: 'CLOSED' };
       }
     },
     check() {
@@ -85,7 +91,7 @@ export const createPresenceMonitor = (options: PresenceMonitorOptions): Presence
         return;
       }
       stopped = true;
-      options.onIdle();
+      options.onIdle(empty.cause);
     },
   };
 };

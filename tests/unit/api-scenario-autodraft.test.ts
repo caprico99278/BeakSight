@@ -22,7 +22,11 @@ import {
   inferredReadExpectationOf,
   inferredReadPageTemplateOf,
   inferredRecordIdKeyOf,
+  commonReadPageTemplateOf,
+  commonRecordIdKeyOf,
+  COMMON_API_RECORD_ID_KEYS,
   isAutoDraftDiscoveryStale,
+  isAutoDraftListPageChoice,
   type AutoDraftScenarioFact,
 } from '../../src/control/approval/api-scenario-autodraft.js';
 import { apiScenarioFormOf, type ApiScenarioFormProposal } from '../../src/control/approval/api-scenario-draft.js';
@@ -190,18 +194,29 @@ describe('FM2b: the plan of the automatic drafts', () => {
     ]);
     // 下書きは、今の下書きの確かめ（保存の口と同じ）を通る。
     expect(validateScenarioDraft(create.draft, CREATE, [], CONTEXT).ok).toBe(true);
-    // 更新は保存しない（変える欄は人が必ず選ぶ）。
-    expect(plan.updates.map(({ status }) => status)).toEqual(['NEEDS_CHANGED_FIELDS']);
+    // OP-2（D10、規則 F）: 更新の変える鍵は BeakSight が決める（登録で送った文字の鍵 name。メールは外部へ届くので保つ）。計画は保存しない。
+    expect(plan.updates).toMatchObject([{ status: 'NEW', changedFieldNames: ['name'], keepFieldNames: ['email'], ground: 'SENT_BY_CREATE' }]);
   });
 
-  it('leaves the record id key empty without an inference (the draft still passes the check)', () => {
+  // OP-G（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.4 の E2。前は、同じ表の更新がないと鍵を空にしていた）: データのないサイト（同じ表の更新の
+  // 型がない）では、よくある番号の鍵の名前を推す。同じ表の更新の型があって推せなかった（filter の名前が 2 つ）ときは、今どおり空。
+  it('infers a common record id key without an update of the same table, and leaves it empty when an update exists but gives no single name', () => {
     const [create] = planOf([CREATE]).creates;
     if (create?.status !== 'NEW') {
       throw new Error(`the create is ${create?.status}`);
     }
-    expect(create.recordIdKey).toBeNull();
-    expect((create.draft['api'] as Record<string, unknown>)['recordId']).toBeNull();
+    expect(create.recordIdKey).toEqual({ value: COMMON_API_RECORD_ID_KEYS[0], origin: 'INFERRED', ground: 'API_RECORD_ID_KEY_COMMON_NAME' });
+    expect((create.draft['api'] as Record<string, unknown>)['recordId']).toEqual({ source: 'RESPONSE_BODY_KEY', key: COMMON_API_RECORD_ID_KEYS[0] });
     expect(validateScenarioDraft(create.draft, CREATE, [], CONTEXT).ok).toBe(true);
+    // 登録で送る鍵は、番号の鍵にしない（次の名前）。承認したサービスの Origin の外は推さない。
+    expect(commonRecordIdKeyOf(CREATE, apiAutoDraftRowsOf([CREATE]), [API], [COMMON_API_RECORD_ID_KEYS[0]])?.value).toBe(COMMON_API_RECORD_ID_KEYS[1]);
+    expect(commonRecordIdKeyOf(CREATE, apiAutoDraftRowsOf([CREATE]), [], [])).toBeNull();
+    const [ambiguous] = planOf([CREATE, UPDATE, OTHER_FILTER_UPDATE]).creates;
+    if (ambiguous?.status !== 'NEW') {
+      throw new Error(`the create is ${ambiguous?.status}`);
+    }
+    expect(ambiguous.recordIdKey).toBeNull();
+    expect((ambiguous.draft['api'] as Record<string, unknown>)['recordId']).toBeNull();
   });
 
   it('does not make a draft of a row that already has a scenario (a draft, an approved one or a revoked one), and lists it as existing', () => {
@@ -272,6 +287,75 @@ describe('FM2b: the READ of the verification of a create draft', () => {
     expect(inferredReadPageTemplateOf('/new', ['/12'])).toBeNull();
   });
 
+  // OP-G（E2）: データのないサイトでは、登録の画面の 1 つ上の path の後ろに `{id}` を足した、よくある詳細の画面の形を推す（データのある・読めた画面から推せるときは
+  // 今どおり）。
+  it('infers the common {id} page template for a site without data, only when asked', () => {
+    expect(commonReadPageTemplateOf(NEW_PATH)).toEqual({ value: '/admin/members/{id}', origin: 'INFERRED', ground: 'READ_PAGE_TEMPLATE_COMMON_SHAPE' });
+    expect(commonReadPageTemplateOf('/new')).toBeNull();
+    expect(commonReadPageTemplateOf('/admin/members/12')).toBeNull();
+    const input = { createPagePath: NEW_PATH, readPagePaths: [], definitions: [], maxDefinitions: 2 };
+    expect(autoDraftReadCheckChoiceOf(input)).toEqual({ kind: 'NOT_INFERRED' });
+    expect(autoDraftReadCheckChoiceOf({ ...input, withoutData: true })).toEqual({
+      kind: 'CREATE',
+      template: { value: '/admin/members/{id}', origin: 'INFERRED', ground: 'READ_PAGE_TEMPLATE_COMMON_SHAPE' },
+      definition: autoDraftReadCheckDefinitionOf('/admin/members/{id}'),
+    });
+  });
+
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: 選ぶ順は、読めた画面から推した `{id}` の型 → 点検の段のリンクにある、登録の画面の
+  // 1 つ上の一覧の画面 → よくある詳細の画面の形（データのないときだけ）。一覧の画面は、データのあるなしによらず使う。照合の READ は照合の専用の印を持つ（単独の READ の
+  // 確かめのジョブは読まない）。
+  it('chooses the list page one above the create page in the audit stage links before the common {id} shape (OP-R R1)', () => {
+    const LIST = { value: '/admin/members', origin: 'INFERRED', ground: 'READ_PAGE_LIST_OF_CREATE_PAGE' };
+    const input = { createPagePath: NEW_PATH, readPagePaths: [], definitions: [], maxDefinitions: 2, auditLinkPaths: ['/admin', '/admin/members', NEW_PATH] };
+    expect(autoDraftReadCheckChoiceOf({ ...input, withoutData: true })).toEqual({
+      kind: 'CREATE', template: LIST, definition: autoDraftReadCheckDefinitionOf('/admin/members'),
+    });
+    expect(autoDraftReadCheckChoiceOf(input)).toMatchObject({ kind: 'CREATE', template: LIST });
+    // 読めた画面から推した `{id}` の型が先。
+    expect(autoDraftReadCheckChoiceOf({ ...input, readPagePaths: READ_PATHS })).toMatchObject({
+      kind: 'CREATE', template: { value: '/admin/members/{id}', ground: 'READ_PAGE_TEMPLATE_FROM_READ_PATH' },
+    });
+    // 点検の段のリンクにない一覧の画面は使わない（データのないときは、今どおり、よくある形）。
+    expect(autoDraftReadCheckChoiceOf({ ...input, auditLinkPaths: ['/admin'], withoutData: true })).toMatchObject({
+      template: { ground: 'READ_PAGE_TEMPLATE_COMMON_SHAPE' },
+    });
+    expect(autoDraftReadCheckChoiceOf({ ...input, auditLinkPaths: [] })).toEqual({ kind: 'NOT_INFERRED' });
+    // 同じ一覧の画面の定義が既にあれば、それを使う。
+    expect(autoDraftReadCheckChoiceOf({ ...input, definitions: [{ readCheckId: 'read-list', revision: 2, targetPagePath: '/admin/members' }] })).toEqual({
+      kind: 'EXISTING', template: LIST, reference: { readCheckId: 'read-list', revision: 2 },
+    });
+    expect(isAutoDraftListPageChoice(autoDraftReadCheckChoiceOf(input))).toBe(true);
+    expect(isAutoDraftListPageChoice(autoDraftReadCheckChoiceOf({ ...input, auditLinkPaths: [], withoutData: true }))).toBe(false);
+    expect(autoDraftReadVerificationOf({ readCheckId: 'read-1', revision: 1 }, { kind: 'TEXT_CONTAINS', fieldName: 'name' }, true))
+      .toEqual({ readCheckId: 'read-1', revision: 1, bindings: [], expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'name' }], verificationOnly: true });
+  });
+
+  // OP-REV6 の I-1: 一覧の画面には前の登録が並ぶので、一覧の画面は、送る欄に実行のたびに違う値になる欄（値の生成の持ち主の判定）があるときだけ推す。期待もその欄と
+  // 比べる（人の名前が最初の欄でも、名前とは比べない）。そのような欄がなければ、次の候補（よくある形）に回す。
+  it('chooses the list page only with a field unique to each run, and compares the expectation with it (OP-REV6 I-1)', () => {
+    const input = {
+      createPagePath: NEW_PATH, readPagePaths: [], definitions: [], maxDefinitions: 2, auditLinkPaths: ['/admin/members'], fieldNames: ['name', 'email'],
+    };
+    expect(autoDraftReadCheckChoiceOf({ ...input, uniqueEachRunFieldNames: [], withoutData: true })).toMatchObject({
+      template: { ground: 'READ_PAGE_TEMPLATE_COMMON_SHAPE' },
+    });
+    expect(autoDraftReadCheckChoiceOf({ ...input, uniqueEachRunFieldNames: [] })).toEqual({ kind: 'NOT_INFERRED' });
+    const list = autoDraftReadCheckChoiceOf({ ...input, uniqueEachRunFieldNames: ['email'] });
+    expect(list).toMatchObject({ template: { ground: 'READ_PAGE_LIST_OF_CREATE_PAGE' } });
+    expect(autoDraftExpectationStepOf({
+      rulesAttached: true, readCheck: list, fieldNames: ['name', 'email'], varyingFieldNames: ['name', 'email'], uniqueEachRunFieldNames: ['email'],
+    })).toMatchObject({ kind: 'LINK', expectation: { value: { kind: 'TEXT_CONTAINS', fieldName: 'email' } } });
+    expect(autoDraftExpectationStepOf({
+      rulesAttached: true, readCheck: list, fieldNames: ['name', 'email'], varyingFieldNames: ['name', 'email'], uniqueEachRunFieldNames: [],
+    })).toEqual({ kind: 'SKIP', outcome: 'NO_VARYING_FIELD' });
+    // `{id}` の型の画面は今のまま（変わる欄の最初の 1 つ）。
+    const template = autoDraftReadCheckChoiceOf({ ...input, auditLinkPaths: [], uniqueEachRunFieldNames: [], withoutData: true });
+    expect(autoDraftExpectationStepOf({
+      rulesAttached: true, readCheck: template, fieldNames: ['name', 'email'], varyingFieldNames: ['name', 'email'], uniqueEachRunFieldNames: [],
+    })).toMatchObject({ kind: 'LINK', expectation: { value: { fieldName: 'name' } } });
+  });
+
   it('makes the definition with the placeholder expectation, and the verification with the expectation inferred from a varying field', () => {
     expect(autoDraftReadCheckDefinitionOf('/admin/members/{id}'))
       .toEqual({ targetPagePath: '/admin/members/{id}', parameters: {}, expectations: AUTO_DRAFT_READ_CHECK_PLACEHOLDER_EXPECTATIONS });
@@ -302,8 +386,8 @@ describe('FM2b: the button blockers and the choice of the READ definition', () =
     expect(autoDraftBlockerOf({ ...base, discoveryRead: false })).toBe('DISCOVERY_MISSING');
     expect(autoDraftBlockerOf({ ...base, context: null })).toBe('DISCOVERY_MISSING');
     expect(autoDraftBlockerOf({ ...base, context: { ...CONTEXT, profileRevisions: { discoveryJob: 1, current: 2 } } })).toBe('DISCOVERY_STALE');
-    expect(autoDraftBlockerOf({ ...base, candidates: [PLAIN] })).toBe('NO_API_ROWS');
-    expect(AUTO_DRAFT_BLOCKERS).toEqual(['PROFILE_NOT_EDITABLE', 'DISCOVERY_MISSING', 'DISCOVERY_STALE', 'NO_API_ROWS', 'PREVIEW_OUTDATED']);
+    expect(autoDraftBlockerOf({ ...base, candidates: [PLAIN] })).toBe('NO_WRITE_ROWS');
+    expect(AUTO_DRAFT_BLOCKERS).toEqual(['PROFILE_NOT_EDITABLE', 'DISCOVERY_MISSING', 'DISCOVERY_STALE', 'NO_WRITE_ROWS', 'PREVIEW_OUTDATED']);
   });
 
   it('uses an existing definition of the same template, stops at the limit, and creates one otherwise', () => {
@@ -422,5 +506,105 @@ describe('FM2b: the step of the READ expectation (FM2R Minor 10)', () => {
       .toEqual({ kind: 'SKIP', outcome: 'NO_READ_CHECK' });
     expect(autoDraftExpectationStepOf({ ...base, varyingFieldNames: [] })).toEqual({ kind: 'SKIP', outcome: 'NO_VARYING_FIELD' });
     expect(AUTO_DRAFT_EXPECTATION_OUTCOMES).toEqual(['LINKED', 'RULES_NOT_ATTACHED', 'NO_READ_CHECK', 'NO_VARYING_FIELD', 'LINK_FAILED']);
+  });
+});
+
+// OP-K（K2。本物のテスト環境で分かった形を、名前を伏せて写したもの）: 登録の画面の行が「扱えない」になった、具体の理由。
+// - A の形: 画面が自動で入れて送る鍵に、作った人の番号の鍵（`author_id`）がある。前は、鍵の名前の比べ（部分一致の fail-closed。`auth`）で秘密に見える鍵になり、
+//   ページが決める鍵から外れて「欄に対応しない鍵」（`SCENARIO_API_KEY_NOT_ALLOWED`）の理由になっていた。設計者の判断 4 で `authorid` を誤検知の除く一覧に足したので、
+//   試せる。秘密に見える鍵（`auth_token` など）がページの鍵にあるときは、外した鍵の本当の理由（秘密に見える鍵）を返す（守りは変えない）。
+// - B の形: 1 つの欄の値を、画面が 2 つの鍵（番号の鍵と、それから作る画像の URL の鍵）に入れて送る。欄と鍵の結び付きが 1 対 1 でないので、試せない（理由は今どおり）。
+//   `Prefer` も `select` もないことだけでは、下書きは拒まれない（番号が取れなければ、送った後に「確かめられませんでした」と出す。OP-G の E2）。
+// - C の形（試せる）: ページが決める鍵が、文字・数・真偽・null。
+describe('OP-K (K2): the concrete reason of a create screen that cannot be tried', () => {
+  const markerOf = (index: number): string => `bsprobe${(index + 1).toString(16).padStart(12, '0')}`;
+  const fieldsOf = (names: readonly string[]): SubmissionProbeInputField[] =>
+    names.map((name, marker) => ({ name, selector: `#${name}`, type: name === 'body' ? 'textarea' : 'text', marker }));
+  const candidateWith = (pagePath: string, url: string, body: Readonly<Record<string, unknown>>, fields: readonly SubmissionProbeInputField[], prefer: boolean) => {
+    const shape = apiRequestShapeOf({
+      method: 'POST', resourceType: 'fetch', url, origin: { kind: 'APPROVED_API', index: 0 },
+      headers: { 'content-type': 'application/json', ...(prefer ? { prefer: 'return=representation' } : {}) },
+      body: { kind: 'TEXT', text: JSON.stringify(body) },
+    }, { pagePath, markers: fields.map((_field, index) => markerOf(index)) });
+    const probe = observedSubmissionProbeOf({ shapes: [shape], nonReadRequestCount: 1, readRequestCount: 0, unrecordedShapeCount: 0 },
+      { filledFieldCount: fields.length, skippedFieldCount: 0 }, fields);
+    return buttonOf(pagePath, probe);
+  };
+  const reasonOf = (candidate: DiscoveryCandidate): string | null => {
+    const [create] = planOf([candidate]).creates;
+    return create === undefined ? 'NO_ROW' : create.status === 'REJECTED' ? create.reason : null;
+  };
+  const postFields = fieldsOf(['title', 'slug', 'summary', 'body']);
+  const postBody = (authorKey: string): Readonly<Record<string, unknown>> => ({
+    title: markerOf(0), slug: markerOf(1), summary: markerOf(2), body: markerOf(3),
+    [authorKey]: '6f1c2e9a-1111-4222-8333-444455556666', tenant_id: 'tenant-1', cover_url: null, published_at: null, is_published: false, view_count: 0,
+  });
+
+  it('A: drafts the shape with the author number key, and gives the secret-looking page key as the reason, not a key without a field', () => {
+    expect(reasonOf(candidateWith('/admin/posts/new', `${API}/rest/v1/posts?select=*`, postBody('author_id'), postFields, true))).toBeNull();
+    expect(reasonOf(candidateWith('/admin/posts/new', `${API}/rest/v1/posts?select=*`, postBody('auth_token'), postFields, true)))
+      .toBe('SCENARIO_API_PAGE_KEY_SECRET_LIKE');
+    // 鍵の名前のほかが同じ形は試せる（null・真偽・数の鍵は、ページが決める鍵として送る）。
+    expect(reasonOf(candidateWith('/admin/posts/new', `${API}/rest/v1/posts?select=*`, postBody('writer_id'), postFields, true))).toBeNull();
+  });
+
+  it('B: keeps the reason of one field sent in two keys, and drafts the shape without Prefer and select', () => {
+    const clipFields = fieldsOf(['title', 'body', 'category', 'clip_code']);
+    const clipBody = (thumbnail: string): Readonly<Record<string, unknown>> => ({
+      category: markerOf(2), body: markerOf(1), display_order: 0, is_published: true, provider: 'video', tenant_id: 'tenant-1',
+      thumbnail_url: thumbnail, title: markerOf(0), clip_code: markerOf(3), clip_url: null,
+    });
+    expect(reasonOf(candidateWith('/admin/clips/new', `${API}/rest/v1/clips`, clipBody(`https://img.example.invalid/vi/${markerOf(3)}/0.jpg`), clipFields, false)))
+      .toBe('SCENARIO_API_FIELD_KEY_MISMATCH');
+    expect(reasonOf(candidateWith('/admin/clips/new', `${API}/rest/v1/clips`, clipBody('https://img.example.invalid/vi/fixed/0.jpg'), clipFields, false))).toBeNull();
+  });
+
+  // OP-L（L3。本物のテスト環境の A の形を、名前を伏せて写したもの）: 本文の鍵が 20 近く、null が多く、作った人の番号の鍵がある。その形だけなら試せる。
+  // 試せない（「入力のしかたを扱えない」）になるのは、画面が自動で入れて送る鍵に、一覧か入れ子の値があるとき（`SCENARIO_API_PAGE_KEY_NOT_SCALAR`）。理由が当たった
+  // 鍵の名前（値ではない）を、計画に添える。
+  const keyOf = (candidate: DiscoveryCandidate): string | null | undefined => {
+    const [create] = planOf([candidate]).creates;
+    return create?.status === 'REJECTED' ? create.reasonKey ?? null : undefined;
+  };
+  const blogFields = fieldsOf(['title', 'slug', 'excerpt', 'body']);
+  const blogBody = (extra: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> => ({
+    title: markerOf(0), slug: markerOf(1), excerpt: markerOf(2), body: markerOf(3), author_id: '6f1c2e9a-1111-4222-8333-444455556666', tenant_id: 'tenant-1',
+    cover_url: null, published_at: null, category_id: null, seo_title: null, seo_description: null, og_image: null, scheduled_at: null, status: 'draft',
+    is_published: false, is_featured: false, view_count: 0, sort_order: 0, updated_by: null, ...extra,
+  });
+  const blogOf = (extra: Readonly<Record<string, unknown>>) => candidateWith('/admin/posts/new', `${API}/rest/v1/posts?select=*`, blogBody(extra), blogFields, true);
+
+  it('OP-L L3 A: drafts the shape of about 20 keys with many nulls and the author number key', () => {
+    expect(Object.keys(blogBody({})).length).toBeGreaterThanOrEqual(19);
+    expect(reasonOf(blogOf({}))).toBeNull();
+  });
+
+  it.each([
+    ['a list', { tags: [] }, 'tags'],
+    ['a list of words', { tags: ['news'] }, 'tags'],
+    ['an object', { meta: {} }, 'meta'],
+  ] as const)('OP-L L3 A: gives the reason of a page key that holds %s, with the name of the key (no value)', (_name, extra, key) => {
+    expect(reasonOf(blogOf(extra))).toBe('SCENARIO_API_PAGE_KEY_NOT_SCALAR');
+    expect(keyOf(blogOf(extra))).toBe(key);
+  });
+
+  it('OP-L L3 B: adds the name of the key of one field sent in two keys (no value)', () => {
+    const clipFields = fieldsOf(['title', 'body', 'category', 'clip_code']);
+    const clip = candidateWith('/admin/clips/new', `${API}/rest/v1/clips`, {
+      category: markerOf(2), body: markerOf(1), display_order: 0, is_published: true, provider: 'video', tenant_id: 'tenant-1',
+      thumbnail_url: `https://img.example.invalid/vi/${markerOf(3)}/0.jpg`, title: markerOf(0), clip_code: markerOf(3), clip_url: null,
+    }, clipFields, false);
+    expect(reasonOf(clip)).toBe('SCENARIO_API_FIELD_KEY_MISMATCH');
+    const key = keyOf(clip);
+    expect(['clip_code', 'thumbnail_url']).toContain(key);
+    expect(String(key).includes('bsprobe')).toBe(false);
+  });
+
+  it('C: drafts the shape with the page keys of a string, a number, a boolean and null', () => {
+    const peopleFields = fieldsOf(['name', 'title', 'organization', 'body', 'category']);
+    expect(reasonOf(candidateWith('/admin/people/new', `${API}/rest/v1/people?select=*`, {
+      category: markerOf(4), body: markerOf(3), display_order: 1, is_published: true, name: markerOf(0), organization: markerOf(2), photo_url: null,
+      tenant_id: 'tenant-1', title: markerOf(1),
+    }, peopleFields, true))).toBeNull();
   });
 });

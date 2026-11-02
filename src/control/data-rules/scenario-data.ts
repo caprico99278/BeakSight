@@ -33,9 +33,11 @@ import {
   SYNTHETIC_EMAIL_LOCAL_DIGITS,
   SYNTHETIC_PHONE_VARIABLE_DIGITS,
   maxNumberOfDigits,
+  SYNTHETIC_TEXT_DIGITS,
   phoneNumberDigitsOf,
   relationFieldNamesOf,
   syntheticEmailAddressOf,
+  syntheticTextOf,
   syntheticPhoneNumberOf,
   type FieldRelation,
   type FieldRuleProblem,
@@ -254,6 +256,15 @@ const attemptOnce = (
       case 'DIGIT_CODE': {
         // FM2c: 番号・コード（桁ごとに 0〜9 を列から選ぶ。欄の制約に合わなければ作り直す）。
         const value = Array.from({ length: plan.digits }, () => String(stream.nextIntInclusive(0, MAX_DECIMAL_DIGIT))).join('');
+        if (plan.issueOf(value) !== null) {
+          return { kind: 'RETRY', report: report(fieldName, { code: 'NEEDS_RULE_INPUT', detail: 'PATTERN_UNSUPPORTED' }) };
+        }
+        values[fieldName] = value;
+        break;
+      }
+      case 'GENERIC_TEXT': {
+        // OP-2: 作り物の文字（数字の部分を列から選ぶ。欄の制約に合わなければ作り直す）。
+        const value = syntheticTextOf(stream.nextIntInclusive(0, maxNumberOfDigits(SYNTHETIC_TEXT_DIGITS)));
         if (plan.issueOf(value) !== null) {
           return { kind: 'RETRY', report: report(fieldName, { code: 'NEEDS_RULE_INPUT', detail: 'PATTERN_UNSUPPORTED' }) };
         }

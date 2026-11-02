@@ -17,7 +17,8 @@
  *   で止める（認証の設定の確かめの前。定義の数は呼び出し側が読んで渡す）。
  * - T28b（Task 28 の設計書 4.5）: モードと認証の方式の確かめを、ジョブの管理と同じ 1 つの判定（`execution-policy.ts` の
  *   `profileOperationRejectionOf`）にした。書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、発見・READ の確かめ・（自動ログインなら）
- *   ログインの確かめは、認証つきの読み取りの監査と同じ確かめになる。監査は `MODE_NOT_EXECUTABLE` のまま。
+ *   ログインの確かめは、認証つきの読み取りの監査と同じ確かめになる。MI-5 から、書き込みのモードの監査も同じ確かめになる（前は
+ *   `MODE_NOT_EXECUTABLE`。監査のジョブは、モードにかかわらず読み取りだけ）。
  */
 import { validateAuthSetup } from '../../../../src/control/auth/auth-setup-policy.js';
 import type { ProfileValidationErrorCode, SiteProfile } from '../../../../src/control/contracts.js';
@@ -26,6 +27,7 @@ import { operationRequiresAuthSetup, profileOperationRejectionOf } from '../../.
 import type { AuditJobStartResult } from '../../../../src/control/job/audit-job-manager.js';
 import type { AutoLoginLimitDecision } from '../../../../src/control/job/auto-login-limits.js';
 import { checkAutoLoginStart, type AutoLoginPreflightRejectionReason } from '../../../../src/control/job/auto-login-preflight.js';
+import { manualLoginEveryTimeApplies } from '../../../../src/control/auth/automated-login-switch.js';
 import type { AuditJobKind, AuditJobStartRejectionReason } from '../../../../src/control/job/job-records.js';
 import { WORKER_AUDIT_JOB_KIND, WORKER_READ_CHECK_JOB_KIND } from '../../../../src/control/worker-protocol.js';
 import { validateSiteProfile, type ProfileValidationContext } from '../../../../src/control/profile-policy.js';
@@ -102,7 +104,8 @@ export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck 
   const { status, profile, pathAccepted, context } = input;
   // 確かめるジョブの種類の省略の値は監査（T44g の CC-105: 値は IPC の契約の名前つきの定数から読む）。
   const jobKind = input.jobKind ?? WORKER_AUDIT_JOB_KIND;
-  // T28b: 認証の設定が要るかは、その操作をそのモードで受けるときだけ（書き込みのモードの監査は始められないので、要るとは言わない）。
+  // T28b: 認証の設定が要るかは、その操作をそのモードで受けるときだけ（判定は `execution-policy.ts`。MI-5 から、書き込みのモードの監査も、認証つきの
+  // 読み取りの監査と同じく要る）。
   const authRequired = operationRequiresAuthSetup(jobKind, profile.mode);
   const storedSetup = authRequired ? input.storedSetup : null;
   const validation = context === undefined ? null : validateSiteProfile(profile, context);
@@ -111,12 +114,13 @@ export const auditStartCheckOf = (input: AuditStartCheckInput): AuditStartCheck 
     : null;
   // T26e: 自動ログインの設定なら、ジョブの管理と同じ開始の前の確かめ（認証の設定の検証を通ったときだけ）。
   const autoLogin = input.autoLogin ?? null;
+  // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 2）: 「毎回手でログインする」が効くジョブは、手でログインするので当てない（判定はジョブの管理と同じ 1 か所）。
   const preflight = setupCheck !== null && setupCheck.ok && setupCheck.setup.automatedLogin !== null && validation !== null && validation.ok
-    && autoLogin !== null
+    && autoLogin !== null && !manualLoginEveryTimeApplies(validation.profile, jobKind)
     ? checkAutoLoginStart({ profile: validation.profile, authSetup: setupCheck.setup, ...autoLogin })
     : null;
   // T28b: ジョブの種類ごとに許すモードと認証の方式は、ジョブの管理と同じ判定（`execution-policy.ts` の `profileOperationRejectionOf`）だけで決める
-  // （T26e のログインの確かめは自動ログインだけ、T27f の発見と READ の確かめは認証の設定が要るモードだけ。書き込みのモードは監査だけを拒む）。READ の
+  // （T26e のログインの確かめは自動ログインだけ、T27f の発見と READ の確かめは認証の設定が要るモードだけ。MI-5 から、書き込みのモードの監査も受ける）。READ の
   // 確かめは、取り消していない定義が 0 件なら、認証の設定の確かめの前に `READ_CHECK_DEFINITIONS_MISSING`。
   const operationRejection = profileOperationRejectionOf(jobKind, profile.mode, profile.auth);
   // T27f: 取り消していない定義が 0 件なら、READ の確かめのジョブは始めない。

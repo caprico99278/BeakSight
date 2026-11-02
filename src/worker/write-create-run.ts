@@ -48,6 +48,22 @@
  * どれも設定の間隔（`crawl.minNavigationIntervalMs`。`NavigationPacer`）を守る。読み込み直しはしない。止める要求は、押す前の各段の前で確かめる
  * （押した後は止めない）。
  *
+ * PL-6a（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 8.1。調査 FV-0 の案 (b2)）: form の書き込みの結果の判定を、人が入れる条件（検証の
+ * 指定の成功の条件と入力の誤りの条件。契約から外し、結果の判定のしかたの印 `FORM_STRUCTURE` に置き換えた）から、構造の判定に変えた。form の登録の ID は、
+ * ID の型の一覧（`URL_PATH_PATTERNS`。2 つまで）だけから取る。記録は版 1.2（成否の条件の代わりに印）。上の 5・6・8 のうち form の部分を、次で置き換える。
+ * - 送る前の確かめ（事前の READ。登録だけ）: 3b の画面の確かめの後、同じ値で照合の READ を 1 回読む（`preSubmitReadStop`。GET 1〜2）。値がもう見えて
+ *   いれば `VALUE_ALREADY_PRESENT`、判定できなければ `VERIFICATION_READ_UNAVAILABLE` で送らない（`PRECHECK_FAILED`）。
+ * - 押した後（`judgeFormResult`）: 307・308 と応答を返せなかった回は今のまま。ほかは、押す前に作った進行中の要求の数え方で、送った後の画面が落ち着く
+ *   まで待って、発見の入口で 1 回読む（凍結。以後この Context では読み込まない）。最後の文書の状態、送ったフォームと同じ「フォームの形」
+ *   （`formShapeKeyOf`）の候補の有無、その form が送った値を保っているか（`submittedValuesKept`）、送った後の URL の ID（`recordIdOfResultUrl`。押す前の
+ *   URL と比べる）を観察として返す。状態が 2xx・3xx でセッションが切れていれば `SESSION_LOST`。
+ * - 書き込みの段を閉じた後（`formSentFactsOf`）: 状態が 2xx・3xx なら、成否によらず照合する（登録は照合の READ、更新は更新の後の照合。更新の照合の READ
+ *   は、更新の後の照合が一致して成功と判定したときだけ）。判定は `formResultJudgementOf`（4xx は入力の誤り、5xx は分からない、照合が一致すれば成功、
+ *   一致しなければ、送った値を保った同じフォームが出たときだけ入力の誤り、ほかは判定できない）。結果は今どおり `actionOutcomeOf`。
+ * - 読み込み（登録）: 画面の確かめ（GET 1）、送る前の答え合わせ（GET 1〜2）、書き込みの画面（GET 1）、POST（と redirect）、照合の READ（GET 2）。
+ *   読み込み（更新）: 今と同じ（更新の後の読み取りは、成功でない 2xx・3xx の回にも 1 回読む）。1 件の予約、送り直しをしない、結果が分からないときに
+ *   止める、の決まりは変えない。
+ *
  * T31g-2（Task 31 の設計書 3 章の「更新の前の読み取り」「送信」「結果の判定」「更新の後の照合」「証拠と記録」、4 章の「読み込みの回数と間隔」）:
  * 更新の書き込みのジョブ（`WRITE_UPDATE`。`write.update` を持つ指定）も、この流れで行う（CREATE と同じ段を共有し、違う所だけを分ける。書き込みの段の
  * Context と入力の部品を使うのは、今どおりこのファイルだけ）。`formPage` と `request` の path は、親が対象の ID を入れた具体的な path。
@@ -75,9 +91,15 @@
  * - 3b の代わりに、送る前の画面の確かめ（`checkApiFormPage`）: 凍結した Context で書き込みの画面を 1 回読み（form と同じ `checkWritePage`。読む URL の
  *   判定 `isReadUrlAllowed`）、`inspectApiWriteInput` で、送信の要素（`submitterIdentityDigest`）がちょうど 1 つあり、鍵の欄（`api.keyFields` の欄の識別）が
  *   そろうことを、値を入れずに確かめる（結果は `candidateDigestMatched`）。外れたら送らずに `PRECHECK_FAILED`。
+ *   OP-L（L1）: SPA が欄と送信の要素を後から描くので、確かめは、出そろうのを上限（`API_WRITE_INPUT_APPEAR_WAIT_MS`）の中で待ってから行う
+ *   （`inspectApiWriteInputWhenRendered`。同じ画面を読み直すだけで、読み込みは足さない。書き込みの段で開き直した画面も同じ）。候補が合わなかったときは、
+ *   どこが違ったか（`candidateMismatch`。理由・候補の数・外れた鍵の欄の位置。値は含まない）を `action-evidence.json` の `precheck` に残す。
  * - 書き込みの段の Context は `transport: 'API'` で、Guard の照合の期待は承認した API の指定と鍵ごとの生成した値（`apiExpectationOf`）、ID を応答の本文から
  *   取るなら `recordIdOf`（`apiRecordIdOfResponseBody` を ID の鍵で包む）。段の中: 書き込みの画面を 1 回読み → `inspectApiWriteInput` → `fillApiWriteInput`
  *   （送信の窓を開いてから入れる）→ 窓の中で止めた要求がないことを確かめる → form と同じ押す直前の確かめ（`readyToPress`）→ `submitApiWriteInput`。
+ *   OP-O（O1）: 書き込みの段の確かめ・入力・押す操作が失敗して送らなかったときは、段・理由・欄の位置・欄の種類・属性の有無・値の変わり方の区分（値と、値の
+ *   長さは含まない）を `action-evidence.json` の `precheck.inputFailure` に残す（form の書き込みも同じ形。`inputFailureOf`・`formInputFailureOf`）。画面には
+ *   出さない。
  * - 結果の判定（`judgeApiResult`。期限は form と同じ `resultTimeoutMs`）: 送らなかった・送り手が書いた後に応答がない・状態が 100〜599 の外は判定なし
  *   （`apiResponseFactsOf`。T40c の発見事項 3 への判断）。応答をブラウザに返せなかった（Guard の `responseDeliveryCanceled`。form と同じ部品）なら
  *   `RESPONSE_NOT_DELIVERED`（ID を取らない）。ほかは `apiResponseJudgementOf` の判定で、成功のときだけ、セッションの切れを
@@ -122,12 +144,12 @@ import type { BrowserContext, Page, Request, Response } from 'playwright';
 import {
   API_WRITE_VALUE_QUIET_TIMEOUT_MS,
   fillApiWriteInput,
-  inspectApiWriteInput,
+  inspectApiWriteInputWhenRendered,
   readApiWriteFieldValues,
   submitApiWriteInput,
   type ApiWriteInputSpec,
 } from '../browser/api-write-submitter.js';
-import { FORM_POST_METHOD } from '../browser/form-submission-common.js';
+import { FORM_POST_METHOD, type WriteInputFailureStage, type WriteInputFieldFacts, type WriteInputValueChange } from '../browser/form-submission-common.js';
 import type { BrowserContextFactory } from '../browser/context-factory.js';
 import {
   fillWriteForm,
@@ -156,12 +178,19 @@ import {
   type ActionBlockReason,
   type ActionEvidenceDocument,
   type ActionGuardSummary,
+  PRECHECK_CANDIDATE_MISMATCH_REASONS,
+  WRITE_INPUT_FAILURE_REASONS,
+  type ActionEvidenceCandidateMismatch,
+  type ActionEvidenceInputFailure,
+  type WriteInputFailureReason,
   type ActionOutcome,
   type ActionResult,
   type ActionRunDocument,
   type ActionRunReadVerification,
   type ActionRunUpdate,
   type ApprovalSummaryDocument,
+  type FormUpdatePostcheck,
+  type PrecheckCandidateMismatchReason,
   type PrecheckFailureDetail,
   type ResponseJudgement,
   type SubmissionState,
@@ -172,7 +201,11 @@ import {
   actionOutcomeOf,
   apiResponseJudgementOf,
   fieldsMatchedOf,
+  formResultJudgementOf,
+  isFormStructureStatus,
   isUsableRecordId,
+  preSubmitReadStopOf,
+  recordIdOfResultUrl,
   recordableRecordIdOf,
   reservationSettlementOf,
 } from '../control/actions/action-outcome.js';
@@ -189,20 +222,24 @@ import { lastRecordIdLikePathSegmentIndexOf, type ApiJsonValueType } from '../co
 import type { RunId, RunStatus } from '../core/contracts.js';
 import { jsonValueOf } from '../core/json-value.js';
 import { wait } from '../core/deadline.js';
-import {
-  ERROR_HTTP_STATUS_RANGE,
-  SERVER_ERROR_HTTP_STATUS_RANGE,
-  TOO_MANY_REQUESTS_HTTP_STATUS,
-  isHttpStatusInRange,
-  type HttpStatusRange,
-} from '../core/http-status.js';
+import { ERROR_HTTP_STATUS_RANGE, isHttpStatusInRange, type HttpStatusRange } from '../core/http-status.js';
 import { CONTEXT_CLOSE_TIMEOUT_MS } from '../core/limits.js';
 import { deriveRunStatus } from '../core/status.js';
 import { formatCompactUtcTimestamp } from '../core/utc-timestamp.js';
 import { createNavigationPacer, type NavigationPacer } from '../crawl/navigation-pacer.js';
-import { FORM_SCENARIO_TRANSPORT, type ScenarioRecordIdSpec, type ScenarioTransport } from '../control/approval/scenario-contracts.js';
-import type { CandidateLocation } from '../discovery/candidate-contracts.js';
-import { pagePathTemplatedIdentityDigestOf, recordIdOfPathPattern, templatedIdentityDigestForRecordIdOf } from '../discovery/fingerprint.js';
+import {
+  FORM_SCENARIO_TRANSPORT,
+  SCENARIO_API_FIELD_TYPES,
+  type ScenarioRecordIdSpec,
+  type ScenarioTransport,
+} from '../control/approval/scenario-contracts.js';
+import { CANDIDATE_FIELD_TYPES, type CandidateFieldType, type CandidateLocation } from '../discovery/candidate-contracts.js';
+import {
+  formShapeKeyOf,
+  pagePathTemplatedIdentityDigestOf,
+  recordIdOfPathPattern,
+  templatedIdentityDigestForRecordIdOf,
+} from '../discovery/fingerprint.js';
 import type { ReadCheckExecutedEvidence } from '../discovery/read-check-evaluation.js';
 import { readCandidatePage } from '../discovery/read-executor.js';
 import {
@@ -215,9 +252,12 @@ import {
 import {
   isServiceRequestLimitReached,
   jobContextFactoryOptions,
+  recordRunStageCarry,
   sessionKeyLostDetailOf,
   type AuditStageRunState,
+  type RunStageCarry,
 } from '../orchestration/audit-stage-run.js';
+import { auditSendOptionsOf } from '../orchestration/audit-send-options.js';
 import { sessionLostUrlOf, type RunAuthentication } from '../orchestration/authenticated-run.js';
 import { navigatePage } from '../orchestration/page-navigation.js';
 import { closePassiveContextBeforeDeadline } from '../orchestration/passive-session-close.js';
@@ -234,7 +274,7 @@ import {
 import { redactUrlSecrets } from '../safety/redact.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
 import type { WritePayloadExpectation } from '../safety/write-payload-policy.js';
-import { isLoginResultConditionPage, loginStageLocator } from './login-stage-checks.js';
+import { loginStageLocator } from './login-stage-checks.js';
 import { isReadUrlAllowed, verifyReadCheck, verifyRecordPageReadCheck } from './read-check-run.js';
 import {
   endWorkerRun,
@@ -279,6 +319,11 @@ export interface WriteCreateRunRequest {
   readonly reportSubmission: (report: WorkerWriteSubmissionReport) => void;
   /** 読み込みの間隔を守る部品（省略すると、設定の `crawl.minNavigationIntervalMs` で作る）。 */
   readonly navigationPacer?: NavigationPacer | undefined;
+  /**
+   * OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.2 の案 C）: まとめて実行の書き込みの段の持ち越し（前の段の 1 分の窓から始め、Browser を閉じた
+   * 後に factory の最新のログインの状態・窓・読み込みの間隔を渡す。メモリの中だけ）。単独の書き込みのジョブは渡さない。
+   */
+  readonly stageCarry?: RunStageCarry | undefined;
   /** 押した後に結果を待つ上限（ms。省略すると、設定の `crawl.navigationTimeoutMs`）。 */
   readonly resultTimeoutMs?: number | undefined;
   /**
@@ -343,6 +388,10 @@ export interface WriteFacts {
   readonly guard: ActionGuardSummary | null;
   /** T44e（Task 44 の設計書 P2-4）: `PRECHECK_FAILED` の具体的な理由（分かったときだけ。`action-run.json` の任意の項目 `precheckDetail`）。 */
   readonly precheckDetail?: PrecheckFailureDetail;
+  /** OP-L（L1）: 候補が合わなかったときの、どこが違ったか（`action-evidence.json` の `precheck.candidateMismatch`。値を含まない）。 */
+  readonly candidateMismatch?: ActionEvidenceCandidateMismatch;
+  /** OP-O（O1）: 書き込みの段の、確かめ・入力・押す操作の失敗（`action-evidence.json` の `precheck.inputFailure`。値と、値の長さを含まない）。 */
+  readonly inputFailure?: ActionEvidenceInputFailure;
   /**
    * T40b-1: API の書き込みで、Guard の照合が返したページが決める鍵の値（`monitor.apiWritePageKeyValues()`。form と、照合まで進まなかった回は
    * null か省略）。文書は、送った回だけ残す。
@@ -359,6 +408,10 @@ const notSent = (
     readonly guard?: ActionGuardSummary | null;
     /** T44e（Task 44 の設計書 P2-4）: `PRECHECK_FAILED` の具体的な理由（ほかの理由では付けない）。 */
     readonly precheckDetail?: PrecheckFailureDetail | undefined;
+    /** OP-L（L1）: 候補が合わなかったときの、どこが違ったか（合わなかったときだけ）。 */
+    readonly candidateMismatch?: ActionEvidenceCandidateMismatch | null;
+    /** OP-O（O1）: 書き込みの段の、確かめ・入力・押す操作の失敗（`PRECHECK_FAILED` のときだけ）。 */
+    readonly inputFailure?: ActionEvidenceInputFailure | undefined;
   } = {},
 ): WriteFacts => Object.freeze({
   submission: 'NOT_SENT',
@@ -373,6 +426,10 @@ const notSent = (
   judgedAt: null,
   guard: details.guard ?? null,
   ...(blockReason === PRECHECK_FAILED && details.precheckDetail !== undefined ? { precheckDetail: details.precheckDetail } : {}),
+  ...(details.candidateDigestMatched === false && details.candidateMismatch !== undefined && details.candidateMismatch !== null
+    ? { candidateMismatch: details.candidateMismatch }
+    : {}),
+  ...(blockReason === PRECHECK_FAILED && details.inputFailure !== undefined ? { inputFailure: details.inputFailure } : {}),
 });
 
 /**
@@ -399,7 +456,43 @@ const guardSummaryOf = (snapshot: WriteStageMonitorSnapshot): ActionGuardSummary
   blockedByPayloadReason: Object.freeze({ ...snapshot.blockedByPayloadReason }),
   documentCharsetRead: snapshot.documentCharsetRead,
   responseDeliveryCanceled: snapshot.responseDeliveryCanceled,
+  // OP-M: 承認した送信のほかに止めた要求の一覧（1 つの配列。値・Origin を含まない）と、一覧に入れなかった数。どちらも、あったときだけ（任意の項目）。
+  ...(snapshot.unexpectedRequests.length > 0 ? { unexpectedRequests: snapshot.unexpectedRequests } : {}),
+  ...(snapshot.unexpectedRequestsUnlisted > 0 ? { unexpectedRequestsUnlisted: snapshot.unexpectedRequestsUnlisted } : {}),
+  // OP-N（設計書 4.1.7 の N2）: 送信の扱い `PASS_EXCEPT_DELETE` で通した、サイトが自動で送る通信の一覧（同じ形。書き込みには数えない）と、一覧に入れなかった数。
+  // どちらも、あったときだけ（任意の項目）。
+  ...(snapshot.passedRequests.length > 0 ? { passedRequests: snapshot.passedRequests } : {}),
+  ...(snapshot.passedRequestsUnlisted > 0 ? { passedRequestsUnlisted: snapshot.passedRequestsUnlisted } : {}),
 });
+
+/** 監査の段の送信の扱いの factory の口の形（`auditSendOptionsOf` が作る）。 */
+type WriteJobAuditSend = NonNullable<ReturnType<typeof auditSendOptionsOf>['auditSend']>;
+
+/**
+ * OP-Q（設計書 4.1.8 の Q1）: 書き込みの作業の承認した送信の送信先（書き込みの段の Guard と中継が数える送信先と同じ値。form は承認の要求の Origin と path、API は
+ * 承認した API の Origin と path の型）。
+ */
+const writeJobEndpointOf = (write: WorkerStartWrite | WorkerStartApiWrite): { readonly origin: string; readonly path: string } =>
+  (isWorkerStartApiWrite(write)
+    ? { origin: write.api.request.origin, path: write.api.request.pathShape }
+    : { origin: write.request.origin, path: write.request.path });
+
+/**
+ * OP-REV3（C-1）と OP-Q（Q1）: 書き込みのジョブの factory の、監査の段の送信の扱いの口（`PASS_EXCEPT_DELETE` のときだけ持つ。どの Context に当てるかを口で分ける）。
+ * - `writeStageAuditSend`: 書き込みの段の Context（値を入れる前だけ。窓と押した後には当てない）。
+ * - `writeJobPassiveAuditSend`: 送る前の確かめと照合の READ の Passive の Context（書き込みの作業の印 `writeJobEndpoint` つき。決まりは書き込みの段の値を入れる前と同じ）。
+ * `READ_ONLY` なら、どちらも持たない（今のまま読み取りだけ）。
+ */
+const writeJobAuditSendOf = (
+  config: Parameters<typeof auditSendOptionsOf>[0],
+  approvedServiceOrigins: readonly string[],
+  write: WorkerStartWrite | WorkerStartApiWrite,
+): { readonly writeStageAuditSend?: WriteJobAuditSend; readonly writeJobPassiveAuditSend?: WriteJobAuditSend } => {
+  const { auditSend } = auditSendOptionsOf(config, approvedServiceOrigins);
+  return auditSend === undefined
+    ? {}
+    : { writeStageAuditSend: auditSend, writeJobPassiveAuditSend: Object.freeze({ ...auditSend, writeJobEndpoint: Object.freeze(writeJobEndpointOf(write)) }) };
+};
 
 const PRECHECK_FAILED: ActionBlockReason = 'PRECHECK_FAILED';
 const PAYLOAD_MISMATCH: ActionBlockReason = 'PAYLOAD_MISMATCH';
@@ -449,12 +542,50 @@ const payloadExpectationOf = (
 const payloadBlocked = (monitor: WriteStageMonitor): boolean =>
   Object.values(monitor.snapshot().blockedByPayloadReason).some((count) => count > 0);
 
-/** HTTP の状態からの判定（429・5xx。ほかは null）。 */
-const statusJudgementOf = (status: number | null): ResponseJudgement | null => {
-  if (status === TOO_MANY_REQUESTS_HTTP_STATUS) {
-    return 'RATE_LIMITED';
+/** PL-6a: form の登録の ID の型（送った後の URL に、この順に当てる。契約は `MAX_FORM_RECORD_ID_PATTERNS` まで。設計書 8.1）。 */
+// PL-5 の 9 の (4): ID の取り方が null（決められなかった）なら型なし（ID を取らない。結果は ID なしの `PARTIAL`）。
+const formRecordIdPatternsOf = (write: WorkerStartWrite): readonly string[] => write.verification.recordId?.pathPatterns ?? [];
+
+/**
+ * PL-6a（設計書 8.1 の「判定の順」の 3）: 送った後の画面の、送ったフォームと同じ形のフォームが、送った値を保っているか。送った値のうち、BeakSight が値を
+ * 作って入れる文字の欄（`SCENARIO_API_FIELD_TYPES` の型。text・email・textarea など）の値を、欄の名前で、落ち着くまで待って読み（書き込みの入力の部品
+ * `readApiWriteFieldValues`。値はメモリの中だけ）、すべて送った値と同じ（`sameValue`）なら真。比べる欄がない・読めない・名前の欄が 2 つ以上あるなら偽
+ * （入力の誤りと言わない側に倒す）。
+ */
+async function submittedValuesKept(page: Page, write: WorkerStartWrite): Promise<boolean> {
+  const textTypes: ReadonlySet<string> = new Set(SCENARIO_API_FIELD_TYPES);
+  const entries = Object.entries(write.values).flatMap(([name, value]) => {
+    const fields = write.candidateFields.filter((field) => field.name === name);
+    return typeof value === 'string' && fields.length === 1 && fields.every(({ type }) => textTypes.has(type)) ? [{ name, value }] : [];
+  });
+  if (entries.length === 0) {
+    return false;
   }
-  return isHttpStatusInRange(status, SERVER_ERROR_HTTP_STATUS_RANGE) ? 'SERVER_ERROR' : null;
+  const read = await readApiWriteFieldValues(page, entries.map(({ name }) => ({ kind: 'NAME' as const, name })));
+  return read.ok && entries.every(({ value }, index) => sameValue(read.values[index] ?? null, value));
+}
+
+/**
+ * PL-6a: form の更新の、更新の後の照合の分け方（`FormUpdatePostcheck`。判定 `formResultJudgementOf` の入力）。後の画面を読めない・照合できない欄があれば
+ * `UNDETERMINED`、すべて一致なら `UPDATED`。一致しない欄があるとき、変えた欄がすべて前の値のままで、保つ欄・状態の欄がすべて一致なら `UNCHANGED`
+ * （更新されていない）、ほかは `CHANGED_OTHERWISE`。
+ */
+const formUpdatePostcheckOf = (
+  update: WorkerStartWriteUpdate,
+  prior: UpdateFormValues,
+  after: UpdateFormValues | null,
+  evidence: WriteUpdateEvidence,
+): FormUpdatePostcheck => {
+  const matched = fieldsMatchedOf(evidence);
+  if (after === null || matched === null) {
+    return 'UNDETERMINED';
+  }
+  if (matched) {
+    return 'UPDATED';
+  }
+  const unchanged = update.changedFieldNames.every((name) => sameValue(after.fields[name] ?? null, prior.fields[name] ?? null))
+    && evidence.fields.every(({ role, matched: fieldMatched }) => role === CHANGED_FIELD_ROLE || fieldMatched === true);
+  return unchanged ? 'UNCHANGED' : 'CHANGED_OTHERWISE';
 };
 
 /**
@@ -841,7 +972,8 @@ function checkApiUpdatePage(
     const [only, ...others] = matching;
     const segment = only === undefined ? null : lastRecordIdLikePathSegmentIndexOf(only.page.path);
     if (only === undefined || others.length > 0 || segment === null || only.page.path.split('/')[segment] !== targetRecordId) {
-      return CANDIDATE_NOT_MATCHED;
+      // OP-L（L1）: 規則の digest は、この確かめでは照らさない（型にした識別と、path の ID の区切りだけ）。
+      return candidateNotMatched(candidateMismatchOf(read.candidates.length, matching, null));
     }
     // T41R-fix（(1)・(4)）: 前の読み取りと後の照合は、画面を読み込む前に作った数え方で、要求が止んだ後に落ち着いた値を読む。
     const values = await readApiUpdateFieldValues(page, write, counter, quiet);
@@ -856,7 +988,7 @@ async function planApiUpdateStage(input: PrecheckInput, write: WorkerStartApiWri
   const checked = await checkApiUpdatePage(input.factory, input.pacer, write, targetRecordId, input.options, quiet);
   noticeSessionLost(input, checked.sessionLostUrl);
   const stop = (candidateDigestMatched: boolean | null, precheckDetail: PrecheckFailureDetail): WriteStagePlan =>
-    ({ kind: 'STOP', facts: notSent(PRECHECK_FAILED, { violation: checked.violation, candidateDigestMatched, precheckDetail }) });
+    ({ kind: 'STOP', facts: notSent(PRECHECK_FAILED, { violation: checked.violation, candidateDigestMatched, precheckDetail, candidateMismatch: checked.candidateMismatch }) });
   if (checked.value === null || input.stopSignal.aborted) {
     return stop(checked.candidateMatched, pageCheckDetailOf(checked, input.stopSignal.aborted));
   }
@@ -900,10 +1032,72 @@ interface WriteStageResult {
   readonly sessionLostUrl: string | null;
   /** T44e（Task 44 の設計書 P2-4）: 送らずに止めたときの具体的な理由（分かったときだけ）。 */
   readonly precheckDetail?: PrecheckFailureDetail;
+  /** OP-O（O1）: 確かめ・入力・押す操作の失敗（値と、値の長さを含まない。分かったときだけ）。 */
+  readonly inputFailure?: ActionEvidenceInputFailure;
+  /**
+   * PL-6a: form の、送った後の画面の観察（応答を受け、307・308、応答を返せなかった、セッションの切れのどれでもないときだけ）。このときの結果の判定は、
+   * 書き込みの段を閉じた後に、照合（登録の答え合わせの READ、更新の後の照合）と合わせて `formResultJudgementOf` で決める（`responseJudgement` は null）。
+   */
+  readonly formFacts?: FormResultPageFacts | null;
 }
 
-/** T44e: 送らずに止めた書き込みの段の結果に、具体的な理由を付ける（送る・送らないは `PRECHECK_STOPPED` のまま）。 */
-const precheckStopped = (precheckDetail: PrecheckFailureDetail): WriteStageResult => Object.freeze({ ...PRECHECK_STOPPED, precheckDetail });
+/** PL-6a: form の、送った後の画面の観察（値は持たない）。 */
+interface FormResultPageFacts {
+  readonly httpStatus: number;
+  readonly sameForm: boolean;
+  readonly sameFormKeptValues: boolean;
+  /** 送った後の URL から取った ID（記録してよい値だけ。`recordableRecordIdOf`）。 */
+  readonly recordId: string | null;
+}
+
+/**
+ * T44e: 送らずに止めた書き込みの段の結果に、具体的な理由を付ける（送る・送らないは `PRECHECK_STOPPED` のまま）。OP-O（O1）: 確かめ・入力・押す操作の失敗の
+ * 記録（`inputFailure`）も、分かれば添える。
+ */
+const precheckStopped = (precheckDetail: PrecheckFailureDetail, inputFailure?: ActionEvidenceInputFailure): WriteStageResult =>
+  Object.freeze({ ...PRECHECK_STOPPED, precheckDetail, ...(inputFailure === undefined ? {} : { inputFailure }) });
+
+/** OP-O（O1）: 入力の部品が返した失敗（理由の語と、分かった細目。値と、値の長さは持たない）。 */
+interface InputPartFailure {
+  readonly reason: string;
+  readonly fieldIndex?: number;
+  readonly field?: WriteInputFieldFacts;
+  readonly valueChange?: WriteInputValueChange;
+}
+
+/**
+ * OP-O（O1）: 入力の部品の失敗を、`action-evidence.json` の `precheck.inputFailure` の形にする（理由と欄の種類は閉じた一覧の値だけ。外れれば記録しない・
+ * 種類は null）。値と、値の長さは持たない。
+ */
+const inputFailureOf = (stage: WriteInputFailureStage, failure: InputPartFailure): ActionEvidenceInputFailure | undefined => {
+  if (!(WRITE_INPUT_FAILURE_REASONS as readonly string[]).includes(failure.reason)) {
+    return undefined;
+  }
+  const type = failure.field?.type ?? null;
+  return Object.freeze({
+    stage,
+    reason: failure.reason as WriteInputFailureReason,
+    fieldPosition: failure.fieldIndex ?? null,
+    fieldType: type !== null && (CANDIDATE_FIELD_TYPES as readonly string[]).includes(type) ? type as CandidateFieldType : null,
+    fieldAttributes: failure.field?.attributes ?? null,
+    valueChange: failure.valueChange ?? null,
+  });
+};
+
+/** OP-O（O1）: form の入力の部品の失敗を、記録の形にする（`VALUE_NOT_APPLIED` は欄の位置・型・変わり方の区分も。属性は読まないので null）。 */
+const formInputFailureOf = (
+  stage: WriteInputFailureStage,
+  failure: { readonly reason: string; readonly valueDetail?: { readonly fieldIndex: number; readonly fieldType: string; readonly valueChange?: WriteInputValueChange } },
+): ActionEvidenceInputFailure | undefined => inputFailureOf(stage, {
+  reason: failure.reason,
+  ...(failure.valueDetail === undefined
+    ? {}
+    : {
+      fieldIndex: failure.valueDetail.fieldIndex,
+      field: { type: failure.valueDetail.fieldType, attributes: null },
+      ...(failure.valueDetail.valueChange === undefined ? {} : { valueChange: failure.valueDetail.valueChange }),
+    }),
+});
 
 const PRECHECK_STOPPED: WriteStageResult = Object.freeze({
   clicked: false,
@@ -931,6 +1125,8 @@ interface WriteStageInput {
   readonly apiUpdate?: ApiUpdateStage | undefined;
   /** T37a fix round 1: ジョブの監査の段の状態（口がなければ `null`）。押す直前に、鍵の消失と上限を確かめる。 */
   readonly auditStage: AuditStageRunState | null;
+  /** PL-6a: form の、送るフォームの形の鍵（送る前の画面の確かめで、承認した候補から求めた `formShapeKeyOf`。API は undefined）。 */
+  readonly formShapeKey?: string | undefined;
 }
 
 /**
@@ -957,11 +1153,14 @@ async function writeOnStage(input: WriteStageInput, write: WorkerStartWrite): Pr
   const inspection = input.update === undefined ? await inspectWriteForm(page, spec) : await inspectUpdateForm(page, input.update.spec, input.update.prior);
   if (!inspection.ok || stopSignal.aborted) {
     // T44e: 更新の確かめの失敗は、書き込みの画面の値が前の値と違う（`inspectUpdateForm`）。登録は入力の前の確かめの失敗。
-    return precheckStopped(stopSignal.aborted ? 'STOPPED' : input.update === undefined ? 'FORM_NOT_READY' : 'PRIOR_VALUE_CHANGED');
+    // OP-O（O1）: 確かめの失敗の段と理由を残す（止める印のときは残さない）。
+    return inspection.ok || stopSignal.aborted
+      ? precheckStopped('STOPPED')
+      : precheckStopped(input.update === undefined ? 'FORM_NOT_READY' : 'PRIOR_VALUE_CHANGED', formInputFailureOf('INSPECT', inspection));
   }
   const filled = await fillWriteForm(page, inspection.form, write.values, monitor);
   if (!filled.ok) {
-    return precheckStopped('FORM_NOT_READY');
+    return precheckStopped('FORM_NOT_READY', formInputFailureOf('FILL', filled));
   }
   const quiet = await submissionWindowDetailOf(input);
   if (quiet !== null) {
@@ -991,23 +1190,27 @@ async function writeOnStage(input: WriteStageInput, write: WorkerStartWrite): Pr
     }
   };
   page.on('requestfailed', onRequestFailed);
+  // PL-6a: 送った後の画面の落ち着きの待ちに使う、進行中の要求の数え方（押す前に作る。POST と redirect の先の読み込みを数える。ページに何もしない）。
+  let counter: InFlightRequestCounter | null = null;
   try {
     const notReady = await readyToPress(input);
     if (notReady !== null) {
       return precheckStopped(notReady);
     }
-    // T40R-fix-A2（Task 40 の設計書 7 章の「T40R-fix-A・B の報告」）: API と同じく、押す直前に、画面の ID の取り方で今の画面から値を読む（記録しない。押した
-    // 後に同じ値か、URL の型で URL が変わっていなければ、ID として使わない）。
-    const baseline = await pageRecordIdBaselineOf(page, write.verification.recordId);
+    // PL-6a（設計書 8.1 の「判定の順」の 2）: 押す直前の URL（記録しない）。送った後の URL から取った ID が、この URL を同じ型に当てた値と同じか、URL が
+    // 変わっていなければ、ID として使わない（T40R-fix-A2 の決まりを、URL の型の判定 `recordIdOfResultUrl` に移した）。
+    const beforeUrl = page.url();
+    counter = new InFlightRequestCounter(page);
     const submittedAt = request.clock();
     const submitted = await submitWriteForm(page, inspection.form, write.values);
     if (!submitted.ok && !submitted.clickAttempted) {
-      return precheckStopped('FORM_NOT_READY');
+      return precheckStopped('FORM_NOT_READY', formInputFailureOf('SUBMIT', submitted));
     }
-    const judged = await judgeResult(input, write, documentStatuses, () => postNavigationFailed, baseline);
-    // T32e: 判定の時刻は、判定を終えた時点の時計（報告の `response.judgedAt`）。
+    const judged = await judgeFormResult(input, write, documentStatuses, () => postNavigationFailed, { counter, beforeUrl });
+    // T32e: 判定の時刻は、判定を終えた時点の時計（報告の `response.judgedAt`）。PL-6a: 構造の判定は、照合の後に時刻を決め直す。
     return { clicked: true, precheckFailed: false, submittedAt, judgedAt: request.clock(), ...judged };
   } finally {
+    counter?.dispose();
     page.off('response', onResponse);
     page.off('requestfailed', onRequestFailed);
   }
@@ -1136,13 +1339,15 @@ async function apiWriteOnOpenedStage(
     }
   }
   const spec = apiInputSpecOf(write);
-  const inspection = await inspectApiWriteInput(page, apiUpdate === undefined ? spec : { ...spec, submitterIdentityDigest: apiUpdate.submitterIdentityDigest });
+  // OP-L（L1）: 書き込みの段で開き直した画面でも、SPA が欄を後から描くのを、上限の中で待ってから確かめる（入れる・押す前。読み込みは足さない）。
+  const inspection = await inspectApiWriteInputWhenRendered(page, apiUpdate === undefined ? spec : { ...spec, submitterIdentityDigest: apiUpdate.submitterIdentityDigest });
   if (!inspection.ok || request.stopSignal.aborted) {
-    return precheckStopped(request.stopSignal.aborted ? 'STOPPED' : 'FORM_NOT_READY');
+    // OP-O（O1）: 確かめの失敗の段・理由・欄の事実を残す（止める印のときは残さない）。
+    return inspection.ok || request.stopSignal.aborted ? precheckStopped('STOPPED') : precheckStopped('FORM_NOT_READY', inputFailureOf('INSPECT', inspection));
   }
   const filled = await fillApiWriteInput(page, inspection.input, monitor);
   if (!filled.ok) {
-    return precheckStopped('FORM_NOT_READY');
+    return precheckStopped('FORM_NOT_READY', inputFailureOf('FILL', filled));
   }
   const quiet = await submissionWindowDetailOf(input);
   if (quiet !== null) {
@@ -1174,7 +1379,7 @@ async function apiWriteOnOpenedStage(
   const submittedAt = request.clock();
   const submitted = await submitApiWriteInput(page, inspection.input);
   if (!submitted.ok && !submitted.clickAttempted) {
-    return precheckStopped('FORM_NOT_READY');
+    return precheckStopped('FORM_NOT_READY', inputFailureOf('SUBMIT', submitted));
   }
   const judged = await judgeApiResult(input, write, baseline);
   return { clicked: true, precheckFailed: false, submittedAt, judgedAt: request.clock(), ...judged };
@@ -1284,73 +1489,115 @@ async function judgeApiResult(input: WriteStageInput, write: WorkerStartApiWrite
   }
 }
 
-/** 押した後の結果の判定（ファイルの先頭の 5・6）。期限（`resultTimeoutMs`）まで、間隔ごとに確かめる。 */
-async function judgeResult(
+/** PL-6a: form の押した後の結果の判定の結果（構造の判定に回すときは、送った後の画面の観察 `formFacts` を持つ）。 */
+type JudgedFormResult = JudgedWriteResult & { readonly formFacts: FormResultPageFacts | null };
+
+/**
+ * 押した後の結果の判定（ファイルの先頭の 5・6。PL-6a で構造の判定に変えた。設計書 8.1）。期限（`resultTimeoutMs`）まで、間隔ごとに応答を待つ。応答を受けたら:
+ * 307・308 → `REPOST_REDIRECT`、応答をブラウザに返せなかった → `RESPONSE_NOT_DELIVERED`（どちらも今のまま）。ほかは、送った後の画面を、発見の入口
+ * （`readCandidatePage`。押す前に作った数え方で、POST と redirect の先の読み込みが落ち着くまで待ち、凍結して 1 回読む。以後、この Context では読み込まない）
+ * で読み、最後の文書の状態が 2xx・3xx で、セッションが切れていれば `SESSION_LOST`。そうでなければ、観察（状態、送ったフォームと同じ形のフォームがあるか、
+ * それが送った値を保っているか、URL の ID）を返し、判定は書き込みの段を閉じた後に照合と合わせて決める（`formResultJudgementOf`）。凍結の条件に合わず
+ * 読めない画面は、同じフォームがないとして扱う（入力の誤りと言わない側）。
+ */
+async function judgeFormResult(
   input: WriteStageInput,
   write: WorkerStartWrite,
   documentStatuses: readonly number[],
   postNavigationFailed: () => boolean,
-  baseline: PageRecordIdBaseline,
-): Promise<JudgedWriteResult> {
+  observation: { readonly counter: InFlightRequestCounter; readonly beforeUrl: string },
+): Promise<JudgedFormResult> {
   const { request, monitor, page, ledger } = input;
   const { authentication, config } = request;
   const deadline = request.now() + (request.resultTimeoutMs ?? config.crawl.navigationTimeoutMs);
   const finalStatus = (): number | null => documentStatuses.at(-1) ?? monitor.submissionReport().responseStatus;
-  const decided = (responseJudgement: ResponseJudgement | null, rawRecordId: string | null = null, sessionLostUrl: string | null = null) => {
+  const decided = (responseJudgement: ResponseJudgement | null, sessionLostUrl: string | null = null): JudgedFormResult => {
     const report = monitor.submissionReport();
-    return { httpStatus: report.responseReceived ? finalStatus() : null, responseJudgement: report.responseReceived ? responseJudgement : null, rawRecordId,
-      sessionLostUrl };
+    return {
+      httpStatus: report.responseReceived ? finalStatus() : null, responseJudgement: report.responseReceived ? responseJudgement : null, rawRecordId: null,
+      sessionLostUrl, formFacts: null,
+    };
   };
   for (;;) {
     // 送らなかったと決まった、または送り手が書いた後に応答がなかった（DEF-099 fix）。判定なしで終える。
     if (submissionEndedWithoutResponse(input)) {
       return decided(null);
     }
-    const report = monitor.submissionReport();
-    if (report.responseReceived) {
-      if (report.responseStatus !== null && REPOST_REDIRECT_STATUSES.has(report.responseStatus)) {
-        return decided('REPOST_REDIRECT');
-      }
-      // T30R2-fix-1（M-b）: 応答をブラウザに返せなかった。今の画面（ページが自分で移った先など）は POST の応答ではないので、判定しない。
-      // HTTP の状態は、送り手が受けた応答のもの（今の画面の文書の状態ではない）。
-      if (monitor.snapshot().responseDeliveryCanceled || postNavigationFailed()) {
-        return { ...decided('RESPONSE_NOT_DELIVERED'), httpStatus: report.responseStatus };
-      }
-      const byStatus = statusJudgementOf(finalStatus());
-      if (byStatus !== null) {
-        return decided(byStatus);
-      }
-      const lost = sessionLostUrlOf(page, ledger, authentication.sessionLostPathPrefix);
-      if (lost !== null) {
-        return decided('SESSION_LOST', null, lost);
-      }
-      const success = await isLoginResultConditionPage(page, write.verification.successCondition, authentication.approvedTestOrigins);
-      const inputError = await isLoginResultConditionPage(page, write.verification.inputErrorCondition, authentication.approvedTestOrigins);
-      if (success && inputError) {
-        return decided('MULTIPLE_CONDITIONS_MATCHED');
-      }
-      if (success) {
-        // T40R-fix-A2: 押す前の画面から同じ取り方で取れた値（URL の型では、押す前から変わっていない URL）は、ID として使わない（`RECORD_ID_NOT_FOUND`）。
-        const spec = write.verification.recordId;
-        const fromPage = await recordIdOf(page, spec);
-        return decided('SUCCESS', !page.isClosed() && isPageRecordIdNew(fromPage, baseline, spec, page.url()) ? fromPage : null);
-      }
-      if (inputError) {
-        return decided('INPUT_ERROR');
-      }
+    if (monitor.submissionReport().responseReceived) {
+      break;
     }
     if (request.now() >= deadline || page.isClosed()) {
-      return decided(report.responseReceived ? 'NO_CONDITION_MATCHED' : null);
+      return decided(null);
     }
     await wait(WRITE_RESULT_POLL_INTERVAL_MS);
   }
+  const report = monitor.submissionReport();
+  if (report.responseStatus !== null && REPOST_REDIRECT_STATUSES.has(report.responseStatus)) {
+    return decided('REPOST_REDIRECT');
+  }
+  // T30R2-fix-1（M-b）: 応答をブラウザに返せなかった。今の画面（ページが自分で移った先など）は POST の応答ではないので、判定しない。
+  // HTTP の状態は、送り手が受けた応答のもの（今の画面の文書の状態ではない）。PL-6a: 送った後の画面を読む前と後に確かめる。
+  const notDelivered = (): boolean => monitor.snapshot().responseDeliveryCanceled || postNavigationFailed();
+  const notDeliveredResult = (): JudgedFormResult => ({ ...decided('RESPONSE_NOT_DELIVERED'), httpStatus: report.responseStatus });
+  if (notDelivered()) {
+    return notDeliveredResult();
+  }
+  const classificationPolicy = { allowedOrigins: new Set(authentication.approvedTestOrigins) };
+  const read = page.isClosed() ? null : await readCandidatePage(page, { classificationPolicy, requestCounter: observation.counter });
+  if (notDelivered()) {
+    return notDeliveredResult();
+  }
+  const status = finalStatus();
+  if (status === null) {
+    return decided('NO_CONDITION_MATCHED');
+  }
+  if (isFormStructureStatus(status)) {
+    const lost = sessionLostUrlOf(page, ledger, authentication.sessionLostPathPrefix);
+    if (lost !== null) {
+      return decided('SESSION_LOST', lost);
+    }
+  }
+  const sameForm = read !== null && input.formShapeKey !== undefined && read.candidates.some((candidate) => formShapeKeyOf(candidate) === input.formShapeKey);
+  const sameFormKeptValues = sameForm && !page.isClosed() && await submittedValuesKept(page, write);
+  const recordId = page.isClosed() ? null : recordableRecordIdOf(recordIdOfResultUrl(formRecordIdPatternsOf(write), observation.beforeUrl, page.url()));
+  return { httpStatus: status, responseJudgement: null, rawRecordId: null, sessionLostUrl: null, formFacts: { httpStatus: status, sameForm, sameFormKeptValues, recordId } };
 }
 
-/** T32e: 画面の候補の確かめの結果（候補が一致しなかった、または一致して、その画面で読んだ値）。 */
-type CandidateCheck<TValue> = { readonly matched: false } | { readonly matched: true; readonly value: TValue };
+/**
+ * T32e: 画面の候補の確かめの結果（候補が一致しなかった、または一致して、その画面で読んだ値）。OP-L（L1）: 一致しなかったときは、どこが違ったか
+ * （`mismatch`。値を含まない）を持つ。
+ */
+type CandidateCheck<TValue> =
+  | { readonly matched: false; readonly mismatch: ActionEvidenceCandidateMismatch }
+  | { readonly matched: true; readonly value: TValue };
 
-/** T32e: 承認に縛った候補が画面になかった（ちょうど 1 つでなかった）。 */
-const CANDIDATE_NOT_MATCHED: { readonly matched: false } = Object.freeze({ matched: false });
+/** OP-L（L1）: 候補が一致しなかった（どこが違ったかを添える）。 */
+const candidateNotMatched = (mismatch: ActionEvidenceCandidateMismatch): { readonly matched: false; readonly mismatch: ActionEvidenceCandidateMismatch } =>
+  Object.freeze({ matched: false, mismatch: Object.freeze({ ...mismatch }) });
+
+/**
+ * OP-L（L1）: 候補を読む確かめ（form の登録・更新、API の更新）の、どこが違ったか。同じ識別の候補がない → 2 つ以上 → 規則の digest が違う、の順。
+ * `sameIdentity` は承認の識別と同じ候補、`ruleDigest` は承認の規則の digest。
+ */
+const candidateMismatchOf = (
+  pageCandidateCount: number,
+  sameIdentity: readonly { readonly ruleDigest: string }[],
+  ruleDigest: string | null,
+): ActionEvidenceCandidateMismatch => {
+  const [only] = sameIdentity;
+  const reason: PrecheckCandidateMismatchReason = only === undefined
+    ? 'IDENTITY_NOT_FOUND'
+    : sameIdentity.length > 1 ? 'IDENTITY_AMBIGUOUS' : ruleDigest !== null && only.ruleDigest !== ruleDigest ? 'RULE_DIGEST_CHANGED' : 'RECORD_ID_NOT_IN_PATH';
+  return { reason, pageCandidateCount, sameIdentityCount: sameIdentity.length, fieldPosition: null };
+};
+
+/** OP-L（L1）: API の入力の前の確かめの理由を、候補が合わなかった理由にする（確かめの理由でなければ `PAGE_UNREADABLE`）。 */
+const apiInspectionMismatchOf = (reason: string, fieldIndex: number | undefined): ActionEvidenceCandidateMismatch => ({
+  reason: (PRECHECK_CANDIDATE_MISMATCH_REASONS as readonly string[]).includes(reason) ? reason as PrecheckCandidateMismatchReason : 'PAGE_UNREADABLE',
+  pageCandidateCount: null,
+  sameIdentityCount: null,
+  fieldPosition: fieldIndex ?? null,
+});
 
 /** 送る前の画面の確かめの結果（form・UPDATE・API で共通。T40b-1 で 1 つにした）。 */
 interface WritePageCheck<TValue> {
@@ -1360,6 +1607,8 @@ interface WritePageCheck<TValue> {
   readonly sessionLostUrl: string | null;
   /** T32e: 承認に縛った候補が、ちょうど 1 つあったか（画面を読めず確かめまで進まなければ null）。 */
   readonly candidateMatched: boolean | null;
+  /** OP-L（L1）: 候補が合わなかったときの、どこが違ったか（合った・確かめまで進まなかったときは null）。 */
+  readonly candidateMismatch: ActionEvidenceCandidateMismatch | null;
 }
 
 /**
@@ -1376,7 +1625,7 @@ async function checkWritePage<TValue>(
 ): Promise<WritePageCheck<TValue>> {
   const formUrl = pageUrlOf(formPage);
   if (!isReadUrlAllowed(formUrl, options.config, options.authentication)) {
-    return { value: null, violation: false, sessionLostUrl: null, candidateMatched: null };
+    return { value: null, violation: false, sessionLostUrl: null, candidateMatched: null, candidateMismatch: null };
   }
   const visit = await visitGuardedPage(factory, pacer, formUrl, options, async (view): Promise<CandidateCheck<TValue | null> | null> => {
     if (view.navigation.navigationOutcome !== 'OK' || isHttpStatusInRange(view.navigation.httpStatus, ERROR_HTTP_STATUS_RANGE)) {
@@ -1385,7 +1634,7 @@ async function checkWritePage<TValue>(
     return check(view);
   });
   if (visit.kind === 'SESSION_LOST') {
-    return { value: null, violation: visit.violation, sessionLostUrl: visit.url, candidateMatched: null };
+    return { value: null, violation: visit.violation, sessionLostUrl: visit.url, candidateMatched: null, candidateMismatch: null };
   }
   const checked = visit.kind === 'VISITED' ? visit.value : null;
   return {
@@ -1393,6 +1642,7 @@ async function checkWritePage<TValue>(
     violation: visit.violation,
     sessionLostUrl: null,
     candidateMatched: checked === null ? null : checked.matched,
+    candidateMismatch: checked !== null && !checked.matched ? checked.mismatch : null,
   };
 }
 
@@ -1406,17 +1656,18 @@ function checkFormPage(
   pacer: NavigationPacer,
   write: WorkerStartWrite,
   options: GuardedPageVisitOptions,
-): Promise<WritePageCheck<Readonly<Record<string, string | null>>>> {
+): Promise<WritePageCheck<{ readonly passthrough: Readonly<Record<string, string | null>>; readonly shapeKey: string }>> {
   const classificationPolicy = { allowedOrigins: new Set(options.authentication.approvedTestOrigins) };
   return checkWritePage(factory, pacer, write.formPage, options, async ({ page, counter }) => {
     const read = await readCandidatePage(page, { classificationPolicy, requestCounter: counter });
     const matching = read.candidates.filter((candidate) => candidate.identityDigest === write.candidate.identityDigest);
     const [only, ...others] = matching;
     if (only === undefined || others.length > 0 || only.ruleDigest !== write.candidate.ruleDigest) {
-      return CANDIDATE_NOT_MATCHED;
+      return candidateNotMatched(candidateMismatchOf(read.candidates.length, matching, write.candidate.ruleDigest));
     }
     const passthrough = await readWritePassthroughValues(page, formSpecOf(write));
-    return { matched: true, value: passthrough.ok ? passthrough.values : null };
+    // PL-6a: 送るフォームの形の鍵（承認した候補の形。送った後の画面で同じ形のフォームを探す）。
+    return { matched: true, value: passthrough.ok ? { passthrough: passthrough.values, shapeKey: formShapeKeyOf(only) } : null };
   });
 }
 
@@ -1430,17 +1681,22 @@ function checkUpdateFormPage(
   write: WorkerStartWrite,
   update: WorkerStartWriteUpdate,
   options: GuardedPageVisitOptions,
-): Promise<WritePageCheck<UpdateFormValues>> {
+): Promise<WritePageCheck<{ readonly values: UpdateFormValues; readonly shapeKey: string }>> {
   const classificationPolicy = { allowedOrigins: new Set(options.authentication.approvedTestOrigins) };
   return checkWritePage(factory, pacer, write.formPage, options, async ({ page, counter }) => {
     const read = await readCandidatePage(page, { classificationPolicy, requestCounter: counter });
     const matching = read.candidates.filter((candidate) => candidate.ruleDigest === write.candidate.ruleDigest
       && templatedIdentityDigestForRecordIdOf(candidate, update.targetRecordId) === update.templatedIdentityDigest);
-    if (matching.length !== 1) {
-      return CANDIDATE_NOT_MATCHED;
+    const [only] = matching;
+    if (matching.length !== 1 || only === undefined) {
+      // OP-L（L1）: どこが違ったかは、型にした識別だけで同じ候補を数えて決める（照らしの決まりは上のまま）。
+      const sameIdentity = read.candidates.filter((candidate) =>
+        templatedIdentityDigestForRecordIdOf(candidate, update.targetRecordId) === update.templatedIdentityDigest);
+      return candidateNotMatched(candidateMismatchOf(read.candidates.length, sameIdentity, write.candidate.ruleDigest));
     }
     const values = await readUpdateFormValues(page, updateSpecOf(write, update));
-    return { matched: true, value: values.ok ? values.values : null };
+    // PL-6a: 送るフォームの形の鍵（対象の画面の候補の形。送った後の画面で同じ形のフォームを探す）。
+    return { matched: true, value: values.ok ? { values: values.values, shapeKey: formShapeKeyOf(only) } : null };
   });
 }
 
@@ -1455,8 +1711,9 @@ function checkApiFormPage(
   options: GuardedPageVisitOptions,
 ): Promise<WritePageCheck<true>> {
   return checkWritePage(factory, pacer, write.formPage, options, async ({ page }) => {
-    const inspection = await inspectApiWriteInput(page, apiInputSpecOf(write));
-    return inspection.ok ? { matched: true, value: true } : CANDIDATE_NOT_MATCHED;
+    // OP-L（L1）: SPA が欄と送信の要素を後から描くので、出そろうのを上限の中で待ってから確かめる（読み込みは足さない。確かめの決まりは変えない）。
+    const inspection = await inspectApiWriteInputWhenRendered(page, apiInputSpecOf(write));
+    return inspection.ok ? { matched: true, value: true } : candidateNotMatched(apiInspectionMismatchOf(inspection.reason, inspection.fieldIndex));
   });
 }
 
@@ -1507,6 +1764,8 @@ interface PrecheckInput {
   readonly options: GuardedPageVisitOptions;
   readonly observer: WriteCreateRunObserver;
   readonly stopSignal: AbortSignal;
+  /** PL-6a: ジョブの監査の段の状態（送る前の答え合わせの READ に、送った後の READ と同じ判定できない決まりを当てる）。 */
+  readonly auditStage: AuditStageRunState | null;
 }
 
 /**
@@ -1520,6 +1779,8 @@ type WriteStagePlan =
     readonly updateStage?: UpdateStage | undefined;
     /** T41d: API の更新の前の値と指定（API の更新だけ）。 */
     readonly apiUpdate?: ApiUpdateStage | undefined;
+    /** PL-6a: form の送るフォームの形の鍵（API は持たない）。 */
+    readonly formShapeKey?: string | undefined;
   }
   | { readonly kind: 'STOP'; readonly facts: WriteFacts };
 
@@ -1540,32 +1801,67 @@ async function planFormWriteStage(input: PrecheckInput, write: WorkerStartWrite)
   if (write.update === undefined) {
     const formPage = await checkFormPage(factory, pacer, write, options);
     noticeSessionLost(input, formPage.sessionLostUrl);
-    const created = formPage.value === null ? null : payloadExpectationOf(write, spec, formPage.value);
-    if (stopSignal.aborted || created === null) {
+    const created = formPage.value === null ? null : payloadExpectationOf(write, spec, formPage.value.passthrough);
+    if (stopSignal.aborted || created === null || formPage.value === null) {
       // T44e: 画面を読めた後に照合の期待を作れなければ、入力の前の確かめの失敗。
       const precheckDetail = formPage.value !== null && !stopSignal.aborted ? 'FORM_NOT_READY' : pageCheckDetailOf(formPage, stopSignal.aborted);
       return {
         kind: 'STOP',
-        facts: notSent(PRECHECK_FAILED, { violation: formPage.violation, candidateDigestMatched: formPage.candidateMatched, precheckDetail }),
+        facts: notSent(PRECHECK_FAILED, {
+          violation: formPage.violation, candidateDigestMatched: formPage.candidateMatched, precheckDetail, candidateMismatch: formPage.candidateMismatch,
+        }),
       };
     }
-    return { kind: 'STAGE', writeStageOf: (monitor) => ({ expectation: created, monitor }) };
+    const preRead = await preSubmitReadStop(input, write);
+    if (preRead !== null) {
+      return { kind: 'STOP', facts: preRead };
+    }
+    return { kind: 'STAGE', writeStageOf: (monitor) => ({ expectation: created, monitor }), formShapeKey: formPage.value.shapeKey };
   }
   // T31g-2: 更新の前の読み取り（ファイルの先頭の T31g-2）と、照合の期待（保つ欄・状態の欄・組は前の値）。
   const prior = await checkUpdateFormPage(factory, pacer, write, write.update, options);
   noticeSessionLost(input, prior.sessionLostUrl);
-  if (prior.value === null || stopSignal.aborted || !priorValuesRecordable(write.update, prior.value)) {
+  if (prior.value === null || stopSignal.aborted || !priorValuesRecordable(write.update, prior.value.values)) {
     // T44e: 前の値を読めた後に止めるのは、前の値が長すぎる（記録に使えない）とき。
     const precheckDetail = prior.value !== null && !stopSignal.aborted ? 'PRIOR_VALUE_UNUSABLE' : pageCheckDetailOf(prior, stopSignal.aborted);
-    return { kind: 'STOP', facts: notSent(PRECHECK_FAILED, { violation: prior.violation, candidateDigestMatched: prior.candidateMatched, precheckDetail }) };
+    return {
+      kind: 'STOP',
+      facts: notSent(PRECHECK_FAILED, {
+        violation: prior.violation, candidateDigestMatched: prior.candidateMatched, precheckDetail, candidateMismatch: prior.candidateMismatch,
+      }),
+    };
   }
-  const updateStage: UpdateStage = { spec: updateSpecOf(write, write.update), prior: prior.value };
+  const updateStage: UpdateStage = { spec: updateSpecOf(write, write.update), prior: prior.value.values };
   const fields = updatePayloadFieldsOf(updateStage.spec, updateStage.prior, write.values);
   if (!fields.ok) {
     return { kind: 'STOP', facts: notSent(PRECHECK_FAILED, { candidateDigestMatched: true, precheckDetail: 'PRIOR_VALUE_UNUSABLE' }) };
   }
   const expectation: WritePayloadExpectation = { request: { origin: write.request.origin, path: write.request.path, enctype: spec.enctype }, ...fields.fields };
-  return { kind: 'STAGE', writeStageOf: (monitor) => ({ expectation, monitor }), updateStage };
+  return { kind: 'STAGE', writeStageOf: (monitor) => ({ expectation, monitor }), updateStage, formShapeKey: prior.value.shapeKey };
+}
+
+/**
+ * PL-6a（設計書 8.1 の「事前の確かめ」。設計者の判断）: form の登録を送る前に、同じ値で答え合わせの READ を 1 回読み（`verifyReadCheck`。送った後の照合と
+ * 同じ部品と同じ判定できない決まり。読み込みは対象の画面と READ の URL の GET 1〜2 回。間隔を守り、読み込み直しはしない）、値がもう見えていれば
+ * `VALUE_ALREADY_PRESENT`、判定できなければ `VERIFICATION_READ_UNAVAILABLE`（`preSubmitReadStopOf`）で送らずに止める。読み込みの間の違反は違反として、
+ * セッションの切れは `SESSION_LOST` として止める。止める印が来ていれば `STOPPED`。送ってよければ null。
+ */
+async function preSubmitReadStop(input: PrecheckInput, write: WorkerStartWrite): Promise<WriteFacts | null> {
+  const verified = await verifyReadCheck(input.factory, input.pacer, write.readVerification, { ...input.options, auditStage: input.auditStage });
+  noticeSessionLost(input, verified.sessionLostUrl);
+  const stopWith = (precheckDetail: PrecheckFailureDetail, violation = false): WriteFacts =>
+    notSent(PRECHECK_FAILED, { violation, candidateDigestMatched: true, precheckDetail });
+  if (verified.violation) {
+    return stopWith('VERIFICATION_READ_UNAVAILABLE', true);
+  }
+  if (verified.sessionLostUrl !== null) {
+    return stopWith('SESSION_LOST');
+  }
+  const stop = preSubmitReadStopOf(verified.evidence.state === 'EXECUTED' ? verified.evidence.result : 'UNDETERMINED');
+  if (stop !== null) {
+    return stopWith(stop);
+  }
+  return input.stopSignal.aborted ? stopWith('STOPPED') : null;
 }
 
 /** T40b-1: API の送る前の確かめ（`checkApiFormPage`）と、書き込みの段の指定（`apiWriteStageOf`）。T41d: 更新は前の読み取り（`planApiUpdateStage`）。 */
@@ -1581,6 +1877,7 @@ async function planApiWriteStage(input: PrecheckInput, write: WorkerStartApiWrit
       kind: 'STOP',
       facts: notSent(PRECHECK_FAILED, {
         violation: checked.violation, candidateDigestMatched: checked.candidateMatched, precheckDetail: pageCheckDetailOf(checked, input.stopSignal.aborted),
+        candidateMismatch: checked.candidateMismatch,
       }),
     };
   }
@@ -1607,7 +1904,9 @@ async function performWrite(
   // T35R2-fix（T35R2 の C-1）: 監査の段の口があれば、Run と同じ部品で作った上限の部品も渡す。T37a（Task 37 の設計書 3.1）: 書き込みのジョブは、Task 39
   // まで登録した読み取りの手続きの呼び出しを通さない（`NONE`）。T37a fix round 1: 作った状態で、書き込みの段を開く前と押す直前に、鍵の消失と上限を
   // 確かめ、当たれば送らずに「送っていない」で終える。
-  const { factoryOptions, state: auditStage } = jobContextFactoryOptions(authentication, now, 'NONE');
+  const { factoryOptions, state: auditStage } = jobContextFactoryOptions(authentication, now, 'NONE', request.stageCarry?.serviceRequestWindowMs ?? []);
+  // OP-2: まとめて実行の書き込みの段の持ち越し（読み込みの間隔は、この段の pacer と設定の最小の間隔。書き込みの段は間隔を上げない）。
+  const navigationCarry = (): Parameters<typeof recordRunStageCarry>[3] => ({ pacer, minIntervalMs: config.crawl.minNavigationIntervalMs, now });
   const preflight = await runPreflight({
     config,
     launchBrowser: request.launchBrowser,
@@ -1615,11 +1914,18 @@ async function performWrite(
     outputDirectory,
     contextFactoryOptions: {
       ...factoryOptions,
+      // OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 実効の設定の監査の段の送信の扱い（親が `START` で渡すプロファイルの設定）が
+      // `PASS_EXCEPT_DELETE` なら、書き込みの段の Context だけに、監査の段と同じ口を渡す（組み立ては発見・READ の確かめのジョブと同じ `auditSendOptionsOf`）。
+      // OP-Q（設計書 4.1.8 の Q1。OP-REV3 の C-1 を改めた）: 送る前の確かめと照合の READ の Passive の Context にも、書き込みの作業の印つきの口を渡す（決まりは
+      // 書き込みの段の値を入れる前と同じで、要求の判定の owner が加える）。`READ_ONLY` なら口を渡さない（今のまま）。
+      ...writeJobAuditSendOf(config, authentication.approvedTestOrigins, write),
       navigationPacer: pacer,
       ...(request.writeSubmissionCertificates === undefined ? {} : { writeSubmissionCertificates: request.writeSubmissionCertificates }),
     },
   });
   if (!preflight.ok) {
+    // OP-2: factory がないので、状態は持ち越さない（次の段は始めない）。
+    recordRunStageCarry(request.stageCarry, null, auditStage, navigationCarry());
     return report({ ...notSent(PRECHECK_FAILED, { precheckDetail: 'PREFLIGHT_FAILED' }), preflightFailed: true });
   }
   const { browser, factory } = preflight;
@@ -1628,7 +1934,7 @@ async function performWrite(
     if (stopSignal.aborted) {
       return report(notSent(PRECHECK_FAILED, { precheckDetail: 'STOPPED' }));
     }
-    const precheck: PrecheckInput = { factory, pacer, options, observer, stopSignal };
+    const precheck: PrecheckInput = { factory, pacer, options, observer, stopSignal, auditStage };
     // T40b-1: 送る前の確かめと書き込みの段の指定は、送り方で分ける（API は `checkApiFormPage`、form は画面の確かめか更新の前の読み取り）。
     const plan = isWorkerStartApiWrite(write) ? await planApiWriteStage(precheck, write) : await planFormWriteStage(precheck, write);
     if (plan.kind === 'STOP') {
@@ -1653,6 +1959,7 @@ async function performWrite(
       const page = await factory.createPassivePage(context);
       const stageInput: WriteStageInput = {
         request, factory, pacer, monitor, context, page, ledger, update: plan.updateStage, apiUpdate: plan.apiUpdate, auditStage,
+        formShapeKey: plan.formShapeKey,
       };
       stage = isWorkerStartApiWrite(write) ? await apiWriteOnStage(stageInput, write) : await writeOnStage(stageInput, write);
     } catch {
@@ -1670,7 +1977,7 @@ async function performWrite(
     if (guardReport.submission === 'NOT_SENT') {
       // T44e: `PRECHECK_FAILED` なら、書き込みの段が返した具体的な理由（例外で終わったときはない）。`PAYLOAD_MISMATCH` には付けない（`notSent` が決める）。
       return report(notSent(payloadBlocked(monitor) ? PAYLOAD_MISMATCH : PRECHECK_FAILED, {
-        violation, candidateDigestMatched: true, guard, precheckDetail: stage.precheckDetail,
+        violation, candidateDigestMatched: true, guard, precheckDetail: stage.precheckDetail, inputFailure: stage.inputFailure,
       }));
     }
     // Guard が承認の POST を通した（送った）。応答がなければ判定なし（予約は `UNKNOWN`）。T40b-1: API の段が判定まで進まなかった回の状態も、100〜599 の
@@ -1688,7 +1995,11 @@ async function performWrite(
       });
     // 送信の報告（送った。報告に使うのは送信の状態と止めた理由だけ）。
     report(sentFacts(null, null, violation));
-    if (isWorkerStartApiWrite(write)) {
+    if (!isWorkerStartApiWrite(write)) {
+      // PL-6a: form は、送った後の照合と構造の判定（`formSentFactsOf`）。
+      return await formSentFactsOf({ request, factory, pacer, options, observer, auditStage }, write, plan, stage, { httpStatus, violation, guard });
+    }
+    {
       // T40b-2: 照合の READ（form と同じ条件: 成功で違反がなく、ID が使える形のときだけ）。`{id}` に ID を入れた画面に、保存の時と同じ画面の path の確かめと
       // 事前の判定をかけ直してから 1 回だけ読む（`verifyRecordPageReadCheck`）。ID がない・使えないときは行わない（`RECORD_ID_NOT_FOUND`・`RECORD_ID_UNSAFE`）。
       const recordId = stage.rawRecordId;
@@ -1718,34 +2029,96 @@ async function performWrite(
       }
       return sentFacts(verified.evidence, apiUpdateEvidence, verified.violation);
     }
-    // T31g-2: UPDATE の更新の後の照合（成功のときだけ。一致しない欄があれば、照合の READ は行わない（結果は `UNKNOWN` に決まる））。
-    let updateEvidence: WriteUpdateEvidence | null = null;
-    const { updateStage } = plan;
-    if (responseJudgement === 'SUCCESS' && !violation && write.update !== undefined && updateStage !== undefined) {
-      const after = await checkUpdateFormPage(factory, pacer, write, write.update, options);
-      if (after.sessionLostUrl !== null) {
-        observer.onSessionLost(redactUrlSecrets(after.sessionLostUrl));
-      }
-      updateEvidence = updateEvidenceOf(write.update, updateStage.prior, after.value, write.values);
-      if (after.violation || fieldsMatchedOf(updateEvidence) === false) {
-        return sentFacts(null, updateEvidence, violation || after.violation);
-      }
-    }
-    if (responseJudgement === 'SUCCESS' && !violation) {
-      // T37R-fix-B（T37R の M-3。Task 37 の設計書 8 章の T37R の行）: 照合の READ にも、判定できない決まりを当てる（監査の段の状態を渡す。読み込みの間に
-      // 断った要求・401・止めた要求があれば `UNDETERMINED`。鍵の消失はセッションの切れ）。書き込みの結果は、今の「照合できない」の写しのまま。
-      const verified = await verifyReadCheck(factory, pacer, write.readVerification, { ...options, auditStage });
-      if (verified.sessionLostUrl !== null) {
-        observer.onSessionLost(redactUrlSecrets(verified.sessionLostUrl));
-      }
-      // T32e: 照合の READ の証拠の全体を残す（実行しなかった定義の証拠は、報告では実行しなかった印にする）。
-      const { evidence } = verified;
-      return sentFacts(evidence.state === 'EXECUTED' ? evidence : null, updateEvidence, verified.violation);
-    }
-    return sentFacts(null, updateEvidence, violation);
   } finally {
     await closeBrowserBeforeDeadline(browser);
+    // OP-2: Browser を閉じた後に、factory の最新の状態と窓と読み込みの間隔を持ち越しの口へ渡す（メモリの中だけ）。
+    recordRunStageCarry(request.stageCarry, factory, auditStage, navigationCarry());
   }
+}
+
+/** PL-6a: form の送った後の照合で使うもの（書き込みの段を閉じた後。凍結した Context と READ の URL の Context を、間隔を守って開く）。 */
+interface FormSentInput {
+  readonly request: WriteCreateRunRequest;
+  readonly factory: BrowserContextFactory;
+  readonly pacer: NavigationPacer;
+  readonly options: GuardedPageVisitOptions;
+  readonly observer: WriteCreateRunObserver;
+  readonly auditStage: AuditStageRunState | null;
+}
+
+/**
+ * PL-6a（設計書 8.1 の「判定の順」）: form の送った回の、送った後の照合と結果の判定（書き込みの段を閉じた後。もう送れない時点）。
+ * - 段が判定を決めた（応答なし、307・308、応答を返せなかった、セッションの切れ）なら、その判定のまま（照合しない）。
+ * - 送った後の画面の観察（`formFacts`）があり、状態が 2xx・3xx で違反がなければ、成否によらず照合する: 登録は答え合わせの READ（`verifyReadCheck`。
+ *   GET 2 回）、更新は更新の後の照合（具体的な更新の画面を凍結した Context で 1 回読む）。更新は、更新の後の照合が一致し、判定が成功のときだけ、続けて
+ *   答え合わせの READ を行う（今のまま）。4xx・5xx は照合しない。
+ * - 判定は `formResultJudgementOf`（照合の結果、送った値を保った同じフォームの形、URL の ID）。結果（`ActionResult`）は呼ぶ側が `actionOutcomeOf` で決める。
+ * 送り直しはしない。読み込み直しはしない。
+ */
+async function formSentFactsOf(
+  input: FormSentInput,
+  write: WorkerStartWrite,
+  plan: Extract<WriteStagePlan, { readonly kind: 'STAGE' }>,
+  stage: WriteStageResult,
+  sent: { readonly httpStatus: number | null; readonly violation: boolean; readonly guard: ActionGuardSummary },
+): Promise<WriteFacts> {
+  const { factory, pacer, options, observer, auditStage, request } = input;
+  const { httpStatus, guard } = sent;
+  let violation = sent.violation;
+  const facts = (
+    judged: { readonly responseJudgement: ResponseJudgement | null; readonly recordId: string | null },
+    readEvidence: ReadCheckExecutedEvidence | null,
+    updateEvidence: WriteUpdateEvidence | null,
+    judgedAt: Date | null,
+  ): WriteFacts => {
+    const responseJudgement = httpStatus === null ? null : judged.responseJudgement ?? 'NO_CONDITION_MATCHED';
+    return Object.freeze({
+      submission: 'SENT', blockReason: null, httpStatus, responseJudgement, rawRecordId: judged.recordId, readEvidence, submittedAt: stage.submittedAt,
+      violation, updateEvidence, candidateDigestMatched: true, judgedAt: responseJudgement === null ? null : judgedAt, guard, apiPageKeyValues: null,
+    });
+  };
+  const formFacts = stage.formFacts ?? null;
+  if (formFacts === null) {
+    return facts({ responseJudgement: stage.responseJudgement, recordId: stage.rawRecordId }, null, null, stage.judgedAt);
+  }
+  const structural = isFormStructureStatus(formFacts.httpStatus) && !violation;
+  /** 照合の READ（監査の段の判定できない決まりを当てる。鍵の消失はセッションの切れ）。証拠の全体を残す（実行しなかった定義は残さない）。 */
+  const readVerification = async (): Promise<ReadCheckExecutedEvidence | null> => {
+    const verified = await verifyReadCheck(factory, pacer, write.readVerification, { ...options, auditStage });
+    if (verified.sessionLostUrl !== null) {
+      observer.onSessionLost(redactUrlSecrets(verified.sessionLostUrl));
+    }
+    violation ||= verified.violation;
+    return verified.evidence.state === 'EXECUTED' ? verified.evidence : null;
+  };
+  const judgedOf = (readEvidence: ReadCheckExecutedEvidence | null, update?: { readonly postcheck: FormUpdatePostcheck; readonly targetRecordId: string }) =>
+    formResultJudgementOf({
+      httpStatus: formFacts.httpStatus, sameForm: formFacts.sameForm, sameFormKeptValues: formFacts.sameFormKeptValues, recordId: formFacts.recordId,
+      readVerification: readEvidence?.result ?? null, update,
+    });
+  const { updateStage } = plan;
+  if (write.update === undefined || updateStage === undefined) {
+    const readEvidence = structural ? await readVerification() : null;
+    return facts(judgedOf(readEvidence), readEvidence, null, request.clock());
+  }
+  // T31g-2: 更新の後の照合（PL-6a: 成否によらず、2xx・3xx なら読む）。一致しない欄があれば、照合の READ は行わない（結果は判定と照合で決まる）。
+  let updateEvidence: WriteUpdateEvidence | null = null;
+  let postcheck: FormUpdatePostcheck = 'UNDETERMINED';
+  if (structural) {
+    const after = await checkUpdateFormPage(factory, pacer, write, write.update, options);
+    if (after.sessionLostUrl !== null) {
+      observer.onSessionLost(redactUrlSecrets(after.sessionLostUrl));
+    }
+    violation ||= after.violation;
+    const afterValues = after.value?.values ?? null;
+    updateEvidence = updateEvidenceOf(write.update, updateStage.prior, afterValues, write.values);
+    postcheck = after.violation ? 'UNDETERMINED' : formUpdatePostcheckOf(write.update, updateStage.prior, afterValues, updateEvidence);
+  }
+  const judged = judgedOf(null, { postcheck, targetRecordId: write.update.targetRecordId });
+  if (judged.responseJudgement === 'SUCCESS' && postcheck === 'UPDATED' && !violation) {
+    return facts(judged, await readVerification(), updateEvidence, request.clock());
+  }
+  return facts(judged, null, updateEvidence, request.clock());
 }
 
 /**
@@ -1837,12 +2210,10 @@ export function writeRunDocumentsOf(input: {
     : { targetRecordId, updateEvidence: facts.updateEvidence ?? null };
   const readVerification = readVerificationOf(facts);
   // T40b-1: 版 1.1 の送り方ごとの項目（1 回だけ求めて両方の文書に入れる）。API は、成否の条件なし、API の要約（ページが決める鍵の値は、照合まで進んだ
-  // 送った回だけ）、送信先は API の path。form は今どおり。
+  // 送った回だけ）、送信先は API の path。form は今どおり。PL-6a: 版 1.2 は、成否の条件の代わりに結果の判定のしかたの印（form は `FORM_STRUCTURE`、API は null）。
   const transport: ScenarioTransport = isWorkerStartApiWrite(write) ? WORKER_API_WRITE_TRANSPORT : FORM_TRANSPORT;
   const api = isWorkerStartApiWrite(write) ? actionApiSummaryOf(write.api, sent ? facts.apiPageKeyValues ?? null : null) : null;
-  const resultConditions = isWorkerStartApiWrite(write)
-    ? null
-    : { successCondition: write.verification.successCondition, inputErrorCondition: write.verification.inputErrorCondition };
+  const resultJudgement = write.verification.resultJudgement;
   const actionPath = isWorkerStartApiWrite(write) ? write.api.request.pathShape : write.request.path;
   const actionRun: ActionRunDocument = {
     schemaVersion: ACTION_RUN_SCHEMA_VERSION,
@@ -1850,7 +2221,7 @@ export function writeRunDocumentsOf(input: {
     grantId: write.grantId,
     seedRecord: write.seedRecord,
     submittedValues,
-    resultConditions,
+    resultJudgement,
     submission: facts.submission,
     blockReason,
     httpStatus: facts.httpStatus,
@@ -1875,7 +2246,14 @@ export function writeRunDocumentsOf(input: {
     ...identity,
     kind: write.approvalFacts.scenario.kind,
     containsHumanEnteredValues: containsHumanEnteredValuesOf(facts),
-    precheck: { candidateDigestMatched: facts.candidateDigestMatched, blockReason },
+    // OP-L（L1）: 候補が合わなかったときは、どこが違ったか（値を含まない）を添える。
+    precheck: {
+      candidateDigestMatched: facts.candidateDigestMatched,
+      blockReason,
+      ...(facts.candidateDigestMatched === false && facts.candidateMismatch !== undefined ? { candidateMismatch: facts.candidateMismatch } : {}),
+      // OP-O（O1）: 書き込みの段の、確かめ・入力・押す操作の失敗（送らずに止めたときだけ。値と、値の長さを含まない。画面には出さない）。
+      ...(blockReason === PRECHECK_FAILED && facts.inputFailure !== undefined ? { inputFailure: facts.inputFailure } : {}),
+    },
     submission: sent
       ? { state: facts.submission, submittedValues, actionPath, submittedAt }
       : { state: facts.submission, submittedValues: {}, actionPath: null, submittedAt: null },

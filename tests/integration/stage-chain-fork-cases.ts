@@ -189,6 +189,10 @@ async function prepare(runBrowser: string, crawl: { readonly intervalMs: number;
     auth: 'MANUAL_SESSION',
     approvedTestOrigins: [space.site.origin],
     environmentEvidenceRef: 'evidence/example-chain-fork/isolation-check-1',
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 1・2）: この確かめは連鎖の仕組み（ログイン 1 回、段の間、改訂）なので、毎回手でログインする
+    // （手でのログインの値を受け取らず、自動ログインへ切り替えない）。ログインの直後の登録は、足すものがないので飛ばす（改訂は進まない）。受け取りと切り替えは
+    // `login-registration-fork.test.ts`。
+    loginPreference: 'MANUAL_EVERY_TIME',
   }, { resolveContext: contextResolver }).ok).toBe(true);
   hideJobBrowser(space.database, PROFILE_ID);
   expect(saveAuthSetup(space.database, setupFor(space.site, MIN_PROFILE_REVISION), { resolveContext: contextResolver }).ok).toBe(true);
@@ -369,9 +373,9 @@ describe.each(RUN_BROWSERS.filter(([name]) => name === runBrowserName))('FM2d: t
     expect(messages.filter(({ type }) => type === 'RUN_STARTED')).toHaveLength(2);
     expect(messages.filter((message) => message.type === 'FINISHED' && message.incompleteReasonCodes !== undefined)).toHaveLength(2);
     expect(messages.filter((message) => message.type === 'AUTH_STATE' && message.state === 'AUTHENTICATED')).toHaveLength(1);
-    // 改訂は、連鎖の途中で進まない（どの段の行も始めた時の改訂）。この fixture のログイン（フォームの送信）は通した送信がないので、手動のログインの
-    // 自動の登録は起きない（連鎖の最後に 1 回だけ登録することは、偽のワーカーの `control-stage-chain.test.ts` で確かめる）。
-    expect(manager.getAuditJob(started.job.jobId)?.loginStage?.autoRegistration).toBeUndefined();
+    // 改訂は、連鎖の途中で進まない（どの段の行も始めた時の改訂）。この fixture のログイン（フォームの送信）は通した送信がなく、成功の条件もあるので、OP-1 の
+    // ログインの直後の登録は、足すものがなく飛ばす（`NOTHING_NEW`。ログインの直後に 1 回だけ登録することは、偽のワーカーの `control-stage-chain.test.ts`）。
+    expect(manager.getAuditJob(started.job.jobId)?.loginStage?.autoRegistration).toEqual({ result: 'SKIPPED', reason: 'NOTHING_NEW' });
     const revisionAfterFirst = getProfile(space.database, PROFILE_ID)?.profile.revision ?? 0;
     expect(revisionAfterFirst).toBe(MIN_PROFILE_REVISION);
 

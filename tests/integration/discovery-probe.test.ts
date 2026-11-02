@@ -26,6 +26,7 @@ import {
   DISCOVERY_FIXTURE_PATHS,
   MANY_OPTIONS_COUNT,
   PAGE_HITS_GLOBAL,
+  SPA_LATE_HEADING_TEXT,
   startDiscoveryFixture,
   type DiscoveryFixture,
   type DiscoveryFixtureRequest,
@@ -287,11 +288,33 @@ describe.each(LAUNCHERS)('T27b: discovering candidates by reading only (%s)', (_
   });
 
   it('finds no candidate on the list and detail pages, and reads them completely', async () => {
-    for (const path of [DISCOVERY_FIXTURE_PATHS.list, DISCOVERY_FIXTURE_PATHS.detail]) {
+    // OP-2 の修正の 1 回目（判断 2）: 読めた画面は、見出しと題を画面の名前として持つ（判定には使わない）。
+    for (const [path, name] of [[DISCOVERY_FIXTURE_PATHS.list, '一覧'], [DISCOVERY_FIXTURE_PATHS.detail, '詳細']] as const) {
       const { record, requestsDuringDiscovery } = await discover(path);
       expect(requestsDuringDiscovery).toEqual([]);
-      expect(record).toEqual({ location: { origin: fixture.origin, path }, incompleteReasons: [], candidates: [] });
+      expect(record).toEqual({ location: { origin: fixture.origin, path }, incompleteReasons: [], candidates: [], screenName: { heading: name, title: name } });
     }
+  });
+
+  it('records the heading and the title of the screen, reading them in the isolated world without a request (OP-2 fix round 1)', async () => {
+    const { record, requestsDuringDiscovery } = await discover(DISCOVERY_FIXTURE_PATHS.create);
+    expect(requestsDuringDiscovery).toEqual([]);
+    expectSafeRecord(record);
+    // 登録の画面は h1 を持たず、題だけ。
+    expect(record.screenName).toEqual({ heading: null, title: '登録' });
+  });
+
+  // OP-K（K1）: SPA の見出しが後から描かれる画面は、凍結の前に上限まで待って、見出しを画面の名前にする（読み込みを足さない。サーバに要求は届かない）。見出しのない
+  // 画面は、上限だけ待って、題を残す。
+  it('waits for the heading that a SPA renders late, and keeps the title of a SPA without a heading (OP-K K1)', async () => {
+    const late = await discover(DISCOVERY_FIXTURE_PATHS.spaLateHeading);
+    expect(late.requestsDuringDiscovery).toEqual([]);
+    expectSafeRecord(late.record);
+    expect(late.record.screenName).toEqual({ heading: SPA_LATE_HEADING_TEXT, title: 'SPA' });
+    const none = await discover(DISCOVERY_FIXTURE_PATHS.spaNoHeading);
+    expect(none.requestsDuringDiscovery).toEqual([]);
+    expect(none.record.screenName).toEqual({ heading: null, title: 'SPA' });
+    expect(none.record.candidates).toHaveLength(1);
   });
 
   it('waits for a SPA that renders its form after a GET response', async () => {

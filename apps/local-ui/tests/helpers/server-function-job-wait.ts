@@ -7,6 +7,7 @@
  * - `tests/helpers/job-test-support.ts` の `waitForJob`（ジョブの管理か管理データを読む口）とは読む口が違うので、名前を分ける
  *   （Gate `tests/architecture/control-test-helper-reuse.test.ts`。画面のテストは、`getAuditJobFn` を読み直す繰り返しを自分で書かない）。
  */
+import { ACTIVE_AUDIT_JOB_STATES } from '../../../../src/control/job/job-records.js';
 import { wait } from '../../../../src/core/deadline.js';
 
 /** 待つ上限と、読み直しの間隔（ms）。 */
@@ -42,4 +43,55 @@ export const waitForJobViaServerFunctions = async <T>(
     await onPending?.(job);
     await wait(stepMs);
   }
+};
+
+/** ジョブの一覧（`listAuditJobsFn`）の 1 行のうち、終わっていないジョブを数えるのに使う項目。 */
+export interface ServerFunctionJobRow {
+  readonly profileId: string;
+  readonly state: string;
+}
+
+/**
+ * PL-3（設計書 `2026-10-26-beaksight-plain-ui-design.md` 2 章の判断 3）: 開始の画面の「点検を始める」は、まとめて実行（点検 → 操作さがし → 見るだけの確かめ）を
+ * 始める。最初の段のジョブが終わっても次の段のジョブが続くので、プロファイルの終わっていないジョブ（`ACTIVE_AUDIT_JOB_STATES`）がなくなるまで、ジョブの一覧を
+ * `listJobs` で読み直して待つ（読み直し方は `waitForJobViaServerFunctions`）。
+ */
+export const waitForNoActiveJobViaServerFunctions = async (
+  listJobs: () => Promise<readonly ServerFunctionJobRow[]>,
+  profileId: string,
+  timing: ServerFunctionJobWaitOptions<readonly ServerFunctionJobRow[]>,
+): Promise<void> => {
+  const activeStates: ReadonlySet<string> = new Set(ACTIVE_AUDIT_JOB_STATES);
+  await waitForJobViaServerFunctions(
+    async () => (await listJobs()).filter((job) => job.profileId === profileId && activeStates.has(job.state)),
+    profileId,
+    (activeJobs) => activeJobs.length === 0,
+    timing,
+  );
+};
+
+/** 作成の画面が始めた下調べの作業の、待つのに使う項目（`getAuditJobFn` の応答の一部）。 */
+export interface ServerFunctionEntryCheckJob {
+  readonly active: boolean;
+  readonly entryCheckFollowUp: { readonly state: string; readonly jobId?: string } | null;
+}
+
+/**
+ * OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.3 の 3）と、その修正の 2 回目（公開のサイトも同じ流れ）: 作成の画面の「点検を始める」は、下調べを
+ * 始め、ジョブの管理が続けて点検を始める。作成のほかを確かめる画面のテストのために、下調べが終わり、続けて始めるかが決まるまで待ち、始めた点検は止めて、終わるまで
+ * 待つ（次の場面の作業を始められるように。同時に 1 つの作業の決まり）。始めた点検の作業の ID（始めなければ `null`）を返す。読み直し方は `waitForJobViaServerFunctions`。
+ */
+export const settleJobsStartedByCreate = async (
+  readJob: (jobId: string) => Promise<ServerFunctionEntryCheckJob | null>,
+  stopJob: (jobId: string) => Promise<unknown>,
+  entryJobId: string,
+  timing: ServerFunctionJobWaitTiming,
+): Promise<string | null> => {
+  const entry = await waitForJobViaServerFunctions(readJob, entryJobId, (job) => !job.active && job.entryCheckFollowUp?.state !== 'WAITING', timing);
+  const followUpJobId = entry.entryCheckFollowUp?.state === 'STARTED' ? (entry.entryCheckFollowUp.jobId ?? null) : null;
+  if (followUpJobId !== null) {
+    await stopJob(followUpJobId);
+    await waitForJobViaServerFunctions(readJob, followUpJobId, (job) => !job.active, timing);
+  }
+  return followUpJobId;
 };

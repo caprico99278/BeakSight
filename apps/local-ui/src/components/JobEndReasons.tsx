@@ -76,9 +76,19 @@ export function RunEndReasons({ runEnd, runStatus }: Readonly<{ runEnd: AuditJob
   );
 }
 
+/** 発見と READ の確かめの終わり方の、次にできること（なければ `null`。最後まで読んだときなど）。 */
+const profileJobNextStepOf = (end: AuditJobProfileJobEndView): string | null =>
+  (end.kind === WORKER_DISCOVERY_JOB_KIND ? steps.discoveryEndReasons[end.endReason] : steps.readCheckEndReasons[end.endReason]);
+
+/**
+ * PL-2（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 終わり方に次にできることがあるか（あれば、作業の画面のふだんの画面に出す。
+ * なければ、たたんだ詳しい内容に入れる）。
+ */
+export const profileJobEndHasNextStep = (end: AuditJobProfileJobEndView): boolean => profileJobNextStepOf(end) !== null;
+
 export function ProfileJobEndReason({ end }: Readonly<{ end: AuditJobProfileJobEndView }>) {
   const display = end.kind === WORKER_DISCOVERY_JOB_KIND ? discoveryEndReasonDisplay(end.endReason) : readCheckEndReasonDisplay(end.endReason);
-  const next = end.kind === WORKER_DISCOVERY_JOB_KIND ? steps.discoveryEndReasons[end.endReason] : steps.readCheckEndReasons[end.endReason];
+  const next = profileJobNextStepOf(end);
   return (
     <section className="panel" data-testid="job-profile-job-end">
       <h2 className="panel-heading">{text.heading}</h2>

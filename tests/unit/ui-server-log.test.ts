@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CONTROL_DATA_DIRECTORY_NAME, resolveUiServerLogPath } from '../../src/control/store/database-path.js';
 import {
+  UI_SERVER_END_REASONS,
   UI_SERVER_LOG_MAX_BYTES,
   UI_SERVER_LOG_MAX_STACK_LINES,
   createUiServerLog,
@@ -146,6 +147,41 @@ describe('DEF-146: the record of the end of the screen server', () => {
     const lines = readLines();
     expect(lines.at(-1)).toMatchObject({ jobId: 'job-199' });
     expect(lines.some((line) => line['jobId'] === 'job-0')).toBe(false);
+  });
+
+  // OP-P（P3）: 起動の行を書き、起動のときに、前の起動の終わりの記録がなければ、そのことを理由のコードだけで 1 行書く（強制の終わりなど、process が記録の前に
+  // 消えた終わりも、次の起動で残る）。止める決まりを受けたことは、終わりの処理の前に 1 行書く（終わりの記録には数えない）。
+  it('writes the start, and tells at the start that the previous run ended without an end record (OP-P)', () => {
+    const later = new Date(NOW.getTime() + 60_000);
+    const first = createUiServerLog({ path, files: TEST_FILES, now: () => NOW });
+    first.recordStart();
+    expect(readLines()).toEqual([{ at: NOW.toISOString(), kind: 'START' }]);
+    // 前の起動は、終わりの記録のないまま消えた（ワーカーの終わりは、終わりの記録ではない）。
+    first.write({ kind: 'WORKER_EXITED', jobId: 'job-1', jobKind: 'AUDIT', exitCode: 0, signal: null });
+    const second = createUiServerLog({ path, files: TEST_FILES, now: () => later });
+    second.recordStart();
+    expect(readLines().slice(-2)).toEqual([
+      { at: later.toISOString(), kind: 'PREVIOUS_END_UNRECORDED', previousStartedAt: NOW.toISOString() },
+      { at: later.toISOString(), kind: 'START' },
+    ]);
+    // 止める決まりの受け付けと終わりの記録があれば、次の起動では書かない。
+    second.write({ kind: 'STOP_REQUESTED', reason: 'UI_SILENT', runningJobs: 0 });
+    second.write({ kind: 'SHUTDOWN', reason: 'UI_SILENT', immediate: false, runningJobs: 0 });
+    const third = createUiServerLog({ path, files: TEST_FILES, now: () => later });
+    third.recordStart();
+    expect(readLines().slice(-3).map((line) => line['kind'])).toEqual(['STOP_REQUESTED', 'SHUTDOWN', 'START']);
+    // 止める決まりの受け付けは、終わりの記録に数えない（終わりの記録がなければ、process の終わりを書く）。
+    third.write({ kind: 'STOP_REQUESTED', reason: 'CONSOLE_CLOSED', runningJobs: 1 });
+    third.recordExit(0, 0);
+    expect(readLines().slice(-2).map((line) => line['kind'])).toEqual(['STOP_REQUESTED', 'EXIT']);
+    // 終わりの理由の閉じた一覧（画面の心拍の途絶え、コンソールを閉じた、Ctrl+Break）。
+    expect(UI_SERVER_END_REASONS).toEqual(['CTRL_C', 'SIGTERM', 'UI_CLOSED', 'UI_SILENT', 'CONSOLE_CLOSED', 'CTRL_BREAK', 'OTHER']);
+  });
+
+  it('writes the start even when the previous file cannot be read, and does not throw (OP-P)', () => {
+    mkdirSync(path, { recursive: true });
+    const log = createUiServerLog({ path, files: TEST_FILES, now: () => NOW });
+    expect(() => log.recordStart()).not.toThrow();
   });
 
   it('does not throw when the file cannot be written', () => {

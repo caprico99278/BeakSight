@@ -14,8 +14,14 @@ import { deepFreeze } from '../../core/immutable.js';
 import type { JsonValueConversion } from '../../core/json-value.js';
 import { sortedKeysJsonOf } from '../../core/sorted-keys-json.js';
 import { compareCodeUnits } from '../../core/text.js';
-import { API_SCENARIO_TRANSPORT, FORM_SCENARIO_TRANSPORT, type ScenarioApiSpec } from '../approval/scenario-contracts.js';
 import {
+  API_SCENARIO_TRANSPORT,
+  FORM_SCENARIO_TRANSPORT,
+  FORM_STRUCTURE_RESULT_JUDGEMENT,
+  type ScenarioApiSpec,
+} from '../approval/scenario-contracts.js';
+import {
+  ACTION_RUN_SCHEMA_VERSION,
   MAX_SUBMITTED_VALUE_LENGTH,
   NOT_SENT_SUBMISSION_STATE,
   type ActionApiSummary,
@@ -111,6 +117,7 @@ const apiSummaryRuleErrors = (api: ActionApiSummary, document: ActionRunDocument
 /**
  * `action-run.json` の、スキーマで書けない決まりの誤り（T40c。スキーマを通った文書に使う）。送り方と API の要約を必ず持つ。FORM は API の要約が null で
  * 成否の条件を持つ。API は成否の条件が null で、API の要約（`apiSummaryRuleErrors`）を持つ。誤りの文に値と名前を入れない。
+ * PL-6a（設計者の判断 (d)）: 版 1.2 の記録は、成否の条件の代わりに結果の判定のしかたの印を持つ（FORM は `FORM_STRUCTURE`、API は null）。版 1.1 の記録は今どおり。
  */
 export const actionRunRuleErrors = (document: ActionRunDocument): readonly string[] => {
   const errors: string[] = [];
@@ -118,19 +125,32 @@ export const actionRunRuleErrors = (document: ActionRunDocument): readonly strin
     errors.push('/ must have the transport and the API summary');
   }
   const { api } = document;
+  const judgementOrConditions = (form: boolean): string | null => {
+    if (document.schemaVersion === ACTION_RUN_SCHEMA_VERSION) {
+      return (document.resultJudgement ?? null) === (form ? FORM_STRUCTURE_RESULT_JUDGEMENT : null) && !Object.hasOwn(document, 'resultConditions')
+        ? null
+        : `/resultJudgement must be ${form ? FORM_STRUCTURE_RESULT_JUDGEMENT : 'null'} for a ${form ? 'FORM' : 'API'} run, without the result conditions`;
+    }
+    return ((document.resultConditions ?? null) !== null) === form && !Object.hasOwn(document, 'resultJudgement')
+      ? null
+      : `/resultConditions must be ${form ? 'present' : 'null'} for a ${form ? 'FORM' : 'API'} run`;
+  };
   switch (document.transport) {
     // T40R-fix-B（M-2）: 送り方の値はシナリオの契約の名前つきの定数（自分で定義しない）。
-    case FORM_SCENARIO_TRANSPORT:
+    case FORM_SCENARIO_TRANSPORT: {
       if (api !== null) {
         errors.push('/api must be null for a FORM run');
       }
-      if (document.resultConditions === null) {
-        errors.push('/resultConditions must be present for a FORM run');
+      const formError = judgementOrConditions(true);
+      if (formError !== null) {
+        errors.push(formError);
       }
       break;
-    case API_SCENARIO_TRANSPORT:
-      if (document.resultConditions !== null) {
-        errors.push('/resultConditions must be null for an API run');
+    }
+    case API_SCENARIO_TRANSPORT: {
+      const apiError = judgementOrConditions(false);
+      if (apiError !== null) {
+        errors.push(apiError);
       }
       if (api === null) {
         errors.push('/api must be present for an API run');
@@ -138,6 +158,7 @@ export const actionRunRuleErrors = (document: ActionRunDocument): readonly strin
         errors.push(...apiSummaryRuleErrors(api, document));
       }
       break;
+    }
   }
   return errors;
 };

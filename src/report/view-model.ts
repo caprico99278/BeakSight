@@ -18,7 +18,10 @@
  *   2か所にある不正な Run では、先にあるもの）から付ける。描画する側は、ID から場所を引き直さない（設計書 6.1.10）。
  * - Safety の事象の一覧（`safety.events`）は、各ページの Safety の Evidence の記録を並べるだけで、Run Status や件数の判定には使わない。
  * - モデルは、入力のオブジェクトを参照せず、写しを持つ（入力を凍結したり、変えたりしない）。
+ * - PL-R（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章）: 報告の冒頭のまとめの段と、作業の画面が読む小さなまとめ（`report-summary.json`）の値
+ *   （`overview`。大事な問題、見たページの数、見られなかった理由）も、ここだけで作る。
  */
+import { rulePlainMessageOf } from '../audit/cross-page-rules.js';
 import { pageArtifactRelativePath } from '../core/artifact-layout.js';
 import { DEFAULT_AUDIT_SEND_POLICY, hasAuditSendWebSocketCaution } from '../core/audit-send-policy.js';
 import { BEAKSIGHT_BLOCK_RELATIONS, type BeakSightBlockRelation } from '../core/beaksight-block-relation.js';
@@ -352,6 +355,11 @@ export interface ScreenshotView {
 /** Finding（写し）と、その Evidence の参照（`evidenceRefs` の順）と、関係づくスクリーンショット。 */
 export interface FindingView {
   readonly finding: Finding;
+  /**
+   * OP-R2（PL 設計書 14 章）: 報告の本文に出す、やさしい文。Finding の ruleId を持つ Rule の定義の文（`rulePlainMessageOf`。文を写さない）で、どの Rule も持たない
+   * ruleId（前の版の Rule など）は、Rule の文（`finding.message`）のまま。ChatGPT 用バンドルには入れない。
+   */
+  readonly plainMessage: string;
   readonly evidence: readonly EvidenceRefView[];
   /**
    * この Finding に関係づくスクリーンショット（設計書 6.1.8。`ScreenshotView.relatedFindingIds` と同じ関係）。重複なし。
@@ -502,9 +510,73 @@ export interface InteractionListView {
   readonly notVerifiableByKind: Readonly<Record<InteractionNotVerifiableKind, number>>;
 }
 
+/**
+ * PL-R（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14 章）: まとめの段の「大事な問題」の数の上限。値の根拠: ユーザーの判断（報告の冒頭に大事な
+ * 3 つ）。
+ */
+export const REPORT_OVERVIEW_TOP_PROBLEM_COUNT = 3;
+
+/**
+ * PL-R: まとめの段の「大事な問題」の 1 件（Rule ごとの要約 `ruleDigests` の 1 件から作る。文言は Rule の文のまま）。`findingId` と `message` は、その Rule の
+ * 例の最初の Finding（種類ごとの問題の表の行へのリンクに使う）。
+ */
+export interface OverviewProblemView {
+  readonly ruleId: string;
+  /** その Rule のいちばん重い severity。 */
+  readonly severity: Severity;
+  readonly count: number;
+  readonly pageCount: number;
+  readonly findingId: FindingId;
+  readonly message: string;
+  /** OP-R2: その Finding のやさしい文（`FindingView.plainMessage` と同じ値）。報告のまとめの段は、これを出す。 */
+  readonly plainMessage: string;
+}
+
+/** PL-R: ページの理由ごとの、その理由のあったページの数（`run.json` の `pageIncompleteReasonCounts` の写しに、説明を添えたもの）。 */
+export interface OverviewPageReasonView {
+  readonly reason: ReasonView;
+  readonly pages: number;
+}
+
+/**
+ * PL-R: まとめの段（報告の冒頭）と、作業の画面が読む小さなまとめ（`report-summary.json`）の値。数えるのは、ここ（表示用モデルの組み立て）だけである。
+ * 描く側は、ここと `summary` の値をそのまま使い、判定・集計し直さない。
+ */
+export interface ReportOverviewView {
+  /** 問題の数（サイト品質の Finding の数。安全は分けて数える。`summary.findingCounts.byGroup.SITE_QUALITY` と同じ値）。 */
+  readonly problemCount: number;
+  /** 開いて見たページの数（`AUDITED` と `PARTIAL` のページ。`RunSummary` の件数のまま）。 */
+  readonly checkedPageCount: number;
+  /** 最後まで見られなかったページの数（`PARTIAL`・`FAILED`・`SKIPPED` のページ。`RunSummary` の件数のまま）。 */
+  readonly notFullyCheckedPageCount: number;
+  /**
+   * 大事な問題（`ruleDigests` の並び（重さの順、件数の多い順）で、いちばん重い severity がサイト品質の Rule を、`REPORT_OVERVIEW_TOP_PROBLEM_COUNT` 件まで）。
+   */
+  readonly topProblems: readonly OverviewProblemView[];
+  /** 点検の全体の理由（`RunSummary.incompleteReasons` の、コードの重なりを除いた記録の順。技術の詳細 `detail` は持たない）。 */
+  readonly runReasons: readonly ReasonView[];
+  /** ページの理由ごとのページの数（`run.json` の `pageIncompleteReasonCounts` の順。持たない前の書き手の Run は空）。 */
+  readonly pageReasons: readonly OverviewPageReasonView[];
+  /**
+   * OP-H（撮影 UI-W4 の 3）: この点検で、この Run（監査の段）の後に登録・更新を試す、チェックした画面の数（`ReportRunFacts.plannedWriteScreenCount` のまま。
+   * なければ 0）。1 以上なら、まとめの段に、この後に登録・更新する 1 行を出す。
+   */
+  readonly plannedWriteScreenCount: number;
+}
+
+/**
+ * OP-H: Run の成果物の外から、表示用モデルに渡す事実（画面の点検のジョブの管理が `START` で渡し、ワーカーが写す）。`run.json` には書かない。省略は今のまま。
+ */
+export interface ReportRunFacts {
+  /** この Run の後に登録・更新を試す、チェックした画面の数（1 以上の整数。チェックのない点検と CLI は省略）。 */
+  readonly plannedWriteScreenCount?: number;
+}
+
 /** 表示用モデル。HTML レポート、ChatGPT 用バンドル、CLI の要約は、どれもこれを使う。 */
 export interface ReportViewModel {
   readonly summary: RunSummaryView;
+  /** PL-R: まとめの段の値（報告の冒頭と、`report-summary.json`）。 */
+  readonly overview: ReportOverviewView;
   /** すべての Finding（`AuditRunResult.findings` の順）。 */
   readonly findings: readonly FindingView[];
   /** 重大な指摘（`SEVERITY_CATALOG` の `criticalSection` が真の severity の Finding。category を問わない。`AuditRunResult.findings` の順）。 */
@@ -702,6 +774,51 @@ const buildRuleDigests = (groups: readonly RuleFindingGroup[], viewportOrder: re
         right.count - left.count ||
         compareCodeUnits(left.ruleId, right.ruleId),
     );
+
+/** PL-R: その Rule のいちばん重い severity（Rule の Finding は 1 件以上ある）。並びの `mostSevereOrder` と同じ決め方。 */
+const mostSevereOf = (bySeverity: Readonly<Record<Severity, number>>): Severity =>
+  sortByDisplayOrder(SEVERITIES, SEVERITY_CATALOG).find((severity) => bySeverity[severity] > 0) ?? SEVERITIES[0];
+
+/**
+ * PL-R: まとめの段の値（`ReportOverviewView`）。大事な問題は、Rule ごとの要約の並びのまま、いちばん重い severity がサイト品質の Rule を先頭から選ぶ（並べ直さない）。
+ * ページの数は `RunSummary` の件数のまま足すだけ。理由は、点検の全体の理由のコードの重なりを除き（記録の順）、技術の詳細を落とす。
+ */
+const overviewView = (
+  run: RunSummary,
+  ruleDigests: readonly RuleDigestView[],
+  findingCounts: SeverityCountsView,
+  facts: ReportRunFacts,
+  findings: readonly FindingView[],
+): ReportOverviewView => {
+  // OP-R2: 大事な問題のやさしい文は、その例の Finding の `plainMessage`（引き直さない）。
+  const plainMessageById = new Map(findings.map((view) => [view.finding.findingId, view.plainMessage]));
+  const runReasonCodes = [...new Set(run.incompleteReasons.map(({ code }) => code))];
+  return {
+    problemCount: findingCounts.byGroup.SITE_QUALITY,
+    checkedPageCount: run.auditedPageCount + run.partialPageCount,
+    notFullyCheckedPageCount: run.partialPageCount + run.failedPageCount + run.skippedPageCount,
+    topProblems: ruleDigests
+      .filter((digest) => isSiteQualitySeverity(mostSevereOf(digest.bySeverity)))
+      .slice(0, REPORT_OVERVIEW_TOP_PROBLEM_COUNT)
+      .flatMap((digest): OverviewProblemView[] => {
+        const [example] = digest.examples;
+        return example === undefined
+          ? []
+          : [{
+            ruleId: digest.ruleId,
+            severity: mostSevereOf(digest.bySeverity),
+            count: digest.count,
+            pageCount: digest.pageCount,
+            findingId: example.findingId,
+            message: example.message,
+            plainMessage: plainMessageById.get(example.findingId) ?? example.message,
+          }];
+      }),
+    runReasons: runReasonCodes.map((code) => reasonView({ code, detail: null })),
+    pageReasons: (run.pageIncompleteReasonCounts ?? []).map(({ code, pages }) => ({ reason: reasonView({ code, detail: null }), pages })),
+    plannedWriteScreenCount: facts.plannedWriteScreenCount ?? 0,
+  };
+};
 
 /**
  * 実行の記録の表示（R6）。実行の回数と再開の回数を数えるのは、ここだけである。最初の実行の後の実行が、再開である。
@@ -970,7 +1087,7 @@ function relateScreenshotsToFindings(result: AuditRunResult): ScreenshotRelation
  * 確定した Run から、表示用モデルを組み立てる（設計書 6.1.3）。入力は、最終の Run Status のもの（`ArtifactWriter.writeRun` の
  * 戻り値の `result`）でなければならない。モデルは深く凍結する。入力は変えない。
  */
-export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
+export function buildReportViewModel(result: AuditRunResult, facts: ReportRunFacts = {}): ReportViewModel {
   const { run } = result;
 
   // Evidence の ID から、それを参照する Finding の ID（`AuditRunResult.findings` の順）。
@@ -1011,6 +1128,8 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
   const blockIndex = indexBeakSightBlocks(result);
   const findings: readonly FindingView[] = result.findings.map((finding, index) => ({
     finding: copyFinding(finding),
+    // OP-R2: やさしい文は Rule の定義が持つ（Rule を評価しない）。
+    plainMessage: rulePlainMessageOf(finding.ruleId) ?? finding.message,
     evidence: finding.evidenceRefs.map((evidenceId) => ({ evidenceId, location: locationById.get(evidenceId) ?? null })),
     screenshots: (relations.screenshotIdsOfFinding[index] ?? []).flatMap((evidenceId) => {
       const screenshot = screenshotById.get(evidenceId);
@@ -1102,6 +1221,8 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
 
   const crawl = run.effectiveConfig.crawl;
   const executions = executionsView(run.executions);
+  const findingCounts = countFindings(findings);
+  const ruleDigests = buildRuleDigests(ruleGroups, viewportOrder);
   const model: ReportViewModel = {
     summary: {
       runId: run.runId,
@@ -1119,7 +1240,7 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
         failed: run.failedPageCount,
         skipped: run.skippedPageCount,
       },
-      findingCounts: countFindings(findings),
+      findingCounts,
       beaksightBlockRelation: {
         byRelation: countByBlockRelation(findings),
         linkedFindingCount: excludedFindings.filter(({ beaksightBlockRelation }) => beaksightBlockRelation !== null).length,
@@ -1144,10 +1265,12 @@ export function buildReportViewModel(result: AuditRunResult): ReportViewModel {
       unverifiedInternalLinkCount: run.unverifiedInternalLinkCount,
       environment: structuredClone(run.environment),
     },
+    // PL-R: まとめの段（Rule ごとの要約と件数は、上で 1 回だけ作ったものを使う）。
+    overview: overviewView(run, ruleDigests, findingCounts, facts, findings),
     findings,
     criticalFindings: findings.filter(({ finding }) => CRITICAL_SEVERITIES.has(finding.severity)),
     categorySections,
-    ruleDigests: buildRuleDigests(ruleGroups, viewportOrder),
+    ruleDigests,
     mainFindings,
     excludedFindings,
     mainRuleDigests: buildRuleDigests(groupFindingsByRule(mainFindings), viewportOrder),

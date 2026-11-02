@@ -21,10 +21,9 @@ import { DISCOVERY_ARTIFACT_SCHEMA_VERSION, discoverySummaryOf, type DiscoveryDo
 import { computeCandidateDigests } from '../../../src/discovery/fingerprint.js';
 import { CANDIDATE_CLASSIFICATION_CATALOG } from '../../../src/presentation/catalog.js';
 import {
-  LOCAL_UI_AUDIT_TEXT,
   LOCAL_UI_AUTH_TEXT,
   LOCAL_UI_DISCOVERY_TEXT,
-  LOCAL_UI_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
   READ_CHECK_DEFINITION_REJECTION_DESCRIPTIONS,
 } from '../../../src/presentation/messages.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
@@ -46,6 +45,7 @@ import {
 import { callServerFunction, encodeServerFunctionPayload, readServerFunctionIds, type ServerFunctionCall } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 const STATUS = Object.freeze({ OK: 200, BAD_REQUEST: 400, FORBIDDEN: 403, NOT_FOUND: 404 });
 /** ジョブの終わりを待つ上限と、読み直す間隔（ms）。 */
@@ -247,7 +247,7 @@ beforeAll(async () => {
   cookie = parseSetCookie(exchange.headers['set-cookie'])?.pair ?? '';
   for (const profileId of [PROFILE_ID, RETIRED_PROFILE_ID]) {
     expect(await valueOf('createProfileFn', 'POST', { profile: testProfile(profileId, target) })).toMatchObject({ ok: true });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(profileId) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(profileId) })).toMatchObject({ ok: true });
   }
   expect(await valueOf('createProfileFn', 'POST', {
     profile: {
@@ -417,20 +417,19 @@ describe('T27f: two allowed origins, the definition rejections, the retired prof
       ['attachment', false, false],
     ]);
 
+    // PL-5（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 画面はサイトのアドレス（Origin）を出さないので、同じ path の候補は 1 つの画面の
+    // まとまりに並べる（Origin で分けるのは、上の Server Function の値と成果物）。候補の種類・送信先・実行の可否は出さず、分類の語だけ（詳しい内容の中）。
     const page = await openPage(`/discovery/${PROFILE_ID}`);
     const groups = page.getByTestId('discovery-page');
-    expect(await groups.count()).toBe(3);
+    expect(await groups.count()).toBe(2);
     const itemsGroups = page.locator(`[data-testid="discovery-page"][data-page-path="${ITEMS_PATH}"]`);
-    expect(await itemsGroups.count()).toBe(2);
-    expect(await itemsGroups.evaluateAll((elements) => elements.map((element) => element.getAttribute('data-page-origin')).sort()))
-      .toEqual([ORIGIN_A, ORIGIN_B]);
-    for (const origin of [ORIGIN_A, ORIGIN_B]) {
-      expect(await page.locator(`[data-testid="discovery-page"][data-page-origin="${origin}"][data-page-path="${ITEMS_PATH}"] h3`).textContent())
-        .toContain(`${origin}${ITEMS_PATH}`);
-    }
+    expect(await itemsGroups.count()).toBe(1);
+    expect(await itemsGroups.locator('[data-testid="discovery-candidate"]').count()).toBe(2);
+    expect(await page.locator('main').textContent()).not.toContain(ORIGIN_A);
+    expect(await page.locator('main').textContent()).not.toContain(ORIGIN_B);
     const create = page.locator(`[data-testid="discovery-candidate"][data-digest="${CREATE.identityDigest}"]`);
     expect(await create.getAttribute('data-classification')).toBe('CREATE');
-    expect(await create.getByTestId('candidate-execution').textContent()).toContain(LOCAL_UI_DISCOVERY_TEXT.notExecutable);
+    expect(await create.getByTestId('candidate-execution').count()).toBe(0);
     expect(await create.getByText(CANDIDATE_CLASSIFICATION_CATALOG.CREATE.label).count()).toBe(1);
     await screenshot(page, 'f02-discovery-two-origins');
   });
@@ -499,7 +498,10 @@ describe('T27f: two allowed origins, the definition rejections, the retired prof
 
     const jobPage = await openPage(`/jobs/${job.jobId}`);
     expect(await jobPage.getByTestId('job-kind').getAttribute('data-kind')).toBe('READ_CHECK');
-    expect(await jobPage.getByTestId('job-no-progress').textContent()).toBe(LOCAL_UI_DISCOVERY_TEXT.job.noProgress);
+    // PL-2（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 2）: 技術の文（進み具合を送らない旨）は出さず、要点の結果の 1 行と主のボタンを出す。
+    expect(await jobPage.getByTestId('job-no-progress').count()).toBe(0);
+    await jobPage.locator('[data-testid="job-result"][data-result="READ_CHECK_FINISHED"]').waitFor();
+    expect(await jobPage.getByTestId('job-open-read-checks').count()).toBe(1);
     expect(await jobPage.getByTestId('job-progress-empty').count()).toBe(0);
     await screenshot(jobPage, 'f03-read-check-job');
 
@@ -564,17 +566,18 @@ describe('T27f: the browser bundle does not include the server parts', () => {
 
 // T28b（Task 28 の設計書 2 章のユーザーの判断 1、4.5、10 章の 5）: 書き込みのモード（`TEST_APPROVED_WRITE`）のプロファイルでも、認証の設定・発見・READ の
 // 確かめを使える（画面の出し分けは、`src/control/execution-policy.ts` の判定）。プロファイルの詳細に、認証の設定と、操作の候補・READ の確かめへの
-// 動線を出す。認証つきの監査は始められない（一覧に「監査を始める」を出さず、開始の確かめは `MODE_NOT_EXECUTABLE`。フォームの案内で理由を出す）。
-describe('T28b: a write mode profile uses the auth setup, the discovery and the READ checks, but not the audit', () => {
+// 動線を出す。MI-5（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.5）: 認証つきの監査も、書き込みのモードで始められるようになった（開始の
+// 確かめの理由がなく、フォームの「このモードでは監査を始められない」の案内も出さない。前は `MODE_NOT_EXECUTABLE`）。ここではジョブを始めない。
+describe('T28b: a write mode profile uses the auth setup, the discovery and the READ checks, and (MI-5) the audit', () => {
   const WRITE_PROFILE_ID = 't28b-write';
 
-  it('saves the auth setup, offers the discovery and the READ checks, and shows why the audit cannot start', async () => {
+  it('saves the auth setup, offers the discovery and the READ checks, and has no reason against the audit start (MI-5)', async () => {
     const target = `config/targets/${TARGET_NAME}.json`;
     expect(await valueOf('createProfileFn', 'POST', { profile: { ...testProfile(WRITE_PROFILE_ID, target), mode: 'TEST_APPROVED_WRITE' } }))
       .toMatchObject({ ok: true });
     expect(await valueOf('getAuthSetupFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({ eligible: true, stored: null });
     expect(await valueOf('discoveryPageFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({ eligible: true, start: { blocker: 'AUTH_SETUP_MISSING' } });
-    expect(await valueOf('saveAuthSetupFn', 'POST', { setup: authSetup(WRITE_PROFILE_ID) })).toMatchObject({ ok: true });
+    expect(await saveAuthSetupRequestInStore(root, { setup: authSetup(WRITE_PROFILE_ID) })).toMatchObject({ ok: true });
     expect(await valueOf('discoveryPageFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({ eligible: true, start: { blocker: null } });
     expect(await valueOf('readCheckPageFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({
       eligible: true,
@@ -583,23 +586,30 @@ describe('T28b: a write mode profile uses the auth setup, the discovery and the 
     });
     expect(await valueOf('auditStartSummaryFn', 'GET', { profileId: WRITE_PROFILE_ID })).toMatchObject({
       mode: 'TEST_APPROVED_WRITE',
-      blocker: 'MODE_NOT_EXECUTABLE',
-      authRequired: false,
+      blocker: null,
+      authRequired: true,
     });
-    expect(await valueOf('startAuditJobFn', 'POST', { profileId: WRITE_PROFILE_ID, expectedRevision: 1, startNew: true }))
-      .toMatchObject({ ok: false, reason: 'MODE_NOT_EXECUTABLE' });
 
     const detail = await openPage(`/profiles/${WRITE_PROFILE_ID}`);
-    const authPanel = detail.getByTestId('profile-auth-setup');
-    expect(await authPanel.getByRole('link', { name: LOCAL_UI_AUTH_TEXT.profileDetail.open }).getAttribute('href')).toBe(`/auth-setup/${WRITE_PROFILE_ID}`);
-    const discoveryPanel = detail.getByTestId('profile-discovery');
-    expect(await discoveryPanel.getByRole('link', { name: LOCAL_UI_DISCOVERY_TEXT.profileDetail.openDiscovery }).getAttribute('href'))
-      .toBe(`/discovery/${WRITE_PROFILE_ID}`);
-    expect(await discoveryPanel.getByRole('link', { name: LOCAL_UI_DISCOVERY_TEXT.profileDetail.openReadChecks }).getAttribute('href'))
-      .toBe(`/read-checks/${WRITE_PROFILE_ID}`);
-    // 手動のログインなので、資格情報の動線は出さない。認証つきの監査を始められない理由は、フォームの案内で出す。
-    expect(await detail.getByTestId('profile-credentials').count()).toBe(0);
-    expect(await detail.getByText(LOCAL_UI_TEXT.profileForm.testModeNotice).count()).toBe(1);
+    // MI-3（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.3）・PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章の 1）: 「ログインの設定を
+    // 開く」と、操作さがし・見るだけの確かめへの入口は、サイトの画面の詳しい内容の中（閉じている間は役割で探せないので、目印で探す）。
+    const details = detail.getByTestId('profile-edit-advanced-settings');
+    await details.waitFor({ timeout: UI_TIMEOUT_MS });
+    const authSetupOpen = details.locator('[data-action="AUTH_SETUP"]');
+    expect(await authSetupOpen.getAttribute('href')).toBe(`/auth-setup/${WRITE_PROFILE_ID}`);
+    expect(await authSetupOpen.textContent()).toBe(LOCAL_UI_AUTH_TEXT.profileDetail.open);
+    expect(await details.getByTestId('profile-open-discovery').getAttribute('href')).toBe(`/discovery/${WRITE_PROFILE_ID}`);
+    expect(await details.getByTestId('profile-open-discovery').textContent()).toBe(LOCAL_UI_DISCOVERY_TEXT.profileDetail.openDiscovery);
+    expect(await details.getByTestId('profile-open-read-checks').getAttribute('href')).toBe(`/read-checks/${WRITE_PROFILE_ID}`);
+    expect(await details.getByTestId('profile-open-read-checks').textContent()).toBe(LOCAL_UI_DISCOVERY_TEXT.profileDetail.openReadChecks);
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D5。意図して直した期待。前は、手動のログインなので資格情報の動線を出さなかった）:
+    // ID とパスワードの画面への入口は、詳しい内容の中の直す道としてだけ出す（要点には出さない。`credential-ui-flows.test.ts` と同じ形）。
+    // MI-5: 監査を始められるので、フォームの「このモードでは監査を始められない」の案内は出さない
+    // （MI-1 の D で、その案内の文言そのものをカタログから消した。`auth-display.test.ts` が確かめる）。
+    expect(await detail.getByTestId('profile-summary').count()).toBe(1);
+    expect(await detail.getByTestId('profile-summary').locator('[data-action="CREDENTIAL"]').count()).toBe(0);
+    expect(await details.locator('[data-action="CREDENTIAL"]').count()).toBe(1);
+    expect(await detail.locator('main [data-action="CREDENTIAL"]').count()).toBe(1);
     await screenshot(detail, 't28b-write-profile-detail');
 
     const discovery = await openPage(`/discovery/${WRITE_PROFILE_ID}`);
@@ -609,6 +619,10 @@ describe('T28b: a write mode profile uses the auth setup, the discovery and the 
     const list = await openPage('/');
     const row = list.locator(`[data-profile-id="${WRITE_PROFILE_ID}"]`);
     await row.waitFor();
-    expect(await row.getByRole('link', { name: LOCAL_UI_AUDIT_TEXT.profileList.startAudit }).count()).toBe(0);
+    // MI-5: 書き込みのモードでも監査を始められる。PL-1（設計書 `2026-10-26-beaksight-plain-ui-design.md` 3 章、4 章の 1。前は一覧の行に「監査を始める」）: 一覧の行は
+    // 「続ける」1 つで、段はサイトの画面と同じ。OP-2（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.1 の D7'。意図して直した期待。前は書き込みの
+    // 手順へ進む `SCENARIOS` の段）: 書き込みは点検の流れの一部なので、書き込みのモードのサイトも、ほかのサイトと同じ点検の段（まだ点検がなく、手でログイン）で進む。
+    expect(await row.getByRole('link', { name: LOCAL_UI_NEXT_STEP_TEXT.continue }).count()).toBe(1);
+    expect(await row.getByTestId('profile-row-next').getAttribute('data-stage')).toBe('AUDIT_MANUAL_LOGIN');
   });
 });

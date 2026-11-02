@@ -282,6 +282,8 @@ export const withSubmissionProbes = (
       const probe = probes.get(index);
       return probe === undefined ? candidate : Object.freeze({ ...candidate, submissionProbe: probe });
     })),
+    // OP-K（K1）: 画面の名前は写す（前は落としていた。押して確かめた画面の一覧の行の名前が取れなかった）。
+    ...(record.screenName === undefined ? {} : { screenName: record.screenName }),
   });
 };
 

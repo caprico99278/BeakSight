@@ -408,7 +408,7 @@ describe('T38c: the verification READ of a page path template for an API scenari
   const CANDIDATE_READ = { readCheckId: 'rc-search', profileId: PROFILE_ID, revision: 1, canceledAt: null, parameterNames: ['q'], targetKind: 'CANDIDATE' } as const;
   const FACTS = [TEMPLATE_READ, PAGE_READ, CANDIDATE_READ];
   const verificationOf = (readCheckId: string, bindings: readonly Record<string, string>[]): Record<string, unknown> => ({
-    successCondition: null, inputErrorCondition: null, recordId: null,
+    resultJudgement: null, recordId: null,
     readVerification: { readCheckId, revision: 1, bindings, expectations: [{ kind: 'TEXT_CONTAINS', fieldName: 'email' }] },
   });
   const withRead = (readCheckId: string, bindings: readonly Record<string, string>[]): Record<string, unknown> =>
@@ -430,11 +430,40 @@ describe('T38c: the verification READ of a page path template for an API scenari
       ['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']],
     ['a READ candidate without a binding', () => validateScenarioDraft(withRead('rc-search', []), CREATE_CANDIDATE, FACTS, CONTEXT), ['SCENARIO_INPUT_INVALID']],
     ['a page path template READ for a FORM scenario', () => validateScenarioDraft(sampleDraft({
-      verification: { ...verificationOf('rc-page', [{ parameterName: 'q', fieldName: 'name' }]) },
+      // PL-6a: form の下書きの結果の判定のしかたの印は FORM_STRUCTURE（null は form の印でない）。
+      verification: { ...verificationOf('rc-page', [{ parameterName: 'q', fieldName: 'name' }]), resultJudgement: 'FORM_STRUCTURE' },
     }), FORM_CREATE_CANDIDATE, [...READ_CHECK_FACTS, ...FACTS], CONTEXT), ['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']],
-    ['no binding for a FORM scenario (the shape)', () => validateScenarioDraft(sampleDraft({ verification: verificationOf('rc-page', []) }),
+    ['no binding for a FORM scenario (the shape)', () => validateScenarioDraft(sampleDraft({ verification: { ...verificationOf('rc-page', []), resultJudgement: 'FORM_STRUCTURE' } }),
       FORM_CREATE_CANDIDATE, [...READ_CHECK_FACTS, ...FACTS], CONTEXT), ['SCENARIO_INPUT_INVALID']],
   ])('rejects %s', (_label, run, codes) => {
     expect(codesOf(run())).toEqual(codes);
+  });
+
+  // OP-R（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1。T37d の判断 5 を改めた）: API の登録に限って、`{id}` のない画面の path の定義（一覧の
+  // 画面）を照合の READ に使える。条件は、登録の画面の path の 1 つ上の path で、生成した値と比べる期待を持つこと（結び付けは 0 件）。
+  describe('OP-R (R1): the list page READ of an API create', () => {
+    const LIST_READ = { ...TEMPLATE_READ, readCheckId: 'rc-list', pageTemplate: false, pagePath: '/admin/members' } as const;
+    const OTHER_PAGE_READ = { ...TEMPLATE_READ, readCheckId: 'rc-other', pageTemplate: false, pagePath: '/admin' } as const;
+    const LIST_FACTS = [...FACTS, LIST_READ, OTHER_PAGE_READ];
+
+    it('accepts the list page one above the create page without a binding, and keeps it in the content', () => {
+      const result = validateScenarioDraft(withRead('rc-list', []), CREATE_CANDIDATE, LIST_FACTS, CONTEXT);
+      expect(codesOf(result)).toEqual([]);
+      if (!result.ok) return;
+      expect(result.content.verification.readVerification).toMatchObject({ readCheckId: 'rc-list', bindings: [] });
+    });
+
+    it.each<readonly [string, () => ScenarioDraftValidationResult, readonly string[]]>([
+      ['a page path READ that is not the list page one above the create page',
+        () => validateScenarioDraft(withRead('rc-other', []), CREATE_CANDIDATE, LIST_FACTS, CONTEXT), ['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']],
+      ['the list page READ without an expectation compared with a generated value', () => validateScenarioDraft(draftOf(CREATE_CANDIDATE, {
+        verification: { resultJudgement: null, recordId: null, readVerification: { readCheckId: 'rc-list', revision: 1, bindings: [], expectations: [{ kind: 'ROW_COUNT_EQUALS', count: 1 }] } },
+      }), CREATE_CANDIDATE, LIST_FACTS, CONTEXT), ['SCENARIO_API_READ_VERIFICATION_NOT_BOUND']],
+      ['the list page READ for a FORM scenario', () => validateScenarioDraft(sampleDraft({
+        verification: { ...verificationOf('rc-list', [{ parameterName: 'q', fieldName: 'name' }]), resultJudgement: 'FORM_STRUCTURE' },
+      }), FORM_CREATE_CANDIDATE, [...READ_CHECK_FACTS, ...LIST_FACTS], CONTEXT), ['SCENARIO_VERIFICATION_READ_CHECK_PAGE_TARGET']],
+    ])('rejects %s', (_label, run, codes) => {
+      expect(codesOf(run())).toEqual(codes);
+    });
   });
 });

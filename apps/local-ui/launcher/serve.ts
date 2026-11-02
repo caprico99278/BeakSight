@@ -34,7 +34,7 @@ import {
   UI_PRESENCE_SILENCE_LIMIT_MS,
 } from '../src/security/ui-presence.ts';
 import { errorMessageOrString } from './error-message.ts';
-import { createPresenceMonitor, handlePresenceRequest, type PresenceMonitor } from './presence.ts';
+import { createPresenceMonitor, handlePresenceRequest, type PresenceIdleCause, type PresenceMonitor } from './presence.ts';
 import { LOCAL_UI_LISTEN_HOST, createSessionToken, formatTokenUrl, guardNodeRequest, type LocalUiGuardOptions } from './request-guard.ts';
 import { createTwoStepShutdown } from './shutdown.ts';
 
@@ -75,6 +75,8 @@ type Bridge = Pick<
   | 'closeLocalUiStore'
   | 'prepareLocalUiAuditJobs'
   | 'prepareLocalUiCredentials'
+  | 'retireUnusableLocalUiProfiles'
+  | 'resumableRecoveredLocalUiJobCount'
   | 'runningLocalUiAuditJobCount'
   | 'shutdownLocalUiAuditJobs'
   | 'AUDIT_JOB_SHUTDOWN_WAIT_MS'
@@ -87,6 +89,8 @@ type Bridge = Pick<
   | 'recordLocalUiServerUnexpectedError'
   | 'recordLocalUiServerShutdown'
   | 'recordLocalUiServerExit'
+  | 'recordLocalUiServerStart'
+  | 'recordLocalUiServerStopRequest'
   | 'setLocalUiServerLogSecrets'
 >;
 
@@ -123,6 +127,8 @@ function isBridge(value: unknown): value is Bridge {
     && 'closeLocalUiStore' in value && typeof value.closeLocalUiStore === 'function'
     && 'prepareLocalUiAuditJobs' in value && typeof value.prepareLocalUiAuditJobs === 'function'
     && 'prepareLocalUiCredentials' in value && typeof value.prepareLocalUiCredentials === 'function'
+    && 'retireUnusableLocalUiProfiles' in value && typeof value.retireUnusableLocalUiProfiles === 'function'
+    && 'resumableRecoveredLocalUiJobCount' in value && typeof value.resumableRecoveredLocalUiJobCount === 'function'
     && 'runningLocalUiAuditJobCount' in value && typeof value.runningLocalUiAuditJobCount === 'function'
     && 'shutdownLocalUiAuditJobs' in value && typeof value.shutdownLocalUiAuditJobs === 'function'
     && 'AUDIT_JOB_SHUTDOWN_WAIT_MS' in value && typeof value.AUDIT_JOB_SHUTDOWN_WAIT_MS === 'number'
@@ -135,6 +141,8 @@ function isBridge(value: unknown): value is Bridge {
     && 'recordLocalUiServerUnexpectedError' in value && typeof value.recordLocalUiServerUnexpectedError === 'function'
     && 'recordLocalUiServerShutdown' in value && typeof value.recordLocalUiServerShutdown === 'function'
     && 'recordLocalUiServerExit' in value && typeof value.recordLocalUiServerExit === 'function'
+    && 'recordLocalUiServerStart' in value && typeof value.recordLocalUiServerStart === 'function'
+    && 'recordLocalUiServerStopRequest' in value && typeof value.recordLocalUiServerStopRequest === 'function'
     && 'setLocalUiServerLogSecrets' in value && typeof value.setLocalUiServerLogSecrets === 'function';
 }
 
@@ -415,21 +423,31 @@ if (isMain) {
             // T26e（Task 26 の設計書 4.1 の「起動のとき」）: 資格情報のフォルダに残った一時のファイルを消し、暗号化が使えるかを 1 回確かめる
             // （結果は環境の状態の画面に出す。使えなくても起動は止めない。例外を投げない）。
             await ready.prepareLocalUiCredentials();
+            // MI-F3 項目 6: 使えないプロファイル（自動ログインで認証の設定がない。MI より前に作られた形）を、起動のときに 1 回だけ自動で取り消し、取り消した
+            // プロファイルの ID と理由をログに 1 行ずつ残す（画面には何も足さない。判定は `src/control/unusable-profile.ts`）。
+            for (const line of await ready.retireUnusableLocalUiProfiles()) {
+              console.log(line);
+            }
+            // MI-F5（再レビュー MI-R2 の Minor M-2）: 中断に直したジョブの案内（「前回の続きから再開する」）は、取り消したプロファイルのジョブを数えない（取り消しの
+            // 後に数える）。
+            const resumable = recovered > 0 ? ready.resumableRecoveredLocalUiJobCount() : 0;
             // UI-close: 管理画面のブラウザが閉じられ、動いているジョブがなければ、Ctrl+C と同じ止め方（1 回目）で止める。
             const argv = process.argv.slice(2);
-            let stopWhenClosed: (() => void) | undefined;
+            let stopWhenClosed: ((cause: PresenceIdleCause) => void) | undefined;
             const presence = createPresenceMonitor({
               closedGraceMs: durationArgument(argv, '--ui-close-grace-ms', UI_PRESENCE_CLOSED_GRACE_MS),
               silenceLimitMs: durationArgument(argv, '--ui-silence-limit-ms', UI_PRESENCE_SILENCE_LIMIT_MS),
               runningJobCount: ready.runningLocalUiAuditJobCount,
-              onIdle: () => {
+              onIdle: (cause) => {
                 console.log(ready.LOCAL_UI_CONSOLE_TEXT.closedByUi);
-                stopWhenClosed?.();
+                stopWhenClosed?.(cause);
               },
             });
             const server = await startLocalUiServer(ready, portArgument.port, presence);
-            if (recovered > 0) {
-              console.log(ready.LOCAL_UI_JOB_CONSOLE_TEXT.recoveredJobs(ready.formatCount(recovered)));
+            // OP-P（P3）: 起動の行を書く（前の起動の行の後に終わりの記録がなければ、そのことを先に 1 行書く。理由のコードと時刻だけ）。
+            ready.recordLocalUiServerStart();
+            if (resumable > 0) {
+              console.log(ready.LOCAL_UI_JOB_CONSOLE_TEXT.recoveredJobs(ready.formatCount(resumable)));
             }
             console.log(ready.LOCAL_UI_CONSOLE_TEXT.tokenUrl(server.tokenUrl));
             console.log(ready.LOCAL_UI_CONSOLE_TEXT.tokenNotice);
@@ -444,12 +462,19 @@ if (isMain) {
               closeServer: () => server.close(),
               closeStore: ready.closeLocalUiStore,
               exit: (code) => process.exit(code),
+              // OP-P（P3）: 止める決まりを受けたこと（終わり方と、動いていたジョブの数）を、終わりの処理の前に書く。
+              recordRequest: (reason, runningJobs) => ready.recordLocalUiServerStopRequest(reason ?? 'OTHER', runningJobs),
               // DEF-146: 止める決まりの終わり（終わり方と、動いていたジョブの数）を、終わりの記録のファイルに書く。
               recordEnd: (reason, immediate, runningJobs) => ready.recordLocalUiServerShutdown(reason ?? 'OTHER', immediate, runningJobs),
             });
             process.on('SIGINT', () => stop('CTRL_C'));
             process.on('SIGTERM', () => stop('SIGTERM'));
-            stopWhenClosed = () => stop('UI_CLOSED');
+            // OP-P（P3）: Windows でコンソールの窓を閉じたとき（SIGHUP。数秒の後に OS が終わらせる）と Ctrl+Break（SIGBREAK）も、同じ止め方にする（受け手が
+            // なければ、Node は記録を書かずに終わる）。
+            process.on('SIGHUP', () => stop('CONSOLE_CLOSED'));
+            process.on('SIGBREAK', () => stop('CTRL_BREAK'));
+            // OP-P（P3）: 閉じた知らせの後か、知らせの途絶えの後かを、終わり方に分ける。
+            stopWhenClosed = (cause) => stop(cause === 'SILENT' ? 'UI_SILENT' : 'UI_CLOSED');
             setInterval(() => presence.check(), durationArgument(argv, '--ui-presence-check-ms', UI_PRESENCE_CHECK_INTERVAL_MS)).unref();
           } catch (error: unknown) {
             await ready.shutdownLocalUiAuditJobs(0);

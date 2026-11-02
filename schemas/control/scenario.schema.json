@@ -86,6 +86,21 @@
       "then": { "required": ["api"], "properties": { "api": { "$ref": "#/$defs/api" }, "request": { "type": "null" }, "update": { "type": "null" } } }
     },
     {
+      "description": "PL-6a: an API scenario has no way to judge the result of a form (resultJudgement null when present) and takes the record id from the page (not the record id patterns of a form).",
+      "if": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] },
+      "then": {
+        "properties": {
+          "verification": {
+            "type": "object",
+            "properties": {
+              "resultJudgement": { "type": "null" },
+              "recordId": { "anyOf": [{ "$ref": "#/$defs/pageRecordId" }, { "type": "null" }] }
+            }
+          }
+        }
+      }
+    },
+    {
       "description": "T38b: a FORM scenario (transport absent or FORM) has the request of a form and no API spec.",
       "if": { "not": { "properties": { "transport": { "const": "API" } }, "required": ["transport"] } },
       "then": { "properties": { "request": { "$ref": "#/$defs/request" }, "api": false } }
@@ -308,12 +323,14 @@
       }
     },
     "verification": {
+      "description": "PL-6a (plain UI design 8.1, the designer's decisions (a)-(c)): the way to judge the result (resultJudgement: FORM_STRUCTURE for a FORM scenario, null for an API scenario) replaced the success and the input error conditions that a person typed. The writer always writes resultJudgement and never the retired conditions (src/control/approval/scenario-policy.ts checks it before storing); a stored document written before may still have the retired conditions and no resultJudgement, which the reader drops and reads as null.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["successCondition", "inputErrorCondition", "recordId", "readVerification"],
+      "required": ["recordId", "readVerification"],
       "properties": {
-        "successCondition": { "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
-        "inputErrorCondition": { "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
+        "resultJudgement": { "anyOf": [{ "enum": ["FORM_STRUCTURE"] }, { "type": "null" }] },
+        "successCondition": { "description": "PL-6a: retired (read and dropped).", "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
+        "inputErrorCondition": { "description": "PL-6a: retired (read and dropped).", "anyOf": [{ "$ref": "#/$defs/resultCondition" }, { "type": "null" }] },
         "recordId": { "anyOf": [{ "$ref": "#/$defs/recordId" }, { "type": "null" }] },
         "readVerification": { "anyOf": [{ "$ref": "#/$defs/readVerification" }, { "type": "null" }] }
       }
@@ -328,6 +345,10 @@
       }
     },
     "recordId": {
+      "oneOf": [{ "$ref": "#/$defs/pageRecordId" }, { "$ref": "#/$defs/formRecordId" }]
+    },
+    "pageRecordId": {
+      "description": "The record id way of an API scenario (from the page after the save: a path pattern or an element).",
       "oneOf": [
         {
           "type": "object",
@@ -349,6 +370,22 @@
         }
       ]
     },
+    "formRecordId": {
+      "description": "PL-6a (plain UI design 8.1): the record id way of a FORM scenario: the record id patterns (1 to MAX_FORM_RECORD_ID_PATTERNS, tried in order on the URL after sending).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "pathPatterns"],
+      "properties": {
+        "source": { "const": "URL_PATH_PATTERNS" },
+        "pathPatterns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^/", "minLength": 1, "maxLength": 2048 }
+        }
+      }
+    },
     "readVerification": {
       "type": "object",
       "additionalProperties": false,
@@ -356,6 +393,10 @@
       "properties": {
         "readCheckId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" },
         "revision": { "type": "integer", "minimum": 1 },
+        "verificationOnly": {
+          "description": "PL-6a (the designer's decision (f)): true when the READ check definition is used only for the verification of this scenario (the READ check job does not read it). Absent means false.",
+          "type": "boolean"
+        },
         "bindings": { "type": "array", "minItems": 0, "maxItems": 50, "items": { "$ref": "#/$defs/binding" } },
         "expectations": { "type": "array", "minItems": 1, "maxItems": 10, "items": { "$ref": "#/$defs/verificationExpectation" } }
       }

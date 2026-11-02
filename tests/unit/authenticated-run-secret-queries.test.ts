@@ -145,8 +145,8 @@ describe('T25f round 1 (1): an authenticated Run does not keep a secret query pa
   it('guides the screen with the CONFIG_ERROR action', () => {
     expect(AUDIT_JOB_FAILURE_REASON_DESCRIPTIONS.CONFIG_ERROR.action).toContain(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION);
     expect(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION).toContain('crawl.allowedQueryParameters');
-    // T44g: 公開の監査も同じ理由で始めないので、画面の案内は公開の監査にも当てはまる文にする。
-    expect(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION).toContain('公開の監査');
+    // T44g: 公開の監査も同じ理由で始めないので、画面の案内は公開の監査にも当てはまる文にする（PL-W: 画面の言葉は「公開の画面の点検」）。
+    expect(AUTHENTICATED_RUN_SECRET_QUERY_PARAMETERS_ACTION).toContain('公開の画面の点検');
   });
 });
 

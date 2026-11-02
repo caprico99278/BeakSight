@@ -17,12 +17,13 @@ import {
 /** 前の取り消しのボタンの文言。 */
 const AMBIGUOUS_CANCEL_LABEL = 'やめる';
 
+// PL-W（設計書 `2026-10-26-beaksight-plain-ui-design.md` 5 章）: 作業の種類の呼び名を画面の言葉にした（監査 → 点検、発見 → 操作さがし、READ の確かめ → 見るだけの確かめ）。
 describe('DEF-146: the text of the stop dialogs', () => {
   it('names the kind of the job in the title and the confirm button, and the cancel does not read "やめる"', () => {
     expect(Object.keys(AUDIT_JOB_STOP_TARGET_NAMES).sort()).toEqual([...WORKER_JOB_KINDS].sort());
-    expect(AUDIT_JOB_STOP_TARGET_NAMES.DISCOVERY).toBe('発見');
-    expect(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT).toBe('監査');
-    expect(AUDIT_JOB_STOP_TARGET_NAMES.READ_CHECK).toBe('READ の確かめ');
+    expect(AUDIT_JOB_STOP_TARGET_NAMES.DISCOVERY).toBe('操作さがし');
+    expect(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT).toBe('点検');
+    expect(AUDIT_JOB_STOP_TARGET_NAMES.READ_CHECK).toBe('見るだけの確かめ');
     for (const dialog of [LOCAL_UI_AUDIT_TEXT.stopDialog, LOCAL_UI_AUDIT_TEXT.forceStopDialog]) {
       expect(dialog.cancel).toBe('止めずに戻る');
       expect(dialog.cancel).not.toBe(AMBIGUOUS_CANCEL_LABEL);
@@ -32,10 +33,10 @@ describe('DEF-146: the text of the stop dialogs', () => {
         expect(dialog.confirm(target)).not.toBe(dialog.cancel);
       }
     }
-    expect(LOCAL_UI_AUDIT_TEXT.stopDialog.title('発見')).toBe('発見を止めますか');
-    expect(LOCAL_UI_AUDIT_TEXT.stopDialog.confirm('発見')).toBe('発見を止める');
-    expect(LOCAL_UI_AUDIT_TEXT.forceStopDialog.title('発見')).toBe('発見を強制的に止めますか');
-    expect(LOCAL_UI_AUDIT_TEXT.forceStopDialog.confirm('発見')).toBe('発見を強制的に止める');
+    expect(LOCAL_UI_AUDIT_TEXT.stopDialog.title('操作さがし')).toBe('操作さがしを止めますか');
+    expect(LOCAL_UI_AUDIT_TEXT.stopDialog.confirm('操作さがし')).toBe('操作さがしを止める');
+    expect(LOCAL_UI_AUDIT_TEXT.forceStopDialog.title('操作さがし')).toBe('操作さがしを強制的に止めますか');
+    expect(LOCAL_UI_AUDIT_TEXT.forceStopDialog.confirm('操作さがし')).toBe('操作さがしを強制的に止める');
   });
 
   // T44d（Task 44 の設計書 P2-3）: 本文と、ジョブの画面の大きい止めるボタンも、ジョブの種類に合わせる（監査だけが続きから再開できる）。
@@ -49,25 +50,25 @@ describe('DEF-146: the text of the stop dialogs', () => {
       const target = AUDIT_JOB_STOP_TARGET_NAMES[kind];
       expect(LOCAL_UI_AUDIT_TEXT.job.stop(target), kind).toBe(LOCAL_UI_AUDIT_TEXT.stopDialog.confirm(target));
     }
-    expect(LOCAL_UI_AUDIT_TEXT.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT)).toBe('監査を止める');
-    expect(LOCAL_UI_AUDIT_TEXT.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.DISCOVERY)).toBe('発見を止める');
+    expect(LOCAL_UI_AUDIT_TEXT.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.AUDIT)).toBe('点検を止める');
+    expect(LOCAL_UI_AUDIT_TEXT.job.stop(AUDIT_JOB_STOP_TARGET_NAMES.DISCOVERY)).toBe('操作さがしを止める');
     // 監査は、今のページを終えてから止まり、前回の続きから再開できる。
-    expect(AUDIT_JOB_STOP_DIALOG_BODIES.AUDIT.stop).toContain('今のページの監査を終えてから止めます');
+    expect(AUDIT_JOB_STOP_DIALOG_BODIES.AUDIT.stop).toContain('今のページの点検を終えてから止めます');
     expect(AUDIT_JOB_STOP_DIALOG_BODIES.AUDIT.stop).toContain('続きから再開');
     // 監査のほかの種類は、再開しない（監査の続きからの再開の案内を書かない）。
     for (const kind of WORKER_JOB_KINDS.filter((each) => each !== 'AUDIT')) {
       for (const body of [AUDIT_JOB_STOP_DIALOG_BODIES[kind].stop, AUDIT_JOB_STOP_DIALOG_BODIES[kind].force]) {
         expect(body, kind).toContain('再開しません');
         expect(body, kind).not.toContain('続きから再開');
-        expect(body, kind).not.toContain('ページの監査');
+        expect(body, kind).not.toContain('ページの点検');
       }
     }
     // 止める要求の後の文（`AUDIT_JOB_STOP_REQUESTED_TEXTS`）も、種類ごと（監査のほかは、ページの監査の文を出さない）。
     expect(Object.keys(AUDIT_JOB_STOP_REQUESTED_TEXTS).sort()).toEqual([...WORKER_JOB_KINDS].sort());
-    expect(AUDIT_JOB_STOP_REQUESTED_TEXTS.AUDIT).toBe('止める要求を送りました。今のページの監査を終えてから止まります。');
+    expect(AUDIT_JOB_STOP_REQUESTED_TEXTS.AUDIT).toBe('止める要求を送りました。今のページの点検を終えてから止まります。');
     for (const kind of WORKER_JOB_KINDS.filter((each) => each !== 'AUDIT')) {
       expect(AUDIT_JOB_STOP_REQUESTED_TEXTS[kind], kind).toContain('止める要求を送りました。');
-      expect(AUDIT_JOB_STOP_REQUESTED_TEXTS[kind], kind).not.toContain('ページの監査');
+      expect(AUDIT_JOB_STOP_REQUESTED_TEXTS[kind], kind).not.toContain('ページの点検');
     }
     // 書き込みは、送る前なら送らない。押した後は送った結果を記録する（強制の止め方では、送ったか分からないことがある）。
     for (const kind of ['WRITE_CREATE', 'WRITE_UPDATE'] as const) {

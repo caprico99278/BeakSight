@@ -1,9 +1,12 @@
 import { useState, type ReactNode } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { HeadContent, Link, Outlet, Scripts, createRootRoute, useRouter, useRouterState, type ErrorComponentProps } from '@tanstack/react-router';
-import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_TEXT } from '../../../../src/presentation/messages.js';
+import { useServerFn } from '@tanstack/react-start';
+import { LOCAL_UI_AUDIT_TEXT, LOCAL_UI_FRAME_TEXT, LOCAL_UI_TEXT } from '../../../../src/presentation/messages.js';
 import { PageFrame } from '../components/PageFrame';
 import { UiPresence } from '../components/UiPresence';
+import type { CredentialEnvironmentState } from '../server/credential-runtime';
+import { environmentStatusFn, type EnvironmentStatusView } from '../server/profile-functions';
 import appCssUrl from '../styles/app.css?url';
 import tokensCssUrl from '../styles/tokens.css?url';
 
@@ -28,7 +31,45 @@ export const Route = createRootRoute({
 /** プロファイルの登録の画面の path。 */
 const NEW_PROFILE_PATH = '/profiles/new';
 
-/** 左のメニュー（使える画面だけ。T24f で「実行履歴」を、T43a で「新しいプロファイル」を足した）。 */
+/** 環境の状態の画面の path。 */
+const ENVIRONMENT_PATH = '/environment';
+
+/**
+ * 環境に、利用者が知るべき問題があるか（PL-V。設計書 `2026-10-26-beaksight-plain-ui-design.md` 13 章の 14）: 管理データの整合性の確かめが通らない
+ * （環境の状態の画面が誤りの知らせを出す条件）か、Windows で資格情報の暗号化を確かめられない（環境の状態の画面が「使えません」を出す状態）とき。
+ * Windows でない環境（`NOT_WINDOWS`）は、直せる問題ではなく、自動ログインを使う画面がそれぞれ理由を出すので、ここでは問題に数えない。
+ */
+const environmentNeedsAttention = (status: EnvironmentStatusView): boolean =>
+  !status.quickCheckOk || status.credentialEnvironment === UNAVAILABLE_CREDENTIAL_ENVIRONMENT;
+
+/** 資格情報の暗号化を確かめられなかった状態（`CREDENTIAL_ENVIRONMENT_STATES` の値）。 */
+const UNAVAILABLE_CREDENTIAL_ENVIRONMENT: CredentialEnvironmentState = 'UNAVAILABLE';
+
+/** 左のメニューの、環境の状態の項目（問題があるときだけ出す。状態はページを開いたときに 1 回だけ読む）。 */
+function EnvironmentProblemItem({ current }: Readonly<{ current: boolean }>) {
+  const fetchStatus = useServerFn(environmentStatusFn);
+  const status = useQuery({
+    queryKey: ['environment-status'],
+    queryFn: () => fetchStatus(),
+    staleTime: Number.POSITIVE_INFINITY,
+    retry: false,
+  });
+  if (status.data === undefined || !environmentNeedsAttention(status.data)) {
+    return null;
+  }
+  return (
+    <li>
+      <Link to={ENVIRONMENT_PATH} className="nav-link nav-link--problem" aria-current={current ? 'page' : undefined}>
+        {LOCAL_UI_FRAME_TEXT.environmentProblem}
+      </Link>
+    </li>
+  );
+}
+
+/**
+ * 左のメニュー（T24f で「実行履歴」を、T43a で「新しいプロファイル」を足した）。PL-V（13 章の 14）: サイトの一覧・サイトを足す・これまでの結果の 3 つ。
+ * 環境の状態は、問題があるときだけ出す（画面の URL は残す）。
+ */
 function Sidebar() {
   const text = LOCAL_UI_TEXT;
   const pathname = useRouterState({ select: (state) => state.location.pathname });
@@ -38,7 +79,7 @@ function Sidebar() {
   const profilesCurrent = !newProfileCurrent && (pathname === '/' || pathname.startsWith('/profiles/') || pathname.startsWith('/start/'));
   // 実行履歴と、ジョブの詳細（進み具合）の画面は、「実行履歴」のメニューに入る（T24f）。
   const jobsCurrent = pathname === '/jobs' || pathname.startsWith('/jobs/');
-  const environmentCurrent = pathname === '/environment';
+  const environmentCurrent = pathname === ENVIRONMENT_PATH;
   return (
     <nav className="sidebar" aria-label={text.navigationLabel}>
       <p className="brand">
@@ -61,11 +102,7 @@ function Sidebar() {
             {LOCAL_UI_AUDIT_TEXT.pages.jobs}
           </Link>
         </li>
-        <li>
-          <Link to="/environment" className="nav-link" aria-current={environmentCurrent ? 'page' : undefined}>
-            {text.pages.environment}
-          </Link>
-        </li>
+        <EnvironmentProblemItem current={environmentCurrent} />
       </ul>
     </nav>
   );

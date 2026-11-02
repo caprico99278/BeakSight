@@ -7,10 +7,14 @@
 //   `READ_VERIFICATION_NOT_VARYING`。FORM のシナリオ、候補の READ（結び付けで生成した値を送る）、規則が実行できない規則の集まり（ほかの理由で止まる）は
 //   null。許可の発行（`scenario-store.ts` の `issueIn`）と開始の画面が使う唯一の判定。シナリオの保存の時は規則がないので、種類だけで確かめる
 //   （`scenario-policy.ts`）。
+// - OP-REV6 の I-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.9 の R1）: `uniqueEachRunFieldNamesOf(planned)` は、実行のたびに違う値になる作り方の
+//   欄（合成の番号つきのメール・電話・番号・文字）の名前。一覧の画面には前の登録が並ぶので、一覧の画面の答え合わせの期待は、この欄に限る（人の名前・固定の一覧・
+//   辞書の値は、2 つ以上の値を作りえても、回をまたいで同じになりうる）。`readVerificationVaryingRejectionOf` は、照合の READ の定義の画面の path が `{id}` の型で
+//   ない（一覧の画面）とき、この欄で判定する。下書き（自動の下書きの選び方）、許可の発行、開始の画面、書き込みの指定の組み立てが同じ判定を使う。
 import type { ExecutionGrantRejectionReason } from '../approval/execution-grant.js';
 import { API_SCENARIO_TRANSPORT, scenarioTransportOf, type ScenarioRevision } from '../approval/scenario-contracts.js';
 import type { DiscoveryCandidate } from '../../discovery/candidate-contracts.js';
-import { hasGeneratedValueExpectation } from '../../discovery/read-check-contracts.js';
+import { hasGeneratedValueExpectation, isReadCheckPageTemplatePath } from '../../discovery/read-check-contracts.js';
 import {
   MAX_RELATION_SIDE_VALUES,
   personValueOf,
@@ -49,11 +53,23 @@ const planVaries = (plan: FieldPlan, planned: RuleSetPlan): boolean => {
     case 'EMAIL':
     case 'PHONE':
     case 'DIGIT_CODE':
+    case 'GENERIC_TEXT':
       return true;
     case 'DERIVED_TOTAL':
       return hasTwoValues(plan.pairs.map(([unit, quantity]) => multiplyDecimalIntegers(unit, quantity)));
   }
 };
+
+/** OP-REV6 の I-1: 実行のたびに違う値になる作り方（合成の番号つき）。 */
+const UNIQUE_EACH_RUN_PLAN_KINDS: ReadonlySet<FieldPlan['kind']> = new Set(['EMAIL', 'PHONE', 'DIGIT_CODE', 'GENERIC_TEXT']);
+
+/** OP-REV6 の I-1: 実行のたびに違う値になる欄の名前（判定の欄の順。凍結。ファイルの先頭の説明）。 */
+export const uniqueEachRunFieldNamesOf = (planned: RuleSetPlan): readonly string[] =>
+  Object.freeze([...planned.plans].filter(([, plan]) => UNIQUE_EACH_RUN_PLAN_KINDS.has(plan.kind)).map(([name]) => name));
+
+/** OP-REV6 の I-1: 照合の READ の定義の画面の path が、一覧の画面（`{id}` の型でない画面の path）か。 */
+export const isListPageReadTarget = (readTargetPagePath: string | null | undefined): boolean =>
+  typeof readTargetPagePath === 'string' && !isReadCheckPageTemplatePath(readTargetPagePath);
 
 /** 実行のたびに変わりうる欄の名前（判定の欄の順。凍結）。 */
 export const varyingFieldNamesOf = (planned: RuleSetPlan): readonly string[] =>
@@ -70,6 +86,8 @@ export const readVerificationVaryingRejectionOf = (
   ruleSet: RuleSetRevision,
   scenario: VaryingScenario,
   candidate: DiscoveryCandidate,
+  /** OP-REV6 の I-1: 照合の READ の定義の画面の path（画面の path の定義でなければ null）。一覧の画面なら、実行のたびに違う値になる欄で判定する。 */
+  readTargetPagePath: string | null = null,
 ): typeof READ_VERIFICATION_NOT_VARYING | null => {
   const read = scenario.verification.readVerification;
   if (scenarioTransportOf(scenario) !== API_SCENARIO_TRANSPORT || read === null || read.bindings.length > 0) {
@@ -79,7 +97,7 @@ export const readVerificationVaryingRejectionOf = (
   if (!planned.evaluation.executable) {
     return null;
   }
-  const varying = new Set(varyingFieldNamesOf(planned));
+  const varying = new Set(isListPageReadTarget(readTargetPagePath) ? uniqueEachRunFieldNamesOf(planned) : varyingFieldNamesOf(planned));
   return hasGeneratedValueExpectation(read.expectations, (expectation) => 'fieldName' in expectation && varying.has(expectation.fieldName))
     ? null
     : READ_VERIFICATION_NOT_VARYING;

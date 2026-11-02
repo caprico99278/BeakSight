@@ -943,6 +943,17 @@ export const readLfTypeScriptFilesUnder = (directories: readonly string[]): read
 /** リポジトリの根からの相対のパスの 1 つのファイルを読み、改行を LF にそろえる（TypeScript の外のファイル（`.mjs`・`package.json` など）も読む）。 */
 export const readLfTextFile = (path: string): string => readFileSync(join(REPOSITORY_ROOT, path), 'utf8').replaceAll('\r\n', '\n');
 
+/**
+ * PL-2（画面の CSS の色の値の Gate）: リポジトリの根からの相対のフォルダの下の、拡張子が `extension` に当たるファイル（TypeScript の外のファイル。`.css`
+ * など）を、1 回だけ列挙して読み込み、改行を LF にそろえる。パスは `<フォルダ>/<相対パス>`（区切りは `/`）、並びは名前の順。
+ */
+export const readLfFilesUnder = (directory: string, extension: RegExp): readonly UnscannedFile[] =>
+  readdirSync(join(REPOSITORY_ROOT, directory), { recursive: true, encoding: 'utf8' })
+    .map((relativePath) => relativePath.replaceAll('\\', '/'))
+    .filter((relativePath) => extension.test(relativePath))
+    .sort()
+    .map((relativePath) => ({ path: `${directory}/${relativePath}`, content: readLfTextFile(`${directory}/${relativePath}`) }));
+
 /** 画面のフォルダ（`apps/local-ui/`）。 */
 export const LOCAL_UI_APP_DIRECTORY = 'apps/local-ui/';
 /** 画面のフォルダの中の、読まないフォルダ（ビルドの出力と依存）。 */

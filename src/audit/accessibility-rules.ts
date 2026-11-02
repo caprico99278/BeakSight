@@ -105,7 +105,7 @@ const violationDrafts = ({ ruleId, violation, evidenceId }: ViolationDraftSpec):
  * axe の `incomplete`（判定できなかったもの）は Finding にしない。収集が `PARTIAL` でも、記録された violation は Finding にする。
  */
 const axeViolationRule = (
-  rule: Pick<AuditRule, 'ruleId' | 'ruleIdPrefix' | 'severity'>,
+  rule: Pick<AuditRule, 'ruleId' | 'ruleIdPrefix' | 'severity' | 'plainMessage'>,
   ruleIdFor: (axeRuleId: string) => string | null,
 ): AuditRule => ({
   ...rule,
@@ -128,11 +128,21 @@ const axeViolationRule = (
 /** アクセシビリティの page rule（axe の結果の対応づけ。T12c）の一覧。登録は `RULE_CATALOG`（`./rule-catalog.ts`）がまとめて行う。 */
 export const ACCESSIBILITY_RULES: readonly AuditRule[] = Object.freeze([
   axeViolationRule(
-    { ruleId: 'COLOR_CONTRAST_VIOLATION', severity: UNKNOWN_IMPACT_SEVERITY },
+    {
+      ruleId: 'COLOR_CONTRAST_VIOLATION',
+      severity: UNKNOWN_IMPACT_SEVERITY,
+      plainMessage: '文字の色と後ろの色の差が小さく、文字が読みにくいところがあります。',
+    },
     (axeRuleId) => (axeRuleId === AXE_COLOR_CONTRAST_RULE_ID ? 'COLOR_CONTRAST_VIOLATION' : null),
   ),
   axeViolationRule(
-    { ruleId: 'A11Y_AXE', ruleIdPrefix: AXE_VIOLATION_RULE_ID_PREFIX, severity: UNKNOWN_IMPACT_SEVERITY },
+    {
+      ruleId: 'A11Y_AXE',
+      ruleIdPrefix: AXE_VIOLATION_RULE_ID_PREFIX,
+      severity: UNKNOWN_IMPACT_SEVERITY,
+      // OP-R2: 評価のたびに ruleId を作る Rule なので、種類（アクセシビリティ）の 1 つの文で、この群のすべての ruleId を受ける。
+      plainMessage: '体の不自由な人や、読み上げのソフトを使う人にとって、使いにくいところがあります。',
+    },
     (axeRuleId) => axeViolationFindingRuleIdOf(axeRuleId),
   ),
 ]);

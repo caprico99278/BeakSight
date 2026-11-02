@@ -12,7 +12,7 @@ import type { ScenarioRevision } from '../../src/control/approval/scenario-contr
 import { validateScenarioDraft } from '../../src/control/approval/scenario-policy.js';
 import { planRuleSet } from '../../src/control/data-rules/field-evaluation.js';
 import type { FieldRule } from '../../src/control/data-rules/rule-contracts.js';
-import { readVerificationVaryingRejectionOf, varyingFieldNamesOf } from '../../src/control/data-rules/varying-values.js';
+import { readVerificationVaryingRejectionOf, uniqueEachRunFieldNamesOf, varyingFieldNamesOf } from '../../src/control/data-rules/varying-values.js';
 import { apiRequestShapeOf } from '../../src/core/api-request-shape.js';
 import type { DiscoveryCandidate } from '../../src/discovery/candidate-contracts.js';
 import { hasGeneratedValueExpectation } from '../../src/discovery/read-check-contracts.js';
@@ -66,7 +66,7 @@ const apiScenarioOf = (readCheckId: string, bindings: readonly Record<string, st
     sideEffectConfirmations: ALL_CONFIRMED,
     limits: { maxCreatesPerRun: 1, maxCumulativeCreates: 20 },
     approvalTtlDays: 30,
-    verification: { successCondition: null, inputErrorCondition: null, recordId: null, readVerification: { readCheckId, revision: 1, bindings, expectations } },
+    verification: { resultJudgement: null, recordId: null, readVerification: { readCheckId, revision: 1, bindings, expectations } },
     api: { shapeDigest: CANDIDATE.submissionProbe?.shapeDigest, pageKeys: [], filterName: null, recordId: { source: 'RESPONSE_BODY_KEY', key: 'id' }, ledger: null },
   }, CANDIDATE, READ_FACTS, { scenarioId: null, scenarios: [], approvedServiceOrigins: [API], profileRevisions: { discoveryJob: 2, current: 2 } });
   if (!result.ok) {
@@ -101,8 +101,9 @@ describe('T40R2-fix M-1: which fields vary from run to run', () => {
 
 describe('T40R2-fix M-1: the expectation of a READ without a value to send must compare with a varying value', () => {
   it('adds the grant rejection reason with its description', () => {
-    // T41b: その後ろに、API の更新の台帳の結び付けの理由を足した（`api-update-grant-start.test.ts`）。
-    expect(EXECUTION_GRANT_REJECTION_REASONS.at(-2)).toBe('READ_VERIFICATION_NOT_VARYING');
+    // T41b: その後ろに、API の更新の台帳の結び付けの理由を足した（`api-update-grant-start.test.ts`）。MI-F1: さらに後ろに、副作用の確認の済んでいない版の
+    // 理由を足した。
+    expect(EXECUTION_GRANT_REJECTION_REASONS.at(-3)).toBe('READ_VERIFICATION_NOT_VARYING');
     expect(EXECUTION_GRANT_REJECTION_DESCRIPTIONS.READ_VERIFICATION_NOT_VARYING.description.length).toBeGreaterThan(0);
   });
 
@@ -129,5 +130,31 @@ describe('T40R2-fix M-1: the expectation of a READ without a value to send must 
     expect(hasGeneratedValueExpectation([TEXT_OF('email')], () => true)).toBe(true);
     expect(hasGeneratedValueExpectation([ONE_ROW], () => true)).toBe(false);
     expect(hasGeneratedValueExpectation([TEXT_OF('email')])).toBe(true);
+  });
+});
+
+// OP-REV6 の I-1（設計書 4.1.9 の R1）: 一覧の画面には前の登録が並ぶので、一覧の画面の答え合わせの期待は、毎回違う値になる作り方の欄（合成の番号つきのメール・電話・
+// 番号・文字）に限る。人の名前・固定の一覧・辞書の値は、2 つ以上の値を作りえても、回をまたいで同じになりうるので使わない。
+describe('OP-REV6 I-1: the expectation of a list page READ must compare with a value unique to each run', () => {
+  const LIST_PATH = '/admin/members';
+  const TEMPLATE_PATH = '/admin/members/{id}';
+
+  it('tells the fields whose value is unique to each run (the generated email, not the person name nor a fixed list)', () => {
+    const scenario = apiScenarioOf('rc-page', [], [TEXT_OF('email')]);
+    const uniqueOf = (rules: readonly FieldRule[]) => [...uniqueEachRunFieldNamesOf(planRuleSet(ruleSetFor(scenario, rules), scenario, CANDIDATE))].sort();
+    expect(uniqueOf([SCORE_RANGE])).toEqual(['email']);
+    expect(uniqueOf([SCORE_RANGE, fixed('name', ['試験 太郎', '試験 次郎']), EMAIL_ONE_VALUE])).toEqual([]);
+  });
+
+  it.each<readonly [string, Expectations, readonly FieldRule[], string | null, string | null]>([
+    ['a text of a person name on the list page', [TEXT_OF('name')], [SCORE_RANGE], LIST_PATH, 'READ_VERIFICATION_NOT_VARYING'],
+    ['a text of a varying fixed list on the list page', [TEXT_OF('name')], [SCORE_RANGE, fixed('name', ['試験 太郎', '試験 次郎'])], LIST_PATH,
+      'READ_VERIFICATION_NOT_VARYING'],
+    ['a text of a generated email on the list page', [TEXT_OF('email')], [SCORE_RANGE], LIST_PATH, null],
+    ['a text of a person name on the {id} page (as before)', [TEXT_OF('name')], [SCORE_RANGE], TEMPLATE_PATH, null],
+    ['a text of a person name without the page path (as before)', [TEXT_OF('name')], [SCORE_RANGE], null, null],
+  ])('judges %s', (_label, expectations, rules, path, reason) => {
+    const scenario = apiScenarioOf('rc-page', [], expectations);
+    expect(readVerificationVaryingRejectionOf(ruleSetFor(scenario, rules), scenario, CANDIDATE, path)).toBe(reason);
   });
 });

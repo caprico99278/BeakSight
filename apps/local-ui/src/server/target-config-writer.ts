@@ -13,7 +13,8 @@
  * - 片付け（`removeWrittenTargetConfig`）: ファイルを書いた後にプロファイルの保存が失敗したときに呼ぶ。書いた中身と同じときだけ消す（ほかの
  *   誰かが書き換えた中身は消さない。途中にリンクがあれば消さない）。消せなくても誤りにしない（呼び出し側は保存の失敗を返す）。
  * - 流れ（`createProfileWithGeneratedTarget`。T43b fix round 1 で `profile-functions.ts` から移し、部品を渡して確かめられるようにした）:
- *   0. 名前が Windows の予約名なら、`TARGET_CONFIG_NAME_RESERVED`（T43R-fix-D の M-6）。
+ *   0. 名前が Windows の予約名なら、`TARGET_CONFIG_NAME_RESERVED`（T43R-fix-D の M-6）。PL-U（14.1 の U7）: 作成の流れ（`createProfileFromRequest`）は、
+ *      その前に番号を付けた名前にする（`withFileNameNotReserved`）ので、ここの拒否は、この関数を直接呼んだときの守りとしてだけ残る。
  *   1. パスはプロファイルの ID から決まる固定の形だけ（ID の形に合わなければ、ファイルを作らずに `PROFILE_ID_INVALID`）。
  *   2. 書く前に、中身を `validateConfig` に通し、その設定を文脈にしてプロファイルを `validateSiteProfile` で確かめ、同じ名前のプロファイルが
  *      ないことを確かめる（書いた後に保存が失敗する場合を減らす）。
@@ -29,6 +30,8 @@ import { targetConfigTextWithoutByteOrderMark, targetConfigWithDefaultsOf } from
 import {
   effectiveConfigInputOf,
   isReservedTargetConfigName,
+  startsAtSameUrl,
+  startUrlOriginOf,
   TARGET_CRAWL_LIMIT_FIELDS,
   targetConfigDocumentOf,
   targetSiteProblemsOf,
@@ -47,11 +50,13 @@ import { errorCodeOf } from '../../../../src/core/errors.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../../../src/core/guards.js';
 import { MAX_CRAWL_MAX_PAGES } from '../../../../src/core/limits.js';
 import { temporaryPathFor } from '../../../../src/core/temporary-file-name.js';
-import type { ProfileValidationErrorCode } from '../../../../src/control/contracts.js';
+import { ENVIRONMENT_KINDS, type EnvironmentKind, type ProfileValidationErrorCode } from '../../../../src/control/contracts.js';
+import { TEST_ORIGIN_MODES, environmentAcceptsEvidence } from '../../../../src/control/profile-combinations.js';
 import { isAcceptedTargetConfigPath, validateSiteProfile, type ProfileValidationContext } from '../../../../src/control/profile-policy.js';
 import type { ProfileContextResolver, ProfileStoreResult } from '../../../../src/control/store/profile-store.js';
 import { LOCAL_TARGET_CONFIG_DIRECTORY, TARGET_CONFIG_EXTENSION } from '../../../../src/control/target-config-locations.js';
-import { generatedTargetConfigPathOf } from '../display/start-url-draft';
+import { generatedTargetConfigPathOf, profileIdSuggestionOf, uniqueProfileIdOf } from '../display/start-url-draft';
+import { isolationUnverifiedEvidenceRefOf } from './isolation-evidence-ref';
 
 /** 名前がもうある（ハードリンクの失敗のコード）。 */
 const ALREADY_EXISTS = 'EEXIST';
@@ -474,4 +479,199 @@ export const createProfileWithGeneratedTarget = async (
     await removeWrittenTargetConfig(root, targetConfigPath, prepared.content);
     throw error;
   }
+};
+
+// ---------------------------------------------------------------------------------------------------------------
+// MI-1（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.2 の「隠す値」の表、6 章の受け入れ条件 1）: 作成の画面は、開始の URL と
+// 使い方の 2 択（と隔離の扱い）だけを送り、利用者が「詳しい設定」で直さなかった値の項目を送らない。送らなかった項目を、ここだけで決める（画面と
+// サーバの 2 か所に同じ判断を書かない）:
+// - 名前（`profileId` がない）: 開始の URL（なければ、使う設定のファイルの開始の URL）からの案（`profileIdSuggestionOf`）。既にあるプロファイルの名前と
+//   重なれば `-2`、`-3`…を付ける（`uniqueProfileIdOf`）。新しくファイルを作るときは、作るファイルの名前が候補に既にある名前も使わない。
+// - 設定のファイル: MI-C（MI-1 の報告。設計者の判断）で、選び方を入力の明示の項目（スキーマ `ui-profile-create` の `targetChoice`。ここでは
+//   `ProfileTargetRequest`）にした（`targetConfigPath` の項目を「新しく作る」の印に使わない）。
+//   - `AUTO`（作成の画面の既定）: 候補（`targetConfigCandidates`。作成の画面の選択肢と同じ集め方）のうち、開始の URL の Origin を `site.allowedOrigins`
+//     に含み、かつ `site.startUrl` が入れた開始の URL と一致する（監査の開始と同じ正規化。`startsAtSameUrl`）ファイルがちょうど 1 つあれば、
+//     それを使う（ファイルを作らない・書き換えない）。2 つ以上なら保存せずに `TARGET_AMBIGUOUS`。Origin が同じファイルはあるが、開始の URL が一致する
+//     ものがないときは、新しいファイルを作らずに `TARGET_START_URL_MISMATCH`（同じ Origin のファイルを候補に返す。どちらも詳しい設定で選んでもらう）。
+//     Origin が同じファイルがなければ、今どおり新しく作る（`createProfileWithGeneratedTarget`）。
+//   - `NEW`（詳しい設定）: いつも新しく作る。`EXISTING`（詳しい設定・編集）: `profile.targetConfigPath` のファイルを使う。
+// - テスト環境の Origin（`approvedTestOrigins` がない）: テスト環境のモード（`TEST_ORIGIN_MODES`）なら、新しく作るときは許可 Origin を写し、既にある
+//   ファイルを使うときは、そのファイルの許可 Origin のうち開始の URL の Origin（開始の URL がなければ、ファイルの開始の URL の Origin）。ほかのモードは空。
+// - 環境の証跡の参照（`environmentEvidenceRef` がない）: テスト環境（`environmentAcceptsEvidence`）なら、保存した日の隔離が未確認の参照
+//   （`isolationUnverifiedEvidenceRefOf`）。公開の環境は `null`。
+// - 承認したサービスの Origin の項目は作らない（手動のログインの観察だけが足す。送られた項目はそのまま検証に回す）。
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 作成の流れに渡す部品（本番は `profile-functions.ts` が組み立てる）。 */
+export interface ProfileCreationDependencies extends GeneratedTargetProfileDependencies {
+  /** 今あるプロファイルの名前（取り消したものを含む。名前の案の重なりを避ける）。 */
+  readonly profileIds: () => readonly string[];
+  /** 設定のファイルの候補（`target-config.ts` の `targetConfigCandidatesIn`。作成の画面の選択肢と同じ集め方）。 */
+  readonly targetConfigCandidates: () => readonly string[];
+  /** 今の時刻（隔離が未確認の参照の日付）。 */
+  readonly now: () => Date;
+}
+
+/**
+ * MI-C: 対象の設定の選び方（スキーマ `ui-profile-create` の `targetChoice` の値。省略は `EXISTING`）。作成の画面の選択肢（`ProfileForm.tsx` の
+ * `TargetSource`）も、この型を使う。
+ */
+export type ProfileTargetChoice = 'AUTO' | 'NEW' | 'EXISTING';
+
+/** MI-C: 作成の入力の、対象の設定の選び方（開始の URL から決める選び方だけが、開始の URL と許可 Origin を持つ）。 */
+export type ProfileTargetRequest =
+  | { readonly choice: Exclude<ProfileTargetChoice, 'EXISTING'>; readonly site: TargetSiteInput }
+  | { readonly choice: 'EXISTING' };
+
+/** 作成の流れの結果（新しく作る流れの結果に、設定のファイルが 1 つに決まらなかったことを足したもの）。 */
+export type ProfileCreationOutcome =
+  | GeneratedTargetProfileOutcome
+  /** 開始の URL の Origin を許可 Origin に含み、開始の URL も一致するファイルが 2 つ以上あった（何も保存しない。候補のパスを名前の順で返す）。 */
+  | { readonly kind: 'TARGET_AMBIGUOUS'; readonly candidates: readonly string[] }
+  /** MI-C: 開始の URL の Origin を許可 Origin に含むファイルはあるが、どれも別の開始の URL だった（何も保存しない。そのファイルを名前の順で返す）。 */
+  | { readonly kind: 'TARGET_START_URL_MISMATCH'; readonly candidates: readonly string[] };
+
+/** 読めた設定のファイル（パスと、`loadConfig` で読んだ文脈）。 */
+interface ReadTargetConfig {
+  readonly path: string;
+  readonly context: ProfileValidationContext;
+}
+
+/** 入力に項目がないか（送らなかった項目は、この流れが決める）。 */
+const lacks = (input: Readonly<Record<string, unknown>>, key: string): boolean => input[key] === undefined;
+
+/** 開始の URL の Origin を許可 Origin に含む、読める設定のファイル（候補の順）。読めないファイルは候補にしない。 */
+const targetConfigsAllowing = async (origin: string, dependencies: ProfileCreationDependencies): Promise<readonly ReadTargetConfig[]> => {
+  const found: ReadTargetConfig[] = [];
+  for (const path of dependencies.targetConfigCandidates()) {
+    const { context } = await dependencies.loadContext(path);
+    if (context !== undefined && context.targetConfig.site.allowedOrigins.includes(origin)) {
+      found.push({ path, context });
+    }
+  }
+  return found;
+};
+
+/** 使う設定のファイルの、テスト環境の Origin の案（開始の URL の Origin がファイルの許可 Origin にあればそれ、なければファイルの開始の URL の Origin）。 */
+const testOriginOfExisting = (context: ProfileValidationContext, startUrl: string | undefined): readonly string[] => {
+  const origin = startUrl === undefined ? undefined : startUrlOriginOf(startUrl);
+  if (origin !== undefined && context.targetConfig.site.allowedOrigins.includes(origin)) {
+    return [origin];
+  }
+  const fileOrigin = startUrlOriginOf(context.targetConfig.site.startUrl);
+  return fileOrigin === undefined ? [] : [fileOrigin];
+};
+
+/** 送らなかった項目を決めるための事実。 */
+interface CompletionFacts {
+  /** 名前の案の元の URL。 */
+  readonly suggestionUrl: string | undefined;
+  /** 使えない名前。 */
+  readonly takenIds: ReadonlySet<string>;
+  /** テスト環境のモードのときの、テスト環境の Origin。 */
+  readonly testOrigins: readonly string[];
+  readonly now: Date;
+}
+
+/** 送らなかった項目を決めた入力（名前・テスト環境の Origin・環境の証跡の参照）。ほかの項目は、送られたまま。 */
+const completedInputOf = (input: Readonly<Record<string, unknown>>, facts: CompletionFacts): Readonly<Record<string, unknown>> => {
+  const { mode, environment } = input;
+  const testMode = TEST_ORIGIN_MODES.some((candidate) => candidate === mode);
+  const testEnvironment = ENVIRONMENT_KINDS.some((kind) => kind === environment) && environmentAcceptsEvidence(environment as EnvironmentKind);
+  return {
+    ...input,
+    ...(lacks(input, 'profileId')
+      ? { profileId: uniqueProfileIdOf(facts.suggestionUrl === undefined ? '' : profileIdSuggestionOf(facts.suggestionUrl), facts.takenIds) }
+      : {}),
+    ...(lacks(input, 'approvedTestOrigins') ? { approvedTestOrigins: testMode ? [...facts.testOrigins] : [] } : {}),
+    ...(lacks(input, 'environmentEvidenceRef')
+      ? { environmentEvidenceRef: testEnvironment ? isolationUnverifiedEvidenceRefOf(facts.now) : null }
+      : {}),
+  };
+};
+
+/** 作るファイルの名前（`local/targets/<名前>.json`）が候補に既にある名前（新しく作るときは、その名前も使わない）。 */
+const generatedFileIdsOf = (candidates: readonly string[]): readonly string[] =>
+  candidates.flatMap((path) => {
+    const id = path.slice(LOCAL_TARGET_CONFIG_DIRECTORY.length, -TARGET_CONFIG_EXTENSION.length);
+    return path.startsWith(LOCAL_TARGET_CONFIG_DIRECTORY) && generatedTargetConfigPathOf(id) === path ? [id] : [];
+  });
+
+/**
+ * PL-U（設計書 `doc/design/2026-10-26-beaksight-plain-ui-design.md` 14.1 の U7）: 作るファイルの名前（＝名前）が Windows の予約名に当たるときは、拒まずに
+ * 番号を付けた名前にする（作成の画面に名前の欄はないので、「別の名前にしてから」と言わない）。番号の付け方と予約名の判定は、名前の案の部品
+ * `uniqueProfileIdOf`（予約名の判定は `isReservedTargetConfigName` の 1 か所）。予約名でない名前は、送られたまま（重なりは今どおり拒む）。
+ */
+const withFileNameNotReserved = (input: Readonly<Record<string, unknown>>, takenIds: ReadonlySet<string>): Readonly<Record<string, unknown>> => {
+  const { profileId } = input;
+  return typeof profileId === 'string' && isReservedTargetConfigName(profileId) ? { ...input, profileId: uniqueProfileIdOf(profileId, takenIds) } : input;
+};
+
+/** 新しく作る（送らなかった項目を決めてから、今の流れ `createProfileWithGeneratedTarget` に渡す）。 */
+const createWithGeneratedTarget = (
+  input: Readonly<Record<string, unknown>>,
+  site: TargetSiteInput,
+  dependencies: ProfileCreationDependencies,
+): Promise<GeneratedTargetProfileOutcome> => {
+  const takenIds = new Set([...dependencies.profileIds(), ...generatedFileIdsOf(dependencies.targetConfigCandidates())]);
+  const completed = completedInputOf(input, { suggestionUrl: site.startUrl, takenIds, testOrigins: site.allowedOrigins, now: dependencies.now() });
+  return createProfileWithGeneratedTarget(withFileNameNotReserved(completed, takenIds), site, dependencies);
+};
+
+/** 既にある設定のファイルを使って保存する（ファイルを作らない・書き換えない）。 */
+const saveWithExistingTarget = (
+  input: Readonly<Record<string, unknown>>,
+  target: ReadTargetConfig,
+  startUrl: string | undefined,
+  dependencies: ProfileCreationDependencies,
+): ProfileCreationOutcome => {
+  const completed = completedInputOf(input, {
+    suggestionUrl: startUrl ?? target.context.targetConfig.site.startUrl,
+    takenIds: new Set(dependencies.profileIds()),
+    testOrigins: testOriginOfExisting(target.context, startUrl),
+    now: dependencies.now(),
+  });
+  const profile = { ...completed, targetConfigPath: target.path };
+  const result = dependencies.saveProfile(profile, (path) => (path === target.path ? target.context : undefined));
+  return { kind: 'SAVED', result, configError: null, removedAfterFailure: false };
+};
+
+/**
+ * MI-1: 作成の画面の入力（`profile` と、対象の設定の選び方 `target`）から、プロファイルを作る（送らなかった項目は、この流れが決める。上の説明）。
+ * 詳しい設定で「すでにある設定のファイルを使う」を選んだ入力（`EXISTING`）で、そのファイルを読めなければ、文脈なしで保存の部品に渡す
+ * （保存の部品が今どおり拒み、設定の誤りの種類を返す）。
+ */
+export const createProfileFromRequest = async (
+  input: Readonly<Record<string, unknown>>,
+  target: ProfileTargetRequest,
+  dependencies: ProfileCreationDependencies,
+): Promise<ProfileCreationOutcome> => {
+  if (target.choice === 'EXISTING') {
+    const path = input['targetConfigPath'];
+    const reading = typeof path === 'string' ? await dependencies.loadContext(path) : { context: undefined, configError: null };
+    if (typeof path !== 'string' || reading.context === undefined) {
+      const result = dependencies.saveProfile(input, () => undefined);
+      return { kind: 'SAVED', result, configError: reading.configError, removedAfterFailure: false };
+    }
+    return saveWithExistingTarget(input, { path, context: reading.context }, undefined, dependencies);
+  }
+  const { site } = target;
+  if (target.choice === 'NEW') {
+    return createWithGeneratedTarget(input, site, dependencies);
+  }
+  const origin = startUrlOriginOf(site.startUrl);
+  const sameOrigin = origin === undefined ? [] : await targetConfigsAllowing(origin, dependencies);
+  if (sameOrigin.length === 0) {
+    return createWithGeneratedTarget(input, site, dependencies);
+  }
+  // MI-C: 開始の URL の比べ方は `src/config/target-config-draft.ts` の `startsAtSameUrl`（監査の開始と同じ正規化。画面のサーバは src/crawl を直接読まない）。
+  const matches = sameOrigin.filter((candidate) => startsAtSameUrl(candidate.context.targetConfig, site.startUrl));
+  const [only, ...others] = matches;
+  if (only === undefined) {
+    return { kind: 'TARGET_START_URL_MISMATCH', candidates: sameOrigin.map((candidate) => candidate.path) };
+  }
+  if (others.length > 0) {
+    return { kind: 'TARGET_AMBIGUOUS', candidates: matches.map((match) => match.path) };
+  }
+  return saveWithExistingTarget(input, only, site.startUrl, dependencies);
 };

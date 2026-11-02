@@ -15,14 +15,20 @@ import { isConfigError } from '../../../src/config/config-error.js';
 import { loadConfig } from '../../../src/config/load-config.js';
 import { closeControlDatabase, openControlDatabase, type ControlDatabase } from '../../../src/control/store/control-database.js';
 import { resolveControlDatabasePath } from '../../../src/control/store/database-path.js';
-import { createProfile, getProfile } from '../../../src/control/store/profile-store.js';
+import { createProfile, getProfile, listProfiles } from '../../../src/control/store/profile-store.js';
+import { targetConfigCandidatesIn } from '../src/server/target-config';
 import {
+  createProfileFromRequest,
   createProfileWithGeneratedTarget,
   prepareGeneratedTargetConfig,
   removeWrittenTargetConfig,
   writeNewTargetConfig,
   type GeneratedTargetProfileDependencies,
+  type ProfileCreationDependencies,
+  type ProfileTargetRequest,
 } from '../src/server/target-config-writer';
+import type { TargetSiteInput } from '../../../src/config/target-config-draft.js';
+import { ISOLATION_UNVERIFIED_EVIDENCE_REF_PREFIX } from '../src/server/isolation-evidence-ref';
 
 const roots: string[] = [];
 
@@ -331,5 +337,232 @@ describe('T43R-fix-D (M-6): the place of the file must not be a reparse point (j
     } finally {
       closeControlDatabase(database);
     }
+  });
+});
+
+// MI-1（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.2 の「隠す値」の表、6 章の受け入れ条件 1）: 作成の画面が開始の URL と使い方の
+// 2 択だけを送ったとき、隠す値（名前、設定のファイル、テスト環境の Origin、隔離が未確認の参照）を、サーバの作成の流れが決める。承認したサービスの Origin の
+// 項目は作らない。作成の画面の「詳しい設定」で直した値（送った項目）は、そのまま使う。
+describe('MI-1: creating a profile from the start URL and the usage only', () => {
+  const START_ORIGIN = 'https://example.test';
+  /** 表示の時間帯（Asia/Tokyo）では 2026-10-26、UTC では 2026-10-25 の時刻（参照の日付は保存した日の表示の日付）。 */
+  const SAVED_AT = new Date('2026-10-25T20:00:00Z');
+  // MI-F3（MI-R の Minor 12）: 接頭辞は形の owner の定数から作る。日付の部分は、保存した時刻（`SAVED_AT`）の表示の時間帯の日付の期待の値（作成の流れが
+  // 日付の関数 `isolationUnverifiedEvidenceRefOf` で作ることを確かめるので、期待をその関数で作らない）。
+  const UNVERIFIED_REF = `${ISOLATION_UNVERIFIED_EVIDENCE_REF_PREFIX}20261026`;
+  let root = '';
+  let database: ControlDatabase | undefined;
+
+  /** 使い方の 2 択だけを決めた入力（名前・設定のファイル・テスト環境の Origin・参照を送らない）。 */
+  const usageInput = (usage: 'TEST' | 'PUBLIC', overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    schemaVersion: 'beaksight-profile/1',
+    revision: 1,
+    ...(usage === 'TEST'
+      ? { environment: 'TEST', mode: 'TEST_AUTH_PASSIVE', auth: 'MANUAL_SESSION' }
+      : { environment: 'PUBLIC', mode: 'PUBLIC_PASSIVE', auth: 'NONE' }),
+    ...overrides,
+  });
+
+  /** MI-C: 自動の選び方（作成の画面の既定）。対象の設定の選び方は、入力の明示の項目（`targetChoice`）で決まる。 */
+  const auto = (site: TargetSiteInput): ProfileTargetRequest => ({ choice: 'AUTO', site });
+
+  const openStore = (): ControlDatabase => {
+    database = openControlDatabase(resolveControlDatabasePath(root));
+    return database;
+  };
+
+  /** 本物の保存の部品と、`loadConfig` で読む文脈と、一時の root の設定のファイルの候補（画面のサーバと同じ集め方）。 */
+  const creationDependenciesOf = (store: ControlDatabase, overrides: Partial<ProfileCreationDependencies> = {}): ProfileCreationDependencies => ({
+    root,
+    profileExists: (profileId) => getProfile(store, profileId) !== null,
+    loadContext: async (targetConfigPath) => {
+      try {
+        return { context: { targetConfig: await loadConfig(join(root, targetConfigPath)) }, configError: null };
+      } catch (error) {
+        if (isConfigError(error)) {
+          return { context: undefined, configError: error.kind };
+        }
+        throw error;
+      }
+    },
+    saveProfile: (profile, resolveContext) => createProfile(store, profile, { resolveContext }),
+    profileIds: () => listProfiles(store).map((stored) => stored.profile.profileId),
+    targetConfigCandidates: () => targetConfigCandidatesIn(root),
+    now: () => SAVED_AT,
+    ...overrides,
+  });
+
+  /** 一時の root に、すでにある設定のファイルを置く（中身を返す）。 */
+  const writeExistingTarget = (path: string, startUrl: string, allowedOrigins: readonly string[]): string => {
+    const content = `${JSON.stringify({ target: { id: 'existing' }, site: { startUrl, allowedOrigins } })}\n`;
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), content, 'utf8');
+    return content;
+  };
+
+  afterEach(() => {
+    if (database !== undefined) {
+      closeControlDatabase(database);
+      database = undefined;
+    }
+  });
+
+  it('saves a test profile with the suggested name, the generated file, the test origin and the unverified reference', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    const outcome = await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store));
+    expect(outcome).toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    const saved = getProfile(store, 'example-test')?.profile;
+    expect(saved).toMatchObject({
+      profileId: 'example-test',
+      targetConfigPath: PATH,
+      environment: 'TEST',
+      mode: 'TEST_AUTH_PASSIVE',
+      auth: 'MANUAL_SESSION',
+      approvedTestOrigins: [START_ORIGIN],
+      environmentEvidenceRef: UNVERIFIED_REF,
+    });
+    // 承認したサービスの Origin の項目は作らない（手動のログインの観察だけが足す）。
+    expect(saved === undefined ? true : Object.hasOwn(saved, 'approvedServiceOrigins')).toBe(false);
+    expect(existsSync(join(root, PATH))).toBe(true);
+  });
+
+  it('copies all the allowed origins of a new file to the test origins, and keeps a public profile without them', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    const twoOrigins = { startUrl: SITE.startUrl, allowedOrigins: [START_ORIGIN, 'https://static.example.test'] };
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(twoOrigins), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'example-test')?.profile.approvedTestOrigins).toEqual(twoOrigins.allowedOrigins);
+
+    const publicSite = { startUrl: 'https://shop.example.test/', allowedOrigins: ['https://shop.example.test'] };
+    expect(await createProfileFromRequest(usageInput('PUBLIC'), auto(publicSite), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'shop-example-test')?.profile).toMatchObject({ approvedTestOrigins: [], environmentEvidenceRef: null });
+  });
+
+  it('uses the one existing file that allows the start origin and starts at the same URL, without creating or changing any file', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    const existingPath = 'config/targets/shop.json';
+    // MI-C: ファイルの開始の URL は、入れた開始の URL と、監査の開始と同じ正規化（`normalizeUrl`。追跡の引数を外す）で一致する。
+    const content = writeExistingTarget(existingPath, `${SITE.startUrl}?utm_source=mail`, ['https://cdn.example.test', START_ORIGIN]);
+    // 開始の Origin を含まないファイルと、読めないファイルは、候補にしない。
+    const otherContent = writeExistingTarget('local/targets/other.json', 'https://other.example.test/', ['https://other.example.test']);
+    writeFileSync(join(root, 'local/targets/broken.json'), '{ not json\n', 'utf8');
+
+    const outcome = await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store));
+    expect(outcome).toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'example-test')?.profile).toMatchObject({
+      targetConfigPath: existingPath,
+      // テスト環境の Origin は、そのファイルの許可 Origin のうち、開始の URL の Origin。
+      approvedTestOrigins: [START_ORIGIN],
+      environmentEvidenceRef: UNVERIFIED_REF,
+    });
+    // 新しい名前のファイルを作らない。すでにあるファイルの中身を書き換えない。
+    expect(existsSync(join(root, PATH))).toBe(false);
+    expect(readFileSync(join(root, existingPath), 'utf8')).toBe(content);
+    expect(readFileSync(join(root, 'local/targets/other.json'), 'utf8')).toBe(otherContent);
+    expect(readdirSync(join(root, 'local/targets')).sort()).toEqual(['broken.json', 'other.json']);
+  });
+
+  it('stops with the reason when two or more existing files allow the start origin and start at the same URL, and saves nothing', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    writeExistingTarget('config/targets/shop.json', SITE.startUrl, [START_ORIGIN]);
+    writeExistingTarget('local/targets/shop-copy.json', SITE.startUrl, [START_ORIGIN]);
+    // 開始の URL が違うファイルは、候補に入れない。
+    writeExistingTarget('local/targets/shop-top.json', 'https://example.test/top/', [START_ORIGIN]);
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store))).toEqual({
+      kind: 'TARGET_AMBIGUOUS',
+      candidates: ['config/targets/shop.json', 'local/targets/shop-copy.json'],
+    });
+    expect(listProfiles(store)).toEqual([]);
+    expect(existsSync(join(root, PATH))).toBe(false);
+  });
+
+  // MI-C（MI-1 の報告。設計者の判断）: 自動の選び方で既存のファイルを使うのは、開始の URL も一致するときだけ。同じ Origin のファイルがあるのに開始の URL が
+  // 一致しないときは、新しいファイルを作らずに止め、理由と候補（同じ Origin のファイル）を返す。
+  it('stops without creating a file when the files of the same origin start at another URL, and gives them as the candidates', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    const topContent = writeExistingTarget('config/targets/shop.json', 'https://example.test/', [START_ORIGIN]);
+    writeExistingTarget('local/targets/shop-top.json', 'https://example.test/top/', ['https://cdn.example.test', START_ORIGIN]);
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store))).toEqual({
+      kind: 'TARGET_START_URL_MISMATCH',
+      candidates: ['config/targets/shop.json', 'local/targets/shop-top.json'],
+    });
+    expect(listProfiles(store)).toEqual([]);
+    expect(existsSync(join(root, PATH))).toBe(false);
+    expect(readFileSync(join(root, 'config/targets/shop.json'), 'utf8')).toBe(topContent);
+    expect(readdirSync(join(root, 'local/targets')).sort()).toEqual(['shop-top.json']);
+
+    // 開始の URL も一致するファイルがちょうど 1 つ加わると、開始の URL が違うファイルがあっても、そのファイルを使う。
+    writeExistingTarget('local/targets/shop-admin.json', SITE.startUrl, [START_ORIGIN]);
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'example-test')?.profile.targetConfigPath).toBe('local/targets/shop-admin.json');
+  });
+
+  it('adds -2 to a suggested name taken by a profile or by a file to create', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    // 2 つ目: 同じ開始の Origin のファイル（1 つ目が作った local/targets/example-test.json）を使い、名前に -2 を付ける。
+    expect(await createProfileFromRequest(usageInput('PUBLIC'), auto(SITE), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'example-test-2')?.profile.targetConfigPath).toBe(PATH);
+    // 作るファイルの名前（local/targets/<名前>.json）が、ほかのサイトのファイルとして既にあれば、その名前も使わない。
+    const otherSite = { startUrl: 'https://other.example.test/', allowedOrigins: ['https://other.example.test'] };
+    writeExistingTarget('local/targets/other-example-test.json', 'https://kept.example.test/', ['https://kept.example.test']);
+    expect(await createProfileFromRequest(usageInput('PUBLIC'), auto(otherSite), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'other-example-test-2')?.profile.targetConfigPath).toBe('local/targets/other-example-test-2.json');
+  });
+
+  // PL-U（設計書 14.1 の U7）: 名前は自動で作るので、作るファイルの名前が Windows の予約名に当たるときは、拒まずに番号を付けた名前にする（予約名の判定は
+  // `isReservedTargetConfigName` の 1 か所。名前の案の部品 `uniqueProfileIdOf` が使う）。
+  it('gives a numbered name instead of rejecting when the name of the new file would be a Windows reserved name', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    const reservedSite: TargetSiteInput = { startUrl: 'https://con/', allowedOrigins: ['https://con'] };
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(reservedSite), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'con-2')?.profile.targetConfigPath).toBe('local/targets/con-2.json');
+    for (const name of ['nul', 'com1', 'lpt9']) {
+      expect(await createProfileFromRequest(usageInput('TEST', { profileId: name }), { choice: 'NEW', site: SITE }, creationDependenciesOf(store)), name)
+        .toMatchObject({ kind: 'SAVED', result: { ok: true } });
+      expect(getProfile(store, name), name).toBeNull();
+      expect(getProfile(store, `${name}-2`)?.profile.targetConfigPath, name).toBe(`local/targets/${name}-2.json`);
+    }
+  });
+
+  it('uses the values sent from the advanced settings as they are', async () => {
+    root = temporaryRoot();
+    const store = openStore();
+    writeExistingTarget('config/targets/shop.json', SITE.startUrl, [START_ORIGIN]);
+    // 名前と、新しく作る選び方（MI-C: 明示の `NEW`。設定のファイルのパスの項目を印に使わない）と、確かめた記録の参照を、利用者が決めた。
+    const input = usageInput('TEST', { profileId: 'my-own', environmentEvidenceRef: 'isolation-checked-ref' });
+    expect(await createProfileFromRequest(input, { choice: 'NEW', site: SITE }, creationDependenciesOf(store))).toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'my-own')?.profile).toMatchObject({
+      targetConfigPath: 'local/targets/my-own.json',
+      environmentEvidenceRef: 'isolation-checked-ref',
+      approvedTestOrigins: [START_ORIGIN],
+    });
+    // 名前を決めて重なったときは、番号を付けずに拒む（ファイルも作らない）。
+    expect(await createProfileFromRequest(usageInput('TEST', { profileId: 'my-own' }), { choice: 'NEW', site: SITE }, creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'PROFILE_REJECTED', reason: 'PROFILE_ALREADY_EXISTS' });
+    // 自動の選び方では、同じ Origin で開始の URL も同じファイルが 2 つ（すでにあるものと、今作ったもの）になったので、選ばずに止める。
+    expect(await createProfileFromRequest(usageInput('TEST'), auto(SITE), creationDependenciesOf(store)))
+      .toMatchObject({ kind: 'TARGET_AMBIGUOUS', candidates: ['config/targets/shop.json', 'local/targets/my-own.json'] });
+    // すでにある設定のファイルを選んだとき（開始の URL を送らない）は、名前とテスト環境の Origin を、そのファイルの開始の URL から決める。
+    const chosen = usageInput('TEST', { targetConfigPath: 'config/targets/shop.json' });
+    expect(await createProfileFromRequest(chosen, { choice: 'EXISTING' }, creationDependenciesOf(store))).toMatchObject({ kind: 'SAVED', result: { ok: true } });
+    expect(getProfile(store, 'example-test')?.profile).toMatchObject({
+      targetConfigPath: 'config/targets/shop.json',
+      approvedTestOrigins: [START_ORIGIN],
+      environmentEvidenceRef: UNVERIFIED_REF,
+    });
   });
 });

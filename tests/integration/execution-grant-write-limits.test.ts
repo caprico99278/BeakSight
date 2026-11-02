@@ -87,11 +87,18 @@ describe('execution grant issue (T30d): the verification spec', () => {
     expect(reasonOf(issueAt(0))).toBe('VERIFICATION_SPEC_MISSING');
   });
 
-  it('rejects the issue when one item of the verification spec is unspecified', () => {
-    prepareScenario(database, latest, 'scenario-1', { verification: { ...VERIFICATION_SPEC, recordId: null } });
+  // PL-5 の 9 の (4)（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1）: form の ID の取り方は求めない（決められなければ null のまま、結果は ID なしの
+  // PARTIAL）。答え合わせ（照合の READ）は今どおり求める。
+  it('rejects the issue when one required item of the verification spec is unspecified', () => {
+    prepareScenario(database, latest, 'scenario-1', { verification: { ...VERIFICATION_SPEC, readVerification: null } });
     expect(reasonOf(issueAt(0))).toBe('VERIFICATION_SPEC_MISSING');
     prepareScenario(database, latest, 'scenario-2');
     expect(issueAt(0, 'scenario-2').ok).toBe(true);
+  });
+
+  it('issues the grant of a form scenario without a way to take the record id when the READ verification is there (PL-5 9 (4))', () => {
+    prepareScenario(database, latest, 'scenario-1', { verification: { ...VERIFICATION_SPEC, recordId: null } });
+    expect(issueAt(0).ok).toBe(true);
   });
 });
 

@@ -147,6 +147,19 @@ export interface BrowserContextFactoryOptions {
    * 省略すると、今と同じ（読み取りだけ。`READ_ONLY`）。
    */
   readonly auditSend?: GuardAuditSend | undefined;
+  /**
+   * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）と OP-REV3（C-1。設計者の判断の案 a）: 書き込みの段の Context（`createWriteStageContext`）
+   * だけに渡す、監査の段の送信の扱いの指定（形は `auditSend` と同じ）。送る前の確かめなどの Passive の Context には渡さない（`auditSend` は書き込みのジョブでは
+   * 渡さない）。Guard は、値を入れる前の読み取りでない要求にだけ、書き込みの段の決まりを加えて当てる。形が違えば `TypeError`。省略は読み取りだけ。
+   */
+  readonly writeStageAuditSend?: GuardAuditSend | undefined;
+  /**
+   * OP-Q（設計書 4.1.8 の Q1）: 書き込みのジョブの Passive の Context（`createPassiveContext`。送る前の確かめと照合の READ）に渡す、監査の段の送信の扱いの指定（形は
+   * `auditSend` と同じで、書き込みの作業の印 `writeJobEndpoint` を必ず持つ）。Guard と中継の判定は、書き込みの段の値を入れる前と同じ決まりを加える（承認した送信先と
+   * その下の path、許可 Origin と承認したサービスの Origin のほか、WebSocket は通さない）。書き込みの段・ログインの段の Context と Isolated Interaction Context には
+   * 渡さない。印がない、形が違う、`auditSend` と一緒、は `TypeError`。省略は読み取りだけ。
+   */
+  readonly writeJobPassiveAuditSend?: GuardAuditSend | undefined;
 }
 
 /**
@@ -390,6 +403,7 @@ function passiveEgressRequestPolicy(
   role: ResourceDeliveryRole,
   auditSend: GuardAuditSend | undefined,
   readAdmissions: EgressReadAdmissions,
+  sendAdmissions: EgressSendAdmissions | null = null,
 ): EgressRequestPolicy {
   const copy = (values: readonly string[]): readonly string[] => Object.freeze(values.map((value) => String(value)));
   const { loginStage, writeStage } = stage;
@@ -439,9 +453,14 @@ function passiveEgressRequestPolicy(
     // T35R2-fix（T35R2 の M-3）: 最初の読み込みでない Context（幅の走査の `REVISIT`）では、中継でも承認したサービスの Origin へ送らない。
     // T44b（P1-1）: 監査の段の送信の扱い `PASS_EXCEPT_DELETE` の Context は、役割によらず送る（Guard と同じ。`servesServiceOrigin`）。
     ...(auditStage === undefined ? {} : { auditStage: egressAuditStagePolicy(auditStage, servesServiceOrigin(role, auditSend)) }),
-    // AS-a: 監査の段の送信の扱いの口（通す数は Guard が数える。中継は残り 1 とする。Guard より広くは通さない）。
-    ...(auditSend === undefined ? {} : { auditSend: egressAuditSendPolicy(auditSend) }),
+    // AS-a: 監査の段の送信の扱いの口（通す数は Guard が数える。中継は残り 1 とする。Guard より広くは通さない）。OP-N（N2）: 書き込みの段では、ここに入れない
+    // （中継は送信の窓と目印を知らないので、Guard が通した要求の写し `sendAdmissions` に当たる要求だけを、下の口で通す）。
+    ...(auditSend === undefined || writeStage !== undefined ? {} : { auditSend: egressAuditSendPolicy(auditSend) }),
   });
+  // OP-N（N2）: 書き込みの段の、送信の扱いの口を足した方針（窓の外・値を入れる前の形。DELETE、危険な語、許可の外、承認した送信の送信先は、ここでも通さない）。
+  const writeStageSendPolicy: PassiveRequestPolicyOptions | null = writeStage !== undefined && auditSend !== undefined && sendAdmissions !== null
+    ? Object.freeze({ ...policy, auditSend: egressAuditSendPolicy(auditSend) })
+    : null;
   const origins: ReadonlySet<string> = new Set(allowedOrigins);
   // T39c: API の書き込みの段では、送り手の 1 回の送信（承認した API の Origin と path の型への `POST`・`PATCH`。query は問わない）も通す。中継は、
   // ページのスクリプトの要求か・送信の窓・照合を知らないので、送信先の形だけを要求の判定の owner の部品で見て、回数は予算（`apiWriteStageEgressBudget`）が
@@ -457,7 +476,79 @@ function passiveEgressRequestPolicy(
     classifyPassiveRequest({ kind: 'HTTP', method, url, ...shape }, origins, target).action === 'ALLOW');
   return (method: string, url: string): boolean => allowedBy(strictPolicy, method, url)
     || (apiWrite !== null && isApiWriteEndpointRequest(method, url, apiWrite))
-    || (isReadMethod(method) && readAdmissions.has(method, url) && allowedBy(policy, method, url));
+    || (isReadMethod(method) && readAdmissions.has(method, url) && allowedBy(policy, method, url))
+    // OP-N（N2）: 書き込みの段の、Guard が送信の扱いの口で通した読み取りでない要求（Guard が知らせた写しを 1 回ずつ使う。Guard より広くは通さない）。
+    || (writeStageSendPolicy !== null && sendAdmissions !== null && !isReadMethod(method) && allowedBy(writeStageSendPolicy, method, url)
+      && sendAdmissions.take(method, url));
+}
+
+/**
+ * OP-N（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1.7 の N2）: 書き込みの段の Context の Guard が通した（`decideGuardRequest` の `ALLOW`）、読み取りで
+ * ない要求の method と URL の写しの数の上限（超えたら古いものから捨てる。捨てた要求は中継が拒んで記録する。fail-closed の側）。Guard が 1 つの Context で通す
+ * 送信の扱いの数の上限より大きく取る。
+ */
+export const MAX_EGRESS_SEND_ADMISSIONS = 256;
+
+/**
+ * OP-N（N2）: 書き込みの段の Context の Guard が通した、読み取りでない要求の写し（中継の要求の方針が使う。`passiveEgressRequestPolicy`）。Guard の口
+ * （`onEgressDestinationAdmitted`）が、命令を送る前に同期で知らせる。中継は、当たった写しを使って消す。鍵は読み取りの写しと同じ形。
+ * OP-REV3（I-2）: Guard は 1 つの要求を CDP の層と route の層の両方で知らせるので、写しは method と URL ごとに 1 つだけ持つ（重ねない。同じ method と URL の要求が
+ * 同時に 2 つあれば、中継は 2 つ目を拒む。止める側）。受けてよいか（`accepting`。送信の窓を開く前だけ真）が偽になったら、残っている写しを捨て、以後は受けず、
+ * 使わせない。
+ */
+export class EgressSendAdmissions {
+  readonly #keys = new Set<string>();
+  readonly #accepting: () => boolean;
+
+  constructor(accepting: () => boolean) {
+    this.#accepting = accepting;
+  }
+
+  /** 受けてよいかを確かめる（偽なら、残っている写しを捨てる）。投げたら、偽とする。 */
+  #open(): boolean {
+    let open: boolean;
+    try {
+      open = this.#accepting() === true;
+    } catch {
+      open = false;
+    }
+    if (!open) {
+      this.#keys.clear();
+    }
+    return open;
+  }
+
+  admit(method: string | undefined, url: string): void {
+    if (method === undefined || isReadMethod(method) || !this.#open()) {
+      return;
+    }
+    const key = egressReadAdmissionKeyOf(method, url);
+    if (key === null) {
+      return;
+    }
+    this.#keys.delete(key);
+    this.#keys.add(key);
+    while (this.#keys.size > MAX_EGRESS_SEND_ADMISSIONS) {
+      const oldest = this.#keys.values().next();
+      if (oldest.done === true) {
+        break;
+      }
+      this.#keys.delete(oldest.value);
+    }
+  }
+
+  take(method: string, url: string): boolean {
+    if (!this.#open()) {
+      return false;
+    }
+    const key = egressReadAdmissionKeyOf(method, url);
+    return key !== null && this.#keys.delete(key);
+  }
+
+  /** 持っている写しの数（単体のテストのため）。 */
+  get size(): number {
+    return this.#keys.size;
+  }
 }
 
 /**
@@ -534,11 +625,33 @@ function egressAuditStagePolicy(stage: AuditStageServiceRequests, servesService:
 }
 
 /** 中継の要求の方針の、監査の段の送信の扱いの口（AS-a。写しを取る。通す数は Guard が数えるので、中継は残り 1 とする）。 */
+/** AS-a: 監査の段の送信の扱いの指定の、凍結した写し（OP-REV3 の C-1 で、Passive の Context の指定と書き込みの段だけの指定に共通にした）。 */
+function guardAuditSendCopyOf(send: GuardAuditSend): GuardAuditSend {
+  return Object.freeze({
+    policy: send.policy,
+    approvedServiceOrigins: Object.freeze([...send.approvedServiceOrigins]),
+    dangerousTerms: Object.freeze([...send.dangerousTerms]),
+    ...(send.maxPassedPerContext === undefined ? {} : { maxPassedPerContext: send.maxPassedPerContext }),
+    // AS-c: WebSocket の接続の上限（あるときだけ）。
+    ...(send.maxWebSocketsPerContext === undefined ? {} : { maxWebSocketsPerContext: send.maxWebSocketsPerContext }),
+    // OP-Q（Q1）: 書き込みの作業の印（あるときだけ。落とすと、監査の段の決まりで通してしまうので、必ず写す）。
+    ...writeJobEndpointCopyOf(send),
+  });
+}
+
+/** OP-Q（Q1）: 書き込みの作業の印の写し（あるときだけ `{ writeJobEndpoint }`）。Guard の指定の写しと、中継の要求の方針の口の両方が使う。 */
+const writeJobEndpointCopyOf = (send: GuardAuditSend): { readonly writeJobEndpoint?: SubmissionEndpoint } =>
+  (send.writeJobEndpoint === undefined
+    ? {}
+    : { writeJobEndpoint: Object.freeze({ origin: String(send.writeJobEndpoint.origin), path: String(send.writeJobEndpoint.path) }) });
+
 function egressAuditSendPolicy(send: GuardAuditSend): AuditSendPolicy {
   return Object.freeze({
     approvedServiceOrigins: Object.freeze([...send.approvedServiceOrigins]),
     dangerousTerms: Object.freeze([...send.dangerousTerms]),
     remainingPasses: EGRESS_LOGIN_POST_REMAINING,
+    // OP-Q（Q1）: 中継も、Guard と同じ書き込みの作業の決まりで判定する（Guard より広くは通さない）。
+    ...writeJobEndpointCopyOf(send),
   });
 }
 
@@ -921,6 +1034,8 @@ export class BrowserContextFactory {
   readonly #contextEgress = new WeakMap<BrowserContext, EgressProxy>();
   /** BN-R0 fix round 1（I-1）: Passive の Context の中継ごとの、Guard が通した読み取りの写し（`EgressReadAdmissions`）。 */
   readonly #egressReadAdmissions = new WeakMap<EgressProxy, EgressReadAdmissions>();
+  /** OP-N（N2）: 書き込みの段の中継の、Guard が通した読み取りでない要求の写し（送信の扱いの口のある書き込みの段の Context だけ）。 */
+  readonly #egressSendAdmissions = new WeakMap<EgressProxy, EgressSendAdmissions>();
   /**
    * T44b（P1-2）: 監査の段の送信の扱いの口（`auditSend`）を Guard に渡した、ページの監査の読み込みの Context（`PRIMARY` で、`createPassiveContext` の印
    * `pageAuditLoad` のあるもの。Desktop と Mobile）。持ち主が閉じるときに、ページを離れてから `AUDIT_SEND_CLOSE_SETTLE_MS` だけ待つ。
@@ -964,6 +1079,10 @@ export class BrowserContextFactory {
   readonly #onSessionKeyLost: (() => void) | null;
   /** AS-a: 監査の段の送信の扱いの指定（`BrowserContextFactoryOptions.auditSend` の写し）。なければ `null`（読み取りだけ）。 */
   readonly #auditSend: GuardAuditSend | null;
+  /** OP-REV3（C-1）: 書き込みの段の Context だけに渡す、監査の段の送信の扱いの指定の写し。なければ `null`。 */
+  readonly #writeStageAuditSend: GuardAuditSend | null;
+  /** OP-Q（Q1）: 書き込みのジョブの Passive の Context に渡す、監査の段の送信の扱いの指定の写し（書き込みの作業の印つき）。なければ `null`。 */
+  readonly #writeJobPassiveAuditSend: GuardAuditSend | null;
   /**
    * 受け継ぐ認証済みの状態と、その世代（T25c。Task 25 の設計書 4.3 の 2026-10-10 の Blocker の行）。Run の中で 1 つだけ持ち、Context を作る
    * とき（生きている、より新しい世代の Context から読む）と、閉じるとき（その世代が今の世代以上なら置き換える）に更新する。認証の指定が
@@ -991,11 +1110,20 @@ export class BrowserContextFactory {
     }
     const {
       loadMeter, resourceCache, egressUpstreamPolicy, authentication, writeSubmissionCertificates, navigationPacer, serviceRequestBudget, auditStageMonitor,
-      onServiceUnauthorizedResponse, onSessionKeyLost, auditSend,
+      onServiceUnauthorizedResponse, onSessionKeyLost, auditSend, writeStageAuditSend, writeJobPassiveAuditSend,
     } = options;
-    // AS-a: 監査の段の送信の扱いの指定は、Guard と同じ確かめ（`isGuardAuditSend`）で受ける。
-    if (auditSend !== undefined && !isGuardAuditSend(auditSend)) {
+    // AS-a: 監査の段の送信の扱いの指定は、Guard と同じ確かめ（`isGuardAuditSend`）で受ける。OP-REV3（C-1）: 書き込みの段だけの指定も同じ。
+    if ((auditSend !== undefined && !isGuardAuditSend(auditSend)) || (writeStageAuditSend !== undefined && !isGuardAuditSend(writeStageAuditSend))) {
       throw new TypeError('BrowserContextFactory audit send policy is malformed');
+    }
+    // OP-Q（Q1）: 書き込みのジョブの Passive の Context の指定は、同じ確かめに加えて、書き込みの作業の印を必ず持ち、監査の段の指定（`auditSend`）とは一緒に受けない。
+    // 監査の段の指定は、書き込みの作業の印を持たない（印は、この口だけが持つ）。
+    if (writeJobPassiveAuditSend !== undefined
+      && (!isGuardAuditSend(writeJobPassiveAuditSend) || writeJobPassiveAuditSend.writeJobEndpoint === undefined || auditSend !== undefined)) {
+      throw new TypeError('BrowserContextFactory write job audit send policy must have the write endpoint and cannot be combined with the audit send policy');
+    }
+    if (auditSend?.writeJobEndpoint !== undefined) {
+      throw new TypeError('BrowserContextFactory audit send policy cannot have the write job endpoint');
     }
     if (onServiceUnauthorizedResponse !== undefined && typeof onServiceUnauthorizedResponse !== 'function') {
       throw new TypeError('BrowserContextFactory service unauthorized response observer must be a function');
@@ -1061,16 +1189,9 @@ export class BrowserContextFactory {
     this.#auditStageMonitor = auditStageMonitor ?? null;
     this.#onServiceUnauthorizedResponse = onServiceUnauthorizedResponse ?? null;
     this.#onSessionKeyLost = onSessionKeyLost ?? null;
-    this.#auditSend = auditSend === undefined
-      ? null
-      : Object.freeze({
-        policy: auditSend.policy,
-        approvedServiceOrigins: Object.freeze([...auditSend.approvedServiceOrigins]),
-        dangerousTerms: Object.freeze([...auditSend.dangerousTerms]),
-        ...(auditSend.maxPassedPerContext === undefined ? {} : { maxPassedPerContext: auditSend.maxPassedPerContext }),
-        // AS-c: WebSocket の接続の上限（あるときだけ）。
-        ...(auditSend.maxWebSocketsPerContext === undefined ? {} : { maxWebSocketsPerContext: auditSend.maxWebSocketsPerContext }),
-      });
+    this.#auditSend = auditSend === undefined ? null : guardAuditSendCopyOf(auditSend);
+    this.#writeStageAuditSend = writeStageAuditSend === undefined ? null : guardAuditSendCopyOf(writeStageAuditSend);
+    this.#writeJobPassiveAuditSend = writeJobPassiveAuditSend === undefined ? null : guardAuditSendCopyOf(writeJobPassiveAuditSend);
     this.#authenticatedState = initialState === null
       ? null
       : Object.freeze({ state: initialState, generation: INITIAL_AUTHENTICATED_STATE_GENERATION });
@@ -1256,10 +1377,24 @@ export class BrowserContextFactory {
   ): Promise<BrowserContext> {
     let context: BrowserContext | undefined;
     const freeze: EgressFreezeRecord = { frozenByInteraction: false };
-    // AS-a: 監査の段の送信の扱いは、Passive の Context（ログインの段と書き込みの段でない）だけに渡す（Guard と中継の両方）。
-    const auditSend = stage.loginStage === undefined && stage.writeStage === undefined ? this.#auditSend ?? undefined : undefined;
+    // AS-a: 監査の段の送信の扱いは、Passive の Context（ログインの段と書き込みの段でない）だけに渡す（Guard と中継の両方）。OP-N（設計書 4.1.7 の N2）・OP-REV3（C-1）:
+    // 書き込みの段の Context には、書き込みの段だけの指定（`writeStageAuditSend`）を渡す（Guard の判定は、書き込みの段の決まりを加えた要求の判定の owner。中継は、
+    // Guard が通した要求の写しだけを通す）。
+    // OP-Q（設計書 4.1.8 の Q1）: 書き込みのジョブの Passive の Context（送る前の確かめと照合の READ）には、書き込みの作業の印つきの指定（`writeJobPassiveAuditSend`）を
+    // 渡す（`auditSend` とは一緒に受けない）。
+    const auditSend = stage.loginStage !== undefined
+      ? undefined
+      : stage.writeStage !== undefined
+        ? this.#writeStageAuditSend ?? undefined
+        : this.#auditSend ?? this.#writeJobPassiveAuditSend ?? undefined;
     // BN-R0 fix round 1（I-1）: この Context の Guard が通した読み取りの写し（中継の要求の方針が使う。Guard の口が知らせる）。
     const readAdmissions = new EgressReadAdmissions();
+    // OP-N（N2）: 書き込みの段で送信の扱いの口があるときだけ、Guard が通した読み取りでない要求の写しを持つ。OP-REV3（I-2）: 送信の窓を開いたら（値を入れ始めたら）、
+    // 写しを捨て、以後は受けない。
+    const writeMonitor = stage.writeStage?.monitor;
+    const sendAdmissions = writeMonitor !== undefined && auditSend !== undefined
+      ? new EgressSendAdmissions(() => !writeMonitor.hasSubmissionWindowOpened())
+      : null;
     const egress = await startEgressProxy({
       upstreamPolicy: this.#egressUpstreamPolicy,
       requestPolicy: passiveEgressRequestPolicy(
@@ -1271,6 +1406,7 @@ export class BrowserContextFactory {
         role,
         auditSend,
         readAdmissions,
+        sendAdmissions,
       ),
       // DEF-099 fix: 書き込みの段の Context では、承認の送信先への POST を 1 回だけ通し、2 回目は止めて記録する（http の重ねの守り。送り手の
       // 1 回だけが通るはず。https はトンネルなので数えない）。T39c: API の書き込みの段は、承認した API の Origin への `POST`・`PATCH` を 1 回。
@@ -1296,6 +1432,9 @@ export class BrowserContextFactory {
     });
     // BN-R0 fix round 1（I-1）: Guard の知らせの口（`#createGuardedContext`）が、この中継の読み取りの写しに書く。
     this.#egressReadAdmissions.set(egress, readAdmissions);
+    if (sendAdmissions !== null) {
+      this.#egressSendAdmissions.set(egress, sendAdmissions);
+    }
     try {
       context = await this.#createGuardedContext(ledger, viewport, role, egress, freeze, stage, auditSend);
     } catch (error) {
@@ -1383,8 +1522,9 @@ export class BrowserContextFactory {
     /** BN-0: Context の種類（Isolated Interaction Context は `INTERACTION`。監査の段の除外の当て方が違う）。 */
     contextKind: 'PASSIVE' | 'INTERACTION' = 'PASSIVE',
   ): Promise<BrowserContext> {
-    if (auditSend !== undefined && (stage.loginStage !== undefined || stage.writeStage !== undefined)) {
-      throw new TypeError('The audit send policy is only for a Passive Context');
+    // OP-N（N2）: 書き込みの段の Context にも渡す（ログインの段には渡さない）。
+    if (auditSend !== undefined && stage.loginStage !== undefined) {
+      throw new TypeError('The audit send policy is only for a Passive Context or a write stage Context');
     }
     // DEF-044、DEF-049: Worker の自己検査が始まってから Context を作る。始められなければ、その例外のまま投げる（Context は作らない）。
     if (this.#closed) {
@@ -1462,8 +1602,10 @@ export class BrowserContextFactory {
       ...guardAuditStage,
       // AS-a: 監査の段の送信の扱い（Passive の Context だけ。Isolated Interaction Context には渡さない）。
       ...(auditSend === undefined ? {} : { auditSend }),
-      // AS-c fix round 1（I-1）: ほかの Origin への CORS の事前確認を、Guard がこの Context の中継を通してサーバへ送る送り手（送信の扱いの口と一緒だけ）。
-      ...(auditSend === undefined
+      // AS-c fix round 1（I-1）: ほかの Origin への CORS の事前確認を、Guard がこの Context の中継を通してサーバへ送る送り手（送信の扱いの口と一緒だけ）。OP-N:
+      // 書き込みの段には渡さない（書き込みの段は、許可 Origin と承認したサービスの Origin のほかへ送らない）。
+      // OP-Q（Q1）: 書き込みのジョブの Passive の Context（書き込みの作業の印）にも渡さない。
+      ...(auditSend === undefined || stage.writeStage !== undefined || auditSend.writeJobEndpoint !== undefined
         ? {}
         : {
           auditSendPreflight: Object.freeze({
@@ -1495,6 +1637,8 @@ export class BrowserContextFactory {
         egress.admitTunnelDestinationOf(url);
         // BN-R0 fix round 1（I-1）: Guard が通した読み取りを、中継の要求の方針に知らせる（Passive の Context の中継だけが写しを持つ）。
         this.#egressReadAdmissions.get(egress)?.admit(method, url);
+        // OP-N（N2）: 書き込みの段の Guard が通した読み取りでない要求も知らせる（送信の扱いの口のある書き込みの段の中継だけが写しを持つ）。
+        this.#egressSendAdmissions.get(egress)?.admit(method, url);
       },
       // DEF-100 fix: main frame の文書の要求を送った時刻を、Run の読み込みの間隔の部品に記録する（サイトに届く間隔を設定以上にする）。
       ...(navigationPacer === null ? {} : { onMainFrameDocumentSent: (): void => navigationPacer.recordDocumentRequestSent() }),

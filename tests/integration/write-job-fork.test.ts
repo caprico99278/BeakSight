@@ -73,7 +73,11 @@ describe('T30f: the write job end to end with the real worker', () => {
     });
     expect(await actionRunOf(stopped)).toMatchObject({ schemaVersion: ACTION_RUN_SCHEMA_VERSION, jobId: stopped.jobId, submission: 'NOT_SENT', result: 'BLOCKED' });
     expect(harness.createPosts()).toEqual([]);
-    harness.expectPacedNavigations(first.since, [`GET ${WRITE_SITE_PATHS.form}`, `GET ${WRITE_SITE_PATHS.form}`]);
+    // PL-6a（設計書 `2026-10-26-beaksight-plain-ui-design.md` 8.1 の「事前の確かめ」）: 画面の確かめの後に、送る前の答え合わせの READ（対象の画面と READ の
+    // URL）を読む。
+    harness.expectPacedNavigations(first.since, [
+      `GET ${WRITE_SITE_PATHS.form}`, `GET ${WRITE_SITE_PATHS.list}`, `GET ${WRITE_SITE_PATHS.list}`, `GET ${WRITE_SITE_PATHS.form}`,
+    ]);
 
     // 2 回目: 成功 → 登録の POST が 1 回だけ届き、ID を取り、照合の READ が一致 → VERIFIED、COMMITTED。
     site.setMode('success');
@@ -115,7 +119,7 @@ describe('T30f: the write job end to end with the real worker', () => {
     expect(harness.createPosts()).toEqual([WRITE_SITE_PATHS.create]);
     expect(site.members).toBe(1);
     harness.expectPacedNavigations(second.since, [
-      `GET ${WRITE_SITE_PATHS.form}`, `GET ${WRITE_SITE_PATHS.form}`, `POST ${WRITE_SITE_PATHS.create}`, `GET ${WRITE_SITE_PATHS.list}`,
+      `GET ${WRITE_SITE_PATHS.form}`, `GET ${WRITE_SITE_PATHS.list}`, `GET ${WRITE_SITE_PATHS.list}`, `GET ${WRITE_SITE_PATHS.form}`, `POST ${WRITE_SITE_PATHS.create}`, `GET ${WRITE_SITE_PATHS.list}`,
       `GET ${WRITE_SITE_PATHS.list}`,
     ]);
 

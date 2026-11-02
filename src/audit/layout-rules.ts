@@ -170,6 +170,7 @@ const layoutDraft = ({ ruleId, severity, message, evidenceId, identityFields }: 
 const layoutRule = (
   ruleId: string,
   severity: Severity,
+  plainMessage: string,
   evaluate: (input: PageRuleInput, draft: (spec: Omit<LayoutDraftSpec, 'ruleId' | 'severity'>) => FindingDraft) =>
     readonly FindingDraft[],
 ): AuditRule => ({
@@ -177,6 +178,7 @@ const layoutRule = (
   version: RULE_VERSION,
   category: 'LAYOUT',
   severity,
+  plainMessage,
   evaluate: (input) => evaluate(input, (spec) => layoutDraft({ ...spec, ruleId, severity })),
 });
 
@@ -191,9 +193,10 @@ type LayoutJudgement = Omit<LayoutDraftSpec, 'ruleId' | 'severity' | 'evidenceId
 const layoutFactRule = (
   ruleId: string,
   severity: Severity,
+  plainMessage: string,
   scope: LayoutScope,
   judge: (layout: LayoutEvidence) => readonly LayoutJudgement[],
-): AuditRule => layoutRule(ruleId, severity, (input, draft) =>
+): AuditRule => layoutRule(ruleId, severity, plainMessage, (input, draft) =>
   layoutsOf(input, scope).flatMap(({ evidenceId, layout, stressWidth }) =>
     judge(layout).map(({ message, identityFields }) => (stressWidth === null
       ? draft({ message, evidenceId, identityFields })
@@ -208,7 +211,9 @@ const layoutFactRule = (
 // DOCUMENT_HORIZONTAL_OVERFLOW
 // ---------------------------------------------------------------------------------------------------------------
 
-const documentHorizontalOverflow = layoutFactRule('DOCUMENT_HORIZONTAL_OVERFLOW', 'ERROR', 'PRIMARY_AND_STRESS_SWEEP', (layout) => {
+const documentHorizontalOverflow = layoutFactRule('DOCUMENT_HORIZONTAL_OVERFLOW', 'ERROR',
+  'ページが画面の幅より広くなっています。横に動かさないと、全部が見えません。',
+  'PRIMARY_AND_STRESS_SWEEP', (layout) => {
   const { document } = layout;
   const overflow = document.horizontalOverflowPx;
   // ビューポートが横に切り取る（`overflow-x: hidden | clip` が html か body から伝わる）場合は、横スクロールが生じない（設計書 5.1.2）。
@@ -263,7 +268,9 @@ const hasHorizontallyOutsideListedAncestor = (
  *   （カルーセル、横にスクロールする表、body の `overflow-x: hidden`。設計書 5.1.2）。
  * - 主要要素でない要素（kind が `other`）と、横にはみ出す祖先が一覧にある要素は、対象にしない（入れ子ごとに重ねない）。
  */
-const elementOutsideViewport = layoutFactRule('ELEMENT_OUTSIDE_VIEWPORT', 'WARN', 'PRIMARY_AND_STRESS_SWEEP', (layout) => {
+const elementOutsideViewport = layoutFactRule('ELEMENT_OUTSIDE_VIEWPORT', 'WARN',
+  'ページの部品の一部が、画面の外へはみ出しています。見えないところがあります。',
+  'PRIMARY_AND_STRESS_SWEEP', (layout) => {
   const viewportWidth = layout.document.viewportWidth;
   const boxes = layout.boxesOutsideViewport;
   return boxes.flatMap((box) => {
@@ -318,8 +325,8 @@ const overlapRuleFor = (overlap: ElementOverlapEvidence): OverlapRuleId | null =
   return null;
 };
 
-const overlapRule = (ruleId: OverlapRuleId, subject: string) =>
-  layoutFactRule(ruleId, 'WARN', 'PRIMARY_AND_STRESS_SWEEP', (layout) =>
+const overlapRule = (ruleId: OverlapRuleId, subject: string, plainMessage: string) =>
+  layoutFactRule(ruleId, 'WARN', plainMessage, 'PRIMARY_AND_STRESS_SWEEP', (layout) =>
     layout.elementOverlaps.flatMap((overlap) => {
       if (
         overlapRuleFor(overlap) !== ruleId
@@ -356,7 +363,9 @@ const overlapRule = (ruleId: OverlapRuleId, subject: string) =>
  *   はみ出しや、横方向に箱と重ならないテキスト（隠れたスライド）は、対象にしない（設計書 5.1.2）。
  * - 幅か高さが `VISUALLY_HIDDEN_MAX_DIMENSION_PX` 以下の箱は、画面から隠す手法とみなし、見切れにしない。
  */
-const textClipping = layoutFactRule('TEXT_CLIPPING', 'WARN', 'PRIMARY', (layout) =>
+const textClipping = layoutFactRule('TEXT_CLIPPING', 'WARN',
+  '文字の一部が、欄からはみ出して切れています。最後まで読めないところがあります。',
+  'PRIMARY', (layout) =>
   layout.clippedText.flatMap((clipped) => {
     if (
       !clipped.partiallyClippedText
@@ -492,7 +501,9 @@ interface OcclusionSummary {
  * 先頭の位置（文書のスクロール位置が 0, 0）で集めた layout で、見える固定要素が、固定要素でない主要要素を覆うもの。
  * 固定要素ごとに1件にまとめ、覆った要素の件数と、最も大きく覆われた要素を文言に載せる。
  */
-const fixedElementOcclusion = layoutFactRule('FIXED_ELEMENT_OCCLUSION', 'WARN', 'PRIMARY_AND_STRESS_SWEEP', (layout) => {
+const fixedElementOcclusion = layoutFactRule('FIXED_ELEMENT_OCCLUSION', 'WARN',
+  '画面に止まって動かない部品が、ページの大事なところを隠しています。',
+  'PRIMARY_AND_STRESS_SWEEP', (layout) => {
   if (layout.scrollPosition.scrollX !== 0 || layout.scrollPosition.scrollY !== 0) {
     return [];
   }
@@ -555,7 +566,9 @@ const fixedElementOcclusion = layoutFactRule('FIXED_ELEMENT_OCCLUSION', 'WARN', 
  *   意図して大きさを0にする手法と区別できないので除く。透明な要素と `aria-hidden` の要素も除く。
  * - 大きさのある描画された子孫を持つ要素（float の画像や absolute の子を包むリンク）は、実際に操作できるので除く（設計書 5.1.2）。
  */
-const zeroSizeInteractiveElement = layoutFactRule('ZERO_SIZE_INTERACTIVE_ELEMENT', 'WARN', 'PRIMARY', (layout) =>
+const zeroSizeInteractiveElement = layoutFactRule('ZERO_SIZE_INTERACTIVE_ELEMENT', 'WARN',
+  '押すための部品の大きさが、ほとんどありません。見えないか、押せないことがあります。',
+  'PRIMARY', (layout) =>
   layout.zeroSizeInteractive.flatMap((element) => {
     if (
       element.hasRenderedDescendant
@@ -580,7 +593,9 @@ const zeroSizeInteractiveElement = layoutFactRule('ZERO_SIZE_INTERACTIVE_ELEMENT
  * 見える固定要素（`position: fixed | sticky`）が、ビューポートの面積のしきい値を超えて占めるもの。
  * z-index が負の固定要素は、内容の奥に描く背景とみなし、対象にしない。
  */
-const oversizedFixedElement = layoutFactRule('OVERSIZED_FIXED_ELEMENT', 'WARN', 'PRIMARY', (layout) =>
+const oversizedFixedElement = layoutFactRule('OVERSIZED_FIXED_ELEMENT', 'WARN',
+  '画面に止まって動かない部品が大きすぎて、ページの中身が見える場所がせまくなっています。',
+  'PRIMARY', (layout) =>
   layout.fixedElements.flatMap((element) => {
     const ratio = element.viewportAreaRatio;
     if (
@@ -608,7 +623,9 @@ const oversizedFixedElement = layoutFactRule('OVERSIZED_FIXED_ELEMENT', 'WARN', 
  * CLS は、直前にユーザー入力があった shift を含めないので、attribution の shift はユーザー入力のないものである。
  * CLS を観測できなかった場合と、要素が記録されていない場合は、Finding を作らない。
  */
-const dynamicLayoutShift = layoutRule('DYNAMIC_LAYOUT_SHIFT', 'WARN', (input, draft) =>
+const dynamicLayoutShift = layoutRule('DYNAMIC_LAYOUT_SHIFT', 'WARN',
+  '何もしていないのに、表示の途中でページの部品が動きました。読んでいる場所を見失ったり、押しまちがえたりすることがあります。',
+  (input, draft) =>
   evidenceOfType(input, 'performance').flatMap((record) => {
     const cls = record.payload.webVitals?.CLS;
     if (cls === undefined || cls.status !== 'OBSERVED' || cls.attribution === null) {
@@ -636,11 +653,11 @@ const dynamicLayoutShift = layoutRule('DYNAMIC_LAYOUT_SHIFT', 'WARN', (input, dr
 export const LAYOUT_RULES: readonly AuditRule[] = Object.freeze([
   documentHorizontalOverflow,
   elementOutsideViewport,
-  overlapRule('ELEMENT_OVERLAP', '要素'),
+  overlapRule('ELEMENT_OVERLAP', '要素', 'ページの部品どうしが重なっています。見えにくいところや、押しにくいところがあります。'),
   textClipping,
   fixedElementOcclusion,
   zeroSizeInteractiveElement,
-  overlapRule('CONTENT_COLLISION', '見出し・段落の要素'),
+  overlapRule('CONTENT_COLLISION', '見出し・段落の要素', '見出しや文章どうしが重なっています。読みにくいところがあります。'),
   oversizedFixedElement,
   dynamicLayoutShift,
 ]);

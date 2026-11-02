@@ -17,10 +17,11 @@ import {  LOGIN_SIDE_REQUEST_METHODS,
 } from '../../../src/control/auth/auth-setup-contracts.js';
 import { FORM_NAVIGATION_SETUP_ITEMS } from '../../../tests/helpers/auth-setup-samples.js';
 import { formatCount } from '../../../src/presentation/format.js';
+import { httpMethodLabel } from '../src/display/labels';
 import {
-  LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT,
   LOCAL_UI_LOGIN_STAGE_TEXT,
   LOCAL_UI_MANUAL_LOGIN_TEXT,
+  LOCAL_UI_NEXT_STEP_TEXT,
   LOCAL_UI_TEXT,
 } from '../../../src/presentation/messages.js';
 import { launchHeadlessChromium } from '../../../tests/helpers/chromium.js';
@@ -40,6 +41,8 @@ import {
 import { callServerFunction, isServerFunctionUrlOf, readServerFunctionIds } from './helpers/server-functions.ts';
 import { waitForJobViaServerFunctions, type ServerFunctionJobWaitTiming } from './helpers/server-function-job-wait.ts';
 import { createUiPageKit } from './helpers/ui-page.ts';
+import { openAdvancedSettings } from './helpers/advanced-settings.ts';
+import { saveAuthSetupRequestInStore } from './helpers/profile-store-setup.ts';
 
 const UI_TIMEOUT_MS = 15_000;
 const SCENARIO_TIMEOUT_MS = 120_000;
@@ -181,7 +184,7 @@ beforeAll(async () => {
     environment: 'TEST', mode: 'TEST_AUTH_PASSIVE', auth: 'MANUAL_SESSION', approvedTestOrigins: [TEST_ORIGIN], environmentEvidenceRef: `${PROFILE_ID}-evidence`,
   };
   expect(await valueOf('createProfileFn', 'POST', { profile })).toMatchObject({ ok: true });
-  expect(await valueOf('saveAuthSetupFn', 'POST', { setup: formSetupOf(FIRST_REVISION) })).toMatchObject({ ok: true });
+  expect(await saveAuthSetupRequestInStore(root, { setup: formSetupOf(FIRST_REVISION) })).toMatchObject({ ok: true });
 }, SCENARIO_TIMEOUT_MS);
 
 afterEach(async () => {
@@ -200,20 +203,24 @@ describe('ML-b-2: the manual login with the job manager and the fake worker', ()
     const jobId = await startJob(FIRST_REVISION);
     const page = await openPage(`/jobs/${jobId}`);
     const panel = page.getByTestId('job-manual-login');
-    await panel.waitFor({ timeout: UI_TIMEOUT_MS });
+    // PL-2（13 章の 11）: 「ログインを終えた」は、要点の主のボタン（要点の 1 つのパネルの中）。
+    const confirmButton = page.getByTestId('job-summary-panel').getByTestId('job-manual-login-confirm');
+    await confirmButton.waitFor({ timeout: UI_TIMEOUT_MS });
     await screenshot(page, 'mlb2-01-awaiting-login');
     expect(confirmedMessages()).toBe(0);
-    await panel.getByTestId('job-manual-login-confirm').click();
+    await confirmButton.click();
 
     // ボタンを押す → ジョブの管理がワーカーへ知らせ、監査に進む（認証済み。ボタンは消える）。
     await expect.poll(() => page.getByTestId('job-auth-state').getAttribute('data-auth-state'), { timeout: UI_TIMEOUT_MS }).toBe('AUTHENTICATED');
     await expect.poll(() => panel.count(), { timeout: UI_TIMEOUT_MS }).toBe(0);
+    expect(await confirmButton.count()).toBe(0);
     expect(confirmedMessages()).toBe(1);
     // 2 回目は、閉じた一覧の理由で拒む（ワーカーへは送らない）。
     expect(await valueOf('confirmManualLoginFn', 'POST', { jobId })).toEqual({ ok: false, reason: 'ALREADY_CONFIRMED' });
     expect(confirmedMessages()).toBe(1);
 
-    // 通した送信の表（行ごとに、通さなければ止めた理由と「登録する」）。
+    // 通した送信の表（行ごとに、通さなければ止めた理由と「登録する」）。PL-2（3 章の 1・2）: 表は、たたんだ詳しい内容の中。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const passed = page.getByTestId('job-login-stage-passed');
     await passed.waitFor({ timeout: UI_TIMEOUT_MS });
     const rows = passed.locator('tbody tr');
@@ -249,15 +256,14 @@ describe('ML-b-2: the manual login with the job manager and the fake worker', ()
     const sides = setup.locator('[data-item="sideRequests"] li');
     expect(await sides.evaluateAll((items) => items.map((item) => item.getAttribute('data-path')))).toEqual([TENANT_PATH]);
     expect(await sides.first().textContent()).toBe(text.sideRequestValue(
-      LOGIN_SIDE_REQUEST_METHODS[0], `${SERVICE_ORIGIN}${TENANT_PATH}`, formatCount(MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE),
+      httpMethodLabel(LOGIN_SIDE_REQUEST_METHODS[0]), `${SERVICE_ORIGIN}${TENANT_PATH}`, formatCount(MAX_LOGIN_SIDE_REQUESTS_PER_LOGIN_STAGE),
     ));
     expect(await setup.locator('[data-item="serviceOrigins"]').textContent()).toBe(SERVICE_ORIGIN);
-    // FM-1（手動の操作を減らす設計書 2.3）: 自動の登録が SAVED なら、「次から自動でログインする」と、その手順の画面への入口を出す。
-    // FM2e（同 3A.4。意図して直した期待）: 3 つの画面への入口の代わりに、1 回の操作で設定を終える画面（資格情報の画面）への入口 1 つ。
-    const offer = page.getByTestId('job-login-setup-automated-login');
-    await offer.waitFor({ timeout: UI_TIMEOUT_MS });
-    expect(await offer.getByRole('heading').textContent()).toBe(LOCAL_UI_AUTOMATED_LOGIN_SETUP_TEXT.offer.heading);
-    expect(await offer.getByTestId('automated-login-offer-setup').getAttribute('href')).toBe(`/credentials/${PROFILE_ID}`);
+    // MI-C 項目 11（MI-4 の報告。意図して直した期待）: 「次から自動でログインする」の案内は、プロファイルの詳細の「次にすること」の 1 か所だけ
+    // （`AutomatedLoginReadinessNote`。そろいを判定する）。ジョブの画面の登録した設定の欄には出さない。
+    expect(await page.getByTestId('job-login-setup-automated-login').count()).toBe(0);
+    // OP-1（設計書 `2026-10-27-beaksight-one-pass-flow-design.md` 4.1 の D5）: 「次から自動でログインする」は、ふだんの流れからなくした（どこにも出ない）。
+    expect(await page.getByText('次から自動でログインする', { exact: true }).count()).toBe(0);
     await screenshot(page, 'mlb2-03-auto-registration-saved');
   }, SCENARIO_TIMEOUT_MS);
 
@@ -270,6 +276,8 @@ describe('ML-b-2: the manual login with the job manager and the fake worker', ()
     expect(await valueOf('stopAuditJobFn', 'POST', { jobId, force: false })).toMatchObject({ ok: true });
     await waitForJobViaServerFunctions(readJob, jobId, (job) => !job.active, JOB_WAIT);
     const page = await openPage(`/jobs/${jobId}`);
+    // PL-2（3 章の 1・2）: 登録の結果の詳しいことは、たたんだ詳しい内容の中。
+    await openAdvancedSettings(page, 'job-details', UI_TIMEOUT_MS);
     const registration = page.getByTestId('job-login-auto-registration');
     await registration.waitFor({ timeout: UI_TIMEOUT_MS });
     expect(await registration.getAttribute('data-result')).toBe('SKIPPED');
@@ -288,11 +296,11 @@ describe('ML-b-2: the manual login with the job manager and the fake worker', ()
     await waitForJobViaServerFunctions(readJob, jobId, (job) => job.lastAuthState === 'AWAITING_LOGIN', JOB_WAIT);
     const page = await openPage(`/jobs/${jobId}`);
     const panel = page.getByTestId('job-manual-login');
-    await panel.waitFor({ timeout: UI_TIMEOUT_MS });
+    const button = page.getByTestId('job-summary-panel').getByTestId('job-manual-login-confirm');
+    await button.waitFor({ timeout: UI_TIMEOUT_MS });
     const before = confirmedMessages();
     // テストだけの操作: 「ログインを終えた」の要求を通信の誤りで終える（Server Function の呼び出しが例外を投げる）。
     await page.route((url) => isServerFunctionUrlOf(ids, 'confirmManualLoginFn', url), (route) => route.abort('failed'));
-    const button = panel.getByTestId('job-manual-login-confirm');
     await button.click();
     const failed = panel.getByTestId('job-manual-login-request-failed');
     await failed.waitFor({ timeout: UI_TIMEOUT_MS });

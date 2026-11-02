@@ -87,7 +87,7 @@
       },
       "else": {
         "properties": {
-          "precheck": { "type": "object", "properties": { "candidateDigestMatched": { "const": true }, "blockReason": { "type": "null" } } },
+          "precheck": { "type": "object", "properties": { "candidateDigestMatched": { "const": true }, "blockReason": { "type": "null" }, "inputFailure": false } },
           "submission": { "type": "object", "properties": { "actionPath": { "type": "string" } } },
           "response": { "type": "object" },
           "result": { "not": { "const": "BLOCKED" } }
@@ -147,7 +147,49 @@
       "required": ["candidateDigestMatched", "blockReason"],
       "properties": {
         "candidateDigestMatched": { "anyOf": [{ "type": "boolean" }, { "type": "null" }] },
-        "blockReason": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/blockReason" }
+        "blockReason": { "$ref": "urn:beaksight:schema:action-run:1.0#/properties/blockReason" },
+        "candidateMismatch": { "$ref": "#/$defs/candidateMismatch" },
+        "inputFailure": { "$ref": "#/$defs/inputFailure" }
+      }
+    },
+    "inputFailure": {
+      "description": "OP-O (O1): the stage, the reason and the field facts of a failed inspection, input or press in the write stage (WRITE_INPUT_FAILURE_* in src/control/actions/action-contracts.ts). Never a value or the length of a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "reason", "fieldPosition", "fieldType", "fieldAttributes", "valueChange"],
+      "properties": {
+        "stage": { "enum": ["INSPECT", "FILL", "SUBMIT"] },
+        "reason": {
+          "enum": [
+            "SPEC_INVALID", "PAGE_UNREADABLE", "FIELD_NOT_FOUND", "FIELD_AMBIGUOUS", "FIELD_TYPE_NOT_SUPPORTED", "FIELD_NOT_VISIBLE", "FIELD_NOT_EDITABLE",
+            "SUBMITTER_NOT_FOUND", "SUBMITTER_AMBIGUOUS", "SUBMITTER_INSIDE_LINK", "ELEMENT_CHANGED", "INPUT_FAILED", "VALUE_CHANGED", "SUBMIT_FAILED",
+            "FORM_UNREADABLE", "FORM_NOT_FOUND", "FORM_AMBIGUOUS", "FIELD_OWNED_BY_OTHER_FORM", "FORM_FIELDS_CHANGED", "FIELD_TYPE_MISMATCH", "METHOD_NOT_POST",
+            "ACTION_NOT_ALLOWED", "ENCTYPE_NOT_ALLOWED", "ENCTYPE_MISMATCH", "FORM_TARGET_NOT_SELF", "ACCEPT_CHARSET_NOT_UTF8", "FORM_CHANGED",
+            "VALUE_NOT_SUPPORTED", "VALUE_NOT_APPLIED", "PRIOR_VALUE_CHANGED", "CHECKBOX_PAIR_NOT_ADJACENT", "SECRET_LIKE_STATE_FIELD",
+            "SECRET_LIKE_PASSTHROUGH_FIELD"
+          ]
+        },
+        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 1000 }, { "type": "null" }] },
+        "fieldType": { "anyOf": [{ "$ref": "urn:beaksight:schema:control:candidate:1#/$defs/field/properties/type" }, { "type": "null" }] },
+        "fieldAttributes": {
+          "anyOf": [
+            { "type": "array", "uniqueItems": true, "maxItems": 7, "items": { "enum": ["readonly", "disabled", "maxlength", "pattern", "min", "max", "step"] } },
+            { "type": "null" }
+          ]
+        },
+        "valueChange": { "anyOf": [{ "enum": ["EMPTIED", "SURROUNDING_WHITESPACE", "DIGIT_GROUPING", "NUMBER_FORMAT", "OTHER"] }, { "type": "null" }] }
+      }
+    },
+    "candidateMismatch": {
+      "description": "OP-L (L1): where the approved candidate did not match the current page (PRECHECK_CANDIDATE_MISMATCH_REASONS). Never a value.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "pageCandidateCount", "sameIdentityCount", "fieldPosition"],
+      "properties": {
+        "reason": { "enum": ["IDENTITY_NOT_FOUND", "IDENTITY_AMBIGUOUS", "RULE_DIGEST_CHANGED", "RECORD_ID_NOT_IN_PATH", "SPEC_INVALID", "PAGE_UNREADABLE", "FIELD_NOT_FOUND", "FIELD_AMBIGUOUS", "FIELD_TYPE_NOT_SUPPORTED", "FIELD_NOT_VISIBLE", "FIELD_NOT_EDITABLE", "SUBMITTER_NOT_FOUND", "SUBMITTER_AMBIGUOUS", "SUBMITTER_INSIDE_LINK"] },
+        "pageCandidateCount": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 100000 }, { "type": "null" }] },
+        "sameIdentityCount": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 100000 }, { "type": "null" }] },
+        "fieldPosition": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 1000 }, { "type": "null" }] }
       }
     },
     "submission": {
@@ -247,8 +289,36 @@
           "additionalProperties": { "$ref": "urn:beaksight:schema:read-evidence:1.0#/$defs/count" }
         },
         "documentCharsetRead": { "type": "boolean" },
-        "responseDeliveryCanceled": { "type": "boolean" }
+        "responseDeliveryCanceled": { "type": "boolean" },
+        "unexpectedRequests": { "$ref": "#/$defs/unexpectedRequests" },
+        "unexpectedRequestsUnlisted": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "passedRequests": {
+          "description": "OP-N (optional): the requests that the site sent by itself and the request guard passed in the write stage under the audit send policy PASS_EXCEPT_DELETE (same shape as unexpectedRequests; the reason is AUDIT_SEND_PASSED). Not counted as writes. No origin name, query, body or value.",
+          "$ref": "#/$defs/unexpectedRequests"
+        },
+        "passedRequestsUnlisted": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
       }
+    },
+    "unexpectedRequests": {
+      "description": "OP-M (optional): the requests other than the approved send that the request guard blocked in the write stage (src/safety/write-stage-unexpected-requests.ts). No origin name, query, body or value.",
+      "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["method", "destination", "pathShape", "resourceType", "timing", "reason", "markerInBody", "bodyKind", "count"],
+            "properties": {
+              "method": { "type": "string", "pattern": "^(?:[A-Z]+|\\[REDACTED\\])$", "maxLength": 32 },
+              "destination": { "enum": ["TEST_ORIGIN", "APPROVED_SERVICE_ORIGIN", "OUTSIDE_ALLOWED_ORIGINS"] },
+              "pathShape": { "type": "string", "minLength": 1, "maxLength": 1024 },
+              "resourceType": { "type": "string", "pattern": "^[a-z]+$", "maxLength": 64 },
+              "timing": { "enum": ["BEFORE_FILL", "AFTER_FILL", "AFTER_PRESS"] },
+              "reason": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$", "maxLength": 64 },
+              "markerInBody": { "type": "boolean" },
+              "bodyKind": { "enum": ["NONE", "UNREADABLE", "NOT_JSON", "OBJECT", "ARRAY", "SCALAR"] },
+              "count": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+            }
+          }
     }
   }
 }

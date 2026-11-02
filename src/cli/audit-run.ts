@@ -79,6 +79,7 @@ import {
 import { ArtifactWriteError, ArtifactWriter } from '../report/artifact-writer.js';
 import { createChatGptBundle, type ReadArtifactFile } from '../report/chatgpt-bundle.js';
 import { renderHtmlReport } from '../report/html-report.js';
+import { reportSummaryDocumentOf } from '../report/report-summary.js';
 import { buildReportViewModel, type RunSummaryView } from '../report/view-model.js';
 import { SafetyLedger } from '../safety/safety-ledger.js';
 import { RUN_UNAVAILABLE_EXIT_CODE, exitCodeForRunStatus } from './exit-codes.js';
@@ -146,6 +147,12 @@ export interface AuditRunOptions {
    * 名前の部分のない今の形。
    */
   readonly profileName?: string | undefined;
+  /**
+   * OP-H（撮影 UI-W4 の 3）: 画面の点検で、この Run（監査の段）の後に登録・更新を試す、チェックした画面の数（ワーカーが `START` の `chain.writeScreenCount`
+   * から入れる）。報告のまとめの 1 行だけに使う（`buildReportViewModel` の事実）。成果物の `run.json` と、再開の比べには使わない。省略（CLI の実行、チェックの
+   * ない点検）は、今の報告のまま。
+   */
+  readonly plannedWriteScreenCount?: number | undefined;
 }
 
 /** 監査の中核の指定の既定値（`--new` なし）。 */
@@ -629,7 +636,7 @@ async function startAndRunAudit(input: {
   }
   let outputs: AuditRunOutputs;
   try {
-    outputs = await writeAuditRunOutputs(result, outputDirectory, writer, options.profileName);
+    outputs = await writeAuditRunOutputs(result, outputDirectory, writer, options.profileName, options.plannedWriteScreenCount);
   } catch (error) {
     await concludeCheckpointAfterOutputFailure(conclusion, session);
     throw error;
@@ -859,7 +866,8 @@ export interface AuditRunOutputs {
  * 2. `buildReportViewModel(written.result)`
  * 3. `renderHtmlReport(viewModel)`
  * 4. `createChatGptBundle(viewModel, written.result, readArtifactFile)`
- * 5. `ArtifactWriter.writePresentation(written, { reportHtml, bundle: { bytes, lastExecutionFinishedAt, profileName } })`（バンドルの名前は、最後の
+ * 5. `ArtifactWriter.writePresentation(written, { reportHtml, reportSummary, bundle: { bytes, lastExecutionFinishedAt, profileName } })`（PL-R: 報告の小さなまとめ
+ *    `report-summary.json` は `reportSummaryDocumentOf(viewModel)`）（バンドルの名前は、最後の
  *    実行の終わりの時刻から作る。結果の行と同じ、表示用モデルの `executions.lastFinishedAt` を使う。ChatGPT 用バンドルのファイル名の
  *    設計書 2.1。PRE42-BN: 画面のジョブは、`profileName`（プロファイルの名前）を名前に入れる。CLI は渡さない）
  * 終了コードは、`writeRun` が返した最終の Run（導き直した後の Run Status）から、`exit-codes.ts` の表で決める。
@@ -867,19 +875,23 @@ export interface AuditRunOutputs {
  * `writer` は省略できる（既定は、公開監査の既定の書き手。`executeAuditRun` は、その Run の書き手を渡す。認証つきの Run では、URL の秘密を伏せる
  * 書き手なので、表示用モデル、HTML、バンドルも、伏せ字の後の最終の Run から作る。T25f）。
  * `profileName` は省略できる（PRE42-BN。画面のジョブのプロファイルの名前。バンドルのファイル名だけに使う。CLI は渡さない）。
+ * `plannedWriteScreenCount` は省略できる（OP-H。この後に登録・更新するチェックした画面の数。表示用モデルの事実。CLI は渡さない）。
  */
 export async function writeAuditRunOutputs(
   result: AuditRunResult,
   outputDirectory: string,
   writer: ArtifactWriter = new ArtifactWriter(),
   profileName: string | undefined = undefined,
+  plannedWriteScreenCount: number | undefined = undefined,
 ): Promise<AuditRunOutputs> {
   const written = await writer.writeRun(result, { outputDirectory });
-  const viewModel = buildReportViewModel(written.result);
+  const viewModel = buildReportViewModel(written.result, plannedWriteScreenCount === undefined ? {} : { plannedWriteScreenCount });
   const reportHtml = renderHtmlReport(viewModel);
   const bundle = await createChatGptBundle(viewModel, written.result, artifactFileReader(written.runDirectory));
   await writer.writePresentation(written, {
     reportHtml,
+    // PL-R: 報告の小さなまとめ（同じ表示用モデルから。画面の作業の画面が問題の数を読む）。
+    reportSummary: reportSummaryDocumentOf(viewModel),
     bundle: { bytes: bundle, lastExecutionFinishedAt: viewModel.summary.executions.lastFinishedAt, profileName },
   });
   const { runId, runStatus } = written.result.run;

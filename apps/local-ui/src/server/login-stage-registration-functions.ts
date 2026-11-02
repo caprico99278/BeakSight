@@ -7,16 +7,22 @@
  * - 保存（`registerLoginStageRowFn`。POST。CSRF は画面のサーバの middleware）: ダイアログが出した改訂（`expectedProfileRevision`）で、サーバの側で
  *   組み立て直し、プロファイル（承認したサービスの Origin を足し、改訂を進める）と認証の設定を 1 回で保存する（`saveProfileAndAuthSetup`。検証は保存の部品）。
  * 値（パスワード、token、query の値）は返さない（token の送信先の query は名前だけ）。
+ * MI-G（設計書 `doc/design/2026-10-26-beaksight-minimal-input-ux-design.md` 4.7）: 案と保存の両方が、ジョブの種類・自動ログインの試しの記録・プロファイルの
+ * 認証の方式を組み立ての部品に渡す。自動ログインの文脈の行からは、token の送信先と承認したサービスの Origin を足さない（部品が拒む）。
  */
-import { createServerFn } from '@tanstack/react-start';
+import { createServerFn, createServerOnlyFn } from '@tanstack/react-start';
 import { readJob } from '../../../../src/control/job/job-store.js';
 import {
   loginStageRowRegistrationOf,
+  loginStageRowSourceOf,
   type LoginStageRowAddition,
   type LoginStageRowRegistration,
   type LoginStageRowRegistrationRejection,
+  type LoginStageRowSource,
 } from '../../../../src/control/manual-login-registration.js';
+import type { WorkerLoginObservation, WorkerLoginStageBlockedRequest } from '../../../../src/control/worker-protocol.js';
 import { getAuthSetup } from '../../../../src/control/store/auth-setup-store.js';
+import type { ControlDatabase } from '../../../../src/control/store/control-database.js';
 import { saveProfileAndAuthSetup } from '../../../../src/control/store/profile-auth-setup-store.js';
 import { getProfile, type StoredProfile } from '../../../../src/control/store/profile-store.js';
 import { localUiStore } from './control-store';
@@ -24,7 +30,7 @@ import { requestOf } from './request-validation';
 import { loadTargetContext } from './target-config';
 
 /** 表の 1 行の指定（`passed` は、手動のログインの間に通した送信の表か、止めた送信の表か）。 */
-interface LoginStageRowKeyRequest {
+export interface LoginStageRowKeyRequest {
   readonly jobId: string;
   readonly passed: boolean;
   readonly index: number;
@@ -76,9 +82,25 @@ type Built =
   | { readonly ok: true; readonly profile: StoredProfile; readonly registration: LoginStageRowRegistration }
   | { readonly ok: false; readonly reason: LoginStageRowRequestRejection };
 
-/** ジョブの記録の行と観察、今のプロファイルと認証の設定から組み立てる。 */
-const buildOf = (request: LoginStageRowKeyRequest): Built => {
-  const database = localUiStore();
+/** ジョブの記録の 1 行と、その出どころと観察と、ジョブのプロファイルの今の値（`loginStageRowContextOf` の結果）。 */
+export type LoginStageRowContext =
+  | {
+    readonly ok: true;
+    readonly profile: StoredProfile;
+    readonly row: WorkerLoginStageBlockedRequest;
+    readonly source: LoginStageRowSource;
+    readonly observation: WorkerLoginObservation | undefined;
+  }
+  | { readonly ok: false; readonly reason: Extract<LoginStageRowRequestRejection, 'JOB_NOT_FOUND' | 'ROW_NOT_FOUND' | 'PROFILE_NOT_FOUND'> };
+
+/**
+ * ジョブの記録の 1 行を読む（表の行の「登録する」と、MI-F1 の認証の設定の画面の下書きからの保存が共用する。値は画面から受けず、ジョブの記録から読み直す）。
+ * MI-G（設計書 `2026-10-26-beaksight-minimal-input-ux-design.md` 4.7）: 行の出どころ（ジョブの種類・自動ログインの試しの記録・プロファイルの方式。自動ログインの
+ * 文脈かの判定は、組み立ての部品の中だけ）も返す。
+ * サーバだけの関数（`createServerOnlyFn`）にする（公開した普通の関数は、ブラウザのバンドルに管理データの部品まで入れてしまう。`credential-functions.ts` の
+ * `localUiCredentialServiceDependencies` と同じ決まり）。
+ */
+export const loginStageRowContextOf = createServerOnlyFn((database: ControlDatabase, request: LoginStageRowKeyRequest): LoginStageRowContext => {
   const job = readJob(database, request.jobId);
   if (job === null) {
     return { ok: false, reason: 'JOB_NOT_FOUND' };
@@ -92,7 +114,18 @@ const buildOf = (request: LoginStageRowKeyRequest): Built => {
   if (profile === null) {
     return { ok: false, reason: 'PROFILE_NOT_FOUND' };
   }
-  const stored = getAuthSetup(database, job.profileId);
+  return { ok: true, profile, row, source: loginStageRowSourceOf(job, profile.profile.auth), observation: job.loginStage?.observation };
+});
+
+/** ジョブの記録の行と観察、今のプロファイルと認証の設定から組み立てる。 */
+const buildOf = (request: LoginStageRowKeyRequest): Built => {
+  const database = localUiStore();
+  const context = loginStageRowContextOf(database, request);
+  if (!context.ok) {
+    return context;
+  }
+  const { profile, row, source, observation } = context;
+  const stored = getAuthSetup(database, profile.profile.profileId);
   if (stored === null) {
     return { ok: false, reason: 'AUTH_SETUP_NOT_FOUND' };
   }
@@ -100,8 +133,9 @@ const buildOf = (request: LoginStageRowKeyRequest): Built => {
     setup: stored.setup,
     profile: { approvedTestOrigins: profile.profile.approvedTestOrigins, approvedServiceOrigins: profile.profile.approvedServiceOrigins ?? [] },
     row,
-    observation: job.loginStage?.observation,
+    observation,
     nextProfileRevision: profile.profile.revision + 1,
+    source,
   });
   return { ok: true, profile, registration };
 };

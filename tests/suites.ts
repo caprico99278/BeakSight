@@ -137,7 +137,11 @@ export const HEAVY_TEST_FILES: readonly string[] = Object.freeze([
   'tests/integration/isolated-interaction-evidence.test.ts',
   'tests/integration/job-audit-stage-review.test.ts',
   'tests/integration/job-audit-stage-spa.test.ts',
+  // DEF-180（OP-DEF）: ジョブの境目の読み込みの間隔（本物のワーカーの fork と Chromium の 2 種。1 回で数分）。
+  'tests/integration/job-boundary-interval-fork.test.ts',
   'tests/integration/job-site-unavailability.test.ts',
+  // OP-1: ログインの直後の登録と自動ログインへの切り替えの fork（2 つの Chromium × 2 つのサイト。測りは約 220 秒）。
+  'tests/integration/login-registration-fork.test.ts',
   'tests/integration/login-form-submitter.test.ts',
   'tests/integration/navigation-pacing.test.ts',
   'tests/integration/page-auditor-interaction.test.ts',
@@ -164,5 +168,7 @@ export const HEAVY_TEST_FILES: readonly string[] = Object.freeze([
   'tests/integration/write-job-g30.test.ts',
   'tests/integration/write-job-g31.test.ts',
   'tests/integration/write-job-update.test.ts',
+  // MI-C（MI-5 の発見事項）: 書き込みのモードの監査が読み取りだけのまま（子の process とビルドを使う。`auth-mode-contrast.test.ts` と同じ種類）。
+  'tests/integration/write-mode-audit-read-only.test.ts',
   'tests/integration/write-update-run.test.ts',
 ]);
