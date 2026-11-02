@@ -1,0 +1,5 @@
+#!/bin/sh
+# コミットする中身に、Git に載せない語（local/secret-terms.txt の一覧）が含まれていないかを調べる。
+# 有効にする: git config core.hooksPath .githooks（doc/spec/development.md の「Git に載せない語の検査」）
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+exec node "$repo_root/tools/secret-terms/scan.mjs" --staged

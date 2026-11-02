@@ -1,6 +1,6 @@
 # 開発者向け
 
-BeakSight を開発する人のための、npm のスクリプト、ローカルでの検証の手順、アーカイブのスクリプトです。
+BeakSight を開発する人のための、npm のスクリプト、ローカルでの検証の手順、Git に載せない語の検査、アーカイブのスクリプトです。
 
 [README に戻る](../../README.md)・[仕様の索引](README.md)
 
@@ -78,6 +78,63 @@ fixture の全体の監査のテストは、次のことを行います。
 | `BEAKSIGHT_TEST_TIER` | `full` のとき、同じ場面を何回もくり返して確かめるテストを、全部の組の回数（`tests/helpers/test-rounds.ts` の `full`）で流します。`test:full` は、起動の部品がどの回にもこの値を渡します。ほかの値と省略は、ふだんの組の回数（`regular`）です。 |
 
 環境変数は、npm の scripts の中では書きません（Git Bash と PowerShell で書き方が違うため）。起動の部品 `tests/run-suite.mjs` が、子のプロセスに渡します。環境変数の名前と値は、`tests/helpers/test-run-environment.ts` にだけ書いています（ほかのファイルに書き写さないことは、Architecture Gate が確かめます）。
+
+## Git に載せない語の検査
+
+監査の対象のサイトの名前や、そのサイトの画面の名前・資源の path・欄の名前などは、Git に載るファイルに書きません。GitHub に届く前に止めるため、伏せる語の一覧を使う検査を 3 か所に置いています。どれも、共通の部品 `tools/secret-terms/scan.mjs`（Node の標準だけ）で判定します。
+
+| 検査 | いつ止めるか | 場所 |
+| --- | --- | --- |
+| Claude Code のフック | Claude Code が Git に載るファイルを書く前（`Write`・`Edit`・`MultiEdit`・`NotebookEdit`、Desktop Commander の `write_file`・`edit_block`） | `.claude/hooks/block-secret-terms.mjs`（`.claude/settings.json` の `PreToolUse`） |
+| Git の pre-commit | コミットのとき（コミットする中身の、追加・変更したファイル） | `.githooks/pre-commit` |
+| Git の pre-push | push のとき（送るコミットのそれぞれで変わったファイル） | `.githooks/pre-push` |
+
+### 有効にする
+
+Git のフックは、clone ごとに 1 回、次の命令で有効にします（Claude Code のフックは `.claude/settings.json` にあるので、設定は要りません）。
+
+```bash
+git config core.hooksPath .githooks
+```
+
+### 一覧の置き場所と形
+
+- 置き場所: `local/secret-terms.txt`（`local/` は Git の外です。この PC にだけ置きます）。
+- 1 行に 1 語を書きます。`#` で始まる行と空の行は飛ばします。前後の空白は取ります。
+- 大文字と小文字は区別しない、ただの部分一致です（正規表現ではありません）。日本語の語も書けます。
+- 文字コードは UTF-8（BOM があってもよい）、改行は CRLF でも LF でもかまいません。
+- 一覧がないとき（クラウドやほかの PC の clone）は、何も止めません（Git のフックは、標準エラーに 1 行の注意を出します）。
+
+例（架空の語）:
+
+```text
+# 伏せる語の一覧
+zzforbiddenzz
+禁止の語の例
+```
+
+### 止まったときの直し方
+
+当たったときは、ファイルの path・行の番号・当たった語の番号（一覧の何行目か）だけを出します。語そのものは、端末やログに残さないため出しません。
+
+```text
+secret-terms: doc/spec/example.md:12: 伏せる語の一覧の 3 行目の語が含まれています
+secret-terms: Git に載せない語です。一般の形（登録の画面、/rest/v1/<x> など）で書き直してください（語の中身は local/secret-terms.txt で確かめます）。
+```
+
+1. 一覧（`local/secret-terms.txt`）の、出た番号の行を見て、どの語かを確かめます。
+2. 出た path と行で、その語を一般の形（「登録の画面」、`/rest/v1/<x>` など）に書き直します。
+3. コミットで止まったときは、直したファイルを `git add` し直してから、もう一度コミットします。
+4. push で止まったときは、出たコミット（`（コミット <sha>）`）に語が入っています。後のコミットで直しても、そのコミットが送る中に残るので止まります。語の入ったコミットを直して（`git rebase -i` など）から push します。
+
+終了コードは、当たらなければ 0、当たれば 1、Git の失敗などで調べられなければ 2 です（1 と 2 は、どちらもコミットと push を止めます）。手で調べるときは、`node tools/secret-terms/scan.mjs --staged`（コミットする中身）、`--push <ローカルの sha> <リモートの sha>`（送るコミット）、`--text <path>`（標準入力の文字列。`<path>` は表示だけ）を使います。一覧の場所は、環境変数 `BEAKSIGHT_SECRET_TERMS_FILE` で変えられます（テスト用）。
+
+### 限界
+
+- 一覧にない語は止められません。新しく伏せる語ができたら、一覧に足します。
+- Claude Code のフックが調べるのは、上の道具で書く文字列だけです（`Edit` は `new_string` だけ）。Bash や PowerShell などで書いたファイルは、書くときには止まらず、コミットのとき（pre-commit）に止まります。
+- Claude Code のフックは、Git に載らない path（`git check-ignore` で無視されるもの、リポジトリの外）を調べません。
+- Git のフックは、`--no-verify` を付けたコミットと push では流れません。付けないでください。
 
 ## アーカイブのスクリプト
 
